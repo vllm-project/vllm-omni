@@ -242,6 +242,44 @@ def test_forward_passes_request_shift_without_mutating_scheduler_config(solver: 
         torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("flow_shift", [float("nan"), float("inf")])
+def test_forward_rejects_unusable_sigmas_right_after_set_timesteps(flow_shift: float) -> None:
+    """Under sigma windows, sigmas that a bad flow_shift produces fail this request before its latents are
+    prepared or any denoise forward runs; a valid flow_shift and an unscheduled request are unaffected."""
+    reached: list[str] = []
+
+    def run(shift: float) -> None:
+        # A fresh pipeline per request, so no request inherits the scheduler another one built.
+        pipeline = _make_pipeline()
+
+        def prepare_latents(**kwargs):
+            reached.append("prepare_latents")
+            return torch.zeros((1, 4, 1, 8, 8), dtype=torch.float32)
+
+        def diffuse(**kwargs):
+            reached.append("diffuse")
+            return kwargs["latents"]
+
+        pipeline.prepare_latents = prepare_latents
+        pipeline.diffuse = diffuse
+        sampling = _make_sampling(num_inference_steps=4, extra_args={"sample_solver": "euler", "flow_shift": shift})
+        request = OmniDiffusionRequest(prompt="prompt", request_id="sigma-check", sampling_params=sampling)
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+    with set_forward_context(), bind_attention_schedule(None, (AttentionSigmaWindow(0.0, 1.0, "p"),)):
+        with pytest.raises(InvalidAttentionScheduleError, match="check flow_shift"):
+            run(flow_shift)
+        assert reached == []
+        run(12.0)
+        assert reached == ["prepare_latents", "diffuse"]
+
+    # Without sigma windows nothing reads the sigmas, so the check does not run.
+    reached.clear()
+    with set_forward_context():
+        run(flow_shift)
+    assert reached == ["prepare_latents", "diffuse"]
+
+
 def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:
     pipeline = _make_pipeline()
     encode_call = {}

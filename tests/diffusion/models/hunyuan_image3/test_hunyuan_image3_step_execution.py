@@ -16,7 +16,7 @@ from vllm_omni.diffusion.attention.schedule import (
     InvalidAttentionScheduleError,
     parse_attention_sigma_schedule,
 )
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
 from vllm_omni.diffusion.forward_context import (
     bind_attention_schedule,
     get_attention_schedule_profile,
@@ -834,6 +834,72 @@ def test_request_loop_rejects_schedule_past_actual_steps_before_any_forward(monk
         _run_request_loop(pipe, num_inference_steps=8)
 
     assert events == []
+
+
+# Sigmas that cannot be normalized into [0, 1]: a NaN first sigma, and a later sigma above or below it.
+_UNUSABLE_SIGMAS = [[float("nan"), 0.5, 0.25, 0.0], [1.0, 1.5, 0.25, 0.0], [1.0, -0.5, 0.25, 0.0]]
+
+
+@pytest.mark.parametrize("sigmas", _UNUSABLE_SIGMAS)
+def test_request_loop_rejects_unusable_scheduler_sigmas_before_any_forward(monkeypatch, sigmas):
+    events: list = []
+    pipe = _request_mode_pipeline(monkeypatch, num_steps=4, events=events)
+    pipe.scheduler.sigmas = sigmas
+    windows = parse_attention_sigma_schedule([{"low": 0.0, "high": 1.0, "profile": "all"}])
+
+    with (
+        set_forward_context(),
+        bind_attention_schedule(None, windows),
+        pytest.raises(InvalidAttentionScheduleError, match="scheduler sigmas"),
+    ):
+        _run_request_loop(pipe)
+    assert events == []
+
+    # Without sigma windows nothing reads the sigmas, so the same loop runs.
+    with set_forward_context():
+        _run_request_loop(pipe)
+    assert events[:2] == ["prepare_latents", "ar_kv_reuse"]
+
+
+class _LatentsReached(Exception):
+    pass
+
+
+@pytest.mark.parametrize("request_windows", [None, []], ids=["inherited-windows", "disabled-windows"])
+def test_prepare_encode_rejects_unusable_scheduler_sigmas_before_latents(monkeypatch, request_windows):
+    """Step mode checks the sigmas in this request's prepare_encode, which the runner fails on its own,
+    instead of in a denoise_step shared with other requests."""
+    pipeline = _pipeline()
+    pipeline.od_config.diffusion_attention_schedule = AttentionScheduleConfig(
+        profiles={"p": {"default": "TORCH_SDPA"}}, sigma=[{"low": 0.0, "high": 1.0, "profile": "p"}]
+    )
+    monkeypatch.setattr(HunyuanImage3Pipeline, "device", property(lambda self: torch.device("cpu")))
+    image_info = _prepared_layout().generated_image_info
+    pipeline.prepare_model_inputs = lambda **kwargs: {
+        "input_ids": torch.zeros(1, 21, dtype=torch.long),
+        "batch_gen_image_info": [image_info],
+    }
+    pipeline.scheduler = SimpleNamespace(sigmas=[1.0, 1.5, 0.25, 0.0])
+    monkeypatch.setattr(
+        hy3_module, "retrieve_timesteps", lambda *args: (torch.tensor([1000.0, 750.0, 500.0, 250.0]), 4)
+    )
+
+    def prepare_latents(**kwargs):
+        raise _LatentsReached
+
+    pipeline._pipeline = SimpleNamespace(prepare_latents=prepare_latents)
+    sampling = _sampling_params()
+    sampling.attention_schedule = None
+    sampling.attention_sigma_schedule = request_windows
+    state = StepRequestState(request_id="req-bad-sigmas", sampling=sampling, prompt={"prompt": "prompt"})
+
+    if request_windows is None:
+        with pytest.raises(InvalidAttentionScheduleError, match="scheduler sigmas"):
+            pipeline.prepare_encode(state)
+    else:
+        # The request disables the server's windows, so its sigmas are never read or checked.
+        with pytest.raises(_LatentsReached):
+            pipeline.prepare_encode(state)
 
 
 class _SpecDependentMaskBackend:
