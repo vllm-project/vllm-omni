@@ -1183,8 +1183,9 @@ _MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 
 # Engine-default (neutral) values for sampling params a v2 stage may list as
-# unsupported: for these keys a default equal to the engine default is a no-op
-# and passes. Any other listed key fails on presence, at any value.
+# unsupported: a default equal to the engine default is a no-op and passes.
+# Unlisted keys have no scalar neutral; for them an empty value (None, [], {})
+# passes as well.
 _MRV2_NEUTRAL_SAMPLING_VALUES: dict[str, Any] = {
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
@@ -1204,7 +1205,7 @@ def _validate_mrv2_default_sampling_params(
     bad = [
         key
         for key in sorted(set(params) & set(ps.mrv2_unsupported_sampling_params))
-        if key not in _MRV2_NEUTRAL_SAMPLING_VALUES or params[key] != _MRV2_NEUTRAL_SAMPLING_VALUES[key]
+        if params[key] not in (_MRV2_NEUTRAL_SAMPLING_VALUES.get(key), None, [], {})
     ]
     if bad:
         raise ValueError(
