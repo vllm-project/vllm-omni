@@ -961,6 +961,13 @@ class Attention(nn.Module):
         # device tensor here would force a host sync on every attention call.
         self._schedule_op_id = torch.tensor(op_id, dtype=torch.int64, device="cpu")
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # copy.copy, copy.deepcopy and unpickling all restore through here. The copied id would still
+        # resolve to the original layer, so a copy that carries one registers its own.
+        super().__setstate__(state)
+        if self._schedule_op_id is not None:
+            self._register_scheduled_op()
+
     def _schedule_op_eligible(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
         """Whether this layer and call can use the scheduled-attention op instead of the eager boundary.
 
