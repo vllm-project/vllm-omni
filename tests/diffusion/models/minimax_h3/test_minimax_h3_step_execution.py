@@ -1030,7 +1030,11 @@ def _small_dit(monkeypatch, baseline) -> h3.MiniMaxH3DiTModel:
     monkeypatch.setattr(layer, "get_current_diffusion_config_or_none", lambda: None)
     monkeypatch.setattr(layer, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
     monkeypatch.setattr(layer, "get_attn_backend_for_role", lambda **kwargs: (baseline, None))
-    model = h3.MiniMaxH3DiTModel(_small_od_config())
+    config = _small_od_config()
+    # With the AdaLN cache on, the constructor probes the current CUDA device for the SM120 offload
+    # default, which fails when CUDA is built but no device is visible. These checks need no cache.
+    config.cache_config = {"minimax_h3_adaln_cache": False}
+    model = h3.MiniMaxH3DiTModel(config)
     attention = [block.attn.attention for block in model.blocks]
     assert all(isinstance(a, layer.Attention) and a.attn_backend is baseline for a in attention)
     return model
