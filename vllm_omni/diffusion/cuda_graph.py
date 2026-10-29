@@ -42,6 +42,8 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
+from vllm_omni.platforms import current_omni_platform
+
 logger = init_logger(__name__)
 
 _PRIMITIVES = (int, float, bool, str, bytes, type(None))
@@ -210,7 +212,8 @@ class GraphedForward:
         ``pin`` exempts a newly captured graph from LRU eviction. Returned
         tensors are clones, so the caller may hold them across the next call.
         """
-        if not self.enabled:
+        if not self.enabled or current_omni_platform.is_graph_capturing():
+            # Inside an outer capture, which records these kernels anyway.
             self.eager_calls += 1
             return self.module(**kwargs)
         key = (kwargs_signature(variant), kwargs_signature(kwargs))

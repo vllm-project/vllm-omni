@@ -15,6 +15,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+import vllm_omni.diffusion.cuda_graph as cuda_graph_mod
+import vllm_omni.diffusion.profiler.diffusion_pipeline_profiler as profiler_mod
 import vllm_omni.diffusion.xpu_graph as xpu_graph_mod
 from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.xpu_graph import XPUGraphedForward
@@ -39,7 +41,8 @@ def platform(monkeypatch) -> SimpleNamespace:
     monkeypatch.setattr(torch.xpu, "stream", lambda side: nullcontext(), raising=False)
     for name in ("get_sync_debug_mode", "set_sync_debug_mode", "Stream", "graph", "CUDAGraph"):
         monkeypatch.setattr(torch.cuda, name, _no_cuda)
-    fake = SimpleNamespace(captures=0)
+    fake = SimpleNamespace(captures=0, outer_capture=False)
+    fake.is_graph_capturing = lambda: fake.outer_capture
 
     def capture_graph(capture, generators=()):
         capture()
@@ -48,6 +51,7 @@ def platform(monkeypatch) -> SimpleNamespace:
 
     fake.capture_graph = capture_graph
     monkeypatch.setattr(xpu_graph_mod, "current_omni_platform", fake)
+    monkeypatch.setattr(cuda_graph_mod, "current_omni_platform", fake)
     return fake
 
 
@@ -108,3 +112,41 @@ def test_capture_context_wraps_the_capture_forwards(platform) -> None:
     graph(x=torch.ones(2))  # replay: no capture, no context
 
     assert entered == [True] and platform.captures == 1
+
+
+def test_runs_eager_inside_an_outer_capture(platform) -> None:
+    graph = _forced_on()
+    platform.outer_capture = True
+
+    torch.testing.assert_close(graph(x=torch.ones(2)), torch.full((2,), 2.0))
+
+    assert graph.enabled and graph.num_graphs == 0 and graph.stats()["eager_calls"] == 1
+    assert platform.captures == 0
+
+
+@pytest.mark.parametrize(("cuda_alike", "stream_capturing", "expected"), [(False, True, False), (True, True, True)])
+def test_base_platform_reports_cuda_stream_capture(monkeypatch, cuda_alike, stream_capturing, expected) -> None:
+    from vllm_omni.platforms.interface import OmniPlatform
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: stream_capturing)
+    platform = SimpleNamespace(is_cuda_alike=lambda: cuda_alike)
+
+    assert OmniPlatform.is_graph_capturing(platform) is expected
+
+
+@pytest.mark.parametrize(("capturing", "expected_syncs"), [(False, 1), (True, 0)])
+def test_profiler_skips_synchronize_during_capture(monkeypatch, capturing, expected_syncs):
+    syncs = []
+    monkeypatch.setattr(
+        profiler_mod,
+        "current_omni_platform",
+        SimpleNamespace(
+            is_available=lambda: True,
+            is_graph_capturing=lambda: capturing,
+            synchronize=lambda: syncs.append(1),
+        ),
+    )
+
+    profiler_mod._sync_if_useful()
+
+    assert len(syncs) == expected_syncs
