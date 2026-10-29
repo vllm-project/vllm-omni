@@ -552,7 +552,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             # AllGather requires every DP rank to execute the same collective
             # schedule, including shape, CFG, denoise steps, output count,
             # and LoRA settings.
-            compatibility_keys = [build_request_batch_sampling_params_key(nr.req) for nr in new_reqs]
+            attention_schedule_config = getattr(self.od_config, "diffusion_attention_schedule", None)
+            compatibility_keys = [
+                build_request_batch_sampling_params_key(nr.req, attention_schedule_config) for nr in new_reqs
+            ]
             if any(key != compatibility_keys[0] for key in compatibility_keys[1:]):
                 raise ValueError(
                     "DLO DP multi-concurrency requires compatible shape, CFG, "

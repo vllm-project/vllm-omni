@@ -18,7 +18,6 @@ from vllm.v1.request import RequestStatus
 from vllm_omni.diffusion.attention.schedule import (
     DECODE_ONLY_PIPELINES,
     InvalidAttentionScheduleError,
-    parse_attention_schedule,
     resolve_request_attention_schedule,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -52,7 +51,7 @@ logger = init_logger(__name__)
 BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey
 
 # LoRA identity and execution mode are request-owned rather than same-named
-# sampling-param fields, and the attention schedule is normalized first, so
+# sampling-param fields, and the attention schedule is resolved first, so
 # they must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
     "attention_schedule",
@@ -772,7 +771,9 @@ class BaseScheduler(ABC):
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
         return StepBatchSamplingParamsKey(
-            attention_schedule=parse_attention_schedule(sampling.attention_schedule),
+            attention_schedule=resolve_request_attention_schedule(
+                sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
+            ),
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),
