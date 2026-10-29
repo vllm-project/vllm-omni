@@ -67,6 +67,10 @@ class PrefixCacheConfig:
     staging_claim_timeout_s: float = 30.0
     # Device→host chunk size for JOIN_ON_FINISH (copied a piece at a time).
     copy_chunk_bytes: int = 16 * 1024 * 1024
+    # Host-byte budget for the session-level prefix store (per-session
+    # row copies, independent of the slot pool). Appends that would exceed
+    # it are refused and fall back to the slot pool.
+    session_store_max_bytes: int = 2 * 1024 * 1024 * 1024
 
     @classmethod
     def from_vllm_config(

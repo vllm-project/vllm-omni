@@ -374,3 +374,17 @@ def test_negative_continuation_does_not_become_a_new_hit():
     )
     assert step.events == ()
     assert step.scheduled_tokens == (("r", 0),)
+
+
+def test_started_event_carries_session_id_when_present():
+    adapter = PrefixCacheSchedulerAdapter()
+    events = adapter.translate_step(
+        output(
+            new=[
+                SimpleNamespace(req_id="a", num_computed_tokens=0, session_id="S"),
+                SimpleNamespace(req_id="b", num_computed_tokens=0),
+                SimpleNamespace(req_id="c", num_computed_tokens=0, session_id=""),
+            ]
+        )
+    ).events
+    assert [(e.req_id, e.session_id) for e in events] == [("a", "S"), ("b", None), ("c", None)]

@@ -507,6 +507,45 @@ Threads, locks, and what each may block on:
 | controller `_lock` / `_wake` | task registry, queues, GPU-clone byte budget | device→host / pool-write body (released before `synchronize`) |
 | `WriteTask.lock` | `state`, `reassigned`, `append_chunk` | waiting on `host_ready` / `done` (those are events) |
 
+### Session-level prefix caching (phase 1)
+
+The slot pool is keyed by KV block id, so any request's traffic can hand
+a block to a new tenant: a live duplex session's prefix rows can be
+evicted by unrelated load. Phase 1 adds a session-level counterpart,
+`SessionPrefixStore`, holding per-session, token-ordered copies of
+immediate-key rows (hidden + non-deferred mm), independent of block-pool
+eviction. A session's rows survive until the session itself mutates its
+history or ends.
+
+- Namespace: `bind_session` / STARTED events carrying `session_id`
+  (the adapter reads it tolerantly from scheduler payloads; absent means
+  slot-pool-only). Bindings drop on finish/abort; stored rows survive
+  across turns.
+- Retention: materialize appends a turn's new rows only on exact
+  continuation (turn hit length equals stored length). The slot pool is
+  untouched, so existing cross-request sharing is unchanged.
+- Coarse invalidation: `invalidate_session` drops a session's segments
+  wholesale on any history mutation (edit, truncation, interruption).
+  Segments are per-session copies, so dropping one session can never
+  corrupt another's hits. A later turn whose hit length is nonzero after
+  an invalidation is refused by the continuation rule until a
+  full-prefix turn rebuilds the stream.
+- Live-session resume: a later turn's hit is served from the session
+  store when it covers the hit prefix (snapshot under the lock,
+  concatenated unlocked, so a concurrent invalidate cannot corrupt an
+  in-flight read). Otherwise the slot-pool path serves it.
+- Limits: `PrefixCacheConfig.session_store_max_bytes` (default 2 GiB)
+  caps host bytes; over-budget appends are refused and fall back to the
+  slot pool. Deferred mm is not stored (not on CPU at materialize time).
+  Steps consumed by `discard_step` (coalesced decode flushes) leave the
+  same kind of gap as a post-invalidation nonzero hit.
+
+Explicitly out of phase 1: fine-grained invalidation (phase 2, builds on
+the snapshot/ledger work), duplex-orchestrator wiring of
+`bind_session` at submit time, and any change to vLLM block eviction —
+the manager cannot pin blocks, which is why the session store holds
+copies rather than namespacing the pool.
+
 ### Related Files
 
 - `vllm_omni/core/prefix_cache/`

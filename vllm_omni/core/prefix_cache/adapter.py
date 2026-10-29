@@ -42,6 +42,10 @@ class PrefixCacheRequestEvent:
     block_ids: tuple[tuple[int, ...], ...] = ()
     scheduled_tokens: int = 0
     num_output_tokens: int = 0
+    # Duplex session a request belongs to, when the scheduler payload
+    # carries it. Absent (None) means the manager serves the request
+    # from the slot pool only; session features stay off for it.
+    session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +164,14 @@ class PrefixCacheSchedulerAdapter:
         return str(value)
 
     @staticmethod
+    def _session_id(data: Any) -> str | None:
+        # Tolerant read: scheduler payloads without a session carry
+        # nothing, and the duplex orchestrator's default "" is not a
+        # session. Neither case enables session features for the request.
+        value = getattr(data, "session_id", None)
+        return str(value) if value else None
+
+    @staticmethod
     def _blocks_value(blocks: Any) -> tuple[tuple[int, ...], ...]:
         if blocks is None:
             return ()
@@ -218,6 +230,7 @@ class PrefixCacheSchedulerAdapter:
                     hit_end=computed_tokens,
                     block_ids=blocks,
                     scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
+                    session_id=self._session_id(data),
                 )
             )
 
