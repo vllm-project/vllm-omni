@@ -63,7 +63,9 @@ A single asynchronous writer per direction sends individual MessagePack values.
 An incremental MessagePack decoder handles partial reads and consecutive values
 without explicit length prefixes or batch envelopes. Socket buffering is left to
 asyncio and the operating system.
-Queues are bounded by message count and encoded bytes. Worker-side session
+The channel owns send admission, capacity-wait timeouts, and closure; closing it
+wakes blocked senders. Queues are bounded by message count and encoded bytes.
+Worker-side session
 buffers enforce native output limits; frontend overflow closes the affected
 session and requests engine cleanup. Worker or transport failure fails pending
 controls and closes handles. Graceful asynchronous shutdown flushes a shutdown
