@@ -2691,7 +2691,9 @@ def _clear_denoise_progress_on_exit():
     """Clear the published denoise step on any exit and restore the timestep, total and sigma seen on entry.
 
     The denoise loop publishes a timestep, total and sigma only when a schedule is bound; without one,
-    the restore assigns the values those fields already hold.
+    the restore assigns the values those fields already hold. Wan2.2 uses
+    ``clear_scheduled_denoise_step_on_exit`` instead, which clears the step, total and sigma only
+    for scheduled runs.
     """
     ctx = get_forward_context() if is_forward_context_available() else None
     previous = (ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma) if ctx is not None else (None,) * 3
