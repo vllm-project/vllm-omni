@@ -28,7 +28,11 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import DenoiseProgressMixin, begin_scheduled_denoise
+from vllm_omni.diffusion.forward_context import (
+    DenoiseProgressMixin,
+    begin_scheduled_denoise,
+    clear_scheduled_denoise_step_on_exit,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -1069,7 +1073,7 @@ class Wan22S2VPipeline(
         # Each clip restarts at step 0, so a bound attention schedule applies to each clip's sequence and is
         # checked against it here, per clip. None without a schedule, so unscheduled runs publish no total.
         total_steps = begin_scheduled_denoise(len(timesteps))
-        with self.progress_bar(total=len(timesteps)) as pbar:
+        with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
                 self.record_denoise_step(step_idx, t, total_steps=total_steps)
@@ -1123,10 +1127,6 @@ class Wan22S2VPipeline(
 
                 pbar.update()
 
-        if total_steps is not None:
-            # Work between clips and after the last one, such as audio encoding and VAE decode, runs outside
-            # the denoise schedule.
-            self.record_denoise_step(None)
         self._current_timestep = None
         return latents
 

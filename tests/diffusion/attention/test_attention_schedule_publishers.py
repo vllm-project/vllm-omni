@@ -12,6 +12,7 @@ from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, Inval
 from vllm_omni.diffusion.forward_context import (
     begin_scheduled_denoise,
     bind_attention_schedule,
+    clear_scheduled_denoise_step_on_exit,
     get_attention_schedule_profile,
     get_forward_context,
     is_forward_context_available,
@@ -68,6 +69,30 @@ def test_begin_scheduled_denoise_rejects_a_requested_bounded_range_past_the_actu
 
     assert isinstance(excinfo.value, OmniClientError)
     assert client_error_metadata(excinfo.value) == (400, "invalid_attention_schedule")
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["exit", "exception"])
+@pytest.mark.parametrize("scheduled", [False, True], ids=["unscheduled", "scheduled"])
+def test_clear_scheduled_denoise_step_on_exit_clears_only_a_scheduled_loop(scheduled, fail):
+    with set_forward_context(), bind_attention_schedule(_ranges((0, None, "sparse")) if scheduled else None):
+        ctx = get_forward_context()
+        total_steps = begin_scheduled_denoise(4)
+        raises = pytest.raises(RuntimeError, match="forward failed") if fail else nullcontext()
+        with raises:
+            with clear_scheduled_denoise_step_on_exit(total_steps):
+                set_forward_context_denoise_step_idx(2)
+                set_forward_context_denoise_timestep(0.5)
+                set_forward_context_denoise_total_steps(total_steps)
+                if fail:
+                    raise RuntimeError("forward failed")
+        # An unscheduled loop keeps what it left, as before; the timestep is never cleared.
+        assert _progress(ctx) == ((None, 0.5, None) if scheduled else (2, 0.5, None))
+
+
+def test_clear_scheduled_denoise_step_on_exit_without_a_context_is_a_no_op():
+    assert is_forward_context_available() is False
+    with clear_scheduled_denoise_step_on_exit(3):
+        pass
 
 
 class _RecordingPagedRuntime:
