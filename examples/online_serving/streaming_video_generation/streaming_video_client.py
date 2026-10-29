@@ -27,6 +27,7 @@ from typing import Any
 
 import av
 from camera_utils import wasd_to_camera_payload
+from websockets.exceptions import ConnectionClosed
 
 try:
     from websockets.asyncio.client import connect  # pyright: ignore[reportMissingImports]
@@ -317,6 +318,16 @@ def save_video(
     )
 
 
+async def _send_heartbeats(websocket: Any, send_lock: asyncio.Lock) -> None:
+    while True:
+        await asyncio.sleep(10)
+        try:
+            async with send_lock:
+                await websocket.send(json.dumps({"type": "session.ping"}))
+        except ConnectionClosed:
+            return
+
+
 async def stream_video(args: argparse.Namespace) -> None:
     payload = build_session_start(args)
     output_path = Path(args.output)
@@ -331,11 +342,13 @@ async def stream_video(args: argparse.Namespace) -> None:
     send_lock = asyncio.Lock()
     prompt_update_task: asyncio.Task[None] | None = None
     camera_update_task: asyncio.Task[None] | None = None
+    heartbeat_task: asyncio.Task[None] | None = None
     pending_chunk_metadata: dict[str, Any] | None = None
 
     try:
         async with connect(url, max_size=None) as websocket:
             ws = websocket
+            heartbeat_task = asyncio.create_task(_send_heartbeats(websocket, send_lock))
             async with send_lock:
                 await websocket.send(json.dumps(payload))
             print(f"Connected: {url}")
@@ -432,6 +445,10 @@ async def stream_video(args: argparse.Namespace) -> None:
                 pass
         raise
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
         if prompt_update_task is not None:
             prompt_update_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

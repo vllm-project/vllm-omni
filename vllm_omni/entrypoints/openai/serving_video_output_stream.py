@@ -859,13 +859,13 @@ class OmniStreamingVideoOutputHandler:
                     chunk = encoder.encode(video)
                     if max_output_bytes is not None and len(chunk or b"") > max_output_bytes:
                         raise ValueError("encoded streaming chunk exceeds streaming_pacing.max_output_bytes")
-                    if chunk:
+                    if chunk or self._num_video_frames(video) == 0:
                         yield (
-                            chunk,
+                            chunk or b"",
                             self._build_chunk_metadata(
                                 request_id=request_id,
                                 kind="media",
-                                byte_length=len(chunk),
+                                byte_length=len(chunk or b""),
                                 num_frames=self._num_video_frames(video),
                                 stream_metadata=self._extract_stream_metadata(result),
                             ),
@@ -895,7 +895,7 @@ class OmniStreamingVideoOutputHandler:
         request: VideoGenerationRequest,
     ) -> tuple[OmniTextPrompt, OmniDiffusionSamplingParams, VideoParams]:
         """Build text-only diffusion inputs for the streaming endpoint."""
-        prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt)
+        prompt = cast(OmniTextPrompt, {"prompt": request.prompt})
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
@@ -1118,6 +1118,11 @@ class OmniStreamingVideoOutputHandler:
             "active_event_ids": stream_metadata.get("active_event_ids", []),
             "completed_event_ids": stream_metadata.get("completed_event_ids", []),
             **{key: stream_metadata[key] for key in ("pacing", "output_chunk_index") if key in stream_metadata},
+            **{
+                key: stream_metadata[key]
+                for key in ("frame_start", "generated_raw_frames", "generated_frames", "withheld_frames")
+                if key in stream_metadata
+            },
             **(
                 {"coalesced_event_ids": stream_metadata["coalesced_event_ids"]}
                 if stream_metadata.get("coalesced_event_ids")
