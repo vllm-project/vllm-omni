@@ -32,6 +32,7 @@ from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentRefineSpec
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -730,6 +731,56 @@ def test_scheduled_request_loop_restarts_progress_for_each_denoise_sequence():
             )
             assert model.progress == [(step, sigmas_video[step], total, "sparse", 1) for step in range(total)]
             assert _denoise_progress(get_forward_context()) == (None, None, None, None)
+
+
+def test_sigma_windows_select_the_latent_refine_pass_by_its_own_tail_sigma():
+    """latent_refine denoises the tail of the main sigma list as a second call that restarts at step 0.
+
+    Each refine step must select its profile from the absolute sigma it publishes, not from its step
+    index and not from a sigma relative to the refine pass's first sigma.
+    """
+    seen = []
+
+    class _SigmaModel(_ProgressRecordingModel):
+        def __call__(self, **kwargs):
+            ctx = get_forward_context()
+            progress = (ctx.denoise_step_idx, ctx.total_denoise_steps, ctx.denoise_sigma)
+            seen.append((*progress, get_attention_schedule_profile()))
+            return super().__call__(**kwargs)
+
+    model = _SigmaModel()
+    branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=24)
+    main_video, main_audio = _sigmas(8, 12.0), _sigmas(8, 3.0)
+    # _build_denoise_inputs slices the refine schedule at this same start index.
+    start = MiniMaxH3LatentRefineSpec(strength=0.5).start_index(len(main_video))
+    tail_video, tail_audio = main_video[start:], main_audio[start:]
+    assert start > 0 and tail_video[0] < 1.0  # the refine pass starts below full noise
+    windows = parse_attention_sigma_schedule(
+        [
+            {"low": 0.0, "high": 0.85, "profile": "low"},
+            {"low": 0.85, "high": 1.0, "profile": "high"},
+        ]
+    )
+    expected_profiles = ["low" if sigma < 0.85 else "high" for sigma in tail_video[:-1]]
+    # Noise relative to the refine pass's first sigma would select differently, so this run tells them apart.
+    assert expected_profiles != ["low" if sigma / tail_video[0] < 0.85 else "high" for sigma in tail_video[:-1]]
+
+    with set_forward_context(), bind_attention_schedule(None, windows):
+        minimax_h3_denoise_loop(
+            model=model,
+            positive=branch,
+            initial_video_rows=video_rows,
+            initial_audio_rows=audio_rows,
+            keyframe_cond_rows=None,
+            sigmas_video=tail_video,
+            sigmas_audio=tail_audio,
+            device=torch.device("cpu"),
+        )
+        assert get_forward_context().denoise_sigma is None
+        assert get_attention_schedule_profile() is None
+
+    total = len(tail_video) - 1
+    assert seen == [(step, total, pytest.approx(tail_video[step]), expected_profiles[step]) for step in range(total)]
 
 
 @pytest.mark.parametrize("batch_frames", [1, 33])
