@@ -942,6 +942,26 @@ def test_scheduled_step_batch_runs_serially_unless_one_packable_profile(schedule
     assert [entry[-1] for entry in model.progress] == [1, 1]
 
 
+@pytest.mark.parametrize(
+    ("schedule", "packed"),
+    [
+        ((AttentionScheduleRange(0, None, "sparse"),), True),
+        ((AttentionScheduleRange(0, 1, "sparse"), AttentionScheduleRange(1, None, "dense")), False),
+    ],
+)
+def test_packed_gate_sees_the_profile_selected_for_the_published_step(schedule, packed):
+    """The gate runs after the step's progress is published, so it reads the step's profile, not the baseline."""
+    model = _ProgressRecordingModel()
+    states = _same_progress_states(model, [schedule, schedule])
+    pipeline = _step_pipeline(model)
+    pipeline._packed_batch_supported = lambda transformer: get_attention_schedule_profile() == "sparse"
+    with set_forward_context(), bind_attention_schedule(schedule):
+        pipeline.denoise_step(InputBatch.make_batch(states), states=states)
+
+    profile = "sparse" if packed else "dense"
+    assert [(entry[3], entry[-1]) for entry in model.progress] == ([(profile, 2)] if packed else [(profile, 1)] * 2)
+
+
 def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
 
