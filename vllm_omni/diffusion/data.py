@@ -1313,6 +1313,17 @@ class OmniDiffusionConfig:
             self.omni_kv_config = dict(self.omni_kv_config)
         else:
             raise TypeError("omni_kv_config must be a mapping")
+        if self.stage_input_payload_keys and self.omni_kv_config.get("connector_config"):
+            from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+
+            connector_name = self.omni_kv_config["connector_config"].get("type", "SharedMemoryConnector")
+            if not OmniConnectorFactory.supports_deadline_receive(connector_name):
+                raise ValueError(
+                    f"Stage {self.stage_id}: connector {connector_name!r} does not support "
+                    "get_with_deadline() required for diffusion stage payload input. "
+                    "Use SharedMemoryConnector for processes sharing host memory, "
+                    "or NixlConnector for network transfers."
+                )
         if self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and self.omni_kv_config.get(
             "need_recv_cache", False
         ):

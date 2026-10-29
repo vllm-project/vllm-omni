@@ -98,6 +98,31 @@ An unsupported backend must implement this capability before being used for
 synchronous remote-only payloads. Existing asynchronous `get()` users are
 unchanged.
 
+### Connector support at startup
+
+When a diffusion stage declares `stage_input_payload_keys` and has a resolved
+`omni_kv_config.connector_config`, `OmniDiffusionConfig` rejects connectors that
+do not declare deadline-aware receive support. This applies to both regular and
+headless stage startup, before the diffusion worker is launched. The error names
+the stage and connector, rather than failing the first generation request.
+
+| Connector | Synchronous diffusion payload receive |
+| --- | --- |
+| `SharedMemoryConnector` | Supported between processes sharing host memory |
+| `NixlConnector` | Supported, including network transfers |
+| `MooncakeStoreConnector` / `MooncakeConnector` | Not supported |
+| `MooncakeTransferEngineConnector` | Not supported |
+| `MoriTransferEngineConnector` | Not supported |
+| `YuanrongConnector` / `YuanrongTransferEngineConnector` | Not supported |
+
+Custom connectors that implement `get_with_deadline()` must register with
+`OmniConnectorFactory.register_connector(..., supports_deadline_receive=True)`.
+Capability inspection does not construct a connector or load its native backend.
+Stages without payload input keys, including existing asynchronous AR `get()`
+users, are unaffected. Inline payload configurations without a connector are
+also unaffected. This support matrix concerns stage payloads, not native KV
+transfer or all uses of the listed connectors.
+
 The deadline covers retry sleeps, metadata socket waits, and NIXL completion
 polling. It is **not a hard real-time bound** on Python execution, allocation,
 serialization, individual native driver calls, device copies, or payload-group
