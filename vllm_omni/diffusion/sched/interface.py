@@ -94,8 +94,9 @@ class StepBatchSamplingParamsKey:
     # separate batches so the worker can activate exactly one adapter per step.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
-    # Same resolved request schedule as the request-batch key.
+    # Same resolved request schedule and source as the request-batch key.
     attention_schedule: AttentionSchedule = ()
+    attention_schedule_explicit: bool = False
 
 
 @dataclass(frozen=True, eq=True)
@@ -163,8 +164,11 @@ class RequestBatchSamplingParamsKey:
     lora_scale: float = 1.0
 
     # Request schedule resolved against the service default; () runs the baseline. Different ranges
-    # must not share a batch, while an inherited default and the same ranges sent explicitly do.
+    # must not share a batch.
     attention_schedule: AttentionSchedule = ()
+    # Whether the request sent its schedule. An explicit schedule is checked against the step count and
+    # an inherited default is not, so the two never share a batch even when their ranges are equal.
+    attention_schedule_explicit: bool = False
 
 
 @dataclass

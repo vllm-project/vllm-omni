@@ -26,7 +26,14 @@ if TYPE_CHECKING:
 # must be resolved separately from the bulk lookup.
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     field.name for field in fields(RequestBatchSamplingParamsKey)
-) - {"attention_schedule", "condition_key", "flow_shift", "lora_int_id", "sample_solver"}
+) - {
+    "attention_schedule",
+    "attention_schedule_explicit",
+    "condition_key",
+    "flow_shift",
+    "lora_int_id",
+    "sample_solver",
+}
 
 
 def _normalize_explicit_sample_solver(value: object | None) -> str | None:
@@ -49,8 +56,8 @@ def build_request_batch_sampling_params_key(
     """Build the compatibility key shared by scheduling and DP dispatch.
 
     ``attention_schedule_config`` is the service's ``diffusion_attention_schedule``. The key carries
-    the request's resolved schedule, so a request that inherits the default and one that sends the
-    same ranges explicitly share a batch.
+    the request's resolved schedule and whether the request sent it, so a request that inherits the
+    default and one that sends the same ranges explicitly stay in separate batches.
     """
     sampling = request.sampling_params
     # LoRA identity is optional on sampling params (and on test stubs).
@@ -65,6 +72,7 @@ def build_request_batch_sampling_params_key(
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
     key_kwargs["attention_schedule"] = resolve_request_attention_schedule(sampling, attention_schedule_config)
+    key_kwargs["attention_schedule_explicit"] = sampling.attention_schedule is not None
     return RequestBatchSamplingParamsKey(**key_kwargs)
 
 
