@@ -117,8 +117,9 @@ per request. Cache refresh, homogeneous LoRA activation, and
 `RequestBatchSamplingParamsKey` contains fields that affect the tensor contract,
 including shape, guidance, output count, and LoRA identity. Only compatible
 requests can share a fused forward call. The key also holds the request's
-normalized `attention_schedule`, because the runner binds one schedule per
-batch: an omitted schedule, `[]` and explicit ranges are distinct keys.
+`attention_schedule` resolved against the service default, because the runner
+binds one schedule per batch: an omitted schedule and the same ranges sent
+explicitly share a key, while `[]` and different ranges do not.
 
 Admission is FIFO and conservative. An incompatible request at the front of the
 waiting queue can prevent later compatible requests from joining the current
