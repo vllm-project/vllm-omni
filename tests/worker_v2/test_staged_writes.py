@@ -263,3 +263,14 @@ def test_nested_runner_contexts_keep_pending_writes_isolated():
     assert not a.pending and not b.pending and staged_writes._active.get() is None
     assert ta.gpu.cpu().tolist() == [[31, 32]]
     assert tb.gpu.cpu().tolist() == [[21, 22]]
+
+
+@pytest.mark.cpu
+def test_high_half_device_addresses_keep_their_bits():
+    # Intel GPU (USM) device pointers live above 2**63; the int64 meta rows must
+    # still carry the exact address (plus row offsets) for the pointer cast.
+    from vllm_omni.worker_v2.staged_writes import _as_int64_address
+
+    for ptr in (0x1000, (1 << 63) - 64, 1 << 63, 0xFF00_0000_1234_5000):
+        meta = _as_int64_address(ptr) + np.array([0, 16, 4096], dtype=np.int64)
+        assert [int(v) for v in meta.view(np.uint64)] == [ptr, ptr + 16, ptr + 4096]
