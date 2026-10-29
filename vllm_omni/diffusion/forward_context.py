@@ -495,6 +495,21 @@ def set_forward_context_denoise_sigma(sigma: float | None) -> None:
         _forward_context.denoise_sigma = None if sigma is None else normalized_sigma(sigma)
 
 
+def check_scheduler_sigmas(scheduler: object, num_steps: int, *, sigma_scheduled: bool | None = None) -> None:
+    """Normalize the sigma of each of the first ``num_steps`` steps once, right after set_timesteps.
+
+    Sigma windows read these sigmas at every step. Checking them before the first forward fails
+    only this request, with the client error the step would raise, instead of a later forward
+    that can be shared with other requests. ``sigma_scheduled`` defaults to whether sigma windows
+    are bound; a caller outside the forward context passes the request's own answer.
+    """
+    if sigma_scheduled is None:
+        sigma_scheduled = _forward_context is not None and bool(_forward_context.attention_sigma_schedule)
+    if sigma_scheduled:
+        for step_idx in range(num_steps):
+            DenoiseProgressMixin._denoise_sigma(step_idx, scheduler, None)
+
+
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:
     """Set the normalized (descending, 1 -> 0) denoise timestep.
 
@@ -561,7 +576,8 @@ class DenoiseProgressMixin:
             return normalized_sigma(float(sigmas[step_idx]), float(sigmas[0]))
         except ValueError as exc:
             # Wan2.2 T2V, TI2V and I2V build these sigmas from the request's flow_shift, so sigmas that
-            # cannot be normalized into [0, 1] are a client error.
+            # cannot be normalized into [0, 1] are a client error. Pipelines raise it before their first
+            # forward through check_scheduler_sigmas; this repeats the check for any other caller.
             raise InvalidAttentionScheduleError(
                 "attention sigma windows cannot select a profile from this request's scheduler sigmas; "
                 f"check flow_shift: {exc}"

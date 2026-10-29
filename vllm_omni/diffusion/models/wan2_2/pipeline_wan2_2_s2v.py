@@ -31,6 +31,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
+    check_scheduler_sigmas,
     clear_scheduled_denoise_step_on_exit,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -1412,6 +1413,8 @@ class Wan22S2VPipeline(
                 self.scheduler.set_timesteps(num_steps, device=device, shift=self._flow_shift)
                 timesteps = self.scheduler.timesteps
                 self._num_timesteps = len(timesteps)
+                # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
+                check_scheduler_sigmas(self.scheduler, len(timesteps))
 
                 # -- Slice audio for this clip --
                 left_idx = r * infer_frames

@@ -28,6 +28,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
+    check_scheduler_sigmas,
     clear_scheduled_denoise_step_on_exit,
     get_forward_context,
     is_forward_context_available,
@@ -1395,6 +1396,8 @@ class Wan22Pipeline(
             else:
                 self.scheduler.set_timesteps(num_steps, device=device)
             timesteps = self.scheduler.timesteps
+            # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
+            check_scheduler_sigmas(self.scheduler, len(timesteps))
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:

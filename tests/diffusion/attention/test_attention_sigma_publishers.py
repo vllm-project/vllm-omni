@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.diffusion.attention.schedule import (
+    InvalidAttentionScheduleError,
     normalized_sigma,
     parse_attention_sigma_schedule,
 )
@@ -15,6 +16,7 @@ from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
     bind_attention_schedule,
+    check_scheduler_sigmas,
     get_attention_schedule_profile,
     get_forward_context,
     request_denoise_progress,
@@ -87,6 +89,23 @@ def test_request_progress_restores_sigma_on_exception():
                 raise RuntimeError("cancelled")
         assert ctx.denoise_sigma == 0.9
         assert get_attention_schedule_profile() is None
+
+
+def test_scheduler_sigma_check_covers_the_steps_that_run_and_only_under_sigma_windows():
+    """Pipelines call this right after set_timesteps, so unusable sigmas fail before the first forward."""
+    unusable_last = SimpleNamespace(sigmas=[1.0, 0.5, 1.5])
+    with set_forward_context():
+        check_scheduler_sigmas(unusable_last, 3)  # nothing reads sigmas without bound windows
+    with set_forward_context(), bind_attention_schedule(None, _ALL):
+        check_scheduler_sigmas(unusable_last, 2)  # a trailing sigma no step reads is not checked
+        check_scheduler_sigmas(SimpleNamespace(), 3)  # no sigmas: the attention layer rejects the step
+        with pytest.raises(InvalidAttentionScheduleError, match="check flow_shift"):
+            check_scheduler_sigmas(unusable_last, 3)
+        assert get_forward_context().denoise_sigma is None  # the check publishes nothing
+    # Outside the forward context, as in step-mode prepare_encode, the caller says whether windows apply.
+    check_scheduler_sigmas(unusable_last, 3, sigma_scheduled=False)
+    with pytest.raises(InvalidAttentionScheduleError, match="check flow_shift"):
+        check_scheduler_sigmas(SimpleNamespace(sigmas=[float("nan"), 0.5, 0.0]), 1, sigma_scheduled=True)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])

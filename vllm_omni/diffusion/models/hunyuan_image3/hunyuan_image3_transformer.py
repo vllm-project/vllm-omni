@@ -78,6 +78,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     begin_scheduled_denoise,
+    check_scheduler_sigmas,
     get_forward_context,
     get_paged_kv_computed_tokens,
     is_forward_context_available,
@@ -3249,6 +3250,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # Check a bound schedule against the sequence this call runs, before any forward below, including
         # the AR-reuse prefill. None when no schedule is bound, which keeps the step-only publish.
         scheduled_total = begin_scheduled_denoise(len(timesteps))
+        # Bound sigma windows read these scheduler sigmas at every step; reject unusable ones here too.
+        check_scheduler_sigmas(self.scheduler, len(timesteps))
 
         # Prepare latent variables
         latents = self.prepare_latents(
