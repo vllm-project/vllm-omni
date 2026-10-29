@@ -159,8 +159,9 @@ errors on the job record rather than the creation response.
   the compiled DiT blocks do not trace the selection.
 
 Each attention layer prepares its own implementation for every distinct
-profile; a profile identical to the base reuses the base implementation.
-A FlashInfer profile therefore adds a 128 MiB workspace per layer,
+profile. A profile identical to the base reuses the base implementation,
+unless the profile carries its own calibration, including one propagated
+from the checkpoint's `sparse_attention_config`. A FlashInfer profile therefore adds a 128 MiB workspace per layer,
 unless FlashInfer runs its cute-dsl backend (the automatic choice on
 Blackwell).
 
