@@ -122,10 +122,12 @@ schedule request handling.
 
 ## Batching and errors
 
-Requests co-batch only with equal normalized request schedules after stage
-defaults. Omitted schedules and explicit server-equivalent ranges remain
-distinct batch keys. Scheduled H3 step batches run one transformer forward
-per request so each uses its own progress.
+Requests co-batch only with equal schedules after resolving stage defaults,
+so an omitted schedule and the same ranges sent explicitly share a batch.
+A scheduled H3 step batch keeps one packed transformer forward when every
+request is at the same step and sigma and the selected profile's backends
+isolate packed requests; otherwise it runs one forward per request so each
+uses its own progress.
 
 Malformed or unknown-profile schedules return HTTP 400 before dispatch.
 A bounded range in the request's own schedule that ends after the sequence
@@ -152,9 +154,13 @@ errors on the job record rather than the creation response.
   precision at startup, because warm-up runs only the base.
 - TRTLLM `target_sparsity` needs a per-layer calibration curve unless the
   layer is explicitly ignored.
+- Regional `torch.compile` stays enabled: H3 selects the profile and runs
+  attention inside its eager `torch.compiler.disable` attention region, so
+  the compiled DiT blocks do not trace the selection.
 
 Each attention layer prepares its own implementation for every distinct
-profile. A FlashInfer profile therefore adds a 128 MiB workspace per layer,
+profile; a profile identical to the base reuses the base implementation.
+A FlashInfer profile therefore adds a 128 MiB workspace per layer,
 unless FlashInfer runs its cute-dsl backend (the automatic choice on
 Blackwell).
 
