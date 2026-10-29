@@ -298,6 +298,11 @@ def _attention_schedule_service() -> AttentionScheduleConfig:
     )
 
 
+def _configure_attention_schedule_service(scheduler: BaseScheduler) -> None:
+    """The key resolves request schedules against the service, so configure one without a full initialize."""
+    scheduler.od_config = OmniDiffusionConfig(diffusion_attention_schedule=_attention_schedule_service())
+
+
 def _make_scheduled_request(req_id: str, schedule: object) -> OmniDiffusionRequest:
     """Assign after construction, so the key builder has to normalize the raw value itself."""
     sp = OmniDiffusionSamplingParams(num_inference_steps=2)
@@ -306,7 +311,9 @@ def _make_scheduled_request(req_id: str, schedule: object) -> OmniDiffusionReque
 
 
 # Two request schedules, and whether their requests may share a batch. None
-# inherits the service default and [] disables it, so those two stay apart.
+# inherits the service default ([0, 1) -> sparse) and [] disables it, so those
+# two stay apart, while an inherited default and the same ranges sent
+# explicitly resolve to one schedule and share a batch.
 _ATTENTION_SCHEDULE_KEY_CASES = [
     pytest.param(
         [{"start": 0, "end": 2, "profile": "sparse"}],
@@ -322,6 +329,7 @@ _ATTENTION_SCHEDULE_KEY_CASES = [
     ),
     pytest.param(None, [], False, id="inherit-and-disable"),
     pytest.param(None, None, True, id="both-inherit"),
+    pytest.param(None, [{"start": 0, "end": 1, "profile": "sparse"}], True, id="inherit-and-explicit-default"),
 ]
 
 
@@ -382,6 +390,7 @@ class TestGetStepBatchSamplingParamsKey:
     @pytest.mark.parametrize(("first", "second", "same_batch"), _ATTENTION_SCHEDULE_KEY_CASES)
     def test_attention_schedule_identity(self, first, second, same_batch) -> None:
         scheduler = _ConcreteScheduler()
+        _configure_attention_schedule_service(scheduler)
         first_key = scheduler._build_sampling_params_key(_make_scheduled_request("a", first))
         second_key = scheduler._build_sampling_params_key(_make_scheduled_request("b", second))
 
@@ -501,6 +510,7 @@ class TestGetRequestBatchSamplingParamsKey:
     @pytest.mark.parametrize(("first", "second", "same_batch"), _ATTENTION_SCHEDULE_KEY_CASES)
     def test_attention_schedule_identity(self, first, second, same_batch) -> None:
         scheduler = RequestScheduler()
+        _configure_attention_schedule_service(scheduler)
         first_key = scheduler._build_sampling_params_key(_make_scheduled_request("a", first))
         second_key = scheduler._build_sampling_params_key(_make_scheduled_request("b", second))
 

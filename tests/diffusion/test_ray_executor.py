@@ -486,7 +486,7 @@ def _make_request_executor(monkeypatch, prompts, component="text_encoder", allga
             "layer_options": {component: {"weight_transfer": "allgather" if allgather else "rank-local"}},
         },
     )
-    monkeypatch.setattr(ray_module, "build_request_batch_sampling_params_key", lambda req: ())
+    monkeypatch.setattr(ray_module, "build_request_batch_sampling_params_key", lambda req, config=None: ())
     requests = []
     for index, prompt in enumerate(prompts):
         request_id = str(index)
