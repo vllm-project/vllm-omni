@@ -48,9 +48,31 @@ MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
 MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp"})
 
+# Deployment-side reference-image budget. Leave unset to preserve the current
+# behavior (reference resolution is kept and only rounded to the 32-pixel grid);
+# a set value caps the short edge and only scales down.
+MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV = "VLLM_OMNI_MINIMAX_H3_REF_SHORT_EDGE"
+
 
 def _align_multiple(value: float, multiple: int = 32) -> int:
     return max(multiple, int(round(float(value) / multiple)) * multiple)
+
+
+def _reference_image_short_edge() -> int | None:
+    """Deployment reference-image short-edge cap, or ``None`` to preserve.
+
+    Unset keeps the reference resolution. A value below the 32-pixel alignment
+    or an unparsable value also falls back to preserve, so a typo cannot
+    silently change the vision-token count.
+    """
+    raw = os.environ.get(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, "")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE else None
 
 
 def load_minimax_h3_images(value: Any) -> list[Image.Image]:
@@ -145,6 +167,10 @@ def resolve_minimax_h3_reference_image_shape(
     ``max_area`` scales the reference down, keeping its aspect ratio, so its
     pixel area does not exceed the output canvas. Timeline-guided requests use
     it because their references ride through every step next to the guides.
+
+    ``VLLM_OMNI_MINIMAX_H3_REF_SHORT_EDGE`` additionally caps the short edge
+    (for example at the target video's short edge), cutting the vision-token
+    count. The cap only scales down; a small reference is never enlarged.
     """
     width, height = image.size
     ratio = width / height
@@ -152,7 +178,13 @@ def resolve_minimax_h3_reference_image_shape(
         raise OmniClientError(f"reference image aspect ratio must be in [0.4, 2.5], got {width}x{height}")
     if min(width, height) < 256 or max(width, height) > 5760:
         raise OmniClientError(f"reference image dimensions must be in [256, 5760] pixels, got {width}x{height}")
-    scale = 1.0 if max_area is None else min(1.0, math.sqrt(max_area / (width * height)))
+    scales = [1.0]
+    if max_area is not None:
+        scales.append(math.sqrt(max_area / (width * height)))
+    short_edge = _reference_image_short_edge()
+    if short_edge is not None:
+        scales.append(short_edge / min(width, height))
+    scale = min(scales)
     return (
         _align_multiple(width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),
         _align_multiple(height * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE),

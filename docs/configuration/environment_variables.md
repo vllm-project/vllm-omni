@@ -140,6 +140,17 @@ settings.
 Omni-owned variable, even though vLLM-Omni supplies a persistent default when
 it is unset.
 
+### MiniMax-H3 reference geometry
+
+Reference images keep their resolution by default (rounded to the 32-pixel
+grid, and scaled down only when a timeline-guided request's `max_area` cap
+applies). A deployment can add a stricter short-edge cap to bound the
+vision-token count.
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_MINIMAX_H3_REF_SHORT_EDGE` | Integer `>= 32`; unset preserves the reference resolution | MiniMax-H3 reference-image normalization; read when a reference image is resized | Environment-only. Unset, unparsable, or a value below 32 preserves the current behavior. When set, the reference short edge is capped to this value; the cap only scales down, so a smaller reference is never enlarged. Setting it to the target video's short edge makes the reference and target short edges match. When a timeline-guided `max_area` also applies, the smaller scale wins. | Experimental performance control |
+
 ### Torch compilation
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |

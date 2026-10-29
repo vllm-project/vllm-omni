@@ -1721,6 +1721,32 @@ def test_reference_image_resize_rejects_invalid_input():
         resolve_minimax_h3_reference_image_shape(Image.new("RGB", (128, 128)))
 
 
+def test_reference_image_short_edge_cap(monkeypatch):
+    from PIL import Image
+
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV,
+        resolve_minimax_h3_reference_image_shape,
+    )
+
+    image = Image.new("RGB", (2048, 4096))
+    monkeypatch.delenv(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, raising=False)
+    assert resolve_minimax_h3_reference_image_shape(image) == (2048, 4096)
+
+    monkeypatch.setenv(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, "480")
+    assert resolve_minimax_h3_reference_image_shape(image) == (480, 960)
+    # The cap only scales down; a small reference is never enlarged.
+    assert resolve_minimax_h3_reference_image_shape(Image.new("RGB", (640, 384))) == (640, 384)
+    # max_area still applies, and the smaller of the two scales wins.
+    assert resolve_minimax_h3_reference_image_shape(image, max_area=768 * 1344) == (480, 960)
+    monkeypatch.delenv(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, raising=False)
+    assert resolve_minimax_h3_reference_image_shape(image, max_area=768 * 768) == (544, 1088)
+
+    for invalid in ("16", "abc", ""):
+        monkeypatch.setenv(MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE_ENV, invalid)
+        assert resolve_minimax_h3_reference_image_shape(image) == (2048, 4096)
+
+
 def test_fl2va_supports_first_last_and_explicit_frame_index_contracts():
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
         _resolve_fl2va_keyframe_indices,
