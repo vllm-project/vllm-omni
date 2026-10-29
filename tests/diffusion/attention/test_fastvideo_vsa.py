@@ -39,6 +39,9 @@ def test_auto_keeps_wan_tile256_on_fastvideo(monkeypatch):
 
 
 def test_fastvideo_vsa_reports_missing_optional_kernel(monkeypatch):
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.attention.backends.fastvideo_vsa.current_omni_platform.is_npu", lambda: False
+    )
     monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
     with pytest.raises(ImportError, match="fastvideo-kernel"):
         FastVideoVSABackend.validate_available()
