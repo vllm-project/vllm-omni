@@ -94,7 +94,7 @@ def dynamic_rope_update(rope_forward: Callable) -> Callable:
 
 def _compute_default_rope_parameters(
     config: PretrainedConfig | None = None,
-    device: "torch.device" | None = None,
+    device: "torch.device | None" = None,
     seq_len: int | None = None,
     **rope_kwargs,
 ) -> tuple["torch.Tensor", float]:
@@ -136,7 +136,7 @@ def _compute_default_rope_parameters(
 
 def _compute_linear_scaling_rope_parameters(
     config: PretrainedConfig | None = None,
-    device: "torch.device" | None = None,
+    device: "torch.device | None" = None,
     seq_len: int | None = None,
     **rope_kwargs,
 ) -> tuple["torch.Tensor", float]:
@@ -177,7 +177,7 @@ def _compute_linear_scaling_rope_parameters(
 
 def _compute_dynamic_ntk_parameters(
     config: PretrainedConfig | None = None,
-    device: "torch.device" | None = None,
+    device: "torch.device | None" = None,
     seq_len: int | None = None,
     **rope_kwargs,
 ) -> tuple["torch.Tensor", float]:
