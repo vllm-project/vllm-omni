@@ -170,8 +170,9 @@ Finally, we look up the output hidden states/multimodal tensors corresponding to
 
 ### Diffusion KV Prefix Caching
 
-HunyuanImage3's standalone DiT pipeline can reuse stable text/reference-image KV
-across requests. Enable it on the diffusion stage in the deploy config:
+HunyuanImage3's standalone DiT pipeline and Qwen-Image 2.1 (`QwenImage21Pipeline`)
+can reuse stable text/reference-image KV across requests. Enable it on the
+diffusion stage in the deploy config:
 
 ```yaml
 pipeline: hunyuan_image3_dit

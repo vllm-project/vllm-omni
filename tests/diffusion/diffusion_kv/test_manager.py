@@ -39,6 +39,8 @@ def _request(
     seq_len: int = 8,
     cache_token_ids=(),
     mm_features=(),
+    atomic_cache_spans=(),
+    cache_dependencies=(),
     kv_contexts=(),
 ) -> DiffusionKVRequest:
     return DiffusionKVRequest(
@@ -49,6 +51,8 @@ def _request(
         seq_len=seq_len,
         cache_token_ids=cache_token_ids,
         mm_features=mm_features,
+        atomic_cache_spans=atomic_cache_spans,
+        cache_dependencies=cache_dependencies,
         kv_contexts=kv_contexts,
     )
 
@@ -58,12 +62,13 @@ def _manager(
     *,
     max_model_len: int = 64,
     enable_prefix_caching: bool = False,
+    cache_granularity: int = BLOCK_SIZE,
 ) -> DiffusionKVCacheManager:
     return DiffusionKVCacheManager(
         _config(num_blocks),
         max_model_len=max_model_len,
         scheduler_block_size=BLOCK_SIZE,
-        hash_block_size=BLOCK_SIZE,
+        hash_block_size=cache_granularity,
         enable_prefix_caching=enable_prefix_caching,
     )
 
@@ -119,6 +124,108 @@ def test_warm_hit_fits_at_the_same_capacity_as_the_cold_request() -> None:
     assert metadata.sequences[0].cached_prefix_len == 4
 
 
+@pytest.mark.parametrize("num_rows", [1, 2])
+def test_lru_evicts_many_distinct_prefixes_without_exhausting_pool(num_rows: int) -> None:
+    blocks_per_row = 4
+    manager = _manager(num_rows * blocks_per_row + 1, enable_prefix_caching=True)
+    free_capacity = manager.native_manager.block_pool.get_num_free_blocks()
+
+    for generation in range(128):
+        public_id = f"request-{generation}"
+        rows = tuple(
+            _request(
+                public_id,
+                sequence_id,
+                prefix_len=12,
+                seq_len=16,
+                cache_token_ids=tuple(generation * 10_000 + sequence_id * 100 + token for token in range(12)),
+            )
+            for sequence_id in range(num_rows)
+        )
+        metadata = manager.reserve_request(public_id, rows)
+        assert metadata is not None
+        assert all(sequence.cached_prefix_len == 0 for sequence in metadata.sequences)
+        manager.publish_request(public_id)
+        manager.free_request(public_id)
+
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_capacity
+        assert manager._cow_retained_blocks == {}
+        assert (
+            len(manager.native_manager.block_pool.cached_block_hashes_by_block)
+            <= manager.native_manager.block_pool.num_gpu_blocks
+        )
+
+
+def test_lru_reclaims_partial_cow_aliases_and_retained_blocks() -> None:
+    # Native caching reserves one null block; six configured blocks leave the
+    # five physical blocks required by four request pages plus one COW source.
+    manager = _manager(6, enable_prefix_caching=True, cache_granularity=1)
+    free_capacity = manager.native_manager.block_pool.get_num_free_blocks()
+
+    cold = _request(
+        "cold",
+        0,
+        prefix_len=12,
+        seq_len=16,
+        cache_token_ids=range(12),
+        atomic_cache_spans=((1, 5), (7, 11)),
+        cache_dependencies=((1, "image-1"), (7, "image-2-0")),
+    )
+    assert manager.reserve_request("cold", (cold,)) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    for generation in range(1, 128):
+        public_id = f"changed-{generation}"
+        changed = _request(
+            public_id,
+            0,
+            prefix_len=12,
+            seq_len=16,
+            cache_token_ids=range(12),
+            atomic_cache_spans=((1, 5), (7, 11)),
+            cache_dependencies=((1, "image-1"), (7, f"image-2-{generation}")),
+        )
+        metadata = manager.reserve_request(public_id, (changed,))
+        assert metadata is not None
+        assert metadata.sequences[0].cached_prefix_len == 7
+        assert len(metadata.block_copies) == 1
+        manager.complete_block_copies(public_id)
+        manager.publish_request(public_id)
+        manager.free_request(public_id)
+
+        assert manager.native_manager.block_pool.get_num_free_blocks() == free_capacity
+        assert manager._cow_retained_blocks == {}
+        assert all(
+            cache_manager.new_block_ids == []
+            for cache_manager in manager.native_manager.coordinator.single_type_managers
+        )
+        cached_hash_count = sum(
+            len(hashes) for hashes in manager.native_manager.block_pool.cached_block_hashes_by_block.values()
+        )
+        assert cached_hash_count <= manager.native_manager.block_pool.num_gpu_blocks * 5
+
+    # Abort/free before Worker completion must also release both retained COW
+    # endpoints instead of permanently pinning pages.
+    aborted = _request(
+        "aborted",
+        0,
+        prefix_len=12,
+        seq_len=16,
+        cache_token_ids=range(12),
+        atomic_cache_spans=((1, 5), (7, 11)),
+        cache_dependencies=((1, "image-1"), (7, "image-2-aborted")),
+    )
+    aborted_metadata = manager.reserve_request("aborted", (aborted,))
+    assert aborted_metadata is not None and aborted_metadata.block_copies
+    manager.free_request("aborted")
+    assert manager.native_manager.block_pool.get_num_free_blocks() == free_capacity
+    assert manager._cow_retained_blocks == {}
+    assert all(
+        cache_manager.new_block_ids == [] for cache_manager in manager.native_manager.coordinator.single_type_managers
+    )
+
+
 def test_unpublished_request_does_not_become_a_prefix_hit() -> None:
     manager = _manager(8, enable_prefix_caching=True)
     failed = _request("failed", 0, cache_token_ids=range(4))
@@ -157,6 +264,140 @@ def test_partial_prefix_hit_recomputes_from_the_first_changed_block() -> None:
     assert metadata is not None
     assert metadata.sequences[0].cached_prefix_len == 4
     assert len(metadata.sequences[0].block_ids[0]) == 3
+
+
+def test_atomic_dependency_hit_uses_exact_boundary_with_copy_on_write() -> None:
+    manager = _manager(12, enable_prefix_caching=True, cache_granularity=1)
+    cold = _request(
+        "cold",
+        0,
+        prefix_len=12,
+        seq_len=16,
+        cache_token_ids=range(12),
+        atomic_cache_spans=((1, 5), (7, 11)),
+        cache_dependencies=((1, "image-1"), (7, "image-2-old")),
+    )
+    assert manager.reserve_request("cold", (cold,)) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    warm = _request(
+        "warm",
+        0,
+        prefix_len=12,
+        seq_len=16,
+        cache_token_ids=range(12),
+        atomic_cache_spans=((1, 5), (7, 11)),
+        cache_dependencies=((1, "image-1"), (7, "image-2-new")),
+    )
+    metadata = manager.reserve_request("warm", (warm,))
+
+    assert metadata is not None
+    assert metadata.sequences[0].cached_prefix_len == 7
+    assert len(metadata.block_copies) == 1
+    src_block_id, dst_block_id = metadata.block_copies[0]
+    assert src_block_id != dst_block_id
+    assert metadata.sequences[0].block_ids[0][1] == dst_block_id
+    manager.complete_block_copies("warm")
+    manager.publish_request("warm")
+    manager.free_request("warm")
+
+    for public_id, second_dependency in (("old-again", "image-2-old"), ("new-again", "image-2-new")):
+        repeated = _request(
+            public_id,
+            0,
+            prefix_len=12,
+            seq_len=16,
+            cache_token_ids=range(12),
+            atomic_cache_spans=((1, 5), (7, 11)),
+            cache_dependencies=((1, "image-1"), (7, second_dependency)),
+        )
+        repeated_metadata = manager.reserve_request(public_id, (repeated,))
+        assert repeated_metadata is not None
+        assert repeated_metadata.sequences[0].cached_prefix_len == 12
+        assert repeated_metadata.block_copies == ()
+        manager.free_request(public_id)
+
+
+def test_cfg_rows_clip_partial_hits_before_taking_common_boundary() -> None:
+    manager = _manager(24, enable_prefix_caching=True, cache_granularity=1)
+    for public_id, dependency in (("seed-a", "second-a"), ("seed-b", "second-b")):
+        cold = _request(
+            public_id,
+            0,
+            prefix_len=12,
+            seq_len=16,
+            cache_token_ids=range(12),
+            atomic_cache_spans=((1, 5), (7, 11)),
+            cache_dependencies=((1, "first"), (7, dependency)),
+        )
+        assert manager.reserve_request(public_id, (cold,)) is not None
+        manager.publish_request(public_id)
+        manager.free_request(public_id)
+
+    rows = (
+        _request(
+            "warm",
+            0,
+            prefix_len=12,
+            seq_len=16,
+            cache_token_ids=range(12),
+            atomic_cache_spans=((1, 5), (7, 11)),
+            cache_dependencies=((1, "first"), (7, "second-a")),
+        ),
+        _request(
+            "warm",
+            1,
+            prefix_len=12,
+            seq_len=16,
+            cache_token_ids=range(12),
+            atomic_cache_spans=((1, 5), (7, 11)),
+            cache_dependencies=((1, "first"), (7, "changed")),
+        ),
+    )
+    metadata = manager.reserve_request("warm", rows)
+
+    assert metadata is not None
+    assert [sequence.cached_prefix_len for sequence in metadata.sequences] == [7, 7]
+    assert len(metadata.block_copies) == 2
+
+
+@pytest.mark.parametrize("num_images", [2, 3, 4, 5])
+def test_last_changed_atomic_span_reuses_every_preceding_span(num_images: int) -> None:
+    manager = _manager(24, max_model_len=64, enable_prefix_caching=True, cache_granularity=1)
+    all_spans = ((1, 5), (7, 13), (15, 19), (21, 29), (31, 37))
+    spans = all_spans[:num_images]
+    cold_dependencies = tuple((start, f"image-{idx}") for idx, (start, _) in enumerate(spans))
+    cold = _request(
+        "cold",
+        0,
+        prefix_len=40,
+        target_len=4,
+        seq_len=44,
+        cache_token_ids=range(40),
+        atomic_cache_spans=spans,
+        cache_dependencies=cold_dependencies,
+    )
+    assert manager.reserve_request("cold", (cold,)) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    changed_dependencies = (*cold_dependencies[:-1], (spans[-1][0], "changed-last-image"))
+    warm = _request(
+        "warm",
+        0,
+        prefix_len=40,
+        target_len=4,
+        seq_len=44,
+        cache_token_ids=range(40),
+        atomic_cache_spans=spans,
+        cache_dependencies=changed_dependencies,
+    )
+    metadata = manager.reserve_request("warm", (warm,))
+
+    assert metadata is not None
+    assert metadata.sequences[0].cached_prefix_len == spans[-1][0]
+    assert len(metadata.block_copies) == 1
 
 
 def test_cfg_rows_use_the_minimum_warm_hit_as_one_execution_boundary() -> None:

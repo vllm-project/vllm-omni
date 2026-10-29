@@ -11,10 +11,12 @@ Differences from the 2.0 mixin (``qwen_image/cfg_parallel.py``):
 """
 
 import logging
+from contextlib import contextmanager
 from typing import Any
 
 import torch
 
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.cfg_parallel import (
     CFGParallelMixin,
     _get_cfg_world_size_or_one,
@@ -25,10 +27,50 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
 )
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import QwenImage21KVCache
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _paged_kv_branch_scope(sequence_id: int):
+    if not is_forward_context_available():
+        yield
+        return
+    ctx = get_forward_context()
+    runtime = getattr(ctx, "paged_kv_runtime", None)
+    step_idx = getattr(ctx, "denoise_step_idx", None)
+    if runtime is None or step_idx is None:
+        yield
+        return
+    rows = runtime.metadata.rows_for_step(step_idx)
+    if len(rows) <= 1:
+        yield
+        return
+    branch_rows = tuple(row for row in rows if row.sequence_id == sequence_id)
+    if len(branch_rows) != 1:
+        raise ValueError(f"Expected exactly one paged KV row for sequence_id={sequence_id}, got {branch_rows!r}")
+    runtime._deactivate()
+    batch = runtime.adapter.prepare_batch(branch_rows)
+    with runtime.adapter.activate(batch):
+        yield
+
+
+def _set_denoise_step_idx(step_idx: int | None, *, sequential_cfg: bool = False) -> None:
+    if sequential_cfg and step_idx is not None and is_forward_context_available():
+        ctx = get_forward_context()
+        runtime = getattr(ctx, "paged_kv_runtime", None)
+        if runtime is not None and len(runtime.metadata.rows_for_step(step_idx)) > 1:
+            runtime._deactivate()
+            ctx.denoise_step_idx = step_idx
+            return
+    set_forward_context_denoise_step_idx(step_idx)
 
 
 class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
@@ -65,8 +107,10 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                 positive_noise_pred = tuple(g[0] for g in gathered)
                 negative_noise_pred = tuple(g[1] for g in gathered)
             else:
-                positive_noise_pred = tail_slice(self.predict_noise(**positive_kwargs))
-                negative_noise_pred = tail_slice(self.predict_noise(**negative_kwargs))
+                with _paged_kv_branch_scope(0):
+                    positive_noise_pred = tail_slice(self.predict_noise(**positive_kwargs))
+                with _paged_kv_branch_scope(1):
+                    negative_noise_pred = tail_slice(self.predict_noise(**negative_kwargs))
             return self.combine_cfg_noise(
                 positive_noise_pred,
                 negative_noise_pred,
@@ -125,7 +169,11 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         try:
             # Fresh cache for every generation: the pipeline is a singleton shared
             # across requests, so cache state must never leak between them.
-            cache_enabled = getattr(self.transformer, "causal_condition", False)
+            uses_paged_kv = (
+                getattr(getattr(self, "od_config", None), "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+                is DiffusionKVCacheMode.PAGED_SCHEDULER
+            )
+            cache_enabled = getattr(self.transformer, "causal_condition", False) and not uses_paged_kv
             kv_cache = QwenImage21KVCache({} for _ in self.transformer.transformer_blocks) if cache_enabled else None
             # Prefill is about to clone another prefix. Drop static copies left
             # by finished requests first (#8831). The next request recaptures.
@@ -136,11 +184,13 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
             self.transformer.do_true_cfg = do_true_cfg
             additional_transformer_kwargs = additional_transformer_kwargs or {}
 
+            sequential_cfg = bool(do_true_cfg and _get_cfg_world_size_or_one() == 1)
             with self.progress_bar(total=len(timesteps)) as pbar:
                 for i, t in enumerate(timesteps):
                     if self.interrupt:
                         continue
                     self._current_timestep = t
+                    _set_denoise_step_idx(i, sequential_cfg=sequential_cfg)
 
                     # Broadcast timestep to match batch size
                     timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
@@ -196,4 +246,5 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
 
             return latents
         finally:
+            set_forward_context_denoise_step_idx(None)
             self.transformer.release_request_geometry()

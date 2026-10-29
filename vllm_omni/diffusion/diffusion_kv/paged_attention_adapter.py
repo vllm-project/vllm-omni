@@ -24,7 +24,10 @@ from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     PagedPiecewisePlan,
     build_paged_piecewise_plan,
 )
-from vllm_omni.diffusion.forward_context import override_paged_kv_adapter
+from vllm_omni.diffusion.forward_context import (
+    override_paged_kv_adapter,
+    vllm_batch_invariant_scope,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -364,6 +367,7 @@ class DiffusionPagedAttentionAdapter:
         attn_groups: list[list[Any]],
         layers: Mapping[str, DiffusionPagedAttentionLayerAdapter],
         resolve_row: DiffusionKVRowResolver,
+        batch_invariant: bool = False,
     ) -> None:
         if not layers:
             raise ValueError("Paged attention requires at least one native attention layer")
@@ -379,6 +383,7 @@ class DiffusionPagedAttentionAdapter:
         self.attn_groups = attn_groups
         self.layers = dict(layers)
         self.resolve_row = resolve_row
+        self.batch_invariant = batch_invariant
         self._owner = object()
         self._prepare_generation = 0
         self._active_batch: PreparedDiffusionPagedAttentionBatch | None = None
@@ -478,7 +483,10 @@ class DiffusionPagedAttentionAdapter:
                 dcp_rank=self.block_tables.cp_rank,
                 cp_kv_cache_interleave_size=self.block_tables.cp_interleave,
             )
-        with set_current_vllm_config(self.vllm_config):
+        with (
+            vllm_batch_invariant_scope(self.batch_invariant),
+            set_current_vllm_config(self.vllm_config),
+        ):
             return current_omni_platform.build_diffusion_kv_attn_metadata(
                 attn_groups=self.attn_groups,
                 num_reqs=len(query_lens),

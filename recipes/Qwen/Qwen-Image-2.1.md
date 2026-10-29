@@ -417,18 +417,41 @@ memory-bound long-prompt / multi-image workloads, not a free lunch;
 Note: a quantized prefix cache is not CUDA-graph capturable — requests using
 this option stay on the eager decode path (a warning is logged once).
 
-### Why not the scheduler-managed paged KV (`DiffusionKVCacheMode.PAGED_SCHEDULER`)?
+### Scheduler-managed paged KV and cross-request prefix caching (`DiffusionKVCacheMode.PAGED_SCHEDULER`)
 
-Evaluated and deliberately not adopted (see the `qwen21-p0-kv` commit message
-for the full analysis): the paged scheduler targets *cross-request* KV
-management — a statically sized page pool, block sharing/dedup, and eviction —
-whereas this prefix cache lives exactly as long as one generation and is
-sized once per request. Migrating would require routing decode attention
-through the worker paged adapter (writing fresh target K/V into pages every
-step), per-request page tables, and re-validating the block-causal
-piecewise-span masking and Ulysses/CFG constraints, for no memory benefit over
-the per-request dense tensors. The FP8 storage above captures the actual
-memory win at ~1% of the integration cost.
+In addition to the default per-request dense prefix cache (`dense_legacy`),
+`QwenImage21Pipeline` supports Scheduler-managed paged KV (`diffusion_kv_mode="paged_scheduler"`)
+with cross-request prefix caching (`enable_prefix_caching=True`). Because reference
+images precede the edit instruction in the block-causal sequence and modulate from
+`t = 0`, repeated requests that share leading reference images reuse their cached
+KV pages across requests, slice the Step-0 prefill query to the uncached suffix,
+and skip redundant condition-image `vae.encode` (and `encode_prompt` on a full-prefix hit):
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="Qwen/Qwen-Image-2.1",
+    diffusion_kv_mode="paged_scheduler",
+    diffusion_kv_max_rows_per_request=2,  # 1 when true_cfg_scale <= 1.0, 2 for standard CFG
+    enable_prefix_caching=True,
+    max_num_batched_tokens=32768,
+)
+```
+
+The startup memory profile defines the safe paged-KV admission envelope. By
+default it profiles 4 reference images, both CFG branches, an 8192-token VLM
+prompt budget, and a 1024x1024 target (4096 DiT target tokens). Requests may
+use other aspect ratios when their aligned target-token count does not exceed
+4096. To serve a larger target envelope, set
+`additional_config["diffusion_kv_profile_height"]`,
+`additional_config["diffusion_kv_profile_width"]`, and, when needed,
+`additional_config["diffusion_kv_profile_max_sequence_length"]`; increase
+`max_model_len` and the KV memory budget consistently. Requests outside the
+profiled sequence or target-token envelope are rejected before execution
+rather than risking an activation-memory OOM.
+
+For 4-reference-image requests with `true_cfg_scale > 1.0` (~20.5k tokens per CFG branch at 1024×1024), single-rank CFG executes the positive and negative branches sequentially so `max_num_batched_tokens=32768` covers each branch's prefill pass; ensure the KV cache pool (`kv_cache_memory_bytes` or `gpu_memory_utilization`) can hold both branches (~21 GiB in BF16 on 1 GPU, or halved per rank under `cfg_parallel_size=2` / `tensor_parallel_size=2` / `ulysses_degree=2`).
 
 ## Quality Comparison (head vs diffusers)
 
