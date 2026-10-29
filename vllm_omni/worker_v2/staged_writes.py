@@ -87,7 +87,7 @@ class StagedWrites:
             prev = np.concatenate(([0], cu[:-1]))
             meta = np.empty((cu.size, 3), dtype=np.int64)
             meta[:, 0] = (
-                t.gpu.data_ptr()
+                _as_int64_address(t.gpu.data_ptr())
                 + np.asarray(indices, dtype=np.int64) * (t.gpu.stride(0) * elem)
                 + np.asarray(starts, dtype=np.int64) * elem
             )
@@ -101,6 +101,15 @@ class StagedWrites:
         meta_uva = self.meta_stager(np.concatenate(metas).reshape(-1), device)
         contents_uva = self.contents_stager(blobs[0] if len(blobs) == 1 else np.concatenate(blobs), device)
         _byte_scatter_kernel[(meta_uva.shape[0] // 3,)](meta_uva, contents_uva, BLOCK=1024)
+
+
+def _as_int64_address(ptr: int) -> int:
+    """Two's-complement view of a device address for the int64 meta rows.
+
+    Intel GPU (USM) device pointers live above 2**63, which NumPy cannot hold
+    as int64; the kernel casts the same bits back to a pointer.
+    """
+    return ptr - (1 << 64) if ptr >= 1 << 63 else ptr
 
 
 def runner_context(method):
