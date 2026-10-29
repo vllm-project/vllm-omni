@@ -6,6 +6,7 @@ Unit tests for StageConfigFactory and related classes.
 
 import importlib
 import warnings
+from dataclasses import fields
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,7 +38,8 @@ from vllm_omni.config.stage_config import (
     pipeline_cfg_resolver,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
+from vllm_omni.engine.arg_utils import SHARED_FIELDS, OmniEngineArgs, internal_blacklist_keys
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -1152,6 +1154,47 @@ class TestPipelineRegistration:
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.stage_by_id(0).diffusion_config.model == "fake/model"
 
+    @pytest.mark.parametrize(
+        ("checkpoint", "expected_output_type"),
+        [
+            ("Lance", "image"),
+            ("Lance_3B", "image"),
+            ("Lance_3B_Video", "video"),
+        ],
+    )
+    @pytest.mark.parametrize("explicit_deploy", [False, True])
+    def test_lance_checkpoint_output_type(self, checkpoint, expected_output_type, explicit_deploy):
+        from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline
+
+        model = f"/models/{checkpoint}"
+        deploy_path = get_deploy_config_path("lance.yaml") if explicit_deploy else None
+        # Lance's config.json has no model_type. Exercise the real basename
+        # fallback and the explicit deployment override without a remote lookup.
+        with (
+            patch.object(StageConfigFactory, "get_hf_config", return_value=None),
+            patch("vllm_omni.config.config_factory.get_hf_file_to_dict", return_value=None),
+        ):
+            omni_config = StageConfigFactory.create_from_model(
+                model,
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=deploy_path,
+            )
+            legacy_configs, _ = StageConfigFactory.create_legacy_stage_configs_from_model(
+                model,
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=deploy_path,
+            )
+
+        assert omni_config is not None
+        assert legacy_configs is not None
+        assert omni_config.pipeline_config.model_type == "lance"
+        assert omni_config.stage_by_id(0).final_output_type == expected_output_type
+        assert legacy_configs[0].final_output_type == expected_output_type
+        assert is_video_generation_pipeline(omni_config.stage_configs) is (expected_output_type == "video")
+        assert OMNI_PIPELINES["lance"].stages[0].final_output_type == "image"
+
     def test_cosyvoice3_deploy_resolves_hash_snapshot_without_hf_metadata(self, tmp_path):
         snapshot = tmp_path / "models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512" / "snapshots" / ("a" * 40)
         snapshot.mkdir(parents=True)
@@ -1539,9 +1582,8 @@ class TestDeployConfigLoading:
         sampler, which asserts on its codec ids (device-side assert out of
         ``get_token_bin_counts_and_mask``).
 
-        Stage 0's prefix caching is NPU-scoped for the same reason: a CUDA
-        stage-0 prefix hit hands the Thinker an empty tts handoff, and the
-        Talker then indexes past the codec vocab.
+        This base profile also leaves stage-0 prefix caching off on CUDA; the
+        CUDA turn profile enables it (see test_thinker_prefix_cache_defaults).
         """
         deploy = _apply_platform_overrides(
             load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml"))),
@@ -2022,6 +2064,46 @@ stages:
         assert deploy.stages[0].tensor_parallel_size == 2
         assert deploy.stages[1].devices == "1"
 
+    @pytest.mark.parametrize(
+        ("yaml_name", "platform", "enabled"),
+        [
+            ("qwen3_omni_moe.yaml", "cuda", True),
+            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
+            ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
+            ("qwen3_omni_duplex.yaml", "cuda", False),
+            ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
+            ("minicpmo_4_5_turn.yaml", "cuda", True),
+            *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
+            ("minicpmo_4_5_turn_mrv2.yaml", "cuda", False),
+            ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", False),
+            ("minicpmo_4_5.yaml", "cuda", False),
+            ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
+        ],
+    )
+    def test_thinker_prefix_cache_defaults(self, monkeypatch, yaml_name: str, platform: str, enabled: bool):
+        """Stage-0 prefix caching ships on only for the validated V1 turn profiles.
+
+        Checked on the final engine args: the stage value rides in
+        ``engine_extras`` and must keep winning over the pipeline-wide flag.
+        """
+        from vllm_omni import platforms
+
+        # merge_pipeline_deploy runs its own override pass for the host platform;
+        # pin it so the row does not depend on the machine running the test.
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path(yaml_name))), platform=platform
+        )
+        # The Qwen3-Omni profiles carry no ``pipeline:`` key; serving resolves it from the model config.
+        pipeline = (
+            resolve_pipeline_config(deploy.pipeline)
+            if deploy.pipeline
+            else resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
+        )
+        assert pipeline is not None
+        stage0 = next(stage for stage in merge_pipeline_deploy(pipeline, deploy) if stage.stage_id == 0)
+        assert stage0.yaml_engine_args["enable_prefix_caching"] is enabled
+
     def test_step_audio2_online_ci_deploy_is_single_thinker(self):
         deploy = load_deploy_config(Path(get_deploy_config_path("step_audio2_ci.yaml")))
 
@@ -2064,6 +2146,81 @@ stages:
             .endswith("thinker2token2wav_async_chunk")
         )
         assert async_stages[1].custom_process_input_func is None
+
+    @pytest.mark.parametrize(
+        ("adapter_path", "deploy_path", "expected"),
+        [
+            pytest.param(
+                "pipeline.PipelineAdapter",
+                "deploy.IgnoredAdapter",
+                "pipeline.PipelineAdapter",
+                id="deploy_conflict_overridden_by_pipeline",
+            ),
+            pytest.param(None, "deploy.IgnoredAdapter", None, id="deploy_ignored_when_pipeline_unset"),
+            pytest.param("pipeline.PipelineAdapter", None, "pipeline.PipelineAdapter", id="deploy_absent"),
+        ],
+    )
+    def test_scheduling_metadata_adapter_pipeline_is_authoritative(self, adapter_path, deploy_path, expected):
+        """Pipeline config is the only source that sets the adapter; deploy cannot."""
+        deploy_kwargs = {} if deploy_path is None else {"engine_extras": {"scheduling_metadata_adapter": deploy_path}}
+        stage = merge_pipeline_deploy(
+            PipelineConfig(
+                model_type="metadata_adapter_test",
+                stages=(
+                    StagePipelineConfig(
+                        stage_id=0,
+                        model_stage="consumer",
+                        scheduling_metadata_adapter=adapter_path,
+                        final_output=True,
+                    ),
+                ),
+            ),
+            DeployConfig(stages=(StageDeployConfig(stage_id=0, **deploy_kwargs),)),
+        )[0]
+
+        assert stage.yaml_engine_args["scheduling_metadata_adapter"] == expected
+
+    def test_scheduling_metadata_adapter_survives_engine_args_filtering(self):
+        adapter_path = "package.CustomSchedulingMetadataAdapter"
+        pipeline = PipelineConfig(
+            model_type="metadata_adapter_test",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="consumer",
+                    scheduling_metadata_adapter=adapter_path,
+                    final_output=True,
+                ),
+            ),
+        )
+
+        stage = merge_pipeline_deploy(pipeline, DeployConfig())[0]
+
+        assert "scheduling_metadata_adapter" in {f.name for f in fields(OmniEngineArgs)}
+
+        filtered = filter_dataclass_kwargs(OmniEngineArgs, dict(stage.yaml_engine_args))
+        assert filtered["scheduling_metadata_adapter"] == adapter_path
+
+    def test_scheduling_metadata_adapter_is_per_stage(self):
+        """Each stage carries only its own pipeline-defined adapter."""
+        stages = merge_pipeline_deploy(
+            PipelineConfig(
+                model_type="metadata_adapter_test",
+                stages=(
+                    StagePipelineConfig(stage_id=0, model_stage="thinker"),
+                    StagePipelineConfig(
+                        stage_id=1,
+                        model_stage="talker",
+                        scheduling_metadata_adapter="pipeline.TalkerAdapter",
+                        final_output=True,
+                    ),
+                ),
+            ),
+            DeployConfig(),
+        )
+
+        assert stages[0].yaml_engine_args["scheduling_metadata_adapter"] is None
+        assert stages[1].yaml_engine_args["scheduling_metadata_adapter"] == "pipeline.TalkerAdapter"
 
     def test_no_bundled_legacy_stage_config_yamls(self):
         repo_root = Path(__file__).resolve().parents[2]
@@ -3166,7 +3323,6 @@ class TestPlatformOverrides:
         if is_cuda:
             args = stages[0].yaml_engine_args
             assert args["enable_prefix_caching"] is True
-            assert args["hf_overrides"]["mrv2_gpu_slot_state"] is True
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
             assert "local_compile_audio_sampler" not in args["hf_overrides"]
@@ -3189,7 +3345,6 @@ class TestPlatformOverrides:
         assert args["max_num_seqs"] == 128
         assert args["max_num_batched_tokens"] == 512
         assert args["hf_overrides"] == {
-            "mrv2_gpu_slot_state": True,
             "mrv2_batch_prefill": True,
             "mrv2_direct_tokens": True,
             "mrv2_eager_mtp": True,
@@ -3371,6 +3526,44 @@ class TestCLIOverrideFlow:
         for s in stages:
             s.runtime_overrides = StageConfigFactory._merge_cli_overrides(s, overrides)
             assert s.runtime_overrides["enforce_eager"] is True
+
+    def test_topology_owned_fields_survive_final_legacy_merge(self):
+        stage = merge_pipeline_deploy(
+            PipelineConfig(
+                model_type="topology_override_test",
+                stages=(
+                    StagePipelineConfig(
+                        stage_id=0,
+                        model_stage="consumer",
+                        requires_full_payload_input=True,
+                        scheduling_metadata_adapter="pipeline.Adapter",
+                        final_output=True,
+                    ),
+                ),
+            ),
+            DeployConfig(),
+        )[0]
+        stage.runtime_overrides = StageConfigFactory._merge_cli_overrides(
+            stage,
+            {
+                "stage_0_requires_full_payload_input": False,
+                "stage_0_scheduling_metadata_adapter": "cli.Adapter",
+            },
+        )
+
+        assert stage.runtime_overrides["requires_full_payload_input"] is False
+        assert stage.runtime_overrides["scheduling_metadata_adapter"] == "cli.Adapter"
+
+        with patch("vllm_omni.config.stage_config.logger.warning") as warning:
+            final_config = stage.to_omegaconf()
+
+        assert warning.call_count == 2
+        assert {call.args[1:] for call in warning.call_args_list} == {
+            (0, "requires_full_payload_input"),
+            (0, "scheduling_metadata_adapter"),
+        }
+        assert final_config.engine_args.requires_full_payload_input is True
+        assert final_config.engine_args.scheduling_metadata_adapter == "pipeline.Adapter"
 
 
 class TestAuraOmniDeploy:

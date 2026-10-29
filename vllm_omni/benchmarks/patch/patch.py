@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import argparse
 import asyncio
 import contextlib
 import io
@@ -261,12 +262,19 @@ _LEGACY_REQUEST_TIMEOUT_S = 6 * 60 * 60.0
 # Set from the ``--omni-request-timeout-s`` CLI flag by ``vllm bench serve``
 # before the benchmark session is built (``None`` = use the default above).
 _REQUEST_TIMEOUT_OVERRIDE_S: float | None = None
+_FAIL_FAST_ON_TIMEOUT = False
 
 
 def set_request_timeout_s(value: float) -> None:
     """Record the explicitly requested per-request timeout (from the CLI)."""
     global _REQUEST_TIMEOUT_OVERRIDE_S
     _REQUEST_TIMEOUT_OVERRIDE_S = float(value)
+
+
+def set_fail_fast_on_timeout(enabled: bool) -> None:
+    """Enable cancellation of the remaining benchmark requests after a timeout."""
+    global _FAIL_FAST_ON_TIMEOUT
+    _FAIL_FAST_ON_TIMEOUT = bool(enabled)
 
 
 def _omni_request_timeout_s() -> float:
@@ -953,6 +961,8 @@ if _serve_mod is not None:
 
 @dataclass
 class MixRequestFuncOutput(RequestFuncOutput):
+    timed_out: bool = False
+    cancelled_after_timeout: bool = False
     audio_ttfp: float = 0.0
     audio_duration: float = 0.0
     audio_frames: int = 0
@@ -1988,6 +1998,8 @@ async def async_request_openai_chat_omni_completions(
         output.output_tokens = 0
         output.error = ""
         output.success = False
+        output.timed_out = False
+        output.cancelled_after_timeout = False
         output.stage_metrics = {}
         output.stage_id = None
         output.final_output_type = None
@@ -2254,6 +2266,13 @@ async def async_request_openai_chat_omni_completions(
                 )
                 await asyncio.sleep(retry_delay)
                 continue
+            break
+        except (asyncio.TimeoutError, TimeoutError, aiohttp.ServerTimeoutError):
+            output.success = False
+            output.timed_out = True
+            output.error = traceback.format_exc()
+            output.latency = time.perf_counter() - st
+            logger.error("Omni benchmark request timed out after %.1fs", output.latency)
             break
         except aiohttp.ClientError as e:
             # transient transport error: may retry
@@ -3470,11 +3489,22 @@ from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
     has_metric_samples,
+    validate_goodput_config,
 )
 
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def check_goodput_args(args: argparse.Namespace) -> dict[str, float]:
+    """Parse goodput SLOs with vLLM-Omni request-level metrics."""
+    if not args.goodput:
+        return {}
+
+    goodput_config_dict = serve.parse_goodput(args.goodput)
+    validate_goodput_config(goodput_config_dict)
+    return goodput_config_dict
 
 
 def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
@@ -3488,6 +3518,73 @@ def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
     merged = dict(base or {})
     merged.update(overrides or {})
     return merged
+
+
+def _cancelled_after_timeout_output(request: RequestFuncInput) -> MixRequestFuncOutput:
+    output = MixRequestFuncOutput(
+        success=False,
+        prompt_len=request.prompt_len,
+        error="Cancelled after another benchmark request timed out.",
+        cancelled_after_timeout=True,
+    )
+    output.start_time = time.perf_counter()
+    return output
+
+
+async def _gather_request_outputs(
+    tasks: list[asyncio.Task[MixRequestFuncOutput]],
+    request_inputs: list[RequestFuncInput],
+    *,
+    pbar: tqdm | None = None,
+) -> list[MixRequestFuncOutput]:
+    """Gather in request order and cancel unfinished work after the first timeout."""
+    if len(tasks) != len(request_inputs):
+        raise ValueError("request task and input counts must match")
+    outputs: list[MixRequestFuncOutput | None] = [None] * len(tasks)
+    task_indexes = {task: index for index, task in enumerate(tasks)}
+    pending = set(tasks)
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            timed_out = False
+            for task in done:
+                output = task.result()
+                outputs[task_indexes[task]] = output
+                timed_out |= bool(getattr(output, "timed_out", False))
+            if not timed_out:
+                continue
+
+            ordered_pending = [task for task in tasks if task in pending]
+            logger.error(
+                "Benchmark request timed out; cancelling %d queued or in-flight requests",
+                len(ordered_pending),
+            )
+            for task in ordered_pending:
+                task.cancel()
+            settled = await asyncio.gather(*ordered_pending, return_exceptions=True)
+            unexpected: BaseException | None = None
+            for task, result in zip(ordered_pending, settled, strict=True):
+                index = task_indexes[task]
+                if isinstance(result, asyncio.CancelledError):
+                    outputs[index] = _cancelled_after_timeout_output(request_inputs[index])
+                    if pbar is not None:
+                        pbar.update(1)
+                elif isinstance(result, BaseException):
+                    unexpected = unexpected or result
+                else:
+                    outputs[index] = result
+            pending.clear()
+            if unexpected is not None:
+                raise unexpected
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    if any(output is None for output in outputs):
+        raise RuntimeError("benchmark request gathering produced incomplete outputs")
+    return [output for output in outputs if output is not None]
 
 
 async def benchmark(
@@ -3672,6 +3769,7 @@ async def benchmark(
     _prepare_omniinteract_batch(input_requests)
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    request_func_inputs: list[RequestFuncInput] = []
 
     rps_change_events = []
     last_int_rps = -1
@@ -3732,14 +3830,24 @@ async def benchmark(
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
         attach_duplex_eval(request, request_func_input)
+        request_func_inputs.append(request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
-    outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
+    if _FAIL_FAST_ON_TIMEOUT:
+        outputs = await _gather_request_outputs(tasks, request_func_inputs, pbar=pbar)
+    else:
+        outputs = await asyncio.gather(*tasks)
+    fail_fast_triggered = any(getattr(output, "timed_out", False) for output in outputs)
 
     if probe_task is not None:
         probe_stop.set()
-        await probe_task
+        if _FAIL_FAST_ON_TIMEOUT and fail_fast_triggered:
+            probe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await probe_task
+        else:
+            await probe_task
 
     if pbar is not None:
         pbar.close()
@@ -3855,6 +3963,10 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    result["timed_out_requests"] = sum(bool(getattr(output, "timed_out", False)) for output in outputs)
+    result["cancelled_after_timeout_requests"] = sum(
+        bool(getattr(output, "cancelled_after_timeout", False)) for output in outputs
+    )
     # Preserve request order, including missing snapshots, so CI can verify
     # fixed stage workloads without parsing logs or storing audio payloads.
     request_stage_metrics = [
@@ -4031,3 +4143,4 @@ async def benchmark(
 
 
 serve.benchmark = benchmark
+serve.check_goodput_args = check_goodput_args

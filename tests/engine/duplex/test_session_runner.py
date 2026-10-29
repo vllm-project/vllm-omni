@@ -376,6 +376,12 @@ def listen_output(request_id: str) -> SimpleNamespace:
     )
 
 
+def _is_silence_unit(submission: DuplexStageSubmission) -> bool:
+    """A continuation unit: the only append whose audio is all zeros."""
+    payload = submission.prompt["model_intermediate_buffer"]["duplex"]["payload"]
+    return set(base64.b64decode(payload["audio"])) == {0}
+
+
 def types(events: Sequence[DuplexEvent]) -> list[str]:
     return [event.type for event in events]
 
@@ -1287,6 +1293,35 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
         await close_harness(h)
 
 
+@pytest.mark.parametrize("fail_cleanup", [False, True])
+async def test_barge_in_releases_only_successfully_cleaned_request_ids(
+    fail_cleanup: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = await open_harness()
+    original_cleanup = h.port.cleanup
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        async def cleanup_with_new_resource(request_ids: list[str], *, abort: bool = False) -> None:
+            assert h.session.resource_request_ids(submitted=True) == [request_id]
+            await original_cleanup(request_ids, abort=abort)
+            h.session.bind_stage_request(0, "next-epoch-request", fence=h.session.fence)
+            if fail_cleanup:
+                raise RuntimeError("synthetic abort failure")
+
+        monkeypatch.setattr(h.port, "cleanup", cleanup_with_new_resource)
+        events = await h.run(commands.BargeIn())
+        assert h.session.epoch == 1
+        assert h.port.cleanups == [([request_id], True)]
+        assert "next-epoch-request" in h.session.resource_request_ids(submitted=True)
+        assert (request_id in h.session.resource_request_ids(submitted=True)) is fail_cleanup
+        assert any(getattr(event, "code", None) == "runtime_signal_failed" for event in events) is fail_cleanup
+    finally:
+        monkeypatch.setattr(h.port, "cleanup", original_cleanup)
+        await close_harness(h)
+
+
 async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> None:
     h = await open_harness()
     release_abort = asyncio.Event()
@@ -1402,6 +1437,63 @@ async def test_cancel_cleanup_failure_retains_requests_for_close_retry() -> None
         assert result.ok and result.operation == "close"
         assert h.port.cleanups == [([request_id], True), ([request_id], True)]
         assert h.session.resource_request_ids() == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended", [False, True])
+@pytest.mark.parametrize("native_signal", [False, True])
+async def test_audio_truncation_preserves_retrieved_and_terminal_transcript(ended, native_signal) -> None:
+    h = await open_harness()
+    try:
+        session = h.session
+        response = session.begin_response()
+        item_id = f"item_{response}"
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("abcdefghij")
+        session.mark_audio_sent(10_000, text_chars=10, audio_complete=True)
+        h.runner.emit(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": response,
+                "audio": "AAA=",
+                "text": "abcdefghij",
+                "audio_duration_ms": 10_000,
+                "audio_text_marks": [{"text_chars": 10, "audio_end_ms": 10_000}],
+            }
+        )
+        if ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+        await h.settle()
+
+        if native_signal:
+            command = commands.SignalTurn(
+                event="conversation.item.truncate", signal_payload={"item_id": item_id, "audio_end_ms": 4_000}
+            )
+        else:
+            command = commands.TruncateItem(item_id=item_id, audio_end_ms=4_000)
+        events = await h.run(command)
+        assert "error" not in types(events)
+        assert find(events, "conversation.item.truncated").audio_end_ms == 4_000
+        for _ in range(2):
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+
+        if not ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+            events = await h.settle()
+            done = find(events, "response.done")
+            assert done.response["output"][0]["content"][0]["transcript"] == "abcd"
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+        assert session.history_item_ids[item_id]["content"] == "abcd"
     finally:
         await close_harness(h)
 
@@ -1911,6 +2003,81 @@ async def test_speech_after_silence_continuation_is_not_the_first_audio_window()
         payload = speech[0].prompt["model_intermediate_buffer"]["duplex"]["payload"]
         assert "first_audio_window" not in payload
         assert len(speech[0].prompt["prompt_token_ids"]) == 25
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_answer_continues_when_the_segment_end_arrives_before_the_answer() -> None:
+    """A continuation planned for the model turn is re-aimed at the answer that opened (#7729)."""
+    h = await open_harness()
+    try:
+        for _ in range(4):
+            await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        # A TTS segment ends with no text or audio before any response exists.
+        # This schedules a continuation, which waits for up to one chunk period.
+        h.deliver(tts_output(request_id, samples=0, text="", tts_is_last_chunk=True))
+        await asyncio.sleep(0.1)
+
+        # During that wait the last real units arrive and the answer starts.
+        h.submit(append_audio())
+        await asyncio.sleep(0.1)
+        h.deliver(tts_output(request_id, samples=24000, text="no"))
+        await asyncio.sleep(0.1)
+        h.submit(append_audio())
+        h.submit(commands.Commit())
+        await h.settle(timeout_s=5.0)
+
+        # More of the answer. Its segment only ends after another unit is processed.
+        for samples, text in ((48000, "no fi"), (72000, "no fight, bu"), (96000, "no fight, but yes,")):
+            await h.deliver_and_settle(tts_output(request_id, samples=samples, text=text))
+        await h.settle(idle_s=2.5, timeout_s=8.0)
+
+        assert h.session.active_response_id is not None
+        # 6 real units, then a silence unit that keeps the answer going.
+        assert len(h.port.submissions) == 7
+        assert _is_silence_unit(h.port.submissions[6])
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_continuation_is_not_re_aimed_across_a_barge_in() -> None:
+    """The re-aim in #7729 stays inside the epoch that planned the unit.
+
+    The next answer must open while the old continuation is still waiting out
+    its chunk period, so this drives the runner with ``submit``/``deliver`` and
+    short sleeps. ``run``/``settle`` would wait for that continuation to drop
+    first, and then a fix that re-arms with the current epoch passes too.
+    """
+    h = await open_harness()
+    try:
+        for _ in range(2):
+            await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        # Plan a continuation for the model turn of epoch 0. It waits for up to
+        # one chunk period (1 s) before it submits.
+        h.deliver(tts_output(request_id, samples=0, text="", tts_is_last_chunk=True))
+        await asyncio.sleep(0.1)
+
+        # The user barges in while it waits, and the next turn opens its own answer.
+        h.submit(commands.BargeIn())
+        await asyncio.sleep(0.1)
+        assert h.session.epoch == 1
+        h.submit(append_audio())
+        await asyncio.sleep(0.1)
+        assert any(task.get_name() == "duplex-continue" and not task.done() for task in h.runner._background_tasks), (
+            "the old continuation should still be waiting when the new answer opens"
+        )
+        h.deliver(tts_output(h.stage0_request_id(), samples=24000, text="hi", epoch=1))
+        await h.settle(idle_s=2.5, timeout_s=8.0)
+
+        assert h.session.epoch == 1
+        assert h.session.active_response_id is not None
+        assert [s for s in h.port.submissions if _is_silence_unit(s)] == []
     finally:
         await close_harness(h)
 
@@ -3178,6 +3345,67 @@ async def test_cancelling_output_keeps_the_pending_semantic_turn(command) -> Non
         events += await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
         assert "input_audio_buffer.speech_started" not in types(events)
         assert types(events).count("input_audio_buffer.committed") == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_keeps_a_commit_deferred_behind_the_active_response() -> None:
+    """Cancelling the answer in flight must not discard the next turn's audio.
+
+    A commit that arrives while a response is still generating is retained
+    with the response it should start. ``response.cancel`` then tears down only
+    the in-flight answer; the client's already-committed turn has to survive so
+    the ``response.create`` that follows can answer it.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, text="hello", finished=False))
+        assert h.runner.model_state.committed_audio_payload is None
+
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=True))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is True
+
+        await h.run(commands.CancelResponse())
+        assert model_state.committed_audio_payload is not None, "the committed turn was discarded"
+        assert model_state.deferred_response_create is True
+        assert h.session.pending_input_bytes > 0
+
+        events = await h.run(commands.CreateResponse())
+        assert "error" not in types(events), types(events)
+        assert find(events, "response.created")
+        assert model_state.committed_audio_payload is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_releases_audio_retained_for_the_cancelled_answer() -> None:
+    """A retain that belongs to the cancelled answer is still released."""
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", finished=False))
+        # Speech arriving mid-answer, committed without asking for a response:
+        # the retain belongs to the answer being generated, so
+        # ``deferred_response_create`` stays False and no new turn owns it.
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=False))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is False
+
+        await h.run(commands.CancelResponse())
+
+        assert model_state.committed_audio_payload is None
+        assert h.session.pending_input_bytes == 0
     finally:
         await close_harness(h)
 

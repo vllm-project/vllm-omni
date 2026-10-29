@@ -120,7 +120,7 @@ def test_xvec_first_chunk_replays_prefix_graph(monkeypatch, skip_flags, initial_
         torch.testing.assert_close(outputs[row], expected)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("initial_frames", [1, 3])
 @pytest.mark.parametrize("time_major", [False, True])
 @torch.inference_mode()
@@ -162,7 +162,7 @@ def test_xvec_graphs_follow_request_first_audio_flags(initial_frames, time_major
                 torch.testing.assert_close(cache[key], expected_cache[key], atol=1e-5, rtol=1e-5)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
     from tests.model_executor.models.qwen3_tts.test_time_major_decoder import _make_decoder
@@ -203,7 +203,7 @@ def test_stream_decoder_preemption_restores_all_state_into_a_different_slot():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("use_graph", [False, True, "pieces"])
 @torch.inference_mode()
 def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph):
@@ -255,7 +255,7 @@ def test_batched_reference_priming_matches_serial_decoder_continuation(use_graph
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("use_graph", [False, True, "prepared"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()

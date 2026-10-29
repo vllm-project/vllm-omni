@@ -291,7 +291,8 @@ Hit spans come from adapter-classified `STARTED` events for new requests:
   `EXTENDED`, so the manager does not mark a hit: those rows were delivered in
   earlier steps and re-emitting them would duplicate output. A
   `delivered_upto` span for this case is Phase 2.
-- Preemption + reschedule: vLLM resets `num_computed_tokens` to 0 on
+- Preemption + reschedule: for stages with `recompute_preemption="allow"`
+  (the default), vLLM resets `num_computed_tokens` to 0 on
   preemption and re-runs prefix matching on resume, so the resumed request
   can come back with a fresh hit. With the V1 model runner it arrives
   through `scheduled_cached_reqs` (id in `resumed_req_ids`, `new_block_ids`
@@ -303,6 +304,22 @@ Hit spans come from adapter-classified `STARTED` events for new requests:
   rows, from this request or the one it hit. Stages that need full prompt
   hidden states should be sized so preemption does not occur while prefix
   caching is on. Same as before this refactor; tracked for Phase 2.
+
+Stages whose decode state cannot be reconstructed from token IDs declare
+`recompute_preemption="fail"` in their AR pipeline topology. Capacity
+preemption then finishes the request with one terminal ERROR and releases its
+request/KV state instead of requeueing it, including when a KV-delivery
+connector asks to discard stale output. Explicit `reset_prefix_cache` retains
+its existing resume behavior, subject to `supports_running_prefix_cache_reset`;
+its reset scope, rather than the shared `drop_stale_output` flag, identifies
+that exception. Fail-mode preemption also notifies the auxiliary-output
+connector before removing the request, so the worker receives its finished
+notification and subsequent metadata assembly cannot reference a freed request.
+
+Fish Omni retains the default `allow` policy: its MRv2 model state saves the
+generated codebooks before a slot is reused and restores full frame rows on
+resume. Missing codebooks in the token stream alone do not imply that a stage
+cannot replay; model-state replay support must also be considered.
 
 The adapter is the sole owner of started-request observations. Its single
 `translate_step` entry point captures an immutable `PrefixCacheStep`.

@@ -13,7 +13,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 from itertools import groupby
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -101,6 +101,7 @@ from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
     MINIMAX_H3_TIMELINE_GUIDES_KEY,
     resolve_guide_start,
 )
+from vllm_omni.outputs.output_metadata import valid_frame_counts
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import (
     resolve_component_quant_config as _resolve_component_quant_config,
@@ -392,6 +393,11 @@ def _minimax_h3_output_canvas(
     return target.height, target.width
 
 
+class _MiniMaxH3EncodedOutput(NamedTuple):
+    video: bytes | list[bytes]
+    frame_counts: list[int]
+
+
 def _minimax_h3_post_process(output, output_type: str = "np"):
     """Convert the joint video/audio output without capturing worker state.
 
@@ -402,6 +408,10 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     frames on the accelerator, so there is nothing left to scale or transpose
     here.
     """
+    frame_counts = None
+    if isinstance(output, _MiniMaxH3EncodedOutput):
+        frame_counts = output.frame_counts
+        output = (output.video, None)
     if not isinstance(output, tuple) or len(output) != 2:
         return output
     video, audio = output
@@ -412,12 +422,27 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     else:
         encoded_videos = None
     if encoded_videos is not None:
-        return {
+        result = {
             "video": encoded_videos,
             "audio": [None] * len(encoded_videos),
             "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
             "fps": MINIMAX_H3_FPS,
         }
+        if frame_counts is not None:
+            if not valid_frame_counts(frame_counts, len(encoded_videos)):
+                logger.warning("Ignoring invalid encoded frame counts; falling back to MP4 metadata inspection")
+                return result
+            return {
+                "payload": {
+                    "video": encoded_videos,
+                    "audio": [None] * len(encoded_videos),
+                },
+                "metadata": {
+                    "video": {"fps": MINIMAX_H3_FPS, "frame_counts": frame_counts},
+                    "audio": {"sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE},
+                },
+            }
+        return result
     if video.dtype != torch.uint8 or video.ndim != 5 or video.shape[-1] not in (3, 4):
         # Float or channel-first frames would reach the muxer as a black or
         # banded video rather than as an error.
@@ -462,9 +487,7 @@ def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any
             component.set_omni_component_cache(cache)
 
 
-def get_minimax_h3_post_process_func(
-    od_config: OmniDiffusionConfig,
-):
+def get_minimax_h3_post_process_func(od_config: OmniDiffusionConfig):
     del od_config
     return _minimax_h3_post_process
 
@@ -2282,6 +2305,7 @@ class MiniMaxH3Pipeline(
         max_pending: int = 2,
         batch_frames: int = 17,
         video_codec_options: dict[str, str] | None = None,
+        frame_counts: list[int] | None = None,
     ) -> bytes:
         """Decode and encode one output on the worker without full-video materialization.
 
@@ -2296,23 +2320,22 @@ class MiniMaxH3Pipeline(
         bytes -- the pre-encoded counterpart of the empty tensor the full
         decode leaves there.
         """
-        from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4 as decode_chunks_to_mp4
+        from vllm_omni.diffusion.utils.chunked_video import (
+            ChunkedVideoMP4Session,
+        )
+        from vllm_omni.diffusion.utils.chunked_video import (
+            decode_to_mp4 as decode_chunks_to_mp4,
+        )
 
-        with self._component_on_device(self.audio_vae):
-            audio = self.audio_vae.decode_latent(audio_latent)
-        audio_np = audio.detach().float().cpu().numpy()
-        if audio_np.ndim == 3 and audio_np.shape[0] == 1:
-            audio_np = audio_np[0]
-
-        with self._component_on_device(self.video_vae):
-            with current_omni_platform.create_autocast_context(
-                device_type=self.device.type,
-                dtype=self.video_vae.decode_dtype,
-                enabled=True,
-            ):
-                videos = decode_chunks_to_mp4(
-                    self.video_vae,
-                    video_latent,
+        session = None
+        try:
+            with self._component_on_device(self.audio_vae):
+                audio = self.audio_vae.decode_latent(audio_latent)
+                audio_np = audio.detach().float().cpu().numpy()
+                if audio_np.ndim == 3 and audio_np.shape[0] == 1:
+                    audio_np = audio_np[0]
+                session = ChunkedVideoMP4Session(
+                    value_range=self.video_vae.chunk_value_range,
                     fps=MINIMAX_H3_FPS,
                     audio_waveforms=[audio_np],
                     audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
@@ -2321,6 +2344,39 @@ class MiniMaxH3Pipeline(
                     video_codec_options=video_codec_options,
                     crop=(height, width),
                 )
+                start_error: BaseException | None = None
+                if self.video_vae.owns_chunk_output:
+                    try:
+                        session.start(width=width, height=height, batch_size=1)
+                    except BaseException as exc:
+                        start_error = exc
+                if self.video_vae.is_distributed_enabled():
+                    # Prestart runs only on the output owner, outside the chunk
+                    # callback's error guard. Agree before any rank enters the
+                    # VAE collectives, including when the owner is not global 0.
+                    group = self.video_vae._native_parallel_state()["sp_process_group"]
+                    # The current VAE SP group supports tensors on video_latent.device,
+                    # matching the callback-failure broadcast in chunked_decode.
+                    failed = torch.tensor([int(start_error is not None)], dtype=torch.int32, device=video_latent.device)
+                    dist.broadcast(failed, src=dist.get_global_rank(group, 0), group=group)
+                    if int(failed.item()) and start_error is None:
+                        raise RuntimeError("MiniMax-H3 MP4 encoder startup failed on the output owner")
+                if start_error is not None:
+                    raise start_error
+
+            with self._component_on_device(self.video_vae.decoder_component):
+                with current_omni_platform.create_autocast_context(
+                    device_type=self.device.type,
+                    dtype=self.video_vae.decode_dtype,
+                    enabled=True,
+                ):
+                    videos = decode_chunks_to_mp4(
+                        self.video_vae, video_latent, session=session, frame_counts=frame_counts
+                    )
+        except BaseException:
+            if session is not None:
+                session.abort()
+            raise
         if not videos:
             return b""
         if len(videos) != 1:
@@ -3323,6 +3379,9 @@ class MiniMaxH3Pipeline(
         height, width = _minimax_h3_output_canvas(context, upscale_target)
         videos = []
         audios = []
+        # Each seed appends one count on the output owner and none on peers;
+        # decode_to_mp4 rejects multiple MP4 outputs for a single seed.
+        frame_counts = []
         for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
             check_request_cancellation()
             output_kwargs = {**denoise_kwargs, "seed": output_seed}
@@ -3363,6 +3422,7 @@ class MiniMaxH3Pipeline(
                         width=width,
                         video_codec_options=context["video_codec_options"],
                         batch_frames=context["preencode_batch_frames"],
+                        frame_counts=frame_counts,
                     )
                 )
                 audios.append(None)
@@ -3395,7 +3455,9 @@ class MiniMaxH3Pipeline(
             video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
             audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
-            output=(video, audio),
+            output=(
+                _MiniMaxH3EncodedOutput(video=video, frame_counts=frame_counts) if frame_counts else (video, audio)
+            ),
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
@@ -3786,6 +3848,7 @@ class MiniMaxH3Pipeline(
             return self._decoder_stage_output(
                 [video_latent], [audio_latent], {**shape, "height": height, "width": width}
             )
+        frame_counts = []
         if shape.get("preencode_mp4", False):
             video = self.decode_to_mp4(
                 video_latent,
@@ -3794,6 +3857,7 @@ class MiniMaxH3Pipeline(
                 width=width,
                 video_codec_options=shape.get("video_codec_options"),
                 batch_frames=shape.get("preencode_batch_frames", 17),
+                frame_counts=frame_counts,
             )
             audio = None
         else:
@@ -3806,7 +3870,9 @@ class MiniMaxH3Pipeline(
             video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
             self._release_stage_cache()
         return DiffusionOutput(
-            output=(video, audio),
+            output=(
+                _MiniMaxH3EncodedOutput(video=video, frame_counts=frame_counts) if frame_counts else (video, audio)
+            ),
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),

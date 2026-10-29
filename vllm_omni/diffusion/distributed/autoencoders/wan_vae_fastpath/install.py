@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from types import MethodType
 from typing import Any
@@ -29,6 +29,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+from vllm_omni.diffusion.layers.vae_norm_epilogue import KERNEL_DEVICE_TYPES
 
 from . import forwards
 
@@ -214,7 +215,7 @@ def _install_bindings(
     component_name = "encoder" if encoder else "decoder"
     device = next((p.device for p in component.parameters()), torch.device("cpu"))
     fused_silu_dtypes: frozenset[torch.dtype] = frozenset()
-    if device.type == "cuda":
+    if device.type in KERNEL_DEVICE_TYPES:
         fused_silu_dtypes = frozenset(
             dtype for dtype in (torch.bfloat16, torch.float16) if rn.silu_epilogue_is_exact(device, dtype)
         )
@@ -224,7 +225,12 @@ def _install_bindings(
         clone_encoder_shortcuts=clone_encoder_shortcuts,
         fuse_norm_cache=encoder,
         exact_bf16_norm=encoder,
+        verify_spatial_padding=encoder or level != "channels_last",
     )
+    # Preserve the output projection's validated formulation. Internal decoder
+    # convolutions can use implicit padding under the channels-last tolerance
+    # contract without allocating full-size first-use equivalence probes.
+    output_cfg = replace(cfg, verify_spatial_padding=True)
 
     with ExitStack() as rollback:
         undo: list[Callable[[], None]] = []
@@ -243,7 +249,8 @@ def _install_bindings(
             rollback.callback(restore)
             undo.append(restore)
             module.forward = MethodType(forward, module)
-            setattr(module, forwards.CFG_ATTR, cfg)
+            module_cfg = output_cfg if module is getattr(component, "conv_out", None) else cfg
+            setattr(module, forwards.CFG_ATTR, module_cfg)
             patched[type(module).__name__] = patched.get(type(module).__name__, 0) + 1
 
         for module, replacement in bindings:

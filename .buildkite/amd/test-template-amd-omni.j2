@@ -104,7 +104,14 @@ steps:
 {% for step in step_group.steps %}
 {% if step.mirror_hardwares and mirror_hw in step.mirror_hardwares %}
       - label: "{{ step.agent_pool }}: {{ step.label }}"
+{% if step.key %}
+        key: {{ step.key }}
+{% endif %}
+{% if step.depends_on %}
+        depends_on: {{ step.depends_on }}
+{% else %}
         depends_on: amd-build
+{% endif %}
         agents:
           {% if step.agent_pool %}
           queue: amd_{{ step.agent_pool }}
@@ -181,7 +188,14 @@ steps:
 {% elif step_group.mirror_hardwares and mirror_hw in step_group.mirror_hardwares %}
 {% set step = step_group %}
   - label: "{{ step.agent_pool }}: {{ step.label }}"
+{% if step.key %}
+    key: {{ step.key }}
+{% endif %}
+{% if step.depends_on %}
+    depends_on: {{ step.depends_on }}
+{% else %}
     depends_on: amd-build
+{% endif %}
     agents:
       {% if step.agent_pool %}
       queue: amd_{{ step.agent_pool }}

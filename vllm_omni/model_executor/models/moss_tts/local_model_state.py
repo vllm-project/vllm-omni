@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 
@@ -382,7 +383,7 @@ class MossLocalModelState(OmniModelState):
         for row in range(input_batch.num_reqs):
             slot = int(input_batch.idx_mapping_np[row])
             buf = self.intermediate_buffer.buffers[slot]
-            if not buf or str(buf.get("req_id", "")).startswith("_warmup_"):
+            if not buf or is_warmup_request(buf.get("req_id", "")):
                 continue
             start = int(input_batch.query_start_loc_np[row])
             count = int(input_batch.num_scheduled_tokens[row])
@@ -477,7 +478,7 @@ class MossLocalModelState(OmniModelState):
             if eager_rows:
                 # Their frame was sampled after the previous forward.
                 slots = self._select_rows(input_batch.idx_mapping, eager_rows, self._uva and self._uva.eager_slots)
-                offsets = self._mtp_offsets[: len(eager_rows)]
+                offsets = self._mtp_state._mtp_offsets[: len(eager_rows)]
                 offsets.copy_(
                     self._select_rows(input_batch.query_start_loc, eager_rows, self._uva and self._uva.eager_offsets)
                 )
@@ -502,9 +503,9 @@ class MossLocalModelState(OmniModelState):
 
     def _run_slot_mtp(self, batch, input_ids, embeds, rows, dispatcher):
         bsz = len(rows)
-        offsets = self._mtp_offsets[:bsz]
-        ids, emb = self._mtp_input_ids[:bsz], self._mtp_input_embeds[:bsz]
-        hidden, step = self._mtp_hidden[:bsz], self._mtp_text_step[:bsz]
+        offsets = self._mtp_state._mtp_offsets[:bsz]
+        ids, emb = self._mtp_state._mtp_input_ids[:bsz], self._mtp_state._mtp_input_embeds[:bsz]
+        hidden, step = self._mtp_state._mtp_hidden[:bsz], self._mtp_state._mtp_text_step[:bsz]
         uva_index = None
         if self._uva is not None:
             from vllm_omni.model_executor.models.moss_tts.local_state_kernels import gather_mtp
@@ -526,21 +527,21 @@ class MossLocalModelState(OmniModelState):
         buffers = [self.intermediate_buffer.buffers[int(batch.idx_mapping_np[row])] for row in rows]
         req_ids = [str(buf["req_id"]) for buf in buffers]
         generators = [
-            self._get_mtp_generator(req_id, buf.get("sampling_params"), ids.device)
+            self._mtp_state._get_mtp_generator(req_id, buf.get("sampling_params"), ids.device)
             for req_id, buf in zip(req_ids, buffers, strict=True)
         ]
-        can_graph = self._is_mtp_graph_runner() and not any(g is not None for g in generators)
+        can_graph = self._mtp_state._is_mtp_graph_runner() and not any(g is not None for g in generators)
         desc = dispatcher(bsz) if can_graph and dispatcher is not None else None
         mode = getattr(desc, "cg_mode", CUDAGraphMode.FULL) if can_graph else CUDAGraphMode.NONE
         num_tokens = int(desc.num_tokens) if desc is not None else bsz
         with set_forward_context(
             None, self.vllm_config, num_tokens=num_tokens, cudagraph_runtime_mode=mode, batch_descriptor=desc
         ):
-            new_emb, codes = self._call_mtp_with_sampling(
-                self._mtp_input_ids[:num_tokens],
-                self._mtp_input_embeds[:num_tokens],
-                self._mtp_hidden[:num_tokens],
-                self._mtp_text_step[:num_tokens],
+            new_emb, codes = self._mtp_state._call_mtp_with_sampling(
+                self._mtp_state._mtp_input_ids[:num_tokens],
+                self._mtp_state._mtp_input_embeds[:num_tokens],
+                self._mtp_state._mtp_hidden[:num_tokens],
+                self._mtp_state._mtp_text_step[:num_tokens],
                 buffers=buffers,
                 req_ids=req_ids,
                 generators=generators,
@@ -566,8 +567,8 @@ class MossLocalModelState(OmniModelState):
         """
         bsz = len(rows)
         slots = self._select_rows(batch.idx_mapping, rows, self._uva and self._uva.eager_mtp_slots)
-        ids, emb = self._mtp_input_ids[:bsz], self._mtp_input_embeds[:bsz]
-        hidden, step = self._mtp_hidden[:bsz], self._mtp_text_step[:bsz]
+        ids, emb = self._mtp_state._mtp_input_ids[:bsz], self._mtp_state._mtp_input_embeds[:bsz]
+        hidden, step = self._mtp_state._mtp_hidden[:bsz], self._mtp_state._mtp_text_step[:bsz]
         ids.zero_()  # the MTP does not read token ids
         emb.zero_()
         torch.index_select(self._hidden_pool, 0, slots, out=hidden)
@@ -583,22 +584,22 @@ class MossLocalModelState(OmniModelState):
         buffers = [self.intermediate_buffer.buffers[int(batch.idx_mapping_np[row])] for row in rows]
         req_ids = [str(buf["req_id"]) for buf in buffers]
         generators = [
-            self._get_mtp_generator(req_id, buf.get("sampling_params"), ids.device)
+            self._mtp_state._get_mtp_generator(req_id, buf.get("sampling_params"), ids.device)
             for req_id, buf in zip(req_ids, buffers, strict=True)
         ]
         dispatcher = self._mtp_dispatcher
-        can_graph = self._is_mtp_graph_runner() and not any(g is not None for g in generators)
+        can_graph = self._mtp_state._is_mtp_graph_runner() and not any(g is not None for g in generators)
         desc = dispatcher(bsz) if can_graph and dispatcher is not None else None
         mode = getattr(desc, "cg_mode", CUDAGraphMode.FULL) if can_graph else CUDAGraphMode.NONE
         num_tokens = int(desc.num_tokens) if desc is not None else bsz
         with set_forward_context(
             None, self.vllm_config, num_tokens=num_tokens, cudagraph_runtime_mode=mode, batch_descriptor=desc
         ):
-            contribution, codes = self._call_mtp_with_sampling(
-                self._mtp_input_ids[:num_tokens],
-                self._mtp_input_embeds[:num_tokens],
-                self._mtp_hidden[:num_tokens],
-                self._mtp_text_step[:num_tokens],
+            contribution, codes = self._mtp_state._call_mtp_with_sampling(
+                self._mtp_state._mtp_input_ids[:num_tokens],
+                self._mtp_state._mtp_input_embeds[:num_tokens],
+                self._mtp_state._mtp_hidden[:num_tokens],
+                self._mtp_state._mtp_text_step[:num_tokens],
                 buffers=buffers,
                 req_ids=req_ids,
                 generators=generators,

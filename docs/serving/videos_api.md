@@ -309,7 +309,7 @@ curl -s http://localhost:8091/v1/videos/sync \
   `video`, or `audio`, each `{"upload_index": N}`. `image` and `video` cannot be
   combined. An upload may be reused by several entries but only for one
   modality; every upload must be referenced. At most 8 entries and 16 uploads.
-- Images use JPEG/PNG/WEBP/HEIC/HEIF (30 MiB), clips MP4/MOV (50 MiB), and audio
+- Images use JPEG/PNG/WEBP (30 MiB), clips MP4/MOV (50 MiB), and audio
   WAV/MP3/FLAC (15 MiB). A clip's soundtrack is never used; upload audio
   explicitly.
 - Let `N` be the aligned output frame count. A negative `frame_index` resolves
@@ -372,6 +372,8 @@ With `preencode_mp4` enabled, each committed VAE chunk leaves the accelerator an
 is encoded while later chunks are still decoding, so host transfer and CPU
 encoding overlap the remaining decode instead of following it. The response is
 unchanged: the same complete MP4, byte-for-byte equivalent frames.
+MiniMax-H3 also starts AAC encoding of the decoded audio early, overlapping it
+with video VAE decoding.
 
 ```bash
 curl -X POST http://localhost:8091/v1/videos/sync \

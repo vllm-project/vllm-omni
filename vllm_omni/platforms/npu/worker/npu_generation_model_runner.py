@@ -591,12 +591,15 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 for out in multimodal_outputs_raw:
                     per_req_payloads.append({"model_outputs": to_host.copy(out) if out is not None else None})
             elif isinstance(multimodal_outputs_raw, Mapping):
+                # Copy through the batch so a mapping payload keeps the same
+                # asynchronous D2H as the tensor and list branches above. A
+                # plain ``tensor.to("cpu")`` here blocks the caller per tensor.
                 per_req_payloads = [
                     _ensure_tensor_values(payload)
                     for payload in split_mapping_outputs(
                         multimodal_outputs_raw,
                         self.input_batch.num_reqs,
-                        lambda tensor: tensor.detach().to("cpu").contiguous(),
+                        to_host.copy,
                     )
                 ]
             else:

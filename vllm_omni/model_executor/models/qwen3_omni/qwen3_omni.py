@@ -111,10 +111,13 @@ logger = init_logger(__name__)
 _THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
     "supports_encoder_cudagraph",
     "encoder_cudagraph_single_replay",
+    "encoder_cudagraph_group_eligible",
     "get_encoder_cudagraph_config",
     "get_input_modality",
     "get_max_frames_per_video",
     "get_encoder_cudagraph_budget_range",
+    "get_encoder_cudagraph_path_max_budget",
+    "get_encoder_cudagraph_path_budgets",
     "get_encoder_cudagraph_item_specs",
     "select_encoder_cudagraph_items",
     "prepare_encoder_cudagraph_capture_inputs",
@@ -304,7 +307,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # since the residual codebooks depend only on CB0 and that step's
             # last hidden, and the next input is their embedding sum plus the
             # next text step (see ``talker_mtp``).
-            self.mtp_eager_frames = True
+            self.has_talker_mtp = True
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
             self._apply_subtalker_sampling_params(getattr(vllm_config.model_config, "subtalker_sampling_params", None))
 
@@ -796,7 +799,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
             # MRv2 passes each request's token span.
             spans = kwargs.get("request_token_spans")
-            if spans is not None and self.eager_frames_active and self.vllm_config.model_config.async_chunk:
+            if spans is not None and self.eager_frames_active:
                 return self._make_eager_talker_output(talker_hidden, spans)
             code_predictor_codes = [info.get("codes", {}).get("audio") for info in info_dicts]
             if spans is not None:
@@ -844,9 +847,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         return aligned
 
     def _make_eager_talker_output(self, hidden: torch.Tensor, spans: list[tuple[int, int]]) -> OmniOutput:
-        """Async-chunk output when the MRv2 runner completes frames after sampling.
+        """Current-step output when the MRv2 runner completes frames after sampling.
 
-        ``run_eager_mtp`` writes each sampled row's frame and validity into the
+        ``post_sample`` writes each sampled row's frame and validity into the
         last token row of its request span; every other row carries no frame.
         """
         num_tokens = spans[-1][1] if spans else 0

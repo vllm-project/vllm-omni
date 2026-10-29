@@ -31,6 +31,21 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
+_RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
+    {
+        "devices",
+        "max_batch_size",
+        "num_replicas",
+    }
+)
+
+_TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
+    {
+        "requires_full_payload_input",
+        "scheduling_metadata_adapter",
+    }
+)
+
 
 def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
     """Normalize promoted backends and enforce their precedence over extras."""
@@ -358,6 +373,14 @@ class StagePipelineConfig:
     supports_pending_generation: bool = False
     # Some stateful audio stages cannot roll back already consumed frames.
     supports_running_prefix_cache_reset: bool = True
+    # Recompute preemption (upstream's only mode) frees KV and replays the
+    # prompt. A native-AR stage whose decode step feeds more than the sampled
+    # token into the model -- side-channel codes, per-request hidden state,
+    # vocoder progress -- cannot rebuild that KV from the token stream. Under
+    # ``"fail"`` the scheduler reclaims the request's resources and emits one
+    # terminal error instead of requeuing it, so the caller never receives the
+    # spliced audio the replay would produce.
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -409,6 +432,9 @@ class StagePipelineConfig:
     # skips this stage and enters at stage 1 (e.g. Qwen3-ASR runs only for
     # requests with audio). Empty means every request runs it.
     bypass_without_modalities: tuple[str, ...] = ()
+    # Optional model-owned adapter for runner payload metadata that affects
+    # scheduling. The scheduler only receives its typed effects.
+    scheduling_metadata_adapter: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -642,6 +668,7 @@ class StageDeployConfig:
 
     enable_distributed_layerwise_offload: bool | None = None
     dlo_use_allgather: bool | None = None
+    dlo_chunk_size_mb: int | None = None
     dlo_resident_layers: int | None = None
     host_weight_runtime_mode: str | None = None
     host_weight_runtime_root: str | None = None
@@ -1132,6 +1159,14 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
     return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
 
 
+# Why a platform still rejects Model Runner V2. CUDA API aliases alone do not
+# adapt a platform worker, so an entry is removed only with the real integration.
+# NPU AR stages use the Ascend V2 runner (attention metadata and input state).
+_MRV2_UNSUPPORTED_PLATFORMS = {
+    "xpu": "the platform worker still uses the legacy chunk-transfer data plane",
+}
+
+
 def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
@@ -1208,11 +1243,10 @@ def _apply_platform_overrides(
         if stage.model_runner is not None and stage.model_runner not in ("v1", "v2"):
             raise ValueError(f"stage {stage.stage_id}: model_runner must be 'v1' or 'v2', got {stage.model_runner!r}")
     uses_v2 = deploy.model_runner == "v2" or any(stage.model_runner == "v2" for stage in deploy.stages)
-    if uses_v2 and platform in {"npu", "xpu"}:
-        raise NotImplementedError(
-            f"Model Runner V2 is not supported on {platform.upper()}: "
-            "the platform worker still uses the legacy chunk-transfer data plane."
-        )
+    if uses_v2 and platform is not None:
+        reason = _MRV2_UNSUPPORTED_PLATFORMS.get(platform)
+        if reason is not None:
+            raise NotImplementedError(f"Model Runner V2 is not supported on {platform.upper()}: {reason}.")
 
     return deploy
 
@@ -1365,6 +1399,9 @@ def _build_engine_args(
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     if not ps.supports_running_prefix_cache_reset:
         engine_args["supports_running_prefix_cache_reset"] = False
+    if ps.execution_type is StageExecutionType.LLM_AR and ps.recompute_preemption != "allow":
+        engine_args["recompute_preemption"] = ps.recompute_preemption
+    engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
     return engine_args
 
 
@@ -1608,15 +1645,23 @@ class StageConfig:
         # rationale as the platform-overlay deep-merge. Legacy atomic mappings
         # are handled explicitly below.
         for key, value in runtime_overrides.items():
-            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
-                existing = engine_args.get(key)
-                # ``omni_kv_config`` is an atomic legacy override: callers use
-                # a partial mapping to replace the topology-provided transfer
-                # role, rather than to add fields to it.
-                if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
-                    engine_args[key] = _get_recursively_merged_dict(existing, value)
-                else:
-                    engine_args[key] = value
+            if value is None or key in _RUNTIME_ONLY_OVERRIDE_FIELDS:
+                continue
+            if key in _TOPOLOGY_OWNED_ENGINE_FIELDS:
+                logger.warning(
+                    "Stage %s: ignoring runtime override for topology-owned field '%s'; keeping the pipeline value.",
+                    self.stage_id,
+                    key,
+                )
+                continue
+            existing = engine_args.get(key)
+            # ``omni_kv_config`` is an atomic legacy override: callers use
+            # a partial mapping to replace the topology-provided transfer
+            # role, rather than to add fields to it.
+            if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
+                engine_args[key] = _get_recursively_merged_dict(existing, value)
+            else:
+                engine_args[key] = value
 
         # Terminal-stage ownership comes from topology, not engine overrides.
         engine_args["final_output"] = self.final_output

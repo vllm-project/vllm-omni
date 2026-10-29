@@ -67,12 +67,14 @@ DIRECT_SKU_MARKER = "Direct SKU"
 BARE_PLATFORM_MARKER = "Bare platform"
 INVALID_HARDWARE_HELPER = "Invalid hardware helper"
 CONFLICTING_DEVICE_MARKERS = "Conflicting CPU/accelerator marks"
+CONFLICTING_PLATFORM_MARKERS = "Conflicting rocm/nvidia_only marks"
 _DISALLOWED_MARKERS = frozenset(
     {
         DIRECT_SKU_MARKER,
         BARE_PLATFORM_MARKER,
         INVALID_HARDWARE_HELPER,
         CONFLICTING_DEVICE_MARKERS,
+        CONFLICTING_PLATFORM_MARKERS,
     }
 )
 _PROBLEM_TEXT = {
@@ -80,6 +82,7 @@ _PROBLEM_TEXT = {
     BARE_PLATFORM_MARKER: "disallowed platform mark",
     INVALID_HARDWARE_HELPER: "invalid hardware helper",
     CONFLICTING_DEVICE_MARKERS: "conflicting CPU/accelerator marks",
+    CONFLICTING_PLATFORM_MARKERS: "conflicting rocm and nvidia_only marks",
     MISSING_LEVEL_MARKER: "missing level mark",
     MISSING_HARDWARE_MARKER: "missing hardware mark",
 }
@@ -293,7 +296,7 @@ def _walk_without_pytest_params(root: ast.AST):
 
 
 def hardware_contract_errors(contents: str) -> list[str]:
-    """Validate collection-time helper calls and CPU/accelerator mark conflicts.
+    """Validate collection-time helper calls and incompatible mark combinations.
 
     Test modules are never imported. Dynamic helper arguments remain subject to
     runtime collection, and calls inside test bodies stay available to negative
@@ -418,41 +421,79 @@ def hardware_contract_errors(contents: str) -> list[str]:
 
     accelerator_marks = platforms | {"gpu"}
 
-    def has_conflict(marks: set[str]) -> bool:
-        return "cpu" in marks and bool(marks & accelerator_marks)
+    def conflict_kinds(marks: set[str]) -> set[str]:
+        kinds: set[str] = set()
+        if "cpu" in marks and bool(marks & accelerator_marks):
+            kinds.add(CONFLICTING_DEVICE_MARKERS)
+        # nvidia_only is an explicit NVIDIA dependency. A ROCm qualification
+        # mark on the same item would both select and exclude that test.
+        if "rocm" in marks and "nvidia_only" in marks:
+            kinds.add(CONFLICTING_PLATFORM_MARKERS)
+        return kinds
 
-    def conflicting_marks(body, inherited: set[str]) -> bool:
+    def parameter_mark_axes(decorators: list[ast.expr]) -> list[list[set[str]]]:
+        """Return one mark axis for each statically specified parametrization."""
+        axes: list[list[set[str]]] = []
+        for decorator in decorators:
+            if not isinstance(decorator, ast.Call) or _name(decorator.func) != "parametrize":
+                continue
+            values = (
+                decorator.args[1]
+                if len(decorator.args) > 1
+                else next(
+                    (keyword.value for keyword in decorator.keywords if keyword.arg == "argvalues"),
+                    None,
+                )
+            )
+            if not isinstance(values, (ast.List, ast.Tuple, ast.Set)):
+                continue
+            axes.append(
+                [
+                    device_marks([value]) if isinstance(value, ast.Call) and _name(value.func) == "param" else set()
+                    for value in values.elts
+                ]
+                or [set()]
+            )
+        return axes
+
+    def expand_parameter_marks(base: list[set[str]], decorators: list[ast.expr]) -> list[set[str]]:
+        effective = base
+        for axis in parameter_mark_axes(decorators):
+            effective = [marks | parameter_marks for marks in effective for parameter_marks in axis]
+        return effective
+
+    def conflicting_marks(body, inherited: list[set[str]]) -> set[str]:
         scope_marks = []
         for node in body:
             if isinstance(node, ast.Assign) and any(_name(target) == "pytestmark" for target in node.targets):
                 scope_marks.append(node.value)
             elif isinstance(node, ast.AnnAssign) and _name(node.target) == "pytestmark" and node.value:
                 scope_marks.append(node.value)
-        inherited = inherited | device_marks(scope_marks)
-        if has_conflict(inherited):
-            return True
+        scope_device_marks = device_marks(scope_marks)
+        inherited = [marks | scope_device_marks for marks in inherited]
+        found = set().union(*(conflict_kinds(marks) for marks in inherited))
 
         for node in body:
             if isinstance(node, ast.ClassDef):
                 class_marks = device_marks(node.decorator_list, _walk_without_pytest_params)
-                if conflicting_marks(node.body, inherited | class_marks):
-                    return True
+                class_variants = expand_parameter_marks(
+                    [marks | class_marks for marks in inherited],
+                    node.decorator_list,
+                )
+                found |= conflicting_marks(node.body, class_variants)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
-                shared = inherited | device_marks(node.decorator_list, _walk_without_pytest_params)
-                if has_conflict(shared):
-                    return True
-                parameter_calls = [
-                    child
-                    for decorator in node.decorator_list
-                    for child in ast.walk(decorator)
-                    if isinstance(child, ast.Call) and _name(child.func) == "param"
-                ]
-                if any(has_conflict(shared | device_marks([call])) for call in parameter_calls):
-                    return True
-        return False
+                function_marks = device_marks(node.decorator_list, _walk_without_pytest_params)
+                variants = expand_parameter_marks(
+                    [marks | function_marks for marks in inherited],
+                    node.decorator_list,
+                )
+                found |= set().union(*(conflict_kinds(marks) for marks in variants))
+        return found
 
-    conflict = conflicting_marks(tree.body, set())
-    return ([INVALID_HARDWARE_HELPER] if invalid else []) + ([CONFLICTING_DEVICE_MARKERS] if conflict else [])
+    conflicts = conflicting_marks(tree.body, [set()])
+    return ([INVALID_HARDWARE_HELPER] if invalid else []) + [
+        kind for kind in (CONFLICTING_DEVICE_MARKERS, CONFLICTING_PLATFORM_MARKERS) if kind in conflicts
+    ]
 
 
 def get_files_missing_markers(
