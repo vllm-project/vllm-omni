@@ -168,7 +168,10 @@ these errors on the job record rather than the creation response.
   even with empty default ranges. Under regional compilation each Wan2.2
   attention call is one opaque op inside the block graph, on every request
   including `[]`; the op picks the profile when it runs, so the block stays one
-  graph. H3 selects outside the compiled graph (below).
+  graph. Because the op changes the compiled graph, a `[]` request on a
+  scheduled server is not bit-identical to the same request on a server without
+  profiles under regional compilation; eager runs are bit-identical.
+  H3 selects outside the compiled graph (below).
   The op carries `attn_mask`, a `video_layout` without video spans and `extra`
   entries holding None, bools, ints or int tuples (a video grid). Other metadata
   (tensors, floats or strings in `extra`, video spans, and any other metadata
