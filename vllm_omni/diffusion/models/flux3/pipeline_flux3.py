@@ -689,6 +689,8 @@ class Flux3Pipeline(
         pad_cfg_text = self.batch_cfg and text_len_neg != text_len_pos and not cache_dit
         batch_cfg = self.batch_cfg and (text_len_neg == text_len_pos or pad_cfg_text)
 
+        use_cfg = guidance_scale != 1.0
+
         # Precompute text and positional encodings that are constant across all denoising steps.
         # ids_by_mod collects all latent positional ID tensors (fixed geometry, never change).
         ids_by_mod: dict[str, torch.Tensor] = {latent_key: latent_ids}
@@ -704,7 +706,7 @@ class Flux3Pipeline(
                 if key.endswith("_cond"):
                     static_content[key] = (value, cond_kwargs[f"{key}_timesteps"])
 
-        if pad_cfg_text:
+        if use_cfg and pad_cfg_text:
             # Fused B=2 forward over text padded to the longer branch. Static text
             # streams are computed per branch at their own length, then padded.
             text_len = max(text_len_neg, text_len_pos)
@@ -723,7 +725,7 @@ class Flux3Pipeline(
                 _pad_seq(t, text_len)
                 for t in (ctx_neg, ctx_ids_neg, timesteps_ctx_neg, ctx_pos, ctx_ids_pos, timesteps_ctx_pos)
             )
-        elif batch_cfg:
+        elif use_cfg and batch_cfg:
             # Single fused B=2 forward — precompute once for the full (neg+pos) batch.
             # Latent IDs are fixed geometry: repeat to B=2 so pe_by_mod matches the doubled latents.
             ctx = torch.cat([ctx_neg, ctx_pos], dim=0)
@@ -746,13 +748,17 @@ class Flux3Pipeline(
             precomputed_neg = None  # not used: batch_cfg merges both into positive_kwargs
         else:
             # Two separate B=1 forwards — precompute independently for neg and pos.
-            precomputed_neg = self.transformer.precompute_static_conditioning(
-                ctx_neg,
-                ctx_ids_neg,
-                vector_neg,
-                timesteps_ctx_neg,
-                ids_by_mod=ids_by_mod,
-                static_content=static_content,
+            precomputed_neg = (
+                self.transformer.precompute_static_conditioning(
+                    ctx_neg,
+                    ctx_ids_neg,
+                    vector_neg,
+                    timesteps_ctx_neg,
+                    ids_by_mod=ids_by_mod,
+                    static_content=static_content,
+                )
+                if use_cfg
+                else None
             )
             precomputed_pos = self.transformer.precompute_static_conditioning(
                 ctx_pos,
@@ -800,10 +806,10 @@ class Flux3Pipeline(
                     **stable_neg,
                 }
                 noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=True,
+                    do_true_cfg=use_cfg,
                     true_cfg_scale=guidance_scale,
                     positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
+                    negative_kwargs=negative_kwargs if use_cfg else None,
                     batch_cfg=batch_cfg,
                 )
                 latents = latents + (t_prev - t_curr) * noise_pred
