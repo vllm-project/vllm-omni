@@ -4257,7 +4257,8 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # Initialize vision encoder (SigLIP)
         if multimodal_config.get_limit_per_prompt("image"):
             # Set attention implementation
-            # (an engine override, else the vision config, else SDPA: eager math without the (B, H, L, L) scores)
+            # Preserve SDPA by default on all platforms. Explicit engine/vision
+            # overrides still win; eager remains available for reference comparisons.
             if getattr(getattr(vllm_config, "model_config", None), "_attn_implementation", None) is not None:
                 config.vision_config._attn_implementation = vllm_config.model_config._attn_implementation
             else:

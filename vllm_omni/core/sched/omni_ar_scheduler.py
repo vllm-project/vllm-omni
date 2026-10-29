@@ -345,7 +345,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return is_final
 
     def _init_prefill_admission_policy(self) -> None:
-        """Optional prefill batching under load (stage connector ``extra``).
+        """Optional prefill batching under load (stage connector ``extra`` or ``additional_config``).
 
         While at least ``ar_prefill_admission_min_running`` requests run, a new
         request waits until ``ar_prefill_admission_min_batch`` requests wait or
@@ -359,6 +359,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if isinstance(connector_config, dict)
             else getattr(connector_config, "extra", None)
         ) or {}
+        # A stage without a configured connector edge sets the same keys in additional_config.
+        additional = getattr(self.vllm_config, "additional_config", None)
+        extra = {**(additional if isinstance(additional, dict) else {}), **extra}
         self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
         self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
         self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
@@ -366,6 +369,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             raise ValueError("ar_prefill_admission_min_batch > 1 needs ar_prefill_admission_max_wait_ms > 0")
         if self._prefill_admission_min_running < 0:
             raise ValueError("ar_prefill_admission_min_running must be >= 0")
+        if self._prefill_admission_min_batch > 1:
+            logger.info(
+                "Prefill admission batching: %d requests or %.0f ms while >= %d run",
+                self._prefill_admission_min_batch,
+                self._prefill_admission_max_wait_s * 1000,
+                self._prefill_admission_min_running,
+            )
 
     def _should_defer_waiting_admission(self) -> bool:
         min_batch = getattr(self, "_prefill_admission_min_batch", 0)
@@ -813,7 +823,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
         # Token-only processors need sampled IDs even without a tensor payload.
         processor = getattr(getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_func", None)
-        requires_token_updates = getattr(processor, "requires_token_updates", False) is True
+        requires_token_updates = (
+            getattr(processor, "requires_token_updates", False) is True
+            or getattr(processor, "_requires_full_token_history", False) is True
+        )
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)
@@ -988,6 +1001,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
 
             status_before_stop = request.status
+            sampling_validation_failed = False
+            model_error = (getattr(model_runner_output, "request_errors", None) or {}).get(req_id)
+            if model_error is None and req_id in getattr(model_runner_output, "invalid_logits_req_ids", ()):
+                model_error = "Sampling received a row with no finite logits"
+            if model_error is not None:
+                request.status = RequestStatus.FINISHED_ERROR
+                request.stop_reason = model_error
+                request.resumable = False
+                generated_token_ids = []
+                sampling_validation_failed = True
             pre_updated = None
             if (
                 fast_decode
@@ -1026,7 +1049,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Stopped this step: the general path below finishes the request.
                 pre_updated = new_token_ids, stopped
             new_logprobs = None
-            logprob_validation_failed = False
 
             # Validate before mutating request token state. A bad runner output
             # is request-local: terminate only this request and keep processing
@@ -1044,7 +1066,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.stop_reason = str(exc)
                     request.resumable = False
                     generated_token_ids = []
-                    logprob_validation_failed = True
+                    sampling_validation_failed = True
 
             scheduled_spec_token_ids = spec_decode_tokens.get(req_id) if spec_decode_tokens else None
             if scheduled_spec_token_ids and generated_token_ids:
@@ -1126,13 +1148,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
-            stopped = logprob_validation_failed
+            stopped = sampling_validation_failed
             is_segment_finished = False
             finished = False
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
+            if sampling_validation_failed:
+                pooler_output = mm_output = inter_stage_output = None
             kv_transfer_params = None
             ec_transfer_params = None
             finish_reason = None

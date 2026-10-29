@@ -62,6 +62,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+from vllm_omni.model_executor.models.qwen3_omni.tool_speech import spoken_span_end
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
@@ -110,10 +111,13 @@ logger = init_logger(__name__)
 _THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
     "supports_encoder_cudagraph",
     "encoder_cudagraph_single_replay",
+    "encoder_cudagraph_group_eligible",
     "get_encoder_cudagraph_config",
     "get_input_modality",
     "get_max_frames_per_video",
     "get_encoder_cudagraph_budget_range",
+    "get_encoder_cudagraph_path_max_budget",
+    "get_encoder_cudagraph_path_budgets",
     "get_encoder_cudagraph_item_specs",
     "select_encoder_cudagraph_items",
     "prepare_encoder_cudagraph_capture_inputs",
@@ -303,7 +307,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # since the residual codebooks depend only on CB0 and that step's
             # last hidden, and the next input is their embedding sum plus the
             # next text step (see ``talker_mtp``).
-            self.mtp_eager_frames = True
+            self.has_talker_mtp = True
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
             self._apply_subtalker_sampling_params(getattr(vllm_config.model_config, "subtalker_sampling_params", None))
 
@@ -795,7 +799,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
             # MRv2 passes each request's token span.
             spans = kwargs.get("request_token_spans")
-            if spans is not None and self.eager_frames_active and self.vllm_config.model_config.async_chunk:
+            if spans is not None and self.eager_frames_active:
                 return self._make_eager_talker_output(talker_hidden, spans)
             code_predictor_codes = [info.get("codes", {}).get("audio") for info in info_dicts]
             if spans is not None:
@@ -843,9 +847,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         return aligned
 
     def _make_eager_talker_output(self, hidden: torch.Tensor, spans: list[tuple[int, int]]) -> OmniOutput:
-        """Async-chunk output when the MRv2 runner completes frames after sampling.
+        """Current-step output when the MRv2 runner completes frames after sampling.
 
-        ``run_eager_mtp`` writes each sampled row's frame and validity into the
+        ``post_sample`` writes each sampled row's frame and validity into the
         last token row of its request span; every other row carries no frame.
         """
         num_tokens = spans[-1][1] if spans else 0
@@ -1298,8 +1302,11 @@ class Qwen3OmniMoeForConditionalGeneration(
                 )
                 talker_input_embeds.append(talker_user_part)
                 talker_input_ids.append(thinker_result_ids[im_start_index:segment_end_index])
-            # Take assistant output (for now)
+            # Take assistant output (for now). A tool call is not speech:
+            # keep the preface and stop at the <tool_call> token so its
+            # hidden state never becomes a Talker text step.
             elif role_token == self.config.assistant_token_id and i == len(im_start_indexes) - 2:
+                segment_end_index = spoken_span_end(result_ids.reshape(-1).tolist(), im_start_index, segment_end_index)
                 talker_assistant_embeds, talker_assistant_ids, trailing_text_hidden = self._get_talker_assistant_parts(
                     im_start_index,
                     segment_end_index,
@@ -1723,44 +1730,34 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights for all components of the omni model."""
+        """Stream weights into the active component of the omni model."""
         loaded_weights = set()
-        thinker_weights = []
-        talker_weights = []
+        known_prefixes = ("thinker.", "talker.", "code2wav.")
+        first_frame_decoder = getattr(self, "first_frame_decoder", None)
         code2wav_weights = []
 
-        # Separate weights by component
-        for k, v in weights:
-            if k.startswith("thinker."):
-                thinker_weights.append((k, v))
-            elif k.startswith("talker."):
-                talker_weights.append((k, v))
-            elif k.startswith("code2wav."):
-                code2wav_weights.append((k, v))
-            else:
-                logger.warning(f"Unknown weight prefix: {k}")
-        # Load thinker weights
-        if self.thinker and thinker_weights:
-            thinker_loaded = self.thinker.load_weights(thinker_weights)
+        def stage_weights(prefix: str) -> Iterable[tuple[str, torch.Tensor]]:
+            for name, weight in weights:
+                if name.startswith(prefix):
+                    yield name, weight
+                elif first_frame_decoder is not None and name.startswith("code2wav."):
+                    # The Talker also needs Code2Wav weights for its first frame.
+                    # Keep CPU copies so deferred loading cannot retain GPU shards.
+                    code2wav_weights.append((name, weight.to(device="cpu", copy=True)))
+                elif not name.startswith(known_prefixes):
+                    logger.warning(f"Unknown weight prefix: {name}")
+
+        if self.thinker:
+            thinker_loaded = self.thinker.load_weights(stage_weights("thinker."))
             thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, "thinker")
             loaded_weights.update(thinker_loaded)
-
-        # Load talker weights
-        if self.talker and talker_weights:
-            talker_loaded = self.talker.load_weights(talker_weights)
+        elif self.talker:
+            talker_loaded = self.talker.load_weights(stage_weights("talker."))
             talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
             loaded_weights.update(talker_loaded)
             loaded_weights.update(self._init_special_tokens_embeddings())
-
-        # The Talker's first-frame decoder is a Code2Wav copy (same code2wav.* weights).
-        first_frame_decoder = getattr(self, "first_frame_decoder", None)
-        if first_frame_decoder is not None and code2wav_weights:
-            decoder_loaded = first_frame_decoder.load_weights(code2wav_weights)
-            loaded_weights.update(add_prefix_to_loaded_weights(decoder_loaded, "first_frame_decoder.code2wav"))
-
-        # Load code2wav weights
-        if self.code2wav and code2wav_weights:
-            code2wav_loaded = self.code2wav.load_weights(code2wav_weights)
+        elif self.code2wav:
+            code2wav_loaded = self.code2wav.load_weights(stage_weights("code2wav."))
             code2wav_loaded = add_prefix_to_loaded_weights(code2wav_loaded, "code2wav")
             loaded_weights.update(code2wav_loaded)
 
@@ -1774,6 +1771,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                     "Failed to enable CUDA Graph for Code2Wav; falling back to eager.",
                     exc_info=True,
                 )
+
+        if first_frame_decoder is not None and code2wav_weights:
+            decoder_loaded = first_frame_decoder.load_weights(code2wav_weights)
+            loaded_weights.update(add_prefix_to_loaded_weights(decoder_loaded, "first_frame_decoder.code2wav"))
 
         # Log summary
         logger.info(

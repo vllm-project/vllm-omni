@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import argparse
 import asyncio
 import contextlib
 import io
@@ -39,6 +40,7 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     _update_headers_common,
     _update_payload_common,
     _validate_api_url,
+    async_request_profile,
 )
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
@@ -82,6 +84,7 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_serving import (
     get_duplex_eval_samples,
     prepare_duplex_eval_sample,
 )
+from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_NONE
 from vllm_omni.benchmarks.omniinteract import (
     VIDEO_FPS,
     OmniInteractBenchmarkConfig,
@@ -259,12 +262,19 @@ _LEGACY_REQUEST_TIMEOUT_S = 6 * 60 * 60.0
 # Set from the ``--omni-request-timeout-s`` CLI flag by ``vllm bench serve``
 # before the benchmark session is built (``None`` = use the default above).
 _REQUEST_TIMEOUT_OVERRIDE_S: float | None = None
+_FAIL_FAST_ON_TIMEOUT = False
 
 
 def set_request_timeout_s(value: float) -> None:
     """Record the explicitly requested per-request timeout (from the CLI)."""
     global _REQUEST_TIMEOUT_OVERRIDE_S
     _REQUEST_TIMEOUT_OVERRIDE_S = float(value)
+
+
+def set_fail_fast_on_timeout(enabled: bool) -> None:
+    """Enable cancellation of the remaining benchmark requests after a timeout."""
+    global _FAIL_FAST_ON_TIMEOUT
+    _FAIL_FAST_ON_TIMEOUT = bool(enabled)
 
 
 def _omni_request_timeout_s() -> float:
@@ -654,10 +664,12 @@ def get_samples(args, tokenizer, **kwargs):
             output_root=output_root,
             timeout_s=float(getattr(args, "omniinteract_timeout_s")),
             media_timeout_s=float(getattr(args, "omniinteract_media_timeout_s")),
-            ref_audio=str(getattr(args, "omniinteract_ref_audio")),
+            ref_audio=getattr(args, "omniinteract_ref_audio", None) or None,
             require_response=bool(getattr(args, "omniinteract_require_response")),
             max_video_duration_s=float(getattr(args, "omniinteract_max_video_duration_s")),
             evaluation=evaluation,
+            turn_detection=str(getattr(args, "omniinteract_turn_detection", TURN_DETECTION_NONE)),
+            instructions=getattr(args, "omniinteract_instructions", None) or None,
         )
         requests = dataset.sample(
             tokenizer,
@@ -670,7 +682,6 @@ def get_samples(args, tokenizer, **kwargs):
         from vllm_omni.clients.duplex import reference_audio_data_url
 
         encoded_ref_audio = reference_audio_data_url(options.ref_audio)
-        assert encoded_ref_audio is not None
         for request in requests:
             case = request.omniinteract_case
             assert isinstance(request, OmniInteractSampleRequest) and case is not None
@@ -950,6 +961,8 @@ if _serve_mod is not None:
 
 @dataclass
 class MixRequestFuncOutput(RequestFuncOutput):
+    timed_out: bool = False
+    cancelled_after_timeout: bool = False
     audio_ttfp: float = 0.0
     audio_duration: float = 0.0
     audio_frames: int = 0
@@ -1895,6 +1908,10 @@ def _apply_video_metrics_from_payload(
         output.video_rtf = output.latency / output.video_duration
 
 
+def _is_retryable_omni_error(error: object) -> bool:
+    return isinstance(error, dict) and error.get("type") == "ServiceUnavailableError" and error.get("code") == 503
+
+
 async def async_request_openai_chat_omni_completions(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -1953,6 +1970,8 @@ async def async_request_openai_chat_omni_completions(
     output.prompt_len = request_func_input.prompt_len
     max_retries = 3
     retry_delay = 0.1
+    st = time.perf_counter()
+    output.start_time = st
     for attempt in range(max_retries + 1):
         # Reset per-attempt state so that retries do not mix partial
         # outputs or metrics from previous attempts.
@@ -1965,8 +1984,6 @@ async def async_request_openai_chat_omni_completions(
         first_inconsistent_wav_params: tuple[int, int, int] | None = None
         # For non-wav responses, accumulate encoded bytes then decode once.
         audio_bytes_buffer = bytearray()
-        st = time.perf_counter()
-        output.start_time = st
         most_recent_timestamp = st
         timestamp = st
         audio_generate_time = 0.0
@@ -1981,6 +1998,8 @@ async def async_request_openai_chat_omni_completions(
         output.output_tokens = 0
         output.error = ""
         output.success = False
+        output.timed_out = False
+        output.cancelled_after_timeout = False
         output.stage_metrics = {}
         output.stage_id = None
         output.final_output_type = None
@@ -1992,6 +2011,9 @@ async def async_request_openai_chat_omni_completions(
         output.stage_durations = None
         completion_tokens_seen = 0
         streaming_error_received = False
+        streaming_errors_retryable = True
+        retryable_response = False
+        response_output_received = False
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
@@ -2021,11 +2043,23 @@ async def async_request_openai_chat_omni_completions(
                                 data = json.loads(chunk)
                                 if (streaming_error := data.get("error")) is not None:
                                     streaming_error_received = True
+                                    streaming_errors_retryable &= _is_retryable_omni_error(streaming_error)
                                     if isinstance(streaming_error, dict):
                                         output.error = str(streaming_error.get("message") or streaming_error)
                                     else:
                                         output.error = str(streaming_error)
                                     continue
+                                # Any visible choice makes replay unsafe, including
+                                # tool/reasoning/audio/image deltas and n > 1.
+                                for streamed_choice in data.get("choices") or []:
+                                    streamed_delta = streamed_choice.get("delta") or {}
+                                    if (
+                                        streamed_choice.get("token_ids")
+                                        or streamed_choice.get("text")
+                                        or streamed_choice.get("message")
+                                        or any(value for key, value in streamed_delta.items() if key != "role")
+                                    ):
+                                        response_output_received = True
                                 _update_output_stage_metrics_from_payload(output, data)
                                 _update_output_peak_memory_from_payload(output, data)
                                 _update_output_stage_durations_from_payload(output, data)
@@ -2211,15 +2245,41 @@ async def async_request_openai_chat_omni_completions(
                             except Exception as ex:
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
                     output.success = not streaming_error_received
+                    retryable_response = streaming_error_received and streaming_errors_retryable
                 else:
                     output.error = response.reason or ""
                     output.success = False
+                    if response.status == 503:
+                        try:
+                            error_payload = await response.json(content_type=None)
+                        except ValueError:
+                            error_payload = None
+                        if isinstance(error_payload, dict):
+                            error = error_payload.get("error")
+                            retryable_response = _is_retryable_omni_error(error)
+                            if isinstance(error, dict):
+                                output.error = str(error.get("message") or error)
+                    output.latency = time.perf_counter() - st
+            if retryable_response and not response_output_received and attempt < max_retries:
+                logger.warning(
+                    "Retryable omni request error before output: attempt=%d/%d", attempt + 1, max_retries + 1
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+            break
+        except (asyncio.TimeoutError, TimeoutError, aiohttp.ServerTimeoutError):
+            output.success = False
+            output.timed_out = True
+            output.error = traceback.format_exc()
+            output.latency = time.perf_counter() - st
+            logger.error("Omni benchmark request timed out after %.1fs", output.latency)
             break
         except aiohttp.ClientError as e:
             # transient transport error: may retry
             output.success = False
             output.error = traceback.format_exc()
-            if attempt < max_retries:
+            output.latency = time.perf_counter() - st
+            if attempt < max_retries and not response_output_received:
                 logger.warning(
                     "ClientError in omni benchmark request (will retry): attempt=%d/%d delay=%.2fs: %s",
                     attempt + 1,
@@ -2237,6 +2297,7 @@ async def async_request_openai_chat_omni_completions(
         except Exception:
             output.success = False
             output.error = traceback.format_exc()
+            output.latency = time.perf_counter() - st
             logger.error(f"ERROR: send request failed, reason is: {output.error}")
             break
 
@@ -2909,6 +2970,8 @@ async def _async_request_omniinteract(
             require_response=options.require_response,
             extra_headers=headers or None,
             extra_body=dict(request_func_input.extra_body or {}) or None,
+            turn_detection=options.turn_detection,
+            instructions=options.instructions,
         )
         case_result = await run_omniinteract_case(
             case,
@@ -2973,8 +3036,8 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
     output.tpot_measured = False
     try:
         sample = getattr(request, "duplex_eval_sample", None)
-        if not isinstance(sample, OmniDuplexEvalSampleRequest) or sample.sample is None or sample.ref_audio is None:
-            raise ValueError("Omni-DuplexEval requires a dataset sample and reference audio")
+        if not isinstance(sample, OmniDuplexEvalSampleRequest) or sample.sample is None:
+            raise ValueError("Omni-DuplexEval requires a dataset sample")
         # The benchmark's concurrency slot bounds live decoded inputs. Keep
         # preparation off the event loop and outside this session's latency;
         # throughput still includes any client preparation stalls.
@@ -2990,8 +3053,11 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
                 ref_audio=sample.ref_audio,
                 output_root=sample.response_root,
                 fps=sample.fps,
+                mix=sample.mix,
                 prepared=prepared,
                 defer_artifacts=True,
+                turn_detection=sample.turn_detection,
+                instructions=sample.instructions,
                 additional_headers=headers or None,
                 extra_body=dict(request.extra_body or {}),
             ),
@@ -3111,6 +3177,7 @@ class _RealtimeTTSProbe:
                 continue
             self._client = client
             break
+        self._client.attach_event_collector(self.events)
         self._consume_task = asyncio.create_task(self.events.consume(self._client))
 
     async def send(self, event: dict[str, object]) -> None:
@@ -3261,18 +3328,25 @@ async def async_request_openai_realtime_duplex(
                 if not isinstance(request_metrics, dict):
                     raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
                 turn_timings.append(timing)
-                turn_metrics.append(
+                metric = {
+                    "session_id": session_id,
+                    "request_index": request_index,
+                    "utterance_id": utterance_id or None,
+                    "response_id": response_id,
+                    **request_metrics,
+                    # The client reports raw data only; the RTF is derived
+                    # here with the canonical server-side definition.
+                    "rtf": _audio_rtf_from_raw_metric(request_metrics),
+                }
+                client_rtf = _audio_rtf_from_raw_metric(
                     {
-                        "session_id": session_id,
-                        "request_index": request_index,
-                        "utterance_id": utterance_id or None,
-                        "response_id": response_id,
-                        **request_metrics,
-                        # The client reports raw data only; the RTF is derived
-                        # here with the canonical server-side definition.
-                        "rtf": _audio_rtf_from_raw_metric(request_metrics),
+                        "audio_generation_ms": request_metrics.get("client_audio_generation_ms"),
+                        "audio_duration_ms": request_metrics.get("audio_duration_ms"),
                     }
                 )
+                if client_rtf is not None:
+                    metric["client_rtf"] = client_rtf
+                turn_metrics.append(metric)
                 response_audio = client.events.audio_bytes(response_id)
                 turn_pcm_bytes.append(
                     _pcm_s16le_to_seed_tts_wer_bytes(
@@ -3415,11 +3489,22 @@ from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
     has_metric_samples,
+    validate_goodput_config,
 )
 
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def check_goodput_args(args: argparse.Namespace) -> dict[str, float]:
+    """Parse goodput SLOs with vLLM-Omni request-level metrics."""
+    if not args.goodput:
+        return {}
+
+    goodput_config_dict = serve.parse_goodput(args.goodput)
+    validate_goodput_config(goodput_config_dict)
+    return goodput_config_dict
 
 
 def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
@@ -3433,6 +3518,73 @@ def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
     merged = dict(base or {})
     merged.update(overrides or {})
     return merged
+
+
+def _cancelled_after_timeout_output(request: RequestFuncInput) -> MixRequestFuncOutput:
+    output = MixRequestFuncOutput(
+        success=False,
+        prompt_len=request.prompt_len,
+        error="Cancelled after another benchmark request timed out.",
+        cancelled_after_timeout=True,
+    )
+    output.start_time = time.perf_counter()
+    return output
+
+
+async def _gather_request_outputs(
+    tasks: list[asyncio.Task[MixRequestFuncOutput]],
+    request_inputs: list[RequestFuncInput],
+    *,
+    pbar: tqdm | None = None,
+) -> list[MixRequestFuncOutput]:
+    """Gather in request order and cancel unfinished work after the first timeout."""
+    if len(tasks) != len(request_inputs):
+        raise ValueError("request task and input counts must match")
+    outputs: list[MixRequestFuncOutput | None] = [None] * len(tasks)
+    task_indexes = {task: index for index, task in enumerate(tasks)}
+    pending = set(tasks)
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            timed_out = False
+            for task in done:
+                output = task.result()
+                outputs[task_indexes[task]] = output
+                timed_out |= bool(getattr(output, "timed_out", False))
+            if not timed_out:
+                continue
+
+            ordered_pending = [task for task in tasks if task in pending]
+            logger.error(
+                "Benchmark request timed out; cancelling %d queued or in-flight requests",
+                len(ordered_pending),
+            )
+            for task in ordered_pending:
+                task.cancel()
+            settled = await asyncio.gather(*ordered_pending, return_exceptions=True)
+            unexpected: BaseException | None = None
+            for task, result in zip(ordered_pending, settled, strict=True):
+                index = task_indexes[task]
+                if isinstance(result, asyncio.CancelledError):
+                    outputs[index] = _cancelled_after_timeout_output(request_inputs[index])
+                    if pbar is not None:
+                        pbar.update(1)
+                elif isinstance(result, BaseException):
+                    unexpected = unexpected or result
+                else:
+                    outputs[index] = result
+            pending.clear()
+            if unexpected is not None:
+                raise unexpected
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    if any(output is None for output in outputs):
+        raise RuntimeError("benchmark request gathering produced incomplete outputs")
+    return [output for output in outputs if output is not None]
 
 
 async def benchmark(
@@ -3560,23 +3712,11 @@ async def benchmark(
 
     if profile:
         print("Starting profiler...")
-        profile_input = RequestFuncInput(
-            model=model_id,
-            model_name=model_name,
-            prompt=test_prompt,
-            api_url=base_url + "/start_profile",
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
-            multi_modal_content=test_mm_content,
-            ignore_eos=ignore_eos,
+        profile_output = await async_request_profile(
+            base_url + "/start_profile",
+            session,
             extra_headers=extra_headers,
-            extra_body=test_extra_body,
-            chat_messages=test_chat_messages,
         )
-        _attach_omni_chat_to_request_func_input(input_requests[0], profile_input)
-        _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
-        profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
             print("Profiler started")
 
@@ -3629,6 +3769,7 @@ async def benchmark(
     _prepare_omniinteract_batch(input_requests)
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    request_func_inputs: list[RequestFuncInput] = []
 
     rps_change_events = []
     last_int_rps = -1
@@ -3689,14 +3830,24 @@ async def benchmark(
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
         attach_duplex_eval(request, request_func_input)
+        request_func_inputs.append(request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
-    outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
+    if _FAIL_FAST_ON_TIMEOUT:
+        outputs = await _gather_request_outputs(tasks, request_func_inputs, pbar=pbar)
+    else:
+        outputs = await asyncio.gather(*tasks)
+    fail_fast_triggered = any(getattr(output, "timed_out", False) for output in outputs)
 
     if probe_task is not None:
         probe_stop.set()
-        await probe_task
+        if _FAIL_FAST_ON_TIMEOUT and fail_fast_triggered:
+            probe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await probe_task
+        else:
+            await probe_task
 
     if pbar is not None:
         pbar.close()
@@ -3785,7 +3936,10 @@ async def benchmark(
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
-            "max_output_tokens_per_s": mm_metrics.max_output_tokens_per_s,
+            # Missing duplex token timelines remain unmeasured in JSON.
+            "max_output_tokens_per_s": (
+                mm_metrics.max_output_tokens_per_s if np.isfinite(mm_metrics.max_output_tokens_per_s) else None
+            ),
             "max_concurrent_requests": mm_metrics.max_concurrent_requests,
             "rtfx": mm_metrics.rtfx,
         }
@@ -3809,6 +3963,10 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    result["timed_out_requests"] = sum(bool(getattr(output, "timed_out", False)) for output in outputs)
+    result["cancelled_after_timeout_requests"] = sum(
+        bool(getattr(output, "cancelled_after_timeout", False)) for output in outputs
+    )
     # Preserve request order, including missing snapshots, so CI can verify
     # fixed stage workloads without parsing logs or storing audio payloads.
     request_stage_metrics = [
@@ -3826,6 +3984,14 @@ async def benchmark(
     ]
     if duplex_request_metrics:
         result["duplex_request_metrics"] = duplex_request_metrics
+        from vllm_omni.benchmarks.duplex_session_metrics import (
+            duplex_response_latency_metrics,
+            print_duplex_response_latency_metrics,
+        )
+
+        response_latency = duplex_response_latency_metrics(duplex_request_metrics)
+        result.update(response_latency)
+        print_duplex_response_latency_metrics(response_latency)
     duplex_session_metrics = [
         session_metrics
         for output in outputs
@@ -3964,17 +4130,11 @@ async def benchmark(
 
     if profile:
         print("Stopping profiler...")
-        profile_input = RequestFuncInput(
-            model=model_id,
-            prompt=test_prompt,
-            api_url=base_url + "/stop_profile",
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
-            extra_body=test_extra_body,
-            chat_messages=test_chat_messages,
+        profile_output = await async_request_profile(
+            base_url + "/stop_profile",
+            session,
+            extra_headers=extra_headers,
         )
-        profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
             print("Profiler stopped")
 
@@ -3983,3 +4143,4 @@ async def benchmark(
 
 
 serve.benchmark = benchmark
+serve.check_goodput_args = check_goodput_args

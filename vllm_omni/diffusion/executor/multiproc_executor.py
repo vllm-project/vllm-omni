@@ -1130,6 +1130,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         fresh one that would never complete.
         """
         with self._futures_lock:
+            if self._closed:
+                closed: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+                closed.set_exception(RuntimeError("Executor shut down"))
+                return closed
             cached = self._completed_outputs.pop(async_output_id, None)
             if cached is not None:
                 return cached

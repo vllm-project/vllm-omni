@@ -29,6 +29,9 @@ connectors:
 stages:
   - stage_id: 0
     model_runner: v2
+    # MRv2 does not merge cached Thinker rows yet; keep the turn profile's
+    # stage-0 prefix cache off here.
+    enable_prefix_caching: false
     # llm2tts consumes the completed Thinker payload via the orchestrator.
     # Only Talker -> Code2Wav is a streaming connector edge. Keep the latent
     # rows on the full-payload output channel instead of partitioning them

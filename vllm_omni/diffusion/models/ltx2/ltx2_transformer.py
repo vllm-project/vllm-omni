@@ -910,6 +910,10 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=video_gated_attn,
+            # The official LTX checkpoint evaluates video Q/K/V as separate
+            # projections. Fusing this GEMM changes BF16 rounding enough to
+            # accumulate across the denoising loop.
+            pack_qkv=False,
             quant_config=quant_config,
             prefix=f"{prefix}.attn1" if prefix else "attn1",
             sequence_parallel_mode="video_self",

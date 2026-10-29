@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import janus
 import pytest
@@ -23,7 +24,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreReques
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -43,12 +44,14 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats, StageStats
-from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
+from vllm_omni.watermarking import AudioTensor, AudioWatermarkerBase
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -151,7 +154,7 @@ class FakeStageClient:
         try:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
-            return SimpleNamespace(outputs=[], scheduler_stats=None, finished_requests=None)
+            return OmniEngineCoreOutputs()
 
     def get_diffusion_output_nowait(self):
         try:
@@ -306,9 +309,13 @@ class RecordingOutputProcessor(FakeOutputProcessor):
 class RecordingStatLogger:
     def __init__(self) -> None:
         self.records: list[tuple[Any, Any, int]] = []
+        self.removed_memory_snapshots: list[int] = []
 
     def record(self, scheduler_stats, iteration_stats, *, engine_idx: int = 0) -> None:
         self.records.append((scheduler_stats, iteration_stats, engine_idx))
+
+    def remove_stage_post_warmup_memory(self, *, engine_idx: int) -> None:
+        self.removed_memory_snapshots.append(engine_idx)
 
 
 def _sampling_params(max_tokens: int = 4) -> SamplingParams:
@@ -682,6 +689,16 @@ def _processed_request(request_id: str, params) -> EngineCoreRequest:
     )
 
 
+@pytest.mark.parametrize("metadata_kind", ["dict", "serialized", "none"])
+def test_processed_stage_request_preserves_metadata_forms(metadata_kind):
+    orchestrator = object.__new__(Orchestrator)
+    info = {"tts_language": "English"} if metadata_kind != "none" else None
+    raw_info = serialize_additional_information(info) if metadata_kind == "serialized" else info
+    request = _processed_request("metadata-forms", _sampling_params())
+    upgraded = orchestrator._upgrade_processed_stage_request(request, {"additional_information": raw_info})
+    assert deserialize_additional_information(getattr(upgraded, "additional_information", None)) == (info or {})
+
+
 @pytest.mark.asyncio
 async def test_add_request_bypassing_stage0_enters_at_stage1(orchestrator_factory) -> None:
     """A raw prompt with ``entry_stage_id=1`` is processed by stage 1's input processor
@@ -850,6 +867,161 @@ async def test_run_single_stage_diffusion(orchestrator_factory) -> None:
         assert output_msg.finished is True
         assert output_msg.engine_outputs.request_id == "req-diff"
         assert "req-diff" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_type", ["llm", "diffusion"])
+@pytest.mark.parametrize("watermarking", [None, True, False])
+async def test_request_watermarking(stage_type: str, watermarking: bool | None) -> None:
+    watermarker = MagicMock()
+    watermarker.watermark_output.side_effect = lambda _request_id, samples, _metadata: samples
+
+    request = SimpleNamespace(request_id="r")
+    params = SamplingParams(watermarking=watermarking)
+    stage_pool_kwargs = {}
+
+    # Build the output for the correct stage type
+    if stage_type == "llm":
+        processor = FakeOutputProcessor()
+        processor.request_states = {"r": object()}
+        stage_pool_kwargs["output_processor"] = processor
+        output = OmniEngineCoreOutput(
+            request_id="r",
+            new_token_ids=[],
+            multimodal_output={"model_outputs": torch.zeros(8), "sr": 24_000},
+        )
+    else:
+        output = OmniRequestOutput.from_diffusion(
+            request_id="r",
+            images=[],
+            multimodal_output={
+                "audio": torch.zeros(1, 1, 8),
+                "audio_sample_rate": 44_100,
+            },
+            final_output_type="audio",
+        )
+
+    pool = StagePool(
+        0,
+        [FakeStageClient(stage_type=stage_type, final_output=True, final_output_type="audio")],
+        watermarkers={"audio": watermarker},
+        **stage_pool_kwargs,
+    )
+
+    state = OrchestratorRequestState(request_id="r", sampling_params_list=[params], final_stage_id=0)
+    await pool.submit_initial("r", state, request)
+
+    # Call the corresponding stage processor based on the type
+    if stage_type == "diffusion":
+        await pool.process_diffusion_output(output)
+    else:
+        await pool.process_llm_raw_outputs(
+            0,
+            SimpleNamespace(outputs=[output], timestamp=1.0, scheduler_stats=None),
+        )
+
+    # Then ensure the watermarking behavior is as expected
+    if watermarking is not False:
+        watermarker.watermark_output.assert_called_once()
+    else:
+        watermarker.watermark_output.assert_not_called()
+
+
+class _OffsetAudioWatermarker(AudioWatermarkerBase[None]):
+    """A fake watermarker that just adds one to audio."""
+
+    def _new_audio_state(self, data: AudioTensor) -> None:
+        return None
+
+    def _watermark_audio(self, data: AudioTensor, state: None) -> AudioTensor:
+        return AudioTensor(data.samples + 1, data.sample_rate)
+
+    def _is_audio_watermarked(self, data: AudioTensor) -> bool:
+        raise NotImplementedError("detection is not exercised in these tests")
+
+
+def _audio_stage_pool(client: FakeStageClient, *, output_processor: FakeOutputProcessor | None = None) -> StagePool:
+    return StagePool(
+        0,
+        client,
+        output_processor=output_processor,
+        watermarkers={"audio": _OffsetAudioWatermarker()},
+        strict_watermarking=True,
+    )
+
+
+def _audio_stage_client(stage_type: str) -> FakeStageClient:
+    return FakeStageClient(stage_type=stage_type, final_output=True, final_output_type="audio")
+
+
+def _diffusion_audio_output(request_id: str, sample_rate: int | None) -> OmniRequestOutput:
+    return OmniRequestOutput.from_diffusion(
+        request_id=request_id,
+        images=[],
+        multimodal_output={"audio": torch.zeros(1, 1, 8), "audio_sample_rate": sample_rate},
+        final_output_type="audio",
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_watermark_failure_replaces_llm_output_with_error() -> None:
+    """Ensure strict LLM watermark failures never emit the unwatermarked output."""
+    processor = FakeOutputProcessor(request_outputs=[_build_request_output("bad"), _build_request_output("good")])
+    processor.request_states = {"bad": object(), "good": object()}
+    pool = _audio_stage_pool(_audio_stage_client("llm"), output_processor=processor)
+    for request_id in ("bad", "good"):
+        state = OrchestratorRequestState(
+            request_id=request_id, sampling_params_list=[SamplingParams()], final_stage_id=0
+        )
+        await pool.submit_initial(request_id, state, SimpleNamespace(request_id=request_id))
+    raw_outputs = [
+        OmniEngineCoreOutput(request_id="bad", new_token_ids=[], multimodal_output={"model_outputs": torch.zeros(8)}),
+        OmniEngineCoreOutput(
+            request_id="good", new_token_ids=[], multimodal_output={"model_outputs": torch.zeros(8), "sr": 24_000}
+        ),
+    ]
+
+    outputs = await pool.process_llm_raw_outputs(
+        0, SimpleNamespace(outputs=raw_outputs, timestamp=1.0, scheduler_stats=None)
+    )
+
+    good_output, bad_output = outputs
+    assert good_output.request_id == "good"
+    assert (bad_output.request_id, bad_output.error) == ("bad", "Failed to watermark output")
+
+
+@pytest.mark.asyncio
+async def test_strict_watermark_failure_is_request_scoped(orchestrator_factory) -> None:
+    """Ensure a strict watermark failure only fails its request and the orchestrator keeps serving."""
+    stage0 = _audio_stage_client("diffusion")
+    orchestrator_fixture = orchestrator_factory([stage0], stage_pools=[_audio_stage_pool(stage0)])
+    try:
+        for request_id in ("req-bad", "req-good"):
+            await _enqueue_add_request(
+                orchestrator_fixture,
+                request_id=request_id,
+                prompt={"prompt": "a drum loop"},
+                original_prompt={"prompt": "a drum loop"},
+                sampling_params_list=[OmniDiffusionSamplingParams()],
+                final_stage_id=0,
+            )
+        await _wait_for(lambda: len(stage0.add_request_calls) == 2)
+        stage0.push_diffusion_output(_diffusion_audio_output("req-bad", sample_rate=None))
+        stage0.push_diffusion_output(_diffusion_audio_output("req-good", sample_rate=16_000))
+
+        # Outputs are pushed in order, so the failed request's error arrives first
+        error_msg = orchestrator_fixture.output_sync_q.get(timeout=2.0)
+        output_msg = orchestrator_fixture.output_sync_q.get(timeout=2.0)
+
+        # Ensure that the bad req is sad, the other one isn't, and that the orchestrator is alive
+        assert isinstance(error_msg, ErrorMessage)
+        assert isinstance(output_msg, OutputMessage)
+        assert (error_msg.request_id, error_msg.fatal) == ("req-bad", False)
+        assert output_msg.request_id == "req-good"
+        assert torch.equal(output_msg.engine_outputs.multimodal_output["audio"], torch.ones(1, 1, 8))
+        assert orchestrator_fixture.thread.is_alive()
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
@@ -1690,6 +1862,111 @@ async def test_stage_pool_submit_update_reuses_existing_binding() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage_type", ["llm", "diffusion"])
+async def test_stage_pool_pinned_submit_preserves_route_and_legacy_round_robin(stage_type: str) -> None:
+    clients = [FakeStageClient(stage_type=stage_type), FakeStageClient(stage_type=stage_type)]
+    pool = StagePool(0, clients, output_processor=FakeOutputProcessor())
+    params = OmniDiffusionSamplingParams() if stage_type == "diffusion" else _sampling_params()
+    state = OrchestratorRequestState(request_id="pinned", sampling_params_list=[params], final_stage_id=0)
+    request = SimpleNamespace(request_id="pinned", prompt_token_ids=[1])
+
+    # Preprocessing and sender endpoint lookup see the same owner as submission.
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    assert pool.get_bound_client("pinned") is clients[1]
+    assert pool.preselect_replica_id("pinned") == 1
+    expected_replica_id = 1 if stage_type == "llm" else None
+    assert (
+        await pool.submit_initial(
+            "pinned", state, request, pinned_replica_id=1, expected_replica_id=expected_replica_id
+        )
+        == 1
+    )
+    assert await pool.submit_update("pinned", state, request, pinned_replica_id=1) == 1
+    assert not clients[0].add_request_calls
+    assert len(clients[1].add_request_calls) == 2
+
+    # Pins neither advance legacy round robin nor survive request cleanup.
+    pool.release_binding("pinned")
+    assert pool.get_bound_replica_id("pinned") is None
+    for index in range(2):
+        request_id = f"ordinary-{index}"
+        state = OrchestratorRequestState(request_id=request_id, sampling_params_list=[params], final_stage_id=0)
+        request = SimpleNamespace(request_id=request_id, prompt_token_ids=[1])
+        assert await pool.submit_initial(request_id, state, request) == index
+        assert await pool.submit_update(request_id, state, request) == index
+    assert pool.select_replica_id("companion", affinity_request_id="ordinary-1") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["submit_initial", "submit_update"])
+@pytest.mark.parametrize("failure", ["unavailable", "detached", "out_of_range", "negative", "conflict"])
+async def test_stage_pool_pinned_submit_never_falls_back(operation: str, failure: str, monkeypatch) -> None:
+    clients = [FakeStageClient(), FakeStageClient()]
+    processor = FakeOutputProcessor()
+    pool = StagePool(0, clients, output_processor=processor)
+    state = OrchestratorRequestState(request_id="pinned", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    request = SimpleNamespace(request_id="pinned", prompt_token_ids=[1])
+    pinned_replica_id = 1
+    expected_binding = None
+    if failure == "conflict":
+        pool.bind_request_to_replica("pinned", 0)
+        expected_binding = 0
+    elif failure == "out_of_range":
+        pinned_replica_id = 2
+    elif failure == "negative":
+        pinned_replica_id = -1
+    else:
+        pool.bind_request_to_replica("pinned", 1)
+        if failure == "unavailable":
+            pool.mark_replica_unavailable(1)
+        else:
+            pool.clients[1] = None
+            expected_binding = 1
+
+    async def fail_selection(*args, **kwargs):
+        raise AssertionError("pinned dispatch must not select another replica")
+
+    monkeypatch.setattr(pool, "_pick_or_select", fail_selection)
+    with pytest.raises(StageUnavailableError, match="pinned replica"):
+        await getattr(pool, operation)("pinned", state, request, pinned_replica_id=pinned_replica_id)
+
+    assert pool.get_bound_replica_id("pinned") == expected_binding
+    assert not processor.add_request_calls
+    assert all(not client.add_request_calls for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_pinned_submit_rejects_mismatched_cache_replica(monkeypatch) -> None:
+    clients = [FakeStageClient(), FakeStageClient()]
+    processor = FakeOutputProcessor()
+    pool = StagePool(0, clients, output_processor=processor)
+    state = OrchestratorRequestState(request_id="pinned", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    request = SimpleNamespace(request_id="pinned", prompt_token_ids=[1])
+
+    async def fail_selection(*args, **kwargs):
+        raise AssertionError("pinned dispatch must not select another replica")
+
+    monkeypatch.setattr(pool, "_pick_or_select", fail_selection)
+    with pytest.raises(StageUnavailableError, match="replica 0 keyed by pinned"):
+        await pool.submit_initial("pinned", state, request, pinned_replica_id=1, expected_replica_id=0)
+
+    assert pool.get_bound_replica_id("pinned") is None
+    assert not processor.add_request_calls
+    assert all(not client.add_request_calls for client in clients)
+
+
+@pytest.mark.parametrize("distributed_hook", ["_hub", "_lb"])
+def test_stage_pool_pinned_binding_rejects_distributed_mode(distributed_hook: str) -> None:
+    pool = StagePool(0, [FakeStageClient(), FakeStageClient()])
+    setattr(pool, distributed_hook, object())
+
+    with pytest.raises(StageUnavailableError, match="only supported for local stage pools"):
+        pool.bind_request_to_replica("pinned", 1)
+
+    assert pool.get_bound_replica_id("pinned") is None
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_failed_replica_releases_distributed_affinity_and_stops_polling() -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     pool = StagePool(
@@ -2212,6 +2489,71 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
     assert metrics.finish_reason == "length"
 
 
+@pytest.mark.parametrize(
+    ("native_record", "expected"),
+    [
+        pytest.param(
+            {"vllm_queued_ms": 2.5, "vllm_prefill_ms": 30.0, "vllm_decode_ms": 0.0, "vllm_num_preemptions": 0},
+            {"vllm_queued_ms": 2.5, "vllm_prefill_ms": 30.0, "vllm_decode_ms": 0.0, "vllm_num_preemptions": 0},
+            id="observed",
+        ),
+        pytest.param(
+            # An absent key is an unobserved phase and must not become 0.
+            {"vllm_decode_ms": 12.0},
+            {"vllm_queued_ms": None, "vllm_prefill_ms": None, "vllm_decode_ms": 12.0, "vllm_num_preemptions": None},
+            id="partly_unobserved",
+        ),
+    ],
+)
+def test_stage_pool_metrics_copy_native_phase_split(native_record, expected) -> None:
+    class PhaseMetricsOutputProcessor(FakeOutputProcessor):
+        def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
+            assert request_id == "req-ar"
+            return {"num_generation_tokens": 2, **native_record}
+
+    pool = StagePool(0, [FakeStageClient(stage_type="llm")], output_processor=PhaseMetricsOutputProcessor())
+
+    metrics = pool.build_stage_metrics(
+        [_build_request_output("req-ar")],
+        submit_ts=time.time(),
+        request_timestamp=time.time(),
+        replica_id=0,
+    )
+
+    assert {key: getattr(metrics, key) for key in expected} == expected
+
+
+def test_stage_pool_metrics_skip_native_phase_split_when_metrics_disabled() -> None:
+    popped: list[str] = []
+
+    class PhaseMetricsOutputProcessor(FakeOutputProcessor):
+        def pop_native_text_metrics(self, request_id: str) -> dict[str, Any]:
+            popped.append(request_id)
+            return {
+                "num_generation_tokens": 2,
+                "vllm_queued_ms": 2.5,
+                "vllm_prefill_ms": 30.0,
+                "vllm_decode_ms": 12.0,
+                "vllm_num_preemptions": 1,
+            }
+
+    pool = StagePool(0, [FakeStageClient(stage_type="llm")], output_processor=PhaseMetricsOutputProcessor())
+    pool.collect_stage_metrics = False
+
+    metrics = pool.build_stage_metrics(
+        [_build_request_output("req-ar")],
+        submit_ts=time.time(),
+        request_timestamp=time.time(),
+        replica_id=0,
+    )
+
+    # The record is still popped so it does not leak, but the optional split stays unset.
+    assert popped == ["req-ar"]
+    assert metrics.num_tokens_out == 2
+    assert metrics.vllm_queued_ms is None and metrics.vllm_prefill_ms is None
+    assert metrics.vllm_decode_ms is None and metrics.vllm_num_preemptions is None
+
+
 def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
     stage = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
     pool = StagePool(
@@ -2232,13 +2574,32 @@ def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
 
     assert metrics.serving_time_to_first_output_ms == pytest.approx(12000.0)
     assert metrics.image_time_to_first_output_ms == pytest.approx(2000.0)
+    # A diffusion stage has no engine-core phase split.
+    assert metrics.vllm_queued_ms is None and metrics.vllm_prefill_ms is None
+    assert metrics.vllm_decode_ms is None and metrics.vllm_num_preemptions is None
 
 
 @pytest.mark.asyncio
-async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client_submit_fails() -> None:
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("abort_fails", [False, True])
+@pytest.mark.parametrize("pinned_replica_id", [None, 0])
+async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client_submit_fails(
+    cancelled: bool, abort_fails: bool, pinned_replica_id: int | None
+) -> None:
+    submission_error = asyncio.CancelledError() if cancelled else RuntimeError("submit failed")
+    abort_attempts: list[list[str]] = []
+
     class FailingStageClient(FakeStageClient):
         async def add_request_async(self, *args, **kwargs) -> None:
-            raise RuntimeError("submit failed")
+            await super().add_request_async(*args, **kwargs)
+            raise submission_error
+
+        async def abort_requests_async(self, request_ids: list[str]) -> None:
+            assert pool.get_bound_replica_id("req-0") == 0
+            abort_attempts.append(request_ids)
+            if abort_fails:
+                raise RuntimeError("abort failed")
+            await super().abort_requests_async(request_ids)
 
     class TrackingOutputProcessor(FakeOutputProcessor):
         def __init__(self) -> None:
@@ -2266,12 +2627,178 @@ async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client
         final_stage_id=0,
     )
 
-    with pytest.raises(RuntimeError, match="submit failed"):
-        await pool.submit_initial("req-0", req_state, SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]))
+    with pytest.raises(type(submission_error)) as raised:
+        await pool.submit_initial(
+            "req-0",
+            req_state,
+            SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]),
+            pinned_replica_id=pinned_replica_id,
+        )
 
+    assert raised.value is submission_error
+    assert abort_attempts == [["req-0"]]
     assert output_processor.added_request_ids == ["req-0"]
+    if abort_fails:
+        assert output_processor.removed_request_ids == []
+        assert pool.get_bound_replica_id("req-0") == 0
+        abort_fails = False
+        await pool.abort_requests(["req-0"])
+        assert client.abort_calls == [["req-0"]]
+        return
+    assert client.abort_calls == [["req-0"]]
     assert output_processor.removed_request_ids == ["req-0"]
     assert pool.get_bound_replica_id("req-0") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_submission", [False, True])
+async def test_stage_pool_preserves_submission_error_when_abort_is_cancelled(mocker, cancel_submission) -> None:
+    submitted, aborting = asyncio.Event(), asyncio.Event()
+    submission_errors: list[BaseException] = []
+    retry_abort = False
+
+    class InterruptedClient(FakeStageClient):
+        async def add_request_async(self, *args, **kwargs) -> None:
+            await super().add_request_async(*args, **kwargs)
+            submitted.set()
+            try:
+                if cancel_submission:
+                    await asyncio.Event().wait()
+                raise RuntimeError("original submission failure")
+            except (RuntimeError, asyncio.CancelledError) as error:
+                submission_errors.append(error)
+                raise
+
+        async def abort_requests_async(self, request_ids: list[str]) -> None:
+            assert pool.get_bound_replica_id("req-0") == 0
+            if not retry_abort:
+                aborting.set()
+                await asyncio.Event().wait()
+            await super().abort_requests_async(request_ids)
+
+    client = InterruptedClient()
+    pool = _build_stage_pools([[client]])[0]
+    state = OrchestratorRequestState(request_id="req-0", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    warning = mocker.spy(logging.getLogger("vllm_omni.engine.stage_pool"), "warning")
+    task = asyncio.create_task(pool.submit_initial("req-0", state, FakePromptRequest("req-0", [1, 2])))
+    try:
+        await asyncio.wait_for(submitted.wait(), timeout=2)
+        if cancel_submission:
+            task.cancel("original submission cancellation")
+        await asyncio.wait_for(aborting.wait(), timeout=2)
+        task.cancel("abort cancellation")
+        with pytest.raises(type(submission_errors[0])) as raised:
+            await task
+        assert raised.value is submission_errors[0]
+        warning.assert_called_once()
+        assert isinstance(warning.call_args.args[-1], asyncio.CancelledError)
+        assert pool.get_bound_replica_id("req-0") == 0
+        # A cancelled abort leaves no shielded background task; the owner can
+        # retry using the retained binding.
+        retry_abort = True
+        await pool.abort_requests(["req-0"])
+        assert client.abort_calls == [["req-0"]]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_survivor", [False, True])
+@pytest.mark.parametrize("companion", [False, True])
+async def test_submit_and_abort_engine_death_evicts_replica_and_fails_request_once(has_survivor, companion) -> None:
+    class DeadClient(FakeStageClient):
+        fail_submission = True
+
+        async def add_request_async(self, *args, **kwargs) -> None:
+            await super().add_request_async(*args, **kwargs)
+            if self.fail_submission:
+                raise EngineDeadError("engine died during submission")
+
+        async def abort_requests_async(self, request_ids: list[str]) -> None:
+            await super().abort_requests_async(request_ids)
+            raise EngineDeadError("engine is still dead during abort")
+
+    dead, survivor = DeadClient(), FakeStageClient()
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    pool = StagePool(
+        0,
+        [dead, survivor] if has_survivor else [dead],
+        output_processor=processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    counter = FakeRunningCounter()
+    output: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+        running_counter=counter,
+    )
+
+    params = SamplingParams(max_tokens=4, detokenize=False)
+
+    def prompt(request_id):
+        request = _processed_request(f"{request_id}-internal", params)
+        request.external_req_id = request_id
+        return request
+
+    async def submit(request_id):
+        await orchestrator._handle_add_request(
+            StageSubmissionMessage(
+                type="add_request",
+                request_id=request_id,
+                prompt=prompt(request_id),
+                original_prompt={},
+                output_prompt_text=None,
+                sampling_params_list=[params],
+                final_stage_id=0,
+                preprocess_ms=0,
+                request_timestamp=0,
+                enqueue_ts=0,
+            )
+        )
+
+    if companion:
+        dead.fail_submission = False
+        await submit("req-dead")
+        dead.fail_submission = True
+        await orchestrator._handle_add_companion(
+            AddCompanionRequestMessage(
+                companion_id="req-cfg",
+                parent_id="req-dead",
+                role="negative",
+                prompt=prompt("req-cfg"),
+                companion_prompt_text=None,
+                sampling_params_list=[params],
+            )
+        )
+    else:
+        await submit("req-dead")
+    error = output.get_nowait()
+    assert isinstance(error, ErrorMessage) and error.request_id == "req-dead"
+    assert error.fatal and output.empty()
+    assert pool.live_replica_ids() == ([1] if has_survivor else [])
+    assert dead.shutdown_calls == 1
+    assert dead.abort_calls == [["req-cfg-internal" if companion else "req-dead-internal"]]
+    assert pool.get_bound_replica_id("req-dead") is None
+    assert pool.get_bound_replica_id("req-cfg") is None
+    assert not orchestrator.request_states and counter.value == 0
+    assert not processor.request_states and not processor.external_req_ids
+    await submit("req-next")
+    if has_survivor:
+        assert pool.get_bound_replica_id("req-next") == 1
+        assert len(survivor.add_request_calls) == 1
+        assert output.empty() and counter.value == 1
+        await orchestrator._cleanup_request_ids(["req-next"], abort=True)
+        assert not processor.request_states and not processor.external_req_ids
+    else:
+        error = output.get_nowait()
+        assert isinstance(error, ErrorMessage) and error.request_id == "req-next"
+        assert output.empty() and counter.value == 0
+    assert len(dead.add_request_calls) == (2 if companion else 1)
 
 
 @pytest.mark.asyncio
@@ -2568,6 +3095,65 @@ async def test_stage_pool_process_llm_raw_outputs_mutates_iteration_stats() -> N
 
 
 @pytest.mark.asyncio
+async def test_stage_pool_watermark_cancellation_waits_before_abort() -> None:
+    """Ensure cancellation waits for watermark work before releasing the lock."""
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+
+    def watermark_output(_request_id, samples, _metadata):
+        worker_started.set()
+        try:
+            release_worker.wait()
+            return samples
+        finally:
+            worker_finished.set()
+
+    watermarker = MagicMock()
+    watermarker.watermark_output.side_effect = watermark_output
+    request_output = _build_request_output("r", finished=False)
+    engine_output = OmniEngineCoreOutput(
+        request_id="r",
+        new_token_ids=[],
+        multimodal_output={"model_outputs": torch.zeros(8), "sr": 24_000},
+    )
+    client = FakeStageClient(stage_type="llm", final_output=True, final_output_type="audio")
+    processor = FakeOutputProcessor(request_outputs=[request_output])
+    processor.request_states = {"r": object()}
+    pool = StagePool(
+        0,
+        [client],
+        output_processor=processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        watermarkers={"audio": watermarker},
+    )
+    pool._request_bindings["r"] = 0
+    pool._request_watermarking["r"] = True
+
+    processing = asyncio.create_task(
+        pool.process_llm_raw_outputs(
+            0,
+            SimpleNamespace(outputs=[engine_output], timestamp=1.0, scheduler_stats=None),
+        )
+    )
+    await asyncio.wait_for(asyncio.to_thread(worker_started.wait), timeout=5)
+    processing.cancel()
+    aborting = asyncio.create_task(pool.abort_requests(["r"]))
+    await asyncio.sleep(0)
+
+    assert not aborting.done()
+    assert not worker_finished.is_set()
+
+    release_worker.set()
+    with pytest.raises(asyncio.CancelledError):
+        await processing
+    assert worker_finished.is_set()
+    await aborting
+    watermarker.watermark_output.assert_called_once()
+    watermarker.discard_request_state.assert_called_once_with("r")
+
+
+@pytest.mark.asyncio
 async def test_abort_retry_does_not_repeat_successful_stage_abort():
     class _Pool:
         def __init__(self, *, fail_once: bool = False) -> None:
@@ -2818,6 +3404,7 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
             InteractionMessage(request_id="video", interaction={"event_id": str(index), "event": {}})
         )
     error = errors.get_nowait()
+    assert error.request_id == "video"
     assert error.event_id == "64"
     assert error.fatal is False
     assert error.error == "Too many pending interactions"
@@ -2826,5 +3413,46 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
     from vllm_omni.entrypoints.async_omni import AsyncOmni
 
     consumer = object.__new__(AsyncOmni)
+    consumer.request_states = {"video": ClientRequestState("video")}
     with pytest.raises(RuntimeError, match="Too many pending interactions"):
         consumer._handle_output_message(error)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_preserves_scheduler_stats_only_outputs():
+    pool = object.__new__(StagePool)
+    stats_outputs = OmniEngineCoreOutputs(scheduler_stats=SimpleNamespace())
+    client = SimpleNamespace(get_output_async=AsyncMock(return_value=stats_outputs))
+
+    assert await pool.read_llm_raw_output(client) is stats_outputs
+
+    client.get_output_async.return_value = OmniEngineCoreOutputs()
+    assert await pool.read_llm_raw_output(client) is None
+
+
+@pytest.mark.asyncio
+async def test_publish_stage_post_warmup_memory_records_initialized_replica():
+    logger = SimpleNamespace(record_stage_post_warmup_memory=Mock())
+    pool = SimpleNamespace(
+        stage_id=0,
+        stage_vllm_config=SimpleNamespace(),
+        clients=[SimpleNamespace()],
+        live_replica_ids=lambda: [0],
+        collective_rpc=AsyncMock(return_value=[None, {"allocated_bytes": 11, "reserved_bytes": 13}]),
+    )
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._stat_logger = logger
+    orchestrator.stage_pools = [pool]
+    orchestrator._stage_replica_to_engine_idx = {(0, 0): 4}
+    orchestrator._stages_shutdown = False
+
+    await orchestrator.publish_stage_post_warmup_memory()
+
+    pool.collective_rpc.assert_awaited_once_with(
+        replica_id=0,
+        method="get_stage_post_warmup_memory_stats",
+    )
+    logger.record_stage_post_warmup_memory.assert_called_once_with(
+        StagePostWarmupMemoryStats(allocated_bytes=11, reserved_bytes=13),
+        engine_idx=4,
+    )

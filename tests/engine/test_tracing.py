@@ -25,6 +25,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from tests.engine.test_orchestrator import (
     FakeOutputProcessor,
+    FakePromptRequest,
     FakeStageClient,
     _build_request_output,
     _build_stage_pools,
@@ -34,6 +35,7 @@ from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import StageSubmissionMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_runtime import StageRuntimeInfo
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -247,6 +249,80 @@ async def test_first_output_check_stops_after_nonempty_output(recording, mocker)
     stage = next(span for span in exporter.get_finished_spans() if span.name == "omni.stage")
     assert [event.name for event in stage.events] == ["omni.stage.first_output"]
     assert check_output.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_type", ["llm", "diffusion"])
+@pytest.mark.parametrize("pinned_replica_id", [None, 1])
+async def test_stage_trace_matches_submitted_replica(recording, stage_type, pinned_replica_id):
+    tracer, exporter = recording
+    clients = [FakeStageClient(stage_type=stage_type), FakeStageClient(stage_type=stage_type)]
+    pool = StagePool(0, clients, output_processor=FakeOutputProcessor())
+    params = OmniDiffusionSamplingParams() if stage_type == "diffusion" else _sampling_params()
+    request_trace = RequestTrace(tracer, "request", HEADERS)
+    state = OrchestratorRequestState(
+        request_id="request", sampling_params_list=[params], final_stage_id=0, trace=request_trace
+    )
+    request = FakePromptRequest(request_id="request", prompt_token_ids=[1])
+    replica_id = await pool.submit_initial("request", state, request, pinned_replica_id=pinned_replica_id)
+    await pool.submit_update("request", state, request, pinned_replica_id=pinned_replica_id)
+    request_trace.end()
+
+    expected_replica_id = pinned_replica_id if pinned_replica_id is not None else 0
+    assert replica_id == expected_replica_id
+    assert len(clients[expected_replica_id].add_request_calls) == 2
+    assert not clients[1 - expected_replica_id].add_request_calls
+    stages = [span for span in exporter.get_finished_spans() if span.name == "omni.stage"]
+    assert len(stages) == 1
+    assert stages[0].attributes["omni.replica.id"] == expected_replica_id
+    assert stages[0].attributes["omni.stage.type"] == stage_type
+    assert stages[0].parent.span_id == request_trace.span.get_span_context().span_id
+
+
+@pytest.mark.asyncio
+async def test_generate_forwards_trace_headers_through_tracked_submit(mocker):
+    from tests.entrypoints.test_async_omni import get_async_omni_instance
+
+    submit = mocker.AsyncMock()
+    omni = get_async_omni_instance(fake_add_request=submit)
+    async for _ in omni.generate(
+        prompt={"prompt": "test"},
+        request_id="traced",
+        sampling_params_list=[_sampling_params()],
+        output_modalities=["text"],
+        trace_headers=HEADERS,
+    ):
+        pass
+    submit.assert_awaited_once()
+    assert submit.await_args.kwargs["trace_headers"] == HEADERS
+    assert not omni.request_states
+
+
+@pytest.mark.asyncio
+async def test_cancelled_duplex_open_releases_replica_and_ends_trace(recording):
+    from tests.engine.duplex.test_session_manager import Harness, PlacementStagePort, _BlockingResultSink
+
+    tracer, exporter = recording
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port) as harness:
+        harness.manager.tracer = tracer
+        sink = _BlockingResultSink()
+        harness.manager._result_sink = sink
+        opening = asyncio.create_task(harness.open("cancelled"))
+        try:
+            await asyncio.wait_for(sink.entered.wait(), timeout=1)
+            assert port.placement.route("cancelled", 0) == 0
+        finally:
+            opening.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await opening
+        assert port.release_calls == ["cancelled"]
+        assert port.placement.snapshot()["sessions"] == {}
+        assert not harness.manager.session_traces
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 1
+        assert spans[0].name == "omni.session"
+        assert spans[0].attributes["omni.session.outcome"] == "cancelled"
 
 
 @pytest.mark.asyncio

@@ -170,7 +170,7 @@ class BaseScheduler(ABC):
         # First, schedule the RUNNING request(s)
         for request_id in self._running:
             state = self._request_states.get(request_id)
-            if state is not None:
+            if state is not None and self._can_schedule_running(state):
                 scheduled_cached_request_ids.append(request_id)
 
         # Second, schedule WAITING requests while capacity remains.
@@ -420,6 +420,16 @@ class BaseScheduler(ABC):
             or self._kv_finished_request_ids
             or self._kv_draining_requests
         )
+
+    def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
+        return True
+
+    def get_execution_wait_timeout(self, now: float) -> float | None:
+        """Seconds until runnable work: zero runs now, None waits for an event."""
+        return 0.0
+
+    def notify_interaction(self, request_id: str) -> None:
+        """Observe an interaction only after all Workers accepted its RPC."""
 
     def update_kv_connector_output(self, output: KVConnectorOutput | None) -> None:
         if output is None:

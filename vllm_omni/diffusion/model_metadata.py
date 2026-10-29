@@ -24,6 +24,9 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
     # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
     supports_timeline_guides: bool = False
+    # Whether ``/v1/images/segmentations`` may serve this model: it takes one
+    # image plus text/box prompts and returns a ``segmentation`` payload.
+    supports_segmentation: bool = False
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -40,6 +43,11 @@ BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
+    "Sam3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        supports_segmentation=True,
+    ),
     "Flux2KleinPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=FLUX2_KLEIN_MAX_INPUT_IMAGES,
@@ -91,6 +99,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_mixed_reference_inputs=True,
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
+        final_output_type="video",
+        attention_mask_free=True,
+    ),
+    # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
+    # layout; alignment padding is a second packed document, as for H3.
+    "TaoMateH3Pipeline": DiffusionModelMetadata(
         final_output_type="video",
         attention_mask_free=True,
     ),

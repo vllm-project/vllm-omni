@@ -9,7 +9,7 @@ from functools import partial
 from math import gcd
 from threading import Lock
 from types import MethodType
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import onnxruntime
@@ -34,10 +34,10 @@ from vllm.multimodal.processing import (
     PromptInsertion,
     PromptUpdate,
 )
+from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
@@ -59,6 +59,13 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     mel_spectrogram,
     unpad_prompt_conditioning,
 )
+from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import (
+    DeferredRejection,
+    _use_triton,
+    categorical_sample,
+    conditional_sample,
+    nucleus_sample,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
@@ -72,6 +79,21 @@ _QWEN2_STACKED_SHARDS = {
     "qkv_proj": ("q_proj", "k_proj", "v_proj"),
     "gate_up_proj": ("gate_proj", "up_proj"),
 }
+
+
+def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) -> None:
+    """Reject unsafe ids before they reach the talker's speech embedding gather."""
+    if input_ids.numel() == 0:
+        return
+    out_of_range = (input_ids < 0) | (input_ids >= num_speech_tokens)
+    if bool(out_of_range.any()):
+        bad = input_ids[out_of_range].flatten()[:8].tolist()
+        raise ValueError(
+            f"cosyvoice3 talker: speech token id out of range [0, {num_speech_tokens}); "
+            f"got out-of-range ids {bad}. Non-multimodal text-only requests are not "
+            "supported by the CosyVoice3 talker; provide the required audio prompt."
+        )
+
 
 # Process-wide cache of per-model mm-processor runtime components (tokenizer,
 # feat_extractor, campplus session/engine). The mm processor is re-created per
@@ -747,7 +769,11 @@ class CosyVoice3Model(
     supports_multimodal = True
     requires_raw_input_tokens = True
     supports_embed_input_ids_query_start_loc = True
+    supports_prefill_token_mask = True
     prefer_model_sampler = True
+    model_sampler_wants_sampling_params = True
+    model_sampler_can_defer_rng = True
+    supports_sampled_token_ids_cpu_override = True
     _sampling_eps = 1e-5
 
     @property
@@ -772,6 +798,8 @@ class CosyVoice3Model(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self._pending_rejection_rng: DeferredRejection | None = None
+        self._sampled_token_feedback: tuple[torch.Tensor, list[list[int]]] | None = None
         self.config = vllm_config.model_config.hf_config
         standard_sampling = cosyvoice3_standard_sampling(self.config)
         logger.info("CosyVoice3 sampling policy: %s", "standard" if standard_sampling else "ras")
@@ -889,94 +917,11 @@ class CosyVoice3Model(
         valid_mask = (req_ids >= 0) & (req_ids < vocab_size)
         return req_ids[valid_mask]
 
-    @staticmethod
-    def _req_scalar(param: torch.Tensor | None, req_idx: int, default: float | int) -> float | int:
-        if param is None or param.numel() == 0:
-            return default
-        index = min(req_idx, int(param.numel()) - 1)
-        value = param.reshape(-1)[index].item()
-        if isinstance(default, int):
-            return int(value)
-        return float(value)
-
-    @staticmethod
-    def _random_sample_one(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
-        return random_sample(probs.unsqueeze(0), {} if generator is None else {0: generator}).reshape(())
-
-    @classmethod
-    def _nucleus_sample_one(
-        cls,
-        weighted_scores: torch.Tensor,
-        *,
-        top_p: float,
-        top_k: int,
-        generator: torch.Generator | None,
-    ) -> int:
-        """Vectorized nucleus + top-k sampling.
-
-        Distribution-equivalent to the reference iterative implementation: the
-        keep-set is identical (token i is kept iff
-        ``cumsum(sorted_probs)[i] - sorted_probs[i] < top_p`` AND ``i < top_k``)
-        and the renormalized sampling distribution matches, but the exact token
-        drawn for a given seed is NOT guaranteed to match. The reference draws
-        via ``multinomial`` over the stacked kept subset while this draws over
-        the full sorted vector (zeroed outside the keep-set), so the generator
-        advances over different-sized inputs and may yield a different sample.
-        The win: no per-token ``.item()`` D2H syncs from the Python loop —
-        those dominated the sampler CPU time in profiling.
-        """
-        probs = weighted_scores.softmax(dim=0)
-        sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
-        cum_before = sorted_prob.cumsum(dim=0) - sorted_prob
-        mask = cum_before < top_p
-        if top_k > 0:
-            n = sorted_prob.shape[0]
-            mask = mask & (torch.arange(n, device=mask.device) < min(int(top_k), n))
-        weights = sorted_prob * mask.to(sorted_prob.dtype)
-        # First token always passes (cum_before[0] = 0 < top_p for any top_p > 0),
-        # so ``weights`` is guaranteed to have at least one nonzero entry. The
-        # final ``.item()`` is the ONLY D2H sync per call.
-        sample_idx = cls._random_sample_one(weights, generator=generator)
-        return int(sorted_idx[sample_idx].item())
-
-    @classmethod
-    def _ras_sample_one(
-        cls,
-        weighted_scores: torch.Tensor,
-        decoded_tokens: Sequence[int],
-        *,
-        top_p: float,
-        top_k: int,
-        win_size: int,
-        tau_r: float,
-        generator: torch.Generator | None,
-    ) -> int:
-        top_id = cls._nucleus_sample_one(
-            weighted_scores,
-            top_p=top_p,
-            top_k=top_k,
-            generator=generator,
-        )
-        if win_size > 0 and decoded_tokens:
-            recent = torch.as_tensor(
-                list(decoded_tokens[-win_size:]),
-                device=weighted_scores.device,
-                dtype=torch.long,
-            )
-            rep_num = int((recent == top_id).sum().item())
-            if rep_num >= win_size * tau_r:
-                weighted_scores = weighted_scores.clone()
-                original_score = weighted_scores[top_id].clone()
-                weighted_scores[top_id] = float("-inf")
-                weighted_scores[top_id] = torch.where(
-                    torch.isfinite(weighted_scores).any(),
-                    weighted_scores[top_id],
-                    original_score,
-                )
-                top_id = int(cls._random_sample_one(weighted_scores.softmax(dim=0), generator=generator).item())
-        return top_id
-
-    def _cosyvoice3_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
+    def _cosyvoice3_ras_enabled(
+        self,
+        sampling_metadata: SamplingMetadata,
+        per_req_sampling_params: Sequence[SamplingParams] | None = None,
+    ) -> bool:
         if self.model_stage != "cosyvoice3_talker":
             return False
         if sampling_metadata.max_num_logprobs is not None:
@@ -985,6 +930,13 @@ class CosyVoice3Model(
             return False
         if bool(sampling_metadata.bad_words_token_ids):
             return False
+        if per_req_sampling_params is not None:
+            # InputBatch stores these values as float32. Match its rounding,
+            # including penalties that underflow to zero, without a D2H read.
+            return not any(
+                np.float32(params.frequency_penalty) != 0 or np.float32(params.presence_penalty) != 0
+                for params in per_req_sampling_params
+            )
         if torch.any(sampling_metadata.frequency_penalties != 0):
             return False
         if torch.any(sampling_metadata.presence_penalties != 0):
@@ -1000,69 +952,97 @@ class CosyVoice3Model(
         default_top_k: int,
         win_size: int,
         tau_r: float,
+        greedy_mask: list[bool] | None = None,
+        defer_rng: bool = False,
     ) -> torch.Tensor:
-        """Batch random RAS without per-row scalar parameter/token transfers.
+        """Batch RAS, excluding greedy rows from all RNG draws.
 
-        Rejection flags cross to the host once per batch so only requests that
-        actually reject a token consume a second RNG draw. Per-request seeded
-        generators retain their ownership when rejection compacts the batch.
+        The runner can supply a host greedy mask from request parameters; direct
+        callers without it read the mask once per mixed batch. The all-random
+        path needs neither. Compact row indices retain request-owned generators
+        and histories; greedy generators must not advance.
+        Immediate callers compact rejection on the host; the runner
+        instead commits conditional RNG consumption with final-token feedback.
+        Both paths preserve generator ownership and rejected-only RNG draws.
         """
         batch_size = logits.shape[0]
 
-        def parameter(value: torch.Tensor | None, default: float | int) -> torch.Tensor:
-            if value is None or value.numel() == 0:
-                return torch.full((batch_size,), default, device=logits.device)
-            value = value.reshape(-1).to(device=logits.device)
-            if value.numel() < batch_size:
-                value = torch.cat((value, value[-1:].expand(batch_size - value.numel())))
-            return value[:batch_size]
-
-        temperature = parameter(sampling_metadata.temperature, 1.0)
-        top_p = parameter(sampling_metadata.top_p, default_top_p)
-        top_k = parameter(sampling_metadata.top_k, default_top_k)
+        # InputBatch supplies device tensors with one entry per batch row.
+        # RAS routing guarantees temperature is present; absent top-p/k retain
+        # the model defaults used by the original sampler.
+        temperature = cast(torch.Tensor, sampling_metadata.temperature)
+        top_p = sampling_metadata.top_p
+        if top_p is None:
+            top_p = torch.full((batch_size,), default_top_p, device=logits.device)
+        top_k = sampling_metadata.top_k
+        if top_k is None:
+            top_k = torch.full((batch_size,), default_top_k, device=logits.device)
+        histories = sampling_metadata.output_token_ids
+        # History can omit padding rows; normalize once before either compaction.
+        histories = [histories[i] if i < len(histories) else [] for i in range(batch_size)]
+        generators = sampling_metadata.generators
+        random_indices = None
+        if not sampling_metadata.all_random:
+            # Match the old Python-float comparison at the epsilon boundary.
+            greedy = greedy_mask
+            if greedy is None:
+                greedy = (temperature.to(torch.float64) < self._sampling_eps).tolist()
+            random_rows = [i for i, is_greedy in enumerate(greedy) if not is_greedy]
+            mixed_output = logits.argmax(dim=1).to(torch.int32)
+            if not random_rows:
+                return mixed_output
+            random_indices = torch.tensor(random_rows, dtype=torch.long, device=logits.device)
+            logits = logits.index_select(0, random_indices)
+            temperature = temperature.index_select(0, random_indices)
+            top_p = top_p.index_select(0, random_indices)
+            top_k = top_k.index_select(0, random_indices)
+            histories = [histories[i] for i in random_rows]
+            generators = {i: generators[row] for i, row in enumerate(random_rows) if row in generators}
         weighted_scores = torch.log_softmax(logits / temperature.clamp_min(self._sampling_eps).unsqueeze(1), dim=1)
         sorted_probs, sorted_ids = weighted_scores.softmax(dim=1).sort(dim=1, descending=True, stable=True)
-        # Keep top-p based on the full distribution, before top-k masking.
-        keep = (sorted_probs.cumsum(dim=1) - sorted_probs) < top_p.unsqueeze(1)
-        ranks = torch.arange(logits.shape[1], device=logits.device)
-        keep &= (top_k.unsqueeze(1) <= 0) | (ranks.unsqueeze(0) < top_k.unsqueeze(1))
-        weights = sorted_probs * keep.to(sorted_probs.dtype)
-        generators = {i: g for i, g in sampling_metadata.generators.items() if i < batch_size}
-        draws = random_sample(weights, generators).reshape(-1, 1).long()
-        sampled = sorted_ids.gather(1, draws).squeeze(1)
-
-        histories = sampling_metadata.output_token_ids
-        if win_size > 0 and any(histories[:batch_size]):
-            recent = []
-            for i in range(batch_size):
-                row = list(histories[i][-win_size:]) if i < len(histories) else []
-                recent.append([-1] * (win_size - len(row)) + row)
-            history = torch.tensor(recent, dtype=torch.long, device=logits.device)
-            repeated = ((history == sampled.unsqueeze(1)).sum(dim=1) >= win_size * tau_r) & (history >= 0).any(dim=1)
+        history = None
+        if win_size > 0 and any(histories):
+            recent = [tokens[-win_size:] for tokens in histories]
+            history = torch.tensor(
+                [[-1] * (win_size - len(row)) + row for row in recent], dtype=torch.long, device=logits.device
+            )
+        sampled, repeated = nucleus_sample(
+            sorted_probs, sorted_ids, top_p, top_k, history, win_size * tau_r, generators
+        )
+        if repeated is not None and defer_rng and _use_triton(weighted_scores):
+            sampled = conditional_sample(weighted_scores, sampled, repeated, generators)
+            self._pending_rejection_rng = DeferredRejection(repeated, generators, weighted_scores.shape[1])
+        elif repeated is not None:
             rejected_rows = [i for i, reject in enumerate(repeated.tolist()) if reject]
             if rejected_rows:
                 rows = torch.tensor(rejected_rows, device=logits.device, dtype=torch.long)
                 scores = weighted_scores.index_select(0, rows)
                 rejected_ids = sampled.index_select(0, rows).unsqueeze(1)
-                original = scores.gather(1, rejected_ids)
+                selected_scores = scores.gather(1, rejected_ids)
                 scores.scatter_(1, rejected_ids, float("-inf"))
-                replacement = torch.where(
-                    torch.isfinite(scores).any(dim=1, keepdim=True),
-                    torch.full_like(original, float("-inf")),
-                    original,
+                scores.scatter_(
+                    1,
+                    rejected_ids,
+                    torch.where(torch.isfinite(scores).any(dim=1, keepdim=True), float("-inf"), selected_scores),
                 )
-                scores.scatter_(1, rejected_ids, replacement)
                 compact_generators = {i: generators[row] for i, row in enumerate(rejected_rows) if row in generators}
                 # RAS rejection samples the complete remaining distribution,
                 # without applying top-k/top-p a second time.
-                replacement_ids = random_sample(scores.softmax(dim=1), compact_generators).reshape(-1).long()
+                replacement_ids = categorical_sample(scores.softmax(dim=1), compact_generators)
                 sampled.index_copy_(0, rows, replacement_ids)
-        return sampled.to(torch.int32)
+        sampled = sampled.to(torch.int32)
+        if random_indices is not None:
+            mixed_output.index_copy_(0, random_indices, sampled)
+            return mixed_output
+        return sampled
 
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        *,
+        per_req_sampling_params: list[SamplingParams | None] | None = None,
+        defer_rng: bool = False,
     ) -> SamplerOutput | None:
         if logits is None or logits.numel() == 0:
             return None
@@ -1083,7 +1063,17 @@ class CosyVoice3Model(
                 )
             return sampler(logits=logits, sampling_metadata=sampling_metadata)
 
-        if not self._cosyvoice3_ras_enabled(sampling_metadata):
+        # The runner supplies live parameters in batch-row order, including
+        # None for missing request state. Use tensor routing for incomplete input.
+        host_params = None
+        if (
+            per_req_sampling_params is not None
+            and len(per_req_sampling_params) == logits.shape[0]
+            and all(params is not None for params in per_req_sampling_params)
+        ):
+            host_params = cast(list[SamplingParams], per_req_sampling_params)
+
+        if not self._cosyvoice3_ras_enabled(sampling_metadata, host_params):
             sampler = getattr(self, "_talker_sampler", None)
             if sampler is None:
                 sampler = Sampler()
@@ -1110,57 +1100,89 @@ class CosyVoice3Model(
         speech_head_size = int(self.config.llm["speech_token_size"]) + 200
         logits = logits[..., :speech_head_size]
         finite_logits = torch.isfinite(logits)
-        if not finite_logits.any(dim=-1).all().item():
-            raise ValueError("CosyVoice3 sampling received a row with no finite logits")
+        valid_rows = finite_logits.any(dim=-1)
+        error_msg = "CosyVoice3 sampling received a row with no finite logits"
+        if not (defer_rng and logits.is_cuda) and not valid_rows.all():
+            raise ValueError(error_msg)
         logits.masked_fill_(~finite_logits, float("-inf"))
+        if defer_rng and logits.is_cuda:
+            # Invalid rows produce a safe placeholder until request-local error
+            # handling at token consumption. Never publish it as a sampled token.
+            logits[:, 0] = torch.where(valid_rows, logits[:, 0], 0.0)
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
         default_top_p = float(sampling_cfg.get("top_p", 0.8))
         default_top_k = int(sampling_cfg.get("top_k", 25))
         win_size = int(sampling_cfg.get("win_size", 10))
         tau_r = float(sampling_cfg.get("tau_r", 0.1))
+        greedy_mask = None
+        if host_params is not None and not sampling_metadata.all_random:
+            # Compare float32 values as Python floats, like the legacy scalar
+            # read. numpy's float32 scalar comparison would round eps as well.
+            greedy_mask = [float(np.float32(params.temperature)) < self._sampling_eps for params in host_params]
 
-        if sampling_metadata.all_random:
-            sampled = self._ras_sample_batch(
-                logits,
-                sampling_metadata,
-                default_top_p=default_top_p,
-                default_top_k=default_top_k,
-                win_size=win_size,
-                tau_r=tau_r,
-            )
-            return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
-
-        sampled_ids: list[int] = []
-        for req_idx in range(int(logits.shape[0])):
-            row_logits = logits[req_idx]
-
-            temperature = float(self._req_scalar(sampling_metadata.temperature, req_idx, 1.0))
-            if temperature < self._sampling_eps:
-                sampled_ids.append(int(torch.argmax(row_logits).item()))
-                continue
-
-            top_p = float(self._req_scalar(sampling_metadata.top_p, req_idx, default_top_p))
-            top_k = int(self._req_scalar(sampling_metadata.top_k, req_idx, default_top_k))
-            generator = sampling_metadata.generators.get(req_idx)
-            weighted_scores = torch.log_softmax(row_logits / max(temperature, self._sampling_eps), dim=0)
-            decoded_tokens = (
-                sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
-            )
-            sampled_ids.append(
-                self._ras_sample_one(
-                    weighted_scores,
-                    decoded_tokens,
-                    top_p=top_p,
-                    top_k=top_k,
-                    win_size=win_size,
-                    tau_r=tau_r,
-                    generator=generator,
-                )
-            )
-
-        sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
+        sampled = self._ras_sample_batch(
+            logits,
+            sampling_metadata,
+            default_top_p=default_top_p,
+            default_top_k=default_top_k,
+            win_size=win_size,
+            tau_r=tau_r,
+            greedy_mask=greedy_mask,
+            defer_rng=defer_rng,
+        )
+        if defer_rng and logits.is_cuda:
+            pending = self._pending_rejection_rng
+            if pending is None:
+                pending = DeferredRejection(torch.empty(0, dtype=torch.bool, device=logits.device), {}, logits.shape[1])
+                self._pending_rejection_rng = pending
+            pending.invalid_logits = ~valid_rows
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
+
+    def finalize_deferred_sampling(self, sampled_token_ids: torch.Tensor) -> DeferredRejection | None:
+        """Commit synchronous feedback and cache host tokens at token completion."""
+        pending = self._pending_rejection_rng
+        if pending is None:
+            return
+        payload = torch.cat((sampled_token_ids.reshape(-1), pending.flags().to(sampled_token_ids.dtype)))
+        host = torch.empty(payload.shape, dtype=payload.dtype, pin_memory=True)
+        host.copy_(payload, non_blocking=True)
+        ready = torch.Event()
+        ready.record()
+        ready.synchronize()
+        values = host.tolist()
+        count = sampled_token_ids.numel()
+        pending.host = host[count:]
+        pending.ready = ready
+        pending.commit(ready=True)
+        self._pending_rejection_rng = None
+        self._sampled_token_feedback = (sampled_token_ids, [[token] for token in values[:count]])
+        return pending
+
+    def stage_deferred_sampling(self, stream: torch.cuda.Stream, ready: torch.Event) -> DeferredRejection | None:
+        """Stage async rejection flags on the token-copy stream and event."""
+        pending = self._pending_rejection_rng
+        if pending is not None:
+            pending.stage(stream, ready)
+        return pending
+
+    def commit_deferred_sampling(self) -> None:
+        """Commit the previous step once before reserving RNG for the next sample."""
+        pending = self._pending_rejection_rng
+        if pending is not None:
+            pending.commit()
+            self._pending_rejection_rng = None
+
+    def consume_sampled_token_ids_cpu_override(self, sampled_token_ids: torch.Tensor) -> list[list[int]] | None:
+        """Consume cached host tokens once for their originating sample tensor."""
+        feedback = self._sampled_token_feedback
+        if feedback is None:
+            return None
+        self._sampled_token_feedback = None
+        tensor, tokens = feedback
+        if tensor is not sampled_token_ids:
+            raise RuntimeError("CosyVoice3 sampled-token feedback belongs to another step")
+        return tokens
 
     def mrv2_custom_sampler(self, sampler: Any) -> None:
         """Model Runner V2: the V1 sampling policies on the MRv2 sampler.
@@ -1269,24 +1291,66 @@ class CosyVoice3Model(
         input_ids: torch.Tensor,
         multimodal_embeddings=None,
         is_multimodal=None,
+        prefill_token_mask: bool | torch.Tensor | None = None,
+        scheduled_token_counts: list[int] | None = None,
         query_start_loc: Sequence[int] | None = None,
     ) -> torch.Tensor:
         if self.model_stage == "cosyvoice3_talker":
+            num_speech_tokens = self.model.speech_embedding.weight.shape[0]
+
+            def validate_prefill_ids(mask: bool | torch.Tensor | None) -> None:
+                # ``None`` is deliberately fail-safe: direct model callers do
+                # not have scheduler metadata, so every id must be safe to
+                # gather from the speech embedding table.
+                if mask is False:
+                    return
+                prefill_ids = input_ids
+                if isinstance(mask, torch.Tensor):
+                    if mask.shape != input_ids.shape:
+                        raise ValueError(
+                            "cosyvoice3 talker: prefill_token_mask must match "
+                            f"input_ids shape; got {mask.shape} and {input_ids.shape}."
+                        )
+                    prefill_ids = input_ids[mask.to(device=input_ids.device, dtype=torch.bool)]
+                _validate_speech_token_ids(prefill_ids, num_speech_tokens)
+
             # Decode-only steps carry no speech embeddings; checking the
             # (device) placeholder mask would synchronize every step.
             if not multimodal_embeddings or is_multimodal is None or not torch.any(is_multimodal):
+                validate_prefill_ids(prefill_token_mask)
                 return self.model.speech_embedding.weight[input_ids]
 
             # Requests can interleave new prefills and ongoing decodes after
             # scheduler slot reuse. A placeholder group identifies the start
             # of a prompt, but cannot identify its end: use runner boundaries.
             total_tokens = input_ids.numel()
-            boundaries = list(query_start_loc) if query_start_loc is not None else [0, total_tokens]
+            if query_start_loc is not None:
+                boundaries = list(query_start_loc)
+            elif scheduled_token_counts is not None:
+                if any(count < 0 for count in scheduled_token_counts) or sum(scheduled_token_counts) != total_tokens:
+                    raise ValueError(
+                        "cosyvoice3 talker: scheduled_token_counts must be non-negative "
+                        "and sum to the input_ids length."
+                    )
+                boundaries = [0]
+                for count in scheduled_token_counts:
+                    boundaries.append(boundaries[-1] + count)
+            else:
+                boundaries = [0, total_tokens]
             if not boundaries or boundaries[0] != 0 or boundaries[-1] != total_tokens:
                 raise ValueError("CosyVoice3 input embedding boundaries must cover all scheduled tokens")
             if any(end <= start for start, end in zip(boundaries, boundaries[1:])):
                 raise ValueError("CosyVoice3 input embedding boundaries must be strictly increasing")
+            if isinstance(prefill_token_mask, torch.Tensor):
+                if prefill_token_mask.shape != input_ids.shape:
+                    raise ValueError(
+                        "cosyvoice3 talker: prefill_token_mask must match "
+                        f"input_ids shape; got {prefill_token_mask.shape} and {input_ids.shape}."
+                    )
+                prefill_token_mask = prefill_token_mask.to(device=input_ids.device, dtype=torch.bool)
             mm_mask = is_multimodal.reshape(-1).tolist()
+            if len(mm_mask) != total_tokens:
+                raise ValueError("CosyVoice3 multimodal token mask must match input_ids length")
             # Conditioning contains prefill rows only, whereas the downstream
             # payload splitter indexes the full (prefill + decode) request batch.
             self._conditioning_request_rows = [
@@ -1303,6 +1367,11 @@ class CosyVoice3Model(
             for start, end in zip(boundaries, boundaries[1:]):
                 request_mask = mm_mask[start:end]
                 if not any(request_mask):
+                    if prefill_token_mask is not False:
+                        request_ids = input_ids[start:end]
+                        if isinstance(prefill_token_mask, torch.Tensor):
+                            request_ids = request_ids[prefill_token_mask[start:end]]
+                        _validate_speech_token_ids(request_ids, num_speech_tokens)
                     segments.append(self.model.speech_embedding.weight[input_ids[start:end]])
                     continue
                 if multimodal_embeddings is None or mm_index >= len(multimodal_embeddings):

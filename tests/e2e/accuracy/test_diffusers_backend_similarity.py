@@ -53,12 +53,13 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 def _flash_attempt_backends() -> list[str]:
     """Backends in ``CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS`` that can actually launch.
 
-    Those names are Hopper FA2/FA3. ``set_attention_backend`` only checks import,
-    so a newer GPU still "selects" them and then dies with "no kernel image".
-    Do not probe by launching: a missing cubin can leave the CUDA context dead.
-    Capability >= 10 is outside that wheel, including future SKUs in that family.
+    Those names are NVIDIA Hopper FA2/FA3. ``set_attention_backend`` only checks
+    import, so ROCm or a newer CUDA GPU can still "select" one and then die when
+    it launches. Do not probe by launching: an incompatible kernel can leave the
+    accelerator context dead. Capability >= 10 is outside that CUDA wheel,
+    including future SKUs in that family.
     """
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.version.hip is not None:
         return []
     major, _ = torch.cuda.get_device_capability()
     if major >= 10:
@@ -307,7 +308,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen-Image"])
 def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifact_root: Path) -> None:
     output_dir = model_output_dir(accuracy_artifact_root, model_id + "-diffusers-backend")

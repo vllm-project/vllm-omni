@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Utilities for handling multimodal outputs / building multimodal output
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 import torch
 from vllm.logger import init_logger
@@ -66,7 +69,7 @@ def partition_flat_payload(
 
 
 def partition_payload_list(
-    payloads: list[dict[str, object]],
+    payloads: Sequence[Mapping[str, object]],
 ) -> tuple[list[dict[str, object] | None] | None, list[dict[str, object] | None] | None]:
     inter_stage_list: list[dict[str, object] | None] = []
     client_mm_list: list[dict[str, object] | None] = []
@@ -180,6 +183,38 @@ def _to_cpu(value):
     return value
 
 
+def split_mapping_outputs(
+    outputs: Mapping[str, object],
+    num_reqs: int,
+    copy_tensor: Callable[[torch.Tensor], torch.Tensor],
+) -> list[dict[str, object]]:
+    """Split a generation stage's batched output mapping into one payload per request."""
+    batch_payloads: list[dict[str, object]] = [{} for _ in range(num_reqs)]
+    for key, out in outputs.items():
+        if isinstance(out, list):
+            if len(out) != num_reqs:
+                raise ValueError(
+                    f"Multimodal output list for key '{key}' has length {len(out)} "
+                    f"but expected {num_reqs} (one entry per request)."
+                )
+            for req_payload, req_item in zip(batch_payloads, out, strict=True):
+                req_payload[key] = copy_tensor(req_item)
+        elif isinstance(out, torch.Tensor):
+            # TODO (Alex): For now, we copy all tensors to all requests, because previously
+            # we used this to pass primitives by wrapping them as 0-d tensors. This is probably
+            # not optimal and should be revisited, but we need to ensure it doesn't cause issues
+            # for cases like max_num_seqs > 1 on audio producing models
+            for req_payload in batch_payloads:
+                req_payload[key] = copy_tensor(out)
+        elif isinstance(out, (int, float, bool)):
+            # primitives are constant across all requests in the batch, e.g., sampling rate
+            for req_payload in batch_payloads:
+                req_payload[key] = out
+        else:
+            logger.warning("Unsupported multimodal output type for key '%s': %s", key, type(out))
+    return batch_payloads
+
+
 def to_payload_element(
     element: object,
     idx: int,
@@ -216,9 +251,13 @@ def to_payload_element(
     # Cached per-token tensors are merged elsewhere; here a first dim equal to
     # either the hidden-aligned or scheduler-aligned batch length means a
     # per-request slice is required.
-    if isinstance(element, torch.Tensor) and (
-        (seq_len is not None and element.shape[0] == seq_len)
-        or (scheduled_seq_len is not None and element.shape[0] == scheduled_seq_len)
+    if (
+        isinstance(element, torch.Tensor)
+        and element.ndim > 0
+        and (
+            (seq_len is not None and element.shape[0] == seq_len)
+            or (scheduled_seq_len is not None and element.shape[0] == scheduled_seq_len)
+        )
     ):
         return element[start:end].contiguous()
     # Every other case is shared between prefix cache (passthrough data)

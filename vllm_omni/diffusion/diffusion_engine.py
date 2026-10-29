@@ -39,6 +39,7 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
 from vllm_omni.diffusion.diffusion_kv.initialization import initialize_diffusion_kv_control_plane
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.interaction.types import MAX_PENDING_INTERACTION_EVENTS, InteractionBoundaryContext
 from vllm_omni.diffusion.io_support import (
     get_dummy_run_num_frames,
     get_dummy_run_num_image_inputs,
@@ -66,8 +67,14 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionRequestStatus, DiffusionSchedulerOutput
+from vllm_omni.diffusion.utils.pipeline_utils import (
+    pipeline_supports,
+    resolve_custom_pipeline_cls,
+    supports_pre_tokenized_prompt_ids,
+)
+from vllm_omni.diffusion.utils.prompt_utils import pre_tokenized_prompt_keys
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
-from vllm_omni.errors import client_error_from_metadata, is_client_error_status
+from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics.utils import (
     diffusion_scheduler_waiting_metrics,
@@ -146,38 +153,8 @@ def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
     )
 
 
-def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) -> type | None:
-    if not custom_pipeline_args or "pipeline_class" not in custom_pipeline_args:
-        return None
-
-    pipeline_cls = custom_pipeline_args["pipeline_class"]
-
-    if isinstance(pipeline_cls, type):
-        return pipeline_cls
-    if isinstance(pipeline_cls, str):
-        try:
-            return resolve_obj_by_qualname(pipeline_cls)
-        except (AttributeError, ImportError, ValueError) as exc:
-            raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
-    raise TypeError(
-        f"custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
-        f"got {type(pipeline_cls).__name__}"
-    )
-
-
 def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
-    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
-    if model_cls is not None:
-        return bool(getattr(model_cls, "supports_request_batch", False))
-
-    if uses_diffusers_adapter(od_config):
-        model_cls = DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
-        return bool(getattr(model_cls, "supports_request_batch", False))
-
-    model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
-    if model_cls is None:
-        return False
-    return bool(getattr(model_cls, "supports_request_batch", False))
+    return pipeline_supports(od_config, "supports_request_batch")
 
 
 def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
@@ -189,7 +166,7 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
 
 def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
     """Whether the local pipeline checks cooperative cancellation boundaries."""
-    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    model_cls = resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
     if model_cls is None:
         name = (
             "DiffusersAdapterPipeline"
@@ -238,6 +215,7 @@ class _StreamingPlayback:
     boundary_at: float | None = None
     next_ready_at: float = 0.0
     pending_boundary: bool = True
+    pending_actions: dict[str, float] = field(default_factory=dict)
     next_media_duration: float = 0.0
     max_output_bytes: int = 64 * 1024 * 1024
     idle_timeout_s: float = 30.0
@@ -320,6 +298,9 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        # Whether admitted requests may carry OmniCustomPrompt.prompt_ids. Read
+        # once from the pipeline class so admission does not touch the registry.
+        self._supports_pre_tokenized_prompt_ids: bool | None = supports_pre_tokenized_prompt_ids(od_config)
         # Set after the paged-KV profile request has gone through model-owned
         # preprocessing. Real requests are admitted only within this measured
         # activation envelope: (max execution sequences, max seq_len,
@@ -464,6 +445,11 @@ class DiffusionEngine:
         self._rpc_lock = threading.RLock()
         self._cv = threading.Condition(self._rpc_lock)
         self._out_streams: dict[str, asyncio.Queue[DiffusionOutput]] = {}
+        # Track ownership by stream because request IDs can be reused.
+        self._unclaimed_async_outputs: dict[asyncio.Queue[DiffusionOutput], set[str]] = {}
+        self._shutdown_output_futures: dict[
+            asyncio.Queue[DiffusionOutput], dict[str, concurrent.futures.Future[DiffusionOutput]]
+        ] = {}
         self._closed = False
         self._shutting_down = False
         self._shutdown_complete = False
@@ -529,26 +515,10 @@ class DiffusionEngine:
         request_id = self._add_prepared_request(request)
         generator = self.get_output_stream(request_id)
         async for output in generator:
-            exec_total_time = time.perf_counter() - exec_start_time
-            output_ready_wait_time = 0.0
-            # Async mode: wait for background D2H/SHM to complete.
-            if output.async_output_id:
-                output_ready_wait_start_time = time.perf_counter()
-                fut = self.executor.wait_output_ready(output.async_output_id)
-                timeout = _async_output_timeout()
-                try:
-                    output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
-                except (TimeoutError, asyncio.TimeoutError):
-                    describe = getattr(self.executor, "describe_pending_state", None)
-                    logger.error(
-                        "Timed out after %.1fs waiting for async output; set %s to a larger value "
-                        "to allow slower steps. Executor state: %s",
-                        timeout,
-                        _ASYNC_OUTPUT_TIMEOUT_ENV,
-                        describe(output.async_output_id) if describe else "unavailable",
-                    )
-                    raise
-                output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
+            output_ready_wait_time = output.output_ready_wait_time
+            # The stream now materializes async outputs before yielding. Keep
+            # that wait separate from execution time in the timing breakdown.
+            exec_total_time = time.perf_counter() - exec_start_time - output_ready_wait_time
             postprocess_start_time = time.perf_counter()
             scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
             try:
@@ -696,13 +666,12 @@ class DiffusionEngine:
                 self._emit_finished_outputs(pending_finished, None)
 
             with self._cv:
-                while (
-                    (self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests())
-                    and self._rpc_queue.empty()
-                    and self.abort_queue.empty()
-                    and not self.stop_event.is_set()
-                ):
+                if self._rpc_queue.empty() and self.abort_queue.empty() and not self.stop_event.is_set():
                     now = time.monotonic()
+                    if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():
+                        wait_timeout: float | None = 1.0
+                    else:
+                        wait_timeout = self.scheduler.get_execution_wait_timeout(now)
                     deadlines = [
                         state.next_ready_at - now
                         for state in (self._streaming_playback or {}).values()
@@ -713,13 +682,23 @@ class DiffusionEngine:
                         for state in (self._streaming_playback or {}).values()
                         if state.idle_since is not None
                     )
-                    self._cv.wait(timeout=min(1.0, *deadlines) if deadlines else 1.0)
-                    break  # Recheck idle expiry even when no client message arrives.
+                    if deadlines:
+                        wait_timeout = min(deadlines) if wait_timeout is None else min(wait_timeout, *deadlines)
+                    if wait_timeout != 0:
+                        self._cv.wait(timeout=wait_timeout)
+                        # Recheck idle expiry, interactions and aborts before scheduling.
+                        continue
 
                 if self.stop_event.is_set():
                     break
 
-                if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():
+                if (
+                    self._scheduling_paused
+                    or self._playback_blocked()
+                    or not self.scheduler.has_requests()
+                    or not self._rpc_queue.empty()
+                    or not self.abort_queue.empty()
+                ):
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
@@ -734,6 +713,11 @@ class DiffusionEngine:
                         playback = (self._streaming_playback or {}).get(request_id)
                         if playback is not None and playback.pending_boundary:
                             now = time.monotonic()
+                            sched_output.interaction_boundaries[request_id] = InteractionBoundaryContext(
+                                boundary_at=now,
+                                window_opened_at=playback.boundary_at,
+                                window_end_at=playback.next_ready_at if playback.boundary_at is not None else None,
+                            )
                             playback.boundary_at = now
                             playback.next_ready_at = 0.0
                             playback.pending_boundary = False
@@ -796,6 +780,11 @@ class DiffusionEngine:
             except Exception as exc:
                 self._fail_engine(exc)
                 return
+            finally:
+                # Streams/async workers own delivered outputs. Keeping this
+                # local would also retain the previous video during execute_fn
+                # on the next iteration. Do not mutate the shared result.
+                del runner_output
 
             if not sched_output.scheduled_request_ids and self.scheduler._kv_draining_requests:
                 # Only exceptional in-flight receives need idle polling. New
@@ -877,13 +866,14 @@ class DiffusionEngine:
                         > state.buffer_seconds + 1e-9
                     )
                     or (state.pending_boundary and now < state.next_ready_at)
+                    or bool(state.pending_actions)
                 )
                 if waiting:
                     blocked = True
                     if state.wait_started_at is None:
                         state.wait_started_at = now
                     # Only client-controlled progress can expire a request.
-                    # A media deadline is internal
+                    # A media deadline or ordered control delivery is internal
                     # pacing and must not look like an idle consumer.
                     client_blocked = state.outstanding_chunk is not None or (
                         state.pending_boundary
@@ -936,6 +926,26 @@ class DiffusionEngine:
             if expired:
                 self._cv.notify_all()
 
+    def track_streaming_interaction(self, request_id: str, event_id: str, pending: bool = True) -> float | None:
+        """Stamp ingress before ordered worker delivery in the engine's clock domain."""
+        if not isinstance(event_id, str) or not event_id:
+            raise ValueError("interaction event_id must be a non-empty string")
+        with self._cv:
+            state = (self._streaming_playback or {}).get(request_id)
+            if state is None:
+                return None
+            if pending:
+                if event_id in state.pending_actions:
+                    return state.pending_actions[event_id]
+                if len(state.pending_actions) >= MAX_PENDING_INTERACTION_EVENTS:
+                    raise ValueError("Too many pending interactions")
+                stamp = time.monotonic()
+                state.pending_actions[event_id] = stamp
+                return stamp
+            state.pending_actions.pop(event_id, None)
+            self._cv.notify_all()
+            return None
+
     def update_streaming_playback(self, request_id: str, position_seconds: float) -> None:
         if (
             isinstance(position_seconds, bool)
@@ -967,7 +977,13 @@ class DiffusionEngine:
             except queue.Empty:
                 return
 
-            self._run_rpc_task(task)
+            try:
+                self._run_rpc_task(task)
+            finally:
+                if task.method == "submit_interaction" and len(task.args) >= 2:
+                    interaction = task.args[1]
+                    if isinstance(interaction, dict) and isinstance(interaction.get("event_id"), str):
+                        self.track_streaming_interaction(task.args[0], interaction["event_id"], pending=False)
 
             if task.method == "pause_scheduler":
                 # A dequeued pause ends this drain whatever became of it, so
@@ -1010,6 +1026,11 @@ class DiffusionEngine:
             if not fut.done():
                 fut.set_exception(exc)
         else:
+            if task.method == "submit_interaction":
+                request_id = task.args[0] if task.args else (task.kwargs or {})["request_id"]
+                with self._cv:
+                    self.scheduler.notify_interaction(request_id)
+                    self._cv.notify_all()
             if not fut.done():
                 fut.set_result(result)
 
@@ -1201,8 +1222,7 @@ class DiffusionEngine:
         with self._cv:
             stream = self._out_streams.get(request_id)
         out = self._finalize_finished_request(request_id, runner_output, missing_result_error)
-        if stream is not None:
-            self._put_queue_output(stream, out)
+        self._put_stream_output(stream, out)
 
     def _emit_outputs(
         self,
@@ -1360,6 +1380,7 @@ class DiffusionEngine:
     def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
+        self._validate_pre_tokenized_prompt(request)
         pre_process_func = getattr(self, "pre_process_func", None)
         if pre_process_func is not None:
             request = pre_process_func(request)
@@ -1371,6 +1392,29 @@ class DiffusionEngine:
         if self._prefix_cache_enabled() and prefix_cache_func is not None and request.diffusion_kv_requests:
             prefix_cache_func(request)
         return request
+
+    def _validate_pre_tokenized_prompt(self, request: OmniDiffusionRequest) -> None:
+        """Reject caller-tokenized ids that this pipeline would silently ignore (#7855).
+
+        Only pipelines declaring ``supports_pre_tokenized_prompt_ids = True``
+        read ``OmniCustomPrompt.prompt_ids``; everywhere else the request would
+        be accepted and generate from an empty or text-only condition. Failing
+        at admission turns that silent success into an HTTP 400. ``None`` means
+        the capability is unknown (undeclared custom pipeline) and is not checked.
+        """
+
+        supported = getattr(self, "_supports_pre_tokenized_prompt_ids", None)
+        if supported is None or supported:
+            return
+        populated = pre_tokenized_prompt_keys(request.prompt)
+        if populated:
+            model_name = getattr(self.od_config, "model_class_name", None) or "This diffusion pipeline"
+            raise OmniClientError(
+                f"{model_name} does not support pre-tokenized prompt ids; "
+                f"request {request.request_id!r} sets {', '.join(populated)}. "
+                "Pass text through `prompt`, or use a pipeline that declares "
+                "supports_pre_tokenized_prompt_ids = True."
+            )
 
     def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
         """Keep admitted paged-KV requests within the profiled activation shape."""
@@ -1458,6 +1502,45 @@ class DiffusionEngine:
         try:
             while True:
                 output: DiffusionOutput = await queue.get()
+                async_output_id = output.async_output_id
+                if async_output_id is not None:
+                    with self._cv:
+                        saved_futures = self._shutdown_output_futures.get(queue, {})
+                        fut = saved_futures.pop(async_output_id, None)
+                        if not saved_futures:
+                            self._shutdown_output_futures.pop(queue, None)
+                        if fut is None:
+                            fut = self.executor.wait_output_ready(async_output_id)
+                        # The consumer now owns this future. Shutdown must not
+                        # claim it again after the executor retires delivery.
+                        pending_ids = self._unclaimed_async_outputs.get(queue)
+                        if pending_ids is not None:
+                            pending_ids.discard(async_output_id)
+                            if not pending_ids:
+                                self._unclaimed_async_outputs.pop(queue, None)
+                    timeout = _async_output_timeout()
+                    output_ready_wait_start_time = time.perf_counter()
+                    try:
+                        output = await asyncio.wait_for(asyncio.wrap_future(fut), timeout=timeout)
+                        output.output_ready_wait_time = time.perf_counter() - output_ready_wait_start_time
+                    except asyncio.CancelledError:
+                        # Delivery already retires completed futures; dropping
+                        # them again would create an orphaned executor waiter.
+                        if not fut.done():
+                            self.executor.drop_output(async_output_id)
+                        raise
+                    except (TimeoutError, asyncio.TimeoutError):
+                        if not fut.done():
+                            self.executor.drop_output(async_output_id)
+                        describe = getattr(self.executor, "describe_pending_state", None)
+                        logger.error(
+                            "Timed out after %.1fs waiting for async output; set %s to a larger value "
+                            "to allow slower steps. Executor state: %s",
+                            timeout,
+                            _ASYNC_OUTPUT_TIMEOUT_ENV,
+                            describe(async_output_id) if describe else "unavailable",
+                        )
+                        raise
                 finished = output.finished
                 yield output
                 with self._cv:
@@ -1479,6 +1562,10 @@ class DiffusionEngine:
         with self._cv:
             if self._out_streams.get(request_id) is queue:
                 self._out_streams.pop(request_id, None)
+            abandoned_ids = self._unclaimed_async_outputs.pop(queue, set())
+            self._shutdown_output_futures.pop(queue, None)
+        for async_output_id in abandoned_ids:
+            self.executor.drop_output(async_output_id)
 
     def async_add_req_and_stream_response(self, request: OmniDiffusionRequest) -> AsyncGenerator[DiffusionOutput, None]:
         request_id = self.add_request(request)
@@ -1574,12 +1661,21 @@ class DiffusionEngine:
                         output = fut.result(timeout=_async_output_timeout())
                     return output
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
         """Start or stop profiling on all diffusion workers.
 
         Args:
             is_start: True to start profiling, False to stop.
             profile_prefix: Optional prefix for trace filename.
+            delay_iterations: Per-session worker steps before profiling starts.
+            max_iterations: Per-session limit on profiled worker steps.
         """
         if is_start:
             if profile_prefix is None:
@@ -1589,7 +1685,15 @@ class DiffusionEngine:
             logger.info("Stopping diffusion profiling...")
 
         try:
-            self.collective_rpc(method="profile", args=(is_start, profile_prefix))
+            kwargs: dict[str, int] = {}
+            if delay_iterations is not None:
+                kwargs["delay_iterations"] = delay_iterations
+            if max_iterations is not None:
+                kwargs["max_iterations"] = max_iterations
+            if kwargs:
+                self.collective_rpc(method="profile", args=(is_start, profile_prefix), kwargs=kwargs)
+            else:
+                self.collective_rpc(method="profile", args=(is_start, profile_prefix))
         except Exception as e:
             action = "start" if is_start else "stop"
             logger.error(f"Failed to {action} profiling on workers", exc_info=True)
@@ -1762,6 +1866,9 @@ class DiffusionEngine:
                 self.release_streaming_output(*args, **(kwargs or {}))
                 task.future.set_result(None)
                 return task
+            if method == "track_streaming_interaction":
+                task.future.set_result(self.track_streaming_interaction(*args, **(kwargs or {})))
+                return task
             if method == "pause_scheduler":
                 self._check_pause_request(kwargs)
                 self._scheduling_paused = True
@@ -1813,6 +1920,8 @@ class DiffusionEngine:
                         return self.update_streaming_playback(*args, **(kwargs or {}))
                     if method == "release_streaming_output":
                         return self.release_streaming_output(*args, **(kwargs or {}))
+                    if method == "track_streaming_interaction":
+                        return self.track_streaming_interaction(*args, **(kwargs or {}))
                     return self.executor.collective_rpc(
                         method=method,
                         timeout=timeout,
@@ -1866,12 +1975,23 @@ class DiffusionEngine:
     def _put_output(self, request_id: str, output: DiffusionOutput) -> None:
         with self._cv:
             queue = self._out_streams.get(request_id)
+            self._put_stream_output(queue, output)
+
+    def _put_stream_output(self, queue: asyncio.Queue[DiffusionOutput] | None, output: DiffusionOutput) -> None:
+        """Track async output ownership for the captured request lifecycle."""
+        async_output_id = output.async_output_id
+        with self._cv:
+            if queue is not None and async_output_id is not None:
+                self._unclaimed_async_outputs.setdefault(queue, set()).add(async_output_id)
         if queue is None:
+            if async_output_id is not None:
+                self.executor.drop_output(async_output_id)
             return
         self._put_queue_output(queue, output)
 
     def close(self) -> None:
         pending_streams: list[asyncio.Queue[DiffusionOutput]] = []
+        abandoned_ids: set[str] = set()
         with self._cv:
             if self._closed and self._shutdown_complete:
                 return
@@ -1885,7 +2005,24 @@ class DiffusionEngine:
                 self._out_streams.clear()
                 if self._streaming_playback is not None:
                     self._streaming_playback.clear()
+                # Registered streams retain ownership of queued outputs until
+                # their consumers finish draining or close their generators.
+                live_streams = set(pending_streams)
+                for stream in list(self._unclaimed_async_outputs):
+                    if stream not in live_streams:
+                        abandoned_ids.update(self._unclaimed_async_outputs.pop(stream))
+                    else:
+                        # Transfer cached results out of the executor before
+                        # shutdown clears its cache. Pending futures receive
+                        # the executor's shutdown error instead.
+                        self._shutdown_output_futures[stream] = {
+                            output_id: self.executor.wait_output_ready(output_id)
+                            for output_id in self._unclaimed_async_outputs[stream]
+                        }
                 self._cv.notify_all()
+
+        for async_output_id in abandoned_ids:
+            self.executor.drop_output(async_output_id)
 
         closed_output = DiffusionOutput(error="DiffusionEngine is closed.")
         for stream in pending_streams:
