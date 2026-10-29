@@ -39,6 +39,9 @@ The author's Diffusers fork is not needed for this integration.
 | Default AR capacity | 120 latent frames, 16 prompt segments, one active session, 704×1280 spatial limits |
 | Explicit recent mode | Shared video/text history budget; independent total frame/segment limits; incremental-v1 sampling |
 
+Recent history applies to AR sessions. Use the session example or the recent
+deployment profile to enable it; the ordinary offline pipeline uses full history.
+
 Each `|||`-separated text describes one segment. Supply prepared reference segment
 JSON as its text when using structured prompts. Prompt enhancement with Nomas-PE
 and the reference dataset prompt-file loader are separate upstream tools.
@@ -70,7 +73,8 @@ for the tested workloads.
 Weights, text encoding, and PixelUMM decoding remain replicated with sequence
 parallelism. The degree must divide the DiT's 16 attention heads and the spatial
 token count per latent frame. Real-model validation covers degrees one and two.
-Device interconnect, peak memory, and host memory were not measured in these checks.
+Memory and latency depend on the workload; see [Verification](#verification)
+for the measured configurations and revisions.
 CPU offload requires sufficient GPU memory for initial component loading and host
 memory for the staged weights.
 The legacy `--enable-cpu-offload` flag swaps the DiT, text encoder, and PixelUMM
@@ -314,46 +318,79 @@ MP4 incrementally instead of retaining all decoded frames in host memory.
 
 ## Verification
 
-### Section A implementation
+### Scope and reference accuracy
 
-Implementation `209771901` passed 234 related CPU checks, all applicable local
-hooks, and four isolated 704×1280 reference cases. Four/eight steps cover three
-49-frame turns and a 129-frame request; resident/offload outputs preserve exact
-complete latents and uint8 pixels under the reference's actual chunk sequence.
-The pinned PixelUMM revision passed 34 CPU checks against the legacy decoder.
+This integration covers offline generation, full/recent AR sessions, and normal
+`/v1/realtime/video` generation with text/camera updates and final flush.
+Implementation `209771901` passed 234 related CPU checks and four isolated
+resident/offload continuation/tail-reference cases; the pinned PixelUMM revision
+passed 34 CPU checks. All applicable local hooks passed.
 
-Post-correction SP2 runs for history budgets 18 and 36 delivered 2,881 frames
-with 20 prompt/camera controls. The remaining sustained matrix and measurement
-summaries are still being collected. Long-session perceptual quality requires
-separate qualification; duration and resource checks do not establish it.
+The latest precision campaign used one H200, SP1, resident BF16, FlexAttention,
+704×1280, 24 fps, seed 42, CFG=1, and flow shift=5:
 
-### Baseline integration evidence
+| Comparison | Workload | Result |
+| --- | --- | --- |
+| Full vs upstream | Three 49-frame turns, separately at 4/8 steps | Exact complete latents and pre-codec uint8 video |
+| Recent vs upstream | Same turns/steps, budget 36, equal actual noise | Exact at every turn |
+| Offline AR vs realtime | Full/recent, 129 frames each; recent includes text/camera segments | Exact latents/pixels; encoded frames and PTS correct |
+| Long recent vs upstream | Budgets 18/36, 48×61=2928 frames, 4 steps | All 48 turns exact; 122 seconds each |
 
-For a quick check, change the offline command to one prompt, 256×256, nine frames,
-and four steps. Verify that the output has nine frames at 24 fps. This checks
-execution; it does not establish video quality or performance.
+Full uses the configured upstream noise timeline. Recent precision comparisons
+supply upstream with the same actual `incremental_v1` generation and KV noise;
+they do not establish same-seed agreement with the unchanged upstream RNG.
+The reference uses its supported `seg_ar` route. Its additional 193-frame
+`recent + chunk_ar` probe fails at an upstream cache write and is not counted
+as a passed comparison. Reported recent precision covers budgets 18/36;
+the interrupted 72-budget campaign is unqualified and was not retried.
 
-CPU coverage checks modular discovery, sharded component loading, parameter-name
-mapping, component initialization, and AR state handling. All 18 GPU cases passed
-with the converted checkpoint:
+Upstream native-RNG controls also show late overexposure, yellowing and distortion
+in this forest/river scene. At equal noise, Omni adds no observed numerical
+difference. The mechanism remains unresolved; one scene/seed does not establish
+broad long-horizon quality. The 48-turn comparison is distinct from the
+single-request WebSocket diagnostic below.
 
-- Six reference comparisons cover text, multiple prompt segments, and camera
-  control in resident and CPU-offload modes. Complete decoded videos match the
-  independent original checkpoint exactly at 384×640, 49 frames, eight steps,
-  BF16, and seed 42 (`rtol=0`, `atol=0`).
-- Two continuation comparisons cover resident and CPU-offload modes. Per-turn
-  latents and the complete 98-frame output match the reference exactly across
-  two 49-frame turns with a prompt change and camera control.
-- Ten offline and video API cases cover single-device and Ulysses degree-two
-  generation, including CPU offload, segment/camera inputs, and duration requests.
+[Public data, calculations, complete viewing videos, images and reproduction commands](https://github.com/wtz2333/vllm-omni/blob/f69d6f0636a0f9c15d68f07becf07e786ffad1d9/test-evidence/PR9338/section-a-20261029/README.md).
 
-On two H200s at 1280×704 and 24 fps, the session example produced 147 frames
-across three turns, emitted as stable chunks of 12, 49, and 86 frames. Closing
-the session flushed all withheld frames. Realtime acceptance completed a
-477-frame request with prompt/camera updates, stopped a separate request after
-23 decoded frames, and completed another 477-frame request on the same service.
-Update acknowledgements, stop status, transport order, and decoded frame counts
-were checked. These checks do not establish latency or throughput performance.
+### Current long-stream diagnostic
+
+Two H200s, SP2, 2881 frames, four steps, seed 42, resident BF16, eager/mp,
+20 prompt/camera updates, nominal 16-latent blocks and a merged 17-latent tail:
+
+| History budget | First playable frame (ms) | Client E2E (ms) | RTF | Peak allocated / reserved per GPU (GiB) |
+| --- | --- | --- | --- | --- |
+| 18 | 17175.3 | 538357.1 | 4.485 | 64.80 / 67.40 |
+| 36 | 19042.5 | 554444.1 | 4.619 | 72.30 / 74.79 |
+
+Each row is one diagnostic session without excluded matching warmup. Timing
+excludes model startup and includes controls, encoding, writes, client decoding,
+and worker observations; compilation effects are not excluded. RTF is E2E divided
+by `2881/24=120.0417` seconds. These are not steady-state benchmark results.
+The decoder retained at most 19 latents and one active mapping record.
+The local timing/control harness is not included; the public scripts reproduce
+the precision and entrypoint checks, rather than this diagnostic workload.
+
+### Historical repeated performance
+
+The latest repeated SDK benchmark belongs to earlier implementation `257856d3`:
+704×1280, 121 frames, eight steps, two warmups and five measured requests per row.
+It has not been repeated on the current bounded-history implementation.
+
+| H200s / SP | Module CPU offload | Median SDK E2E (ms) | Peak allocated / reserved per GPU (GiB) |
+| --- | --- | --- | --- |
+| 1 / 1 | no | 30894.7 | 59.09 / 63.37 |
+| 2 / 2 | no | 21123.7 | 53.05 / 57.06 |
+| 1 / 1 | yes | 41248.6 | 30.56 / 32.07 |
+| 2 / 2 | yes | 38466.6 | 23.80 / 25.99 |
+
+SDK E2E excludes loading, encoding and writes. The SP1 recheck median was
+25669.2 ms, a -16.91% change on the shared host. Raw samples, mean/SD/p95,
+earlier ordinary/offload accuracy and benchmark commands remain in the
+[historical evidence](https://github.com/wtz2333/vllm-omni/blob/a518affb28c71bf072bae2e4397dd5f227822e75/test-evidence/PR9338/hy-nomas-diffusers/README.md).
+
+Production service hardening, compute-mid-generation cancellation and real TCP
+blocked sending are outside this integration's acceptance scope. GPU CI and a
+matched 240-frame SGLang benchmark have not run.
 
 ## References
 
