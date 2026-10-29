@@ -547,24 +547,32 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
     assert torch.equal(result, torch.full_like(latents, 10.0))
 
 
+@pytest.mark.parametrize("kind", ["steps", "sigma"])
 @pytest.mark.parametrize("fail", [False, True], ids=["exit", "exception"])
-def test_diffuse_clears_the_scheduled_step_on_any_exit(fail) -> None:
+def test_diffuse_clears_the_scheduled_step_on_any_exit(fail, kind) -> None:
     pipeline = _make_pipeline()
+    pipeline.scheduler.sigmas = [1.0, 0.5, 0.25, 0.0]  # type: ignore[attr-defined]
     latents = torch.zeros((1, 1, 1, 2, 2), dtype=torch.float32)
     seen: list[tuple[int | None, float | None, int | None]] = []
+    sigmas_seen: list[float | None] = []
 
     def _fake_predict_noise_maybe_with_cfg(**kwargs):
         context = get_forward_context()
         seen.append((context.denoise_step_idx, context.denoise_timestep, context.total_denoise_steps))
+        sigmas_seen.append(context.denoise_sigma)
         if fail and context.denoise_step_idx == 1:
             raise RuntimeError("forward failed")
         return torch.zeros_like(latents)
 
     pipeline.predict_noise_maybe_with_cfg = _fake_predict_noise_maybe_with_cfg  # type: ignore[method-assign]
     pipeline.scheduler_step_maybe_with_cfg = lambda noise_pred, t, current, cfg: current  # type: ignore[method-assign]
-    schedule = (AttentionScheduleRange(start=1, end=2, profile="candidate"),)
+    if kind == "steps":
+        schedule = (AttentionScheduleRange(start=1, end=2, profile="candidate"),)
+        binding = bind_attention_schedule(schedule, from_request=True)
+    else:
+        binding = bind_attention_schedule(None, (AttentionSigmaWindow(0.0, 0.5, "candidate"),))
 
-    with set_forward_context(), bind_attention_schedule(schedule, from_request=True):
+    with set_forward_context(), binding:
         raises = pytest.raises(RuntimeError, match="forward failed") if fail else nullcontext()
         with raises:
             pipeline.diffuse(
@@ -579,12 +587,20 @@ def test_diffuse_clears_the_scheduled_step_on_any_exit(fail) -> None:
                 attention_kwargs={},
             )
         context = get_forward_context()
-        after = (context.denoise_step_idx, context.denoise_timestep, context.total_denoise_steps)
+        after = (
+            context.denoise_step_idx,
+            context.denoise_timestep,
+            context.total_denoise_steps,
+            context.denoise_sigma,
+        )
 
     # _StubScheduler normalizes by num_train_timesteps=1000.
     published = [(0, pytest.approx(0.007), 3), (1, pytest.approx(0.003), 3), (2, pytest.approx(0.001), 3)]
     assert seen == (published[:2] if fail else published)
-    assert after == (None, None, None)
+    # Sigma windows publish the scheduler noise at each step; step ranges never compute it.
+    expected_sigmas = [1.0, 0.5, 0.25] if kind == "sigma" else [None] * 3
+    assert sigmas_seen == expected_sigmas[: len(seen)]
+    assert after == (None, None, None, None)
 
 
 def test_cache_dit_expert_budgets_follow_each_request_schedule(monkeypatch) -> None:
