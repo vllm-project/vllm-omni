@@ -35,6 +35,14 @@ from .omni_duplex_eval_metrics import (
 
 logger = logging.getLogger(__name__)
 
+# Echo the offending reply back once and ask for the score JSON again. This
+# corrects the response format only; the scoring prompt itself (and the pinned
+# rubric it carries) is never reworded. Trace lines record every retry.
+_JUDGE_FORMAT_FOLLOWUP = (
+    "Your reply does not contain the required score fields ({fields}). "
+    "Respond again with only the JSON object that includes these fields."
+)
+
 
 def _read(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -91,22 +99,35 @@ def evaluate_sample(
     trace_path = score_path.with_suffix(".judge.jsonl")
     trace_path.write_text("", encoding="utf-8")
 
-    def judge_result(call: Callable[[], str], required: tuple[str, ...]) -> dict[str, Any]:
+    def judge_result(call: Callable[..., str], required: tuple[str, ...]) -> dict[str, Any]:
+        def _trace(payload: dict[str, Any]) -> None:
+            with trace_path.open("a", encoding="utf-8") as trace:
+                trace.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
         try:
             raw_response = call()
         except JudgeResponseError as exc:
-            with trace_path.open("a", encoding="utf-8") as trace:
-                trace.write(
-                    json.dumps(
-                        {"raw_response": exc.raw_response, "finish_reason": exc.finish_reason, "error": str(exc)},
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+            _trace({"raw_response": exc.raw_response, "finish_reason": exc.finish_reason, "error": str(exc)})
             raise
-        with trace_path.open("a", encoding="utf-8") as trace:
-            trace.write(json.dumps({"raw_response": raw_response}, ensure_ascii=False) + "\n")
-        return parse_judge_json(raw_response, required=required)
+        _trace({"raw_response": raw_response})
+        try:
+            return parse_judge_json(raw_response, required=required)
+        except ValueError:
+            pass
+        # The judge model can answer with prose (a bare VQA-style option, a
+        # refusal, ...) instead of the required score JSON. Echo the offending
+        # reply back once so the format is corrected without rewording the
+        # pinned scoring prompt; every retry is recorded in the trace.
+        try:
+            retry_response = call(followup=(raw_response, _JUDGE_FORMAT_FOLLOWUP.format(fields=", ".join(required))))
+        except TypeError as exc:
+            if "followup" not in str(exc):
+                raise
+            # A judge whose chat() predates followup support cannot be
+            # re-asked in context; surface the original parse failure as-is.
+            raise
+        _trace({"raw_response": retry_response, "judge_retry": True})
+        return parse_judge_json(retry_response, required=required)
 
     raw = _read(response_path)
     meta = (
@@ -146,7 +167,9 @@ def evaluate_sample(
                 continue
             frames = _extract_frames(video_path, _times(*window, fps=judge_fps))
             parsed = judge_result(
-                lambda: judge.temporal(build_temporal_prompt(*window, item["sentence"], sample.question_text), frames),
+                lambda **kw: judge.temporal(
+                    build_temporal_prompt(*window, item["sentence"], sample.question_text), frames, **kw
+                ),
                 ("temporal_score", "is_relevant"),
             )
             temporal_rows.append(
@@ -169,7 +192,9 @@ def evaluate_sample(
         )
         try:
             content = judge_result(
-                lambda: judge.content(content_prompt, video_path, frames=content_frames, mode=judge_video_mode),
+                lambda **kw: judge.content(
+                    content_prompt, video_path, frames=content_frames, mode=judge_video_mode, **kw
+                ),
                 ("content_score",),
             )
         except Exception as exc:
@@ -190,7 +215,9 @@ def evaluate_sample(
                 # Nothing to fall back to: keep the original judge error.
                 raise
             content = judge_result(
-                lambda: judge.content(content_prompt, video_path, frames=content_frames, mode="frame-sample"),
+                lambda **kw: judge.content(
+                    content_prompt, video_path, frames=content_frames, mode="frame-sample", **kw
+                ),
                 ("content_score",),
             )
             content["judge_input_fallback"] = "frame-sample"
@@ -214,7 +241,9 @@ def evaluate_sample(
         if task == "correction" or not times:
             response = separator.join(chunk["text"] for chunk in chunks).strip()
             parsed = judge_result(
-                lambda: judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1)),
+                lambda **kw: judge.chat(
+                    build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
+                ),
                 ("success_score",),
             )
             event_rows.append({"response_segment": response, **parsed})
@@ -228,7 +257,9 @@ def evaluate_sample(
                     event_rows.append({"start_time": start, "response_segment": "", "success_score": 0})
                 else:
                     parsed = judge_result(
-                        lambda: judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1)),
+                        lambda **kw: judge.chat(
+                            build_reminder_prompt(sample.question_text, response, task, sample.answer1), **kw
+                        ),
                         ("success_score",),
                     )
                     event_rows.append({"start_time": start, "response_segment": response, **parsed})
