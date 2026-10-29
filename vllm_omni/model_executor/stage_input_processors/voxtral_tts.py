@@ -48,11 +48,13 @@ def generator2tokenizer_async_chunk(
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
 
+    added_frame = False
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            added_frame = True
     elif not finished:
         # Some steps may not produce multimodal_output. Only flush on finish.
         return None
@@ -70,14 +72,13 @@ def generator2tokenizer_async_chunk(
         )
     length = len(transfer_manager.code_prompt_token_ids[request_id])
 
-    # Avoid emitting empty chunks during normal streaming. If the request is
-    # finished and nothing was produced, emit an EOF marker.
+    # Avoid empty chunks during streaming. A terminal-only marker preserves any
+    # pending audio chunk instead of resetting the downstream prompt.
     if length <= 0:
         if finished:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
-            )
+            payload = OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)))
+            transfer_manager.code_prompt_token_ids.pop(request_id, None)
+            return payload
         return None
 
     # Use a small chunk size at begin
@@ -85,6 +86,14 @@ def generator2tokenizer_async_chunk(
         chunk_size = chunk_size_at_begin
 
     chunk_length = length % chunk_size
+
+    # A request can finish on a step with no new codec frame after its last
+    # complete chunk was already emitted. Send only EOF in that case instead
+    # of replaying the last chunk to the tokenizer.
+    if finished and not added_frame and chunk_length == 0:
+        payload = OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)))
+        transfer_manager.code_prompt_token_ids.pop(request_id, None)
+        return payload
 
     if chunk_length != 0 and not finished:
         return None
@@ -97,7 +106,7 @@ def generator2tokenizer_async_chunk(
     # Pack context + chunk into codebook-major flat codes for adapter.
     code_predictor_codes = torch.tensor(window_frames).reshape(-1).tolist()
 
-    return OmniPayloadStruct(
+    payload = OmniPayloadStruct(
         codes=CodesStruct(
             audio=torch.tensor(
                 [int(ctx_frames), int(context_length)] + code_predictor_codes,
@@ -106,3 +115,6 @@ def generator2tokenizer_async_chunk(
         ),
         meta=MetaStruct(finished=torch.tensor(finished, dtype=torch.bool)),
     )
+    if finished:
+        transfer_manager.code_prompt_token_ids.pop(request_id, None)
+    return payload

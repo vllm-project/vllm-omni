@@ -78,7 +78,7 @@ def test_flush_tail_when_finished():
 
 
 def test_eof_marker_when_finished_with_no_frames():
-    """Emits EOF marker with empty codes when finished with no accumulated frames."""
+    """Emits a terminal-only marker when finished with no accumulated frames."""
     transfer_manager = _make_transfer_manager()
     request = _req("rid-eof", finished=True)
 
@@ -88,7 +88,7 @@ def test_eof_marker_when_finished_with_no_frames():
         request=request,
     )
 
-    assert payload.codes.audio.tolist() == []
+    assert payload.codes is None
     assert payload.meta.finished.item() is True
 
 
@@ -213,3 +213,48 @@ def test_none_multimodal_output_not_finished_returns_none():
     )
 
     assert payload is None
+
+
+def test_interleaved_requests_keep_frames_separate_and_cleanup_on_finish():
+    transfer_manager = _make_transfer_manager(
+        codec_chunk_frames=4,
+        codec_left_context_frames=0,
+        codec_chunk_frames_at_begin=2,
+    )
+    req_a = _req("rid-a", finished=False)
+    req_b = _req("rid-b", finished=False)
+
+    assert generator2tokenizer_async_chunk(
+        transfer_manager,
+        {"codes": {"audio": torch.full((8,), 1.0)}},
+        req_a,
+    ) is None
+    assert generator2tokenizer_async_chunk(
+        transfer_manager,
+        {"codes": {"audio": torch.full((8,), 9.0)}},
+        req_b,
+    ) is None
+    chunk_a = generator2tokenizer_async_chunk(
+        transfer_manager,
+        {"codes": {"audio": torch.full((8,), 2.0)}},
+        req_a,
+    )
+    assert chunk_a is not None
+    assert chunk_a.codes.audio[0].item() == 0
+    assert chunk_a.codes.audio[1].item() == 2
+    assert chunk_a.codes.audio[2:].tolist() == [1] * 8 + [2] * 8
+
+    # Ending on a chunk boundary emits EOF without replaying the last chunk.
+    req_a_done = _req("rid-a", finished=True)
+    payload_a = generator2tokenizer_async_chunk(transfer_manager, None, req_a_done)
+    assert payload_a is not None
+    assert payload_a.codes is None
+    assert payload_a.meta.finished.item()
+    assert "rid-a" not in transfer_manager.code_prompt_token_ids
+
+    req_b_done = _req("rid-b", finished=True)
+    payload_b = generator2tokenizer_async_chunk(transfer_manager, None, req_b_done)
+    assert payload_b is not None
+    assert payload_b.codes.audio[1].item() == 1
+    assert payload_b.codes.audio[2:].tolist() == [9] * 8
+    assert "rid-b" not in transfer_manager.code_prompt_token_ids

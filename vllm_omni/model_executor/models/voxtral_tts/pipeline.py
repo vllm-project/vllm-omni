@@ -22,6 +22,7 @@ VOXTRAL_TTS_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=0,
             model_stage="audio_generation",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             final_output=False,
@@ -34,6 +35,7 @@ VOXTRAL_TTS_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="audio_tokenizer",
+            supports_native_mrv2_data_plane=True,
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,
