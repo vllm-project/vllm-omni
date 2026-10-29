@@ -52,6 +52,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import HostCopyBatch, index_to_device
@@ -1526,8 +1527,22 @@ class GPUARModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
+                # Auxiliary outputs are used by proposers that consume
+                # intermediate target hidden states (for example EAGLE3,
+                # DFlash, and extract_hidden_states). Upstream runners
+                # receive ``(hidden, aux_hidden_states)``.
+                # Omni wraps Thinker captures in OmniOutput so the same rows
+                # can feed downstream stages; recover the DFlash rows from
+                # that sidecar before the generic speculative path consumes
+                # them.
+                if isinstance(model_output, OmniOutput):
+                    hidden_states = model_output.text_hidden_states
+                    payload = model_output.multimodal_outputs or {}
+                    captured_layers = payload.get("hidden_states", {}).get("layers", {})
+                    aux_layer_ids = self._get_eagle3_aux_layers_from_config() or ()
+                    aux_hidden_states = [captured_layers[layer_id] for layer_id in aux_layer_ids]
+                else:
+                    hidden_states, aux_hidden_states = model_output
             else:
                 # Common case.
                 hidden_states = model_output
