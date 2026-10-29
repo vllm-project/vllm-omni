@@ -89,6 +89,23 @@ def _config_flag(config: Any, name: str) -> bool:
     return bool(getattr(config, name, False))
 
 
+def _log_step0_profile_reuse(od_config: OmniDiffusionConfig) -> None:
+    """Note at startup that a default schedule's step-0 profile also shapes every later step.
+
+    Later steps reuse the prompt K/V computed in the step-0 forward, and deeper layers' prompt K/V
+    depend on earlier layers' attention outputs. Ranges are ordered, so only the first can cover
+    step 0. A request's own schedule is not known at startup.
+    """
+    schedule_config = getattr(od_config, "diffusion_attention_schedule", None)
+    default = schedule_config.default if schedule_config is not None else ()
+    if default and default[0].start == 0:
+        logger.info(
+            "HunyuanImage-3.0 reuses the step-0 prompt K/V on every later step, so profile %r, which the "
+            "default attention schedule selects at step 0, also affects the steps it does not cover.",
+            default[0].profile,
+        )
+
+
 class HunyuanImage3FlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
     def get_timestep_r(self, timestep: float | torch.FloatTensor):
         if self.step_index is None:
@@ -386,6 +403,7 @@ class HunyuanImage3Pipeline(
         # update diffusion config
         self.generation_config = GenerationConfig.from_pretrained(od_config.model)
         self.od_config = od_config
+        _log_step0_profile_reuse(od_config)
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
