@@ -518,8 +518,8 @@ def test_text_encoder_allgather_accepts_matching_precomputed_embedding_paths(mon
 def test_dp_wave_key_resolves_attention_schedules_against_the_service(monkeypatch):
     """The wave check must build the scheduler's key, which resolves each request's schedule.
 
-    Without the service config, a request inheriting the default and one sending the same ranges
-    explicitly would get different keys and fail a wave the scheduler formed.
+    Without the service config, explicit ranges would be resolved against no profiles and rejected,
+    failing a wave the scheduler formed.
     """
     executor, scheduled = _make_request_executor(monkeypatch, ["first", "second"])
     service = object()
