@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Correctness tests for the fused alias-free Snake Triton kernel.
+"""Correctness and dispatch tests for the fused alias-free Snake Triton kernel.
 
 The kernel replaces the eager ``AliasFreeActivation1d`` path (replicate-pad
 -> depthwise conv_transpose1d upsample -> SnakeBeta -> replicate-pad ->
@@ -8,10 +8,13 @@ depthwise strided conv1d downsample) with two Triton kernels. Only the tap
 summation order differs, so the fused output must match eager within the
 eager path's own rounding.
 
-These tests call the kernel directly with the exact argument signature the
-dispatch uses, so they validate the math independently of routing. The eager
-reference is the real module forward (which itself uses SnakeBeta's Triton
-path on CUDA) — the shipping composition, not a hand-rolled substitute.
+The first group of tests calls the kernel directly with the exact argument
+signature the dispatch uses, so they validate the math independently of
+routing; the eager reference is the real module forward (which itself uses
+SnakeBeta's Triton path on CUDA) — the shipping composition, not a
+hand-rolled substitute. The second group verifies the dispatch in
+``AliasFreeActivation1d.forward``: who routes to the kernel, who stays
+eager, and what happens when the kernel fails.
 """
 
 import copy
@@ -19,6 +22,7 @@ import copy
 import pytest
 import torch
 
+import vllm_omni.model_executor.models.common.alias_free_activation as fir
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.common.alias_free_activation import (
     AliasFreeActivation1d,
@@ -179,47 +183,176 @@ def _make_tiny_vocoder():
 
 
 @pytest.mark.parametrize("t_mel", [64, 256])
-def test_whole_vocoder_smoke(t_mel):
-    """Composed diff through a real (tiny) vocoder: measured ~8e-5 through
-    the full 109-instance network, so atol=1e-3 has 10x headroom."""
+def test_whole_vocoder_smoke(t_mel, monkeypatch):
+    """Composed diff through a real (tiny) vocoder, via the dispatch: measured
+    ~8e-5 through the full 109-instance network, so atol=1e-3 has 10x
+    headroom."""
     model = _make_tiny_vocoder()
     mel = torch.randn(1, 80, t_mel, device=DEVICE) - 5.0
-
-    fused_forwards = {}
-
-    def make_fused_forward(m):
-        up, down, act = m.upsample, m.downsample, m.act
-        if not act._cached:
-            act.precompute_exp_cache()
-        up_taps = up.filter.reshape(-1).contiguous()
-        down_taps = down.filter.reshape(-1).contiguous()
-        return lambda x: alias_free_snake(
-            x,
-            up_taps,
-            down_taps,
-            act._exp_alpha,
-            act._inv_beta,
-            up.ratio,
-            up.pad,
-            up.pad_left,
-            down.stride,
-            down.pad_left,
-            down.pad_right,
-        )
-
-    try:
-        with torch.no_grad():
-            stock = model(mel)
-            for m in model.modules():
-                if isinstance(m, AliasFreeActivation1d):
-                    fused_forwards[m] = m.forward
-                    m.forward = make_fused_forward(m)
-            fused = model(mel)
-    finally:
-        for m, forward in fused_forwards.items():
-            m.forward = forward
-
+    with torch.no_grad():
+        fused = model(mel)
+        monkeypatch.setattr(AliasFreeActivation1d, "_fused_disabled", True)
+        stock = model(mel)
     torch.testing.assert_close(fused, stock, rtol=0.0, atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch: who routes to the kernel, who stays eager
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("up_ratio", "up_kernel", "down_ratio", "down_kernel", "eligible"),
+    [
+        (2, 12, 2, 12, True),  # the geometry every shared BigVGAN family uses
+        (2, 16, 2, 16, True),
+        (2, 11, 2, 11, True),  # odd taps: the polyphase form still hits every k
+        (3, 15, 3, 15, True),
+        (4, 8, 4, 8, False),  # crop does not cover the filter's reach
+        (2, 12, 3, 12, False),  # downsample stride != upsample ratio
+    ],
+)
+def test_eligibility_predicate(monkeypatch, up_ratio, up_kernel, down_ratio, down_kernel, eligible):
+    calls = []
+    real = fir.alias_free_snake
+
+    def recorder(*args, **kwargs):
+        calls.append(args[0].shape)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fir, "alias_free_snake", recorder)
+    torch.manual_seed(7)
+    act = SnakeBeta(4)
+    with torch.no_grad():
+        act.alpha.uniform_(-0.5, 0.5)
+        act.beta.uniform_(-0.5, 0.5)
+    module = AliasFreeActivation1d(act, up_ratio, down_ratio, up_kernel, down_kernel).to(DEVICE).eval()
+    assert module._fused_eligible is eligible
+
+    x = torch.randn(1, 4, 130, device=DEVICE)
+    with torch.no_grad():
+        dispatched = module(x)
+        monkeypatch.setattr(AliasFreeActivation1d, "_fused_disabled", True)
+        eager = module(x)
+    assert bool(calls) is eligible
+    if eligible:
+        torch.testing.assert_close(dispatched, eager, rtol=0.0, atol=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_whole_module_dispatch(monkeypatch, dtype):
+    """The dispatch must produce exactly the kernel's output (same call,
+    deterministic kernel) and preserve the input dtype; fp32 additionally
+    matches eager at the T1.1 bound (bf16 vs eager is gated by
+    ``test_bf16_no_worse_than_eager_rounding``)."""
+    torch.manual_seed(8)
+    module = _make_module(24, "beta", dtype)
+    x = torch.randn(2, 24, 517, device=DEVICE, dtype=dtype)
+    with torch.no_grad():
+        dispatched = module(x)
+        direct = _fused(module, x)
+        monkeypatch.setattr(AliasFreeActivation1d, "_fused_disabled", True)
+        eager = module(x)
+    assert dispatched.dtype == dtype
+    assert torch.equal(dispatched, direct)
+    if dtype == torch.float32:
+        torch.testing.assert_close(dispatched, eager, rtol=0.0, atol=1e-5)
+
+
+def test_dispatch_requires_cuda_and_no_grad(monkeypatch):
+    """CUDA + no-grad routes to the kernel; grad-enabled stays eager."""
+    module = _make_module(8, "beta", torch.float32)
+    x = torch.randn(1, 8, 300, device=DEVICE)
+    calls = []
+    real = fir.alias_free_snake
+
+    def recorder(*args, **kwargs):
+        calls.append(args[0].shape)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fir, "alias_free_snake", recorder)
+    with torch.no_grad():
+        module(x)
+    assert len(calls) == 1
+    with torch.enable_grad():
+        module(x)
+    assert len(calls) == 1  # no second call: grad-enabled kept the eager path
+
+
+def test_custom_activation_stays_eager(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("a non-Snake activation must not reach the fused kernel")
+
+    monkeypatch.setattr(fir, "alias_free_snake", unexpected)
+    module = AliasFreeActivation1d(torch.nn.PReLU(8)).to(DEVICE).eval()
+    x = torch.randn(1, 8, 300, device=DEVICE)
+    with torch.no_grad():
+        out = module(x)
+    assert out.shape == x.shape
+
+
+def test_triton_unavailable_stays_eager(monkeypatch):
+    monkeypatch.setattr(fir, "HAS_TRITON", False)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("with Triton unavailable the module must stay eager")
+
+    monkeypatch.setattr(fir, "alias_free_snake", unexpected)
+    module = _make_module(8, "beta", torch.float32)
+    x = torch.randn(1, 8, 300, device=DEVICE)
+    with torch.no_grad():
+        out = module(x)
+        monkeypatch.setattr(AliasFreeActivation1d, "_fused_disabled", True)
+        eager = module(x)
+    torch.testing.assert_close(out, eager, rtol=0.0, atol=1e-5)
+
+
+def test_npu_platform_stays_eager(monkeypatch):
+    module = _make_module(8, "beta", torch.float32)  # built before the platform patch
+    monkeypatch.setattr(fir.current_omni_platform, "is_npu", lambda: True)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("NPU must keep the replication-pad/chunked-conv path")
+
+    monkeypatch.setattr(fir, "alias_free_snake", unexpected)
+    x = torch.randn(1, 8, 300, device=DEVICE)
+    with torch.no_grad():
+        out = module(x)
+    assert out.shape == x.shape
+
+
+def test_fused_failure_warns_once_and_falls_back(monkeypatch):
+    module = _make_module(8, "beta", torch.float32)
+    x = torch.randn(1, 8, 300, device=DEVICE)
+    warnings = []
+    monkeypatch.setattr(fir.logger, "warning", lambda *args, **kwargs: warnings.append(args))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("kernel boom")
+
+    monkeypatch.setattr(fir, "alias_free_snake", boom)
+    monkeypatch.setattr(AliasFreeActivation1d, "_fused_disabled", False)
+    with torch.no_grad():
+        first = module(x)
+        second = module(x)
+    assert len(warnings) == 1  # one warning, then the latch silences it
+
+    monkeypatch.setattr(AliasFreeActivation1d, "_fused_disabled", True)
+    with torch.no_grad():
+        eager = module(x)
+    torch.testing.assert_close(first, eager, rtol=0.0, atol=1e-5)
+    torch.testing.assert_close(second, eager, rtol=0.0, atol=1e-5)
+
+
+def test_non_contiguous_input(monkeypatch):
+    module = _make_module(8, "beta", torch.float32)
+    x = torch.randn(300, 1, 8, device=DEVICE).permute(1, 2, 0)  # [1, 8, 300]
+    assert not x.is_contiguous()
+    with torch.no_grad():
+        dispatched = module(x)
+        monkeypatch.setattr(AliasFreeActivation1d, "_fused_disabled", True)
+        eager = module(x)
+    torch.testing.assert_close(dispatched, eager, rtol=0.0, atol=1e-5)
 
 
 def test_cuda_graph_capture():

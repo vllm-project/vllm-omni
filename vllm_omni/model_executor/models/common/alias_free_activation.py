@@ -18,7 +18,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON
 
+from vllm_omni.model_executor.models.common.ops.alias_free_triton import alias_free_snake
+from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -259,6 +262,14 @@ class AliasFreeActivation1d(nn.Module):
     ``SnakeBeta`` from ``common.snake_activation``, which already dispatches
     between Triton and eager PyTorch internally.
 
+    On CUDA, inference-only, with the shared Snake/SnakeBeta activation and an
+    eligible filter geometry, the whole forward dispatches to the fused Triton
+    kernel in ``common.ops.alias_free_triton`` (measured ~4.6x on the module,
+    ~2.3x on the whole vocoder on H100). Every other case — training, CPU/XPU,
+    NPU (which keeps its replication-pad and chunked-conv workarounds), custom
+    activations, ineligible geometry, or a Triton failure (one warning, then a
+    permanent fallback) — keeps the eager path below.
+
     Args:
         activation: Pointwise activation module (e.g. ``SnakeBeta(channels)``).
         up_ratio: Upsample factor before activation.
@@ -266,6 +277,9 @@ class AliasFreeActivation1d(nn.Module):
         up_kernel_size: Kaiser sinc filter taps for upsampling.
         down_kernel_size: Kaiser sinc filter taps for downsampling.
     """
+
+    # Latched permanently after a fused-kernel failure; see ``forward``.
+    _fused_disabled = False
 
     def __init__(
         self,
@@ -281,9 +295,60 @@ class AliasFreeActivation1d(nn.Module):
         self.act = activation
         self.upsample = UpSample1d(up_ratio, up_kernel_size)
         self.downsample = DownSample1d(down_ratio, down_kernel_size)
+        # The fused kernel indexes its crop from the start of the transposed
+        # conv output, so the crop must cover the filter's reach and the
+        # cropped length must be exactly ratio * T (the identity AUK validates
+        # for its geometry; it holds for this pad parameterization but guards
+        # a future refactor). The downsample stride must match the upsample
+        # ratio so the module keeps its input length.
+        up, down = self.upsample, self.downsample
+        taps = up.filter.numel()
+        self._fused_eligible = (
+            up.pad_left >= taps - 1
+            and (2 * up.pad - 1) * up.ratio + taps == up.pad_left + up.pad_right
+            and down.stride == up.ratio
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._can_fuse(hidden_states):
+            try:
+                return self._fused_forward(hidden_states)
+            except Exception:
+                logger.warning("fused alias-free kernel failed, falling back to eager", exc_info=True)
+                AliasFreeActivation1d._fused_disabled = True
         hidden_states = self.upsample(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.downsample(hidden_states)
         return hidden_states
+
+    def _can_fuse(self, hidden_states: torch.Tensor) -> bool:
+        """Whether ``hidden_states`` can take the fused Triton kernel."""
+        return (
+            not AliasFreeActivation1d._fused_disabled
+            and self._fused_eligible
+            and isinstance(self.act, SnakeBeta)
+            and HAS_TRITON
+            and hidden_states.is_cuda
+            and hidden_states.dim() == 3
+            and not torch.is_grad_enabled()
+            and not current_omni_platform.is_npu()
+        )
+
+    def _fused_forward(self, x: torch.Tensor) -> torch.Tensor:
+        act = self.act
+        if not act._cached:
+            act.precompute_exp_cache()
+        up, down = self.upsample, self.downsample
+        return alias_free_snake(
+            x,
+            up.filter.reshape(-1),
+            down.filter.reshape(-1),
+            act._exp_alpha,
+            act._inv_beta,
+            up.ratio,
+            up.pad,
+            up.pad_left,
+            down.stride,
+            down.pad_left,
+            down.pad_right,
+        )
