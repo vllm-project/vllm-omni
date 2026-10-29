@@ -18,7 +18,6 @@ from torch.nn.utils import weight_norm
 
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
 from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
-from vllm_omni.platforms import current_omni_platform
 
 # --------------- Utilities ---------------
 
@@ -99,7 +98,7 @@ def apply_rotary_pos_emb(pos, t):
         return t * pos.cos() + rotate_half(t) * pos.sin()
 
 
-# sinc, kaiser_sinc_filter1d removed — now in common.alias_free_activation
+# sinc, kaiser_sinc_filter1d removed, now in common.alias_free_activation
 
 
 # --------------- Basic Layers ---------------
@@ -292,14 +291,14 @@ class ConvPositionEmbed(nn.Module):
 # --------------- Anti-aliasing (BigVGAN) ---------------
 
 
-# LowPassFilter1d, UpSample1d, DownSample1d, Activation1d removed —
+# LowPassFilter1d, UpSample1d, DownSample1d, Activation1d removed,
 # now provided by common.alias_free_activation.AliasFreeActivation1d
 
 
 # --------------- Activations ---------------
 
 
-# SnakeBeta removed — now in common.snake_activation (with alpha_logscale support)
+# SnakeBeta removed, now in common.snake_activation (with alpha_logscale support)
 
 
 # --------------- Attention ---------------
@@ -358,11 +357,9 @@ class MultiHeadAttention(nn.Module):
         self.o_dropout = Dropout(dropout)
 
         # SDPA backends allowed in forward() when the inputs are on CUDA; unused on other devices.
+        # FlashAttention is excluded because forward() always passes a dense attn_bias tensor,
+        # which FA2 does not accept as an arbitrary attn_mask.
         self.cuda_backends = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, SDPBackend.CUDNN_ATTENTION]
-        if current_omni_platform.is_cuda():
-            device_properties = torch.cuda.get_device_properties(torch.accelerator.current_device_index())
-            if device_properties.major == 8 and device_properties.minor == 0:
-                self.cuda_backends.append(SDPBackend.FLASH_ATTENTION)
 
         if self.rotary_bias:
             self.rotary = RotaryEmbedding(self.head_dim)
