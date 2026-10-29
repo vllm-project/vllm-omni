@@ -108,6 +108,30 @@ def test_scheduler_sigma_check_covers_the_steps_that_run_and_only_under_sigma_wi
         check_scheduler_sigmas(SimpleNamespace(sigmas=[float("nan"), 0.5, 0.0]), 1, sigma_scheduled=True)
 
 
+class _SliceOnlySigmas:
+    """Device-tensor stand-in that fails on per-step indexing, which would sync once per element."""
+
+    def __init__(self, values):
+        self._values = list(values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __getitem__(self, key):
+        assert isinstance(key, slice), "check_scheduler_sigmas must read sigmas with one host copy"
+        return _SliceOnlySigmas(self._values[key])
+
+    def tolist(self):
+        return list(self._values)
+
+
+def test_scheduler_sigma_check_reads_the_ladder_with_one_host_copy():
+    with set_forward_context(), bind_attention_schedule(None, _ALL):
+        check_scheduler_sigmas(SimpleNamespace(sigmas=_SliceOnlySigmas([1.0, 0.5, 1.5])), 2)
+        with pytest.raises(InvalidAttentionScheduleError, match="check flow_shift"):
+            check_scheduler_sigmas(SimpleNamespace(sigmas=_SliceOnlySigmas([1.0, 0.5, 1.5])), 3)
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1, 1.1, True])
 def test_noise_publisher_rejects_invalid_normalized_values(value):
     with set_forward_context(), bind_attention_schedule(None, _ALL), pytest.raises((ValueError, TypeError)):
