@@ -126,6 +126,7 @@ from .denoise_loop import (
 from .encoder import MiniMaxH3Qwen3VLEncoder
 from .fasth3 import FastH3WeightFusion, resolve_fasth3_fusion
 from .fasth3_checkpoint import FastH3CheckpointSpec, FastH3OmniCheckpointSpec
+from .larry_lora import load_minimax_h3_larry_lora, validate_larry_request
 from .latent_mask import (
     MiniMaxH3LatentEdit,
     minimax_h3_audio_edit_masks,
@@ -719,6 +720,8 @@ class MiniMaxH3Pipeline(
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._clear_adaln_caches()
+        larry_ids = self.__dict__.setdefault("_larry_lora_ids", set())
+        larry_ids.discard(lora_request.lora_int_id)
         self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
         self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
@@ -731,6 +734,17 @@ class MiniMaxH3Pipeline(
                     offload_modes.append("model-level CPU offload")
                 elif resolved_offload.strategy is OffloadStrategy.LAYER_WISE:
                     offload_modes.append("layerwise offload")
+        larry_loaded = load_minimax_h3_larry_lora(
+            partition=self.partition,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
+        )
+        if larry_loaded is not None:
+            larry_ids.add(lora_request.lora_int_id)
+            return larry_loaded
+
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
@@ -767,11 +781,12 @@ class MiniMaxH3Pipeline(
         lora_model: LoRAModel,
         bound_lora_names: frozenset[str],
     ) -> None:
-        if lora_model.id in self._turbo_lora_specs:
+        is_larry = lora_model.id in getattr(self, "_larry_lora_ids", ())
+        if is_larry or lora_model.id in self._turbo_lora_specs:
             missing = sorted(set(lora_model.loras) - bound_lora_names)
             if missing:
                 raise ValueError(
-                    "MiniMax-H3 Turbo LoRA binding is incomplete: "
+                    f"MiniMax-H3 {'Larry' if is_larry else 'Turbo'} LoRA binding is incomplete: "
                     f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
                 )
             return
@@ -952,6 +967,7 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
         )
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
+        self._larry_lora_ids: set[int] = set()
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         model_root = _resolve_minimax_h3_model_root(
@@ -1423,6 +1439,7 @@ class MiniMaxH3Pipeline(
         derived from the step count, together with the count the rest of the
         request speaks in.
         """
+        validate_larry_request(self, sampling, task)
         if self._fasth3 is not None:
             # A fused student carries its own positions; the checkpoint
             # underneath it is the many-step teacher, whose schedule does not
