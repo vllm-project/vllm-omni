@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 
 from tests.diffusion.attention.test_attention_schedule_context import (
@@ -78,14 +80,46 @@ def test_request_mode_rejects_a_mixed_sigma_batch():
         resolve_batch_attention_sigma_schedule([first.sampling_params, second.sampling_params], _service())
 
 
+def _key_builder(mode):
+    """Both batch keys resolve sigma windows against the service configuration."""
+    if mode == "request":
+        return lambda request: build_request_batch_sampling_params_key(request, _service())
+    scheduler = StepScheduler()
+    scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=_service())
+    return scheduler._build_sampling_params_key
+
+
 @pytest.mark.parametrize("mode", ["request", "step"])
 def test_scheduler_keys_include_immutable_sigma_windows(mode):
     first, second = _request("a"), _request("b")
     first.sampling_params.attention_sigma_schedule = [{"low": 0.0, "high": 0.3, "profile": "low"}]
     second.sampling_params.attention_sigma_schedule = [{"low": 0.3, "high": 1.0, "profile": "high"}]
-    build = build_request_batch_sampling_params_key if mode == "request" else StepScheduler()._build_sampling_params_key
+    build = _key_builder(mode)
     first_key, second_key = build(first), build(second)
     assert first_key != second_key
     assert isinstance(first_key.attention_sigma_schedule, tuple)
     first.sampling_params.attention_sigma_schedule[0]["high"] = 0.1
     assert first_key.attention_sigma_schedule[0].high == 0.3
+
+
+@pytest.mark.parametrize("mode", ["request", "step"])
+def test_inherited_and_explicit_equal_sigma_windows_share_a_key(mode):
+    """Sigma windows are keyed on their resolved value: nothing checks explicit windows differently,
+    so a request that inherits the service windows co-batches with one that sends the same windows."""
+    inherited, explicit, disabled = _request("a"), _request("b"), _request("c")
+    inherited.sampling_params.attention_sigma_schedule = None
+    explicit.sampling_params.attention_sigma_schedule = [dict(window) for window in _service_windows()]
+    disabled.sampling_params.attention_sigma_schedule = []
+    build = _key_builder(mode)
+
+    assert build(inherited) == build(explicit)
+    assert build(inherited).attention_sigma_schedule == build(explicit).attention_sigma_schedule != ()
+    assert build(disabled) != build(inherited)
+    assert build(disabled).attention_sigma_schedule == ()
+
+
+def _service_windows():
+    return [
+        {"low": 0.0, "high": 0.3, "profile": "low"},
+        {"low": 0.3, "high": 1.0, "profile": "high"},
+    ]
