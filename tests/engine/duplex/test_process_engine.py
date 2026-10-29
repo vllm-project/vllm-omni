@@ -295,6 +295,48 @@ def test_native_values_survive_msgpack():
         assert msgspec.convert(decoded, type=DuplexControlResultMessage) == result
 
 
+@pytest.mark.parametrize("operation", ["check_health_async", "get_outputs_async"])
+def test_cancelled_startup_waiter_does_not_cancel_shared_connection(monkeypatch, operation):
+    """An abandoned IPC caller must leave startup usable by later callers."""
+
+    async def run():
+        client = make_client()
+        started, release = asyncio.Event(), asyncio.Event()
+        connect = client._connect
+
+        async def paused_connect():
+            started.set()
+            await release.wait()
+            await connect()
+
+        monkeypatch.setattr(client, "_connect", paused_connect)
+        first = asyncio.create_task(getattr(client, operation)())
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert client._start_task is not None and not client._start_task.cancelled()
+            release.set()
+            await asyncio.wait_for(client.check_health_async(), 5)
+            buffer = DuplexOutputBuffer(max_bytes=1024, max_events=8)
+            result = await asyncio.wait_for(
+                client.open_session_async("s", DuplexSessionConfig(), output_buffer=buffer), 5
+            )
+            assert result.ok
+            assert isinstance(await asyncio.wait_for(buffer.get(), 5), SessionCreated)
+            await client.close_session_async("s", reason="done")
+            outputs = await client.get_outputs_async(timeout=5)
+            assert outputs[0].event.reason == "done"
+        finally:
+            release.set()
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            client.shutdown()
+
+    asyncio.run(run())
+
+
 def test_spawned_client_streams_audio_controls_and_invalidations():
     async def run():
         client = make_client()
