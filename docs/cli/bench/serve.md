@@ -755,7 +755,7 @@ The checked-in local performance configuration measures eight deterministic case
 measured cases. Case WAV, transcript, event, and evaluation artifacts are written to a temporary directory during the
 run and deleted afterwards; they are not kept under `tests/dfx/perf/results/omniinteract/`. The runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
 (`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to the process). After each subset finishes it
-scores All Global IA-QTF1 through that local judge and writes a dashboard `result_acc_*.json` next to the performance
+scores All Global IA-QTF1 through that local judge and writes a `result_acc_*.json` next to the performance
 JSON (`ACC_BENCH_RESULT_DIR`, else `BENCHMARK_DIR`). After all three subsets finish, pooled TP/FP/FN are written as
 `result_acc_*_omniinteract_aggregate_*.json`. This is protocol-compatible with the paper metric, not a GPT-4o
 paper-table score. Run it from the repository root with two visible GPUs:
