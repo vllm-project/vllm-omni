@@ -750,11 +750,17 @@ def run_benchmark(
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
-        from tests.e2e.accuracy.helpers import _acc_result_filename, write_dfx_accuracy_result
+        from tests.e2e.accuracy.helpers import (
+            _DUPLEX_EVAL_DEFAULT_ACC_DIR,
+            _acc_result_filename,
+            dfx_accuracy_result_dir,
+            write_dfx_accuracy_result,
+        )
 
+        # Intentional parallel of _write_omniinteract_accuracy_result: no flatten; NPU exit stays after the write.
         model_id = result.get("model_id") or _cli_argument(args, "--model")
         dataset = "omni_duplex_eval"
-        accuracy_dir = Path(os.environ.get("ACC_BENCH_RESULT_DIR", "tests/e2e/accuracy/omni_duplex_eval/results"))
+        accuracy_dir = dfx_accuracy_result_dir(_DUPLEX_EVAL_DEFAULT_ACC_DIR)
         accuracy_path = accuracy_dir / _acc_result_filename(str(model_id), dataset, when=started_at)
         # Persist before quality assertions, including partial or failed judging.
         duplex = result.get("omni_duplex_eval")

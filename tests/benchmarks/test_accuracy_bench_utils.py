@@ -57,6 +57,8 @@ from tests.e2e.accuracy.helpers import (
     _acc_result_filename,
     _validate_seed_tts,
     _write_accuracy_result_metadata,
+    _DUPLEX_EVAL_DEFAULT_ACC_DIR,
+    dfx_accuracy_result_dir,
     flatten_omniinteract_accuracy_metrics,
     omniinteract_accuracy_result_dir,
     parse_acc_benchmark_args,
@@ -146,6 +148,14 @@ def test_omniinteract_accuracy_result_dir_prefers_acc_then_benchmark(
     assert omniinteract_accuracy_result_dir() == tmp_path / "perf"
     monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "acc"))
     assert omniinteract_accuracy_result_dir() == tmp_path / "acc"
+
+
+def test_duplex_eval_accuracy_result_dir_ignores_benchmark_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path / "perf"))
+    assert dfx_accuracy_result_dir(_DUPLEX_EVAL_DEFAULT_ACC_DIR) == _DUPLEX_EVAL_DEFAULT_ACC_DIR
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "acc"))
+    assert dfx_accuracy_result_dir(_DUPLEX_EVAL_DEFAULT_ACC_DIR) == tmp_path / "acc"
 
 
 def test_write_dfx_accuracy_result_envelope(tmp_path: Path) -> None:
