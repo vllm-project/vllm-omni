@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import importlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -503,6 +503,44 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
         (3.0, 3, 28.0, False),
     ]
     assert torch.equal(result, torch.full_like(latents, 10.0))
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["exit", "exception"])
+def test_diffuse_clears_the_scheduled_step_on_any_exit(fail) -> None:
+    pipeline = _make_pipeline()
+    latents = torch.zeros((1, 1, 1, 2, 2), dtype=torch.float32)
+    seen: list[tuple[int | None, int | None]] = []
+
+    def _fake_predict_noise_maybe_with_cfg(**kwargs):
+        context = get_forward_context()
+        seen.append((context.denoise_step_idx, context.total_denoise_steps))
+        if fail and context.denoise_step_idx == 1:
+            raise RuntimeError("forward failed")
+        return torch.zeros_like(latents)
+
+    pipeline.predict_noise_maybe_with_cfg = _fake_predict_noise_maybe_with_cfg  # type: ignore[method-assign]
+    pipeline.scheduler_step_maybe_with_cfg = lambda noise_pred, t, current, cfg: current  # type: ignore[method-assign]
+    schedule = (AttentionScheduleRange(start=1, end=2, profile="candidate"),)
+
+    with set_forward_context(), bind_attention_schedule(schedule, from_request=True):
+        raises = pytest.raises(RuntimeError, match="forward failed") if fail else nullcontext()
+        with raises:
+            pipeline.diffuse(
+                latents=latents,
+                timesteps=torch.tensor([7, 3, 1], dtype=torch.int64),
+                prompt_embeds=torch.randn(1, 8),
+                negative_prompt_embeds=None,
+                guidance_low=1.0,
+                guidance_high=1.0,
+                boundary_timestep=None,
+                dtype=torch.float32,
+                attention_kwargs={},
+            )
+        context = get_forward_context()
+        after = (context.denoise_step_idx, context.total_denoise_steps)
+
+    assert seen == ([(0, 3), (1, 3)] if fail else [(0, 3), (1, 3), (2, 3)])
+    assert after == (None, None)
 
 
 def test_cache_dit_expert_budgets_follow_each_request_schedule(monkeypatch) -> None:
