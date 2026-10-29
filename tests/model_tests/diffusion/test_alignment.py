@@ -116,6 +116,11 @@ EXCLUDED_MODELS = [
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
     # the real-checkpoint E2E test instead of a tiny model.
     "AuKPipeline",
+    # Segmentation, not generation: the tiny-model suite checks generated
+    # images/videos. Covered by tests/diffusion/models/sam3 and the
+    # /v1/images/segmentations endpoint tests.
+    "Sam3Model",
+    "Sam3VideoModel",
 ]
 
 

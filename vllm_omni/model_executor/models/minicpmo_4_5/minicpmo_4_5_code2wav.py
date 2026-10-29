@@ -1417,10 +1417,10 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         Only validates and enqueues; :meth:`run_idle_prefetch` does the work
         (the prompt, plus the setup with ``token2wav_ref_prefetch_setup``).
-        A bad payload is logged and skipped, never raised. Only the V1 GPU and
-        NPU generation runners call this hook and :meth:`run_idle_prefetch`;
-        under any other runner (e.g. the MRv2 generation runner) nothing is
-        queued and chunk 0 prepares its reference inline.
+        A bad payload is logged and skipped, never raised. The V1 GPU, MRv2
+        GPU and NPU generation runners call this hook and
+        :meth:`run_idle_prefetch`; runners without these optional hooks prepare
+        the reference inline at chunk 0.
         """
         if not self._ref_prefetch_enabled or self.backend is None:
             return

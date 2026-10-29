@@ -141,9 +141,13 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _check_max_generated_image_size,
     _choose_output_format,
     _extract_images_from_result,
+    _extract_segmentation_instances,
     _generated_size_str,
     _get_max_edit_input_images,
     _load_input_images,
+    _load_uploaded_image,
+    _parse_json_list_form,
+    _supports_segmentation,
     _update_if_not_none,
 )
 from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
@@ -157,7 +161,9 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
     ImageGenerationResponse,
+    ImageSegmentationResponse,
     ResponseFormat,
+    SegmentationMaskFormat,
 )
 from vllm_omni.entrypoints.openai.protocol.rollout import (
     CreateSessionRequest,
@@ -2749,6 +2755,93 @@ async def edit_images(
     except Exception as e:
         logger.exception(f"Image edit failed: {e}")
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Image edit failed: {str(e)}")
+
+
+@router.post(
+    "/v1/images/segmentations",
+    response_model=None,
+    responses={
+        HTTPStatus.OK.value: {"model": ImageSegmentationResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def segment_image(
+    raw_request: Request,
+    image: UploadFile | None = File(None),
+    prompt: str = Form(""),
+    boxes: str | None = Form(None),  # JSON [[x0, y0, x1, y1], ...] in pixels
+    box_labels: str | None = Form(None),  # JSON [1 | 0, ...]: positive or negative exemplar
+    score_threshold: Annotated[float | None, Form(ge=0, le=1)] = None,
+    mask_threshold: Annotated[float | None, Form(ge=0, le=1)] = None,
+    mask_format: SegmentationMaskFormat = Form(SegmentationMaskFormat.PNG),
+    model: str | None = Form(None),
+) -> ImageSegmentationResponse:
+    """Segment every instance of a text and/or exemplar-box concept in one image."""
+    engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model not in (None, "auto", model_name):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
+        )
+    if not _supports_segmentation(raw_request, engine_client):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model '{model_name}' does not support image segmentation.",
+        )
+    if image is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Upload the input 'image'.")
+    box_list = _parse_json_list_form(boxes, "boxes")
+    label_list = _parse_json_list_form(box_labels, "box_labels")
+    if not prompt.strip() and not box_list:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value, detail="Provide a text 'prompt', exemplar 'boxes', or both."
+        )
+    try:
+        request_id = f"img_seg-{random_uuid()}"
+        raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+        pil_image = await _load_uploaded_image(image)
+        omni_prompt = OmniTextPrompt(prompt=prompt.strip(), multi_modal_data={"image": pil_image})
+        extra_args: dict[str, Any] = {}
+        for key, value in (
+            ("boxes", box_list),
+            ("box_labels", label_list),
+            ("score_threshold", score_threshold),
+            ("mask_threshold", mask_threshold),
+        ):
+            if value is not None:
+                extra_args[key] = value
+        result = await _generate_with_async_omni(
+            engine_client=engine_client,
+            gen_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+            stage_configs=stage_configs,
+            prompt=omni_prompt,
+            request_id=request_id,
+        )
+        width, height = pil_image.size
+        return ImageSegmentationResponse(
+            created=int(time.time()),
+            model=model_name,
+            width=width,
+            height=height,
+            mask_format=mask_format,
+            data=_extract_segmentation_instances(result, mask_format),
+        )
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except HTTPException:
+        raise
+    except OmniClientError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception("Image segmentation failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Image segmentation failed: {e}"
+        ) from e
 
 
 @router.post(

@@ -261,6 +261,52 @@ bash examples/offline_inference/minimax_h3/run_h3_2gpu_all_tasks.sh
 The script selects 20 resident layers for `PROFILE=rtx5090` and 12 for
 `PROFILE=rtx4090`; `DLO_RESIDENT_LAYERS=N` overrides either default.
 
+### Two 80 GB GPUs (A100): TP2 with text-encoder layerwise offload
+
+On two 80 GB GPUs (such as 2x NVIDIA A100-SXM4-80GB), keeping the TP2-sharded
+DiT (~30 GiB/GPU), video/audio VAEs, and the TP2-sharded Qwen3-VL text encoder
+(~25.75 GiB/GPU) simultaneously resident leaves insufficient headroom for
+`Ref2VA` multi-reference conditioning and request-scoped Cache-DiT
+(`quality="high"`). Offloading only the `text_encoder` component in `layer`
+mode keeps the DiT and VAEs permanently resident on GPU while streaming the
+Qwen3-VL decoder layers from pinned host memory through a double-buffered
+CUDA stream during conditioning:
+
+```bash
+export MODEL=MiniMaxAI/MiniMax-H3
+export PORT=8091
+
+CUDA_VISIBLE_DEVICES=0,1 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=3600 \
+VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=3600 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+vllm serve "${MODEL}" \
+  --omni \
+  --host 0.0.0.0 \
+  --port "${PORT}" \
+  --trust-remote-code \
+  --task-type ref2va \
+  --num-gpus 2 \
+  --tensor-parallel-size 2 \
+  --usp 1 \
+  --ring 1 \
+  --text-encoder-tp-size 2 \
+  --vae-patch-parallel-size 2 \
+  --vae-parallel-mode tile \
+  --vae-use-tiling \
+  --diffusion-attention-backend FLASH_ATTN \
+  --diffusion-offload-config '{"mode":"layer","components":["text_encoder"]}'
+```
+
+Validated on 2x NVIDIA A100-SXM4-80GB (`Ref2VA`, 1344x768, 10.0 s at 24 FPS,
+25 steps, `quality="high"`):
+
+| Workload | Quiescent VRAM/GPU | Allocator peak/GPU (`x-peak-memory-mb`) | Sampled `nvidia-smi` peak/GPU | Warm client E2E |
+| --- | ---: | ---: | ---: | ---: |
+| 2 reference images (2726x1536) | 41.69 GiB | 54.63 GiB | 57.46 GiB | 756.3 s |
+| 2 reference images + 2 reference videos | 41.69 GiB | — | 67.92 GiB | — |
+
 ### Four GPUs: throughput-oriented combined service
 
 For a combined service on four high-memory GPUs, use:

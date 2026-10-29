@@ -91,11 +91,15 @@ def _metadata_from_legacy_payload(payload: dict[str, DiffusionPayloadValue]) -> 
     return metadata
 
 
+# Structured (non-media) payloads travel in ``multimodal_output`` under their own key.
+STRUCTURED_PAYLOAD_KEYS = frozenset({"actions", "trajectory", "segmentation"})
+
+
 def _infer_primary_payload_key(payload: DiffusionPayload) -> str | None:
     for key in ("video", "image", "text", "audio", "output"):
         if key in payload:
             return key
-    if set(payload).issubset({"actions", "trajectory"}):
+    if set(payload).issubset(STRUCTURED_PAYLOAD_KEYS):
         return None
     if "actions" in payload:
         return None
@@ -259,8 +263,7 @@ def _has_non_audio_postprocess_payload(postprocess_output: DiffusionPostprocessO
         "video" in postprocess_output.outputs
         or "image" in postprocess_output.outputs
         or "text" in postprocess_output.metadata
-        or "actions" in postprocess_output.outputs
-        or "trajectory" in postprocess_output.outputs
+        or any(key in postprocess_output.outputs for key in STRUCTURED_PAYLOAD_KEYS)
         or _metadata_video_fps(postprocess_output.metadata) is not None
     )
 
@@ -273,7 +276,7 @@ def _build_multimodal_output(
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
     for key, value in postprocess_output.outputs.items():
-        if key in {"audio", "actions", "trajectory"}:
+        if key == "audio" or key in STRUCTURED_PAYLOAD_KEYS:
             mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate
