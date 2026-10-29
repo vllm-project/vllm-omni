@@ -805,16 +805,20 @@ class Flux2Pipeline(
         prompt_embeds=None,
         callback_on_step_end_tensor_inputs=None,
     ):
-        if (
-            height is not None
-            and height % (self.vae_scale_factor * 2) != 0
-            or width is not None
-            and width % (self.vae_scale_factor * 2) != 0
-        ):
+        multiple_of = self.vae_scale_factor * 2
+        for name, size in (("height", height), ("width", width)):
+            if size is not None and size < multiple_of:
+                raise ValueError(
+                    f"`{name}` must be at least {multiple_of} to produce a non-empty latent grid, got {size}."
+                )
+
+        height_needs_resize = height is not None and height % multiple_of != 0
+        width_needs_resize = width is not None and width % multiple_of != 0
+        if height_needs_resize or width_needs_resize:
             logger.warning(
                 "`height` and `width` have to be divisible by %s but are %s and %s. "
                 "Dimensions will be resized accordingly",
-                self.vae_scale_factor * 2,
+                multiple_of,
                 height,
                 width,
             )
@@ -916,8 +920,9 @@ class Flux2Pipeline(
         else:
             image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
 
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
+        # Preserve explicit zero dimensions so check_inputs can reject them.
+        height = req.sampling_params.height if req.sampling_params.height is not None else height
+        width = req.sampling_params.width if req.sampling_params.width is not None else width
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
