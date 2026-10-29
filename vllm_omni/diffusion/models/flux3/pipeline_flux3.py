@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterable
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any, ClassVar
 
@@ -143,15 +143,6 @@ def _flux3_sampler_config(package_config: dict[str, Any] | None) -> dict[str, An
         "alpha": float(sampler_cfg.get("alpha", _F3_DEFAULT_FLOW_SHIFT)),
         "size": (int(size[0]), int(size[1])),
     }
-
-
-def _should_autotune_flux3_prims_ts(transformer: Any) -> bool:
-    adapter = getattr(transformer, "kernel_adapter", None)
-    if getattr(adapter, "backend", None) != "prims_ts" or getattr(adapter, "_configured_blocks", 0) <= 0:
-        return False
-    from vllm_omni.diffusion.models.flux3.flux3_prims_ts_config import prims_ts_autotune_enabled
-
-    return prims_ts_autotune_enabled()
 
 
 def _flux3_image_rope_scale(package_config: dict[str, Any] | None) -> float:
@@ -993,27 +984,17 @@ class Flux3Pipeline(
 
         self._guidance_scale = guidance_scale
 
-        if _should_autotune_flux3_prims_ts(getattr(self, "transformer", None)):
-            from vllm_omni.diffusion.models.flux3.flux3_prims_ts_config import flux3_prims_ts_autotune_context
-
-            tune_context = flux3_prims_ts_autotune_context(
-                self.od_config.model,
-                tune_mode=req.is_dummy_run(),
-            )
-        else:
-            tune_context = nullcontext()
-        with tune_context:
-            decoded = self.generate(
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                seed=int(seed),
-                image=image,
-                negative_prompt=negative_prompt,
-                flow_shift=flow_shift,
-            )
+        decoded = self.generate(
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            seed=int(seed),
+            image=image,
+            negative_prompt=negative_prompt,
+            flow_shift=flow_shift,
+        )
         return DiffusionOutput(
             output=decoded, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
         )

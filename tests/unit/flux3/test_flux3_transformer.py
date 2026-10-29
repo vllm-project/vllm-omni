@@ -192,8 +192,8 @@ class TestShapeInvariants:
             "image_cond": IMAGE_C,
         }
 
-    def test_nvfp4_qkv_layout_fuses_only_prims_ts_targets(self):
-        """Only PrimsTS targets can fuse NVFP4 Q/K/V without losing scales."""
+    def test_nvfp4_qkv_layout_stays_split(self):
+        """NVFP4 blocks keep split projections to preserve per-projection scales."""
 
         class NvFp4Config:
             def get_name(self):
@@ -201,8 +201,6 @@ class TestShapeInvariants:
 
         config = NvFp4Config()
         assert _resolve_fuse_qkv(config) is False
-        assert _resolve_fuse_qkv(config, "prims_ts") is False
-        assert _resolve_fuse_qkv(config, "prims_ts", prims_ts_target=True) is True
         assert _resolve_fuse_qkv(None) is True
 
     def test_mixed_qkv_layout_maps_checkpoint_to_each_block(self):

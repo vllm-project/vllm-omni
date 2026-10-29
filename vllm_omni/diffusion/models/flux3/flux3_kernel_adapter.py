@@ -51,11 +51,6 @@ class Flux3KernelAdapter:
     def __init__(self, qk_norm_rope: QKNormRopeFn) -> None:
         self._qk_norm_rope = qk_norm_rope
 
-    def uses_fused_qkv(self, prefix: str, head_dim: int) -> bool:
-        """Whether this adapter needs a fused QKV projection for a block."""
-        del prefix, head_dim
-        return False
-
     def configure_block(self, block: Any, prefix: str) -> Flux3BlockKernelPlan:
         # Default setup is intentionally a no-op. Specialized adapters use
         # these arguments to inspect the block and install a fixed kernel plan.

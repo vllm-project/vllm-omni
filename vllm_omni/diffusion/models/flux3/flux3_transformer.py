@@ -76,13 +76,11 @@ def _is_nvfp4_quant_config(quant_config: "QuantizationConfig | None") -> bool:
 def _resolve_fuse_qkv(
     quant_config: "QuantizationConfig | None",
     kernel_backend: str = "vllm",
-    prims_ts_target: bool = False,
 ) -> bool:
     """Return the QKV layout compatible with the selected quantization method."""
     if _is_nvfp4_quant_config(quant_config):
-        # PrimsTS preserves the separate projection scales in its fused QKV
-        # kernel. Other NVFP4 blocks need split projections for those scales.
-        return kernel_backend == "prims_ts" and prims_ts_target
+        # NVFP4 blocks keep split projections to preserve the separate scales.
+        return False
     return True
 
 
@@ -852,7 +850,6 @@ class Flux3Transformer2DModel(nn.Module, SupportsQuant):
             prefix: _resolve_fuse_qkv(
                 quant_config,
                 self.kernel_adapter.backend,
-                self.kernel_adapter.uses_fused_qkv(prefix, self.head_dim),
             )
             for prefix in _iter_qkv_prefixes(content_modalities, depth, depth_single_blocks, depth_late_blocks)
         }
