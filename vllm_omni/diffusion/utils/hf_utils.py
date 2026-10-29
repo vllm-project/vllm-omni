@@ -23,6 +23,14 @@ _MAGI2_REQUIRED_FILES = (
     "turbo_vae/checkpoint.ckpt",
 )
 
+# FastWAM-family checkpoints ship raw ``.pt`` files and no root config. Exact Hub
+# IDs, or a local directory holding one of the signature file sets.
+_FASTWAM_MODEL_IDS = ("amd/CAE-FastWAM", "yuanty/fastwam")
+_FASTWAM_SIGNATURES = (
+    ("policy.pt", "action_vae.pt", "stats/libero_spatial.json"),  # CAE-FastWAM
+    ("libero_uncond_2cam224.pt", "libero_uncond_2cam224_dataset_stats.json"),  # FastWAM
+)
+
 
 def get_diffusion_model_index(
     model_name: str,
@@ -57,18 +65,35 @@ def _looks_like_bagel(model_name: str, *, revision: str | None = None) -> bool:
         return False
 
 
-def _looks_like_magi2(model_name: str) -> bool:
-    """Detect the official Hub ID or a complete local Preview checkpoint."""
+def _normalize_model_name(model_name: str) -> str:
     normalized = str(model_name).strip().rstrip("/")
     hub_prefix = "https://huggingface.co/"
     if normalized.lower().startswith(hub_prefix):
         normalized = normalized[len(hub_prefix) :]
         normalized = normalized.split("/tree/", 1)[0]
+    return normalized
+
+
+def _has_files(directory: str, relative_paths: tuple[str, ...]) -> bool:
+    return os.path.isdir(directory) and all(
+        os.path.isfile(os.path.join(directory, *relative.split("/"))) for relative in relative_paths
+    )
+
+
+def _looks_like_magi2(model_name: str) -> bool:
+    """Detect the official Hub ID or a complete local Preview checkpoint."""
+    normalized = _normalize_model_name(model_name)
     if normalized.lower() == _MAGI2_MODEL_ID.lower():
         return True
-    return os.path.isdir(normalized) and all(
-        os.path.isfile(os.path.join(normalized, *relative.split("/"))) for relative in _MAGI2_REQUIRED_FILES
-    )
+    return _has_files(normalized, _MAGI2_REQUIRED_FILES)
+
+
+def _looks_like_fastwam(model_name: str) -> bool:
+    """Detect a FastWAM-family checkpoint by exact Hub ID or local signature files (no network)."""
+    normalized = _normalize_model_name(model_name)
+    if normalized.lower() in {model_id.lower() for model_id in _FASTWAM_MODEL_IDS}:
+        return True
+    return any(_has_files(normalized, signature) for signature in _FASTWAM_SIGNATURES)
 
 
 def _looks_like_praxis1(model_name: str, *, revision: str | None = None) -> bool:
@@ -101,6 +126,8 @@ def resolve_native_diffusion_model_class(model_name: str) -> str | None:
         return "Magi2Pipeline"
     if resolve_checkpoint(model_name) is not None:
         return "VideoDepthAnythingPipeline"
+    if _looks_like_fastwam(model_name):
+        return "FastWAMPipeline"
     return None
 
 
