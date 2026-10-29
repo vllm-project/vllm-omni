@@ -641,6 +641,40 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    # MOSS-TTS-Local-v1.5 on NPU: run both stages eagerly. Pipelined NPUGraph
+    # capture for ``moss_codec_decode`` fails on current torch-npu, and ACL
+    # graph replay in stage 0 can deadlock the 8B backbone; eager execution
+    # is required until the Ascend graph paths are fixed.
+    "moss_tts_local": {
+        "base_config": "moss_tts_local.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "enforce_eager": True,
+            },
+            {
+                "stage_id": 1,
+                "enforce_eager": True,
+            },
+        ],
+        # ``platforms.npu.stages[1]`` from the base deploy YAML contributes
+        # ``compilation_config.cudagraph_mode: PIECEWISE`` outside the top-level
+        # ``stages`` merge. Disable it explicitly so the CI profile does not
+        # depend on ``enforce_eager`` vs ``cudagraph_mode`` precedence.
+        "platforms": {
+            "npu": {
+                "stages": [
+                    {
+                        "stage_id": 1,
+                        "compilation_config": {
+                            "cudagraph_mode": "NONE",
+                            "cudagraph_capture_sizes": [],
+                        },
+                    },
+                ],
+            },
+        },
+    },
 }
 
 
@@ -724,11 +758,16 @@ def get_deploy_duplex_max_sessions(rel_path: str) -> int:
 
 
 def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
-    """Return ``stage_id`` values from a new-schema deploy YAML (``stages``)."""
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    """Return ``stage_id`` values from a deploy YAML (``stages``).
+
+    Resolves ``base_config`` inheritance so base-wrapper overlays (e.g.
+    ``moss_tts_local.yaml``) work with the dummy/real load-format patching.
+    """
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+
+    resolved = resolve_deploy_yaml(stage_config_path)
     try:
-        return load_stage_ids(cfg)
+        return load_stage_ids(resolved)
     except ValueError as exc:
         raise ValueError(f"Deploy YAML missing top-level 'stages': {stage_config_path}") from exc
 
@@ -754,10 +793,10 @@ def _delete_dummy_load_format(
     """For ``advanced_model`` / ``full_model``, strip ``load_format: dummy`` so real weights load."""
     if run_level not in {"advanced_model", "full_model"} or stage_config_path is None:
         return stage_config_path
-    with open(stage_config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+
     try:
-        stages = get_stage_entries(cfg)
+        stages = get_stage_entries(resolve_deploy_yaml(stage_config_path))
     except ValueError as exc:
         raise ValueError(f"Deploy YAML missing top-level 'stages': {stage_config_path}") from exc
 
