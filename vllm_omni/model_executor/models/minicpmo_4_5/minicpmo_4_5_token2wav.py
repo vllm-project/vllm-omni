@@ -122,6 +122,14 @@ class MiniCPMO45Token2wav:
         """Delegate prompt feature extraction to the wrapped core."""
         return self._core._prepare_prompt(prompt_wav)
 
+    def _prepare_prompt_host(self, prompt_wav: str):
+        """Delegate the host half of prompt preparation to the wrapped core."""
+        return self._core._prepare_prompt_host(prompt_wav)
+
+    def _prepare_prompt_device(self, host):
+        """Delegate the device half of prompt preparation to the wrapped core."""
+        return self._core._prepare_prompt_device(host)
+
     def enable_trt_spk_embedding(self, *, cpu_reference: bool = False) -> None:
         """Run the campplus speaker-embedding model on TensorRT."""
         self._core.enable_trt_spk_embedding(cpu_reference=cpu_reference)

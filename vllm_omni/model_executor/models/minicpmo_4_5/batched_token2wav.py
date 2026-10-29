@@ -10,7 +10,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -44,6 +44,9 @@ from .dit_fused import (
     tiled_attention_supported,
 )
 from .flow_encoder_graph import FlowEncoderGraphs
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import PromptHostFeatures
 
 logger = init_logger(__name__)
 
@@ -670,6 +673,63 @@ class BatchedToken2Wav(nn.Module):
                 mels=values[3],
             )
             self._prompt_features[cache_key] = cached
+        return cached
+
+    def has_prompt_features(self, prompt_cache_id: str, prompt_wav: str) -> bool:
+        """Whether :meth:`prepare_prompt` would hit its cache now; read-only."""
+        return (prompt_cache_id, prompt_wav) in self._prompt_features
+
+    def prepare_prompt_host(self, prompt_wav: str) -> PromptHostFeatures:
+        """The host half of :meth:`prepare_prompt`.
+
+        Touches no device, so a worker thread may run it while the device is
+        busy. :meth:`install_prompt` runs the device half.
+        """
+        return self._token2wav._prepare_prompt_host(prompt_wav)
+
+    def install_prompt(
+        self,
+        prompt_cache_id: str,
+        prompt_wav: str,
+        host: PromptHostFeatures,
+        stream: torch.cuda.Stream | None = None,
+    ) -> PromptFeatures:
+        """Queue the device half of :meth:`prepare_prompt` on ``stream`` and cache the result.
+
+        Returns as soon as the work is queued. Before using the features, the
+        calling stream must wait for ``stream`` (an event recorded after this
+        call). The features are marked as used by the calling stream, so the
+        allocator does not hand their memory to ``stream`` while the calling
+        stream may still read it. ``stream=None`` runs on the current stream.
+        The values equal those :meth:`prepare_prompt` computes for the same
+        prompt.
+        """
+        cache_key = (prompt_cache_id, prompt_wav)
+        cached = self._prompt_features.get(cache_key)
+        if cached is not None:
+            return cached
+        consumer = torch.cuda.current_stream() if stream is not None else None
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float32)
+            with (
+                torch.cuda.stream(stream) if stream is not None else nullcontext(),
+                _autocast_disabled(self.speech_window.device),
+            ):
+                values = self._token2wav._prepare_prompt_device(host)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        cached = PromptFeatures(
+            cache_key=cache_key,
+            speech_tokens=values[0],
+            speaker_embedding=values[2],
+            mels=values[3],
+        )
+        if consumer is not None:
+            for tensor in (cached.speech_tokens, cached.speaker_embedding, cached.mels):
+                if tensor.is_cuda:
+                    tensor.record_stream(consumer)
+        self._prompt_features[cache_key] = cached
         return cached
 
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:

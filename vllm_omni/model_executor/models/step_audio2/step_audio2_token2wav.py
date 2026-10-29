@@ -116,6 +116,20 @@ def fade_in_out(
     return fade_in_mel
 
 
+@dataclass(frozen=True)
+class PromptHostFeatures:
+    """Host half of a prepared prompt: everything computed before any device work.
+
+    Produced by :meth:`StepAudio2Token2WavCore._prepare_prompt_host`, which
+    touches no device, so it can run on a worker thread.
+    """
+
+    mels: torch.Tensor
+    mels_lens: torch.Tensor
+    spk_feat: torch.Tensor
+    prompt_mel: torch.Tensor
+
+
 @dataclass
 class _StreamState:
     """Per-request streaming state for concurrent Token2Wav sessions."""
@@ -513,6 +527,14 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
+        return self._prepare_prompt_device(self._prepare_prompt_host(prompt_wav))
+
+    def _prepare_prompt_host(self, prompt_wav: str) -> PromptHostFeatures:
+        """Load the prompt and extract its features on the host.
+
+        Touches no device and no lazily loaded model, so it may run on a
+        worker thread while the device is busy.
+        """
         audio_np_raw, sample_rate = load_audio(prompt_wav, sr=None, mono=True)
         sample_rate = int(sample_rate)
 
@@ -521,28 +543,9 @@ class StepAudio2Token2WavCore(nn.Module):
         audio = torch.from_numpy(audio_16k)
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
-        mels_d = _h2d_async(mels, self.device)
-        mels_lens_d = _h2d_async(mels_lens, self.device)
-        if mels.shape[-1] > _S3_MAX_FRAMES:
-            # Long audio (>30 s) keeps the library call: it routes to the
-            # sliding-window mixed-batch path.
-            prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(mels_d, mels_lens_d)
-        else:
-            # Short audio: NPU graph replay of the library's else-branch
-            # (encoder + quantizer.encode). The device-side
-            # `mel_len > max_frames` check is skipped — its `.any()` forces an
-            # implicit D2H sync; the frame count is static on host
-            # (mels.shape[-1]), so the branch decision needs no sync.
-            prompt_speech_tokens, prompt_speech_tokens_lens = self._quantize_s3_graph(mels_d, mels_lens_d)
 
         spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
         spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
-        spk_emb = self._forward_spk_embedding(spk_feat)
-        if self._spk_event is not None:
-            # Device-side join for the private campplus stream (never blocks the
-            # host); it lands here so the host-side 24 kHz mel work overlaps.
-            torch.npu.current_stream(self.device).wait_event(self._spk_event)
-            self._spk_event = None
 
         # 24 kHz branch: mel spectrogram for flow model conditioning
         # Must resample from the ORIGINAL audio, not the 16 kHz version.
@@ -563,10 +566,39 @@ class StepAudio2Token2WavCore(nn.Module):
             .transpose(1, 2)
             .squeeze(0)
         )  # [T, num_mels]
-        prompt_mels = _h2d_async(prompt_mel.unsqueeze(0), self.device)
+        return PromptHostFeatures(mels=mels, mels_lens=mels_lens, spk_feat=spk_feat, prompt_mel=prompt_mel)
+
+    def _prepare_prompt_device(self, host: PromptHostFeatures):
+        """Run the device half of prompt preparation on the current stream.
+
+        The host inputs are staged in pinned memory, so the copies do not wait
+        for device work already queued on the stream.
+        """
+        mels_d = _h2d_async(host.mels, self.device)
+        mels_lens_d = _h2d_async(host.mels_lens, self.device)
+        if host.mels.shape[-1] > _S3_MAX_FRAMES:
+            # Long audio (>30 s) keeps the library call: it routes to the
+            # sliding-window mixed-batch path.
+            prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(mels_d, mels_lens_d)
+        else:
+            # Short audio: NPU graph replay of the library's else-branch
+            # (encoder + quantizer.encode). The device-side
+            # `mel_len > max_frames` check is skipped — its `.any()` forces an
+            # implicit D2H sync; the frame count is static on host
+            # (mels.shape[-1]), so the branch decision needs no sync.
+            prompt_speech_tokens, prompt_speech_tokens_lens = self._quantize_s3_graph(mels_d, mels_lens_d)
+
+        spk_emb = self._forward_spk_embedding(host.spk_feat)
+        if self._spk_event is not None:
+            # Device-side join for the private campplus stream (never blocks the
+            # host).
+            torch.npu.current_stream(self.device).wait_event(self._spk_event)
+            self._spk_event = None
+
+        prompt_mels = _h2d_async(host.prompt_mel.unsqueeze(0), self.device)
         # Build on host then async-copy: torch.tensor(..., device=...) is itself
         # a synchronous H2D that blocks behind queued decode work.
-        prompt_mels_lens = _h2d_async(torch.tensor([prompt_mel.shape[0]], dtype=torch.int32), self.device)
+        prompt_mels_lens = _h2d_async(torch.tensor([host.prompt_mel.shape[0]], dtype=torch.int32), self.device)
         prompt_mels = torch.nn.functional.pad(
             prompt_mels,
             (0, 0, 0, prompt_speech_tokens.shape[1] * self.flow.up_rate - prompt_mels.shape[1]),

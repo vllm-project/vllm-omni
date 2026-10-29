@@ -3334,6 +3334,37 @@ class TestPlatformOverrides:
             assert all(not stage.yaml_engine_args["enable_prefix_caching"] for stage in stages)
             assert all(not stage.yaml_runtime.get("env") for stage in stages)
 
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+    def test_minicpmo_high_concurrency_profile_adds_code2wav_options(self, platform):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        base = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml"))), platform=platform
+        )
+        profile = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5_high_concurrency.yaml"))), platform=platform
+        )
+        is_cuda = platform == "cuda"
+        # MPS comes from the default profile; this profile only adds Code2Wav options.
+        assert base.cuda_mps is is_cuda
+        assert profile.cuda_mps is is_cuda
+        base_stages = merge_pipeline_deploy(pipeline, base)
+        profile_stages = merge_pipeline_deploy(pipeline, profile)
+        assert all(stage.yaml_runtime.get("cuda_mps", False) is is_cuda for stage in profile_stages)
+        # Stage engine args are inherited unchanged from the default profile.
+        assert [s.yaml_engine_args for s in profile_stages] == [s.yaml_engine_args for s in base_stages]
+        # The Code2Wav connector gains exactly the measured options; the rest is inherited.
+        base_extra = base.connectors["connector_of_shared_memory"]["extra"]
+        profile_extra = profile.connectors["connector_of_shared_memory"]["extra"]
+        added = {"token2wav_async_ref_prepare": True, "micro_batch_size": 8, "cfm_onset_merge": True}
+        assert profile_extra == {**base_extra, **added}
+        assert base_extra.get("micro_batch_size") == 4
+        assert (
+            profile.connectors["connector_of_shared_memory"]["name"]
+            == base.connectors["connector_of_shared_memory"]["name"]
+        )
+        assert profile.session_mode == base.session_mode
+        assert profile.duplex_session == base.duplex_session
+
     def test_moss_local_first_audio_preserves_prefix_cache_and_runner_options(self):
         pipeline = resolve_pipeline_config("moss_tts_local")
         path = get_deploy_config_path("moss_tts_local.yaml")

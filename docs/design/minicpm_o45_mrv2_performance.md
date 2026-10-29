@@ -266,3 +266,35 @@ changing backend versions; floating-point waveform identity is not promised.
 `platforms.cuda.cuda_mps`. Profiles that inherit it, including
 `minicpmo_4_5_turn.yaml`, inherit both. Set either key to `false` in an
 overlay to disable that part.
+
+## Asynchronous reference preparation
+
+`token2wav_async_ref_prepare` (connector extra, default `false`, CUDA only)
+prepares each async-chunk placeholder's reference while other streams are
+live. The V1 generation runner's `on_requests_added` hook hands the reference
+to a worker thread (`token2wav_async_ref_workers`, default `2`) that runs only
+the host half of prompt preparation: normalization, the runtime prompt WAV,
+resampling, S3 log-mel, fbank and mel. The worker makes no device calls. The
+next forward or idle step queues the device half (S3 quantize, CAM++, pinned
+copies) on a side stream and pins the prompt to its request; chunk 0 orders
+its stream after that work with an event. The stage matmul policy and graph
+captures therefore stay on the forward thread. With the CPU-reference
+TensorRT speaker, CAM++ enqueues on that side stream and synchronizes it, so
+the forward thread waits there for the device half queued so far, not for the
+main stream.
+
+Prompt features stay keyed by content and equal those of inline preparation.
+A reference that is not ready by chunk 0 is prepared inline, and the late
+result is dropped. A job whose request finishes after its worker started is
+kept until it settles; its prompt WAV then joins the runtime-prompt cache as
+the next eviction candidate, unless another request already tracks it. A
+failed job's WAV is handled the same way. The option replaces the idle
+prefetch while active. Duplex
+sessions (no prewarm payload), the MRv2 generation runner and NPU keep the
+existing behavior. The CFM setup solve still runs at chunk 0.
+
+`minicpmo_4_5_high_concurrency.yaml` enables this option together with
+`micro_batch_size: 8` and `cfm_onset_merge: true`, so first chunks and
+continuing streams share one ragged Whole-Euler solve. The batching options
+apply on every platform but were measured on CUDA only, and they change
+batched rounding.
