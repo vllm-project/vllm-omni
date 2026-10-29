@@ -122,8 +122,11 @@ schedule request handling.
 
 ## Batching and errors
 
-Requests co-batch only with equal schedules after resolving stage defaults,
-so an omitted schedule and the same ranges sent explicitly share a batch.
+Requests co-batch only with equal schedules after resolving stage defaults
+and only when they all sent their schedule or all inherited it. An omitted
+schedule does not co-batch with the same ranges sent explicitly, because an
+explicit schedule is checked against the step count while an inherited
+default is not.
 A scheduled H3 step batch keeps one packed transformer forward when every
 request is at the same step and sigma and the selected profile's backends
 isolate packed requests; otherwise it runs one forward per request so each
