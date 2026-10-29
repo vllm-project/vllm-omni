@@ -14,6 +14,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, ClassVar
 
+import torch
+
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.prope import PRoPECameras
 from vllm_omni.diffusion.models.minwm.camera import trajectory_cameras
@@ -21,6 +23,7 @@ from vllm_omni.diffusion.models.self_forcing.pipeline_self_forcing import (
     SelfForcingPipeline,
     get_self_forcing_post_process_func,
 )
+from vllm_omni.errors import OmniClientError
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -48,9 +51,13 @@ class MinWMAction2VPipeline(SelfForcingPipeline):
         trajectory = extra_args.get("trajectory")
         if trajectory is None:
             return None
+        # Client errors, so the worker's rejection reaches the caller as a 400 rather than a 500.
         if not isinstance(trajectory, str) or not trajectory.strip():
-            raise ValueError("extra_params.trajectory must be a non-empty string such as 'a*4,w*8,s*7'.")
-        viewmats, intrinsics = trajectory_cameras(trajectory, num_latent_frames=num_latent_frames)
-        return PRoPECameras.from_views(
-            viewmats.to(self.device), intrinsics.to(self.device), dtype=self.transformer.dtype
-        )
+            raise OmniClientError("extra_params.trajectory must be a non-empty string such as 'a*4,w*8,s*7'.")
+        try:
+            viewmats, intrinsics = trajectory_cameras(trajectory, num_latent_frames=num_latent_frames)
+        except ValueError as exc:
+            raise OmniClientError(str(exc)) from exc
+        # Built in float32: apply_prope casts to the feature dtype at the point of use, so only that last
+        # multiply runs in bf16, not the composition and the rigid inverse.
+        return PRoPECameras.from_views(viewmats.to(self.device), intrinsics.to(self.device), dtype=torch.float32)

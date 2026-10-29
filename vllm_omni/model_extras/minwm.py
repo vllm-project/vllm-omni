@@ -18,8 +18,18 @@ MINWM_EXTRA_OUTPUT_PARAMS: frozenset[str] = frozenset()
 def get_minwm_video_generation_defaults(
     extra_body: Mapping[str, Any] | None = None,
 ) -> VideoGenerationDefaults:
-    """The 77-frame 480x832 clip the Action2V generator was distilled on, at four DMD steps without CFG."""
-    del extra_body
+    """The 77-frame 480x832 clip the Action2V generator was distilled on, at four DMD steps without CFG.
+
+    A trajectory is parsed here, in the API server, so a malformed one is a 400 before the request reaches a
+    worker; whether its step count fits the frame count is checked in the pipeline once ``num_frames`` is known.
+    """
+    trajectory = (extra_body or {}).get("trajectory")
+    if trajectory is not None:
+        if not isinstance(trajectory, str) or not trajectory.strip():
+            raise ValueError("extra_params.trajectory must be a non-empty string such as 'a*4,w*8,s*7'.")
+        from vllm_omni.diffusion.models.minwm.camera import parse_trajectory
+
+        parse_trajectory(trajectory)
     return VideoGenerationDefaults(
         width=832,
         height=480,

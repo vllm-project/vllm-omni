@@ -352,7 +352,10 @@ def test_minwm_without_a_trajectory_renders_without_the_camera_branch() -> None:
 @pytest.mark.cpu
 @pytest.mark.usefixtures("native_ops")
 def test_minwm_rejects_a_trajectory_of_another_length() -> None:
-    with pytest.raises(ValueError, match="describes 4 latent frames"):
+    """A client error, so the rejection reaches the caller as a 400 rather than a 500."""
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(OmniClientError, match="describes 4 latent frames"):
         _minwm_pipeline()._parse_request(_request(extra_args={"trajectory": "w*3"}))
 
 
@@ -361,7 +364,7 @@ def _cameras(frames: int):
     from vllm_omni.diffusion.models.minwm.camera import trajectory_cameras
 
     viewmats, intrinsics = trajectory_cameras(f"w*{frames - 1}", num_latent_frames=frames)
-    return PRoPECameras.from_views(viewmats.cuda(), intrinsics.cuda(), dtype=torch.bfloat16)
+    return PRoPECameras.from_views(viewmats.cuda(), intrinsics.cuda(), dtype=torch.float32)
 
 
 @hardware_test(res={"cuda": "L4"})

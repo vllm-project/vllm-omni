@@ -90,10 +90,10 @@ def apply_prope(features: torch.Tensor, transforms: torch.Tensor) -> torch.Tenso
 
 
 def _lift(matrices: torch.Tensor) -> torch.Tensor:
-    lifted = torch.zeros(matrices.shape[:-2] + (4, 4), device=matrices.device)
+    lifted = torch.zeros(matrices.shape[:-2] + (4, 4), device=matrices.device, dtype=matrices.dtype)
     lifted[..., :3, :3] = matrices
     lifted[..., 3, 3] = 1.0
-    return lifted.to(matrices.dtype)
+    return lifted
 
 
 def _invert_rigid(transforms: torch.Tensor) -> torch.Tensor:

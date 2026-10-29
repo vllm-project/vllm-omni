@@ -15,6 +15,8 @@ import numpy as np
 import regex as re
 import torch
 
+from vllm_omni.diffusion.layers.prope import _invert_rigid
+
 _TRANSLATION_STEP = 0.08
 _ROTATION_STEP = float(np.radians(3.0))
 _MOTIONS: dict[str, tuple[str, float]] = {
@@ -34,8 +36,8 @@ _SEGMENT = re.compile(r"([a-z]+)\*(\d+)")
 _INTRINSICS = np.array([[0.5, 0.0, 0.5], [0.0, 0.5, 0.5], [0.0, 0.0, 1.0]], dtype=np.float32)
 
 
-def trajectory_viewmats(trajectory: str, *, num_latent_frames: int) -> np.ndarray:
-    """Parse a trajectory string into ``[num_latent_frames, 4, 4]`` float32 world-to-camera matrices."""
+def parse_trajectory(trajectory: str) -> list[tuple[str, int]]:
+    """Split a trajectory string into ``(direction, steps)`` segments without expanding them."""
     segments: list[tuple[str, int]] = []
     for segment in trajectory.strip().split(","):
         match = _SEGMENT.fullmatch(segment.strip())
@@ -45,7 +47,12 @@ def trajectory_viewmats(trajectory: str, *, num_latent_frames: int) -> np.ndarra
         if token not in _MOTIONS:
             raise ValueError(f"Unknown trajectory direction {token!r}; valid: {sorted(_MOTIONS)}.")
         segments.append((token, count))
+    return segments
 
+
+def trajectory_viewmats(trajectory: str, *, num_latent_frames: int) -> np.ndarray:
+    """Parse a trajectory string into ``[num_latent_frames, 4, 4]`` float32 world-to-camera matrices."""
+    segments = parse_trajectory(trajectory)
     # Summed before the counts are repeated, so an oversized request builds no poses.
     steps = sum(count for _, count in segments)
     if steps + 1 != num_latent_frames:
@@ -72,7 +79,7 @@ def trajectory_viewmats(trajectory: str, *, num_latent_frames: int) -> np.ndarra
         else:
             camera_to_world[:3, 3] += rotation @ np.array([0.0, -amount, 0.0])
         poses.append(camera_to_world.copy())
-    return np.stack([np.linalg.inv(pose) for pose in poses]).astype(np.float32)
+    return _invert_rigid(torch.from_numpy(np.stack(poses))).numpy().astype(np.float32)
 
 
 def trajectory_cameras(trajectory: str, *, num_latent_frames: int) -> tuple[torch.Tensor, torch.Tensor]:

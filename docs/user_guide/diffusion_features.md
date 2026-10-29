@@ -207,7 +207,7 @@ The following tables show which models support each feature:
 | **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **Self-Forcing**             |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |     ✅ (request mode)      |          ❌           |       ❓        |        ✅*        |
-| **minWM Action2V**           |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❓             |          ❌           |       ❓        |        ✅*        |
+| **minWM Action2V**           |     ❌     |     ❌      |          ❌<sup>6</sup> |       ❌        |         ❌         |         ❌         |   ❌    |             ❓             |          ❌           |       ❓        |        ✅*        |
 
 > Notes:
 > 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
@@ -215,6 +215,9 @@ The following tables show which models support each feature:
 > the token sequence in isolation. Doing so would need a distributed scan or
 > an all-gather before every GDN block. The remaining ❌ columns are simply
 > unvalidated on this model, not known-broken.
+> 6. minWM Action2V's PRoPE self-attention rejects Ulysses sequence
+> parallelism when the model loads, so `--usp` above 1 fails at startup even if
+> no request carries a trajectory.
 
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`. Self-Forcing streams one AR block per chunk only with
