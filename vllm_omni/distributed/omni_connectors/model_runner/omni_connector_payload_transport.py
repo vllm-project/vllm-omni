@@ -190,13 +190,23 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 return True
         return False
 
-    @staticmethod
-    def _get_local_tp_group() -> Any | None:
-        """Return the local TP group when tensor parallelism is initialized."""
+    def _get_local_tp_group(self) -> Any | None:
+        """Return the local TP group when tensor parallelism is initialized.
+
+        The group does not change after distributed init, and the receive
+        loop calls this on every poll. Cache a resolved group. A call made
+        before init returns None without caching, so a later call can succeed.
+        """
+        group = getattr(self, "_local_tp_group", None)
+        if group is not None:
+            return group
         try:
-            return get_tp_group()
+            group = get_tp_group()
         except Exception:
             return None
+        if group is not None:
+            self._local_tp_group = group
+        return group
 
     def _recv_ordinary_stage_result(
         self,
@@ -987,7 +997,16 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     # ------------------------------------------------------------------ #
 
     def _recv_loop(self) -> None:
-        """Background thread: poll connector for incoming data."""
+        """Background thread: poll connector for incoming data.
+
+        Drain chunks that are already queued, then wait. A request that just
+        returned a chunk may already have the next one, so only those
+        requests are polled again. A miss means that chunk is not in the
+        connector yet; rescanning it opens a missing lock file and holds the
+        GIL against the model thread for the whole burst. The wait is also
+        the recheck for a non-AR payload deferred until the scheduler takes
+        the previous one.
+        """
         _recv_poll_count = 0
         while not self._stop_event.is_set():
             snapshot = getattr(self._omni_connector, "get_wakeup_generation", None)
@@ -1010,19 +1029,21 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     _recv_poll_count,
                 )
 
-            made_progress = self._poll_pending_requests_once(pending_ids)
+            active = pending_ids
+            while active and not self._stop_event.is_set():
+                active = self._poll_pending_requests_once(active)
 
-            if not made_progress and not self._stop_event.is_set():
-                # Wait for a *new* arrival: existing future chunks may be
-                # blocked by scheduler ownership of the previous payload.
-                # A key-presence predicate would spin and compete for the
-                # GIL. Honor the configured readiness recheck interval.
-                wait_for_change = getattr(self._omni_connector, "wait_for_change", None)
-                if generation is not None and callable(wait_for_change):
-                    wait_for_change(generation, timeout=_RECV_POLL_S)
-                else:
-                    self._work_available.wait(timeout=_RECV_POLL_S)
-                    self._work_available.clear()
+            if not self._stop_event.is_set():
+                self._wait_for_next_payload(generation)
+
+    def _wait_for_next_payload(self, generation: int | None) -> None:
+        """Block until a new payload arrives, or until the recheck interval."""
+        wait_for_change = getattr(self._omni_connector, "wait_for_change", None)
+        if generation is not None and callable(wait_for_change):
+            wait_for_change(generation, timeout=_RECV_POLL_S)
+            return
+        self._work_available.wait(timeout=_RECV_POLL_S)
+        self._work_available.clear()
 
     _MAX_SEND_RETRIES = 3
 
@@ -1628,19 +1649,29 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         self._save_work_available.set()
         return True, completion
 
-    def _poll_pending_requests_once(self, pending_ids: list[str]) -> bool:
-        """Poll one receiver pass and publish its ready requests as a cohort."""
-        made_progress = False
+    def _poll_pending_requests_once(self, pending_ids: list[str]) -> list[str]:
+        """Poll one pass and return requests that still have a stream open.
+
+        A request whose terminal chunk arrived in this pass is not returned,
+        so the drain does not poll it again. Ready requests are published as
+        one cohort.
+        """
+        ready: list[str] = []
         for req_id in pending_ids:
             if self._stop_event.is_set():
                 break
             try:
-                made_progress = self._poll_single_request(req_id, publish_ready=False) or made_progress
+                if self._poll_single_request(req_id, publish_ready=False):
+                    ready.append(req_id)
             except Exception:
                 logger.warning("Error receiving data for %s", req_id, exc_info=True)
-        if made_progress and self._async_chunk:
+        if ready and self._async_chunk:
             self.publish_omni_connector_output_to_sink()
-        return made_progress
+        if not ready:
+            return ready
+        with self._lock:
+            pending = self._pending_load_reqs
+            return [req_id for req_id in ready if req_id in pending]
 
     @staticmethod
     def _finish_marker_payload() -> OmniPayload:

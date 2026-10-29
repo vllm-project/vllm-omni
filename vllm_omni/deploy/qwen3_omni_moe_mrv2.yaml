@@ -36,10 +36,13 @@ connectors:
 stages:
   - stage_id: 0
     model_runner: v2
-    # The base profile's Thinker prefix cache is validated on V1 only.
+    # Opt-in: true reuses Thinker KV and merges the cached rows the Talker
+    # consumes (stage-output prefix cache).
     enable_prefix_caching: false
   - stage_id: 1
     model_runner: v2
+    # Opt-in: on MRv2 the Talker reuses native KV only; its outputs are
+    # sampled codec frames, so a prefix hit has no output rows to replay.
   - stage_id: 2
     model_runner: v2
 

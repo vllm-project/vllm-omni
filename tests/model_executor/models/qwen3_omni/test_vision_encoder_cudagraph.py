@@ -392,3 +392,17 @@ def test_runner_encodes_a_group_beyond_one_replay_in_one_eager_call(monkeypatch)
     for output, reference in zip(cached, model.encoder_eager_forward(images).split([2, 3])):
         torch.testing.assert_close(output, reference)
     assert manager.graph_hits == 0 and manager.graph_misses == 2
+
+
+def test_eager_vision_chunks_follow_frame_boundaries():
+    """A 60x22x40 video is 52800 patches; chunks stay on frame edges and cover it."""
+    grid = torch.tensor([[60, 22, 40]], dtype=torch.int32)
+    chunks = Qwen3Omni_VisionTransformer._eager_vision_chunks(grid, max_tokens=8192)
+    frame = 22 * 40
+    assert all(count % frame == 0 for _, count, _, _, _ in chunks)
+    assert sum(count for _, count, _, _, _ in chunks) == 60 * frame
+    assert all(count <= 8192 or frames == 1 for _, count, frames, _, _ in chunks)
+    assert chunks[0][0] == 0
+    assert [offset for offset, _, _, _, _ in chunks] == list(
+        torch.cumsum(torch.tensor([0, *[count for _, count, _, _, _ in chunks[:-1]]]), dim=0).tolist()
+    )
