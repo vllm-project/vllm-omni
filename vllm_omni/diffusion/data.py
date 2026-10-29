@@ -1346,6 +1346,10 @@ class OmniDiffusionConfig:
             raise ValueError(
                 f"request_batch_max_wait_ms must be a finite non-negative number, got {self.request_batch_max_wait_ms}."
             )
+        # Fail at startup: pipelines that take their shift only from config
+        # (e.g. Wan2.2 S2V/VACE) would otherwise denoise on NaN sigmas.
+        if self.flow_shift is not None and not math.isfinite(float(self.flow_shift)):
+            raise ValueError(f"flow_shift must be finite, got {self.flow_shift!r}.")
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig

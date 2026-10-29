@@ -718,6 +718,15 @@ class TestRequestBatchAdmission:
         with pytest.raises(ValueError, match="request_batch_max_wait_ms"):
             OmniDiffusionConfig(model="test", request_batch_max_wait_ms=bad_wait)
 
+    @pytest.mark.parametrize("bad_shift", [float("nan"), float("inf"), float("-inf")])
+    def test_config_rejects_nonfinite_flow_shift(self, bad_shift: float) -> None:
+        with pytest.raises(ValueError, match="flow_shift must be finite"):
+            OmniDiffusionConfig(model="test", flow_shift=bad_shift)
+
+    @pytest.mark.parametrize("shift", [None, 3.0, 12.0])
+    def test_config_keeps_finite_flow_shift(self, shift: float | None) -> None:
+        assert OmniDiffusionConfig(model="test", flow_shift=shift).flow_shift == shift
+
     def test_config_normalizes_request_batch_max_wait_ms_to_float(self) -> None:
         config = OmniDiffusionConfig(model="test", request_batch_max_wait_ms=5)
 

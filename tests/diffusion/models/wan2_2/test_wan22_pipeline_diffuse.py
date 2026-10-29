@@ -243,8 +243,9 @@ def test_resolve_wan_flow_shift_rejects_non_finite_request_value(flow_shift: obj
 def test_resolve_wan_flow_shift_rejects_non_finite_config_value() -> None:
     request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={}))
 
-    with pytest.raises(ValueError, match="flow_shift must be finite"):
+    with pytest.raises(ValueError, match="flow_shift must be finite") as exc_info:
         resolve_wan_flow_shift(request, SimpleNamespace(flow_shift=float("nan")))
+    assert not isinstance(exc_info.value, OmniClientError)
 
 
 @pytest.mark.parametrize("bad_shift", ["nan", float("nan"), "inf"])

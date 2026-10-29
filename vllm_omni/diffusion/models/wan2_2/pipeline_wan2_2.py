@@ -155,16 +155,18 @@ def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc")
 def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> float:
     extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
     raw_flow_shift = extra_args.get("flow_shift")
+    # A bad request value is a client error (HTTP 400); a bad server config is not.
+    error_cls = OmniClientError if raw_flow_shift is not None else ValueError
     if raw_flow_shift is None:
         raw_flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
 
     try:
         flow_shift = float(raw_flow_shift)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+        raise error_cls(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
     # NaN would also defeat the scheduler-cache comparison in forward().
     if not math.isfinite(flow_shift):
-        raise OmniClientError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be finite.")
+        raise error_cls(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be finite.")
     return flow_shift
 
 
