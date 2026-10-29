@@ -118,6 +118,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`StabilityAI/Stable-Audio-Open.md`](./StabilityAI/Stable-Audio-Open.md) | Offline + online text-to-audio generation (Stable Audio Open) | 1x RTX 4090 24GB / 1x AMD MI300X |
 | [`Tencent/AuK-H100.md`](./Tencent/AuK-H100.md) | Offline instruction-driven TTS, speech editing, enhancement and separation (AuK base and Flash) | 1x H100 80GB |
 | [`Tencent/Covo-Audio-Chat.md`](./Tencent/Covo-Audio-Chat.md) | Online serving for audio chat | 1x A100 80GB |
+| [`Tencent/Hy-Nomas.md`](./Tencent/Hy-Nomas.md) | Diffusers-format text-to-video, realtime interaction, and multi-turn continuation | 1x or 2x H200 141GB |
 | [`Tencent/HunyuanImage-3.0-Instruct.md`](./Tencent/HunyuanImage-3.0-Instruct.md) | DiT-only text-to-image serving and benchmark, including ModelOpt mixed FP8/NVFP4 | 4x H100/H800 80GB / 2x B200 |
 | [`Tencent/HunyuanVideo-1.5.md`](./Tencent/HunyuanVideo-1.5.md) | Offline text-to-video (HunyuanVideo-1.5 Diffusers) | 1x Intel Arc Pro B70 32GB |
 | [`Tongyi-MAI/Z-Image-Turbo.md`](./Tongyi-MAI/Z-Image-Turbo.md) | Offline few-step text-to-image; online text-to-image and image-editing serving | 1x Intel Arc Pro B70 32GB / 1x RTX 5880 48GB |

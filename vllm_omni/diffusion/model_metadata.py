@@ -42,6 +42,8 @@ BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HyNomasModularPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
     "Sam3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,

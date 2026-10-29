@@ -1,0 +1,14 @@
+# Isolate the reference components' process-global state.
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: HyNomasPipeline
+    default_sampling_params:
+      num_inference_steps: 8
+      guidance_scale: 1.0
+      fps: 24

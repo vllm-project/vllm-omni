@@ -206,6 +206,7 @@ The following tables show which models support each feature:
 | **MiniMax-H3** ([FastH3 single-card guide](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3%20RefOmni%20Single%20Card.md)) | ✅ (FL2VA) | ✅ | ✅ | ❌ | ✅ (DiT/TE) | ❌ | ✅ | ✅ | ✅ (tile) | ✅ (DiT) | ❌ |
 | **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **[Hy-Nomas](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/Hy-Nomas.md)** (Diffusers-format weights) | ❌ | ❌ | ✅ (Ulysses only) | ❌ | ❌ | ❌ | ❌ | ✅ (module only) | ❌ | ❌ | ❌ |
 
 > Notes:
 > 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta

@@ -1,0 +1,33 @@
+# Hy-Nomas streaming on two GPUs through /v1/realtime/video.
+# Session limits reserve exact KV history; admission fails if the budget cannot fit.
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: HyNomasPipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    ulysses_degree: 2
+    sequence_parallel_size: 2
+    custom_pipeline_args:
+      ar_height: 704
+      ar_width: 1280
+      ar_chunk_latent_frames: 16
+      ar_max_latent_frames: 120
+      ar_max_segments: 16
+      ar_session_capacity: 1
+    default_sampling_params:
+      num_inference_steps: 8
+      guidance_scale: 1.0
+      fps: 24
+      output_type: np
+    model_config:
+      ar_diffusion_kv_config:
+        gpu_memory_fraction: 0.02
+        warmup_cudagraph: false
