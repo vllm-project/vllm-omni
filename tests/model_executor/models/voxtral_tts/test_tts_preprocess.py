@@ -56,6 +56,7 @@ def _make_voxtral_tts_model():
     model.model_stage = "audio_generation"
     model.model = FakeAudioGeneration()
     model._audio_token_id = 42
+    model._cudagraph_acoustic_transformer = None
     return model
 
 
@@ -181,7 +182,13 @@ def test_make_omni_output_mrv2_uses_request_slots_and_sampling_cfg():
     input_batch = type(
         "InputBatch",
         (),
-        {"num_reqs": 2, "logits_indices": torch.tensor([2, 0])},
+        {
+            "num_reqs": 2,
+            "logits_indices": torch.tensor([2, 0]),
+            "num_computed_prefill_tokens_np": [20, 20],
+            "num_scheduled_tokens": [1, 1],
+            "prefill_len_np": [20, 20],
+        },
     )()
     hidden_states = torch.zeros((3, 4))
 
@@ -202,6 +209,40 @@ def test_make_omni_output_mrv2_uses_request_slots_and_sampling_cfg():
         request_infos[1]["codes"]["audio_history"][0], torch.full((1, 1, 4), 2.0)
     )
     torch.testing.assert_close(output.text_hidden_states[[2, 0], 0], torch.tensor([0.0, 1.0]))
+
+
+def test_make_omni_output_mrv2_filters_intermediate_prefill_frames_by_request():
+    model = _make_voxtral_tts_model()
+    request_infos = [
+        {"request_id": "req-prefill"},
+        {"request_id": "req-decode"},
+    ]
+    input_batch = type(
+        "InputBatch",
+        (),
+        {
+            "num_reqs": 2,
+            "logits_indices": torch.tensor([2, 0]),
+            "num_computed_prefill_tokens_np": [5, 20],
+            "num_scheduled_tokens": [5, 1],
+            "prefill_len_np": [20, 20],
+        },
+    )()
+
+    output = model.make_omni_output_mrv2(
+        torch.zeros((3, 4)),
+        input_batch=input_batch,
+        req_states=None,
+        model_intermediate_buffer=request_infos,
+    )
+
+    assert "codes" not in request_infos[0]
+    torch.testing.assert_close(
+        request_infos[1]["codes"]["audio_history"][0], torch.full((1, 1, 4), 2.0)
+    )
+    audio_frames = output.multimodal_outputs["codes"]["audio"]
+    assert audio_frames[0] is None
+    torch.testing.assert_close(audio_frames[1], torch.full((1, 1, 4), 2.0))
 
 
 def test_voxtral_pipeline_declares_both_mrv2_stages_native():

@@ -294,7 +294,25 @@ class VoxtralTTSForConditionalGeneration(
             replay_mask = (positions >= prompt_len) & (input_ids == self._audio_token_id)
             if bool(replay_mask.any()):
                 frame_indices = (positions[replay_mask] - prompt_len).tolist()
-                selected_frames = self._select_feedback_frames(audio_history, frame_indices, input_ids.device)
+                history_length = (
+                    len(audio_history)
+                    if isinstance(audio_history, (list, tuple))
+                    else int(audio_history.shape[0])
+                    if isinstance(audio_history, torch.Tensor) and audio_history.ndim > 0
+                    else 0
+                )
+                if (
+                    len(frame_indices) == 1
+                    and frame_indices[0] == history_length - 1
+                    and isinstance(audio_tokens, torch.Tensor)
+                ):
+                    # Live decode normally consumes only the newest frame. Keep it on
+                    # device; older frames are needed only when replaying preempted work.
+                    selected_frames = audio_tokens.to(input_ids.device).reshape(1, -1)
+                else:
+                    selected_frames = self._select_feedback_frames(
+                        audio_history, frame_indices, input_ids.device
+                    )
                 multimodal_embeddings = self.model.embed_multimodal(
                     audio_tokens=selected_frames.unsqueeze(0)
                 )
@@ -347,6 +365,38 @@ class VoxtralTTSForConditionalGeneration(
                 input_embeds[replay_mask] = frame_embeddings
             return input_ids, input_embeds, {}
         return input_ids, input_embeds, {}
+
+    @staticmethod
+    def _filter_ineligible_feedback_outputs(
+        multimodal_outputs: object,
+        request_sample_eligible: list[bool] | tuple[bool, ...] | torch.Tensor | None,
+    ) -> None:
+        if request_sample_eligible is None:
+            return
+        if isinstance(request_sample_eligible, torch.Tensor):
+            request_sample_eligible = request_sample_eligible.tolist()
+        if not isinstance(request_sample_eligible, (list, tuple)):
+            raise TypeError("Voxtral sample eligibility must be a per-request sequence")
+        codes = multimodal_outputs.get("codes") if isinstance(multimodal_outputs, dict) else None
+        if not isinstance(codes, dict):
+            return
+        audio = codes.get("audio")
+        if isinstance(audio, torch.Tensor):
+            frames = [audio] if audio.ndim == 1 else list(audio.unbind(0))
+        elif isinstance(audio, (list, tuple)):
+            frames = list(audio)
+        else:
+            return
+        if len(frames) != len(request_sample_eligible):
+            raise RuntimeError(
+                "Voxtral acoustic output count does not match sample eligibility: "
+                f"frames={len(frames)} eligible={len(request_sample_eligible)}"
+            )
+        if any(not bool(eligible) for eligible in request_sample_eligible):
+            codes["audio"] = [
+                frame if bool(eligible) else None
+                for frame, eligible in zip(frames, request_sample_eligible, strict=True)
+            ]
 
     @staticmethod
     def _store_feedback_frames(
@@ -411,18 +461,19 @@ class VoxtralTTSForConditionalGeneration(
             if isinstance(request_codes, dict):
                 # Keep persistent replay history on CPU. Copy each emitted frame once,
                 # instead of snapshotting the growing history on every preprocess step.
-                detached_frame = frame.detach().to(device="cpu", copy=True).contiguous()
-                request_codes["audio"] = detached_frame
+                latest_frame = frame.detach().clone()
+                history_frame = frame.detach().to(device="cpu", copy=True).contiguous()
+                request_codes["audio"] = latest_frame
                 history = request_codes.setdefault("audio_history", [])
                 if isinstance(history, list):
-                    history.append(detached_frame)
+                    history.append(history_frame)
                 elif isinstance(history, torch.Tensor):
                     # Resumed requests normally restore a list; tolerate an
                     # older serialized runner payload that restored a tensor.
                     history_cpu = history.detach().to(device="cpu", copy=True).contiguous()
-                    request_codes["audio_history"] = [*history_cpu.unbind(0), detached_frame]
+                    request_codes["audio_history"] = [*history_cpu.unbind(0), history_frame]
                 else:
-                    request_codes["audio_history"] = [detached_frame]
+                    request_codes["audio_history"] = [history_frame]
 
     def _cfg_alpha_from_request_infos(
         self,
@@ -550,9 +601,9 @@ class VoxtralTTSForConditionalGeneration(
                 request_infos = kwargs.get("runtime_additional_information")
                 if request_infos is None:
                     request_infos = kwargs.get("model_intermediate_buffer")
-                self._store_feedback_frames(
-                    multimodal_outputs, request_infos, kwargs.get("request_sample_eligible")
-                )
+                sample_eligible = kwargs.get("request_sample_eligible")
+                self._filter_ineligible_feedback_outputs(multimodal_outputs, sample_eligible)
+                self._store_feedback_frames(multimodal_outputs, request_infos, sample_eligible)
                 return OmniOutput(
                     text_hidden_states=hidden_states,
                     multimodal_outputs=multimodal_outputs,
@@ -602,6 +653,7 @@ class VoxtralTTSForConditionalGeneration(
                 num_computed_prefill, num_scheduled_tokens, prefill_lens, strict=True
             )
         ]
+        self._filter_ineligible_feedback_outputs(multimodal_outputs, request_sample_eligible)
         self._store_feedback_frames(
             multimodal_outputs, model_intermediate_buffer, request_sample_eligible
         )
