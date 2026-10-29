@@ -57,6 +57,7 @@ x-fish-speech: &fish_speech
   - vllm_omni/entrypoints/omni_base.py
   - vllm_omni/worker/gpu_model_runner.py
   - vllm_omni/model_executor/models/fish_speech/
+  - vllm_omni/model_executor/stage_input_processors/fish_speech.py
   - vllm_omni/transformers_utils/configs/fish_speech.py
   - vllm_omni/entrypoints/openai/serving_speech.py
   - vllm_omni/entrypoints/openai/tts_adapters/fish_speech.py
