@@ -1081,6 +1081,10 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
         # stage config, and baking a resolved default here would freeze it, so a
         # later change to the default could not reach deploy-config stages. The
         # runtime ``OmniDiffusionConfig`` resolves the unset value instead.
+        #
+        # Legacy imported AR KV (``omni_kv_config['need_recv_cache']``) is not a
+        # field of this projection, so that combination is only rejected when
+        # the runtime config is built. Everything else above is validated here.
         if self.enable_prefix_caching and not kv_resolution.is_paged:
             raise ValueError(
                 "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
@@ -1129,17 +1133,11 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     def _explicit_attention_backend(self) -> str | None:
         """Return the explicitly selected diffusion attention backend, if any."""
 
-        attention_config = self.diffusion_attention_config
-        if isinstance(attention_config, Mapping):
-            # The runtime config may still hold the raw mapping here: it is
-            # normalised into AttentionConfig later in __post_init__.
-            default_spec = attention_config.get("default")
-        else:
-            default_spec = getattr(attention_config, "default", None)
-        if isinstance(default_spec, Mapping):
-            backend = default_spec.get("backend")
-        else:
-            backend = getattr(default_spec, "backend", None)
+        # Both config classes normalize ``diffusion_attention_config`` before
+        # resolving the KV mode, so the effective backend (including the
+        # DIFFUSION_ATTENTION_BACKEND fallback) is readable here.
+        default_spec = getattr(self.diffusion_attention_config, "default", None)
+        backend = getattr(default_spec, "backend", None)
         if backend is None:
             return None
         if isinstance(backend, str):
