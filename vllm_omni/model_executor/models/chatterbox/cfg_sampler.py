@@ -27,7 +27,11 @@ class ChatterboxCFGSampler:
     A conditional request with zero weight needs no companion. Synthetic
     MRv2 warmup rows bypass pairing and still receive the speech token mask.
     A negative-infinity restriction from V1 logit bias on either row, such as
-    a min_tokens or allowed_token_ids mask, bans that id from the blend.
+    a min_tokens or allowed_token_ids mask, bans that id from the blend. The
+    companion's sampling parameters are a clone of the conditional request's
+    with only ``extra_args`` replaced (``ExpandedPrompt.apply_overrides``), so
+    both rows carry the same restrictions and the blend bans no id that
+    sampling the conditional row alone would allow.
     The stage that owns the registry registers and releases its pairs.
     """
 
