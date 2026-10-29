@@ -169,8 +169,10 @@ frames are not observation messages.
   observation and seed. If omitted, the stage's deploy
   `default_sampling_params.seed` applies; without one, the engine assigns a
   random per-request seed. The FastWAM deploy configs set `seed: 42` (the
-  reference LIBERO evaluator's seed), so unseeded FastWAM requests are
-  deterministic. The API layer
+  reference LIBERO evaluator's seed), so unseeded FastWAM requests use the
+  same noise. "Same chunk" holds up to run-to-run GPU kernel variation (for
+  FastWAM on ROCm, one non-deterministic convolution in the Wan VAE encoder;
+  bitwise with `torch.use_deterministic_algorithms(True)`). The API layer
   consumes `seed`; it is not forwarded inside the observation.
 
 ## Limits and Errors

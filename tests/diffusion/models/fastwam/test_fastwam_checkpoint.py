@@ -10,6 +10,7 @@ observation against the original implementation's chunk (see
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import numpy as np
@@ -64,9 +65,30 @@ def test_chunk_matches_reference(policy):
     np.testing.assert_array_equal(rows[:, 6], ref.REFERENCE_CHUNK_ROWS[:, 6])
 
 
+@contextlib.contextmanager
+def _deterministic_kernels():
+    """Bitwise-repeatable kernels for the duration of the block. By default one
+    convolution of the Wan VAE encoder is not run-to-run deterministic on ROCm
+    (MIOpen), so two calls with the same seed can differ by a few 1e-2."""
+    previous = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+    )
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
+        torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = previous[2], previous[3]
+
+
 @hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_seed_determinism_and_suite_conditioning(policy):
-    first = _infer(policy, 3)
-    np.testing.assert_array_equal(first, _infer(policy, 3))
+    with _deterministic_kernels():
+        first = _infer(policy, 3)
+        np.testing.assert_array_equal(first, _infer(policy, 3))
     assert not np.allclose(first, _infer(policy, 4))
     assert not np.allclose(first, _infer(policy, 3, task_suite="libero_goal"))

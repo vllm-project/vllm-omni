@@ -34,13 +34,13 @@ validated variant. The original FastWAM LIBERO checkpoint (`yuanty/fastwam`,
 | --- | --- |
 | Inputs | `observation/image` and `observation/wrist_image`: uint8 `HxWx3`, upright (the OpenPI LIBERO client rotates LIBERO frames by 180°); `observation/state`: 8 floats (eef position, eef axis-angle, gripper qpos); `prompt`: task instruction |
 | Suite | `task_suite` (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`) selects the suite's normalisation statistics and action-codec embedding. Required on every request unless `model_config.task_suite` in the deploy config pins one suite (needed for the stock OpenPI LIBERO client, which does not send it); requests without either are rejected |
-| Optional inputs | `seed` (deploy default 42, so unseeded requests are deterministic); `sampling_params.num_inference_steps` |
+| Optional inputs | `seed` (deploy default 42, so unseeded requests use the same noise); `sampling_params.num_inference_steps` |
 | Image processing | Each camera scaled to cover 224x224 (bilinear) and centre-cropped; cameras concatenated side by side |
 | Output | float32 `[32, 7]`, de-normalised; gripper binarised to LIBERO's convention (+1 close, -1 open) |
 | Steps | 10 by default (CAE-FastWAM was also published at 4) |
 | Batch | One observation per request (`max_num_seqs: 1`) |
 | State | None across requests; `session_id` and `reset` are accepted and ignored |
-| Determinism | The request seed seeds a CPU generator for the initial noise, as the reference evaluator does (deploy default `seed: 42`) |
+| Determinism | The request seed seeds a CPU generator for the initial noise, as the reference evaluator does (deploy default `seed: 42`). On MI355X, one convolution of the Wan VAE encoder (MIOpen) is not run-to-run deterministic by default, in the reference implementation as well; repeated chunks for the same seed differ by up to about 4e-2 (normalised) / 3e-2 (env units). With `torch.use_deterministic_algorithms(True)` they are bitwise repeatable |
 
 | Profile | Deploy config | Status |
 | --- | --- | --- |

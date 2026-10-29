@@ -11,9 +11,13 @@ pipeline predicts one action chunk per request, and returns it as a float32
 FastWAM keeps no state between requests, so ``reset`` and ``session_id`` are
 accepted and ignored. The request ``seed`` seeds a CPU generator for the initial
 action noise, as the reference evaluator does, so the same seed and observation
-give the same chunk on any device. Unseeded OpenPI requests get the deploy
+draw the same noise on any device. Unseeded OpenPI requests get the deploy
 config's ``default_sampling_params.seed`` (42 in the FastWAM deploy configs, the
-reference evaluator's seed), so they are deterministic too.
+reference evaluator's seed). The chunk is repeatable up to run-to-run GPU kernel
+variation: on ROCm one convolution of the Wan VAE encoder is not deterministic by
+default (the reference implementation behaves the same way), so repeated chunks
+can differ by a few 1e-2. With ``torch.use_deterministic_algorithms(True)`` they
+are bitwise repeatable.
 """
 
 from __future__ import annotations

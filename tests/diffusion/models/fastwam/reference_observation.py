@@ -27,7 +27,9 @@ REFERENCE_CHUNK_ROWS = np.array([
     [-0.0604248009622097, -0.2508544921875, -0.3369140326976776, -0.004754453431814909, -0.017469095066189766, -0.0061376988887786865, -1.0],  # noqa: E501
 ], dtype=np.float32)
 # fmt: on
-# TODO(validation): confirm on MI355X / H100 once the GPU parity run is done.
+# MI355X (2026-10-29): the reference implementation itself lands up to 1.2e-2
+# (eager) / 1.7e-2 (GEAK kernels) from these CPU rows, the port up to 1.2e-2
+# (eager) / 1.6e-2 (regional compile), so 2e-2 covers bfloat16 GPU rounding.
 GPU_ATOL = 2e-2
 
 

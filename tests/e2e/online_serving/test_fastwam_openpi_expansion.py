@@ -46,6 +46,14 @@ def _session(openai_client, observation: dict) -> OpenPIWebSocketResponse:
     )[0]
 
 
+def _chunk(response: OpenPIWebSocketResponse) -> np.ndarray:
+    # FastWAM replies with a bare [32, 7] array (not a dict of action groups),
+    # which the helper collects in ``action_tensors``.
+    assert response.actions is None
+    assert response.action_tensors is not None and len(response.action_tensors) == 1
+    return response.action_tensors[0]
+
+
 @pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"rocm": "MI325"}, num_cards=1)
@@ -57,8 +65,7 @@ def test_cae_fastwam_openpi_online(omni_server, openai_client) -> None:
     assert metadata["needs_wrist_camera"] is True and metadata["needs_session_id"] is False
     assert list(metadata["image_resolution"]) == [224, 224]
 
-    actions = response.actions
-    assert isinstance(actions, np.ndarray)
+    actions = _chunk(response)
     assert actions.shape == (32, 7) and actions.dtype == np.float32
     assert np.isfinite(actions).all()
     assert set(np.unique(actions[:, -1])) <= {-1.0, 1.0}  # binarised LIBERO gripper
@@ -70,8 +77,7 @@ def test_cae_fastwam_openpi_online(omni_server, openai_client) -> None:
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_cae_fastwam_openpi_precision(omni_server, openai_client) -> None:
     """Actions match the original CAE-FastWAM eager path (request seed=42)."""
-    actions = _session(openai_client, ref.build_libero_reference_observation(seed=ref.SEED)).actions
-    assert actions is not None
+    actions = _chunk(_session(openai_client, ref.build_libero_reference_observation(seed=ref.SEED)))
     rows = actions[list(ref.REFERENCE_ROWS)]
     np.testing.assert_allclose(
         rows[:, :6],
