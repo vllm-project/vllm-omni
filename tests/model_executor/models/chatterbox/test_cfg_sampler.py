@@ -206,3 +206,24 @@ def test_an_id_restricted_on_one_row_is_banned_from_the_blend(v1_sampler: Sample
     assert not torch.isnan(guided).any() and not torch.isposinf(guided).any()
     assert torch.isneginf(guided[:, 7]).all()
     assert output.sampled_token_ids.tolist() == [[0], [0]]
+
+
+def test_a_pair_restricted_to_a_few_ids_keeps_them_sampleable(v1_sampler: Sampler) -> None:
+    """allowed_token_ids masks every other id on both rows; the blend leaves the allowed ones finite.
+
+    The companion's parameters are a clone of the conditional request's, so
+    the rows carry the same mask and the union bans nothing more than either.
+    """
+    allowed = [5, 9]
+    registry = {"c": ("pair", "cond", 0.5), "u": ("pair", "uncond", 0.5)}
+    sampler = ChatterboxCFGSampler(v1_sampler, registry)
+    logits = torch.full((2, STOP_SPEECH_TOKEN + 3), -torch.inf)
+    logits[:, allowed] = torch.tensor([[1.0, 3.0], [2.0, 0.0]])
+
+    guided, _ = sampler.prepare_logits(logits, ["c", "u"])
+    output = sampler.sample(logits, sampling_metadata(2), [{"chatterbox_cfg": registry[rid]} for rid in ["c", "u"]])
+
+    assert torch.isfinite(guided[:, allowed]).all()
+    assert torch.isfinite(guided).sum(dim=1).tolist() == [len(allowed)] * 2
+    # 1 + 0.5 * (1 - 2) = 0.5 against 3 + 0.5 * (3 - 0) = 4.5.
+    assert output.sampled_token_ids.tolist() == [[9], [9]]

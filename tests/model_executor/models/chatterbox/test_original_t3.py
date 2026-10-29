@@ -148,7 +148,8 @@ def test_only_a_guided_original_prompt_is_expanded_with_an_unconditional_compani
     info = prompt["additional_information"]
     assert info["chatterbox"] == {"cfg_weight": weight, "exaggeration": 0.7}
     info["global_request_id"] = ["external-request"]
-    params = SamplingParams(max_tokens=1000)
+    # Restrictions that become -inf logits; the guidance blend relies on both rows carrying the same ones.
+    params = SamplingParams(max_tokens=1000, min_tokens=5, allowed_token_ids=[1, 2, 3], logit_bias={2: 1.0})
     prepare_original_prompt(prompt, [params])
     expanded = expand_original_cfg_prompts(prompt, params)
     if weight == 0:
@@ -161,6 +162,13 @@ def test_only_a_guided_original_prompt_is_expanded_with_an_unconditional_compani
         pair_key, role, cfg_weight = params.extra_args["chatterbox_cfg"]
         assert (pair_key, role, cfg_weight) == ("external-request", "cond", weight)
         assert companion_params.extra_args["chatterbox_cfg"] == (pair_key, "uncond", weight)
+        # The companion differs from the conditional request in extra_args alone.
+        differing = [
+            field
+            for field in SamplingParams.__struct_fields__
+            if getattr(companion_params, field) != getattr(params, field)
+        ]
+        assert differing == ["extra_args"]
         assert expanded[0].request_id_suffix == "__cfg_uncond"
         companion = expanded[0].prompt
         assert companion["prompt_token_ids"] == prompt["prompt_token_ids"]
