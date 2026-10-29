@@ -55,7 +55,7 @@ class PRoPECameras:
         inverse_focal[:, 1, 1] = 1.0 / focal[:, 1, 1]
         inverse_focal[:, 2, 2] = 1.0
         projection = torch.einsum("...ij,...jk->...ik", _lift(focal), viewmats)
-        inverse = torch.einsum("...ij,...jk->...ik", _invert_rigid(viewmats), _lift(inverse_focal))
+        inverse = torch.einsum("...ij,...jk->...ik", invert_rigid(viewmats), _lift(inverse_focal))
         return cls(query=projection.transpose(-1, -2), key=inverse, output=projection)
 
     def __len__(self) -> int:
@@ -96,7 +96,8 @@ def _lift(matrices: torch.Tensor) -> torch.Tensor:
     return lifted
 
 
-def _invert_rigid(transforms: torch.Tensor) -> torch.Tensor:
+def invert_rigid(transforms: torch.Tensor) -> torch.Tensor:
+    """Invert ``[..., 4, 4]`` rigid transforms in closed form; the rotation block must be orthonormal."""
     rotation_inverse = transforms[..., :3, :3].transpose(-1, -2)
     inverse = torch.zeros_like(transforms)
     inverse[..., :3, :3] = rotation_inverse

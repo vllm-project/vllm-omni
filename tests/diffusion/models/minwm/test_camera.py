@@ -7,6 +7,7 @@ import pytest
 
 from vllm_omni.diffusion.models.minwm import camera
 from vllm_omni.diffusion.models.minwm.camera import trajectory_cameras, trajectory_viewmats
+from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -48,7 +49,7 @@ def test_cameras_carry_one_normalized_intrinsic_per_frame() -> None:
 
 @pytest.mark.parametrize(("trajectory", "message"), [("w*2,x*1", "Unknown trajectory direction"), ("w2", "segment")])
 def test_malformed_trajectories_are_rejected(trajectory: str, message: str) -> None:
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(OmniClientError, match=message):
         trajectory_viewmats(trajectory, num_latent_frames=3)
 
 
@@ -61,6 +62,6 @@ def test_step_counts_past_the_requested_frames_are_rejected_before_a_pose_is_bui
     def unreachable(*args: object, **kwargs: object) -> None:
         raise AssertionError("poses were built before the step count was validated")
 
-    monkeypatch.setattr(camera, "_invert_rigid", unreachable)
+    monkeypatch.setattr(camera, "invert_rigid", unreachable)
     with pytest.raises(ValueError, match="latent frames"):
         trajectory_viewmats(trajectory, num_latent_frames=20)
