@@ -1090,7 +1090,7 @@ async def _parse_video_form(
     guidance_scale: float | None = Form(default=None),
     guidance_scale_2: float | None = Form(default=None),
     boundary_ratio: float | None = Form(default=None),
-    flow_shift: float | None = Form(default=None),
+    flow_shift: float | None = Form(default=None, allow_inf_nan=False),
     true_cfg_scale: float | None = Form(default=None),
     seed: int | None = Form(default=None),
     generate_sound: bool | None = Form(default=None),

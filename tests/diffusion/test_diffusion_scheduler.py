@@ -437,6 +437,15 @@ class TestGetRequestBatchSamplingParamsKey:
 
         assert scheduler.num_waiting_requests() == 0
 
+    def test_rejects_non_numeric_flow_shift_as_client_error(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(request_batch_max_wait_ms=0.0))
+
+        with pytest.raises(OmniClientError, match="flow_shift must be a float"):
+            scheduler.add_request(self._make(extra_args={"flow_shift": "abc"}))
+
+        assert scheduler.num_waiting_requests() == 0
+
     def test_distinguishes_pipeline_condition_structure(self) -> None:
         scheduler = RequestScheduler()
 

@@ -39,7 +39,10 @@ def _normalize_explicit_flow_shift(value: float | str | None) -> float | None:
     """Normalize an explicitly provided flow shift without selecting a default."""
     if value is None:
         return None
-    flow_shift = float(value)
+    try:
+        flow_shift = float(value)
+    except (TypeError, ValueError) as exc:
+        raise OmniClientError(f"Invalid flow_shift={value!r}. flow_shift must be a float.") from exc
     if not math.isfinite(flow_shift):
         raise OmniClientError(f"Invalid flow_shift={value!r}. flow_shift must be finite.")
     return flow_shift
