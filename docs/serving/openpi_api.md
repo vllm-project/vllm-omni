@@ -89,6 +89,39 @@ python examples/online_serving/dreamzero/openpi_client.py \
   --video-dir outputs/dreamzero/assets
 ```
 
+## FastWAM Quick Start
+
+Serve CAE-FastWAM for LIBERO (one GPU, bfloat16):
+
+```bash
+vllm serve amd/CAE-FastWAM --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/cae_fastwam_libero.yaml
+```
+
+The handshake advertises two 224x224 cameras and a `[32, 7]` action chunk.
+Observations use the OpenPI LIBERO client keys, plus an optional `task_suite`
+that selects CAE-FastWAM's per-suite statistics:
+
+```python
+import numpy as np
+from openpi_client import websocket_client_policy
+
+policy = websocket_client_policy.WebsocketClientPolicy(
+    host="ws://127.0.0.1:8091/v1/realtime/robot/openpi"
+)
+actions = policy.infer({
+    "observation/image": agentview,          # uint8 HxWx3, rotated upright
+    "observation/wrist_image": wrist,        # uint8 HxWx3, rotated upright
+    "observation/state": state,              # float32 [8]: eef pos, axis-angle, gripper qpos
+    "prompt": "put the bowl on the plate",
+    "task_suite": "libero_goal",             # optional; deploy default otherwise
+    "seed": 42,                              # optional
+})  # float32 [32, 7]; LIBERO gripper convention (+1 close, -1 open)
+```
+
+See the [CAE-FastWAM recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/AMD/CAE-FastWAM-MI355X.md)
+for the full contract.
+
 ## Protocol
 
 The connection is request-response after an initial server handshake:
@@ -128,7 +161,7 @@ frames are not observation messages.
   dictionary.
 - An optional integer `seed` in an inference message becomes the engine
   request's `sampling_params.seed`. A policy whose sampling consumes the
-  request generator (GR00T-N1.7) returns the same action chunk for the same
+  request generator or seed (GR00T-N1.7, FastWAM) returns the same action chunk for the same
   observation and seed. If omitted, the engine assigns a random per-request
   seed, so unseeded inferences are independent of each other. The API layer
   consumes `seed`; it is not forwarded inside the observation.
