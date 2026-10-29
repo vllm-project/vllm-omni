@@ -7,8 +7,6 @@ Owns FastAPI app **and** router mutation used during server construction.
 route-table helpers itself.
 """
 
-from collections.abc import Set
-
 from fastapi import APIRouter, FastAPI
 from starlette.routing import Route
 
@@ -16,7 +14,7 @@ from starlette.routing import Route
 def remove_route_from_app(
     app: FastAPI,
     path: str,
-    methods: Set[str],
+    methods: set[str],
 ) -> None:
     """Remove app routes matching a path and one of the given HTTP methods."""
     routes_to_remove = [

@@ -19,7 +19,6 @@
 import math
 from collections.abc import Callable
 from functools import wraps
-from typing import Optional
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import is_torch_available, logging
@@ -95,7 +94,7 @@ def dynamic_rope_update(rope_forward: Callable) -> Callable:
 
 def _compute_default_rope_parameters(
     config: PretrainedConfig | None = None,
-    device: Optional["torch.device"] = None,
+    device: "torch.device" | None = None,
     seq_len: int | None = None,
     **rope_kwargs,
 ) -> tuple["torch.Tensor", float]:
@@ -137,7 +136,7 @@ def _compute_default_rope_parameters(
 
 def _compute_linear_scaling_rope_parameters(
     config: PretrainedConfig | None = None,
-    device: Optional["torch.device"] = None,
+    device: "torch.device" | None = None,
     seq_len: int | None = None,
     **rope_kwargs,
 ) -> tuple["torch.Tensor", float]:
@@ -178,7 +177,7 @@ def _compute_linear_scaling_rope_parameters(
 
 def _compute_dynamic_ntk_parameters(
     config: PretrainedConfig | None = None,
-    device: Optional["torch.device"] = None,
+    device: "torch.device" | None = None,
     seq_len: int | None = None,
     **rope_kwargs,
 ) -> tuple["torch.Tensor", float]:
