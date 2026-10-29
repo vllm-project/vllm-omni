@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from vllm_omni.diffusion.attention.schedule import (
@@ -51,6 +52,22 @@ def test_adjacent_half_open_windows_and_terminal_one():
 def test_invalid_window_bounds(low, high):
     with pytest.raises((ValueError, TypeError)):
         parse_attention_sigma_schedule([{"low": low, "high": high, "profile": "p"}])
+
+
+@pytest.mark.parametrize("real", [np.float32, np.float64])
+def test_numpy_window_bounds_are_accepted_as_floats(real):
+    """Offline callers may pass numpy scalars; they are stored as float, so batch keys match parsed JSON."""
+    (window,) = parse_attention_sigma_schedule([{"low": real(0.25), "high": real(1.0), "profile": "p"}])
+    assert type(window.low) is float and type(window.high) is float
+    assert (window.low, window.high) == (0.25, 1.0)
+    assert window == parse_attention_sigma_schedule([{"low": 0.25, "high": 1.0, "profile": "p"}])[0]
+    assert select_attention_profile_by_sigma((window,), 1.0) == "p"
+
+
+@pytest.mark.parametrize("low", [np.float32("nan"), np.float64(-0.5), np.bool_(False)])
+def test_invalid_numpy_window_bounds(low):
+    with pytest.raises((ValueError, TypeError)):
+        parse_attention_sigma_schedule([{"low": low, "high": 1.0, "profile": "p"}])
 
 
 @pytest.mark.parametrize(
