@@ -23,9 +23,11 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Protocol
 
+import anyio
 import msgpack
 import msgspec
 import uvloop
+from anyio.abc import TaskGroup
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -232,8 +234,6 @@ async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any]
         reader, writer = await asyncio.open_connection(sock=sock)
         channel = _MessageSocket(reader, writer)
         await _DuplexProcessWorker(runtime, channel).run()
-    except (EOFError, asyncio.IncompleteReadError, ConnectionError):
-        pass  # Frontend disconnected; finally owns stage cleanup.
     except Exception:
         logger.exception("Duplex engine process failed")
         if not ready:
@@ -271,36 +271,15 @@ class _DuplexProcessWorker:
         self.runtime, self.engine, self.channel = runtime, runtime.engine, channel
         self.loop = asyncio.get_running_loop()
         self.buffers: dict[str, DuplexOutputBuffer] = {}
-        self.tasks: set[asyncio.Task[Any]] = set()
-        self.fatal: asyncio.Future[None] = self.loop.create_future()
+        self.tasks: TaskGroup
 
     async def run(self) -> None:
-        self.track(self.channel.write())
-        self.track(self.pump_engine())
-        requests = self.track(self.read_requests())
-        try:
-            done, _ = await asyncio.wait((requests, self.fatal), return_when=asyncio.FIRST_COMPLETED)
-            await asyncio.gather(*done)
-        finally:
-            self.fatal.cancel()
-            pending = list(self.tasks)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-
-    def track(self, coro: Any) -> asyncio.Task[Any]:
-        task = asyncio.create_task(coro)
-        self.tasks.add(task)
-
-        def done(completed: asyncio.Task[Any]) -> None:
-            self.tasks.discard(completed)
-            if not completed.cancelled():
-                exc = completed.exception()
-                if exc is not None and not self.fatal.done():
-                    self.fatal.set_exception(exc)
-
-        task.add_done_callback(done)
-        return task
+        async with anyio.create_task_group() as self.tasks:
+            self.tasks.start_soon(self.read_requests)
+            self.tasks.start_soon(self.pump_engine)
+            with suppress(ConnectionError):
+                await self.channel.write()
+            self.tasks.cancel_scope.cancel()
 
     def notify_invalidation(self, session_id: str, response_id: str, through_epoch: int) -> None:
         entry = self.channel.entry(("invalidate", session_id, response_id, through_epoch))
@@ -311,8 +290,8 @@ class _DuplexProcessWorker:
             except DuplexSessionError:
                 return  # The channel closed before this callback ran.
             except asyncio.QueueFull:
-                if not self.fatal.done():
-                    self.fatal.set_exception(RuntimeError("Duplex IPC invalidation queue overflow"))
+                logger.error("Duplex IPC invalidation queue overflow")
+                self.channel.close("Duplex IPC invalidation queue overflow")
 
         self.loop.call_soon_threadsafe(enqueue)
 
@@ -347,7 +326,7 @@ class _DuplexProcessWorker:
                     self.engine.duplex_session_config, partial(self.notify_invalidation, session_id)
                 )
                 self.buffers[session_id] = buffer
-                self.track(self.pump_session(session_id, buffer))
+                self.tasks.start_soon(self.pump_session, session_id, buffer)
                 try:
                     result = await self.engine.open_session_async(*args, output_buffer=buffer, **kwargs)
                 except BaseException:
@@ -363,21 +342,23 @@ class _DuplexProcessWorker:
             await self.channel.send(("result", request_id, False, _error(exc)))
 
     async def read_requests(self) -> None:
-        while True:
-            request_id, operation, args, kwargs = await self.channel.receive()
-            if operation == "shutdown":
-                return
-            if operation == "submit_command_async":
-                session_id, name, data = args
-                command: commands.DuplexCommand = msgspec.convert(data, type=_COMMAND_TYPES[name])
-                try:
-                    await self.engine.submit_command_async(session_id, command)
-                except Exception as exc:
-                    await self.send_event(session_id, error_event(getattr(exc, "code", "engine_error"), str(exc)))
-            elif operation in _CONTROLS or operation == "check_health":
-                self.track(self.control(request_id, operation, args, kwargs))
-            else:
-                raise ValueError(f"Unsupported duplex IPC operation: {operation}")
+        with suppress(EOFError, ConnectionError):
+            while True:
+                request_id, operation, args, kwargs = await self.channel.receive()
+                if operation == "shutdown":
+                    break
+                if operation == "submit_command_async":
+                    session_id, name, data = args
+                    command: commands.DuplexCommand = msgspec.convert(data, type=_COMMAND_TYPES[name])
+                    try:
+                        await self.engine.submit_command_async(session_id, command)
+                    except Exception as exc:
+                        await self.send_event(session_id, error_event(getattr(exc, "code", "engine_error"), str(exc)))
+                elif operation in _CONTROLS or operation == "check_health":
+                    self.tasks.start_soon(self.control, request_id, operation, args, kwargs)
+                else:
+                    raise ValueError(f"Unsupported duplex IPC operation: {operation}")
+        self.tasks.cancel_scope.cancel()
 
 
 class ProcessDuplexEngineClient:

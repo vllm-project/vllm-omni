@@ -25,6 +25,7 @@ from vllm_omni.engine.duplex.process_engine import (
     _QUEUE_BYTES,
     ProcessDuplexEngineClient,
     ProcessDuplexStageMetadata,
+    _DuplexProcessWorker,
     _MessageSocket,
 )
 
@@ -85,6 +86,8 @@ class FakeEngine:
             buffer.put(AudioDelta(session_id=session_id, response_id="r", epoch=1, delta="ZnJlc2g="))
         elif isinstance(command, AppendText) and command.text == "crash":
             os._exit(17)
+        elif isinstance(command, AppendText) and command.text == "bad_output":
+            self.output.put_nowait("unexpected engine output")
         elif isinstance(command, AppendText) and command.text == "reject":
             raise DuplexSessionError("queue full", code="engine_backpressure", retryable=True)
 
@@ -116,13 +119,16 @@ class FakeRuntime:
     engine: FakeEngine
     process_warmup_audio: dict[str, object]
     health_error: bool = False
+    shutdown_path: str | None = None
 
     async def check_health(self):
         if self.health_error:
             raise EngineDeadError("Stage-2 has no live replica")
 
     def shutdown(self):
-        pass
+        if self.shutdown_path is not None:
+            with open(self.shutdown_path, "w") as marker:
+                marker.write("closed")
 
 
 def fake_factory(model, options):
@@ -131,6 +137,7 @@ def fake_factory(model, options):
         FakeEngine(options.get("small_buffers", False)),
         {"audio": "AAAAAA==", "format": "pcm_f32le", "sample_rate_hz": 24000},
         health_error=options.get("health_error", False),
+        shutdown_path=options.get("shutdown_path"),
     )
 
 
@@ -296,6 +303,13 @@ def test_spawned_client_streams_audio_controls_and_invalidations():
             assert client.metadata.warmup_audio["sample_rate_hz"] == 24000
             assert client.duplex_capabilities.supports_chat_completions  # Model facts are unchanged.
             await client.check_health_async()
+            rejected = DuplexOutputBuffer(max_bytes=1024, max_events=8)
+            with pytest.raises(DuplexSessionError) as failed:
+                await client.open_session_async(
+                    "rejected", DuplexSessionConfig(extra_body={"reject": True}), output_buffer=rejected
+                )
+            assert failed.value.code == "capacity"
+            assert "rejected" not in client._buffers
             buffer = DuplexOutputBuffer(max_bytes=1024 * 1024, max_events=512)
             result = await client.open_session_async("s", DuplexSessionConfig(), output_buffer=buffer)
             assert result.public_session["worker_pid"] != os.getpid()
@@ -331,22 +345,63 @@ def test_spawned_client_streams_audio_controls_and_invalidations():
     asyncio.run(run())
 
 
-def test_child_death_wakes_pending_controls_and_buffers():
+@pytest.mark.parametrize("failure", ["crash", "bad_output"])
+def test_child_death_wakes_pending_controls_and_buffers(tmp_path, failure):
     async def run():
-        client = make_client()
+        marker = tmp_path / "shutdown"
+        client = make_client(shutdown_path=str(marker))
         try:
             buffer = DuplexOutputBuffer(max_bytes=1024, max_events=8)
             await client.open_session_async("s", DuplexSessionConfig(), output_buffer=buffer)
             await buffer.get()
             pending = asyncio.create_task(client.touch_session_async("s", activity="hang"))
             await asyncio.sleep(0.05)
-            await client.submit_command_async("s", AppendText(text="crash"))
+            await client.submit_command_async("s", AppendText(text=failure))
             assert await asyncio.wait_for(buffer.get(), 5) is None
             with pytest.raises(DuplexSessionError) as failed:
                 await asyncio.wait_for(pending, 5)
             assert failed.value.code == "engine_dead"
         finally:
             client.shutdown()
+        if failure == "bad_output":
+            assert marker.read_text() == "closed"
+            assert client._process.exitcode == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["eof", "writer", "invalidation"])
+def test_worker_stops_all_tasks_on_disconnect_or_overflow(monkeypatch, failure):
+    async def run():
+        monkeypatch.setattr("vllm_omni.engine.duplex.process_engine._QUEUE_SIZE", 1)
+        reader = asyncio.StreamReader()
+        writer = Mock(drain=AsyncMock(), close=Mock(side_effect=reader.feed_eof))
+        channel = _MessageSocket(reader, writer)
+        worker = _DuplexProcessWorker(fake_factory("fake", {}), channel)
+        log = Mock()
+        monkeypatch.setattr("vllm_omni.engine.duplex.process_engine.logger.error", log)
+        if failure == "eof":
+            reader.feed_eof()
+        elif failure == "writer":
+            monkeypatch.setattr(channel, "write", AsyncMock(side_effect=BrokenPipeError))
+        else:
+            # Hold the writer stalled so the queue stays full while the event
+            # loop delivers an orchestrator-thread invalidation.
+            monkeypatch.setattr(channel, "write", asyncio.Event().wait)
+            await channel.send(("queued",))
+            worker.notify_invalidation("s", "r", 0)
+        tasks_before = asyncio.all_tasks()
+        try:
+            await asyncio.wait_for(worker.run(), 1)
+            assert asyncio.all_tasks() == tasks_before
+            assert not worker.buffers
+            if failure == "invalidation":
+                log.assert_called_once_with("Duplex IPC invalidation queue overflow")
+                writer.close.assert_called()
+            else:
+                log.assert_not_called()
+        finally:
+            channel.close()
 
     asyncio.run(run())
 
