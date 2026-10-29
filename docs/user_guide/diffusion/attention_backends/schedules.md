@@ -170,9 +170,13 @@ these errors on the job record rather than the creation response.
   `[]`; the op picks the profile when it runs, so the block stays one graph.
   The op carries `attn_mask`, a `video_layout` without video spans and `extra`
   entries holding None, bools, ints or int tuples (a video grid). Other metadata
-  (tensors, floats or strings in `extra`, joint tensors, video spans), HSDP
-  and autograd keep an eager boundary that splits the block around attention.
-  Different candidate output layouts may trigger recompilation.
+  (tensors, floats or strings in `extra`, video spans, and any other metadata
+  field off its default, such as joint tensors, `full_attn_spans`, query
+  ranges, packed padding or cross-attention masks), HSDP, scheduler-managed
+  paged KV and autograd keep an eager boundary that splits the block around
+  attention. Different candidate output layouts may trigger recompilation.
+  HunyuanImage-3.0 has no repeated blocks, so regional compilation skips it
+  and it runs eager; its image attention also sends `full_attn_spans`.
 - H3 rejects non-empty schedules with request-scoped Cache-DiT (`quality=high`)
   or `latent_refine`. Disable the schedule or the conflicting option.
   Step mode rejects these H3 options regardless of schedule. Non-empty
