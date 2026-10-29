@@ -3686,7 +3686,12 @@ class MiniMaxH3Pipeline(
         attentions = [module for module in transformer.modules() if isinstance(module, MiniMaxH3Attention)]
         if not attentions:
             return False
-        return all(_attention_isolates_packed_requests(module.attention) for module in attentions)
+        # Each layer is checked against the backend it runs under the published progress: inside a
+        # scheduled step that is the step's candidate, otherwise the baseline.
+        return all(
+            _attention_isolates_packed_requests(module.attention, module.attention.effective_attention()[1])
+            for module in attentions
+        )
 
     def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState:
         """Run every request-level stage once and seed the per-request step state."""
@@ -3815,8 +3820,11 @@ class MiniMaxH3Pipeline(
         attention document each, so the whole batch costs one DiT forward.
         Backends that ignore ``cu_seqlens`` cannot express that isolation, so
         they fall back to one forward per request. A batch under a bound
-        attention schedule also runs one forward per request, each under that
-        request's own step, sigma and total.
+        attention schedule is packed only when every request carries the same
+        schedule and sits at the same progress, so all of them select one
+        profile, and that profile's backends isolate packed requests; otherwise
+        it runs one forward per request, each under that request's own step,
+        sigma and total.
         """
         del kwargs
         batch_states = list(states if states is not None else input_batch.states)
@@ -3867,13 +3875,20 @@ class MiniMaxH3Pipeline(
             for state, schedule in zip(batch_states, schedules)
         ]
         progress = set(request_progress)
-        minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None, None)))
+        uniform_progress = len(progress) == 1
+        minimax_h3_publish_denoise_progress(*(progress.pop() if uniform_progress else (None, None, None)))
         scheduled = is_forward_context_available() and bool(getattr(get_forward_context(), "attention_schedule", None))
+        # Under a schedule, a packed forward selects one profile from the progress published above,
+        # so it may only carry requests that all select that profile: one schedule, one progress.
+        # _packed_batch_supported() then checks the selected profile's backends, not the baseline.
+        schedule_splits_batch = scheduled and (
+            not uniform_progress or len({state.attention_schedule for state in batch_states}) > 1
+        )
 
         pdd = isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
         if pdd or (
             len(batch_states) > 1
-            and (scheduled or mixed_transformers or not self._packed_batch_supported(transformers[0]))
+            and (schedule_splits_batch or mixed_transformers or not self._packed_batch_supported(transformers[0]))
         ):
             if pdd:
                 logger.debug(
@@ -3886,10 +3901,11 @@ class MiniMaxH3Pipeline(
                     "running %d requests one forward at a time.",
                     len(batch_states),
                 )
-            elif scheduled:
+            elif schedule_splits_batch:
                 logger.info_once(
-                    "MiniMax H3 runs a step batch under an attention schedule one request per forward, "
-                    "so each request selects attention at its own step; running %d requests one forward at a time.",
+                    "MiniMax H3 runs a scheduled step batch whose requests differ in progress or schedule "
+                    "one request per forward, so each request selects attention at its own step; running %d "
+                    "requests one forward at a time.",
                     len(batch_states),
                 )
             elif any(
@@ -3925,10 +3941,9 @@ class MiniMaxH3Pipeline(
                 )
                 if pdd:
                     forward_kwargs["pdd_step"] = int(batch_states[index].step_index)
-                # Scheduled requests are evaluated one at a time even when they share a
-                # profile name, because the name alone does not show that the selected
-                # backend isolates packed requests. The batch-level progress published
-                # above is restored after each forward, including when it raises.
+                # Each scheduled request selects its profile at its own progress. The
+                # batch-level progress published above is restored after each forward,
+                # including when it raises.
                 step, sigma_video, total_steps = request_progress[index]
                 with request_denoise_progress(step, total_steps, sigma_video) if scheduled else nullcontext():
                     request_video, request_audio = transformers[index](**forward_kwargs)
