@@ -401,8 +401,20 @@ async def _run_client_vad_replay(
     replay_path: Path,
     *,
     wait_s: float = 10.0,
+    answer_timeout_s: float = 60.0,
 ) -> list[str]:
-    """Replay a captured LiveKit client-VAD session at its original speed."""
+    """Replay a captured LiveKit client-VAD session at its original speed.
+
+    The capture ends with the recorder's own teardown: two ``response.cancel``
+    events sent 5.93 s after its last ``response.create``. Replayed at their
+    captured offsets they are not part of the conversation but a wall-clock
+    deadline for the last turn -- a reply that is merely slower than the
+    recording is cancelled before its first transcript delta and comes back as
+    an empty answer (issue #9069). They are held back and replayed once the
+    answers are collected, so the checks below compare model output rather than
+    the recording's teardown. The cancels that precede a ``response.create`` are
+    part of the interaction and still go out on time.
+    """
     with replay_path.open() as replay_file:
         records = [json.loads(line) for line in replay_file]
     assert records
@@ -410,7 +422,30 @@ async def _run_client_vad_replay(
     answers_by_response_id: dict[str, str] = {}
     response_order: list[str] = []
     completed_answers: dict[str, str] = {}
+    pending_responses: dict[str, asyncio.Future] = {}
     errors: list[dict] = []
+
+    last_create = max(
+        (index for index, record in enumerate(records) if record["data"].get("type") == "response.create"),
+        default=-1,
+    )
+    trailing_cancels = [
+        record["data"]
+        for index, record in enumerate(records)
+        if index > last_create and record["data"].get("type") == "response.cancel"
+    ]
+
+    async def _await_last_turn() -> None:
+        """Wait for the last started response to finish, without cancelling it."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + answer_timeout_s
+        while not response_order and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        if not response_order:
+            return
+        pending = pending_responses[response_order[-1]]
+        with suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(pending), timeout=max(deadline - loop.time(), 0.0))
 
     async with websockets.connect(
         f"ws://{host}:{port}/v1/realtime?model={model}",
@@ -429,6 +464,7 @@ async def _run_client_vad_replay(
                     response_id = event["response"]["id"]
                     response_order.append(response_id)
                     answers_by_response_id[response_id] = ""
+                    pending_responses[response_id] = asyncio.get_running_loop().create_future()
                 elif event_type in {
                     "response.audio_transcript.delta",
                     "response.output_audio_transcript.delta",
@@ -443,13 +479,16 @@ async def _run_client_vad_replay(
                     response_id = response["id"]
                     text = answers_by_response_id.get(response_id, "")
                     completed_answers[response_id] = text or _output_text(response)
+                    future = pending_responses.get(response_id)
+                    if future is not None and not future.done():
+                        future.set_result(None)
 
         receiver = asyncio.create_task(receive_responses())
         capture_start = records[0]["ts"]
         replay_start = asyncio.get_running_loop().time()
 
         try:
-            for record in records:
+            for index, record in enumerate(records):
                 target = replay_start + (record["ts"] - capture_start)
                 delay = target - asyncio.get_running_loop().time()
                 if delay > 0:
@@ -460,8 +499,14 @@ async def _run_client_vad_replay(
                 # replay client uploads its optional reference-audio asset.
                 if "__VOICE__" in json.dumps(message):
                     continue
+                if index > last_create and message.get("type") == "response.cancel":
+                    continue
                 await ws.send(json.dumps(message))
 
+            await _await_last_turn()
+            # Replay the recorded teardown now that every answer is in.
+            for message in trailing_cancels:
+                await ws.send(json.dumps(message))
             await asyncio.sleep(wait_s)
         finally:
             receiver.cancel()

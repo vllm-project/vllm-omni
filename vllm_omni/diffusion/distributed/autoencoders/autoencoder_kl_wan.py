@@ -29,6 +29,7 @@ from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     is_encoder_installed,
     is_installed,
 )
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath._utils import suggests_channels_last
 from vllm_omni.diffusion.models.interface import DecodedChunkConsumer
 from vllm_omni.platforms import current_omni_platform
 
@@ -301,17 +302,47 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         return tiletask_list, grid_spec
 
     def tile_exec(self, task: TileTask) -> torch.Tensor:
-        """Decode a single latent tile into RGB space."""
+        """Decode one tile, retaining raw values and patch layout for blending."""
         self.clear_cache()
-        time = []
-        with self._execution_context():
-            for k in range(len(task.tensor)):
-                self._conv_idx = [0]
-                tile = self.post_quant_conv(task.tensor[k])
-                decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0))
-                time.append(decoded)
-        result = torch.cat(time, dim=2)
-        return result
+        output = None
+        offset = 0
+        frames_per_chunk = 2 ** sum(bool(flag) for flag in self.decoder.temperal_upsample)
+        channels_last = False
+        try:
+            with self._execution_context():
+                for k in range(len(task.tensor)):
+                    self._conv_idx = [0]
+                    tile = self.post_quant_conv(task.tensor[k])
+                    decoded = self.decoder(
+                        tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0)
+                    )
+                    if output is None:
+                        total_frames = decoded.shape[2] + (len(task.tensor) - 1) * frames_per_chunk
+                        channels_last = suggests_channels_last(decoded)
+                        output = torch.empty(
+                            (*decoded.shape[:2], total_frames, *decoded.shape[3:]),
+                            dtype=decoded.dtype,
+                            device=decoded.device,
+                            memory_format=torch.channels_last_3d if channels_last else torch.contiguous_format,
+                        )
+                    elif channels_last and not suggests_channels_last(decoded):
+                        # Match cat's layout when chunks have different formats.
+                        output = output.contiguous()
+                        channels_last = False
+                    if decoded.shape[:2] != output.shape[:2] or decoded.shape[3:] != output.shape[3:]:
+                        raise RuntimeError("Wan tile decoder changed its non-temporal output shape")
+                    if decoded.shape[2] < 1 or (k > 0 and decoded.shape[2] != frames_per_chunk):
+                        raise RuntimeError("Wan tile decoder produced an unexpected temporal chunk length")
+                    end = offset + decoded.shape[2]
+                    output[:, :, offset:end].copy_(decoded)
+                    offset = end
+                    del decoded
+        finally:
+            # Keep causal history between temporal chunks, never between tiles.
+            self.clear_cache()
+        if output is None or offset != output.shape[2]:
+            raise RuntimeError("Wan tile decoder produced no output or an incomplete temporal output")
+        return output
 
     def encode_tile_split(self, x: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         _, _, num_frames, height, width = x.shape

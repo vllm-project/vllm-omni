@@ -6,7 +6,9 @@ import base64
 import numpy as np
 import pytest
 
+from vllm_omni.engine.duplex.realtime_commands import build_append_audio
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.input import MiniCPMO45PcmAppendBuffer
+from vllm_omni.protocol.realtime import RealtimeInputDefaults
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -28,15 +30,37 @@ def _b64_audio(payload: dict[str, object]) -> bytes:
     return base64.b64decode(audio)
 
 
-def test_commit_does_not_add_silence_after_incremental_audio_was_drained():
+@pytest.mark.parametrize("tail_samples", [0, 1, 15_999])
+def test_commit_flushes_only_an_actual_residual_after_incremental_audio(tail_samples):
     buffer = MiniCPMO45PcmAppendBuffer()
 
     emitted = buffer.append(pcm_payload(16_000), chunk_period_ms=1_000)
+    if tail_samples:
+        # Exercise PCM16 decoding too: one sample has a zero-ms duration hint.
+        tail = build_append_audio(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(bytes(tail_samples * 2)).decode(),
+                "input_audio_format": "pcm16",
+                "sample_rate_hz": 16_000,
+                "duration_ms": tail_samples // 16,
+                "audio_end_ms": 1000 + tail_samples // 16,
+            },
+            defaults=RealtimeInputDefaults(),
+        )
+        assert buffer.append(tail.payload(), chunk_period_ms=1_000) is None
+        assert buffer.pending_byte_count == tail_samples * 4
     committed = buffer.commit(chunk_period_ms=1_000)
 
     assert emitted is not None
     assert not buffer.has_pending()
-    assert committed is None
+    if tail_samples:
+        assert committed is not None and committed["final"] is True
+        assert committed["is_speech"] is False
+        assert _b64_audio(committed) == bytes(16_000 * 4)
+    else:
+        assert committed is None
+    assert buffer.commit(chunk_period_ms=1_000) is None
 
 
 def test_append_emits_one_model_unit_when_multiple_units_are_buffered():
