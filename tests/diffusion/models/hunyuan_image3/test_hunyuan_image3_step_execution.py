@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from diffusers.configuration_utils import FrozenDict
 
 import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as hy3_transformer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
@@ -753,6 +754,9 @@ def _request_mode_pipeline(monkeypatch, *, num_steps: int, events: list, fail_at
     model._update_model_kwargs_for_generation = lambda _output, model_kwargs: model_kwargs
 
     pipe = object.__new__(HunyuanImage3Text2ImagePipeline)
+    # A loaded pipeline has a config. DiffusionPipeline.__setattr__ reads it when __call__ reassigns
+    # _guidance_scale, so a pipeline reused after a failed request needs it too.
+    pipe._internal_dict = FrozenDict()
     pipe.model = model
     pipe.scheduler = _FakeFlowScheduler()
     pipe.vae = SimpleNamespace(config=SimpleNamespace(), decode=lambda latents, return_dict, generator: (latents,))
@@ -855,10 +859,7 @@ def test_request_loop_rejects_unusable_scheduler_sigmas_before_any_forward(monke
         _run_request_loop(pipe)
     assert events == []
 
-    # Without sigma windows nothing reads the sigmas, so the same loop runs. It runs on a fresh fake: the
-    # first call set _guidance_scale, and DiffusionPipeline.__setattr__ reads self.config to reassign it.
-    pipe = _request_mode_pipeline(monkeypatch, num_steps=4, events=events)
-    pipe.scheduler.sigmas = sigmas
+    # Without sigma windows nothing reads the sigmas, so the same pipeline runs the same loop.
     with set_forward_context():
         _run_request_loop(pipe)
     assert events[:2] == ["prepare_latents", "ar_kv_reuse"]
@@ -881,10 +882,13 @@ def test_prepare_encode_rejects_unusable_scheduler_sigmas_before_latents(monkeyp
     pipeline.prepare_model_inputs = lambda **kwargs: {
         "input_ids": torch.zeros(1, 21, dtype=torch.long),
         "batch_gen_image_info": [image_info],
+        "generator": None,
     }
     pipeline.scheduler = SimpleNamespace(sigmas=[1.0, 1.5, 0.25, 0.0])
     # prepare_encode reads the latent channel count before it calls prepare_latents.
-    pipeline.config = SimpleNamespace(vae={"latent_channels": 1})
+    pipeline.config = hy3_transformer_module.HunyuanImage3Config(
+        cfg_distilled=False, use_meanflow=False, vae={"latent_channels": 1}
+    )
     monkeypatch.setattr(
         hy3_module, "retrieve_timesteps", lambda *args: (torch.tensor([1000.0, 750.0, 500.0, 250.0]), 4)
     )
