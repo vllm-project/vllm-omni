@@ -7,7 +7,7 @@ session_mode: duplex
 # A smaller window serializes first-packet generation for concurrent chat turns.
 duplex_session:
   # Matches Stage 0/1 max_num_seqs below.
-  max_sessions: 16
+  max_sessions: 32
 
 trust_remote_code: true
 enable_prefix_caching: false
@@ -73,7 +73,7 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 16
+    max_num_seqs: 32
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     # The NPU block below overrides this with measured single-card budgets.
     gpu_memory_utilization: 0.55
@@ -110,7 +110,7 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
-    max_num_seqs: 16
+    max_num_seqs: 32
     # Preserve the checkpoint's full-attention Talker prompt while it fits;
     # native duplex rolls over to a one-chunk window at context capacity.
     # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
@@ -140,7 +140,7 @@ stages:
       detokenize: false
 
   - stage_id: 2
-    max_num_seqs: 16
+    max_num_seqs: 32
     gpu_memory_utilization: 0.18
     enforce_eager: true
     enable_chunked_prefill: false
@@ -170,18 +170,20 @@ platforms:
         attention_backend: TRITON_ATTN
       - stage_id: 1
         # Full-attention occupancy is bounded by max_num_seqs * max_model_len
-        # (16 * 4096 = 65536 tokens). Keep the reported CUDA KV token capacity
+        # (32 * 4096 = 131072 tokens). Keep the reported CUDA KV token capacity
         # above that bound because physical-preemption replay is unsupported
         # (2 GiB holds ~35k tokens). The explicit cap leaves device headroom
         # for concurrent Stage 2.
-        kv_cache_memory_bytes: 4294967296  # 4 GiB
+        kv_cache_memory_bytes: 8589934592  # 8 GiB
 
   npu:
+    duplex_session:
+      max_sessions: 16
     stages:
       - stage_id: 0
         # Keep the three stages' concurrency caps aligned so the top tier is
         # not gated by a single stage.
-        max_num_seqs: 8
+        max_num_seqs: 16
         # Measured single-card co-location budget (910B1). The turn-mode v1
         # KV check needs one full 40960-token request on this stage:
         # 144.8 KiB/token x 40960 = 5.62 GiB, so the KV pool must stay above
@@ -211,18 +213,10 @@ platforms:
           # with K=8.
           cudagraph_mode: PIECEWISE
       - stage_id: 1
-        # Concurrency cap raised from 4 to 8; the override block only covered
-        # stages 0 and 2, so stage 1 kept the base value of 4.
-        max_num_seqs: 8
-        # Match CUDA's fixed KV budget and leave headroom for Stage 2
-        # (upstream #8735). When kv_cache_memory_bytes is not None, vLLM
-        # reserves exactly that for KV and skips memory profiling, so the
-        # gpu_memory_utilization below sizes nothing in this stage; it only
-        # acts as the device-level headroom knob for the colocated HiFi-GAN
-        # cuDNN workspace in the replica overlays that set this key to null
-        # (measured on 910B1: ~5.2 GiB Talker KV at 0.10 vs the 4 GiB
-        # fixed budget). Whether 4 GiB covers 8 concurrent Talker requests
-        # with the K=8 step is pending a sweep re-run on the merged config.
+        max_num_seqs: 16
+        # 16 full 4096-token contexts require 65536 KV tokens. Keep the
+        # fixed 4 GiB pool; verify the reported capacity with K=8 enabled.
+        # This explicit KV budget takes precedence over gpu_memory_utilization.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
         gpu_memory_utilization: 0.10
         max_num_batched_tokens: 8192
@@ -243,7 +237,7 @@ platforms:
         compilation_config:
           cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 2
-        max_num_seqs: 8
+        max_num_seqs: 16
         # 0.22 covers the 64k-token Code2Wav budget; the headroom that
         # survived a full three-tier concurrency sweep upstream (measured
         # on 910B1 under the pre-merge config, where stage 1's 0.10 was
@@ -261,21 +255,8 @@ platforms:
           # inputs and caches whose outputs are dropped; live slots keep their
           # own math, so this is a capture-key optimization only. Unset keeps
           # exact-batch capture.
-          cfm_graph_batch_buckets: [1, 2, 4, 8]
-          # Pool stays at 32. The CFM mel bucketing
-          # (cfm_graph_bucket_frames: 16) only aligns the mel-frame dimension;
-          # the capture key carries the full tensor shape
-          # (NPUExactGraphRunner._tensor_signature), so the batch dimension
-          # multiplies the shape space -- an 8-way concurrent stage-2 run
-          # reaches 61 distinct shapes, not 19. Captured graph buffers are
-          # allocated outside vLLM's gpu_memory_utilization budget, and this
-          # profile co-locates three stages on one card (measured pre-merge
-          # as 0.50 + 0.10 + 0.22 with 0.10 the live stage-1 knob; after the
-          # merge stage 1 carries a fixed 4 GiB KV budget instead),
-          # so a 64-entry pool OOMs the card at 128/8 while 32 completes all
-          # three tiers. cfm_graph_batch_buckets above is what makes 32
-          # sufficient: it collapses the batch axis so the 8-way shape space
-          # fits inside the pool instead of overflowing it into eager replay.
-          # It buys shape-space coverage, not graph memory -- both settings
-          # capture up to the pool limit.
+          cfm_graph_batch_buckets: [1, 2, 4, 8, 16]
+          # Keep the pool bounded: graph buffers are outside the vLLM memory
+          # budget. Batch-16 coverage does not establish that all shapes fit
+          # in 32 entries; unseen shapes fall back to eager once it is full.
           code2wav_max_npu_graphs: 32

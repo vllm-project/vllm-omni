@@ -453,6 +453,7 @@ source_file_dependencies:
     - *minicpmo_4_5
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_minicpmo_4_5_ready.json
+    - tests/dfx/perf/tests/test_minicpmo_4_5_cuda_c32.json
     - tests/dfx/perf/tests/test_minicpmo_4_5.json
 
   omni_minicpmo_4_5_doc:
