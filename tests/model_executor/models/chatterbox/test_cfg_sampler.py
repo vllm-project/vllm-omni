@@ -189,3 +189,20 @@ def test_v1_shared_logit_bias_masks_survive_guidance(v1_sampler: Sampler, weight
     torch.testing.assert_close(guided[:, 0], torch.full((2,), 4.0 + weight * 2.0))
     torch.testing.assert_close(logits, original)
     assert output.sampled_token_ids.tolist() == [[0], [0]]
+
+
+@pytest.mark.parametrize("restricted_row", [0, 1], ids=["cond", "uncond"])
+def test_an_id_restricted_on_one_row_is_banned_from_the_blend(v1_sampler: Sampler, restricted_row: int) -> None:
+    """Unmasked, an id only the unconditional row restricts would blend to cond - (-inf) = +inf and be forced."""
+    registry = {"c": ("pair", "cond", 0.5), "u": ("pair", "uncond", 0.5)}
+    sampler = ChatterboxCFGSampler(v1_sampler, registry)
+    logits = torch.ones(2, STOP_SPEECH_TOKEN + 3)
+    logits[:, 0] = 4.0
+    logits[restricted_row, 7] = -torch.inf
+
+    guided, _ = sampler.prepare_logits(logits, ["c", "u"])
+    output = sampler.sample(logits, sampling_metadata(2), [{"chatterbox_cfg": registry[rid]} for rid in ["c", "u"]])
+
+    assert not torch.isnan(guided).any() and not torch.isposinf(guided).any()
+    assert torch.isneginf(guided[:, 7]).all()
+    assert output.sampled_token_ids.tolist() == [[0], [0]]

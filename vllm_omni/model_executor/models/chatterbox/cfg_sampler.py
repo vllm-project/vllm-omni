@@ -26,8 +26,8 @@ class ChatterboxCFGSampler:
     must be scheduled atomically and have identical speech token histories.
     A conditional request with zero weight needs no companion. Synthetic
     MRv2 warmup rows bypass pairing and still receive the speech token mask.
-    Shared negative-infinity restrictions from V1 logit bias are preserved
-    during blending, including min_tokens and allowed_token_ids masks.
+    A negative-infinity restriction from V1 logit bias on either row, such as
+    a min_tokens or allowed_token_ids mask, bans that id from the blend.
     The stage that owns the registry registers and releases its pairs.
     """
 
@@ -75,11 +75,13 @@ class ChatterboxCFGSampler:
             if weight != companion_weight:
                 raise ValueError(f"Mismatched Chatterbox CFG weights: {key}")
             conditional, unconditional = logits[cond].float(), logits[uncond].float()
-            shared_mask = torch.isneginf(conditional) & torch.isneginf(unconditional)
-            conditional = conditional.masked_fill(shared_mask, 0.0)
-            unconditional = unconditional.masked_fill(shared_mask, 0.0)
+            # An id either row restricts is banned from the blend: left in,
+            # cond - (-inf) would give it a +inf logit.
+            banned = torch.isneginf(conditional) | torch.isneginf(unconditional)
+            conditional = conditional.masked_fill(banned, 0.0)
+            unconditional = unconditional.masked_fill(banned, 0.0)
             blended = conditional + weight * (conditional - unconditional)
-            blended.masked_fill_(shared_mask, -torch.inf)
+            blended.masked_fill_(banned, -torch.inf)
             guided[cond] = blended
             guided[uncond] = blended
             row_pairs.append((cond, uncond))
@@ -103,6 +105,9 @@ class ChatterboxCFGSampler:
         self, logits: torch.Tensor, sampling_metadata: SamplingMetadata, per_req_extra_args: list[dict]
     ) -> SamplerOutput:
         """V1 model sampler entry point; preserve upstream sampling metadata."""
+        # Every row is a scheduled request: prepare_original_prompt tags each
+        # one, guided or not. The V1 runner's warmup (_dummy_sampler_run)
+        # calls its own sampler directly and never reaches this method.
         pairs = [extra["chatterbox_cfg"] for extra in per_req_extra_args]
         guided, row_pairs = self.prepare_logits(logits, [pair[0] for pair in pairs], pair_metadata=pairs)
         output = self.base_sampler(logits=guided, sampling_metadata=sampling_metadata)
