@@ -17,7 +17,7 @@ Only ``test_dense_request_matches_a_service_without_a_schedule_bit_for_bit`` com
 on CPU. Compilation for the target GPU attention backend is not covered here.
 """
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -569,10 +569,29 @@ def test_scheduled_op_returns_a_fresh_contiguous_tensor_and_rejects_a_wrong_shap
 
 
 def test_op_metadata_rule_covers_every_attention_metadata_field():
-    carried_or_checked = {"attn_mask", "extra", "joint_strategy", "video_layout"}
-    assert {f.name for f in fields(AttentionMetadata)} - carried_or_checked == set(
-        layer_mod._SCHEDULED_OP_NONE_FIELDS
-    ) | set(layer_mod._SCHEDULED_OP_FALSE_FIELDS)
+    names = {f.name for f in fields(AttentionMetadata)}
+    checked = {name for name, _ in layer_mod._SCHEDULED_OP_FIELD_DEFAULTS}
+    assert checked == names - layer_mod._SCHEDULED_OP_CARRIED_FIELDS
+    assert layer_mod._SCHEDULED_OP_CARRIED_FIELDS <= names
+
+
+@pytest.mark.parametrize(
+    "name", sorted({f.name for f in fields(AttentionMetadata)} - layer_mod._SCHEDULED_OP_CARRIED_FIELDS)
+)
+def test_op_metadata_with_any_uncarried_field_off_its_default_keeps_the_boundary(name):
+    # Enumerated from the dataclass, so a field added to AttentionMetadata is covered here too.
+    metadata = replace(AttentionMetadata(), **{name: object()})
+    assert layer_mod._encode_scheduled_op_metadata(metadata) is None
+
+
+def test_op_metadata_with_a_field_the_op_does_not_know_keeps_the_boundary(monkeypatch):
+    # Stands in for a field added after the op: no declared default, so it never matches.
+    monkeypatch.setattr(
+        layer_mod,
+        "_SCHEDULED_OP_FIELD_DEFAULTS",
+        (*layer_mod._SCHEDULED_OP_FIELD_DEFAULTS, ("joint_strategy", layer_mod._NO_FIELD_DEFAULT)),
+    )
+    assert layer_mod._encode_scheduled_op_metadata(AttentionMetadata()) is None
 
 
 def test_op_metadata_round_trips_layouts_and_scalar_extras():
@@ -601,8 +620,9 @@ def test_op_metadata_round_trips_layouts_and_scalar_extras():
         AttentionMetadata(extra={"kv_cache_dtype": "fp8"}),
         AttentionMetadata(joint_query=torch.ones(1)),
         AttentionMetadata(joint_strategy="rear"),
+        AttentionMetadata(cross_kv_rows_validated=True),
     ],
-    ids=["tensor", "float", "string", "joint", "rear"],
+    ids=["tensor", "float", "string", "joint", "rear", "cross_validated"],
 )
 def test_op_metadata_it_cannot_carry_returns_none(metadata):
     assert layer_mod._encode_scheduled_op_metadata(metadata) is None
