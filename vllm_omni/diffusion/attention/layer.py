@@ -971,11 +971,20 @@ class Attention(nn.Module):
     def _schedule_op_eligible(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
         """Whether this layer and call can use the scheduled-attention op instead of the eager boundary.
 
-        Evaluated while tracing, on structure only (never on the step). HSDP (its own boundary) and
-        autograd (the op has no backward) keep ``_forward_schedule_compile_boundary``, as does metadata
-        that ``_encode_scheduled_op_metadata`` cannot carry.
+        Evaluated while tracing, on structure only (never on the step). HSDP (its own boundary),
+        Scheduler-managed paged KV and autograd (the op has no backward) keep
+        ``_forward_schedule_compile_boundary``, as does metadata that ``_encode_scheduled_op_metadata``
+        cannot carry.
+
+        The op is registered with ``mutates_args=[]``, so Inductor may reorder it against other reads
+        of state it writes outside its arguments. Paged KV writes the Scheduler's cache through the
+        Worker adapter, so it stays behind the boundary. KV-cache quantization quantizes per call into
+        fresh tensors and keeps no state between calls. Prompt K/V capture (HunyuanImage-3.0) runs in
+        the model's attention module around this call, not inside ``_forward_impl``.
         """
         if self._schedule_op_id is None or self._uses_hsdp_compile_boundary():
+            return False
+        if self._scheduler_paged_kv and self.paged_kv_cache_role is not None:
             return False
         return not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
 
