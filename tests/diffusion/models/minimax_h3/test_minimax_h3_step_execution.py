@@ -83,6 +83,10 @@ class _SegmentMeanModel:
             video = video * kwargs["update_mask"].view(-1).unsqueeze(-1)
         return video, audio
 
+    def modules(self):
+        """The nn.Module walk the serial step branch uses to look for ring attention; this DiT has none."""
+        return iter([self])
+
 
 def _make_branch(*, text_len: int, latent_t: int, latent_h: int, latent_w: int, audio_t: int, seed: int):
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import MiniMaxH3DenoiseBranch
