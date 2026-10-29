@@ -75,6 +75,16 @@ denoise over a fixed timestep table, publish that timestep divided by the
 training timestep scale. Missing or invalid sigma fails
 rather than silently selecting the base backend.
 
+MiniMax-H3 windows therefore refer to absolute noise, while Wan2.2 and
+HunyuanImage-3.0 windows refer to noise relative to the run's first scheduler
+sigma. The two agree only for a run that starts at full noise, which every
+supported Wan2.2 and HunyuanImage-3.0 path does: none takes a `strength` or
+custom sigmas, or starts part-way down the schedule. Request `latents` replace
+the initial noise, not the schedule. The first sigma is 1.0, except under Wan's
+UniPC solver, whose ladder starts within 0.001 of 1.0. The MiniMax-H3
+`latent_refine` pass does start below full noise and selects by the absolute
+sigma of its own steps.
+
 Each window has exactly `low`, `high` and `profile`. Bounds must be finite
 numbers with `0 <= low < high <= 1`. List windows by ascending `low`, the
 reverse of denoising order, without overlaps. Windows are half-open
@@ -208,7 +218,14 @@ deployments above, this happens after stage 0 has finished: the H3 encoder,
 the HunyuanImage-3.0 AR stage or the Wan2.2 encode stage.
 A bounded range in the request's own schedule that ends after the sequence
 fails before denoising and retains the client error through
-the runner and multiprocess executor. Asynchronous `/v1/videos` reports all of
+the runner and multiprocess executor.
+Under sigma windows, Wan2.2 and HunyuanImage-3.0 check each step's scheduler
+sigma once, right after building the timesteps. Sigmas that cannot be normalized
+into `[0, 1]`, for example from a NaN Wan2.2 `flow_shift`, raise the same
+`invalid_attention_schedule` client error as the other checks here, before any
+denoise forward. In step mode the request fails during its own preparation,
+not in a step shared with other requests. MiniMax-H3 solvers reject such sigmas
+when the request's schedule is prepared. Asynchronous `/v1/videos` reports all of
 these errors on the job record rather than the creation response.
 
 ## Compatibility limits
