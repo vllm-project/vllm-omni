@@ -11,7 +11,7 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, TypeGuard
+from typing import Any, NamedTuple, TypeGuard
 
 import pytest
 
@@ -380,8 +380,29 @@ _OMNIINTERACT_AGGREGATE_MIN_IA_QTF1 = "omniinteract_aggregate_min_ia_qtf1"
 _OMNIINTERACT_AGGREGATE_SUBSETS = "omniinteract_aggregate_subsets"
 _OMNIINTERACT_AGGREGATE_GROUP = "omniinteract_aggregate_group"
 _OMNIINTERACT_PERSIST_ARTIFACTS = "omniinteract_persist_artifacts"
-_OMNIINTERACT_AGGREGATE_COUNTS: dict[tuple[str, str], tuple[float, float, float]] = {}
 _OMNIINTERACT_MIN_EVALUATED_CASES = 1
+
+
+class _OmniInteractSubsetCounts(NamedTuple):
+    tp: float
+    fp: float
+    fn: float
+    num_prompts: int
+    completed: int
+    failed: int
+
+
+class _OmniInteractPooledAggregate(NamedTuple):
+    tp: float
+    fp: float
+    fn: float
+    ia_qtf1: float
+    num_prompts: int
+    completed: int
+    failed: int
+
+
+_OMNIINTERACT_AGGREGATE_COUNTS: dict[tuple[str, str], _OmniInteractSubsetCounts] = {}
 
 
 def _reset_omniinteract_aggregate_counts() -> None:
@@ -448,7 +469,18 @@ def _aggregate_accuracy_params_for_test(test_name: str) -> dict[str, object]:
     }
 
 
-def _maybe_assert_aggregate_ia_qtf1(params: dict[str, object], acc_summary: dict[str, object]) -> None:
+def _request_count(value: object, fallback: int) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return fallback
+
+
+def _maybe_assert_aggregate_ia_qtf1(
+    params: dict[str, object],
+    acc_summary: dict[str, object],
+    result: Mapping[str, object],
+    num_prompt: int,
+) -> None:
     min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
     if min_ia_qtf1 is None:
         return
@@ -471,19 +503,27 @@ def _maybe_assert_aggregate_ia_qtf1(params: dict[str, object], acc_summary: dict
     tp = _finite_accuracy_count(acc_summary.get("Global_TP"), "Global_TP")
     fp = _finite_accuracy_count(acc_summary.get("Global_FP"), "Global_FP")
     fn = _finite_accuracy_count(acc_summary.get("Global_FN"), "Global_FN")
-    _OMNIINTERACT_AGGREGATE_COUNTS[(group, subset)] = (tp, fp, fn)
+    _OMNIINTERACT_AGGREGATE_COUNTS[(group, subset)] = _OmniInteractSubsetCounts(
+        tp,
+        fp,
+        fn,
+        num_prompt,
+        _request_count(result.get("completed"), num_prompt),
+        _request_count(result.get("failed"), 0),
+    )
     pooled = _pooled_omniinteract_aggregate(params)
     if pooled is None:
         return
-    total_tp, total_fp, total_fn, ia_qtf1 = pooled
     print(
-        f"OmniInteract aggregate All Global IA-QTF1: {ia_qtf1:.6f} "
-        f"(TP={total_tp:.6f} / FP={total_fp:.6f} / FN={total_fn:.6f})"
+        f"OmniInteract aggregate All Global IA-QTF1: {pooled.ia_qtf1:.6f} "
+        f"(TP={pooled.tp:.6f} / FP={pooled.fp:.6f} / FN={pooled.fn:.6f})"
     )
-    assert ia_qtf1 >= float(min_ia_qtf1), f"OmniInteract aggregate All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
+    assert pooled.ia_qtf1 >= float(min_ia_qtf1), (
+        f"OmniInteract aggregate All Global IA-QTF1 {pooled.ia_qtf1} is below {min_ia_qtf1}"
+    )
 
 
-def _pooled_omniinteract_aggregate(params: Mapping[str, object]) -> tuple[float, float, float, float] | None:
+def _pooled_omniinteract_aggregate(params: Mapping[str, object]) -> _OmniInteractPooledAggregate | None:
     subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
     group = params.get(_OMNIINTERACT_AGGREGATE_GROUP)
     if not isinstance(subsets, list | tuple) or not subsets or not isinstance(group, str) or not group:
@@ -492,10 +532,18 @@ def _pooled_omniinteract_aggregate(params: Mapping[str, object]) -> tuple[float,
     if any(counts is None for counts in recorded):
         return None
     present = [counts for counts in recorded if counts is not None]
-    total_tp = sum(counts[0] for counts in present)
-    total_fp = sum(counts[1] for counts in present)
-    total_fn = sum(counts[2] for counts in present)
-    return total_tp, total_fp, total_fn, _ia_qtf1_from_counts(total_tp, total_fp, total_fn)
+    total_tp = sum(counts.tp for counts in present)
+    total_fp = sum(counts.fp for counts in present)
+    total_fn = sum(counts.fn for counts in present)
+    return _OmniInteractPooledAggregate(
+        total_tp,
+        total_fp,
+        total_fn,
+        _ia_qtf1_from_counts(total_tp, total_fp, total_fn),
+        sum(counts.num_prompts for counts in present),
+        sum(counts.completed for counts in present),
+        sum(counts.failed for counts in present),
+    )
 
 
 def _omniinteract_accuracy_baseline(params: Mapping[str, object], test_name: str) -> dict[str, object]:
@@ -527,7 +575,6 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         write_dfx_accuracy_result,
     )
 
-    total_tp, total_fp, total_fn, ia_qtf1 = pooled
     model_id = result.get("model_id") or "model"
     when = datetime.now()
     accuracy_path = omniinteract_accuracy_result_dir() / _acc_result_filename(
@@ -536,6 +583,8 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
         when=when,
     )
     subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
+    min_ia_qtf1 = params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
+    passed = not _is_finite_number(min_ia_qtf1) or pooled.ia_qtf1 >= float(min_ia_qtf1)
     write_dfx_accuracy_result(
         accuracy_path,
         test_name=str(result.get("test_name") or params.get(_OMNIINTERACT_AGGREGATE_GROUP) or ""),
@@ -549,25 +598,25 @@ def _maybe_write_omniinteract_aggregate_accuracy_result(
             key: value
             for key, value in (
                 ("omniinteract_min_ia_qtf1", params.get("omniinteract_min_ia_qtf1")),
-                (_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1, params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)),
+                (_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1, min_ia_qtf1),
             )
             if value is not None
         },
         branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
-        num_prompts=int(result["num_prompts"]) if isinstance(result.get("num_prompts"), int) else 0,
+        num_prompts=pooled.num_prompts,
         max_concurrency=int(result["max_concurrency"]) if isinstance(result.get("max_concurrency"), int) else None,
-        benchmark_exit_code=0,
+        benchmark_exit_code=0 if passed else 1,
         generation={
-            "completed": result.get("completed", 0),
-            "failed": result.get("failed", 0),
+            "completed": pooled.completed,
+            "failed": pooled.failed,
             "subsets": list(subsets) if isinstance(subsets, list | tuple) else [],
         },
         accuracy={
-            "status": "ok",
-            "IA_QTF1": ia_qtf1,
-            "Global_TP": total_tp,
-            "Global_FP": total_fp,
-            "Global_FN": total_fn,
+            "status": "ok" if passed else "failed",
+            "IA_QTF1": pooled.ia_qtf1,
+            "Global_TP": pooled.tp,
+            "Global_FP": pooled.fp,
+            "Global_FN": pooled.fn,
         },
     )
     print(f"Accuracy result saved to {accuracy_path}")
@@ -664,7 +713,7 @@ def assert_result(result, params, num_prompt) -> None:
                 assert float(ia_qtf1) >= float(min_ia_qtf1), (
                     f"OmniInteract All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
                 )
-            _maybe_assert_aggregate_ia_qtf1(params, acc_summary)
+            _maybe_assert_aggregate_ia_qtf1(params, acc_summary, result, num_prompt)
     baseline = params.get("baseline")
     hardware = result.get("Hardware")
     hardware_baseline = baseline.get(hardware) if isinstance(baseline, dict) and isinstance(hardware, str) else None

@@ -578,9 +578,10 @@ def _write_omniinteract_accuracy_result(
 
     model_id = result.get("model_id") or _cli_argument(args, "--model")
     subset = _cli_argument(args, "--omniinteract-subsets") or None
+    suite = f"{_OMNIINTERACT_DATASET}_{subset}" if subset else _OMNIINTERACT_DATASET
     accuracy_path = omniinteract_accuracy_result_dir() / _acc_result_filename(
         str(model_id),
-        _OMNIINTERACT_DATASET,
+        suite,
         when=started_at,
     )
     omni = result.get("omniinteract")

@@ -1128,60 +1128,6 @@ def test_omniinteract_aggregate_rejects_pooled_ia_qtf1_below_floor():
         )
 
 
-def test_flatten_omniinteract_accuracy_metrics_lifts_summary_scores():
-    from tests.e2e.accuracy.helpers import flatten_omniinteract_accuracy_metrics
-
-    payload = flatten_omniinteract_accuracy_metrics(
-        {
-            "status": "ok",
-            "summary": {"IA_QTF1": 0.25, "Global_TP": 1.0, "Global_FP": 2, "Global_FN": 3},
-        }
-    )
-    assert payload["status"] == "ok"
-    assert payload["IA_QTF1"] == 0.25
-    assert payload["Global_TP"] == 1.0
-
-
-def test_write_dfx_accuracy_result_envelope(tmp_path):
-    from tests.e2e.accuracy.helpers import write_dfx_accuracy_result
-
-    path = tmp_path / "result_acc_MiniCPM-o-4_5_omniinteract_20261027_120000.json"
-    write_dfx_accuracy_result(
-        path,
-        test_name="test_minicpmo_4_5_omniinteract",
-        name="1q1a",
-        model_id="openbmb/MiniCPM-o-4_5",
-        dataset="omniinteract",
-        dataset_path="lucky-lance/OmniInteract",
-        date="20261027-120000",
-        hardware="H100",
-        baseline={"omniinteract_aggregate_min_ia_qtf1": 0.2},
-        branch="main",
-        num_prompts=4,
-        max_concurrency=8,
-        benchmark_exit_code=0,
-        generation={"completed": 4, "failed": 0},
-        accuracy={"status": "ok", "IA_QTF1": 0.25},
-    )
-    saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["dataset"] == "omniinteract"
-    assert saved["name"] == "1q1a"
-    assert saved["accuracy"]["IA_QTF1"] == 0.25
-    assert saved["max_concurrency"] == 8
-
-
-def test_omniinteract_accuracy_result_dir_prefers_acc_then_benchmark(tmp_path, monkeypatch):
-    from tests.e2e.accuracy.helpers import omniinteract_accuracy_result_dir
-
-    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
-    monkeypatch.delenv("BENCHMARK_DIR", raising=False)
-    assert omniinteract_accuracy_result_dir() == Path("tests/e2e/accuracy/omniinteract/results")
-    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path / "perf"))
-    assert omniinteract_accuracy_result_dir() == tmp_path / "perf"
-    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "acc"))
-    assert omniinteract_accuracy_result_dir() == tmp_path / "acc"
-
-
 def test_minicpmo_omniinteract_local_config_uses_c8_and_ephemeral_artifacts():
     config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omniinteract.json").read_text())[0]
     assert config["omniinteract_aggregate_min_ia_qtf1"] == 0.2
@@ -1234,6 +1180,9 @@ def test_omniinteract_run_benchmark_writes_result_acc(tmp_path, monkeypatch):
     }
 
     class BenchmarkProcess:
+        def __class_getitem__(cls, item):
+            return cls
+
         def __init__(self, command, **kwargs):
             self.stdout = io.StringIO("")
             self.stderr = io.StringIO("")
@@ -1266,6 +1215,7 @@ def test_omniinteract_run_benchmark_writes_result_acc(tmp_path, monkeypatch):
     )
     acc_paths = list(perf_dir.glob("result_acc_*.json"))
     assert len(acc_paths) == 1
+    assert "omniinteract_1q1a" in acc_paths[0].name
     saved = json.loads(acc_paths[0].read_text())
     assert saved["dataset"] == "omniinteract"
     assert saved["name"] == "1q1a"
@@ -1380,9 +1330,52 @@ def test_omniinteract_aggregate_writes_result_acc(tmp_path, monkeypatch):
     saved = json.loads(written.read_text())
     assert saved["name"] == "aggregate"
     assert saved["dataset"] == "omniinteract"
+    assert saved["num_prompts"] == 12
+    assert saved["generation"]["completed"] == 12
+    assert saved["generation"]["failed"] == 0
+    assert saved["generation"]["subsets"] == ["1q1a", "1q1a_math", "1qna"]
+    assert saved["accuracy"]["status"] == "ok"
+    assert saved["benchmark_exit_code"] == 0
     assert saved["accuracy"]["IA_QTF1"] == runner._ia_qtf1_from_counts(7.291043, 22, 28)
     assert saved["accuracy"]["Global_TP"] == 7.291043
     assert saved["max_concurrency"] == 8
+
+
+def test_omniinteract_aggregate_writes_failed_result_acc_when_floor_missed(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    runner._reset_omniinteract_aggregate_counts()
+    first = _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0)
+    first["model_id"] = "openbmb/MiniCPM-o-4_5"
+    first["test_name"] = "test_minicpmo_4_5_omniinteract"
+    first["Hardware"] = "H100"
+    first["date"] = "20261027-120000"
+    first["max_concurrency"] = 8
+    runner.assert_result(first, _omniinteract_aggregate_params("1q1a", group="write-fail"), 4)
+    runner.assert_result(
+        _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0),
+        _omniinteract_aggregate_params("1q1a_math", group="write-fail"),
+        4,
+    )
+    last = _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0)
+    for key in ("model_id", "test_name", "Hardware", "date", "max_concurrency"):
+        last[key] = first[key]
+    with pytest.raises(AssertionError, match="aggregate All Global IA-QTF1"):
+        runner.assert_result(last, _omniinteract_aggregate_params("1qna", group="write-fail"), 4)
+    written = runner._maybe_write_omniinteract_aggregate_accuracy_result(
+        last,
+        _omniinteract_aggregate_params("1qna", group="write-fail"),
+    )
+    assert written is not None
+    saved = json.loads(written.read_text())
+    assert saved["name"] == "aggregate"
+    assert saved["num_prompts"] == 12
+    assert saved["generation"]["completed"] == 12
+    assert saved["generation"]["failed"] == 0
+    assert saved["accuracy"]["status"] == "failed"
+    assert saved["benchmark_exit_code"] == 1
 
 
 def test_omniinteract_aggregate_rejects_entirely_skipped_subset():
