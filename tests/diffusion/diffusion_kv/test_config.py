@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import logging
+
 import pytest
 
 from vllm_omni.config.omni_config import _DiffusionConfigProjection
@@ -268,6 +270,48 @@ def test_explicit_paged_rejects_offload(config_cls) -> None:
             diffusion_kv_mode="paged_scheduler",
             enable_cpu_offload=True,
         )
+
+
+@pytest.mark.parametrize("config_cls", [OmniDiffusionConfig, _DiffusionConfigProjection])
+def test_explicit_paged_accepts_supported_attention_backend(config_cls) -> None:
+    config = config_cls.from_kwargs(
+        model_class_name=PAGED_MODEL,
+        diffusion_kv_mode="paged_scheduler",
+        diffusion_attention_config={"default": {"backend": "FLASH_ATTN"}},
+    )
+
+    assert config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
+    assert config.diffusion_kv_max_rows_per_request == 2
+
+
+def test_explicit_paged_rejects_env_selected_unsupported_backend(monkeypatch) -> None:
+    # The env fallback is applied while normalizing the attention config, so the
+    # paged compatibility check must consult the effective backend, not the raw
+    # ``diffusion_attention_config``.
+    monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "SDPA")
+
+    with pytest.raises(ValueError, match="advertises paged KV support"):
+        OmniDiffusionConfig.from_kwargs(model_class_name=PAGED_MODEL, diffusion_kv_mode="paged_scheduler")
+
+
+def test_implicit_paged_incompatibility_logs_warning(monkeypatch, caplog) -> None:
+    from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVResolution
+
+    reason = "step_execution is not implemented on the paged path"
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.data.resolve_diffusion_kv_cache_mode",
+        lambda *args, **kwargs: DiffusionKVResolution(
+            mode=DiffusionKVCacheMode.DENSE_LEGACY,
+            max_rows_per_request=None,
+            reason=reason,
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        OmniDiffusionConfig.from_kwargs(model_class_name=PAGED_MODEL, step_execution=True)
+
+    assert "supports paged diffusion KV" in caplog.text
+    assert reason in caplog.text
 
 
 def test_implicit_resolution_selects_paged_when_enabled() -> None:

@@ -28,6 +28,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.transformers_utils.repo_utils import get_model_path
 
 from vllm_omni.diffusion.diffusion_kv.config import (
+    REASON_IMPLICIT_DISABLED,
     DiffusionKVCacheMode,
     resolve_diffusion_kv_cache_mode,
 )
@@ -1292,12 +1293,20 @@ class OmniDiffusionConfig:
         else:
             raise TypeError("omni_kv_config must be a mapping")
 
+        # Normalize the attention configuration first: it applies the
+        # DIFFUSION_ATTENTION_BACKEND fallback and turns the entrypoint shorthand
+        # into the effective backend, which is what the paged compatibility
+        # check has to consult.
+        self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
+
         # Resolve the KV ownership mode before any mode-dependent validation so
         # an omitted diffusion_kv_mode can select paged execution, and so both
         # config classes validate the effective mode rather than the raw input.
+        requested_kv_mode = self.diffusion_kv_mode
         metadata = get_diffusion_model_metadata(self.model_class_name)
         kv_resolution = resolve_diffusion_kv_cache_mode(
-            self.diffusion_kv_mode,
+            requested_kv_mode,
             model_supports_paged_kv=metadata.supports_paged_kv,
             max_rows_per_request=self.diffusion_kv_max_rows_per_request,
             model_default_max_rows=metadata.paged_kv_max_rows_per_request,
@@ -1308,12 +1317,33 @@ class OmniDiffusionConfig:
         )
         self.diffusion_kv_mode = kv_resolution.mode
         self.diffusion_kv_max_rows_per_request = kv_resolution.max_rows_per_request
-        logger.debug(
-            "Diffusion KV mode resolved to %s for model %r: %s",
-            self.diffusion_kv_mode.value,
-            self.model_class_name,
-            kv_resolution.reason,
-        )
+        if kv_resolution.is_paged:
+            logger.debug(
+                "Diffusion KV mode resolved to %s for model %r: %s",
+                self.diffusion_kv_mode.value,
+                self.model_class_name,
+                kv_resolution.reason,
+            )
+        elif (
+            requested_kv_mode is None
+            and metadata.supports_paged_kv
+            and kv_resolution.reason != REASON_IMPLICIT_DISABLED
+        ):
+            # Once the implicit default is enabled, an incompatible stage would
+            # otherwise fall back to dense silently.
+            logger.warning(
+                "Model %r supports paged diffusion KV, but this configuration cannot run it: %s. "
+                "Falling back to dense_legacy.",
+                self.model_class_name,
+                kv_resolution.reason,
+            )
+        else:
+            logger.debug(
+                "Diffusion KV mode resolved to %s for model %r: %s",
+                self.diffusion_kv_mode.value,
+                self.model_class_name,
+                kv_resolution.reason,
+            )
 
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
             raise ValueError(
@@ -1469,8 +1499,6 @@ class OmniDiffusionConfig:
 
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
-        self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
-        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -1536,17 +1564,11 @@ class OmniDiffusionConfig:
         an implicit resolution stays on the dense path for it.
         """
 
-        attention_config = self.diffusion_attention_config
-        if isinstance(attention_config, Mapping):
-            # The runtime config may still hold the raw mapping here: it is
-            # normalised into AttentionConfig later in __post_init__.
-            default_spec = attention_config.get("default")
-        else:
-            default_spec = getattr(attention_config, "default", None)
-        if isinstance(default_spec, Mapping):
-            backend = default_spec.get("backend")
-        else:
-            backend = getattr(default_spec, "backend", None)
+        # Both config classes normalize ``diffusion_attention_config`` before
+        # resolving the KV mode, so the effective backend (including the
+        # DIFFUSION_ATTENTION_BACKEND fallback) is readable here.
+        default_spec = getattr(self.diffusion_attention_config, "default", None)
+        backend = getattr(default_spec, "backend", None)
         if backend is None:
             return None
         if isinstance(backend, str):

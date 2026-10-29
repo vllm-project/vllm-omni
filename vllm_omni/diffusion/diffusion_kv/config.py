@@ -169,6 +169,13 @@ def resolve_diffusion_kv_cache_mode(
     is given, paged execution is selected only when implicit paged execution is
     enabled, the model declares support, and the runtime configuration can
     actually run it; every other case stays on the dense path and reports why.
+
+    An explicit ``paged_scheduler`` selection is deliberately **not** gated on
+    ``model_supports_paged_kv``: the capability registry only decides the
+    implicit default, while an explicit selection is validated against runtime
+    compatibility. That keeps a paged integration usable while its metadata is
+    still being added, and an unsupported model still fails at model build when
+    it has no paged attention path.
     """
 
     parsed = parse_diffusion_kv_cache_mode(mode)
