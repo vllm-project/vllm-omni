@@ -7,13 +7,13 @@
 
 import contextlib
 import math
-from collections import namedtuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.utils import weight_norm
 
 from vllm_omni.model_executor.models.common.alias_free_activation import AliasFreeActivation1d
@@ -304,8 +304,6 @@ class ConvPositionEmbed(nn.Module):
 
 # --------------- Attention ---------------
 
-AttentionConfig = namedtuple("AttentionConfig", ["enable_flash", "enable_math", "enable_mem_efficient"])
-
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, theta=50000):
@@ -359,12 +357,11 @@ class MultiHeadAttention(nn.Module):
         self.o_proj = Linear(hidden_size, hidden_size)
         self.o_dropout = Dropout(dropout)
 
-        self.cpu_config = AttentionConfig(True, True, True)
-        self.cuda_config = AttentionConfig(False, True, True)
+        self.cuda_backends = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, SDPBackend.CUDNN_ATTENTION]
         if current_omni_platform.is_cuda():
             device_properties = torch.cuda.get_device_properties(torch.accelerator.current_device_index())
             if device_properties.major == 8 and device_properties.minor == 0:
-                self.cuda_config = AttentionConfig(True, True, True)
+                self.cuda_backends.append(SDPBackend.FLASH_ATTENTION)
 
         if self.rotary_bias:
             self.rotary = RotaryEmbedding(self.head_dim)
@@ -389,7 +386,6 @@ class MultiHeadAttention(nn.Module):
         v = rearrange(v, "b n (h d) -> b h n d", h=self.num_heads)
         q, k = self.q_norm(q), self.k_norm(k)
 
-        config = self.cuda_config if q.is_cuda else self.cpu_config
         attn_bias = torch.zeros(B, self.num_heads, L, S, dtype=q.dtype, device=q.device)
 
         if self.rotary_bias:
@@ -405,7 +401,7 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
 
-        sdp_ctx = torch.backends.cuda.sdp_kernel(**config._asdict()) if q.is_cuda else contextlib.nullcontext()
+        sdp_ctx = sdpa_kernel(self.cuda_backends) if q.is_cuda else contextlib.nullcontext()
         with sdp_ctx:
             out = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_bias, dropout_p=self.attn_drop.p if self.training else 0.0
