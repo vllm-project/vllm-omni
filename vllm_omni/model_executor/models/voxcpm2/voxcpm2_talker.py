@@ -1154,6 +1154,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         if self._enable_delayed_audio_copy:
             raise ValueError("VoxCPM2 MRV2 uses the runner's async audio copy; disable model-side delayed_audio_copy")
+        if omni_platform.current_omni_platform.is_npu():
+            from vllm_omni.platforms.npu.models.voxcpm2_model_state import NPUVoxCPM2ModelState
+
+            return NPUVoxCPM2ModelState(vllm_config, self, encoder_cache, device)
         return VoxCPM2ModelState(vllm_config, self, encoder_cache, device)
 
     def _get_or_create_state(self, request_id: str) -> _RequestState:

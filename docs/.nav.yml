@@ -13,6 +13,8 @@ nav:
         - Audio Generation: serving/audio_generate_api.md
         - Image Generation: serving/image_generation_api.md
         - Image Edit: serving/image_edit_api.md
+        - Image Segmentation: serving/image_segmentation_api.md
+        - Video Segmentation: serving/video_segmentation_api.md
         - Videos: serving/videos_api.md
       - Streaming and Realtime:
         - Full Duplex OpenAI: serving/realtime_openai_duplex_api.md

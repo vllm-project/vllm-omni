@@ -1929,6 +1929,23 @@ class DuplexSessionRunner:
     # Cancel / barge-in                                                  #
     # ------------------------------------------------------------------ #
 
+    def _retained_turn_awaits_its_own_response(self) -> bool:
+        """Whether the retained PCM belongs to a turn this cancel must keep.
+
+        A commit that arrived while the previous response was still running is
+        retained together with the response it should start
+        (``_defer_commit_behind_active_response``). That turn owns its audio,
+        not the response in flight: cancelling the in-flight answer must not
+        discard a turn the client has already committed, or the ``response.create``
+        that follows finds nothing to answer and the user's speech is lost.
+        """
+        model_state = self.model_state
+        return (
+            model_state.deferred_response_create is True
+            and model_state.committed_audio_payload is not None
+            and not model_state.committed_audio_consume_started
+        )
+
     async def _on_cancel(self, event: dict[str, object]) -> None:
         session = self.session
         model_state = self.model_state
@@ -1982,7 +1999,7 @@ class DuplexSessionRunner:
         had_append = await self.tasks.cancel_append_tasks(
             response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
         )
-        if event_type == "response.cancel":
+        if event_type == "response.cancel" and not self._retained_turn_awaits_its_own_response():
             session.release_input_bytes(model_state.clear_committed_audio())
         had_stream = self.run.stream_request_id is not None
         cancelled = await self._cancel_active_response(self.tasks.active_response_task, reason=cancel_reason)

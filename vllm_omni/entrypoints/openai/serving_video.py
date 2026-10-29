@@ -194,8 +194,7 @@ class OmniOpenAIServingVideo:
     ) -> tuple[OmniDiffusionConfig | SimpleNamespace | None, tuple[DiffusionModelMetadata, ...]]:
         """Resolve capability metadata from the runtime and diffusion stages."""
         od_config = self._resolve_diffusion_od_config()
-        model_archs = [None if od_config is None else getattr(od_config, "model_class_name", None)]
-        model_archs.extend(_stage_diffusion_model_class_name(stage) for stage in self.stage_configs or ())
+        model_archs = self._get_model_architectures(od_config)
         return od_config, tuple(get_diffusion_model_metadata(model_arch) for model_arch in model_archs)
 
     def _video_encoding_options(self) -> dict[str, bool]:
@@ -243,6 +242,20 @@ class OmniOpenAIServingVideo:
         if self._stage_configs is None and stage_configs is not None:
             self._stage_configs = stage_configs
 
+    def _get_model_architectures(self, od_config: OmniDiffusionConfig | SimpleNamespace | None) -> list[str | None]:
+        """Read architecture names from the current config and stage projections."""
+        model_archs = [_config_value(od_config, "model_class_name")]
+        for stage_config in self.stage_configs or ():
+            engine_args = _config_value(stage_config, "engine_args", {}) or {}
+            model_archs.extend(
+                (
+                    _stage_diffusion_model_class_name(stage_config),
+                    _config_value(stage_config, "model_arch"),
+                    _config_value(engine_args, "model_class_name"),
+                )
+            )
+        return model_archs
+
     @cached_property
     def preserves_reference_image_size(self) -> bool:
         """Return whether the active pipeline owns reference-image resizing."""
@@ -272,6 +285,36 @@ class OmniOpenAIServingVideo:
         """Return whether the configured diffusion model accepts latent edits."""
         _, metadata = self._resolve_diffusion_metadata()
         return any(item.supports_latent_mask_editing for item in metadata)
+
+    @property
+    def is_minimax_h3(self) -> bool:
+        config = self._resolve_diffusion_od_config()
+        architectures = set(self._get_model_architectures(config))
+        return bool(architectures & {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"})
+
+    @property
+    def controlnet_configured(self) -> bool:
+        """Whether the active model was started with a control checkpoint."""
+        config = self._resolve_diffusion_od_config()
+        if config is not None and hasattr(config, "controlnet_model_path"):
+            return bool(config.controlnet_model_path)
+        # Out-of-process clients expose only an architecture/capability view.
+        # Read the actual stage projection in that case, never request extras.
+        stages = self.stage_configs
+        if stages is None:
+            stages = getattr(self._engine_client, "stage_configs", None)
+        for stage in stages or []:
+            if get_stage_type(stage) != "diffusion":
+                continue
+            projection = _config_value(stage, "diffusion_config")
+            if projection is None:
+                projection = _config_value(stage, "engine_args") or {}
+            architecture = _config_value(projection, "model_class_name") or _config_value(stage, "model_arch")
+            if architecture not in {"MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"}:
+                continue
+            if _config_value(projection, "controlnet_model_path"):
+                return True
+        return False
 
     @property
     def supports_timeline_guides(self) -> bool:
@@ -429,6 +472,9 @@ class OmniOpenAIServingVideo:
         guide_input = request._timeline_guide_input
         if guide_input is not None:
             multi_modal_data["timeline_guides"] = guide_input.guides
+        if request._minimax_h3_control_media:
+            # MINIMAX_H3_CONTROL_MEDIA_KEY: server-persisted control uploads, never request extras.
+            multi_modal_data["minimax_h3_control"] = dict(request._minimax_h3_control_media)
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
         if vp.width is not None and vp.height is not None:
@@ -827,9 +873,15 @@ class OmniOpenAIServingVideo:
 
     def _extract_video_outputs(self, result: object) -> list[DiffusionPayloadValue]:
         videos = None
-        if hasattr(result, "images") and result.images:
+        custom_output = getattr(result, "custom_output", None)
+        if isinstance(custom_output, Mapping) and "video_frames" in custom_output:
+            videos = custom_output["video_frames"]
+            has_custom_video = True
+        else:
+            has_custom_video = False
+        if not has_custom_video and hasattr(result, "images") and result.images:
             videos = result.images
-        if videos is None:
+        if videos is None and not has_custom_video:
             multimodal_output = getattr(result, "multimodal_output", None)
             if isinstance(multimodal_output, Mapping):
                 videos = multimodal_output.get("video")

@@ -62,6 +62,8 @@ stages:
 - The `channels_last` level changes the order in which cuDNN accumulates
   convolutions, so outputs differ from the reference in the last bits. Use
   `lossless` when bitwise reproducibility against diffusers matters.
+- `channels_last` also skips internal decoder bitwise padding checks to reduce
+  first-decode peak memory. Lossless decoding retains all of its checks.
 - For a supported causal convolution with one input frame and no history,
   the temporal input is `[0, 0, x]`. The `channels_last` level uses Conv2d with
   the last temporal weight slice, preserving the convolution formula for
