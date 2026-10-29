@@ -186,6 +186,27 @@ def test_identical_effective_profiles_dedup_to_shared_record(attention_env):
     assert attention._schedule_candidates["a"].impl is attention._schedule_candidates["b"].impl
 
 
+def test_candidate_with_the_baseline_identity_reuses_the_baseline_impl(attention_env):
+    """A profile resolving to the baseline's backend, flag, impl class and kwargs builds no second impl."""
+    schedule = AttentionScheduleConfig(
+        profiles={
+            "same": AttentionConfig(default=AttentionSpec(backend="SDPA")),
+            "auto": AttentionConfig(),
+            "calibrated": AttentionConfig(default=AttentionSpec(backend="SDPA", skip_calibration={"a": 1.0})),
+        },
+        default=[{"start": 0, "end": None, "profile": "same"}],
+    )
+    layer = attention_env.build(
+        _make_config(baseline=AttentionConfig(default=AttentionSpec(backend="SDPA")), schedule=schedule)
+    )
+
+    assert layer._schedule_candidates["same"].impl is layer.attention
+    # A profile that leaves the role on the platform default is a different identity.
+    assert layer._schedule_candidates["auto"].impl is not layer.attention
+    # Its own calibration is stamped onto its own impl, so it never shares the baseline's.
+    assert layer._schedule_candidates["calibrated"].impl is not layer.attention
+
+
 def test_candidates_are_built_with_the_baseline_impl_arguments(attention_env):
     """A candidate impl gets every argument the baseline impl gets, except its own backend selection."""
     schedule = AttentionScheduleConfig(
