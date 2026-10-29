@@ -461,3 +461,23 @@ def test_format_empty_diffusion_outputs_preserves_custom_output() -> None:
 
     assert result.custom_output == {"lifecycle": "started"}
     assert result.finished is False
+
+
+def test_formatter_routes_segmentation_payload_to_multimodal_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    segmentation = {"masks": torch.zeros(1, 4, dtype=torch.uint8), "scores": torch.tensor([0.9])}
+    postprocess_output = normalize_diffusion_postprocess_output({"segmentation": segmentation})
+
+    [result] = format_diffusion_outputs(
+        request=_request("prompt-0"),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data={"segmentation": segmentation},
+        postprocess_output=postprocess_output,
+    )
+
+    # Structured payloads are not images: they travel under their own key.
+    assert result.images == []
+    assert result.multimodal_output["segmentation"] is segmentation

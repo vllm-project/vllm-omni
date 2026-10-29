@@ -249,7 +249,7 @@ def _cpu_manager(model):
 def test_manager_preserves_item_order_deepstack_and_previous_outputs():
     model = _thinker()
     manager = _cpu_manager(model)
-    inputs = _images([[1, 2, 4], [1, 2, 2]])  # packing reorders 2/1-token images
+    inputs = _images([[1, 2, 4], [1, 2, 2]])  # 2/1-token images in one replay
     expected = model.encoder_eager_forward(inputs).split([2, 1])
     outputs = manager.execute(inputs)
     assert manager.graph_hits == 2

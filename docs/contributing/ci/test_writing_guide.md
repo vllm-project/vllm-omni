@@ -96,6 +96,39 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
 5. **Works with pytest filtering**  
    Allows tests to be filtered and selected at runtime using standard pytest marker expressions (e.g., `-m "H100 and cards_2"`, `-m "L4 and not cards_1"`).
 
+##### Platform marker contract
+
+Do not add an `amd` marker. The repository already selects AMD with `rocm`.
+
+| Marker | Meaning |
+| --- | --- |
+| `cpu` | Shared CPU-mode test. AMD jobs keep running these. |
+| `cuda` | Qualified for NVIDIA CUDA. |
+| `rocm` | Qualified for AMD ROCm. Add `rocm: MI325` only after the test has passed on ROCm. |
+| `nvidia_only` | Explicit NVIDIA dependency. Keep it during migration. |
+
+A cross-platform test lists both platforms. The same card count stays one item:
+
+```python
+@hardware_test(
+    res={"cuda": "L4", "rocm": "MI325"},
+    num_cards=1,
+)
+```
+
+Different card counts become one collected variant per platform:
+
+```python
+@hardware_test(
+    res={"cuda": "H100", "rocm": "MI325"},
+    num_cards={"cuda": 4, "rocm": 2},
+)
+```
+
+`check-mark` rejects an effective item that has both `rocm` and `nvidia_only`, including combinations created by class-level and stacked function parametrizations. Using the `torch.cuda` namespace does not make a test NVIDIA-only: PyTorch ROCm also uses that namespace. A CPU test stays `pytest.mark.cpu`; do not relabel it to keep an AMD GPU job green.
+
+AMD GPU jobs select `rocm`, not `cuda`. To migrate a legacy selector, first run its current CUDA-marked collection on AMD, add `rocm: MI325` only to the items that pass, and preserve every existing CUDA mark. Compare the old and new node manifests, account explicitly for expected NVIDIA-only or runtime-skipped removals, and add an exact nonzero collection check to the job so later marker drift fails before the GPU workload starts.
+
 ##### Example usage for decorator
 
 - Single call for multiple platforms:
@@ -128,15 +161,17 @@ This decorator is intended to make hardware-aware, cross-platform test authoring
 ```python
 from tests.helpers.mark import hardware_marks
 
-MULTI_CARD_MARKS = hardware_marks(
-    res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2
-)
+MULTI_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A2"}, num_cards=2)
 
-@pytest.mark.parametrize("omni_server", [
-    pytest.param(OmniServerParams(...), id="case_001", marks=MULTI_CARD_MARKS),
-], indirect=True)
-def test_feature(omni_server):
-    ...
+
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(OmniServerParams(...), id="case_001", marks=MULTI_CARD_MARKS),
+    ],
+    indirect=True,
+)
+def test_feature(omni_server): ...
 ```
 
 #### JSON `mark` field (L4 perf configs)
@@ -188,6 +223,7 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
    ```python
    # In vllm-omni/tests/helpers/mark.py
 
+
    def _tpu_marks(*, res: str, num_cards: int):
        _require_sku("tpu", res)
        return [pytest.mark.tpu, getattr(pytest.mark, res), _cards_mark(num_cards)]
@@ -206,8 +242,7 @@ If you want to add support for a new platform (e.g., "tpu" for a new accelerator
        res={"tpu": "TPU_V3"},
        num_cards=2,
    )
-   def test_my_tpu_feature():
-       ...
+   def test_my_tpu_feature(): ...
    ```
 
 **Summary**:  
@@ -303,6 +338,7 @@ Examples from `tests/model_executor/models/qwen2_5_omni/test_audio_length.py`
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_resolve_max_mel_frames_default():
     from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import resolve_max_mel_frames
@@ -479,7 +515,7 @@ L3 level testing executes after code is merged into the main branch. Its core pu
             "audio": ["water", "cricket"],
             "video": ["sphere", "globe", "circle", "round"],
             "image": ["square", "quadrate"],
-            "text": ["beijing"]
+            "text": ["beijing"],
         },
     }
     ```

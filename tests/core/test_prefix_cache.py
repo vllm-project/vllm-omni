@@ -42,6 +42,7 @@ from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheSchedulerAdapter,
     PrefixCacheStep,
 )
+from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
 from vllm_omni.core.prefix_cache.controller import StagingBufferHolder, WriteTaskHandle
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
@@ -370,6 +371,15 @@ def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
         third = run_step(mgr, view, {"a": ([0, 1], 5, 1)}, new_hits={"a": 4})
         assert not mgr._step_ctxs[third].hits
         assert mgr.materialize(third, ["a"]).hidden_states["a"].shape == (1, HIDDEN)
+    finally:
+        mgr.shutdown()
+
+
+def test_owned_step_outputs_must_be_unpadded():
+    mgr, _ = make_manager()
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="owned step outputs must be unpadded: 4 rows for 2"):
+            mgr._split_step_outputs(torch.zeros(4, HIDDEN), {}, 2, 4, owned=True)
     finally:
         mgr.shutdown()
 
@@ -706,8 +716,8 @@ def test_cap_forces_flush_of_deferred():
         mgr.materialize(sid, ["a"])
     # Fourth chunk flushed the first three; only it is still charged.
     assert mgr._controller._staged_bytes == 16
-    rows = mgr._pool.rows("k", view.slots_for("a", 0, 4))[:, 0].tolist()
-    assert rows == [1.0, 2.0, 3.0, 0.0]
+    slots = view.slots_for("a", 0, 4)
+    assert mgr._pool.rows("k", slots[:3])[:, 0].tolist() == [1.0, 2.0, 3.0]
     assert mgr._request_tasks.deferred["a"].write_n == 2
     assert len(mgr._request_tasks.tasks["a"]) == 1  # the flushed write was drained
 
@@ -1182,10 +1192,13 @@ def test_materialize_unknown_step_id_fails_fast():
     mgr.discard_step(sid)
 
 
-def test_mm_hit_span_never_registered_serves_mirror_baseline():
+@pytest.mark.parametrize("deferred", [frozenset(), frozenset({"k"})])
+def test_mm_hit_span_never_registered_serves_mirror_baseline(monkeypatch, deferred):
     """A hit span slot on which a sparse mm key was never registered is
     legitimate absence — served from the mirror baseline, not a crash."""
-    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"k"}))
+    alloc = PrefixBlockPool._alloc
+    monkeypatch.setattr(PrefixBlockPool, "_alloc", lambda self, dtype, feat: alloc(self, dtype, feat).fill_(7.0))
+    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=deferred)
     mgr, view = make_manager(policy=policy)
     s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 5.0)})
     mgr.materialize(s1, ["a"])
@@ -1284,7 +1297,7 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
         original = WriteTask.mark_host_ready
 
         def fail_copy(task):
-            if task.req_id == "b":
+            if task.req_id == "a":
                 raise RuntimeError("injected copy failure")
             return original(task)
 
@@ -1293,7 +1306,7 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
         original = ctrl._scatter
 
         def fail_scatter(task):
-            if task.req_id == "b":
+            if task.req_id == "a":
                 raise RuntimeError("injected scatter failure")
             return original(task)
 
@@ -1304,12 +1317,9 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
             run_step(mgr, view, {"a": ([0], 0, 4), "b": ([1], 0, 4), "c": ([2], 0, 4)})
         assert set(mgr._step_ctxs) == {preserved_sid}
         assert ctrl._staged_bytes == 0
-        tasks = [task for task in ctrl._tasks.values() if task.req_id in {"a", "b", "c"}]
-        assert len(tasks) == 3
-        for task in tasks:
-            expected = TaskState.WRITTEN if task.req_id == "a" else TaskState.FAILED
-            assert task.state is expected
-            assert task.done.is_set() and task.host_ready.is_set()
+        (task,) = [task for task in ctrl._tasks.values() if task.req_id in {"a", "b", "c"}]
+        assert task.state is TaskState.FAILED
+        assert task.done.is_set() and task.host_ready.is_set()
         assert all(
             holder == StagingBufferHolder.for_step(preserved_sid)
             for holders in ctrl._staging_pool._busy
@@ -1350,14 +1360,12 @@ def test_eager_escalation_failure_releases_deferred_tasks(monkeypatch):
         mgr.shutdown()
 
 
-def test_per_request_staging_writes():
+def test_step_shares_one_staging_write():
     mgr, view = make_manager()
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8), "d": ([2], 0, 1)})
-    tp = mgr._controller._tasks.get(next(iter(mgr._request_tasks.tasks["p"])))
-    td = mgr._controller._tasks.get(next(iter(mgr._request_tasks.tasks["d"])))
-    assert tp is not None and td is not None
-    assert (tp.req_id, td.req_id) == ("p", "d")
-    assert mgr._join_next_step_tids == [tp.tid, td.tid]
+    (tid,) = mgr._request_tasks.tasks["p"]
+    assert mgr._request_tasks.tasks["d"] == {tid}
+    assert mgr._join_next_step_tids == [tid]
     outs = mgr.materialize(sid, ["p", "d"])
     assert torch.equal(outs.hidden_states["p"], expected_rows(view.slots_for("p", 0, 8)))
     assert torch.equal(outs.hidden_states["d"], expected_rows(view.slots_for("d", 0, 1)))
@@ -1618,6 +1626,27 @@ def test_delayed_read_after_committed_reuse_serves_preserved():
         got = mgr._fetch_source(src)
     assert torch.equal(got, expected_rows(slots))
     assert all(ref is not src for ref in mgr._pending_reads)
+    assert not any(bool(counts.any()) for counts in mgr._pending_slot_refs.values())
+
+
+def test_pending_slot_counts_drain_with_duplicate_slots():
+    """The per-slot pending-ref counter is the fast-path gate for COW
+    preservation: a ref counts each of its slots, duplicates included, and
+    the fetch's unregister takes the same amount back."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(s1, ["a"])
+    slots = view.slots_for("a", 0, 4)
+    dup = torch.cat([slots, slots[:1]])
+    with mgr._state_lock:
+        src = mgr._slot_ref(dup, HIDDEN_KEY, "a")
+    counts = mgr._pending_slot_refs[HIDDEN_KEY]
+    assert counts[slots].tolist() == [2, 1, 1, 1] and int(counts.sum()) == 5
+    with torch.inference_mode():
+        got = mgr._fetch_source(src)
+    assert torch.equal(got, expected_rows(dup))
+    assert not any(bool(c.any()) for c in mgr._pending_slot_refs.values())
+    mgr.shutdown()
 
 
 def test_done_fires_only_after_completion_record_published():
@@ -1863,10 +1892,10 @@ def _bare_controller(eager=True):
 def test_manager_partial_publish_failure_releases_resources(monkeypatch):
     policy = ModelCachePolicy(deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
-    map_slots = mgr._map_slots
+    claim_slots = mgr._claim_slots
 
-    def fail_publish(slots, tid, keys):
-        map_slots(slots, tid, keys)
+    def fail_publish(slots, keys, spans):
+        claim_slots(slots, keys, spans)
         if "k" in keys:
             raise RuntimeError("partial publish")
 
@@ -1874,7 +1903,7 @@ def test_manager_partial_publish_failure_releases_resources(monkeypatch):
         # Rollback must release both the old and newly appended deferred rows.
         sid = run_step(mgr, view, {"a": ([0], 0, 1)}, mm={"k": torch.ones(1, 2)})
         mgr.materialize(sid, ["a"])
-        monkeypatch.setattr(mgr, "_map_slots", fail_publish)
+        monkeypatch.setattr(mgr, "_claim_slots", fail_publish)
         with pytest.raises(RuntimeError, match="partial publish"):
             run_step(mgr, view, {"a": ([0], 1, 1), "b": ([1], 0, 2)}, mm={"k": torch.ones(3, 2)})
         assert mgr._step_ctxs == {}
@@ -2013,12 +2042,21 @@ def test_scatter_host_ready_writes_only_staged_tasks():
     assert torch.equal(pool.rows(HIDDEN_KEY, slots), torch.ones(2, HIDDEN))
 
 
+def test_release_bytes_rejects_more_than_charged():
+    ctrl, _ = _bare_controller()
+    ctrl.reserve_bytes(64)
+    ctrl.release_bytes(64)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="releasing 1 GPU-budget bytes with only 0 charged"):
+        ctrl.release_bytes(1)
+    assert ctrl._staged_bytes == 0
+
+
 def test_budget_ticket_uncharges_once_per_clone():
     from vllm_omni.core.prefix_cache.controller import _BudgetTicket
 
     ctrl, _ = _bare_controller()
     ticket = _BudgetTicket(nbytes=100)
-    ctrl._reserve_bytes(100)
+    ctrl.reserve_bytes(100)
     a, _ = _bare_task(tid=1, budget=ticket)
     b, _ = _bare_task(tid=2, budget=ticket)
     ctrl._pin_budget(ticket, 1)
@@ -2038,7 +2076,7 @@ def test_fail_task_after_copy_does_not_uncharge_twice():
 
     ctrl, _ = _bare_controller()
     ticket = _BudgetTicket(nbytes=64)
-    ctrl._reserve_bytes(64)
+    ctrl.reserve_bytes(64)
     task, _ = _bare_task(tid=3, budget=ticket, queued=True)
     ctrl._tasks[task.tid] = task
     ctrl._pin_budget(ticket, 3)

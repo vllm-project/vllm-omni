@@ -59,16 +59,19 @@ def _minimax_h3_keyframe_encode_context(
 
     # Deterministic cuDNN algorithms can still use reduced-precision TF32.
     # On Hopper, TF32 can shift the keyframe latent enough to push I2VA below
-    # the reference accuracy thresholds. Use FP32 convolutions for this
-    # sensitive encode only; preserve the existing math mode elsewhere.
+    # the reference accuracy thresholds. Use FP32 deterministic convolutions
+    # for this sensitive CUDA encode only. MIOpen has no deterministic
+    # algorithm for the MI325 timeline-guide convolution, so applying the
+    # cuDNN policy on ROCm raises ``miopenStatusUnknownError``.
+    deterministic = current_omni_platform.is_cuda()
     allow_tf32 = True
-    if current_omni_platform.is_cuda():
+    if deterministic:
         capability = current_omni_platform.get_device_capability(device.index or 0)
         allow_tf32 = capability is None or capability.major != 9
     with torch.backends.cudnn.flags(
         enabled=True,
         benchmark=False,
-        deterministic=True,
+        deterministic=deterministic,
         allow_tf32=allow_tf32,
     ):
         yield
@@ -260,9 +263,12 @@ class _AudioVAEDeterminismContext(AbstractContextManager):
         backends.cuda.enable_flash_sdp(False)
         backends.cuda.enable_mem_efficient_sdp(False)
         backends.cuda.enable_math_sdp(True)
+        self._jit_executor = torch.jit.optimized_execution(False)
+        self._jit_executor.__enter__()
         return self
 
     def __exit__(self, exc_type, exc, traceback):
+        self._jit_executor.__exit__(exc_type, exc, traceback)
         backends = torch.backends
         (
             backends.cuda.matmul.allow_tf32,
@@ -1034,6 +1040,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     # denormalizes and clamps into the unit interval.
     chunk_value_range: ClassVar[tuple[float, float]] = (0.0, 1.0)
 
+    @property
+    def owns_chunk_output(self) -> bool:
+        """Whether this rank publishes frames to the streaming MP4 consumer."""
+        if not self.is_distributed_enabled():
+            return True
+        group = self._native_parallel_state().get("sp_process_group")
+        if group is None:
+            raise RuntimeError("MiniMax-H3 VAE chunk decode has no spatial-parallel group")
+        return dist.get_rank(group) == 0
+
     @torch.inference_mode()
     def decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
         """Decode temporal clips and synchronously publish frames-only chunks.
@@ -1228,7 +1244,10 @@ class MiniMaxH3AudioVAE(nn.Module):
             device=latent.device,
             dtype=latent.dtype,
         ).view(1, channels, 1)
-        waveform = self.remote.decode(latent * std + mean)
+        # The remote decoder's TorchScript activations round differently on
+        # their first (unfused) call; keep every request on the same path.
+        with torch.jit.optimized_execution(False):
+            waveform = self.remote.decode(latent * std + mean)
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"unexpected decoded audio shape {tuple(waveform.shape)}")
         return waveform.permute(1, 0, 2).contiguous().float()

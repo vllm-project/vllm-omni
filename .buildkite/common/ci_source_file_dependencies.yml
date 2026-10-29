@@ -1,4 +1,4 @@
-# Uploader-only path-prefix presets for CUDA L2–L5 and NPU L4 test YAML.
+# Uploader-only path-prefix presets for CUDA L2–L5, AMD L4/L5, and NPU L4 test YAML.
 # Referenced as ``source_file_dependencies: omni_qwen3_omni_function`` (or a list of
 # keys) on a step; ``upload_pipeline.py`` expands the key(s) only.
 #
@@ -134,6 +134,27 @@ x-qwen3-omni: &qwen3_omni
   - vllm_omni/deploy/qwen3_omni_moe_mrv2_h200.yaml
   - vllm_omni/deploy/qwen3_omni_moe_thinking.yaml
 
+x-cosyvoice3: &cosyvoice3
+  - vllm_omni/model_executor/models/cosyvoice3/
+  - vllm_omni/diffusion/models/cosyvoice3_audio/
+  - vllm_omni/model_executor/stage_input_processors/cosyvoice3.py
+  - vllm_omni/transformers_utils/configs/cosyvoice3.py
+  - vllm_omni/entrypoints/openai/tts_adapters/cosyvoice3.py
+  - vllm_omni/deploy/cosyvoice3.yaml
+
+x-personaplex: &personaplex
+  - vllm_omni/model_executor/models/personaplex/
+  - vllm_omni/model_executor/stage_input_processors/personaplex.py
+  - vllm_omni/deploy/personaplex.yaml
+
+x-joy-image: &joy_image
+  - vllm_omni/diffusion/models/joy_image/
+
+x-pi05: &pi05
+  - vllm_omni/diffusion/models/pi05/
+  - vllm_omni/diffusion/models/pi05_pipeline_config.py
+  - vllm_omni/deploy/pi05.yaml
+
 x-wan22: &wan22
   - vllm_omni/diffusion/models/wan2_2/
   - vllm_omni/diffusion/models/dmd2/
@@ -260,6 +281,8 @@ source_file_dependencies:
 
   omni_qwen3_omni_function:
     - *qwen3_omni
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
     - tests/e2e/offline_inference/test_qwen3_omni.py
     - tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
     - tests/e2e/offline_inference/test_qwen3_omni_autoround_w4a16_expansion.py
@@ -268,6 +291,37 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen3_omni_expansion.py
     - tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
     - tests/e2e/online_serving/test_qwen3_omni_thinking.py
+
+  omni_qwen3_omni_duplex_playback_function:
+    - *qwen3_omni
+    - *duplex
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py
+    - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+    - tests/assets/minicpmo_4_5/
+    - tests/assets/semantic_vad/
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/deploy/qwen3_omni_duplex.yaml
+
+  omni_bagel_sleep_function:
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/entrypoints/test_omni_sleep_mode.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/stage_config.py
+    - vllm_omni/deploy/bagel.yaml
+    - vllm_omni/deploy/bagel_single_stage.yaml
+    - vllm_omni/diffusion/models/bagel/
+    - vllm_omni/diffusion/worker/diffusion_worker.py
+    - vllm_omni/engine/async_omni_engine.py
+    - vllm_omni/engine/orchestrator.py
+    - vllm_omni/engine/stage_engine_core_proc.py
+    - vllm_omni/engine/stage_pool.py
+    - vllm_omni/entrypoints/async_omni.py
+    - vllm_omni/model_executor/models/bagel/
+    - vllm_omni/model_executor/stage_input_processors/bagel.py
+    - vllm_omni/model_extras/bagel.py
+    - vllm_omni/worker/base.py
 
   omni_qwen3_omni_shm_leak_function:
     - *qwen3_omni
@@ -287,21 +341,13 @@ source_file_dependencies:
 
   omni_qwen3_omni_perf:
     - *qwen3_omni
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
     - tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
     - tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
     - tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
-
-  omni_qwen3_omni_seed_tts_perf:
-    - *qwen3_omni
-    - tests/dfx/perf/scripts/run_benchmark.py
-    - tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json
-    - vllm_omni/benchmarks/realtime_seed_tts.py
-    - vllm_omni/benchmarks/patch/patch.py
-    - vllm_omni/benchmarks/data_modules/seed_tts_dataset.py
-    - vllm_omni/clients/duplex.py
-    - vllm_omni/deploy/qwen3_omni_duplex.yaml
 
   omni_qwen3_omni_duplex_perf:
     - *qwen3_omni
@@ -334,6 +380,40 @@ source_file_dependencies:
     - examples/online_serving/qwen2_5_omni/
     - examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py
     - tests/examples/online_serving/test_qwen2_5_omni.py
+
+  omni_processor_function:
+    - .buildkite/amd/scripts/run-omni-processor-test.sh
+    - tests/model_executor/helpers.py
+    - tests/model_executor/models/registry.py
+    - tests/model_executor/models/test_omni_processing.py
+    - vllm_omni/config/
+    - vllm_omni/model_executor/models/
+    - vllm_omni/transformers_utils/repo_utils.py
+
+  omni_mimo_audio_function:
+    - examples/online_serving/mimo_audio/
+    - tests/e2e/online_serving/test_mimo_audio_expansion.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/deploy/mimo_audio.yaml
+    - vllm_omni/model_executor/models/mimo_audio/
+    - vllm_omni/model_executor/stage_input_processors/mimo_audio.py
+
+  omni_ming_flash_omni_function:
+    - tests/e2e/offline_inference/test_ming_flash_omni_expansion.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/deploy/ming_flash_omni.yaml
+    - vllm_omni/deploy/ming_flash_omni_thinker_only.yaml
+    - vllm_omni/model_executor/models/ming_flash_omni/
+    - vllm_omni/model_executor/stage_input_processors/ming_flash_omni.py
+    - vllm_omni/model_executor/stage_input_processors/ming_talker.py
+    - vllm_omni/model_extras/ming_flash_omni.py
+    - vllm_omni/transformers_utils/configs/ming_flash_omni.py
+    - vllm_omni/transformers_utils/configs/ming_talker.py
+    - vllm_omni/transformers_utils/processors/ming.py
+
+  omni_personaplex_temporal_function:
+    - *personaplex
+    - tests/model_executor/models/personaplex/test_temporal_streaming_hoist.py
 
   omni_minicpmo_4_5_function:
     - *minicpmo_4_5
@@ -390,6 +470,10 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
     - tests/e2e/online_serving/test_minicpmo_4_5_window.py
     - tests/e2e/online_serving/helpers/minicpmo_window_e2e.py
+    - tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py
+    - tests/e2e/online_serving/test_minicpmo_duplex_recognition_contract.py
+    - tests/e2e/online_serving/helpers/minicpmo_duplex_recognition.py
+    - examples/online_serving/minicpmo/realtime_duplex_demo.py
     - tests/e2e/online_serving/test_duplex_client_live.py
     - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
     - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py
@@ -432,14 +516,53 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen3_tts_customvoice.py
     - tests/e2e/online_serving/test_qwen3_tts_customvoice_expansion.py
 
+  tts_cosyvoice3_function:
+    - *cosyvoice3
+    - tests/assets/cosyvoice3/
+    - tests/e2e/offline_inference/test_cosyvoice3_expansion.py
+    - tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py
+
   tts_drama_3_function:
     - *fish_omni
     - tests/e2e/online_serving/test_drama_3.py
+    # Stage 0 stays on Model Runner V2. A change there, or in the NPU runner
+    # that builds Ascend attention metadata, must run the Drama 3 jobs.
+    - vllm_omni/worker_v2/
+    - vllm_omni/platforms/npu/worker/npu_omni_v2_model_runner.py
 
   tts_qwen3_tts_perf:
     - *qwen3_tts
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_tts.json
+
+  tts_voxtral_tts_perf:
+    - tests/dfx/perf/scripts/run_benchmark.py
+    - tests/dfx/perf/tests/test_tts.json
+    - vllm_omni/config/omni_config.py
+    - vllm_omni/config/pipeline_registry.py
+    - vllm_omni/config/stage_config.py
+    - vllm_omni/core/sched/
+    - vllm_omni/data_entry_keys.py
+    - vllm_omni/deploy/voxtral_tts.yaml
+    - vllm_omni/distributed/omni_connectors/
+    - vllm_omni/engine/async_omni_engine.py
+    - vllm_omni/engine/cuda_mps.py
+    - vllm_omni/engine/orchestrator.py
+    - vllm_omni/engine/stage_engine_core_proc.py
+    - vllm_omni/engine/stage_init_utils.py
+    - vllm_omni/engine/stage_pool.py
+    - vllm_omni/engine/stage_runtime.py
+    - vllm_omni/entrypoints/omni_base.py
+    - vllm_omni/entrypoints/openai/protocol/audio.py
+    - vllm_omni/entrypoints/openai/serving_speech.py
+    - vllm_omni/entrypoints/openai/tts_adapters/
+    - vllm_omni/model_executor/models/voxtral_tts/
+    - vllm_omni/model_executor/models/registry.py
+    - vllm_omni/model_executor/stage_input_processors/voxtral_tts.py
+    - vllm_omni/transformers_utils/configs/voxtral_tts.py
+    - vllm_omni/transformers_utils/parsers/voxtral_tts.py
+    - vllm_omni/worker/gpu_model_runner.py
+    - vllm_omni/worker_v2/
 
   tts_qwen3_tts_cov:
     - *qwen3_tts
@@ -580,6 +703,7 @@ source_file_dependencies:
   diffusion_hunyuan_image3_reliability:
     - *hunyuan_image3
     - tests/dfx/reliability/test_hunyuan_image.py
+    - tests/dfx/reliability/test_hunyuan_image_ep_startup.py
     - tests/dfx/reliability/scenarios/
     - tests/dfx/reliability/helpers.py
     - tests/dfx/conftest.py
@@ -630,6 +754,14 @@ source_file_dependencies:
     - *stable_audio
     - tests/e2e/offline_inference/test_stable_audio_expansion.py
     - tests/e2e/online_serving/test_stable_audio_online_expansion.py
+
+  diffusion_joy_image_function:
+    - *joy_image
+    - tests/diffusion/models/joy_image/test_joy_image_gpu.py
+
+  diffusion_pi05_unit:
+    - *pi05
+    - tests/diffusion/models/pi05/test_pi05_units.py
 
   diffusion_lingbot_function:
     - *lingbot_video

@@ -306,41 +306,38 @@ class _MossTTSAdapterBase(ARTTSAdapter):
     def _resolve_ref_encoder_device(self):
         """Pick the device of the API-process reference-audio encoder.
 
-        The encoder follows the code2wav stage onto its first GPU: the stage
-        worker remaps its ``devices`` entry through ``CUDA_VISIBLE_DEVICES``
+        The encoder follows the code2wav stage onto its first accelerator: the stage
+        worker remaps its ``devices`` entry through the platform's visibility variable
         and sees it as logical index 0, while replica launch restores the
-        parent environment, so the same index names the same physical GPU in
+        parent environment, so the same index names the same physical device in
         this process. When the stage pins no devices the stage worker and the
-        encoder both default to the first visible GPU. Falls back to CPU when
-        CUDA is unavailable or the stage device is not parseable.
+        encoder both default to the first visible device. Device enumeration
+        and construction use the platform interface for every variant.
+        Unavailable or unparsable stage devices fall back to CPU.
         """
         import torch  # local to avoid pulling torch at module import time
 
-        if not torch.cuda.is_available():
-            return torch.device("cpu")
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = current_omni_platform
         devices_str = self._codec_stage_devices()
-        if devices_str is None:
-            # No explicit pinning: the stage worker lands on the first visible
-            # GPU (vLLM picks cuda:0 of the un-remapped environment).
-            return torch.device("cuda", 0)
-        first = devices_str.split(",")[0].strip()
-        if not first:
-            return torch.device("cuda", 0)
+        first = devices_str.split(",")[0].strip() if devices_str is not None else ""
         if first == "cpu":
             return torch.device("cpu")
-        if not first.isdigit():
+        if first and not first.isdigit():
             logger.warning("MOSS ref encoder: codec stage devices %r not parseable; keeping CPU", devices_str)
             return torch.device("cpu")
-        index = int(first)
-        device_count = torch.accelerator.device_count()
+        index = int(first) if first else 0
+        device_count = platform.get_device_count()
         if index >= device_count:
             logger.warning(
-                "MOSS ref encoder: codec stage device cuda:%d out of range (%d visible); keeping CPU",
+                "MOSS ref encoder: codec stage device %s:%d out of range (%d visible); keeping CPU",
+                platform.device_type,
                 index,
                 device_count,
             )
             return torch.device("cpu")
-        return torch.device("cuda", index)
+        return platform.get_torch_device(index)
 
     def _get_moss_processor(self):
         """Lazily load the upstream MOSS-TTS processor once per server.

@@ -18,6 +18,7 @@ from vllm_omni.diffusion.models.causvid_wan.transformer import StageWanTransform
 from vllm_omni.diffusion.models.causvid_wan.wan_cell import WanCell
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext, CellRunSpec, CellTopology
+from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec, NoisyKVCache, NoisyKVState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -25,11 +26,11 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _bare_pipeline(*, stages: int = 1, history: int = 1) -> CausVidWanPipeline:
+def _bare_pipeline(*, step_replicas: int = 1, history: int = 1, layer_groups: int = 1) -> CausVidWanPipeline:
     """``__new__`` stub with the fields ``_plan_for`` reads."""
     pipeline = CausVidWanPipeline.__new__(CausVidWanPipeline)
-    pipeline.stage_parallel_size = stages
-    pipeline.layer_groups = 1
+    pipeline.step_replicas = step_replicas
+    pipeline.layer_groups = layer_groups
     pipeline.max_history_chunks = history
     pipeline.transformer = SimpleNamespace(num_layers=1, local_num_layers=1)
     pipeline._default_shift = CAUSVID_DEFAULT_SHIFT
@@ -153,11 +154,11 @@ def test_cell_schedule_rejects_unknown_values():
         pipeline._plan_for(req)
 
 
-@pytest.mark.parametrize("name", ["self_forcing", "latest_kv", "same_step"])
-def test_cell_schedule_accepts_known_values(name):
+@pytest.mark.parametrize(("name", "step_replicas"), [("self_forcing", 1), ("latest_kv", 4)])
+def test_cell_schedule_accepts_known_values(name, step_replicas):
     from vllm_omni.experimental.ar_diffusion.cell_schedule import Ordering
 
-    pipeline = _bare_pipeline(stages=4, history=6)
+    pipeline = _bare_pipeline(step_replicas=step_replicas, history=6)
     req = OmniDiffusionRequest(
         prompt="x",
         request_id=f"sched-{name}",
@@ -170,7 +171,7 @@ def test_cell_schedule_accepts_known_values(name):
     assert plan.schedule.ordering.value == name
 
 
-@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step_kv"])
+@pytest.mark.parametrize("name", ["serial", "latest", "interleaved", "vertical", "same_step", "same_step_kv"])
 def test_cell_schedule_rejects_removed_aliases(name):
     pipeline = _bare_pipeline()
     req = OmniDiffusionRequest(
@@ -178,7 +179,7 @@ def test_cell_schedule_rejects_removed_aliases(name):
         request_id=f"sched-alias-{name}",
         sampling_params=OmniDiffusionSamplingParams(extra_args={"cell_schedule": name}),
     )
-    with pytest.raises(ValueError, match="cell_schedule"):
+    with pytest.raises(ValueError, match="cell_schedule|same_step is not supported"):
         pipeline._plan_for(req)
 
 
@@ -199,18 +200,123 @@ def test_cell_schedule_rejects_nonpositive_steps(source, steps):
 
 
 @pytest.mark.parametrize(
-    ("stages", "expected_steps"),
+    ("stages", "schedule", "expected_steps"),
     [
-        (1, CAUSVID_DEFAULT_DENOISE_STEPS),  # S=1 keeps model default
-        (4, 3),  # S=T+1 with T=default
-        (5, 4),  # S≠1 and S≠T+1 → derive T=S-1
+        (1, "self_forcing", CAUSVID_DEFAULT_DENOISE_STEPS),  # S=1 keeps model default
+        (3, "latest_kv", 2),  # S≠1 and S≠D+1 (default D=3) → derive D=S-1 → S=D+1
+        (4, "latest_kv", 3),  # S=D+1 with D=default
+        (5, "latest_kv", 4),  # S≠1 and S≠D+1 → derive D=S-1
     ],
 )
-def test_cell_schedule_unset_steps_keep_topology_default(stages, expected_steps):
-    pipeline = _bare_pipeline(stages=stages, history=6)
-    req = OmniDiffusionRequest(prompt="x", request_id="default-steps", sampling_params=OmniDiffusionSamplingParams())
+def test_cell_schedule_unset_steps_keep_topology_default(stages, schedule, expected_steps):
+    pipeline = _bare_pipeline(step_replicas=stages, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="default-steps",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"cell_schedule": schedule, "num_chunks": 2}),
+    )
     plan, _, steps = pipeline._plan_for(req)
     assert steps == plan.schedule.num_denoise_steps == expected_steps
+    assert plan.schedule.step_replicas in (1, steps + 1)
+
+
+@pytest.mark.parametrize(
+    ("stages", "expected_ordering"),
+    [
+        (1, Ordering.SELF_FORCING),  # S=1 layer PP defaults to Self-Forcing
+        (4, Ordering.LATEST_KV),  # S>1 vertical defaults to Latest-KV
+    ],
+)
+def test_cell_schedule_default_derives_from_topology(stages, expected_ordering):
+    """cell_schedule absent: the deploy topology fixes the ordering."""
+    pipeline = _bare_pipeline(step_replicas=stages, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="default-schedule",
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"num_chunks": 2}),
+    )
+    plan, _, _ = pipeline._plan_for(req)
+    assert plan.schedule.ordering is expected_ordering
+
+
+@pytest.mark.parametrize(("layer_groups", "expect_reject"), [(1, False), (2, True)])
+def test_causvid_s1_stream_decode_single_rank_only(layer_groups, expect_reject):
+    """S=1 keeps local streaming on a single rank (G=1); G>1 has no VAE on the finish rank."""
+    pipeline = _bare_pipeline(step_replicas=1, history=6, layer_groups=layer_groups)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="s1-stream",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={
+                "cell_schedule": "self_forcing",
+                "num_denoise_steps": 3,
+                "num_chunks": 2,
+                "stream_decode": True,
+            }
+        ),
+    )
+    if expect_reject:
+        with pytest.raises(ValueError, match="no VAE on its finish rank"):
+            pipeline._plan_for(req)
+    else:
+        plan, _, _ = pipeline._plan_for(req)
+        assert plan.schedule.step_replicas == 1
+
+
+def test_causvid_rejects_explicit_s_eq_d():
+    """Latest-KV does not accept the S=D Same-Step topology."""
+    pipeline = _bare_pipeline(step_replicas=3, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="s-eq-d",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "latest_kv", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    with pytest.raises(ValueError, match=r"step_replicas must be 1 or D\+1"):
+        pipeline._plan_for(req)
+
+
+def test_causvid_rejects_vertical_self_forcing():
+    """Vertical (S>1) step replicas are Latest-KV only; Self-Forcing is S=1 layer PP."""
+    pipeline = _bare_pipeline(step_replicas=4, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="vertical-sf",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "self_forcing", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    with pytest.raises(ValueError, match="self_forcing requires step_replicas=1"):
+        pipeline._plan_for(req)
+
+
+def test_causvid_rejects_s1_latest_kv():
+    """Latest-KV is the vertical S=D+1 clean topology; S=1 layer PP is self_forcing."""
+    pipeline = _bare_pipeline(step_replicas=1, history=6)
+    req = OmniDiffusionRequest(
+        prompt="x",
+        request_id="s1-lkv",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "latest_kv", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    with pytest.raises(ValueError, match="latest_kv requires step_replicas=D\\+1"):
+        pipeline._plan_for(req)
+
+
+def test_cell_schedule_s1_steps_independent_of_history():
+    """S=1 self_forcing always runs the clean step (ordering property)."""
+    pipeline = _bare_pipeline(step_replicas=1, history=6)
+    sf = OmniDiffusionRequest(
+        prompt="x",
+        request_id="s1-sf",
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={"cell_schedule": "self_forcing", "num_denoise_steps": 3, "num_chunks": 2}
+        ),
+    )
+    plan_sf, _, _ = pipeline._plan_for(sf)
+    assert plan_sf.schedule.num_schedule_steps == 4
 
 
 @pytest.mark.parametrize("shape", [(1, 16, 1, 4, 8), (1, 16, 1, 8, 16)])
@@ -222,7 +328,7 @@ def test_pipeline_rejects_token_count_change_before_admission(shape):
     transformer.patch_size = (1, 2, 2)
     transformer.register_parameter("test_device", torch.nn.Parameter(torch.zeros(1)))
     pipeline.transformer = transformer
-    pipeline.stage_parallel_size = pipeline.layer_groups = pipeline.max_history_chunks = 1
+    pipeline.step_replicas = pipeline.layer_groups = pipeline.max_history_chunks = 1
     pipeline.block_size = pipeline.max_chunk_tokens = 16
     pipeline._chunk_ctx = None
     pipeline._default_shift = CAUSVID_DEFAULT_SHIFT
@@ -255,9 +361,9 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
     prompt = torch.zeros(1, 8, 16, device=device, dtype=dtype)
 
     class _FakeTransformer:
-        def __init__(self, *, is_stage_first: bool, is_stage_last: bool) -> None:
-            self.is_stage_first = is_stage_first
-            self.is_stage_last = is_stage_last
+        def __init__(self, *, is_layer_group_first: bool, is_layer_group_last: bool) -> None:
+            self.is_layer_group_first = is_layer_group_first
+            self.is_layer_group_last = is_layer_group_last
             self.start_layer = 0
             self.end_layer = 1
             self.dim = 8
@@ -279,7 +385,7 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
 
     sampler = FlowEuler(2, shift=1.0)
     mid = WanCell(
-        _FakeTransformer(is_stage_first=True, is_stage_last=False),  # type: ignore[arg-type]
+        _FakeTransformer(is_layer_group_first=True, is_layer_group_last=False),  # type: ignore[arg-type]
         sampler=sampler,
         prompt_embeds=prompt,
         latent_shape=shape,
@@ -288,7 +394,7 @@ def test_latent_adapter_g_gt1_packs_hidden_and_advances_on_last_only():
         dtype=dtype,
     )
     last = WanCell(
-        _FakeTransformer(is_stage_first=False, is_stage_last=True),  # type: ignore[arg-type]
+        _FakeTransformer(is_layer_group_first=False, is_layer_group_last=True),  # type: ignore[arg-type]
         sampler=sampler,
         prompt_embeds=prompt,
         latent_shape=shape,

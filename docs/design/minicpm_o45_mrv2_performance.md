@@ -201,3 +201,68 @@ A larger limit can compete with Thinker/Talker on a shared device, so keep the
 conservative default until cold and warm end-to-end TTFP/RTF measurements
 justify a change. Setup prefetch remains a separate opt-in; warming prompt
 features does not imply warming the CFM setup or achieving lower TTFP.
+
+## CPU-reference CUDA speaker extraction
+
+`token2wav_spk_cpu_reference: true` in connector `extra` selects a CUDA
+TensorRT speaker backend compatible with the CPU ONNX reference graph.
+`minicpmo_4_5.yaml` sets it by default, so a CUDA host with TensorRT installed
+uses this speaker. If `tensorrt` cannot be imported, startup logs a warning and
+keeps the Torch speaker, so CI images without TensorRT still load this profile.
+Set the flag to `false` in an overlay to keep Torch even when TensorRT is
+installed. Other platforms ignore the flag. An
+explicit `token2wav_trt: true`,
+`MINICPMO_TOKEN2WAV_TRT=1`, or `token2wav_device_spk: false` keeps the full
+DiT TensorRT path or the CPU onnxruntime fallback and drops this flag.
+The CAM++ TensorRT profile accepts 4 to 3000 fbank frames. The default 6 s
+window is 598 frames and stays on this path. A wider
+`ref_audio_max_seconds` is checked before the engine is installed: 31 s
+normalizes to 3098 frames and is rejected at startup, rather than failing while
+the first prompt is prepared. It does not change DiT, HiFT, sampling or chunk size.
+
+`minicpmo_4_5.yaml` sets `cuda_mps: true` under `platforms.cuda`, so colocated
+CUDA stages share a private MPS daemon when `nvidia-cuda-mps-control` is on
+PATH and every stage is one numeric GPU with sequential initialization. NPU
+does not enable it. A missing control binary, an MPS daemon that fails to
+start or respond, `parallel_stage_init`, or a
+non-numeric / multi-GPU stage disables MPS and continues. Set `cuda_mps: false`
+in an overlay to disable it explicitly. Improved throughput can trade off
+against first-audio tail latency and low-concurrency throughput.
+
+Install a TensorRT build matching the CUDA runtime before enabling the speaker
+flag on CUDA. For example, the CUDA 13 validation environment uses
+`tensorrt-cu13==11.4.0.106`. ONNX Runtime remains required: startup exports
+its BASIC-optimized graph before building the TensorRT engine. CAM++ uses
+zero padding followed by ceil-mode average pooling. ONNX Runtime's PadFusion
+changes the partial-window denominator; converting the original graph
+directly would not reproduce the existing CPU reference. This path
+uses the optimized graph and disables TensorRT TF32 for speaker extraction.
+This does not change the independent CFM TF32 policy.
+
+`COSYVOICE3_TRT_CACHE` controls the derived ONNX and engine cache directory
+(default: `~/.cache/vllm_omni/cosyvoice3_trt`). Derived ONNX files are keyed
+by source content and ONNX Runtime version and published under a file lock.
+Derived graphs and engines are atomically published from uniquely named sibling
+files using normal file-creation permissions (0666 filtered by the process
+umask). Complete cache hits do not acquire a write lock. A prebuilt cache
+can be mounted read-only only when its derived ONNX and engine keys still
+match. Engine keys include the ONNX absolute path, size and integer-second
+mtime, as well as precision policy, device name and TensorRT version. For
+CPU-reference mode, this ONNX is the derived file inside the cache directory:
+keep the same absolute mount path and preserve file mtimes when copying the
+cache (for example, with `cp -a`). The source content and ONNX Runtime version
+must also match to select the same derived ONNX. Relocating the cache or
+changing mtimes produces a cache miss, even with identical model bytes.
+Cold builds retain a lock and re-check the artifact under it; misses on a
+read-only mount can raise `PermissionError` when acquiring the build lock.
+Prebuild in a writable cache at the final path before mounting it read-only,
+or provide a writable cache directory for rebuilding. The
+first start builds an engine and can take substantially longer; measure
+startup separately from steady-state serving. Source model files are not
+modified. Revalidate speaker similarity and generated speech quality when
+changing backend versions; floating-point waveform identity is not promised.
+
+`minicpmo_4_5.yaml` enables both `token2wav_spk_cpu_reference` and
+`platforms.cuda.cuda_mps`. Profiles that inherit it, including
+`minicpmo_4_5_turn.yaml`, inherit both. Set either key to `false` in an
+overlay to disable that part.

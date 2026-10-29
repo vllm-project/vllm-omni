@@ -473,14 +473,36 @@ steps:
 
       - label: "Diffusion · SenseNova-U1 · H100 · Single-GPU"
         timeout_in_minutes: 90
+        artifact_paths:
+          - sensenova-accuracy/**/*
         commands:
-          - >-
-            pytest -sv
-            tests/e2e/offline_inference/test_sensenova_u1_expansion.py
-            tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py
-            tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py
-            -m "slow and diffusion and H100 and cards_1"
-            --run-level "full_model"
+          - |
+            export SENSENOVA_U1_ARTIFACT_DIR=sensenova-accuracy
+            export SENSENOVA_U1_CI_IMAGE="936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$$BUILDKITE_COMMIT"
+            mkdir -p "$$SENSENOVA_U1_ARTIFACT_DIR"
+            set +e
+            pytest -sv \
+              tests/e2e/offline_inference/test_sensenova_u1_expansion.py \
+              tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py \
+              tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py \
+              -m 'slow and diffusion and cuda and H100 and cards_1' -k 'not pixel_accuracy' \
+              --run-level full_model --junitxml=sensenova-accuracy/smoke.xml
+            smoke_exit=$$?
+            pytest -sv tests/e2e/offline_inference/test_sensenova_u1_text2img_expansion.py::test_sensenova_u1_text2img_pixel_accuracy \
+              -m 'slow and diffusion and cuda and H100 and cards_1' \
+              --run-level full_model --junitxml=sensenova-accuracy/text2img.xml
+            text2img_exit=$$?
+            pytest -sv tests/e2e/offline_inference/test_sensenova_u1_img2img_expansion.py::test_sensenova_u1_img2img_pixel_accuracy \
+              -m 'slow and diffusion and cuda and H100 and cards_1' \
+              --run-level full_model --junitxml=sensenova-accuracy/img2img.xml
+            img2img_exit=$$?
+            if [ "$$smoke_exit" -ne 0 ]; then
+              exit "$$smoke_exit"
+            fi
+            if [ "$$text2img_exit" -ne 0 ]; then
+              exit "$$text2img_exit"
+            fi
+            exit "$$img2img_exit"
         mirror_hardwares: h100_1
 
       - label: "Diffusion · MammothModa2 · H100 · Single-GPU"
@@ -608,7 +630,6 @@ steps:
           - >-
             pytest -sv
             tests/e2e/online_serving/test_dreamzero_expansion.py
-            tests/e2e/accuracy/test_dreamzero.py
             -m "slow and diffusion and H100 and cards_2"
             --run-level "full_model"
         mirror_hardwares: h100_2

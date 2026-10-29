@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 from numpy.typing import NDArray
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
 
@@ -1330,15 +1331,13 @@ class MiniCPMO45Stage0DuplexRuntime:
             return []
         from io import BytesIO
 
-        from PIL import Image
-
         decoded: list[Image.Image] = []
         for frame_b64 in frames:
             if not isinstance(frame_b64, str) or not frame_b64:
                 continue
             try:
                 raw = base64.b64decode(frame_b64, validate=True)
-                image = Image.open(BytesIO(raw))
+                image = open_image(BytesIO(raw))
                 image.load()
             except Exception as exc:  # noqa: BLE001 - normalized below
                 raise ValueError("invalid omni duplex video frame payload") from exc

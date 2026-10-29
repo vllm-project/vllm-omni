@@ -148,8 +148,10 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
+| `seed` | integer | null | Random seed for repeatable generation. |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
+| `extra_params` | object | null | Model-specific generation controls. See the model sections for supported fields. |
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
 
@@ -182,7 +184,8 @@ response headers:
 | `x-vllm-omni-input-audio-tokens` | Reference-audio codec frames, non-zero only for in-context voice cloning. |
 
 Diffusion-mode speech servers route through a separate response path and do not
-emit these headers.
+emit these usage headers. They do report the audio format headers described
+below.
 
 **Raw audio stream** (`stream_format="audio"`). Streams raw audio bytes (PCM or
 WAV) as they are decoded.
@@ -196,6 +199,7 @@ response headers:
 | --- | --- |
 | `x-audio-sample-rate` | Sample rate of the returned audio in Hz (after any `sample_rate` resampling). |
 | `x-audio-channels` | Channel count of the returned audio. |
+| `x-audio-duration-seconds` | Duration of the returned audio in seconds, to three decimals. Non-streaming responses only: a raw stream sends its headers before the audio is generated, so it cannot report a duration. A clip that encoded to zero frames reports `0.000`; the header is omitted only when no duration is known. |
 
 Both streaming modes (`stream_format="audio"` and `"sse"`) require
 `response_format="pcm"` or `"wav"`, and `speed` must be `1.0` (or omitted).
@@ -214,11 +218,13 @@ Each event has an `event:` line and a JSON `data:` line:
     `sample_rate` and `channels` extend the OpenAI event and describe the
     decoded chunk.
 
-- `speech.audio.done` — terminal event, carrying token `usage`:
+- `speech.audio.done` — terminal event, carrying the generated audio `duration`
+  and token `usage`:
 
     ```json
     {
         "type": "speech.audio.done",
+        "duration": 3.2,
         "usage": {
             "input_tokens": 119,
             "output_tokens": 77,
@@ -227,6 +233,13 @@ Each event has an `event:` line and a JSON `data:` line:
         }
     }
     ```
+
+    `duration` extends the OpenAI event: it is the total length in seconds of
+    the audio already sent as `speech.audio.delta` events. Non-streaming
+    responses report the same value in the `x-audio-duration-seconds` header.
+    Like that header, it is `0.0` when the encoder reports zero frames and is
+    absent when no duration is known: empty chunks are skipped before encoding,
+    so a stream with no audio reports no duration rather than `0.0`.
 
 - `speech.audio.error` — emitted instead of `speech.audio.done` if generation fails:
 
@@ -978,11 +991,55 @@ See the [Gepard section of the online TTS hub](../user_guide/examples/online_ser
 
 | Model | Description |
 | ------- | ------------- |
-| `k2-fsa/OmniVoice` | Pure-diffusion TTS. Supports voice cloning via `ref_audio` (with optional `ref_text`); no built-in voice presets. |
+| `k2-fsa/OmniVoice` | OmniVoice generates mono speech at 24 kHz. It supports text-to-speech without a reference clip, voice cloning with `ref_audio` and optional `ref_text`, and voice design. It has no built-in voice presets. |
+
+For voice cloning, send `ref_audio`. If `ref_text` is missing or blank, the default deploy config leaves Whisper unloaded until the first such request, then loads `openai/whisper-large-v3-turbo` on the worker device and transcribes the clip. Set `additional_config.omnivoice_asr.load_asr_on_startup` to `true` to load it during worker startup. Set `additional_config.omnivoice_asr.asr_device` to `cuda:0` or `cpu` to override the worker device. Sending `ref_text` avoids ASR and uses the supplied transcript.
+
+OmniVoice prepares the reference clip before it builds the voice cloning input. It performs these steps:
+
+- It converts the clip to mono, resamples it to 24 kHz, and measures its original root mean square (RMS) level.
+- When the original RMS is greater than zero and less than `0.1`, it raises the waveform level to `0.1` and keeps the original RMS for output volume control.
+- When `ref_text` is missing, it trims a clip longer than 20 seconds at a detected silence. Supplied text skips this special long-audio trim.
+- It removes middle silence and trims silence at both edges whether the transcript is automatic or supplied by the caller.
+- It aligns the sample count down to the audio tokenizer hop size.
+- When `ref_text` is missing, it sends the prepared waveform to Whisper.
+- It adds a final period for English text or a Chinese full stop for Chinese text when the reference text has no ending punctuation.
+- It sends the same prepared waveform to the audio tokenizer.
+
+OmniVoice processes voice-cloning audio after decoding. It removes middle gaps of at least 500 milliseconds. It trims edge silence while keeping 100 milliseconds at each edge. It scales cloned output using the original reference RMS when that value is below `0.1`, and leaves the level unchanged when the value is at least `0.1`. It fades the first and last 100 milliseconds, then adds 100 milliseconds of silence at each edge. Text-only output returns the decoder tensor without this voice-cloning postprocessing.
 
 OmniVoice uses packed variable-length attention for batched generator execution. The attention operator accepts FP16 and BF16 inputs, so its query,
 key, and value tensors are evaluated in BF16 even when the stage is configured with `dtype: float32`; the attention output is converted back to the model's
 hidden-state dtype before the output projection. Consequently, a float32 stage configuration does not imply FP32 attention arithmetic.
+
+OmniVoice splits long input into smaller text chunks and joins the decoded audio. You can change the split behavior for one request through `extra_params`:
+
+| Parameter               | Type   | Default   | Description                                                                                |
+| ----------------------- | ------ | --------- | ------------------------------------------------------------------------------------------ |
+| `audio_chunk_duration`  | float  | 15.0      | Target duration in seconds for each generated text chunk. The value must be positive.      |
+| `audio_chunk_threshold` | float  | 30.0      | Estimated duration in seconds above which chunking starts. The value must be non-negative. |
+
+The splitter prefers complete sentences and line endings, merging adjacent segments when they fit the character budget. Commas, semicolons, and colons are fallback split points only when a sentence or line exceeds that budget. This avoids unnecessary audio joins inside sentences.
+
+Unlike the upstream OmniVoice splitter, this implementation protects periods and commas between digits from punctuation-based splitting, so numbers such as `0.26` and `0,26` remain intact when they fit the character budget. Oversized chunks still fall back to clause boundaries, whitespace, and finally a hard character split; a single token longer than the budget can therefore still be split. Chunk duration is an estimate, not a hard duration or memory limit.
+
+Use the defaults unless you have tested output quality for your workload. To retain protection from long text word loss, keep `audio_chunk_duration` at or below 15 seconds and `audio_chunk_threshold` at or below 30 seconds. Lower values create more chunks and audio joins, which can increase generation time and introduce audible pauses.
+
+OmniVoice accepts at most 64 text chunks per request. Requests that exceed this limit return HTTP 400 before audio generation starts. Increase `audio_chunk_duration` within the recommended range, or send less text. At the default target duration, 64 chunks represent roughly 16 minutes of estimated audio. The limit bounds the number of generation passes, not the total response duration.
+
+The default `omnivoice.yaml` uses step execution so a completed short request can return while a longer request continues. New requests can join when a scheduler slot is available. Step execution adds scheduling overhead and can increase the long request's latency. If you disable `step_execution`, every request in a batch waits for the longest request to finish all its chunks. Setting `max_num_seqs: 1` prevents shared batches, but requests still wait behind the running request.
+
+Voice cloning uses the supplied or automatically transcribed reference text and reference audio length to estimate the target duration. Reference-based estimation also applies to short requests that do not activate chunking. Text-only requests retain the fixed text-based duration heuristic.
+
+```json
+{
+    "input": "A long passage to synthesize...",
+    "extra_params": {
+        "audio_chunk_duration": 15.0,
+        "audio_chunk_threshold": 30.0
+    }
+}
+```
 
 ### VoxCPM2
 

@@ -7,12 +7,15 @@ import argparse
 import asyncio
 import base64
 import json
+import math
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
+from vllm_omni.benchmarks.duplex import omni_duplex_eval_media as media
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
@@ -393,6 +396,125 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turn_detection,duration,audio_duration,fps",
+    [
+        (turn, duration, audio, 2.0)
+        for turn in ("none", "server_vad")
+        for duration in (1.125, 2.0)
+        for audio in (0.25, 2.25)
+    ]
+    + [
+        ("none", 4.0, 0.25, 1.5),  # Fractional FPS must not create an endpoint frame.
+        ("none", 4.0, 0.25, 1.50001),  # A real frame in the last sample must survive.
+        ("none", 1.00001, 0.25, 1.0),  # A sub-sample video tail still contains a frame.
+        ("none", 0.99999, 0.25, 1.00002),
+        ("none", 0.00002, 0.0, 1.0),  # Even a sub-sample clip includes its t=0 frame.
+    ],
+)
+async def test_generate_preserves_av_inputs(tmp_path, monkeypatch, turn_detection, duration, audio_duration, fps):
+    import websockets
+
+    from vllm_omni.protocol.realtime.items import validate_realtime_video_frames
+
+    pcm = b"\x01\x00" * round(audio_duration * 16000)
+    # Keep the real frame-time generator; only JPEG decoding is replaced here.
+    monkeypatch.setattr(
+        media, "extract_jpeg", lambda path, *, timestamp, quality: b"\xff\xd8" + str(timestamp).encode()
+    )
+    frames = tuple(media.iter_jpegs("unused.mp4", fps=fps, duration=duration))
+    prepared = runner.PreparedSample(pcm, frames, duration, None, None)
+    received = []
+    server_turns = turn_detection == "server_vad"
+    capabilities = (
+        {"required_input_modalities": ["audio"], "optional_input_modalities": [], "supports_image_input": True}
+        if server_turns
+        else {"chunk_period_ms": 1000}
+    )
+
+    async def handler(socket):
+        responded = False
+        async for raw in socket:
+            event = json.loads(raw)
+            received.append(event)
+            if event["type"] == "session.update":
+                await socket.send(json.dumps({"type": "session.created", "session": {"capabilities": capabilities}}))
+            elif not responded and event["type"] == (
+                "input_audio_buffer.append" if server_turns else "input_audio_buffer.commit"
+            ):
+                responded = True
+                for response in [
+                    *([] if server_turns else [{"type": "input_audio_buffer.committed"}]),
+                    {"type": "response.created", "response": {"id": "r1"}},
+                    {"type": "response.done", "response": {"id": "r1"}},
+                ]:
+                    await socket.send(json.dumps(response))
+            elif event["type"] == "session.close":
+                await socket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    monkeypatch.setattr(runner, "SERVER_VAD_TAIL_S", 0.064)
+    monkeypatch.setattr(runner, "_SERVER_TURN_SETTLE_S", 0.01)
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.01)
+    sample = DuplexSample.from_row({"id": "sample", "split": "PR_correction"})
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        result = await runner.generate_sample(
+            sample,
+            url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path,
+            prepared=prepared,
+            pace="realtime" if server_turns else "as-fast-as-possible",
+            turn_detection=turn_detection,
+        )
+
+    expected_pcm = pcm + bytes(max(0, math.ceil(duration * 16000) * 2 - len(pcm)))
+    if server_turns:
+        expected_pcm += bytes(1024 * 2)
+    elif len(expected_pcm) % 32000 == 0:
+        # Keep a residual unit without excluding a legitimate final frame.
+        if frames[-1][0] >= (len(expected_pcm) // 2 - 1) / 16000:
+            expected_pcm += b"\0\0"
+        else:
+            expected_pcm = expected_pcm[:-2]
+    appends = [event for event in received if event["type"] == "input_audio_buffer.append"]
+    assert b"".join(base64.b64decode(event["audio"]) for event in appends) == expected_pcm
+    sent_frames = []
+    pending_images = []
+    offset = 0
+    timestamps = {frame: timestamp for timestamp, frame in frames}
+    for event in received:
+        if event["type"] == "conversation.item.create":
+            url = event["item"]["content"][0]["image_url"]
+            pending_images.append(base64.b64decode(url.split(",", 1)[1]))
+        elif event["type"] == "input_audio_buffer.append":
+            chunk = base64.b64decode(event["audio"])
+            end = offset + len(chunk) // 2
+            if server_turns:
+                assert "video_frames" not in event
+                assert len(chunk) <= 1024
+                attached = pending_images
+                pending_images = []
+            else:
+                encoded = event.get("video_frames", [])
+                assert validate_realtime_video_frames(encoded, None) is None
+                attached = [base64.b64decode(frame) for frame in encoded]
+            for frame in attached:
+                assert offset / 16000 <= timestamps[frame] < end / 16000
+            sent_frames.extend(attached)
+            offset = end
+    assert not pending_images
+    assert sent_frames == [frame for _, frame in frames]
+    assert [timestamp for timestamp, _ in frames] == pytest.approx(
+        [index / fps for index in range(math.ceil(duration * fps)) if index / fps < duration]
+    )
+    assert any(event["type"] == "input_audio_buffer.commit" for event in received) is not server_turns
+    assert not result.error and result.metadata["response_done"]
+    assert prepared.pcm == pcm  # Readiness, warmups and measurements reuse this object.
+
+
+@pytest.mark.asyncio
 async def test_generate_finishes_a_silent_session_on_the_post_commit_listen(tmp_path: Path, monkeypatch):
     import websockets
 
@@ -569,6 +691,7 @@ def test_residual_unit_decision_follows_the_committed_event():
 
     assert runner._residual_unit_decided([created, done, committed], 0) is False
     assert runner._residual_unit_decided([created, committed, done], 0) is False
+    assert runner._residual_unit_decided([created, committed, done], 0, settled_silence_is_terminal=True) is True
     assert runner._residual_unit_decided([created, committed, listen, done], 0) is False
     assert runner._residual_unit_decided([created, committed, done, listen], 0) is True
     assert runner._residual_unit_decided([created, committed, late_created, late_done, done], 0) is True
@@ -580,11 +703,101 @@ def test_residual_unit_decision_follows_the_committed_event():
     late_failed = {"type": "response.done", "response": {"id": "r2", "status": "failed"}}
     # Barge-in can cancel the open reply and still open the residual afterwards.
     assert runner._residual_unit_decided([created, committed, cancelled], 0) is False
+    assert runner._residual_unit_decided([created, committed, cancelled], 0, settled_silence_is_terminal=True) is True
     assert runner._residual_unit_decided([created, committed, cancelled, late_created, late_done], 0) is True
     assert runner._residual_unit_decided([committed, late_created, late_cancelled], 0) is False
+    assert (
+        runner._residual_unit_decided([committed, late_created, late_cancelled], 0, settled_silence_is_terminal=True)
+        is True
+    )
     # A failed reply is terminal: nothing is promoted after it.
     assert runner._residual_unit_decided([created, committed, failed], 0) is True
     assert runner._residual_unit_decided([committed, late_created, late_failed], 0) is True
+    state = runner._completion_diagnostics(
+        [created, committed, cancelled],
+        0,
+        response_ids=["r1"],
+        stable_since=time.monotonic() - runner._COMPLETION_SETTLE_S - 1,
+    )
+    assert state["committed_observed"] is True
+    assert state["open_response_ids_at_commit"] == ["r1"]
+    assert state["unfinished_response_ids"] == []
+    assert state["quiet_window_satisfied"] is True
+    assert state["normal_terminal_decision"] is False
+    assert state["settled_silence_terminal_decision"] is True
+    assert state["completion_state_events"][-1] == {
+        "type": "response.done",
+        "response_id": "r1",
+        "response_status": "cancelled",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "cancelled"])
+async def test_generate_accepts_settled_terminal_silence_only_after_the_drain_timeout(
+    tmp_path: Path, monkeypatch, status: str
+):
+    import websockets
+
+    timeout_observed = False
+
+    async def full_timeout(predicate, *, timeout_s: float, label: str):
+        nonlocal timeout_observed
+        assert timeout_s >= 20.0 and label == "response.done"
+        await asyncio.sleep(0.02)
+        assert predicate() is False
+        await asyncio.sleep(0.1)
+        assert predicate() is False
+        timeout_observed = True
+        raise TimeoutError(f"Timed out waiting for {label}")
+
+    async def handler(websocket):
+        opened = False
+        async for raw in websocket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await websocket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.append" and not opened:
+                opened = True
+                await websocket.send(json.dumps({"type": "response.created", "response": {"id": "r1"}}))
+                await websocket.send(
+                    json.dumps({"type": "response.output_text.delta", "response_id": "r1", "delta": "Interrupted."})
+                )
+            elif event["type"] == "input_audio_buffer.commit":
+                await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                await websocket.send(json.dumps({"type": "response.done", "response": {"id": "r1", "status": status}}))
+            elif event["type"] == "session.close":
+                await websocket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    monkeypatch.setattr(runner, "wait_for", full_timeout)
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.05)
+    monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: b"\1\0" * 16_000)
+    monkeypatch.setattr(runner, "video_duration", lambda path: 1.0)
+    monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter([(0.0, b"jpeg")]))
+    audio = tmp_path / "question.wav"
+    video = tmp_path / "video.mp4"
+    for path in (audio, video):
+        path.write_bytes(b"data")
+    sample = DuplexSample("sample", "PR_post_event_reminder", "pr", "post_event_reminder", video, audio)
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        result = await runner.generate_sample(
+            sample,
+            url=f"ws://127.0.0.1:{port}/v1/realtime?duplex=1",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path / "responses",
+            pace="as-fast-as-possible",
+        )
+
+    assert timeout_observed
+    assert result.error == ""
+    assert result.metadata["response_done"] is True
+    assert result.metadata["drain_timeout"] is None
+    assert result.metadata["unfinished_response_ids"] == []
+    assert [row["sentence"] for row in result.timed_sentences] == ["Interrupted."]
 
 
 @pytest.mark.asyncio
@@ -651,8 +864,9 @@ async def test_generate_waits_for_a_response_opened_after_an_in_flight_reply(tmp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("speech_frames,silence_frames", [(35, 19), (36, 16)])
+@pytest.mark.parametrize("video_tail_s", [0.0, 2.0])
 async def test_generate_server_vad_sends_image_items_and_waits_for_server_turns(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, speech_frames: int, silence_frames: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, speech_frames: int, silence_frames: int, video_tail_s: float
 ):
     import numpy as np
     import websockets
@@ -661,13 +875,16 @@ async def test_generate_server_vad_sends_image_items_and_waits_for_server_turns(
 
     received = []
     commits = []
+    speech_starts = []
+    images_after_speech = []
     caps = {"required_input_modalities": ["audio"], "optional_input_modalities": [], "supports_image_input": True}
     pcm = (
         np.concatenate([np.ones(speech_frames * 512), np.zeros(silence_frames * 512), np.ones(21 * 512)])
         .astype("<i2")
         .tobytes()
     )
-    frames = [(float(index), f"jpeg-{index}".encode()) for index in range(3)]
+    duration = len(pcm) / 32000 + video_tail_s
+    frames = [(float(index), f"jpeg-{index}".encode()) for index in range(math.ceil(duration))]
 
     async def handler(websocket):
         detector = ServerTurnDetector(TurnDetectionConfig())
@@ -679,32 +896,38 @@ async def test_generate_server_vad_sends_image_items_and_waits_for_server_turns(
             if event["type"] == "session.update":
                 await websocket.send(json.dumps({"type": "session.created", "session": {"capabilities": caps}}))
             elif event["type"] == "input_audio_buffer.append":
-                detected = detector.process(event["audio"], fmt="pcm16", sample_rate_hz=event["sample_rate_hz"])
-                if detected.speech_started:
-                    await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
-                if detected.speech_stopped:
-                    await websocket.send(json.dumps({"type": "input_audio_buffer.speech_stopped"}))
-                if detected.should_commit:
-                    commits.append(event["audio_end_ms"])
-                    response_id = f"r{len(commits)}"
-                    for turn_event in (
-                        {"type": "response.created", "response": {"id": response_id}},
-                        {"type": "response.output_text.delta", "response_id": response_id, "delta": "Now."},
-                        {
-                            "type": "response.output_audio.delta",
-                            "response_id": response_id,
-                            "delta": base64.b64encode(b"\0\0" * 240).decode(),
-                            "sample_rate_hz": 24_000,
-                        },
-                        {"type": "response.done", "response": {"id": response_id}},
-                    ):
-                        await websocket.send(json.dumps(turn_event))
+                for segment in detector.process_segments(
+                    event["audio"], fmt="pcm16", sample_rate_hz=event["sample_rate_hz"]
+                ):
+                    detected = segment.result
+                    if detected.speech_started:
+                        speech_starts.append(event["audio_end_ms"])
+                        await websocket.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
+                    if detected.speech_stopped:
+                        await websocket.send(json.dumps({"type": "input_audio_buffer.speech_stopped"}))
+                    if detected.should_commit:
+                        commits.append(event["audio_end_ms"])
+                        response_id = f"r{len(commits)}"
+                        for turn_event in (
+                            {"type": "response.created", "response": {"id": response_id}},
+                            {"type": "response.output_text.delta", "response_id": response_id, "delta": "Now."},
+                            {
+                                "type": "response.output_audio.delta",
+                                "response_id": response_id,
+                                "delta": base64.b64encode(b"\0\0" * 240).decode(),
+                                "sample_rate_hz": 24_000,
+                            },
+                            {"type": "response.done", "response": {"id": response_id}},
+                        ):
+                            await websocket.send(json.dumps(turn_event))
+            elif event["type"] == "conversation.item.create" and len(commits) == 2:
+                images_after_speech.append(event["item"]["content"][0]["image_url"])
             elif event["type"] == "session.close":
                 await websocket.send(json.dumps({"type": "session.closed"}))
                 return
 
     monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: pcm)
-    monkeypatch.setattr(runner, "video_duration", lambda path: len(pcm) / 32_000)
+    monkeypatch.setattr(runner, "video_duration", lambda path: duration)
     monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter(frames))
     monkeypatch.setattr(runner, "_SERVER_TURN_SETTLE_S", 0.05)
     audio = tmp_path / "question.wav"
@@ -728,6 +951,7 @@ async def test_generate_server_vad_sends_image_items_and_waits_for_server_turns(
     # A large append can contain both an endpoint and a new onset. The first
     # endpoint must reach ServerTurnDetector before the next speech starts.
     assert len(commits) == 2, commits
+    assert len(speech_starts) == 2, speech_starts
     assert commits == [(speech_frames + 16) * 32, (speech_frames + silence_frames + 21 + 16) * 32]
     assert len(result.request_metrics) == 2
     session = next(event["session"] for event in received if event["type"] == "session.update")
@@ -738,12 +962,15 @@ async def test_generate_server_vad_sends_image_items_and_waits_for_server_turns(
     appends = [event for event in received if event["type"] == "input_audio_buffer.append"]
     chunks = [base64.b64decode(event["audio"]) for event in appends]
     assert max(map(len, chunks)) <= 512 * 2
-    assert b"".join(chunks) == pcm + bytes(24_000 * 2)
+    assert b"".join(chunks) == pcm.ljust(math.ceil(duration * 16000) * 2, b"\0") + bytes(24_000 * 2)
     assert not any("video_frames" in event for event in appends)
     images = [event for event in received if event["type"] == "conversation.item.create"]
     assert [event["item"]["content"][0]["image_url"] for event in images] == [
         "data:image/jpeg;base64," + base64.b64encode(frame).decode() for _, frame in frames
     ]
+    if video_tail_s:
+        assert images_after_speech
+        assert images_after_speech[-1] == "data:image/jpeg;base64," + base64.b64encode(frames[-1][1]).decode()
     assert [sentence["sentence"] for sentence in result.timed_sentences] == ["Now.", "Now."]
     meta = json.loads(result.output.with_name("sample.meta.json").read_text(encoding="utf-8"))
     assert meta["response_done"] is True and meta["drain_timeout"] is None
@@ -1048,7 +1275,9 @@ def test_judge_exercises_openai_http_schema():
         def do_POST(self):
             length = int(self.headers["Content-Length"])
             requests.append((self.path, self.headers["Authorization"], json.loads(self.rfile.read(length))))
-            payload = json.dumps({"choices": [{"message": {"content": '{"success_score": 1}'}}]}).encode()
+            payload = json.dumps(
+                {"choices": [{"message": {"content": '{"success_score": 1}'}, "finish_reason": "stop"}]}
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))

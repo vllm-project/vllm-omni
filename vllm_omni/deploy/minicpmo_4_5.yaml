@@ -55,6 +55,12 @@ connectors:
       micro_batch_size: 4
       cfm_precapture_empty_cache: true
       cfm_max_graphs: 32
+      # Default CUDA speaker path: CPU-reference TensorRT, not full DiT TensorRT.
+      # Missing TensorRT falls back to the Torch speaker. Non-CUDA ignores the
+      # flag. Set false in an overlay to keep Torch. token2wav_trt /
+      # MINICPMO_TOKEN2WAV_TRT and token2wav_device_spk: false win when both
+      # are set.
+      token2wav_spk_cpu_reference: true
 
 stages:
   - stage_id: 0
@@ -63,11 +69,12 @@ stages:
     # The NPU block below overrides this with measured single-card budgets.
     gpu_memory_utilization: 0.55
     enforce_eager: false
-    # Stage-level prefix caching is NPU-only (see platforms.npu below): in the
-    # platform-shared block it killed the stage-1 replica on CUDA (empty tts
-    # handoff, then an indexSelectSmallIndex device assert). Stage-0 n-gram
+    # Thinker prefix caching stays off here: this profile serves duplex, whose
+    # KV window refuses the cache (duplex/window_kv.py). minicpmo_4_5_turn.yaml
+    # turns it on at stage level for CUDA turn serving. Stage-0 n-gram
     # speculation stays off either way -- the omni prefix cache refuses it next
     # to enable_prefix_caching.
+    enable_prefix_caching: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
@@ -142,7 +149,16 @@ stages:
 
 platforms:
   cuda:
+    # Private MPS for colocated CUDA stages. NPU does not read this block.
+    # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
+    # init, or a stage that is not one numeric GPU disables MPS and continues. Set false
+    # in an overlay to disable it explicitly.
+    cuda_mps: true
     stages:
+      - stage_id: 0
+        # Match the CUDA Thinker backend used for Transformers accuracy validation.
+        # Keep this scoped to stage 0; Talker retains its own backend selection.
+        attention_backend: TRITON_ATTN
       - stage_id: 1
         # Full-attention occupancy is bounded by max_num_seqs * max_model_len
         # (16 * 4096 = 65536 tokens). Keep the reported CUDA KV token capacity

@@ -42,7 +42,7 @@ stages:
 
 ## Behavior and limitations
 
-- Only CUDA is supported. On other platforms the reference decoder runs.
+- Only CUDA and XPU are supported. On other platforms the reference decoder runs.
 - The fast path is installed once per VAE instance when the pipeline is
   initialized. It rebinds the forwards of the loaded decoder modules; parameter
   names, `state_dict` keys and weight loading are unchanged.
@@ -62,6 +62,8 @@ stages:
 - The `channels_last` level changes the order in which cuDNN accumulates
   convolutions, so outputs differ from the reference in the last bits. Use
   `lossless` when bitwise reproducibility against diffusers matters.
+- `channels_last` also skips internal decoder bitwise padding checks to reduce
+  first-decode peak memory. Lossless decoding retains all of its checks.
 - For a supported causal convolution with one input frame and no history,
   the temporal input is `[0, 0, x]`. The `channels_last` level uses Conv2d with
   the last temporal weight slice, preserving the convolution formula for
@@ -229,8 +231,11 @@ activations and the cuDNN workspace, not by the output assembly.
 
 `benchmarks/diffusion/bench_wan_vae_decode.py` decodes seeded latents with the
 real VAE at each level and reports decode time, peak memory, bitwise equality
-and PSNR against the `off` level. `--profile` prints a per-kernel table with the
-convolution share and any layout-transpose kernels:
+and PSNR against the `off` level. After `--warmup` decodes it times `--iters`
+decodes and prints their median, min, max, standard deviation and every raw
+sample; the speedup compares medians. `--tiling` decodes with the VAE's spatial
+tiling on one GPU. `--profile` prints a per-kernel table with the convolution
+share and any layout-transpose kernels:
 
 ```bash
 python benchmarks/diffusion/bench_wan_vae_decode.py --model nvidia/Cosmos3-Nano \

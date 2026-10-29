@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for vllm_omni.engine.arg_utils — invariants that must
 hold for the orchestrator/engine/server CLI flag partition."""
 
@@ -30,11 +30,14 @@ def test_no_ambiguous_overlap_with_real_engine():
     # Fields on both classes by design: orchestrator captures them to prevent
     # uniform per-stage propagation; redistributed via DeployConfig.
     orchestrator_captured = {"async_chunk", "tokenizer"}
+    # Orchestrator holds Omni's per-modality watermarking config, which may contain a
+    # subconfig that is passed to vLLM to configure sampling time watermarking for text.
+    derived_per_modality = {"watermark_config"}
 
     orch = orchestrator_field_names()
     engine = {f.name for f in fields(OmniEngineArgs)}
     overlap = orch & engine
-    unexpected = overlap - SHARED_FIELDS - orchestrator_captured
+    unexpected = overlap - SHARED_FIELDS - orchestrator_captured - derived_per_modality
     assert not unexpected, (
         f"OmniEngineArgs has ambiguous overlap with OrchestratorArgs: "
         f"{sorted(unexpected)}. Update SHARED_FIELDS or remove duplication."
