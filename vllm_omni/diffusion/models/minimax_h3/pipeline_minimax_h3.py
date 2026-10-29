@@ -1211,6 +1211,7 @@ class MiniMaxH3Pipeline(
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
+                enable_temporal_scheduling=od_config.enable_vae_temporal_scheduling,
                 decoder_source=(od_config.additional_config or {}).get(
                     "video_vae_decoder",
                     str(model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors")

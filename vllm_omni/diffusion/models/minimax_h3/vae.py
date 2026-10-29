@@ -10,7 +10,7 @@ import os
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -37,6 +37,9 @@ from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
+
+if TYPE_CHECKING:
+    from .vae_window import TiledVideoDecoder
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -345,8 +348,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decode_only: bool = False,
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
+        enable_temporal_scheduling: bool = False,
     ) -> None:
         super().__init__()
+        if type(enable_temporal_scheduling) is not bool:
+            raise ValueError("enable_temporal_scheduling must be a boolean")
+        self.enable_temporal_scheduling = enable_temporal_scheduling
+        self._temporal_scheduling_available = False
         self._device_target = device
         self.encode_only = bool(encode_only)
         self.decode_only = bool(decode_only)
@@ -387,8 +395,30 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 decoder,
                 device=device,
             )
-        install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         self.model = self.remote.model
+        window_decode = None
+        window_plan = None
+        if enable_temporal_scheduling and device.type != "npu":
+            logger.info(
+                "H3 VAE scheduling requested=true selected=false executed=false reason=unsupported_backend:%s",
+                device.type,
+            )
+        if enable_temporal_scheduling and device.type == "npu" and not encode_only:
+            from .vae_window import temporal_scheduling_unavailable_reason
+
+            reason = temporal_scheduling_unavailable_reason(self.model)
+            if reason is None:
+                self._temporal_scheduling_available = True
+                window_decode = self._decode_temporal_window
+                window_plan = self._plan_temporal_schedule
+            else:
+                logger.info("H3 VAE scheduling requested=true selected=false executed=false reason=%s", reason)
+        install_temporal_stream_patches(
+            self.model,
+            pixel_transform=self._pixel_transform,
+            window_decode=window_decode,
+            window_plan=window_plan,
+        )
         self._stager = None
         self._encoder_stager = None
         self._decoder_stager = None
@@ -984,6 +1014,46 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ).float()
         return rows, shape
 
+    def _plan_temporal_schedule(
+        self,
+        model: TiledVideoDecoder,
+        z: torch.Tensor,
+        head: torch.Tensor | None,
+        tail: torch.Tensor | None,
+        num_chunks: int,
+    ) -> int:
+        from .vae_window import select_temporal_window
+
+        state = self._native_parallel_state()
+        return select_temporal_window(
+            model,
+            z,
+            head,
+            tail,
+            num_chunks,
+            rank=state["sp_rank"],
+            world_size=state["sp_size"],
+            process_group=state["sp_process_group"],
+        )
+
+    def _decode_temporal_window(
+        self,
+        clips: list[torch.Tensor],
+        *,
+        contexts: list[tuple[int, int, int, int]] | None = None,
+    ) -> list[torch.Tensor]:
+        from .vae_window import decode_temporal_window
+
+        state = self._native_parallel_state()
+        return decode_temporal_window(
+            self.model,
+            clips,
+            rank=state["sp_rank"],
+            world_size=state["sp_size"],
+            process_group=state["sp_process_group"],
+            contexts=contexts,
+        )
+
     def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
         """Pick the tiling mode a decode of ``latent`` can safely use.
 
@@ -1010,7 +1080,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if getattr(self, "encode_only", False):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
-        with self._decode_tiling_context(latent):
+        # The opt-in planner needs the real group even when S<P. Its singleton
+        # fallback avoids empty-rank gathers locally. Chunked output stays native.
+        context = (
+            nullcontext()
+            if getattr(self, "_temporal_scheduling_available", False) and self.enable_temporal_scheduling
+            else self._decode_tiling_context(latent)
+        )
+        with context:
             decoded = self.model.decode_base(self._denormalize_latent(latent))
         if decoded.dtype == torch.uint8:
             # The streaming uint8 write-back already ran the revert and the

@@ -1117,6 +1117,14 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
         omni_config_group.add_argument(
+            "--enable-vae-temporal-scheduling",
+            action="store_true",
+            default=False,
+            help="Enable adaptive MiniMax-H3 NPU video VAE temporal scheduling. "
+            "Uses bounded task geometry and memory limits; unsupported or "
+            "resource-limited layouts keep native scheduling. Disabled by default.",
+        )
+        omni_config_group.add_argument(
             "--text-encoder-tp-size",
             type=int,
             default=None,

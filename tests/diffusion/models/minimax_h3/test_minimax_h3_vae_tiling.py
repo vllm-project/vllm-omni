@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """CPU tests for the decoder tile-shortage guard in the MiniMax-H3 video VAE."""
 
@@ -47,7 +47,7 @@ class _FakeCheckpointModel:
 def _vae(parallel_size, state):
     """A stand-in instance: the guard only reads .model/.remote/.parallel_size."""
     module = types.ModuleType("fake_ckpt.parallel")
-    module.get_parallel_state = lambda: state
+    setattr(module, "get_parallel_state", lambda: state)
     sys.modules.setdefault("fake_ckpt", types.ModuleType("fake_ckpt"))
     sys.modules["fake_ckpt.parallel"] = module
 
@@ -212,3 +212,16 @@ def test_decode_latent_leaves_the_group_state_alone_when_the_grid_is_large_enoug
     assert seen["sp_enabled"] is True
     assert seen["sp_process_group"] is state["sp_process_group"]
     assert seen["parallel_tiling"] is True
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_opt_in_preserves_real_group_for_request_local_planning(enabled):
+    vae, state, seen = _dispatch_vae(4)
+    vae.enable_temporal_scheduling = enabled
+    vae._temporal_scheduling_available = True
+    original_state = dict(state)
+    for h, w in [(16, 16), (48, 84), (24, 32), (16, 16)]:
+        vae.decode_latent(_latent(h, w))
+        assert seen["sp_size"] == (1 if not enabled and h == w == 16 else 4)
+        assert state == original_state
+        assert vae.model.parallel_tiling is True
