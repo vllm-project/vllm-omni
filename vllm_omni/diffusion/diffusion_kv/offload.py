@@ -403,14 +403,33 @@ class DiffusionKVOffloadCoordinator:
     def __init__(
         self,
         *,
-        transport: KVPageOffloadTransport,
+        transport: KVPageOffloadTransport | None = None,
         max_bytes: int | None = None,
     ) -> None:
         if max_bytes is not None and (type(max_bytes) is not int or max_bytes <= 0):
             raise ValueError(f"max_bytes must be a positive integer when set, got {max_bytes!r}")
+        if transport is None and max_bytes is not None:
+            # A budget needs a discard path.  Without a transport the
+            # coordinator can only track pages, so a budget would be a
+            # promise the coordinator cannot keep.
+            raise ValueError("max_bytes requires a transport that can discard host-resident pages")
         self._transport = transport
         self._max_bytes = max_bytes
         self._index = DiffusionKVOffloadIndex()
+
+    @property
+    def transport(self) -> KVPageOffloadTransport | None:
+        """The local transport, if this coordinator moves bytes itself."""
+
+        return self._transport
+
+    def _require_transport(self, operation: str) -> KVPageOffloadTransport:
+        if self._transport is None:
+            raise RuntimeError(
+                f"Diffusion KV page offload {operation} requires a local transport; "
+                "in a multi-process deployment the Engine relays pages to the Workers by RPC"
+            )
+        return self._transport
 
     @property
     def index(self) -> DiffusionKVOffloadIndex:
@@ -445,10 +464,27 @@ class DiffusionKVOffloadCoordinator:
         # the save would drop freshly saved pages instead, which wastes the
         # copy work and leaves the caller with pages it can no longer restore.
         self.enforce_budget()
-        sizes = self._transport.save_pages(ordered)
+        sizes = self._require_transport("save").save_pages(ordered)
         for page in ordered:
             self._index.track(page, int(sizes.get(page.key, 0)))
         return tuple(ordered)
+
+    def commit_saved_pages(
+        self,
+        pages: Sequence[OffloadedKVPage],
+        sizes: Mapping[bytes, int],
+    ) -> tuple[OffloadedKVPage, ...]:
+        """Register pages whose bytes a Worker already copied to the host.
+
+        A multi-process deployment never moves bytes inside the Scheduler:
+        the Engine relays page *names* to the Workers by RPC and reports the
+        saved sizes back, so the Scheduler-side coordinator only commits the
+        resulting index state.
+        """
+
+        for page in pages:
+            self._index.track(page, int(sizes.get(page.key, 0)))
+        return tuple(pages)
 
     def find_restore_candidates(
         self,
@@ -481,7 +517,7 @@ class DiffusionKVOffloadCoordinator:
         for request in requests:
             if request.key not in self._index:
                 raise KeyError(f"No offloaded KV page for key {request.key!r}")
-        self._transport.restore_pages(requests)
+        self._require_transport("restore").restore_pages(requests)
         for request in requests:
             self._index.acquire(request.key)
 
@@ -506,7 +542,7 @@ class DiffusionKVOffloadCoordinator:
             candidate = self._find_evictable()
             if candidate is None:
                 break
-            self._transport.discard_pages([candidate])
+            self._require_transport("discard").discard_pages([candidate])
             self._index.remove(candidate)
             dropped.append(candidate)
         return tuple(dropped)

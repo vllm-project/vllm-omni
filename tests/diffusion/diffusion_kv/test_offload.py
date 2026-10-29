@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import get_block_hash, get_group_id
@@ -14,6 +17,7 @@ from vllm_omni.diffusion.diffusion_kv.offload import (
     OffloadedKVPage,
     make_page_key,
 )
+from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -316,3 +320,150 @@ def test_store_and_index_agree_on_which_pages_are_available() -> None:
     assert page.key in store
     assert page.key in coordinator.index
     assert store.bytes_used == coordinator.bytes_used
+
+
+def _make_backend(num_blocks: int = 3) -> Any:
+    from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+    from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+
+    backend = object.__new__(DiffusionKVModelRunnerBackend)
+    backend.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER)
+    backend.device = torch.device("cpu")
+    backend.block_tables = SimpleNamespace(blocks_per_kv_block=[2])
+    backend.kv_cache_config = SimpleNamespace(
+        num_blocks=num_blocks,
+        kv_cache_groups=[SimpleNamespace(layer_names=["l0", "l1"])],
+    )
+    base = torch.arange(6 * 2 * 2 * 8, dtype=torch.float32).reshape(6, 2, 2, 8).to(torch.bfloat16)
+    backend._kv_cache_layer_adapters = {
+        "l0": SimpleNamespace(kv_cache=base.clone()),
+        "l1": SimpleNamespace(kv_cache=base.add(1).to(torch.bfloat16)),
+    }
+    backend._kv_page_offload_store = None
+    return backend
+
+
+def test_backend_capture_covers_all_layers_and_kernel_blocks() -> None:
+    backend = _make_backend()
+    page = _page(1, source_block_id=1)
+
+    sizes = backend.save_diffusion_kv_pages([page])
+
+    expected = (
+        torch.cat(
+            [
+                backend._kv_cache_layer_adapters["l0"].kv_cache[2:4],
+                backend._kv_cache_layer_adapters["l1"].kv_cache[2:4],
+            ]
+        )
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(-1)
+    )
+    assert sizes == {page.key: expected.numel()}
+    store = backend._kv_page_offload_store
+    assert store is not None and len(store) == 1
+    assert torch.equal(store.restore(page.key), expected)
+    assert store.bytes_used == expected.numel()
+
+
+def test_backend_capture_uses_each_group_kernel_block_count() -> None:
+    backend = _make_backend()
+    backend.block_tables = SimpleNamespace(blocks_per_kv_block=[2, 1])
+    backend.kv_cache_config.kv_cache_groups.append(SimpleNamespace(layer_names=["l2"]))
+    backend._kv_cache_layer_adapters["l2"] = SimpleNamespace(
+        kv_cache=backend._kv_cache_layer_adapters["l0"].kv_cache.add(2).to(torch.bfloat16)
+    )
+
+    group_zero = _page(1, group_index=0, source_block_id=1)
+    group_one = _page(1, group_index=1, source_block_id=2)
+    sizes = backend.save_diffusion_kv_pages([group_zero, group_one])
+
+    assert group_zero.key != group_one.key
+    store = backend._kv_page_offload_store
+    assert torch.equal(
+        store.restore(group_one.key),
+        backend._kv_cache_layer_adapters["l2"].kv_cache[2:3].contiguous().view(torch.uint8).reshape(-1),
+    )
+    # Group zero spans two layers x two kernel blocks; group one one layer x one block.
+    assert sizes[group_zero.key] == 4 * sizes[group_one.key]
+
+
+def test_backend_capture_rejects_unknown_group_and_block() -> None:
+    backend = _make_backend(num_blocks=2)
+
+    with pytest.raises(ValueError, match="unknown cache group"):
+        backend.save_diffusion_kv_pages([_page(1, group_index=5)])
+    with pytest.raises(ValueError, match="outside"):
+        backend.save_diffusion_kv_pages([_page(1, source_block_id=9)])
+
+
+def test_backend_capture_requires_initialized_paged_kv() -> None:
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+    from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+
+    backend = object.__new__(DiffusionKVModelRunnerBackend)
+    backend.od_config = SimpleNamespace(diffusion_kv_mode=DiffusionKVCacheMode.DENSE_LEGACY)
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        backend.save_diffusion_kv_pages([])
+
+
+class _FakeExecutor(DiffusionExecutor):
+    def __init__(self, replies: list) -> None:
+        self.replies = replies
+        self.calls: list[tuple[str, tuple]] = []
+
+    def _init_executor(self) -> None:
+        return None
+
+    def is_dead(self) -> bool:
+        return False
+
+    def execute_request(self, scheduler_output):
+        raise NotImplementedError
+
+    def execute_batch(self, scheduler_output):
+        raise NotImplementedError
+
+    def execute_step(self, scheduler_output):
+        raise NotImplementedError
+
+    def shutdown(self) -> None:
+        return None
+
+    def collective_rpc(self, method, timeout=None, args=(), kwargs=None, unique_reply_rank=None, exec_all_ranks=False):
+        self.calls.append((method, args))
+        return self.replies
+
+    def check_health(self) -> None:
+        return None
+
+
+def test_executor_save_dedupes_pages_and_returns_sizes() -> None:
+    page = _page(1)
+    executor = _FakeExecutor(replies=[{page.key: 128}])
+
+    sizes = executor.save_diffusion_kv_pages([page, page])
+
+    assert sizes == {page.key: 128}
+    method, args = executor.calls[0]
+    assert method == "save_diffusion_kv_pages"
+    assert args == ([page],)
+
+
+def test_executor_save_rejects_disagreeing_ranks() -> None:
+    page = _page(1)
+    executor = _FakeExecutor(replies=[{page.key: 128}, {page.key: 256}])
+
+    with pytest.raises(RuntimeError, match="disagrees on saved Diffusion KV page sizes"):
+        executor.save_diffusion_kv_pages([page])
+
+
+def test_executor_save_with_no_pages_skips_the_rpc() -> None:
+    executor = _FakeExecutor(replies=[])
+
+    assert executor.save_diffusion_kv_pages([]) == {}
+    assert executor.calls == []

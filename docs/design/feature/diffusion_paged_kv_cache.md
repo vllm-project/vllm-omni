@@ -117,6 +117,34 @@ Dense requests do not install paged metadata. Paged requests reject legacy
 dense KV payloads or stale/incomplete native metadata instead of silently
 falling back to dense execution.
 
+### KV page offload (phase 1)
+
+When `enable_diffusion_kv_page_offload` is set, the stable prefix pages of a
+*completed* request are copied from device to host memory so their device
+blocks return to the pool. Active-request pages and mutable image pages never
+leave the device.
+
+The ownership split extends the boundary above:
+
+| Component | Owns | Does not own |
+| --- | --- | --- |
+| Worker (`KVPageOffloadStore`) | Host-resident payload bytes of offloaded pages | Page identity or refcounts |
+| Scheduler (`DiffusionKVOffloadIndex`) | Page identity, refcounts, and host byte accounting | Payload bytes |
+
+The sides exchange *names only*: the Engine relays `OffloadedKVPage` identities
+to the Workers over `save_diffusion_kv_pages` RPC, and the Workers report
+per-page byte sizes back. A page's key is the group-scoped block hash, the
+same encoding the native prefix cache uses, so an offloaded page and a
+device-resident cached page are interchangeable identities. The payload of one
+page covers every layer of its cache group (in `layer_names` order) and its
+kernel blocks; restore reverses this with the same group config.
+
+The release path holds a completed request with published pages until the
+Engine's save RPC lands; a failed save releases the request on-device, so
+offload never turns a finished request into an error. Restoring offloaded
+pages into the prefix-hit lookup path is a follow-up phase: phase 1 is
+capacity-only offloading.
+
 ### AR-to-DiT transfer contract
 
 When an AR stage and a DiT stage are deployed separately, the previous
@@ -308,6 +336,8 @@ and a prepared memory-profile request. The main fields are:
 | --- | --- |
 | `diffusion_kv_mode` | `dense_legacy` (default) or `paged_scheduler` |
 | `diffusion_kv_max_rows_per_request` | Worker row capacity for one public request, including CFG branches |
+| `enable_diffusion_kv_page_offload` | Copy the stable prefix pages of completed requests to host memory (phase 1; requires `paged_scheduler` and `enable_prefix_caching`) |
+| `diffusion_kv_offload_max_bytes` | Optional host byte budget for offloaded pages; `None` keeps pages until explicit invalidation |
 | `kv_cache_memory_bytes` | Optional explicit physical KV-pool budget per Worker rank |
 | `gpu_memory_utilization` | Automatic pool sizing when no byte budget is supplied |
 | `diffusion_attention_backend` | Must resolve to `FLASH_ATTN` for the current paged implementation |
@@ -330,6 +360,9 @@ required.
   Ring, AllGather-KV, and independent Hunyuan KV contexts are not implemented.
 - Imported AR-to-DiT page transfer and cross-request canonical prefix caching
   are follow-up integrations; `ar_diffusion_kv` is a separate contract.
+- KV page offload phase 1 is capacity-only: offloaded pages are not yet served
+  back into the prefix-hit lookup, and sleep mode is rejected while offload is
+  enabled.
 - Quantized KV and CPU/DLO offload combinations are untested.
 - For a formal `paged_scheduler` request, missing native metadata or backend
   support is an explicit error, not a dense or SDPA fallback. The marked
@@ -337,7 +370,7 @@ required.
 
 ## Related Files
 
-- Scheduler and allocation: [`diffusion_kv/manager.py`](gh-file:vllm_omni/diffusion/diffusion_kv/manager.py), [`diffusion_kv/request.py`](gh-file:vllm_omni/diffusion/diffusion_kv/request.py), [`diffusion_kv/metadata.py`](gh-file:vllm_omni/diffusion/diffusion_kv/metadata.py)
+- Scheduler and allocation: [`diffusion_kv/manager.py`](gh-file:vllm_omni/diffusion/diffusion_kv/manager.py), [`diffusion_kv/request.py`](gh-file:vllm_omni/diffusion/diffusion_kv/request.py), [`diffusion_kv/metadata.py`](gh-file:vllm_omni/diffusion/diffusion_kv/metadata.py), [`diffusion_kv/offload.py`](gh-file:vllm_omni/diffusion/diffusion_kv/offload.py)
 - Scheduler and runtime: [`sched/base_scheduler.py`](gh-file:vllm_omni/diffusion/sched/base_scheduler.py), [`diffusion_kv/config.py`](gh-file:vllm_omni/diffusion/diffusion_kv/config.py), [`forward_context.py`](gh-file:vllm_omni/diffusion/forward_context.py), [`vllm_config.py`](gh-file:vllm_omni/diffusion/vllm_config.py)
 - Executor boundary: [`executor/abstract.py`](gh-file:vllm_omni/diffusion/executor/abstract.py), [`executor/uniproc_executor.py`](gh-file:vllm_omni/diffusion/executor/uniproc_executor.py)
 - Worker data plane: [`diffusion_kv/initialization.py`](gh-file:vllm_omni/diffusion/diffusion_kv/initialization.py), [`diffusion_kv/model_runner_backend.py`](gh-file:vllm_omni/diffusion/diffusion_kv/model_runner_backend.py), [`worker/diffusion_model_runner.py`](gh-file:vllm_omni/diffusion/worker/diffusion_model_runner.py)
