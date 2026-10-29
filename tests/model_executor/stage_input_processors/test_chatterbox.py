@@ -477,6 +477,8 @@ def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes(
     """
     (terminal,) = streamed_payloads(side, adapter, plane, receiver, request_prompt(250), [])
     assert terminal.codes.audio.numel() == 0 and bool(terminal.meta.finished)
+    # The same terminal contract as a final chunk with tokens.
+    assert bool(terminal.meta.stream_finished) and terminal.meta.left_context_size == 0
     stage1_request = OmniRequest(
         request_id="r",
         prompt_token_ids=[0] * 88,

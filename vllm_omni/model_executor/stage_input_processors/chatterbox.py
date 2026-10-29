@@ -170,11 +170,9 @@ def t3_to_s3gen_async_chunk(
     sent, hop = state["sent"], state["hop"]
     if is_finished:
         state["terminal_sent"] = True
-        if len(tokens) <= sent:
-            return OmniPayloadStruct(
-                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-                meta=MetaStruct(finished=torch.tensor(True)),
-            )
+        # Every chunk leaves its lookahead unsent, so only an utterance with
+        # no speech tokens ends with nothing past the cursor; its empty codes
+        # clear stage 1's placeholder prompt.
         end = len(tokens)
     else:
         end = sent + hop + PRE_LOOKAHEAD
