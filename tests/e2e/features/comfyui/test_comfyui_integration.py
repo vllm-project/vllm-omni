@@ -20,7 +20,7 @@ from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import av
 import pytest
@@ -711,7 +711,9 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
     torch.set_num_threads(1)
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("API server fixture forks so the child inherits the mocked engine")
-    server_process = multiprocessing.get_context("fork").Process(target=run_server)
+    # typeshed types get_context() as BaseContext, which does not declare Process.
+    fork_context = cast(Any, multiprocessing.get_context("fork"))
+    server_process = fork_context.Process(target=run_server)
     server_process.start()
 
     # Wait for the server to be ready by polling the health endpoint.
