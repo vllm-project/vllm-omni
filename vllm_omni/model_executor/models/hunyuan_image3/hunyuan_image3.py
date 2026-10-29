@@ -1424,6 +1424,31 @@ class HunyuanImage3RotaryEmbedding(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
 
+def _vae_generators_for_images(
+    seeds: torch.Tensor | None,
+    num_images: int,
+    device: torch.device,
+) -> list[torch.Generator | None]:
+    """One fresh generator per image, seeded from that image's request.
+
+    A shared generator keeps the first seed and consumes its stream for every
+    later image in the batch, so those images no longer match a standalone
+    encode with their own seed.
+    """
+    if seeds is None or seeds.numel() == 0 or num_images == 0:
+        return [None] * num_images
+    flat = seeds.reshape(-1)
+    generators: list[torch.Generator | None] = []
+    for index in range(num_images):
+        if index >= flat.numel():
+            generators.append(None)
+            continue
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(flat[index].item()))
+        generators.append(generator)
+    return generators
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     HunyuanImage3MultiModalProcessor,
     info=HunyuanImage3ProcessingInfo,
@@ -1952,19 +1977,22 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vit_spatial_shapes = pixel_values["vit_spatial_shapes"]
         vae_pixel_values = pixel_values["vae_pixel_values"]
         vae_generator_seed = pixel_values.get("vae_generator_seed")
-        vae_generator = None
-        if vae_generator_seed is not None and vae_generator_seed.numel() > 0:
-            vae_generator = torch.Generator(device=vae_pixel_values[0].device).manual_seed(
-                int(vae_generator_seed.reshape(-1)[0].item())
-            )
+        vae_generators = _vae_generators_for_images(
+            vae_generator_seed,
+            len(vae_pixel_values),
+            vae_pixel_values[0].device,
+        )
 
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
 
         # VAE encode + patch_embed per image — each cond image is at its own
         # `reso_group` bucket so shapes are ragged across the image-batch dim.
+        # Each image gets a generator seeded from its own request. Reusing one
+        # generator would apply the first seed to the whole batch and advance
+        # that stream for every later image.
         vae_token_embeddings = []
-        for vae_image_i in vae_pixel_values:
+        for vae_image_i, vae_generator in zip(vae_pixel_values, vae_generators):
             t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor, generator=vae_generator)
             t_emb = self.time_embed(t_i[0])
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
