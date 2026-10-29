@@ -171,7 +171,9 @@ def t3_to_s3gen_async_chunk(
             "would be missing from the audio"
         )
     state["seen"] = seen + len(new_tokens)
-    # Drops the stop token.
+    # Drops the stop token. Only ever extended: ids are filtered on the way
+    # in, and the transport frees the whole list after the request ends, so
+    # it never shrinks under the cursor.
     tokens = transfer_manager.code_prompt_token_ids[request_id]
     tokens.extend(token for token in new_tokens if token < SPEECH_TOKEN_LIMIT)
 

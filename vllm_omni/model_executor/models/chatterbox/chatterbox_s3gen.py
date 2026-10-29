@@ -393,11 +393,16 @@ class S3GenDecoder(nn.Module):
             start = self.prompt_noise_frames + chunk.start * ratio
             end = start + row.numel() * ratio
             # Sliced past its end the buffer comes back short, and the row
-            # would be padded with zeros instead of its own noise.
+            # would be padded with zeros instead of its own noise. No request
+            # reaches this: an utterance is bounded by stage 0's context, and
+            # the buffer covers this stage's. Only a deploy file that gives
+            # this stage the shorter context does, and then every long
+            # utterance fails, so the step fails with it.
             if end > self.flow_noise.shape[2]:
                 raise RuntimeError(
                     f"chatterbox_s3gen got a chunk of {row.numel()} tokens at utterance position {chunk.start}, "
-                    f"past the {self.flow_noise.shape[2] - self.prompt_noise_frames} noise frames of its context"
+                    f"past the {self.flow_noise.shape[2] - self.prompt_noise_frames} noise frames of its context: "
+                    "this stage's max_model_len must be at least stage 0's"
                 )
             rows.append(row)
             offsets.append(chunk.token_offset)
