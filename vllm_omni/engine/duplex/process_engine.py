@@ -513,7 +513,7 @@ class ProcessDuplexEngineClient:
             raise DuplexSessionError(self._failure or "engine closed", code="engine_dead")
         self.start()
         assert self._start_task is not None
-        await self._start_task
+        await asyncio.shield(self._start_task)
         assert self._channel is not None
         await self._channel.send(message, timeout=30)
 
@@ -609,7 +609,7 @@ class ProcessDuplexEngineClient:
         """Poll lifecycle events for the frontend pump; session data uses local buffers."""
         self.start()
         assert self._start_task is not None
-        await self._start_task
+        await asyncio.shield(self._start_task)
         if not self.is_alive():
             raise EngineDeadError(self._failure or "Duplex engine process exited")
         try:
