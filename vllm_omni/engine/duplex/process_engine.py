@@ -83,6 +83,8 @@ class ProcessDuplexStageMetadata:
 
 @dataclass(frozen=True)
 class ProcessDuplexMetadata:
+    """Serializable startup facts needed by the frontend without stage clients."""
+
     model: str
     num_stages: int
     stage_configs: list[ProcessDuplexStageMetadata]
@@ -96,6 +98,7 @@ class ProcessDuplexMetadata:
 
     @classmethod
     def from_runtime(cls, runtime: WorkerRuntime) -> ProcessDuplexMetadata:
+        """Snapshot deployment facts after the native runtime has initialized."""
         engine = runtime.engine
         stages = []
         for stage, vllm_config in zip(engine.stage_configs, engine.stage_vllm_configs):
@@ -144,12 +147,14 @@ class _MessageSocket:
 
     @staticmethod
     def entry(message: tuple[Any, ...]) -> bytes:
+        """Encode one message and reject payloads exceeding the queue byte budget."""
         payload = msgspec.msgpack.encode(message)
         if len(payload) > _QUEUE_BYTES:
             raise ValueError("Duplex IPC message exceeds the 8 MiB queue budget")
         return payload
 
     def put_nowait(self, entry: bytes) -> None:
+        """Admit encoded data without waiting; raise QueueFull or engine_dead."""
         if self._failure is not None:
             raise DuplexSessionError(self._failure, code="engine_dead")
         if self.pending_bytes + len(entry) > _QUEUE_BYTES:
@@ -158,6 +163,11 @@ class _MessageSocket:
         self.pending_bytes += len(entry)
 
     async def send(self, message: tuple[Any, ...], *, timeout: float | None = None) -> None:
+        """Wait for queue admission, not peer delivery.
+
+        The optional timeout bounds capacity waits and reports retryable
+        backpressure. Cancellation before admission leaves no queued message.
+        """
         entry = self.entry(message)
         try:
             self.put_nowait(entry)
@@ -170,6 +180,7 @@ class _MessageSocket:
                 ) from exc
 
     async def send_entry(self, entry: bytes) -> None:
+        """Wait for queue capacity or fail when the channel closes."""
         while True:
             try:
                 self.put_nowait(entry)
@@ -179,6 +190,11 @@ class _MessageSocket:
                 await self._space.wait()
 
     async def write(self) -> None:
+        """Drain admitted messages in FIFO order; run as the sole writer task.
+
+        Capacity is released before socket drain, so the active payload and
+        transport buffers are additional to the queue byte budget.
+        """
         while True:
             payload = await self.queue.get()
             self.pending_bytes -= len(payload)
@@ -187,6 +203,7 @@ class _MessageSocket:
             await self.writer.drain()
 
     async def receive(self) -> Any:
+        """Decode the next value, retaining partial and trailing data across reads."""
         while True:
             for message in self.unpacker:
                 return message
@@ -196,6 +213,7 @@ class _MessageSocket:
             self.unpacker.feed(chunk)
 
     def close(self, detail: str = "Duplex IPC connection closed") -> None:
+        """Reject new sends, wake capacity waiters, and close the socket transport."""
         self._failure = self._failure or detail
         self._space.set()
         self.writer.close()
@@ -215,11 +233,17 @@ def _error(exc: Exception) -> dict[str, Any]:
 
 
 def _worker(sock: socket.socket, model: str, options: dict[str, Any], factory: EngineFactory) -> None:
+    """Create a process group for the runtime and its children, then start its loop."""
     os.setsid()
     uvloop.run(_serve_worker(sock, model, options, factory))
 
 
 async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any], factory: EngineFactory) -> None:
+    """Initialize the runtime, send its startup result, and serve until shutdown.
+
+    Startup uses the blocking socket before handing it to asyncio. This scope
+    owns native runtime cleanup after the worker tasks have stopped.
+    """
     runtime = None
     channel = None
     ready = False
@@ -274,6 +298,7 @@ class _DuplexProcessWorker:
         self.tasks: TaskGroup
 
     async def run(self) -> None:
+        """Supervise worker tasks, cancelling siblings on failure or disconnect."""
         async with anyio.create_task_group() as self.tasks:
             self.tasks.start_soon(self.read_requests)
             self.tasks.start_soon(self.pump_engine)
@@ -282,6 +307,11 @@ class _DuplexProcessWorker:
             self.tasks.cancel_scope.cancel()
 
     def notify_invalidation(self, session_id: str, response_id: str, through_epoch: int) -> None:
+        """Schedule an invalidation from the orchestrator thread onto the IPC loop.
+
+        Overflow closes the channel: losing an invalidation could let stale
+        audio reach the frontend.
+        """
         entry = self.channel.entry(("invalidate", session_id, response_id, through_epoch))
 
         def enqueue() -> None:
@@ -299,6 +329,7 @@ class _DuplexProcessWorker:
         await self.channel.send(("event", session_id, type(event).__name__, event))
 
     async def pump_session(self, session_id: str, buffer: DuplexOutputBuffer) -> None:
+        """Forward valid buffered events until closure, then retire the buffer."""
         try:
             while (event := await buffer.get()) is not None:
                 if buffer.is_valid(event):
@@ -307,6 +338,7 @@ class _DuplexProcessWorker:
             self.buffers.pop(session_id, None)
 
     async def pump_engine(self) -> None:
+        """Forward engine events, routing session closure through its output buffer."""
         while True:
             for message in await self.engine.get_outputs_async():
                 if not isinstance(message, DuplexSessionEventMessage):
@@ -318,6 +350,7 @@ class _DuplexProcessWorker:
                     await self.send_event(message.session_id, message.event)
 
     async def control(self, request_id: int, operation: str, args: list[Any], kwargs: dict[str, Any]) -> None:
+        """Execute a control RPC and return its result or a structured error."""
         try:
             if operation == "open_session_async":
                 session_id = args[0]
@@ -342,6 +375,7 @@ class _DuplexProcessWorker:
             await self.channel.send(("result", request_id, False, _error(exc)))
 
     async def read_requests(self) -> None:
+        """Dispatch commands in receive order and run control RPCs concurrently."""
         with suppress(EOFError, ConnectionError):
             while True:
                 request_id, operation, args, kwargs = await self.channel.receive()
@@ -372,6 +406,7 @@ class ProcessDuplexEngineClient:
     input_processor = None
 
     def __init__(self, model: str, options: dict[str, Any], *, factory: EngineFactory) -> None:
+        """Spawn the runtime and synchronously wait for startup metadata or failure."""
         from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
 
         if os.name != "posix":
@@ -428,6 +463,7 @@ class ProcessDuplexEngineClient:
         return None
 
     def _read_startup(self) -> Any:
+        """Read the blocking startup reply, preserving trailing data for async reads."""
         while True:
             for message in self._unpacker:
                 return message
@@ -437,6 +473,7 @@ class ProcessDuplexEngineClient:
             self._unpacker.feed(chunk)
 
     def start(self) -> None:
+        """Lazily attach IPC tasks to the caller's running event loop."""
         if self._start_task is None:
             self._start_task = asyncio.create_task(self._connect())
 
@@ -448,6 +485,7 @@ class ProcessDuplexEngineClient:
             task.add_done_callback(self._transport_done)
 
     def _transport_done(self, task: asyncio.Task[None]) -> None:
+        """Fan out transport failure and cancel the other IPC task."""
         exc = None if task.cancelled() else task.exception()
         if self._closed:
             return
@@ -457,6 +495,7 @@ class ProcessDuplexEngineClient:
                 other.cancel()
 
     def _fail(self, detail: str) -> None:
+        """Fail pending controls and close local buffers, waking their consumers."""
         self._failure = detail
         if self._channel is not None:
             with suppress(RuntimeError):
@@ -479,6 +518,11 @@ class ProcessDuplexEngineClient:
         await self._channel.send(message, timeout=30)
 
     async def _rpc(self, operation: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        """Correlate a control reply with a bounded wait and retire its future.
+
+        A timeout or caller cancellation does not cancel work in the child;
+        late replies are ignored after the pending entry is removed.
+        """
         request_id = next(self._ids)
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
@@ -503,6 +547,7 @@ class ProcessDuplexEngineClient:
         output_buffer: DuplexOutputBuffer,
         timeout: float | None = 60,
     ) -> DuplexControlResultMessage:
+        """Register local output delivery before asking the worker to open a session."""
         self._buffers[session_id] = output_buffer
         try:
             return await self._rpc("open_session_async", (session_id, config), {"timeout": timeout})
@@ -545,9 +590,11 @@ class ProcessDuplexEngineClient:
         )
 
     async def submit_command_async(self, session_id: str, command: commands.DuplexCommand) -> None:
+        """Queue a command; worker-side rejection arrives as a session error event."""
         await self._send((None, "submit_command_async", (session_id, type(command).__name__, command), {}))
 
     async def check_health_async(self) -> None:
+        """Check native runtime health over IPC, beyond child-process liveness."""
         if not self.is_alive():
             raise EngineDeadError(self._failure or "Duplex engine process is not alive")
         try:
@@ -559,6 +606,7 @@ class ProcessDuplexEngineClient:
         return self._process.is_alive() and self._failure is None and not self._closed
 
     async def get_outputs_async(self, timeout: float = 0.1) -> list[DuplexSessionEventMessage]:
+        """Poll lifecycle events for the frontend pump; session data uses local buffers."""
         self.start()
         assert self._start_task is not None
         await self._start_task
@@ -570,6 +618,11 @@ class ProcessDuplexEngineClient:
             return []
 
     async def _read(self) -> None:
+        """Resolve RPCs and apply invalidations and events in wire order.
+
+        Stale audio is discarded before local delivery. Session closure goes
+        through the frontend output pump; other events enter session buffers.
+        """
         assert self._channel is not None
         while True:
             message = await self._channel.receive()
@@ -613,6 +666,7 @@ class ProcessDuplexEngineClient:
                 raise RuntimeError(f"Unknown duplex IPC message: {kind}")
 
     def _overflow_session(self, session_id: str, buffer: DuplexOutputBuffer) -> None:
+        """Close the overflowing frontend session and asynchronously release it in the worker."""
         self._buffers.pop(session_id, None)
         self._invalidated.pop(session_id, None)
         with suppress(DuplexOutputOverflowError):
@@ -634,6 +688,7 @@ class ProcessDuplexEngineClient:
         task.add_done_callback(self._cleanup_tasks.discard)
 
     async def aclose(self) -> None:
+        """Request graceful worker cleanup for up to 30 seconds, then ensure termination."""
         if self._closed:
             return
 
@@ -651,6 +706,7 @@ class ProcessDuplexEngineClient:
             self.shutdown(timeout=0)
 
     def shutdown(self, timeout: float | None = None) -> None:
+        """Idempotently close IPC and join the child, escalating to process-group signals."""
         if self._closed:
             return
         self._closed = True
