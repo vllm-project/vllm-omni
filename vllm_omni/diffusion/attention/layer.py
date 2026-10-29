@@ -481,10 +481,23 @@ class Attention(nn.Module):
         Identical effective identities for this role share one record. The dedup key carries the
         backend name, explicit-vs-default selection, the impl class object, and canonical JSON of
         backend_kwargs and of the spec's skip_calibration. An unserializable kwargs value does not
-        share. Two profiles that differ only in their calibration curve never share one impl.
+        share. Two profiles that differ only in their calibration curve never share one impl. A
+        candidate whose key equals the baseline's, with no calibration of its own, reuses the
+        baseline impl.
         """
         profiles = schedule_config.profiles
         self._schedule_profiles = tuple(sorted(profiles))
+        # A candidate with the baseline's identity reuses the baseline impl instead of building a
+        # second one. Calibration stamping writes the fallback dict onto the baseline, so only a
+        # candidate that carries no calibration of its own (and is stamped from that same fallback)
+        # can share it.
+        baseline_key = (
+            cast(type[AttentionBackend], self.attn_backend).get_name(),
+            self.backend_explicit,
+            self.attn_impl_cls,
+            _canonical_json(self.attn_spec.backend_kwargs() if self.attn_spec is not None else None),
+            "",
+        )
         prepared: dict[tuple, ScheduleCandidate] = {}
         candidates: dict[str, ScheduleCandidate] = {}
         for name in self._schedule_profiles:
@@ -508,7 +521,10 @@ class Attention(nn.Module):
             )
             record = prepared.get(dedup_key)
             if record is None:
-                impl = impl_cls(**impl_kwargs, backend_kwargs=backend_kwargs, backend_explicit=backend_explicit)
+                if dedup_key == baseline_key:
+                    impl = self.attention
+                else:
+                    impl = impl_cls(**impl_kwargs, backend_kwargs=backend_kwargs, backend_explicit=backend_explicit)
                 record = ScheduleCandidate(
                     backend_cls=backend_cls,
                     spec=spec,
