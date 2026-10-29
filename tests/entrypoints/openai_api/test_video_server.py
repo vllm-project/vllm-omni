@@ -339,6 +339,7 @@ class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
     supports_latent_mask_editing = False
     supported_control_upload_types: frozenset[str] = frozenset()
+    is_minimax_h3 = False
 
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -3812,10 +3813,13 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
 
     async def generate(prompt, request_id, sampling_params_list):
         config = sampling_params_list[0].extra_args[mode]
-        captured.update(config)
-        for key in ("control_path", "source_path", "mask_path"):
-            if key in config:
-                assert Path(config[key]).is_file()
+        # Settings travel in request extras; the persisted uploads travel only in multi_modal_data.
+        assert config == {"control_context_scale": 0.75}
+        media = prompt["multi_modal_data"]["minimax_h3_control"]
+        captured.update(config, **media)
+        assert set(media) == ({"mask_path"} if mode == "inpaint" else {"control_path"})
+        for path in media.values():
+            assert Path(path).is_file()
         async for output in original(prompt, request_id, sampling_params_list):
             yield output
 
@@ -3867,9 +3871,11 @@ def test_h3_inpaint_source_is_not_ref2va(endpoint, with_hint, test_client, mocke
     if not endpoint.endswith("/sync"):
         _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
     config = engine.captured_sampling_params_list[0].extra_args[mode]
-    assert "source_path" in config and "mask_path" in config
+    assert not any(key.endswith("_path") for key in config)
+    media = engine.captured_prompt["multi_modal_data"]["minimax_h3_control"]
+    assert {"source_path", "mask_path"} <= set(media)
     assert not engine.captured_prompt.get("multi_modal_data", {}).get("video")
-    assert all(not Path(value).exists() for key, value in config.items() if key.endswith("_path"))
+    assert all(not Path(value).exists() for value in media.values())
 
 
 @pytest.mark.parametrize(
@@ -4075,7 +4081,7 @@ def test_h3_inpaint_generation_failure_releases_all_uploads(endpoint, test_clien
     paths: list[str] = []
 
     async def fail(request, *args, **kwargs):
-        paths.extend(value for key, value in request.extra_params["canny"].items() if key.endswith("_path"))
+        paths.extend(request._minimax_h3_control_media.values())
         assert len(paths) == 3 and all(Path(path).exists() for path in paths)
         raise RuntimeError("controlled failure")
 
@@ -4105,7 +4111,7 @@ def test_h3_inpaint_timeout_releases_uploads(test_client, mocker, monkeypatch):
     cancelled = []
 
     async def block(request, *args, **kwargs):
-        paths.extend(value for key, value in request.extra_params["inpaint"].items() if key.endswith("_path"))
+        paths.extend(request._minimax_h3_control_media.values())
         try:
             await asyncio.Future()
         except asyncio.CancelledError:

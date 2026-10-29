@@ -300,21 +300,32 @@ def test_canvas_temporal_hold_and_truncate():
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -1, True, "1"])
 def test_invalid_control_scale(value):
     with pytest.raises(ValueError, match="finite"):
-        parse_control({"canny": {"control_path": "x", "control_context_scale": value}})
+        parse_control({"canny": {"control_context_scale": value}}, {"control_path": "x"})
 
 
 def test_control_mode_errors_and_no_control():
     assert parse_control({}) is None
-    assert parse_control({"canny": {"control_path": "x", "control_context_scale": 0}})["control_context_scale"] == 0
-    for extra in (
-        {"canny": {"source_path": "x"}},
-        {"canny": {"mask_path": "x"}},
-        {"inpaint": {"control_path": "x"}},
-        {"inpaint": {"mask_path": "x", "unknown": 1}},
-        {"canny": {"control_path": "x"}, "depth": {"control_path": "x"}},
+    zero = parse_control({"canny": {"control_context_scale": 0}}, {"control_path": "x"})
+    assert zero == {"control_context_scale": 0, "control_path": "x"}
+    for extra, media in (
+        ({"canny": {}}, {"source_path": "x"}),
+        ({"canny": {}}, {"mask_path": "x"}),
+        ({"inpaint": {}}, {"control_path": "x"}),
+        ({"inpaint": {"unknown": 1}}, {"mask_path": "x"}),
+        ({"canny": {}, "depth": {}}, {"control_path": "x"}),
+        ({}, {"control_path": "x"}),
+        ({"canny": {}}, {"other_path": "x"}),
     ):
         with pytest.raises(ValueError):
-            parse_control(extra)
+            parse_control(extra, media)
+
+
+@pytest.mark.parametrize("role", ["control_path", "source_path", "mask_path"])
+def test_request_extras_cannot_name_control_media_paths(role):
+    # Request extras are client input on every endpoint (e.g. chat completions extra_body),
+    # so a server-local path there must be refused even when the media channel is empty.
+    with pytest.raises(ValueError, match="must be uploaded"):
+        parse_control({"inpaint": {role: "/etc/passwd"}})
 
 
 def test_lossless_temporal_mask_sampling(tmp_path):
@@ -618,6 +629,7 @@ def test_control_rows_and_padded_sequence_survive_denoise_preparation():
         visual_condition_shapes=None,
         audio_condition_lengths=None,
         keyframe_frame_indices=None,
+        guide_blocks=None,
         control_rows=control_rows,
         control_context_scale=0.75,
         pad_seq_len=192,
@@ -699,17 +711,18 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
         audio_edit_mask=None,
     )
     sampling = SimpleNamespace(
-        extra_args={"canny": {"control_path": "control.mkv", "control_context_scale": 0.5}},
+        extra_args={"canny": {"control_context_scale": 0.5}},
         quality="lossless",
         seed=7,
         num_outputs_per_prompt=1,
     )
     pixels = torch.ones(1, 3, num_frames, 32, 32)
     rows = torch.ones(planner.video_latent_t(num_frames) * 4, 196)
+    media = {"control_path": "control.mkv"}
     monkeypatch.setattr(pipeline_module, "load_control_pixels", lambda *args, **kwargs: pixels)
     monkeypatch.setattr(pipeline_module, "build_control_rows", lambda *args, **kwargs: rows)
 
-    context = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+    context = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=media)
 
     assert context["control_rows"] is rows
     assert context["control_context_scale"] == 0.5
@@ -718,7 +731,7 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
 
     conditioning.guide_blocks = ({"kind": "image", "frame_index": 0, "latent_h": 2, "latent_w": 2},)
     with pytest.raises(pipeline_module.OmniClientError, match="visual timeline guides"):
-        pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+        pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=media)
     conditioning.guide_blocks = ()
 
     # A second DiT pass must not reuse control rows encoded for a smaller canvas.
@@ -727,10 +740,10 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
     pipeline._resolve_latent_upscale = lambda *args, **kwargs: target
     pipeline._resolve_latent_refine = lambda extra: refine
     with pytest.raises(pipeline_module.OmniClientError, match="first-pass canvas"):
-        pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+        pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=media)
 
     target = pipeline_module.MiniMaxH3LatentUpscaleTarget(latent_height=2, latent_width=2, scale=1.0)
-    same_canvas = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+    same_canvas = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=media)
     assert same_canvas["control_rows"] is rows
     assert same_canvas["latent_upscale"] is target
     assert same_canvas["latent_refine"] is refine

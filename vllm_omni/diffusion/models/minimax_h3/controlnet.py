@@ -10,7 +10,7 @@ The released full-width AdaLN weights are required; ComfyUI repacks are not supp
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -26,9 +26,22 @@ CONTROL_TYPES = frozenset({"canny", "depth", "hed", "mlsd", "pose", "inpaint"})
 CONTROL_BLOCKS = (0, 10, 20, 30, 40)
 
 
-def parse_control(extra: dict[str, Any]) -> dict[str, Any] | None:
+# Control media reaches the pipeline in ``multi_modal_data`` under this key,
+# filled by the video API from request-scoped uploads. ``extra_args`` is client
+# input on every endpoint, so it carries settings only, never media paths.
+MINIMAX_H3_CONTROL_MEDIA_KEY = "minimax_h3_control"
+CONTROL_MEDIA_ROLES = ("control_path", "source_path", "mask_path")
+
+
+def parse_control(extra: dict[str, Any], media: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+    """Merge the request's control settings with the server-provided control media."""
+    media = dict(media or {})
+    if set(media) - set(CONTROL_MEDIA_ROLES):
+        raise ValueError(f"Unsupported MiniMax H3 control media: {sorted(set(media) - set(CONTROL_MEDIA_ROLES))}")
     modes = CONTROL_TYPES.intersection(extra)
     if not modes:
+        if media:
+            raise ValueError("MiniMax H3 control media requires a control type")
         return None
     if len(modes) != 1:
         raise ValueError("MiniMax H3 accepts exactly one control type per request")
@@ -36,10 +49,12 @@ def parse_control(extra: dict[str, Any]) -> dict[str, Any] | None:
     value = extra[mode]
     if not isinstance(value, dict):
         raise ValueError(f"MiniMax H3 {mode} control settings must be an object")
-    unknown = set(value) - {"control_path", "source_path", "mask_path", "control_context_scale"}
+    if set(value) & set(CONTROL_MEDIA_ROLES):
+        raise ValueError("MiniMax H3 control media must be uploaded, not named as server-local paths")
+    unknown = set(value) - {"control_context_scale"}
     if unknown:
         raise ValueError(f"Unsupported MiniMax H3 control settings: {sorted(unknown)}")
-    value = dict(value)
+    value = {**value, **media}
     scale = value.get("control_context_scale", 1.0)
     try:
         valid_scale = (
@@ -209,7 +224,8 @@ def build_control_rows(
 class MiniMaxH3ControlBlock(MiniMaxH3DiTBlock):
     def __init__(self, arch: MiniMaxH3DiTArchConfig, index: int):
         prefix = f"controlnet.control_blocks.{index}"
-        super().__init__(arch, None, prefix=prefix)
+        # Control blocks never receive reference-KV state, so the index only satisfies the base signature.
+        super().__init__(arch, None, prefix=prefix, layer_index=index)
         if index == 0:
             self.before_proj = ColumnParallelLinear(
                 arch.hidden_size,

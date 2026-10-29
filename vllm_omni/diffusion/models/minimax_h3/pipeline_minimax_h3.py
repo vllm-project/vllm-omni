@@ -117,7 +117,7 @@ from .condition_noise import (
     minimax_h3_imgvid_cond_noise_rows,
 )
 from .continuation import diffuse_continuation, plan_continuation_windows, resolve_continuation
-from .controlnet import build_control_rows, load_control_pixels, parse_control
+from .controlnet import MINIMAX_H3_CONTROL_MEDIA_KEY, build_control_rows, load_control_pixels, parse_control
 from .denoise_loop import (
     MiniMaxH3DenoiseBranch,
     minimax_h3_denoise_loop,
@@ -3046,7 +3046,9 @@ class MiniMaxH3Pipeline(
             )
         else:
             conditioning = self._extract_encoder_conditioning(raw_prompt)
-        context.update(self._prepare_encoder_conditioning_inputs(conditioning, sampling))
+        prompt_media = raw_prompt.get("multi_modal_data") if isinstance(raw_prompt, Mapping) else None
+        control_media = prompt_media.get(MINIMAX_H3_CONTROL_MEDIA_KEY) if isinstance(prompt_media, Mapping) else None
+        context.update(self._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=control_media))
         if (
             context.get("latent_refine") is not None
             and context.get("latent_upscale") is not None
@@ -3081,10 +3083,11 @@ class MiniMaxH3Pipeline(
         self,
         conditioning: MiniMaxH3EncoderConditioning,
         sampling: Any,
+        control_media: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         extra = sampling.extra_args or {}
         try:
-            control = parse_control(extra)
+            control = parse_control(extra, control_media)
         except ValueError as exc:
             raise OmniClientError(str(exc)) from exc
         if control is not None:

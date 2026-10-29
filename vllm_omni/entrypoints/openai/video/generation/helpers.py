@@ -1405,8 +1405,11 @@ async def _parse_video_form(
                     # Decode validation is shared media logic; request ownership
                     # remains here and covers partial persistence failures too.
                     await asyncio.to_thread(validate_control_media_file, path, allow_image=role == "mask")
-                assert request.extra_params is not None
-                request.extra_params[normalized_control_type][f"{role}_path"] = path
+                if h3_control:
+                    request._minimax_h3_control_media[f"{role}_path"] = path
+                else:
+                    assert request.extra_params is not None
+                    request.extra_params[normalized_control_type][f"{role}_path"] = path
         except InvalidInputReferenceError as exc:
             _cleanup_video_references(reference_video, reference_audio, request)
             raise HTTPException(400, detail=str(exc)) from exc

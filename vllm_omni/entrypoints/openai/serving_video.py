@@ -472,6 +472,9 @@ class OmniOpenAIServingVideo:
         guide_input = request._timeline_guide_input
         if guide_input is not None:
             multi_modal_data["timeline_guides"] = guide_input.guides
+        if request._minimax_h3_control_media:
+            # MINIMAX_H3_CONTROL_MEDIA_KEY: server-persisted control uploads, never request extras.
+            multi_modal_data["minimax_h3_control"] = dict(request._minimax_h3_control_media)
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
         if vp.width is not None and vp.height is not None:
