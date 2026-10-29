@@ -18,6 +18,23 @@ retain the pinned Hy-Nomas reference implementation.
 `HyNomasModularPipeline` in the checkpoint index selects this vLLM-Omni pipeline.
 The author's Diffusers fork is not needed for this integration.
 
+## Model architecture
+
+Qwen text conditioning and optional camera geometry guide a segment-autoregressive
+dual-stream DiT; retained KV connects segments, and PixelUMM decodes DCAE-V latents.
+
+| Component | Structure | Parameters | BF16 weights (GiB) |
+| --- | --- | --- | --- |
+| DiT | 54 blocks, hidden 2048, 16×128 heads, FFN 8192; token refiner included | 8.55B | 15.93 |
+| Qwen2.5-VL language component | 28 layers, hidden 3584 | 7.07B | 13.17 |
+| PixelUMM decoder | 36 layers, hidden 4096, 32 query / 8 KV heads, one decode step | 6.97B | 12.99 |
+
+The loaded components total 22.60B parameters / 42.09 GiB BF16 weights, excluding
+KV, staging, activations and workspaces. DCAE-V uses 32 channels, 32× spatial and
+4× temporal compression; PixelUMM uses 10-latent windows with overlap 5.
+Parameter counts use checkpoint-index bytes divided by two and agree with
+actual loaded component bytes; 8.55B describes the DiT alone.
+
 ## Supported model contract
 
 | Task | Entrypoint | Input | Output |
@@ -318,6 +335,27 @@ MP4 incrementally instead of retaining all decoded frames in host memory.
 
 ## Verification
 
+### Scope relative to the RFC
+
+This first PR implements model integration and qualifies offline/full/recent
+accuracy plus normal realtime output. Relative to
+[RFC #14, §5](https://github.com/wtz2333/vllm-omni/issues/14):
+
+| RFC item | Included here | Deferred / not claimed here |
+| --- | --- | --- |
+| A1 | Absolute progress, resident budgets, incremental-v1 noise, legacy full behavior and model-state guards | Complete production resource/lifecycle qualification |
+| A2 | Pinned companion reference rolling decoder at `16a4c228` | Reference-side source is not duplicated in this Omni diff |
+| A3 | Session-bound rolling decode, positions, empty stable metadata, normal final flush | Full cancellation/transport qualification |
+| A4 | Full/recent transactional retention; offline AR and normal realtime/typed output; 18/36 precision and 120+ second delivery | Remaining A4 service matrix, 72 precision, complete high-water accounting and broad W6/full-vs-recent quality |
+| B1–B9 | Basic SP/module offload remains supported; no new B-series optimization claimed | Media/kernel/attention/staging optimization, chunk residency/prefetch, decode parallelism, encoder sharding, regional compile/graphs and sparsity |
+| C1–C8 | Full/recent through AR state interfaces | CPU archival, other history sampling, KV/weight quantization, undo and pause/resume |
+| D1–D3 | Camera trajectory conditioning | Nomas-PE, official LoRA and browser camera UI |
+
+The shared runtime retains its existing cancellation, timeout, quota and
+backpressure mechanisms. Their complete production qualification, including
+mid-compute cancellation and real blocked TCP sending, is outside this PR's
+acceptance scope; this is not a declaration that the entire A4 milestone passed.
+
 ### Scope and reference accuracy
 
 This integration covers offline generation, full/recent AR sessions, and normal
@@ -350,7 +388,7 @@ difference. The mechanism remains unresolved; one scene/seed does not establish
 broad long-horizon quality. The 48-turn comparison is distinct from the
 single-request WebSocket diagnostic below.
 
-[Public data, calculations, complete viewing videos, images and reproduction commands](https://github.com/wtz2333/vllm-omni/blob/f69d6f0636a0f9c15d68f07becf07e786ffad1d9/test-evidence/PR9338/section-a-20261029/README.md).
+[Public data, calculations, complete viewing videos, images and reproduction commands](https://github.com/wtz2333/vllm-omni/blob/16278847a58dbde41b8d5e15017c7b092585340e/test-evidence/PR9338/section-a-20261029/README.md).
 
 ### Current long-stream diagnostic
 
@@ -372,7 +410,34 @@ the precision and entrypoint checks, rather than this diagnostic workload.
 
 ### Historical repeated performance
 
-The latest repeated SDK benchmark belongs to earlier implementation `257856d3`:
+Earlier same-H200 offline 4/8-step data at `257856d3` is also retained: 704×1280,
+121 frames, resident BF16, SP1, ten unprofiled measured requests per step count
+(five before/five after diagnostics; two initial and one recovery warmup each).
+
+| Steps | Samples | Median SDK E2E (ms) | Mean ± SD (ms) | Median drift |
+| --- | --- | --- | --- | --- |
+| 8 | 10 | 25653.8 | 25787.4 ± 555.7 | +0.055% |
+| 4 | 10 | 19199.9 | 19202.1 ± 64.1 | -0.396% |
+
+Both have peak allocated/reserved 59.09/63.37 GiB. The observed 1.336× step-count
+ratio is not a quality-equivalence claim; cross-step outputs differ.
+
+Two separate event diagnostics per step count give this decomposition:
+
+| Stage | 8 steps (ms) | 4 steps (ms) |
+| --- | --- | --- |
+| Text encoding | 41.4 | 41.3 |
+| DiT denoising | 12682.1 | 6356.5 |
+| KV commit | 1583.5 | 1583.8 |
+| VAE / PixelUMM decode, six windows | 8758.8 | 8750.2 |
+| Other pipeline residual | 8.6 | 8.6 |
+| Post-pipeline return residual | 2383.1 | 2461.7 |
+
+Diagnostic E2E means are 25457.4/19202.2 ms, rather than the formal medians above.
+Event stream elapsed can include host gaps; residuals are calculated differences,
+not isolated IPC/PCIe measurements. Do not add nested stage wrappers twice.
+
+The separate SP/module-offload SDK matrix belongs to the same earlier implementation:
 704×1280, 121 frames, eight steps, two warmups and five measured requests per row.
 It has not been repeated on the current bounded-history implementation.
 
@@ -387,6 +452,30 @@ SDK E2E excludes loading, encoding and writes. The SP1 recheck median was
 25669.2 ms, a -16.91% change on the shared host. Raw samples, mean/SD/p95,
 earlier ordinary/offload accuracy and benchmark commands remain in the
 [historical evidence](https://github.com/wtz2333/vllm-omni/blob/a518affb28c71bf072bae2e4397dd5f227822e75/test-evidence/PR9338/hy-nomas-diffusers/README.md).
+
+### Historical per-chunk stages and current chunk records
+
+The earlier `b5c9b68f5` full-history stream used one H200/SP1, 253 frames, four
+steps, 16-latent chunks and explicit capacity 64 latents / 1 prompt. Unprofiled
+median first-playable frame was 7595.3 ms, E2E 58517.9 ms, RTF 5.551 (n=5).
+The following stage values are means of two separate event diagnostics:
+
+| Previous latents | Stable frames | DiT denoise (ms) | KV commit (ms) | PixelUMM prediction (ms) | Decode/convert inclusive (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 24 | 2581.5 | 655.0 | 2919.8 | 3970.9 |
+| 16 | 64 | 3860.9 | 979.8 | 4376.2 | 7148.2 |
+| 32 | 64 | 4878.6 | 1229.1 | 4376.7 | 7425.4 |
+| 48, final flush | 101 | 5916.8 | 1493.3 | 8749.3 | 13762.5 |
+
+PixelUMM prediction is inside decode/convert; staging is inside DiT/commit.
+Event elapsed is not pure GPU kernel time. The final flush changes decode work.
+The explicit single-H200 capacity is not evidence that the default AR capacity fits.
+
+Current 18/36 SP2 diagnostics publish all 90 chunk records (45 per session),
+including positions, metadata intervals, decoded-frame timestamps and hashes.
+No per-stage event timers were collected for those recent rollouts; historical
+full-mode stage values do not replace that missing measurement.
+[Raw stage samples, all chunk records, architecture calculations and RFC mapping](https://github.com/wtz2333/vllm-omni/blob/16278847a58dbde41b8d5e15017c7b092585340e/test-evidence/PR9338/section-a-20261029/architecture-stages-scope.md).
 
 Production service hardening, compute-mid-generation cancellation and real TCP
 blocked sending are outside this integration's acceptance scope. GPU CI and a
