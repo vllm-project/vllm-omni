@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """LAYA decision model (convaiinnovations/laya-*) as a response judge (pooling runner).
 
-Same maths as laya.common.DecisionModel
+Encoder and decision-head maths follow laya.common.DecisionModel
 (Apache-2.0): ModernBERT encoder -> + type embedding -> 2 TransformerEncoder
 layers -> scorer at every [MASK] option marker. The act/escalate head is not
 needed for a judge decision and is not loaded.
@@ -10,6 +10,9 @@ needed for a judge decision and is not loaded.
 The prompt (``[CLS] <type> question: <ins> [SEP] [MASK] opt0 [MASK] opt1 [SEP]
 state [SEP]``) is built by the ``response_judge`` bridge; the pooler finds the
 option markers from the prompt token ids and returns one raw logit per option.
+Checkpoint temperature is ignored: the bridge applies softmax at T=1.
+SDK-calibrated thresholds need retuning when its temperature differs; see
+docs/features/response_judge.md.
 """
 
 from __future__ import annotations

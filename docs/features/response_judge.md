@@ -66,6 +66,18 @@ Options per format:
 `reply_option` may be a list; the probabilities of the listed options are
 added.
 
+LAYA score calibration: this adapter returns raw option logits and ignores
+the checkpoint's `temperature` buffer. The bridge computes
+`softmax(logits)` (effective temperature `T = 1`), rather than
+`softmax(logits / T)`. If the LAYA SDK uses a checkpoint temperature other
+than 1, its probabilities and threshold-based decisions can differ here.
+Do not reuse an SDK-calibrated `threshold` without validation: retune it
+using this adapter's scores on representative tuning data for your
+checkpoint, prompt and options, then validate on a separate held-out set.
+The current example uses `T = 1`, so this
+temperature difference does not affect it. Temperature scaling is not
+configurable in this adapter.
+
 For `laya`, the server refuses to start if `options` is empty,
 `reply_option` names an option that is not configured, or `threshold` is not
 a number in [0, 1]. Loading also fails if a judge head weight does not have

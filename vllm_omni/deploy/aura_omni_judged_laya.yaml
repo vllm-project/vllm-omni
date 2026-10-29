@@ -2,6 +2,9 @@
 # Only stage 1 changes: LAYA is an encoder with a decision head, served with
 # the pooling runner; it scores the listed options at their [MASK] markers
 # and the turn is let through when P(reply_option) >= threshold.
+# Scores use softmax(raw logits), effectively T=1; checkpoint temperature is
+# ignored. Retune SDK-calibrated thresholds with this adapter if SDK T differs.
+# The current example uses T=1. See docs/features/response_judge.md.
 #
 # LAYA checkpoints keep config.json and the tokenizer in subfolders; `model`
 # is a directory laid out for vLLM (config.json with
