@@ -285,13 +285,42 @@ def _random_like(t: torch.Tensor, generator: torch.Generator, std: float = 1.0) 
     return torch.empty_like(t).normal_(0.0, std, generator=generator)
 
 
+def _log_probe_skipped(conv: nn.Module, x: torch.Tensor) -> None:
+    logger.info_once(
+        "Not enough free device memory to verify the fast path for %s %s; using the reference formulation for "
+        "this call (verified once memory allows)",
+        type(conv).__name__,
+        tuple(x.shape),
+    )
+
+
+def _probe_fits(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Whether a probe's scratch tensors fit in the device memory that is free now.
+
+    A probe holds a random weight, a random input, the reference's prepared
+    copy of it (at most a padded copy) and both outputs, on top of the live
+    decode state; at large shapes that is what would push the first call past
+    the reference's peak. Counts memory the caching allocator has reserved but
+    not handed out; 10% headroom covers the padding and allocator rounding.
+    """
+    out_bytes = x.nbytes * weight.shape[0] // x.shape[1]  # same spatial size, at most as many frames
+    need = weight.nbytes + int(1.1 * (2 * x.nbytes + 2 * out_bytes))
+    device_module = torch.get_device_module(x.device)
+    try:
+        free, _ = device_module.mem_get_info(x.device)
+        free += device_module.memory_reserved(x.device) - device_module.memory_allocated(x.device)
+    except Exception:  # backend without memory queries: rely on the OutOfMemoryError fallback
+        return True
+    return need <= free
+
+
 def _equal_on_random_operands(
     x: torch.Tensor,
     weight: torch.Tensor,
     candidate: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     reference: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     reference_input: Callable[[torch.Tensor], torch.Tensor],
-) -> bool:
+) -> bool | None:
     """Compare two convolution formulations on seeded random stand-ins for ``x`` and ``weight``.
 
     Agreement on the real operands proves little: all-zero activations or
@@ -307,13 +336,24 @@ def _equal_on_random_operands(
     is created; callers probe before running the real convolution. The first
     call for a shape then holds at most one probe input, the reference copy
     and the two probe outputs, no more than comparing real operands did.
+
+    Returns ``None`` when the probe does not fit in free device memory (see
+    :func:`_probe_fits`) or runs out of it: the caller then runs the reference
+    formulation for this call and records nothing, so the shape is probed
+    again once memory allows. The first call therefore never needs more
+    memory than the reference path, and devices with room keep the fast path.
     """
-    generator = torch.Generator(device=x.device).manual_seed(_PROBE_SEED)
-    probe_weight = _random_like(weight, generator, std=weight[0].numel() ** -0.5)
-    state = generator.get_state()
-    reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
-    generator.set_state(state)
-    return _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
+    if not _probe_fits(x, weight):
+        return None
+    try:
+        generator = torch.Generator(device=x.device).manual_seed(_PROBE_SEED)
+        probe_weight = _random_like(weight, generator, std=weight[0].numel() ** -0.5)
+        state = generator.get_state()
+        reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
+        generator.set_state(state)
+        return _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
+    except torch.OutOfMemoryError:
+        return None
 
 
 def _conv_with_spatial_padding(
@@ -356,6 +396,9 @@ def _conv_with_spatial_padding(
     verdict = verdicts.get(key)
     if verdict is None:
         verdict = _equal_on_random_operands(assembled, conv.weight, candidate, padded, pad)
+        if verdict is None:
+            _log_probe_skipped(conv, assembled)
+            return padded(pad(assembled), conv.weight)
         _record_verdict(verdicts, key, verdict)
         if not verdict:
             logger.info(
@@ -446,10 +489,9 @@ def _run_cached_causal_conv(
         x = conv(x, feat_cache[idx])
         feat_cache[idx] = cache_x
 
-    The fused path stores the last ``CACHE_T`` frames of the assembled conv
-    input instead. On the very first chunk that is ``[0, x]`` where upstream
-    stores ``[x]``; the next conv input is identical either way because the
-    causal padding shrinks by the cache length.
+    The fused path stores the last ``CACHE_T`` cache/``x`` frames of the
+    assembled conv input instead, never its zero front padding, so the cache
+    holds what upstream's holds.
 
     With ``return_bias=True`` the fused path leaves the convolution bias unadded
     and returns it alongside the output so the consumer can fold it into its own
@@ -629,6 +671,9 @@ def _run_conv_out_channels_last(
     key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
     if not verdicts.get(key, True):
         return None
+    if key not in verdicts and not _probe_fits(x, conv.weight):
+        _log_probe_skipped(conv, x)
+        return None  # the standard path, before the channels-last copy is assembled
     pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T, channels_last_output=True)
     if pair is None:
         return None
@@ -644,6 +689,9 @@ def _run_conv_out_channels_last(
 
     if key not in verdicts:
         verdict = _equal_on_random_operands(assembled, conv.weight, candidate, channels_first, lambda t: t.contiguous())
+        if verdict is None:
+            _log_probe_skipped(conv, assembled)
+            return channels_first(assembled.contiguous(), conv.weight)
         _record_verdict(verdicts, key, verdict)
         if not verdict:
             logger.info(
@@ -1039,6 +1087,9 @@ def _conv2d_with_padding(conv: nn.Conv2d, frame: torch.Tensor, pad: tuple[int, i
     verdict = verdicts.get(key)
     if verdict is None:
         verdict = _equal_on_random_operands(frame, conv.weight, candidate, padded, pre_pad)
+        if verdict is None:
+            _log_probe_skipped(conv, frame)
+            return padded(pre_pad(frame), conv.weight)
         _record_verdict(verdicts, key, verdict)
         if not verdict:
             logger.info(

@@ -44,14 +44,16 @@ def cpu_assembly(monkeypatch):
         history = 0 if cache_x is None else cache_x.shape[2]
         zeros = x.new_zeros((*x.shape[:2], pad_front - history, *x.shape[3:]))
         assembled = torch.cat([zeros, *([] if cache_x is None else [cache_x]), x], dim=2)
-        return (assembled, assembled[:, :, -keep_cache_frames:].clone()) if keep_cache_frames else assembled
+        keep = min(keep_cache_frames, history + x.shape[2])  # never the zero front padding
+        return (assembled, assembled[:, :, -keep:].clone()) if keep_cache_frames else assembled
 
     def cat_pad(x, cache_x, padding, keep_cache_frames=0, channels_last_output=False):
         in_time = cat_time(x, cache_x, padding[4])
         assembled = torch.nn.functional.pad(in_time, (*padding[:4], 0, 0))
         if channels_last_output:
             assembled = assembled.contiguous(memory_format=torch.channels_last_3d)
-        return (assembled, in_time[:, :, -keep_cache_frames:].clone()) if keep_cache_frames else assembled
+        keep = min(keep_cache_frames, (0 if cache_x is None else cache_x.shape[2]) + x.shape[2])
+        return (assembled, in_time[:, :, -keep:].clone()) if keep_cache_frames else assembled
 
     monkeypatch.setattr(fp.dm, "cat_time_5d", cat_time)
     monkeypatch.setattr(fp.dm, "cat_pad_5d", cat_pad)
@@ -264,6 +266,86 @@ def test_replaced_cache_is_released_before_convolution(cpu_assembly, monkeypatch
 
 
 @torch.no_grad()
+@torch.no_grad()
+@pytest.mark.parametrize("shortage", ["no_room", "out_of_memory"])
+def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_assembly, monkeypatch, shortage) -> None:
+    """A probe that does not fit leaves the shape unverified: reference formulation now, a probe once memory allows."""
+    cache_name, cache = verdict_cache
+    spatial_padding = cache_name == "_SPATIAL_PAD_VERDICTS"
+    conv = fp.WanCausalConv3d(2, 2, 3, padding=1)
+    conv.weight.fill_(1)
+    conv.bias.zero_()
+    conv3d = torch.nn.functional.conv3d
+    fast_calls = []
+
+    def counting_conv3d(x, weight, bias, stride, padding, dilation, groups):
+        fast_calls.append(_is_candidate_call(spatial_padding, x, padding))
+        return conv3d(x, weight, bias, stride, padding, dilation, groups)
+
+    monkeypatch.setattr(fp.F, "conv3d", counting_conv3d)
+    random_like = fp._random_like
+    room = False
+
+    def probe_fits(x, weight):
+        return room or shortage != "no_room"
+
+    def maybe_oom(t, generator, std=1.0):
+        if not room and shortage == "out_of_memory":
+            raise torch.OutOfMemoryError("probe")
+        return random_like(t, generator, std)
+
+    monkeypatch.setattr(fp, "_probe_fits", probe_fits)
+    monkeypatch.setattr(fp, "_random_like", maybe_oom)
+
+    def run():
+        x = torch.full((1, 2, 1, 3, 4), 2.0)
+        expected = conv3d(torch.nn.functional.pad(x, conv._padding), conv.weight, conv.bias)
+        if spatial_padding:
+            output = fp._run_cached_causal_conv(conv, x, [None], 0)
+        else:
+            output = fp._run_conv_out_channels_last(conv, x, [None], 0)
+        return output, expected
+
+    output, expected = run()
+    if output is None:
+        assert not spatial_padding and shortage == "no_room"  # declined before the channels-last copy
+    else:
+        assert torch.equal(output, expected)
+    assert not cache.get(conv)  # nothing recorded: the shape stays unverified
+    assert not any(fast_calls)  # the real input only went through the reference formulation
+
+    room = True
+    fast_calls.clear()
+    output, expected = run()
+    assert torch.equal(output, expected)
+    assert list(cache[conv].values()) == [True]
+    assert fast_calls[-1]  # verified, so the fast formulation ran
+
+
+def test_probe_fits_counts_free_and_reserved_unallocated_memory(monkeypatch) -> None:
+    x = torch.empty(1, 4, 3, 8, 8)  # 3 KiB
+    weight = torch.empty(8, 4, 3, 3, 3)  # twice the channels out: 6 KiB of output
+    need = weight.nbytes + int(1.1 * (2 * x.nbytes + 2 * 2 * x.nbytes))
+    memory = {"free": need, "reserved": 0, "allocated": 0}
+    device_module = type(
+        "DeviceModule",
+        (),
+        {
+            "mem_get_info": staticmethod(lambda device: (memory["free"], 1 << 40)),
+            "memory_reserved": staticmethod(lambda device: memory["reserved"]),
+            "memory_allocated": staticmethod(lambda device: memory["allocated"]),
+        },
+    )
+    monkeypatch.setattr(fp.torch, "get_device_module", lambda device: device_module)
+    assert fp._probe_fits(x, weight)
+    memory["free"] = need - 1
+    assert not fp._probe_fits(x, weight)
+    memory.update(reserved=10, allocated=9)  # cached allocator blocks not handed out count as free
+    assert fp._probe_fits(x, weight)
+    monkeypatch.setattr(fp.torch, "get_device_module", lambda device: object())  # no memory queries
+    assert fp._probe_fits(x, weight)
+
+
 @pytest.mark.parametrize("channels_last,verify", [(False, True), (True, True), (True, False)])
 def test_spatial_probe_policy_preserves_exact_paths(monkeypatch, channels_last: bool, verify: bool) -> None:
     conv = fp.WanCausalConv3d(2, 2, 3, padding=1)
