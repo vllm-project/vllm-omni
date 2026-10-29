@@ -516,6 +516,28 @@ def test_serve_cli_forwards_distilled_lora_to_diffusion_stage():
     ]
 
 
+def test_serve_cli_forwards_vae_stack_tiling():
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--vae-stack-tiling",
+            "auto",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = StageConfigFactory.create_default_diffusion(explicit_kwargs)[0]
+
+    assert args.vae_stack_tiling == "auto"
+    assert stage_cfg["engine_args"]["vae_stack_tiling"] == "auto"
+
+
 def test_serve_cli_forwards_compact_diffusion_offload_config():
     """Ensure component-specific layer settings reach the diffusion stage."""
     parser = TrackingArgumentParser()

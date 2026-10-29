@@ -241,6 +241,18 @@ def test_invalid_vae_fast_path_is_rejected():
         OmniDiffusionConfig(model="x", vae_fast_path="fast")
 
 
+def test_vae_stack_tiling_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_stack_tiling == "false"
+    assert _roundtrip_diffusion_config(model="x", vae_stack_tiling="auto").vae_stack_tiling == "auto"
+    # YAML booleans normalize to the string modes.
+    assert OmniDiffusionConfig(model="x", vae_stack_tiling=True).vae_stack_tiling == "true"
+
+
+def test_invalid_vae_stack_tiling_is_rejected():
+    with pytest.raises(ValueError, match="vae_stack_tiling"):
+        OmniDiffusionConfig(model="x", vae_stack_tiling="on")
+
+
 def test_vae_encode_fast_path_roundtrip():
     assert _roundtrip_diffusion_config(model="x").vae_encode_fast_path == "lossless"
     od = _roundtrip_diffusion_config(model="x", vae_fast_path="off", vae_encode_fast_path="channels_last")

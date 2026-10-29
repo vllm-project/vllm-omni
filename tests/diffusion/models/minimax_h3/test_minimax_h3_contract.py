@@ -561,6 +561,86 @@ def test_encoder_free_stage_skips_missing_component_during_dlo_registration():
     audio_vae.set_omni_component_cache.assert_called_once_with(cache)
 
 
+def _stack_tiling_video_vae(*, parallel_size=1, tile_rows=1, tile_columns=1, mode="false"):
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    def split_tiles(input_len, is_decoder=False):
+        assert is_decoder
+        count = tile_rows if input_len == 16 else tile_columns
+        return list(range(count)), [1] * count, [0] * max(0, count - 1)
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    nn.Module.__init__(vae)
+    vae.model = SimpleNamespace(
+        stack_tiling=False,
+        parallel_tiling=parallel_size > 1,
+        vae_ratio=16,
+        split_tiles=split_tiles,
+    )
+    vae.parallel_size = parallel_size
+    vae.stack_tiling_mode = mode
+    vae._native_parallel_state = lambda: {"sp_size": parallel_size, "sp_rank": 0}
+    return vae
+
+
+def test_h3_video_vae_stack_tiling_mode_is_decode_scoped():
+    vae = _stack_tiling_video_vae()
+
+    assert vae.supports_stack_tiling
+    for mode in ("true", "auto", "false"):
+        vae.set_stack_tiling(mode)
+        assert vae.stack_tiling_mode == mode
+        # Only the decode context raises the checkpoint flag, so encode stays sequential.
+        assert vae.model.stack_tiling is False
+    with pytest.raises(ValueError, match="invalid VAE stacked-tiling mode"):
+        vae.set_stack_tiling("on")
+
+
+@pytest.mark.parametrize(
+    ("mode", "parallel_size", "tile_rows", "tile_columns", "expect_stack", "expect_rank_local"),
+    [
+        ("auto", 1, 1, 2, True, False),
+        ("auto", 2, 1, 2, False, False),
+        ("auto", 2, 2, 2, True, False),
+        ("auto", 4, 2, 4, True, False),
+        # Fewer tiles than ranks: decode falls back rank-locally, so one rank owns every tile.
+        ("auto", 4, 1, 2, True, True),
+        ("auto", 4, 1, 1, False, True),
+        ("true", 2, 1, 2, True, False),
+        ("false", 1, 2, 2, False, False),
+    ],
+)
+def test_h3_video_vae_decode_context_stacks_against_tile_ranks(
+    mode, parallel_size, tile_rows, tile_columns, expect_stack, expect_rank_local
+):
+    vae = _stack_tiling_video_vae(
+        parallel_size=parallel_size,
+        tile_rows=tile_rows,
+        tile_columns=tile_columns,
+        mode=mode,
+    )
+    parallel_tiling = vae.model.parallel_tiling
+    latent = torch.zeros(1, 32, 1, 1, 2)
+
+    with vae._decode_tiling_context(latent):
+        assert vae.model.stack_tiling is expect_stack
+        assert vae.model.parallel_tiling is (parallel_tiling and not expect_rank_local)
+
+    assert vae.model.stack_tiling is False
+    assert vae.model.parallel_tiling is parallel_tiling
+
+
+def test_h3_video_vae_rejects_remote_without_stack_tiling():
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    nn.Module.__init__(vae)
+    vae.model = SimpleNamespace()
+
+    with pytest.raises(RuntimeError, match="does not expose stack_tiling"):
+        vae.set_stack_tiling("true")
+
+
 def _write_partition_index(path, *, partition, tasks):
     path.mkdir(parents=True)
     (path / "model_index.json").write_text(

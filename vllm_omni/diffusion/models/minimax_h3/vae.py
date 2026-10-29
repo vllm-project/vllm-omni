@@ -334,6 +334,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
     decode_dtype: torch.dtype = torch.float16
     _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+    supports_stack_tiling: ClassVar[bool] = True
+    stack_tiling_mode: str = "false"
 
     def __init__(
         self,
@@ -984,7 +986,40 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ).float()
         return rows, shape
 
-    def _decode_tiling_context(self, latent: torch.Tensor) -> AbstractContextManager:
+    def set_stack_tiling(self, mode: str) -> None:
+        """Select when decode batches a rank's tiles into one decoder call.
+
+        Only decode stacks: the checkpoint's own ``stack_tiling`` flag is
+        raised inside :meth:`_decode_tiling_context` and restored afterwards,
+        so encode keeps its sequential tile loop.
+        """
+        if not hasattr(self.model, "stack_tiling"):
+            raise RuntimeError("MiniMax H3 video VAE remote model does not expose stack_tiling")
+        if mode not in ("auto", "true", "false"):
+            raise ValueError(f"invalid VAE stacked-tiling mode: {mode!r}")
+        self.stack_tiling_mode = mode
+
+    def _should_stack_decode_tiles(self, num_tiles: int, tile_ranks: int) -> bool:
+        """Whether each of ``tile_ranks`` ranks gets enough tiles to batch.
+
+        ``auto`` requires at least two tiles on every rank under the
+        checkpoint's round-robin split; one tile per rank has nothing to batch.
+        """
+        if self.stack_tiling_mode != "auto":
+            return self.stack_tiling_mode == "true"
+        return num_tiles >= 2 * tile_ranks
+
+    @contextmanager
+    def _stacked_decode_tiles(self) -> Iterator[None]:
+        saved_stack_tiling = self.model.stack_tiling
+        self.model.stack_tiling = True
+        try:
+            yield
+        finally:
+            self.model.stack_tiling = saved_stack_tiling
+
+    @contextmanager
+    def _decode_tiling_context(self, latent: torch.Tensor) -> Iterator[None]:
         """Pick the tiling mode a decode of ``latent`` can safely use.
 
         The checkpoint hands rank r the tiles ``range(r, num_tiles, sp_size)``
@@ -993,9 +1028,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         forever, so too few tiles hangs the whole stage rather than failing
         it. Tile count depends only on the latent shape, so every rank takes
         this branch together.
+
+        Stacked tiling is decided against the ranks that actually split the
+        tiles, which is one once decode falls back to rank-local tiling.
         """
         num_tiles = self._decoder_tile_count(latent)
-        if self.parallel_size > 1 and num_tiles < self.parallel_size:
+        rank_local = self.parallel_size > 1 and num_tiles < self.parallel_size
+        if rank_local:
             logger.warning_once(
                 "MiniMax-H3 VAE decode splits into %d tile(s) but the tile group has "
                 "%d ranks; decoding rank-locally for this shape instead, which is "
@@ -1003,8 +1042,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 num_tiles,
                 self.parallel_size,
             )
-            return self._rank_local_tiling()
-        return nullcontext()
+        stack = self._should_stack_decode_tiles(num_tiles, 1 if rank_local else self.parallel_size)
+        with (
+            self._rank_local_tiling() if rank_local else nullcontext(),
+            self._stacked_decode_tiles() if stack else nullcontext(),
+        ):
+            yield
 
     @torch.inference_mode()
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:

@@ -940,6 +940,15 @@ class OmniServeCommand(CLISubcommand):
                 "the reference encoder."
             ),
         )
+        omni_config_group.add_argument(
+            "--vae-stack-tiling",
+            choices=("auto", "true", "false"),
+            default="false",
+            help=(
+                "Batch native VAE decoder tiles into fewer model calls. 'auto' enables it "
+                "when each rank that decodes tiles has multiple tiles (default: false)."
+            ),
+        )
 
         # Parallel weight loading (faster diffusion startup)
         omni_config_group.add_argument(

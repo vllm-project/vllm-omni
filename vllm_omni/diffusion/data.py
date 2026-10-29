@@ -48,6 +48,8 @@ logger = init_logger(__name__)
 
 # Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
 VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
+# Accepted values for ``OmniDiffusionConfig.vae_stack_tiling``.
+VAE_STACK_TILING_MODES: tuple[str, ...] = ("auto", "true", "false")
 
 
 def _move_diffusion_alias(
@@ -983,6 +985,9 @@ class OmniDiffusionConfig:
     # Independent encoder fast path for the residual, patchified Wan VAE used
     # by Cosmos3. Levels have the same numerical contract as the decoder.
     vae_encode_fast_path: str = "lossless"
+    # Batch native VAE decoder tiles into one call per rank. ``"auto"`` stacks
+    # only when every rank that decodes tiles owns at least two of them.
+    vae_stack_tiling: str = "false"
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -1265,6 +1270,12 @@ class OmniDiffusionConfig:
         if self.vae_encode_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(
                 f"vae_encode_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_encode_fast_path!r}"
+            )
+        if isinstance(self.vae_stack_tiling, bool):
+            self.vae_stack_tiling = "true" if self.vae_stack_tiling else "false"
+        if self.vae_stack_tiling not in VAE_STACK_TILING_MODES:
+            raise ValueError(
+                f"vae_stack_tiling must be one of {list(VAE_STACK_TILING_MODES)}, got {self.vae_stack_tiling!r}"
             )
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
