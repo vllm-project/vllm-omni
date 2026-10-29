@@ -28,6 +28,7 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     set_forward_context,
 )
+from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
@@ -1016,7 +1017,10 @@ def _schedule_candidate(name: str, *, mask_free=False, prefix_kv_slicing=False, 
 
 def _small_dit(monkeypatch, baseline) -> h3.MiniMaxH3DiTModel:
     """A small CPU MiniMax H3 DiT whose blocks use real Attention layers resolved to ``baseline``."""
+    # The DiT blocks live in minimax_h3_blocks; the model's own projections stay in minimax_h3_transformer.
     for name in ("ColumnParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(blocks, name, _FakeLinear)
+    for name in ("ColumnParallelLinear", "RowParallelLinear"):
         monkeypatch.setattr(h3, name, _FakeLinear)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(layer, "get_current_diffusion_config_or_none", lambda: None)
@@ -1034,7 +1038,7 @@ def _candidate_rejections(attention: layer.Attention, record) -> list[str]:
 
 def test_vdn_attention_accepts_only_vdnh3_candidates(monkeypatch):
     """VDN-H3 checkpoints read the frame window only in VDNH3_ATTN, so other profiles are rejected at startup."""
-    monkeypatch.setattr(h3, "VDNH3HybridAttention", lambda *args, **kwargs: object())
+    monkeypatch.setattr(blocks, "VDNH3HybridAttention", lambda *args, **kwargs: object())
     model = _small_dit(monkeypatch, VDNAttentionBackend)
 
     model.enable_vdn(config=None)
