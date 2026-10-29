@@ -475,15 +475,16 @@ class OmniPrefixCacheManager:
         if (hk := policy.hidden_key) is not None:
             self._slot_status.init_table(hk)
 
-    def bind_session(self, req_id: str, session_id: str) -> None:
+    def bind_session(self, req_id: str, session_id: str, *, resumable: bool = False) -> None:
         """Bind a request to a duplex session for session-level caching.
 
         The duplex layer calls this when it knows the mapping; the
-        adapter also binds STARTED events that carry a session. The
-        binding is dropped when the request finishes or aborts; the
-        session's stored rows survive across turns.
+        adapter also binds STARTED events that carry a session. A
+        non-resumable binding is dropped when the request finishes or
+        aborts; a resumable binding's termination drops the session's
+        stored rows as well (see ``SessionPrefixStore.terminate``).
         """
-        self._session_store.bind(req_id, session_id)
+        self._session_store.bind(req_id, session_id, resumable=resumable)
 
     def invalidate_session(self, session_id: str) -> int:
         """Coarse invalidation: drop all of a session's stored segments.
@@ -527,8 +528,11 @@ class OmniPrefixCacheManager:
                     continue
                 req_id = event.req_id
                 tids, dtask = self._request_tasks.finish(req_id)
-                # Segments survive: only the request's binding is dropped.
-                self._session_store.unbind(req_id)
+                # A resumable session request's termination is the
+                # session-end signal: its private rows are dropped with
+                # it. Anything else only loses its binding; segments
+                # survive for later turns of the same session.
+                self._session_store.terminate(req_id)
                 if dtask is not None:
                     tids.add(dtask.tid)
                 pending_tasks = [tid for tid in tids if self._controller.lookup(tid) is not None]
@@ -546,7 +550,7 @@ class OmniPrefixCacheManager:
                     continue
                 req_id = event.req_id
                 if event.session_id is not None:
-                    self._session_store.bind(req_id, event.session_id)
+                    self._session_store.bind(req_id, event.session_id, resumable=event.resumable)
                 # The adapter alone classifies starts versus continuation or
                 # resume. Do not re-infer that lifecycle from write-task state.
                 num_computed = int(event.hit_end)

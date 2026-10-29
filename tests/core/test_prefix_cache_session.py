@@ -193,3 +193,27 @@ def test_concurrent_append_invalidate_fetch_never_serves_misaligned_rows():
         t.join(timeout=60)
     assert not errors
     assert all(not t.is_alive() for t in threads)
+
+
+def test_terminate_resumable_drops_session():
+    store = SessionPrefixStore()
+    store.bind("req-1", "sess-A", resumable=True)
+    store.append("sess-A", "hidden", _rows(0, 3))
+    assert store.terminate("req-1") == "sess-A"
+    assert store.session_of("req-1") is None
+    assert store.stored_tokens("sess-A", "hidden") == 0
+    assert "sess-A" not in store.session_ids()
+
+
+def test_terminate_ephemeral_only_unbinds():
+    store = SessionPrefixStore()
+    store.bind("req-1", "sess-A")
+    store.append("sess-A", "hidden", _rows(0, 3))
+    assert store.terminate("req-1") is None
+    assert store.session_of("req-1") is None
+    assert store.stored_tokens("sess-A", "hidden") == 3
+
+
+def test_terminate_unknown_request_is_noop():
+    store = SessionPrefixStore()
+    assert store.terminate("no-such-req") is None

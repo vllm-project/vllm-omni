@@ -46,6 +46,10 @@ class PrefixCacheRequestEvent:
     # carries it. Absent (None) means the manager serves the request
     # from the slot pool only; session features stay off for it.
     session_id: str | None = None
+    # True when the request is a long-lived resumable duplex stage
+    # request: its termination ends the session (the store drops the
+    # session's rows); an ephemeral request's termination only unbinds.
+    resumable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +235,7 @@ class PrefixCacheSchedulerAdapter:
                     block_ids=blocks,
                     scheduled_tokens=max(0, int(scheduled_tokens.get(req_id, 0))),
                     session_id=self._session_id(data),
+                    resumable=bool(getattr(data, "resumable", False)),
                 )
             )
 

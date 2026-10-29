@@ -609,6 +609,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 if self.request_states.get(context.request_id) is not request_state:
                     raise RuntimeError("duplex request cancelled during input preprocessing")
             request.external_req_id = request.request_id
+            # Carry the duplex session into the stage scheduler payload:
+            # the stage runner's prefix-cache adapter binds this request
+            # to its session from it (session-level prefix caching).
+            request.session_id = context.session_id
             mm_features = getattr(request, "mm_features", None)
             if mm_features is not None:
                 request_state.mm_features = mm_features

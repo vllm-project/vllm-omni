@@ -32,6 +32,12 @@ class OmniNewRequestData(NewRequestData):
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
     resumable: bool = False
+    # Duplex session the request belongs to. Carried explicitly (rather
+    # than relying on the upstream payload shape) so the worker-side
+    # prefix-cache adapter can bind the request to its session even
+    # when the upstream NewRequestData has no session field. Empty
+    # means no session, same as None.
+    session_id: str | None = None
 
     @classmethod
     def from_base(
@@ -41,12 +47,18 @@ class OmniNewRequestData(NewRequestData):
     ) -> "OmniNewRequestData":
         """Preserve upstream request data while attaching Omni payloads."""
         base_data = {field.name: getattr(data, field.name) for field in fields(NewRequestData)}
+        # The upstream payload may already carry a session; the live
+        # Request wins when it names one. Pop first: passing it twice
+        # (inside base_data and explicitly) is a duplicate-kwarg error.
+        base_session = base_data.pop("session_id", None)
+        value = getattr(request, "session_id", None) or base_session
         return cls(
             **base_data,
             external_req_id=getattr(request, "external_req_id", None),
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            session_id=str(value) if value else None,
         )
 
     @classmethod
@@ -82,6 +94,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            session_id=str(request.session_id) if getattr(request, "session_id", None) else None,
         )
 
 

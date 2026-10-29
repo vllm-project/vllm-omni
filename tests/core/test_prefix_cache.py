@@ -103,11 +103,12 @@ class FakeView:
 
 
 class FakeNewReq:
-    def __init__(self, req_id, num_computed_tokens=0, block_ids=None, session_id=None):
+    def __init__(self, req_id, num_computed_tokens=0, block_ids=None, session_id=None, resumable=False):
         self.req_id = req_id
         self.num_computed_tokens = num_computed_tokens
         self.block_ids = block_ids
         self.session_id = session_id
+        self.resumable = resumable
 
 
 class FakeSchedOut:
@@ -2175,7 +2176,9 @@ def test_hit_block_group_accepts_complete_prefix_and_ignores_tail(blocks):
 # with a different offset is distinguishable from the session's rows.
 
 
-def run_session_step(mgr, view, req_id, blocks, start_pos, sched, *, hit=0, session=None, offset=0, finished=()):
+def run_session_step(
+    mgr, view, req_id, blocks, start_pos, sched, *, hit=0, session=None, offset=0, finished=(), resumable=False
+):
     """One single-request step through the adapter (session-aware)."""
     view.order = [req_id]
     view.req_blocks[req_id] = blocks
@@ -2184,7 +2187,11 @@ def run_session_step(mgr, view, req_id, blocks, start_pos, sched, *, hit=0, sess
     view.step_slot_mapping = slots
     hidden = (slots.to(DTYPE) + offset).unsqueeze(1).expand(sched, HIDDEN).clone()
     sched_out = FakeSchedOut(
-        new_reqs=[FakeNewReq(req_id, num_computed_tokens=hit, block_ids=[list(blocks)], session_id=session)],
+        new_reqs=[
+            FakeNewReq(
+                req_id, num_computed_tokens=hit, block_ids=[list(blocks)], session_id=session, resumable=resumable
+            )
+        ],
         finished=list(finished),
         num_scheduled={req_id: sched},
     )
@@ -2326,5 +2333,43 @@ def test_session_store_serves_cuda_hidden_through_d2h():
         assert merged.device.type == "cpu"
         assert torch.equal(merged[:8], expected_rows(view.slots_for("a", 0, 8)))
         assert torch.equal(merged[8:], expected_rows(view.slots_for("a2", 8, 12)))
+    finally:
+        mgr.shutdown()
+
+
+def finish_session_request(mgr, req_id):
+    """Drive a FINISHED event for req_id through the adapter + manager."""
+    adapter = getattr(mgr, "_test_adapter", None)
+    if adapter is None:
+        adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(FakeSchedOut(finished=[req_id]))
+    mgr.new_step_starts(step)
+
+
+def test_session_drop_on_resumable_request_finish():
+    """A resumable session request's finish ends the session: rows drop."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S", resumable=True)
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        finish_session_request(mgr, "a")
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        assert "S" not in mgr._session_store.session_ids()
+        assert mgr._session_store.session_of("a") is None
+    finally:
+        mgr.shutdown()
+
+
+def test_session_survives_ephemeral_request_finish():
+    """An ephemeral session request's finish only unbinds; rows survive."""
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        finish_session_request(mgr, "a")
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        assert mgr._session_store.session_of("a") is None
     finally:
         mgr.shutdown()

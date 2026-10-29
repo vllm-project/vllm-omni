@@ -59,21 +59,47 @@ class SessionPrefixStore:
         self._lengths: dict[tuple[SessionId, TensorName], int] = {}
         # req -> session, for session-end cleanup of bindings.
         self._bindings: dict[ReqId, SessionId] = {}
+        # req -> whether the bound request is a long-lived resumable
+        # duplex stage request (vs a one-shot ephemeral request).
+        self._resumable: dict[ReqId, bool] = {}
         self._stored_bytes = 0
         self.refused_appends = 0
 
     # ---------------------------------------------------------- bindings
 
-    def bind(self, req_id: ReqId, session_id: SessionId) -> None:
-        """Record that ``req_id`` belongs to ``session_id``."""
+    def bind(self, req_id: ReqId, session_id: SessionId, *, resumable: bool = False) -> None:
+        """Record that ``req_id`` belongs to ``session_id``.
+
+        ``resumable`` marks a long-lived duplex stage request: its
+        termination is the session-end signal (see :meth:`terminate`).
+        """
         with self._lock:
             self._bindings[req_id] = session_id
+            self._resumable[req_id] = resumable
 
     def unbind(self, req_id: ReqId) -> None:
         """Drop a request's binding. Segments are untouched: a finished
         turn's rows still belong to its session's stream."""
         with self._lock:
             self._bindings.pop(req_id, None)
+            self._resumable.pop(req_id, None)
+
+    def terminate(self, req_id: ReqId) -> SessionId | None:
+        """End a request's binding; return the session dropped, if any.
+
+        A resumable duplex stage request is resumed across turns, so its
+        FINISHED/ABORTED is the worker-visible session-end signal: the
+        session's rows are private to it and can never serve again, so
+        the whole session is dropped. An ephemeral request's termination
+        only unbinds; the session continues and its rows stay servable.
+        """
+        with self._lock:
+            session_id = self._bindings.pop(req_id, None)
+            resumable = self._resumable.pop(req_id, False)
+        if session_id is None or not resumable:
+            return None
+        self.drop(session_id)
+        return session_id
 
     def session_of(self, req_id: ReqId) -> SessionId | None:
         """Session a request belongs to, or None when unbound."""
@@ -222,6 +248,7 @@ class SessionPrefixStore:
         with self._lock:
             for req_id in [r for r, s in self._bindings.items() if s == session_id]:
                 del self._bindings[req_id]
+                self._resumable.pop(req_id, None)
         return dropped
 
     def session_ids(self) -> list[SessionId]:

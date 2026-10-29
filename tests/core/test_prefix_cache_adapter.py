@@ -388,3 +388,16 @@ def test_started_event_carries_session_id_when_present():
         )
     ).events
     assert [(e.req_id, e.session_id) for e in events] == [("a", "S"), ("b", None), ("c", None)]
+
+
+def test_started_event_carries_resumable_flag():
+    adapter = PrefixCacheSchedulerAdapter()
+    events = adapter.translate_step(
+        output(
+            new=[
+                SimpleNamespace(req_id="a", num_computed_tokens=0, session_id="S", resumable=True),
+                SimpleNamespace(req_id="b", num_computed_tokens=0, session_id="S"),
+            ]
+        )
+    ).events
+    assert [(e.req_id, e.resumable) for e in events] == [("a", True), ("b", False)]

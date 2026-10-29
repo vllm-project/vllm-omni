@@ -519,8 +519,15 @@ history or ends.
 
 - Namespace: `bind_session` / STARTED events carrying `session_id`
   (the adapter reads it tolerantly from scheduler payloads; absent means
-  slot-pool-only). Bindings drop on finish/abort; stored rows survive
-  across turns.
+  slot-pool-only). Wiring, all inside this repo: the duplex orchestrator
+  stamps `session_id` on the stage request at submit time, the
+  `OmniNewRequestData` conversions carry it to the worker-side adapter
+  (explicitly, not relying on the upstream payload shape), and the
+  adapter binds the STARTED event. A duplex session's stage request is
+  long-lived (resumed across turns), so its FINISHED/ABORTED is the
+  worker-visible session-end signal: a resumable binding's termination
+  drops the session's rows. An ephemeral request's termination only
+  unbinds; the session continues and its rows stay servable.
 - Retention: materialize appends a turn's new rows only on exact
   continuation (turn hit length equals stored length). The slot pool is
   untouched, so existing cross-request sharing is unchanged.
@@ -541,8 +548,7 @@ history or ends.
   same kind of gap as a post-invalidation nonzero hit.
 
 Explicitly out of phase 1: fine-grained invalidation (phase 2, builds on
-the snapshot/ledger work), duplex-orchestrator wiring of
-`bind_session` at submit time, and any change to vLLM block eviction —
+the snapshot/ledger work), and any change to vLLM block eviction —
 the manager cannot pin blocks, which is why the session store holds
 copies rather than namespacing the pool.
 
