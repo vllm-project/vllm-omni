@@ -20,7 +20,7 @@ _BASE_BACKENDS = {SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, SDPBackend.CU
 
 
 @pytest.mark.cpu
-def test_cuda_backends_excludes_flash(monkeypatch):
+def test_cuda_backends_excludes_flash():
     """cuda_backends never includes FLASH_ATTENTION.
 
     forward() always passes a dense attn_bias tensor as attn_mask, which
