@@ -168,9 +168,11 @@ these errors on the job record rather than the creation response.
   even with empty default ranges. Under regional compilation each Wan2.2
   attention call is one opaque op inside the block graph, on every request
   including `[]`; the op picks the profile when it runs, so the block stays one
-  graph. Because the op changes the compiled graph, a `[]` request on a
-  scheduled server is not bit-identical to the same request on a server without
-  profiles under regional compilation; eager runs are bit-identical.
+  graph. Because the op changes the compiled graph, outputs on a server with
+  profiles are not bit-identical to a server without profiles under regional
+  compilation, even for `[]` or on steps that use the base configuration; the
+  difference is deterministic and of the same order as compiled versus eager.
+  Eager runs of `[]` are bit-identical.
   H3 selects outside the compiled graph (below).
   The op carries `attn_mask`, a `video_layout` without video spans and `extra`
   entries holding None, bools, ints or int tuples (a video grid). Other metadata
