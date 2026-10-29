@@ -121,7 +121,7 @@ requests can share a fused forward call. The key also holds the request's
 binds one schedule per batch, plus whether the request sent it. An omitted
 schedule does not share a key with the same ranges sent explicitly, because an
 explicit schedule is checked against the step count while an inherited default
-is not. `[]` stays apart from a non-empty inherited default, and different
+is not. `[]` never shares a batch with an omitted schedule, and different
 ranges never share.
 
 Admission is FIFO and conservative. An incompatible request at the front of the

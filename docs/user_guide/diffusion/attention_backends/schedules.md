@@ -126,7 +126,8 @@ Requests co-batch only with equal schedules after resolving stage defaults
 and only when they all sent their schedule or all inherited it. An omitted
 schedule does not co-batch with the same ranges sent explicitly, because an
 explicit schedule is checked against the step count while an inherited
-default is not.
+default is not. For the same reason `[]` never shares a batch with an
+omitted schedule.
 A scheduled H3 step batch keeps one packed transformer forward when every
 request is at the same step and sigma and the selected profile's backends
 isolate packed requests; otherwise it runs one forward per request so each
@@ -164,9 +165,9 @@ errors on the job record rather than the creation response.
 Each attention layer prepares its own implementation for every distinct
 profile. A profile identical to the base reuses the base implementation,
 unless the profile carries its own calibration, including one propagated
-from the checkpoint's `sparse_attention_config`. A FlashInfer profile therefore adds a 128 MiB workspace per layer,
-unless FlashInfer runs its cute-dsl backend (the automatic choice on
-Blackwell).
+from the checkpoint's `sparse_attention_config`. Each distinct FlashInfer
+implementation adds a 128 MiB workspace per layer, unless FlashInfer runs
+its cute-dsl backend (the automatic choice on Blackwell).
 
 Startup warm-up does not exercise profiles. Warm up the base and each profile
 before timing. CPU tests use stand-in kernels; they do not establish GPU,
