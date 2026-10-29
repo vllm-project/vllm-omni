@@ -313,17 +313,17 @@ class VoxtralTTSForConditionalGeneration(
         if audio_tokens is None and history_is_empty:
             # Backward compatible with request state written before #4527 moved
             # Voxtral TTS feedback frames under ``codes.audio``.
-            audio_tokens = info_dict.pop("audio", None)
+            audio_tokens = info_dict.get("audio")
         if audio_tokens is not None and (audio_history is None or not has_replay_positions):
             kwargs = {"audio_tokens": audio_tokens.to(input_ids.device)}
             multimodal_embeddings = self.model.embed_multimodal(**kwargs)
             if input_ids[0] == self._audio_token_id:
                 input_embeds = multimodal_embeddings[0]
-            return input_ids, input_embeds, info_dict
+            return input_ids, input_embeds, {}
 
         voice = info_dict.get("voice")
         if voice is not None and self._is_prefill_step(info_dict, input_ids):
-            voice = info_dict.pop("voice")
+            voice = info_dict.get("voice")
             if isinstance(voice, list):
                 voice = voice[0]
             multimodal_embeddings = self.voice_to_embedding[voice].to(input_ids.device).clone().detach()
@@ -345,16 +345,22 @@ class VoxtralTTSForConditionalGeneration(
             if replay_mask is not None and bool(replay_mask.any()):
                 input_embeds = input_embeds.clone()
                 input_embeds[replay_mask] = frame_embeddings
-            return input_ids, input_embeds, info_dict
-        return input_ids, input_embeds, info_dict
+            return input_ids, input_embeds, {}
+        return input_ids, input_embeds, {}
 
     @staticmethod
-    def _store_feedback_frames(multimodal_outputs: object, request_infos: object) -> None:
+    def _store_feedback_frames(
+        multimodal_outputs: object,
+        request_infos: object,
+        request_sample_eligible: list[bool] | tuple[bool, ...] | torch.Tensor | None = None,
+    ) -> None:
         """Save each emitted acoustic frame in its request-local model state.
 
         The next decode step consumes this frame in tts_preprocess. Keeping it
         in the runner's per-request buffer avoids a model-global cursor, which
         can associate frames with the wrong request under batching.
+        request_sample_eligible excludes intermediate prompt chunks; the
+        final prompt chunk remains eligible for the first generated token.
         """
         if not isinstance(multimodal_outputs, Mapping) or not isinstance(request_infos, (list, tuple)):
             return
@@ -373,6 +379,25 @@ class VoxtralTTSForConditionalGeneration(
                 len(request_infos),
             )
             return
+        if request_sample_eligible is not None:
+            if isinstance(request_sample_eligible, torch.Tensor):
+                request_sample_eligible = request_sample_eligible.tolist()
+            if not isinstance(request_sample_eligible, (list, tuple)) or len(request_sample_eligible) != len(
+                request_infos
+            ):
+                logger.warning(
+                    "Skipping Voxtral feedback update: sample eligibility count does not match requests"
+                )
+                return
+            eligible_pairs = [
+                (request_info, frame)
+                for request_info, frame, eligible in zip(
+                    request_infos, frames, request_sample_eligible, strict=True
+                )
+                if bool(eligible)
+            ]
+            request_infos = [request_info for request_info, _ in eligible_pairs]
+            frames = [frame for _, frame in eligible_pairs]
         for request_info, frame in zip(request_infos, frames, strict=True):
             if not isinstance(request_info, dict) or not isinstance(frame, torch.Tensor):
                 continue
@@ -384,7 +409,9 @@ class VoxtralTTSForConditionalGeneration(
                 frame = frame.unsqueeze(0)
             request_codes = request_info.setdefault("codes", {})
             if isinstance(request_codes, dict):
-                detached_frame = frame.detach()
+                # Keep persistent replay history on CPU. Copy each emitted frame once,
+                # instead of snapshotting the growing history on every preprocess step.
+                detached_frame = frame.detach().to(device="cpu", copy=True).contiguous()
                 request_codes["audio"] = detached_frame
                 history = request_codes.setdefault("audio_history", [])
                 if isinstance(history, list):
@@ -392,7 +419,8 @@ class VoxtralTTSForConditionalGeneration(
                 elif isinstance(history, torch.Tensor):
                     # Resumed requests normally restore a list; tolerate an
                     # older serialized runner payload that restored a tensor.
-                    request_codes["audio_history"] = [*history.unbind(0), detached_frame]
+                    history_cpu = history.detach().to(device="cpu", copy=True).contiguous()
+                    request_codes["audio_history"] = [*history_cpu.unbind(0), detached_frame]
                 else:
                     request_codes["audio_history"] = [detached_frame]
 
@@ -475,6 +503,10 @@ class VoxtralTTSForConditionalGeneration(
 
     _DEFAULT_CFG_ALPHA = 1.2
 
+    @property
+    def requires_request_sample_eligibility(self) -> bool:
+        return self.model_stage == "audio_generation"
+
     def _extract_cfg_alpha(self, input_hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         """Extract per-request cfg_alpha from sampling_extra_args.
 
@@ -518,7 +550,9 @@ class VoxtralTTSForConditionalGeneration(
                 request_infos = kwargs.get("runtime_additional_information")
                 if request_infos is None:
                     request_infos = kwargs.get("model_intermediate_buffer")
-                self._store_feedback_frames(multimodal_outputs, request_infos)
+                self._store_feedback_frames(
+                    multimodal_outputs, request_infos, kwargs.get("request_sample_eligible")
+                )
                 return OmniOutput(
                     text_hidden_states=hidden_states,
                     multimodal_outputs=multimodal_outputs,
@@ -559,7 +593,18 @@ class VoxtralTTSForConditionalGeneration(
         else:
             fake_eos, multimodal_outputs = self.model.compute_mm_logits(input_hidden_states, cfg_alpha=cfg_alpha)
         model_outputs[logits_indices, 0] = fake_eos.reshape(-1)
-        self._store_feedback_frames(multimodal_outputs, model_intermediate_buffer)
+        num_computed_prefill = input_batch.num_computed_prefill_tokens_np[:num_reqs]
+        num_scheduled_tokens = input_batch.num_scheduled_tokens[:num_reqs]
+        prefill_lens = input_batch.prefill_len_np[:num_reqs]
+        request_sample_eligible = [
+            int(computed) + int(scheduled) >= int(prompt_len)
+            for computed, scheduled, prompt_len in zip(
+                num_computed_prefill, num_scheduled_tokens, prefill_lens, strict=True
+            )
+        ]
+        self._store_feedback_frames(
+            multimodal_outputs, model_intermediate_buffer, request_sample_eligible
+        )
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=multimodal_outputs)
 
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
