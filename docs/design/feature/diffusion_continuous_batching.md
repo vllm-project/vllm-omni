@@ -118,9 +118,11 @@ per request. Cache refresh, homogeneous LoRA activation, and
 including shape, guidance, output count, and LoRA identity. Only compatible
 requests can share a fused forward call. The key also holds the request's
 `attention_schedule` resolved against the service default, because the runner
-binds one schedule per batch: an omitted schedule shares a key with the same
-ranges sent explicitly. `[]` stays apart only from a non-empty inherited
-default, and different ranges never share.
+binds one schedule per batch, plus whether the request sent it. An omitted
+schedule does not share a key with the same ranges sent explicitly, because an
+explicit schedule is checked against the step count while an inherited default
+is not. `[]` stays apart from a non-empty inherited default, and different
+ranges never share.
 
 Admission is FIFO and conservative. An incompatible request at the front of the
 waiting queue can prevent later compatible requests from joining the current
