@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.offload import OffloadedKVPage
 from vllm_omni.diffusion.sched.interface import CachedRequestData
 
 if TYPE_CHECKING:
@@ -191,6 +192,33 @@ class DiffusionExecutor(ABC):
             "remove_diffusion_kv_requests",
             args=(unique_request_ids,),
         )
+
+    def save_diffusion_kv_pages(self, pages: Sequence[OffloadedKVPage]) -> dict[bytes, int]:
+        """Copy named device pages into every Worker's host offload store.
+
+        The Scheduler only ever exchanges page names and byte sizes with the
+        Workers, so the RPC carries :class:`OffloadedKVPage` identities and
+        returns per-page byte sizes.  All ranks must agree: a rank that fails
+        or reports a divergent size aborts the whole save, because the
+        Scheduler index must never claim a page only some Workers hold.
+        """
+
+        unique_pages = list({page.key: page for page in pages}.values())
+        if not unique_pages:
+            return {}
+        result = self.collective_rpc(
+            "save_diffusion_kv_pages",
+            args=(unique_pages,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, list) or not result:
+            raise TypeError(f"save_diffusion_kv_pages returned {type(result).__name__}, expected a non-empty list")
+        sizes = result[0]
+        for rank, rank_sizes in enumerate(result[1:], start=1):
+            if rank_sizes != sizes:
+                raise RuntimeError(f"Worker rank {rank} disagrees on saved Diffusion KV page sizes")
+        return dict(sizes)
 
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput) -> KVConnectorOutput | None:
         if scheduler_output.kv_prefetch_connector_metadata is not None:

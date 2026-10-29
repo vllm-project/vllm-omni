@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, get_block_hash
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_omni.core.sched.utils import free_kv_blocks_in_physical_order
@@ -15,6 +15,7 @@ from vllm_omni.diffusion.diffusion_kv.metadata import (
     DiffusionKVMetadata,
     DiffusionKVSequenceMetadata,
 )
+from vllm_omni.diffusion.diffusion_kv.offload import OffloadedKVPage
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 
 
@@ -281,6 +282,44 @@ class DiffusionKVCacheManager:
             )
             if publishable_prefix_len > 0:
                 self.native_manager.cache_blocks(request, publishable_prefix_len)
+
+    def get_publish_offload_targets(self, public_request_id: str) -> tuple[OffloadedKVPage, ...]:
+        """Return the published prefix pages of one completed request.
+
+        Every published full block carries its group-scoped hash, so the
+        target identity is read straight from the pool and no alignment is
+        recomputed here.  The caller holds the request until the save lands;
+        see :meth:`BaseScheduler.hold_kv_offload` for the hold protocol.
+        """
+
+        if not self.enable_prefix_caching:
+            return ()
+        try:
+            requests = self._requests[public_request_id]
+        except KeyError as exc:
+            raise KeyError(f"Diffusion KV request {public_request_id!r} is not allocated") from exc
+        num_groups = len(self.native_manager.kv_cache_config.kv_cache_groups)
+        targets: dict[bytes, OffloadedKVPage] = {}
+        for request in requests:
+            blocks = self.native_manager.get_blocks(request.request_id)
+            for group_index in range(num_groups):
+                for block in blocks.blocks[group_index]:
+                    if block.is_null or block.block_hash is None:
+                        continue
+                    page = OffloadedKVPage.create(
+                        group_index=group_index,
+                        block_hash=get_block_hash(block.block_hash),
+                        source_block_id=block.block_id,
+                        num_tokens=block.block_hash_num_tokens or self.hash_block_size,
+                    )
+                    known = targets.get(page.key)
+                    if known is not None and known.source_block_id != page.source_block_id:
+                        raise RuntimeError(
+                            "Published Diffusion KV page maps to two device blocks: "
+                            f"key={page.key!r}, blocks={known.source_block_id}, {page.source_block_id}"
+                        )
+                    targets[page.key] = page
+        return tuple(targets.values())
 
     def get_metadata(self, public_request_id: str) -> DiffusionKVMetadata:
         try:

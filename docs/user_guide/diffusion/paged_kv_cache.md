@@ -68,6 +68,9 @@ stages:
 | --- | --- | --- |
 | `diffusion_kv_mode` | Yes | `paged_scheduler` enables Scheduler-managed pages; `dense_legacy` is the default |
 | `diffusion_kv_max_rows_per_request` | Yes for paged | Positive Worker row limit, including all internal CFG branches; use `1` without CFG and `2` for standard CFG |
+| `enable_prefix_caching` | Optional | Publish the stable prefix of completed requests so later requests can hit the cached pages |
+| `enable_diffusion_kv_page_offload` | Optional | Also copy those published prefix pages to host memory after a request completes, freeing their device blocks. Requires `paged_scheduler` and `enable_prefix_caching` |
+| `diffusion_kv_offload_max_bytes` | Optional | Host byte budget for offloaded pages; omit it to keep every offloaded page resident until invalidated |
 | `kv_cache_memory_bytes` | Optional | Explicit physical KV-pool budget per Worker/rank; omit it to use automatic sizing |
 | `gpu_memory_utilization` | Optional | Automatic pool-sizing fraction when no explicit byte budget is set |
 | `max_num_seqs` | Recommended `1` | Public request capacity; it is separate from the internal CFG row limit |
@@ -85,6 +88,9 @@ enable quantized paged KV, and model weight quantization has not been validated
 in combination with this mode. CPU offload, layerwise offload, and distributed
 layerwise offload (DLO) are currently untested with paged KV. Leave these
 options disabled for paged KV; use `dense_legacy` when offload is required.
+`enable_diffusion_kv_page_offload` (host-resident prefix pages) is part of the
+paged path itself, but cannot be combined with sleep mode; other offload
+features remain untested with it.
 
 ## Hunyuan request-mode example
 
