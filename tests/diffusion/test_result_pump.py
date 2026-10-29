@@ -27,6 +27,8 @@ def _make_executor(step_execution=False):
     """Create a minimal MultiprocDiffusionExecutor-like object with pump state."""
     od_config = MagicMock()
     od_config.step_execution = step_execution
+    # OmniDiffusionConfig defaults this to None; a MagicMock attribute would be parsed as a schedule.
+    od_config.diffusion_attention_schedule = None
 
     executor = object.__new__(MultiprocDiffusionExecutor)
     executor.od_config = od_config
