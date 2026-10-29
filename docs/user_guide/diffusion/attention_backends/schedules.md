@@ -63,7 +63,8 @@ with the base configuration. Deeper layers' prompt K/V also depend on earlier
 layers' step-0 attention outputs, so on this model the step-0 profile affects
 every step, not only step 0. A range that starts at step 0 with an approximate
 profile therefore also changes the later steps; the server logs this at startup
-when its default schedule does so.
+when its default schedule does so. A sigma window that covers 1.0 selects the
+step-0 profile in the same way; the startup log covers only step ranges.
 
 ## Sigma windows
 
@@ -77,8 +78,9 @@ rather than silently selecting the base backend.
 
 MiniMax-H3 windows therefore refer to absolute noise, while Wan2.2 and
 HunyuanImage-3.0 windows refer to noise relative to the run's first scheduler
-sigma. The two agree only for a run that starts at full noise, which every
-supported Wan2.2 and HunyuanImage-3.0 path does: none takes a `strength` or
+sigma. The two agree, to within the first sigma's distance from 1.0, only for a
+run that starts at the top of its ladder, which every supported Wan2.2 and
+HunyuanImage-3.0 path does: none takes a `strength` or
 custom sigmas, or starts part-way down the schedule. Request `latents` replace
 the initial noise, not the schedule. The first sigma is 1.0, except under Wan's
 UniPC solver, whose ladder starts at the shifted top of its training range:
@@ -200,18 +202,24 @@ schedule request handling.
 
 ## Batching and errors
 
-Requests co-batch only with equal schedules after resolving stage defaults
-and only when they all sent their schedule or all inherited it. An omitted
-schedule does not co-batch with the same ranges sent explicitly, because an
-explicit schedule is checked against the step count while an inherited
-default is not. For the same reason `[]` never shares a batch with an
-omitted schedule.
+Requests co-batch only with equal step ranges and equal sigma windows after
+resolving stage defaults. For step ranges (`attention_schedule`), the requests
+must also all have sent them or all inherited them. An omitted step schedule
+does not co-batch with the same ranges sent explicitly, because an explicit
+schedule is checked against the step count while an inherited default is not.
+For the same reason `attention_schedule: []` never shares a batch with an
+omitted one. Sigma windows (`attention_sigma_schedule`) co-batch on their
+resolved value alone, because nothing checks explicit windows differently: an
+inherited service default shares a batch with the same windows sent
+explicitly, and `[]` shares one with an omitted value when the service has no
+sigma default. The step-range rule still applies to requests with equal sigma
+windows, so one that omits `attention_schedule` and one that sends
+`attention_schedule: []` stay in separate batches.
 A scheduled H3 step batch keeps one packed transformer forward when every
 request is at the same step and sigma and the selected profile's backends
 isolate packed requests; otherwise it runs one forward per request so each
 uses its own progress. A scheduled HunyuanImage-3.0 step batch always runs one
 transformer forward per request.
-Sigma windows also participate in batch keys.
 
 Malformed schedules return HTTP 400 before dispatch. A request schedule that
 names a profile the denoising stage does not configure returns HTTP 400 when
