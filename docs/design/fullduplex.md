@@ -35,55 +35,8 @@ the model plugins.
 
 ## Runtime process placement
 
-`DuplexOmni(duplex_engine_backend_as_process=False)` keeps the existing shared-memory
-runtime and supports the model's ordinary chat surface. Setting
-`duplex_engine_backend_as_process=True` selects a session-only deployment.
-`DuplexOmni` retains the handle registry, session configuration normalization,
-and abandoned-open/resume compensation; `ProcessDuplexEngineClient` owns spawning, IPC correlation, local
-output buffers, invalidation delivery, health checks, and child teardown.
-The process client does not subclass the public entrypoint. Both backends use
-`AsyncOmniBase`'s output pump and engine-death fan-out. Shared frontend
-initializers attach output bookkeeping and engine metadata independently of
-generation processor setup. The process client exposes its metadata directly
-and supplies optional frontend-config and asynchronous health hooks; it does
-not require backend-specific config accessors or an output pump in `DuplexOmni`.
-
-A module-level, entrypoint-owned worker factory loads normal general plugins
-and creates the native runtime in the child, including its orchestrator thread
-and stage clients. The engine transport has no model or entrypoint imports.
-`_DuplexProcessWorker` owns child-side control dispatch, session forwarding, and
-invalidation callbacks. Startup metadata is constructed by its typed snapshot,
-independently of the worker task lifecycle. An AnyIO task group supervises the
-worker pumps and controls: unexpected task failures cancel siblings, while
-shutdown and socket EOF explicitly end the group before native runtime cleanup.
-The startup handshake exports typed session configuration, unchanged model
-capabilities, stage/deployment facts, frontend admission ownership, endpoint
-restrictions, and model-specific warmup audio. It exports no renderers,
-processors, stage clients, or callable plugin instances. The standard server
-uses a lightweight model listing and the exported warmup facts.
-
-Only an inherited private socketpair connects the two processes. Commands,
-control results, events, and invalidations use typed MessagePack data.
-A single asynchronous writer per direction sends individual MessagePack values.
-An incremental MessagePack decoder handles partial reads and consecutive values
-without explicit length prefixes or batch envelopes. Socket buffering is left to
-asyncio and the operating system.
-The channel owns send admission, capacity-wait timeouts, and closure; closing it
-wakes blocked senders. Queues are bounded by message count and encoded bytes.
-Worker-side session buffers enforce native output limits; frontend overflow closes the affected
-session and requests engine cleanup. Worker or transport failure fails pending
-controls and closes handles. Graceful asynchronous shutdown flushes a shutdown
-request; synchronous shutdown provides bounded process-group termination.
-
-Cross-process invalidation has a different delivery boundary from the default
-shared-memory buffer: the frontend guard is atomic with receipt of an
-invalidation, not with its generation in the child. An event already committed
-while that notification was in transit cannot be recalled. The frontend filters
-stale epochs until that response's terminal event and retires the response's
-invalidation history at completion. Session-close retires all remaining state.
-This backend does not add remote session ownership or cross-frontend resume.
-
-See [process backend usage and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
+The optional process runtime isolates the orchestrator from the frontend GIL
+and serves sessions only. See [process runtime usage, ownership, and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
 
 ## Playback completion ownership
 

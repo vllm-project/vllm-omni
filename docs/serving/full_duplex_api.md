@@ -70,18 +70,27 @@ receives stage IDs, types, and effective context limits, not full stage
 configurations or processors. Generation, tokenization, profiling, sleep/wake,
 and weight-transfer administration are outside this session-only interface.
 
-Both processes keep bounded per-session output buffers. Each IPC direction
-also permits at most 1024 queued messages and 8 MiB of encoded queued data;
-a single message larger than 8 MiB is rejected. A writer can additionally hold
-one batch and the socket transport's pending bytes. Queued messages are batched
-immediately, without a batching timer. Process isolation adds serialization
-and buffering costs, so benchmark the target workload before selecting it.
+`DuplexOmni` retains session handles and lifecycle behavior;
+`ProcessDuplexEngineClient` owns spawning, IPC, and child teardown. The child
+owns the native orchestrator thread and stage clients. The processes exchange
+MessagePack data over a private socketpair using asyncio, without reader or
+writer threads. Both backends share the frontend output pump and engine-death
+handling.
 
-Audio invalidation is forwarded in the same event stream. On receipt, the
-frontend removes matching queued audio and rejects stale epochs. Unlike the
-thread backend's shared delivery lock, this cannot revoke audio already
-committed by the frontend while the invalidation notification was in transit.
-Resume leases and replay control IDs remain owned by the native engine.
+Each process keeps bounded per-session output buffers. Each IPC direction
+admits at most 1024 queued messages and 8 MiB of encoded queued data; larger
+individual messages are rejected. The active write and socket buffers are
+additional to this budget. Frontend output overflow closes the affected session;
+worker or transport failure fails pending controls and closes local buffers.
+`await omni.aclose()` requests graceful worker cleanup; synchronous `shutdown()`
+provides bounded process-group termination. Serialization and buffering add
+costs, so benchmark the target workload.
+
+Invalidations share the event stream: the frontend removes matching queued
+audio and rejects stale epochs, but cannot revoke audio committed while the
+notification was in transit. Resume leases and replay control IDs remain owned
+by the native engine; process mode adds no cross-frontend session ownership or
+resume support.
 
 ## Choose an Endpoint
 
