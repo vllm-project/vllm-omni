@@ -818,3 +818,12 @@ def test_startup_notes_a_default_schedule_that_covers_step_0(default, logged, ca
     messages = [record.getMessage() for record in caplog.records if "step-0 prompt K/V" in record.getMessage()]
     assert len(messages) == (1 if logged else 0)
     assert all("profile 'approx'" in message for message in messages)
+
+
+def test_startup_step_0_note_logs_only_on_rank_0(caplog, monkeypatch):
+    monkeypatch.setattr(hy3_module.logger, "handlers", [*hy3_module.logger.handlers, caplog.handler])
+    monkeypatch.setattr(hy3_module, "_is_rank_zero", lambda: False)
+    schedule = SimpleNamespace(default=(AttentionScheduleRange(start=0, end=2, profile="approx"),))
+    with caplog.at_level("INFO", logger=hy3_module.logger.name):
+        hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=schedule))
+    assert "step-0 prompt K/V" not in caplog.text
