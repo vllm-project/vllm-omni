@@ -1,6 +1,12 @@
 # Qwen3-Omni-MoE production deploy, verified on 2x H100 (stage 0 on cuda:0,
 # stages 1+2 on cuda:1).
 #
+# Runner selection:
+#   Model Runner V2 is the default on CUDA. Set `model_runner: v1` in an
+#   overlay to opt out. The `platforms:` sections keep V1 on NPU, XPU, ROCm
+#   and MUSA. The Thinker prefix cache stays off: it is validated for the V1
+#   turn path only. Duplex keeps V1 in qwen3_omni_duplex.yaml.
+#
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
 # vllm_omni/config/stage_config.py). Notable implicit defaults for this
 # model:
@@ -12,6 +18,7 @@
 #     MIOpen conv_transpose1d is not capture-safe in the Code2Wav graph path.
 #   * Platform sections flip enforce_eager per-stage where platform
 #     cudagraph support differs.
+model_runner: v2
 async_chunk: true
 
 connectors:
@@ -29,15 +36,15 @@ stages:
     gpu_memory_utilization: 0.9
     moe_backend: triton
     trust_remote_code: true
-    # Thinker prefix cache: hits reuse KV and the cached hidden rows the Talker
-    # consumes. Validated on CUDA V1 turn serving only: the non-CUDA platform
-    # blocks below and the MRv2 and duplex profiles keep it off. To turn it
-    # off, serve an overlay:
+    # Thinker prefix cache reuses KV and the cached hidden rows the Talker
+    # consumes. That path is validated for CUDA V1 turn serving only, so the
+    # V2 default leaves it off. Restore it with a V1 overlay:
     #   base_config: qwen3_omni_moe.yaml
+    #   model_runner: v1
     #   stages:
     #     - stage_id: 0
-    #       enable_prefix_caching: false
-    enable_prefix_caching: true
+    #       enable_prefix_caching: true
+    enable_prefix_caching: false
     devices: "0"
     default_sampling_params:
       temperature: 0.0
@@ -102,6 +109,7 @@ platforms:
   # checkpoint-level metadata for the BF16 audio stages on the verified MUSA
   # profile before vLLM performs its normal quantization auto-detection.
   musa:
+    model_runner: v1
     stages:
       - stage_id: 0
         enable_prefix_caching: false
@@ -113,6 +121,7 @@ platforms:
           quantization_config: null
 
   npu:
+    model_runner: v1
     stages:
       - stage_id: 0
         enable_prefix_caching: false
@@ -139,6 +148,7 @@ platforms:
   # vLLM's outer graph capture, so stage 2 runs eager to avoid MIOpen/HIP
   # graph-capture failures.
   rocm:
+    model_runner: v1
     stages:
       - stage_id: 0
         enable_prefix_caching: false
@@ -146,6 +156,7 @@ platforms:
         enforce_eager: true
 
   xpu:
+    model_runner: v1
     stages:
       - stage_id: 0
         enable_prefix_caching: false

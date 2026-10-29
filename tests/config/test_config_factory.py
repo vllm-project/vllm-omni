@@ -1695,6 +1695,29 @@ stages:
         connector = deploy.connectors["connector_of_shared_memory"]
         assert "async_chunk_batch_min_size" not in connector["extra"]
         assert "async_chunk_batch_max_wait_ms" not in connector["extra"]
+        assert deploy.model_runner == "v2"
+
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+    def test_qwen3_omni_default_runner_is_v2_on_cuda_only(self, platform):
+        pipeline = resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
+        assert isinstance(pipeline, PipelineConfig)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("qwen3_omni_moe.yaml"))),
+            platform=platform,
+        )
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        expect_v2 = platform == "cuda"
+        assert deploy.model_runner == ("v2" if expect_v2 else "v1")
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [expect_v2] * 3
+        assert stages[0].yaml_engine_args["enable_prefix_caching"] is False
+
+        duplex = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("qwen3_omni_duplex.yaml"))),
+            platform=platform,
+        )
+        duplex_stages = merge_pipeline_deploy(pipeline, duplex)
+        assert duplex.model_runner == "v1"
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in duplex_stages] == [False, False, False]
 
     @pytest.mark.parametrize(
         ("hf_config", "model"),
@@ -2067,7 +2090,7 @@ stages:
     @pytest.mark.parametrize(
         ("yaml_name", "platform", "enabled"),
         [
-            ("qwen3_omni_moe.yaml", "cuda", True),
+            ("qwen3_omni_moe.yaml", "cuda", False),
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),

@@ -1,6 +1,7 @@
-# Opt-in CUDA Model Runner V2 profile for Qwen3-Omni-MoE: the Thinker (stage 0),
-# Talker (stage 1) and Code2Wav (stage 2) run on MRv2 with its native data
-# plane. The base profile keeps every stage on V1.
+# CUDA codec profile on top of the default Model Runner V2 deploy. The default
+# qwen3_omni_moe.yaml already selects model_runner v2 for Thinker, Talker and
+# Code2Wav. This overlay adds first-frame delivery, the codec chunk ramp,
+# length-grouped Code2Wav graphs, and fused decoder blocks.
 #
 # On MRv2 the Thinker hands each generated token's embedding to the Talker with
 # the step that sampled it (one Thinker step earlier than its next forward would
