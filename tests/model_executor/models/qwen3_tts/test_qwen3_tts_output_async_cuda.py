@@ -16,7 +16,7 @@ from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu
 pytestmark = [pytest.mark.core_model]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("validity_device", ["cpu", "cuda"])
 @torch.inference_mode()
 def test_output_validity_preserves_values_without_waiting_for_forward(validity_device):

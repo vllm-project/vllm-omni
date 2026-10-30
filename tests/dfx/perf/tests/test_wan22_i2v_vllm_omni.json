@@ -54,9 +54,9 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.0361,
-            "mean_e2el_ms": 27620.6,
-            "mean_peak_memory_mb": 80548.0
+            "request_throughput": 0.0414,
+            "mean_e2el_ms": 24166.28,
+            "mean_peak_memory_mb": 74032.6571
           }
         }
       }
@@ -84,6 +84,8 @@
     "server_params": {
       "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
       "serve_args": {
+        "stage-init-timeout": 1800,
+        "init-timeout": 2100,
         "usp": 2,
         "vae-patch-parallel-size": 2,
         "use-hsdp": true,
@@ -122,14 +124,14 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.05263,
-            "mean_e2el_ms": 18941.5,
-            "mean_peak_memory_mb": 50053.7
+            "request_throughput": 0.0547,
+            "mean_e2el_ms": 18296.7849,
+            "mean_peak_memory_mb": 47041.8
           },
           "A3": {
             "request_throughput": 0.0155,
             "mean_e2el_ms": 64626.4676,
-            "mean_peak_memory_mb": 59932.5714
+            "mean_peak_memory_mb": 59763.64
           }
         }
       },
@@ -163,14 +165,14 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.009595,
-            "mean_e2el_ms": 104105.8,
-            "mean_peak_memory_mb": 59718.0
+            "request_throughput": 0.0107,
+            "mean_e2el_ms": 93497.9734,
+            "mean_peak_memory_mb": 53625.1143
           },
           "A3": {
             "request_throughput": 0.0021,
-            "mean_e2el_ms": 469604.3521,
-            "mean_peak_memory_mb": 59889.7714
+            "mean_e2el_ms": 467818.7769,
+            "mean_peak_memory_mb": 59792.0
           }
         }
       }

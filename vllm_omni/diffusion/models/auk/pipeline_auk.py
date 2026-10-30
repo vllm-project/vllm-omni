@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.auk.auk_transformer import (
 )
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
+from vllm_omni.diffusion.models.auk.fp8_linear import fp8_supported, quantize_block_linears
 from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
@@ -45,6 +46,7 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_extras.auk import resolve_gen_frames
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig, resolve_component_quant_config
 
 logger = init_logger(__name__)
 
@@ -93,6 +95,46 @@ def get_auk_post_process_func(od_config: OmniDiffusionConfig):
         return audio.cpu().float().numpy()
 
     return post_process_func
+
+
+def _dit_fp8_config(quant_config: Any) -> Any | None:
+    """The stage's FP8 config for the DiT, or None when the DiT stays unquantized.
+
+    A per-component config is resolved to its ``dit`` entry first. Only the
+    DiT can be quantized, so a component config naming any other part of the
+    pipeline, any method other than ``fp8``, and FP8 options this pipeline
+    cannot honour are rejected rather than silently ignored.
+    """
+    if quant_config is None:
+        return None
+    if isinstance(quant_config, ComponentQuantizationConfig):
+        components = quant_config.component_configs
+        # The whole DiT takes one config; per-layer opt-outs go through ignored_layers.
+        scoped = [p for p in components if p != "dit" and p.split(".")[0] == "dit"]
+        if scoped:
+            raise ValueError(
+                f"AuK quantizes the DiT as one component and does not support the sub-scopes {scoped}; "
+                "configure 'dit' and list the linears to keep in the model dtype in its ignored_layers"
+            )
+        others = [p for p, c in components.items() if c is not None and p != "dit"]
+        if others:
+            raise ValueError(f"AuK quantizes only the DiT; set components {others} to null")
+    quant_config = resolve_component_quant_config(quant_config, "dit")
+    if quant_config is None:
+        return None
+    name = quant_config.get_name() if hasattr(quant_config, "get_name") else str(quant_config)
+    if name != "fp8":
+        raise ValueError(f"AuK supports only 'fp8' quantization of the DiT, got {name!r}")
+    unsupported = []
+    if getattr(quant_config, "is_checkpoint_fp8_serialized", False):
+        unsupported.append("is_checkpoint_fp8_serialized")
+    if getattr(quant_config, "weight_block_size", None):
+        unsupported.append("weight_block_size")
+    if getattr(quant_config, "activation_scheme", "dynamic") != "dynamic":
+        unsupported.append("activation_scheme")
+    if unsupported:
+        raise ValueError(f"AuK's online FP8 DiT does not support the FP8 options {unsupported}")
+    return quant_config
 
 
 def _prompt_mapping(prompt: Any) -> dict[str, Any]:
@@ -211,6 +253,25 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         self.dit.load_state_dict(_read_dit_weights(model_dir, self.dtype), strict=True)
         self.dit = self.dit.to(device=self.device).eval()
         self.dit.requires_grad_(False)
+        # Opt-in FP8 GEMMs for the block linears (stage `diffusion_quantization_config: fp8`).
+        # The swap happens before compilation and graph capture, which then see the FP8 modules.
+        self.dit_fp8 = False
+        fp8_config = _dit_fp8_config(getattr(od_config, "quantization_config", None))
+        if fp8_config is not None:
+            if fp8_supported(self.device):
+                count = quantize_block_linears(
+                    self.dit,
+                    ignored_layers=list(getattr(fp8_config, "ignored_layers", None) or ()),
+                    match_mode=getattr(fp8_config, "ignored_layers_match_mode", "exact"),
+                )
+                self.dit_fp8 = True
+                logger.info("AuK DiT: %d block linears run as FP8 GEMMs", count)
+            else:
+                logger.warning(
+                    "AuK FP8 quantization needs an Ada or Hopper CUDA device; the DiT stays %s on %s",
+                    self.dtype,
+                    self.device,
+                )
         self.cudagraph_wrapper = AuKCUDAGraphWrapper(
             self.dit, enabled=not od_config.enforce_eager, max_graphs=max_dit_graphs
         )

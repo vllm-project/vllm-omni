@@ -18,9 +18,11 @@ import torch
 from tests.helpers.assertions import assert_audio_valid
 from tests.helpers.mark import hardware_test
 from vllm_omni import Omni
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.watermarking import AudioSealWatermarker, AudioTensor
 
 pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
@@ -35,6 +37,7 @@ def generate_stable_audio_short_clip(
     audio_end_in_s: float = 2.0,
     num_inference_steps: int = 4,
     seed: int = 42,
+    watermarking: bool = True,
 ) -> np.ndarray:
     """Run a minimal Stable Audio generation and return audio as (batch, channels, samples)."""
     outputs = omni.generate(
@@ -47,6 +50,7 @@ def generate_stable_audio_short_clip(
             guidance_scale=7.0,
             generator=torch.Generator(current_omni_platform.device_type).manual_seed(seed),
             num_outputs_per_prompt=1,
+            watermarking=watermarking,
             extra_args={
                 "audio_start_in_s": audio_start_in_s,
                 "audio_end_in_s": audio_end_in_s,
@@ -117,4 +121,21 @@ def test_stable_audio_cpu_offload() -> None:
             duration_s=_CLIP_DURATION_S,
         )
     finally:
+        m.close()
+
+
+@hardware_test(res={"cuda": "L4"})
+def test_stable_audio_watermarking_opt_out() -> None:
+    """Offline audio is watermarked by default, and requests can opt out through sampling params."""
+    m = Omni(
+        model="stabilityai/stable-audio-open-1.0",
+        watermark_config=WatermarkConfig({"audio": {"algorithm": "audioseal"}}),
+    )
+    watermarker = AudioSealWatermarker()
+    try:
+        for watermarking in (True, False):
+            audio = generate_stable_audio_short_clip(m, watermarking=watermarking)
+            assert watermarker.is_watermarked(AudioTensor(torch.from_numpy(audio), _SAMPLE_RATE)) is watermarking
+    finally:
+        watermarker.close()
         m.close()

@@ -1,14 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for OmniRequestOutput class."""
 
+import numpy as np
 import pytest
 from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
 
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("payload_location", ["request", "completion", "missing"])
+def test_multimodal_output_audio_accessor(payload_location):
+    audio = {"audio": [0.1, -0.1], "sr": 24000}
+    output = OmniRequestOutput(request_id="audio-accessor")
+    if payload_location == "request":
+        output = OmniRequestOutput.from_diffusion(request_id="audio-accessor", images=[], multimodal_output=audio)
+    elif payload_location == "completion":
+        output.outputs = [
+            MultimodalCompletionOutput(
+                index=0,
+                text="",
+                token_ids=[],
+                cumulative_logprob=None,
+                logprobs=None,
+                multimodal_output=audio,
+            )
+        ]
+
+    assert output.multimodal_output == ({} if payload_location == "missing" else audio)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -157,6 +180,7 @@ class TestMsgpackRoundTrip:
         )
 
         source = _make_text_request_output(text="round trip")
+        source.prompt_token_id_logprobs = np.array([[-0.5, -1.5], [-0.2, -2.2]], dtype=np.float32)
         out = OmniRequestOutput.from_stage_output(
             source,
             request_id="rt-1",
@@ -178,6 +202,7 @@ class TestMsgpackRoundTrip:
         assert decoded.outputs[0].text == "round trip"
         assert decoded.prompt == "test prompt"
         assert decoded.prompt_token_ids == [1, 2, 3]
+        np.testing.assert_array_equal(decoded.prompt_token_id_logprobs, source.prompt_token_id_logprobs)
 
     def test_round_trip_diffusion_output(self):
         """A diffusion output round-trips without data loss."""
@@ -301,6 +326,16 @@ class TestRequestOutputFieldParity:
         assert omni.ec_transfer_params is None
         assert omni.num_cached_tokens is None
         assert omni.num_cache_creation_tokens is None
+
+    def test_fixed_token_scores_survive_stage_output_wrapping(self) -> None:
+        source = _make_text_request_output()
+        source.prompt_token_id_logprobs = np.array([[-0.5, -1.5], [-0.2, -2.2]], dtype=np.float32)
+
+        omni = OmniRequestOutput.from_stage_output(source, stage_id=0)
+        forwarded = OmniRequestOutput.from_stage_output(omni, stage_id=1)
+
+        np.testing.assert_array_equal(forwarded.prompt_token_id_logprobs, source.prompt_token_id_logprobs)
+        assert OmniRequestOutput(request_id="unscored").prompt_token_id_logprobs is None
 
     def test_transfer_param_fields_are_copied_from_the_stage_output(self) -> None:
         """Declaring the fields is not enough — they must also be copied.

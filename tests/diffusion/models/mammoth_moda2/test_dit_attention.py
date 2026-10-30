@@ -17,11 +17,14 @@ from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBa
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
+    Transformer2DModel,
     TransformerBlock,
     apply_real_rotary_emb,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+from .helpers import initialize_block_weights
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.usefixtures("mock_tp1")]
 
 # Small stand-in for the real 2520 / 21 / 7 (head_dim 120) layout.
 DIM, HEADS = 48, 6
@@ -45,6 +48,7 @@ def _block(kv_heads: int, modulation: bool = True) -> TransformerBlock:
             norm_eps=1e-5,
             modulation=modulation,
         )
+    initialize_block_weights(block)
     return block.eval()
 
 
@@ -136,6 +140,31 @@ def test_block_forward_hands_native_kv_heads_to_shared_layer(monkeypatch, modula
     assert torch.equal(metadata.attn_mask, mask)
 
 
+def test_empty_text_stream_skips_the_entire_context_refiner():
+    class FailOnCall(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            raise AssertionError("context refiner called with an empty text stream")
+
+    class Increment(torch.nn.Module):
+        def forward(self, hidden_states, *args, **kwargs):
+            return hidden_states + 1
+
+    model = object.__new__(Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.context_refiner = torch.nn.ModuleList([FailOnCall()])
+    model.noise_refiner = torch.nn.ModuleList([Increment()])
+    text = torch.empty(BATCH, 0, DIM)
+    text_mask = torch.empty(BATCH, 0, dtype=torch.bool)
+    image = torch.zeros(BATCH, SEQ, DIM)
+
+    refined_text, refined_image = model._apply_refiners(
+        text, text_mask, torch.empty(1, 0, DIM), image, None, None, None
+    )
+
+    assert refined_text.shape == text.shape
+    torch.testing.assert_close(refined_image, torch.ones_like(image))
+
+
 def test_backend_selection_reaches_the_dit_layer():
     """The diffusion config selects the backend when the DiT layer is constructed."""
     assert _block(2).attn.omni_attn.attn_backend is DiffusionAttentionBackendEnum.TORCH_SDPA.get_class()
@@ -187,3 +216,69 @@ def test_empty_text_stream_skips_the_kernel(monkeypatch, with_mask):
         image_rotary_emb=(angles.cos(), angles.sin()),
     )
     assert out.shape == (BATCH, 0, DIM)
+
+
+def test_model_owns_repeated_pair_rope_contract():
+    from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
+    from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
+
+    with set_current_diffusion_config(_SDPA_CONFIG):
+        model = Transformer2DModel(
+            hidden_size=48,
+            num_attention_heads=6,
+            num_kv_heads=2,
+            num_layers=1,
+            num_refiner_layers=1,
+            multiple_of=8,
+            ffn_dim_multiplier=1.0,
+            axes_dim_rope=(2, 2, 4),
+            axes_lens=(8, 8, 8),
+            text_feat_dim=32,
+        )
+    for blocks in (model.layers, model.noise_refiner, model.ref_image_refiner, model.context_refiner):
+        assert all(block.attn.processor.rope_repeats_pairs for block in blocks)
+    assert not _block(2).attn.processor.rope_repeats_pairs
+    freqs = RotaryPosEmbedReal.get_freqs_real((2, 2, 4), (8, 8, 8), 10000)
+    ids = torch.tensor([[[0, 1, 2], [3, 4, 5]], [[1, 0, 3], [2, 5, 4]]])
+    cos, sin = model.rope_embedder._get_freqs_real(freqs, ids)
+    for table in (cos, sin):
+        torch.testing.assert_close(table[..., 0::2], table[..., 1::2], atol=0, rtol=0)
+    assert not torch.equal(cos[0], cos[1])
+
+
+def test_embedding_preparation_preserves_stubbed_rope_tables(monkeypatch):
+    from types import SimpleNamespace
+
+    from torch import nn
+
+    import vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model as mammoth_dit
+
+    # Embedding-only tests can stub the RoPE producer without constructing
+    # attention layers or supplying full transformer configuration.
+    model = object.__new__(mammoth_dit.Transformer2DModel)
+    nn.Module.__init__(model)
+    object.__setattr__(model, "_internal_dict", SimpleNamespace(patch_size=2))
+
+    class CaptionEmbedding(nn.Module):
+        def forward(self, timestep, text, dtype):
+            return torch.zeros(2, 8), text
+
+    model.time_caption_embed = CaptionEmbedding()
+    model.x_embedder = nn.Identity()
+    model.rope_embedder = lambda *args: (None, None, None, None, [4, 4], [8, 8])
+
+    def forbid_gate(*args):
+        raise AssertionError("Embedding preparation must not resolve the fusion token gate")
+
+    monkeypatch.setattr(mammoth_dit, "fused_qk_norm_rope_min_tokens", forbid_gate)
+    prepared = model._prepare_embeddings(
+        torch.zeros(2, 4, 4, 4),
+        torch.ones(2),
+        torch.zeros(2, 4, 8),
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.zeros(1),
+        2,
+        4,
+        4,
+    )
+    assert prepared[6:9] == (None, None, None)

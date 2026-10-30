@@ -54,7 +54,7 @@ def test_full_decode_graph_matches_fa3_aot_schedule(graph_mode, tmp_path):
     kvconfig = KVCacheConfig(num_blocks=1024, kv_cache_tensors=[], kv_cache_groups=[KVCacheGroupSpec(["attn"], spec)])
     state = OmniModelState.__new__(OmniModelState)
     state.vllm_config = c
-    state.max_model_len = 2048
+    state.model_config = c.model_config
     state.supports_mm_inputs = False
     with set_current_vllm_config(c):
         group = AttentionGroup(FlashAttentionBackend, ["attn"], spec, 0)

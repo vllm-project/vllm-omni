@@ -10,7 +10,6 @@ from transformers.models.t5gemma2.modeling_t5gemma2 import (
     T5Gemma2TextEncoder,
     sliding_window_mask_function,
 )
-from vllm.platforms import current_platform
 
 from vllm_omni.platforms import current_omni_platform
 
@@ -76,14 +75,13 @@ class BreezeTextEncoderGraph:
         self.local_mask_base = torch.zeros_like(self.full_mask).masked_fill_(~allowed[:, None], torch.finfo(dtype).min)
         self.local_mask = self.local_mask_base.clone()
         self.masks = {"full_attention": self.full_mask, "sliding_attention": self.local_mask}
+        self._encoder = encoder
+        self._projection = projection
         for _ in range(3):
             self._encode(encoder, projection)
         current_omni_platform.synchronize()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(
-            self.graph, pool=current_platform.get_global_graph_pool(), capture_error_mode="thread_local"
-        ):
-            self.output = self._encode(encoder, projection)
+        self.output: torch.Tensor | None = None
+        self.graph = current_omni_platform.capture_graph(self._run)
 
     def _encode(self, encoder: T5Gemma2TextEncoder, projection: nn.Linear) -> torch.Tensor:
         embedding = encoder.embed_tokens
@@ -97,6 +95,9 @@ class BreezeTextEncoderGraph:
         )
         encoded = encoder(inputs_embeds=hidden, attention_mask=self.masks, position_ids=self.positions)
         return projection(encoded.last_hidden_state)
+
+    def _run(self) -> None:
+        self.output = self._encode(self._encoder, self._projection)
 
     def run(self, prompt: torch.Tensor) -> torch.Tensor:
         return self.run_batch([prompt[0]])[0]
@@ -116,7 +117,7 @@ class BreezeTextEncoderGraph:
         self.full_mask.masked_fill_(invalid, torch.finfo(self.full_mask.dtype).min)
         self.local_mask.copy_(self.local_mask_base)
         self.local_mask.masked_fill_(invalid, torch.finfo(self.local_mask.dtype).min)
-        self.graph.replay()
+        current_omni_platform.replay_graph(self.graph, self._run)
         # Subsequent prefills and backbone/depth graphs reuse graph storage.
         # The runner must receive independently owned prompt embeddings.
         return [self.output[row, :length].clone() for row, length in enumerate(lengths)]

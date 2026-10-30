@@ -43,8 +43,10 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "unsupported_nemotron_duplex_mode": "invalid_request_error",
     "unsupported_native_response_options": "invalid_request_error",
     "runtime_touch_failed": "server_error",
+    "session_stats_disabled": "invalid_request_error",
     "engine_error": "server_error",
     "input_backpressure": "rate_limit_error",
+    "output_backpressure": "rate_limit_error",
     "response_already_active": "invalid_request_error",
     "response_not_active": "invalid_request_error",
     "response_create_without_input": "invalid_request_error",
@@ -66,8 +68,16 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "native_text_append_unsupported": "invalid_request_error",
     "invalid_video_frames": "invalid_request_error",
     "invalid_input_modality": "invalid_request_error",
+    "invalid_function_call": "invalid_request_error",
     "invalid_function_call_output": "invalid_request_error",
+    "invalid_tool_result_timeout": "invalid_request_error",
+    "tool_result_timeout": "invalid_request_error",
+    "tool_result_timeout_update_unsupported": "invalid_request_error",
+    "tool_call_registration_failed": "server_error",
+    "tool_call_settlement_failed": "server_error",
+    "tool_result_retirement_failed": "server_error",
     "server_vad_unavailable": "server_error",
+    "semantic_vad_unavailable": "server_error",
 }
 
 

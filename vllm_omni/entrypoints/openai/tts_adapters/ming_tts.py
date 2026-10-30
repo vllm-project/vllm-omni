@@ -275,13 +275,7 @@ class MingTTSAdapter(ARTTSAdapter):
         if request.instructions and len(request.instructions) > server._max_instructions_length:
             return f"Instructions too long (max {server._max_instructions_length} characters)"
 
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < self.max_new_tokens_min:
-                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
-            if request.max_new_tokens > self.max_new_tokens_max:
-                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
-
-        return None
+        return self._validate_max_new_tokens(request)
 
     def _validate_ming_tts_podcast_request(self, request: "OpenAICreateSpeechRequest") -> str | None:
         server = self.ctx.server
@@ -314,13 +308,7 @@ class MingTTSAdapter(ARTTSAdapter):
         if request.instructions and len(request.instructions) > server._max_instructions_length:
             return f"Instructions too long (max {server._max_instructions_length} characters)"
 
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < self.max_new_tokens_min:
-                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
-            if request.max_new_tokens > self.max_new_tokens_max:
-                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
-
-        return None
+        return self._validate_max_new_tokens(request)
 
     def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
         if emb_dim != SPEAKER_EMBEDDING_DIM:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
@@ -234,6 +235,16 @@ def _build_abs_positions_from_grid_hw(grid_hw, device=None):
     return pid % W_per_patch, pid // W_per_patch
 
 
+@dataclass(frozen=True)
+class VisionGrid:
+    sizes: list[tuple[int, int]]
+    positions: tuple[torch.Tensor, torch.Tensor]
+
+    @classmethod
+    def from_tensor(cls, grid_hw: torch.Tensor) -> VisionGrid:
+        return cls([tuple(size) for size in grid_hw.tolist()], _build_abs_positions_from_grid_hw(grid_hw))
+
+
 class NEOVisionEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -269,12 +280,14 @@ class NEOVisionEmbeddings(nn.Module):
         self.register_buffer("cos_cached_y", cos_y, persistent=False)
         self.register_buffer("sin_cached_y", sin_y, persistent=False)
 
-    def forward(self, pixel_values, grid_hw=None):
+    def forward(self, pixel_values, grid_hw=None, grid: VisionGrid | None = None):
         pixel_values = pixel_values.view(-1, 3, self.patch_size, self.patch_size)
         patch_embeds = self.gelu(self.patch_embedding(pixel_values)).view(-1, self.embed_dim)
 
         # 2D RoPE
-        abs_x, abs_y = _build_abs_positions_from_grid_hw(grid_hw)
+        if grid is None:
+            grid = VisionGrid.from_tensor(grid_hw)
+        abs_x, abs_y = grid.positions
         dim_half = self.embed_dim // 2
         p1 = _apply_rotary_emb_1d(
             patch_embeds[:, :dim_half].float(),
@@ -292,8 +305,7 @@ class NEOVisionEmbeddings(nn.Module):
 
         patches_list = []
         cur = 0
-        for i in range(grid_hw.shape[0]):
-            h, w = grid_hw[i]
+        for h, w in grid.sizes:
             pe = patch_embeds[cur : cur + h * w].view(h, w, -1).unsqueeze(0)
             pe = self.dense_embedding(pe.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
             patches_list.append(pe.view(-1, pe.shape[-1]))
@@ -307,8 +319,8 @@ class NEOVisionModel(nn.Module):
         super().__init__()
         self.embeddings = NEOVisionEmbeddings(config)
 
-    def forward(self, pixel_values=None, grid_hw=None, **_kwargs):
-        return self.embeddings(pixel_values, grid_hw=grid_hw)
+    def forward(self, pixel_values=None, grid_hw=None, grid: VisionGrid | None = None, **_kwargs):
+        return self.embeddings(pixel_values, grid_hw=grid_hw, grid=grid)
 
 
 # ---------------------------------------------------------------------------
@@ -611,9 +623,9 @@ class SenseNovaU1Pipeline(
                 "Use BF16 without quantization for distilled LoRA, or omit the LoRA options for online FP8."
             )
 
-    def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None):
+    def _extract_feature(self, pixel_values, gen_model=False, grid_hw=None, grid: VisionGrid | None = None):
         if gen_model:
-            return self.fm_modules["vision_model_mot_gen"](pixel_values=pixel_values, grid_hw=grid_hw)
+            return self.fm_modules["vision_model_mot_gen"](pixel_values=pixel_values, grid_hw=grid_hw, grid=grid)
         return self.vision_model(pixel_values=pixel_values, grid_hw=grid_hw)
 
     def _build_t2i_text_inputs(self, query):
@@ -719,9 +731,8 @@ class SenseNovaU1Pipeline(
         denoising_model = self.language_model if cache_dit_skip else self.denoising_transformer
         outputs = denoising_model(
             inputs_embeds=input_embeds,
-            image_gen_indicators=torch.ones(
-                (input_embeds.shape[0], input_embeds.shape[1]), dtype=torch.bool, device=input_embeds.device
-            ),
+            exist_und=False,
+            exist_gen=True,
             indexes=indexes_image,
             attention_mask=attn_mask,
             past_key_values=past_key_values,
@@ -1162,15 +1173,13 @@ class SenseNovaU1Pipeline(
             kwargs["cache_dit_skip"] = True
         return kwargs
 
-    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i):
+    def _denoise(self, image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, use_cfg: bool):
         if not is_it2i:
-            has_cached_partner = t >= p.cfg_interval[0] and t <= p.cfg_interval[1] and p.cfg_scale > 1
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not use_cfg
             )
 
-            in_interval = t >= p.cfg_interval[0] and t <= p.cfg_interval[1]
-            if not (in_interval and p.cfg_scale > 1):
+            if not use_cfg:
                 return self.predict_noise(**cond_kwargs)
 
             uncond_kwargs = self._get_cfg_kwargs(caches, image_embeds, t, z, ns, p, branch="uncond")
@@ -1184,14 +1193,11 @@ class SenseNovaU1Pipeline(
             )
             return noise_pred
         else:
-            use_cfg = (t > p.cfg_interval[0] and t < p.cfg_interval[1]) or p.cfg_interval[0] == 0
-            needs_cfg = p.cfg_scale != 1 or p.img_cfg_scale != 1
-            has_cached_partner = use_cfg and needs_cfg
             cond_kwargs = self._get_cfg_kwargs(
-                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not has_cached_partner
+                caches, image_embeds, t, z, ns, p, branch="cond", cache_dit_skip=not use_cfg
             )
 
-            if not use_cfg or not needs_cfg:
+            if not use_cfg:
                 return self.predict_noise(**cond_kwargs)
 
             cfg_norm = p.cfg_norm if (p.cfg_scale > 1 or p.img_cfg_scale > 1) else None
@@ -1503,6 +1509,27 @@ class SenseNovaU1Pipeline(
         """Shared denoising loop for both T2I and IT2I."""
         merge_size = self.merge_size
         image_prediction = ns.image_prediction
+        grid = VisionGrid.from_tensor(ns.grid_hw)
+        times = ns.timesteps[:-1]
+        if is_it2i:
+            cfg_steps = ((times > p.cfg_interval[0]) & (times < p.cfg_interval[1])) | (p.cfg_interval[0] == 0)
+            cfg_steps &= p.cfg_scale != 1 or p.img_cfg_scale != 1
+        else:
+            cfg_steps = (times >= p.cfg_interval[0]) & (times <= p.cfg_interval[1])
+            cfg_steps &= p.cfg_scale > 1
+        cfg_steps = cfg_steps.tolist()
+
+        noise_scale_emb = None
+        if self.model_cfg.add_noise_scale_embedding:
+            ns_tensor = torch.full(
+                (p.batch_size * ns.token_h * ns.token_w,),
+                ns.noise_scale / self.model_cfg.noise_scale_max_value,
+                dtype=ns.timesteps.dtype,
+                device=ns.timesteps.device,
+            )
+            noise_scale_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
+                p.batch_size, ns.token_h * ns.token_w, -1
+            )
 
         for step_i in range(p.num_steps):
             t = ns.timesteps[step_i]
@@ -1514,6 +1541,7 @@ class SenseNovaU1Pipeline(
                 image_input.view(p.batch_size * ns.grid_h * ns.grid_w, -1),
                 gen_model=True,
                 grid_hw=ns.grid_hw,
+                grid=grid,
             ).view(p.batch_size, ns.token_h * ns.token_w, -1)
 
             t_expanded = t.expand(p.batch_size * ns.token_h * ns.token_w)
@@ -1522,17 +1550,13 @@ class SenseNovaU1Pipeline(
                 ns.token_h * ns.token_w,
                 -1,
             )
-            if self.model_cfg.add_noise_scale_embedding:
-                ns_tensor = torch.full_like(t_expanded, ns.noise_scale / self.model_cfg.noise_scale_max_value)
-                ns_emb = self.fm_modules["noise_scale_embedder"](ns_tensor).view(
-                    p.batch_size,
-                    ns.token_h * ns.token_w,
-                    -1,
-                )
-                timestep_embeddings = timestep_embeddings + ns_emb
+            if noise_scale_emb is not None:
+                timestep_embeddings = timestep_embeddings + noise_scale_emb
             image_embeds = image_embeds + timestep_embeddings
 
-            v_pred = self._denoise(image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i)
+            v_pred = self._denoise(
+                image_prediction, ns, t, z, image_embeds, caches, p, step_i, is_it2i, cfg_steps[step_i]
+            )
             z = z + (t_next - t) * v_pred
             image_prediction = _unpatchify(z, self.patch_size * merge_size, p.image_size[1], p.image_size[0])
 

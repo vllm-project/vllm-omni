@@ -72,8 +72,13 @@ def _replace_streaming_session(session: Request) -> None:
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
+    # Upstream Scheduler.__init__ resolves hash_block_size = block_size (16 by
+    # default); the super()._update_request_as_session call at the pinned
+    # target truncates session.block_hashes with it.
+    sched.hash_block_size = 16
     sched.chunk_transfer_adapter = None
-    sched.skipped_waiting = set()
+    sched.kv_holding_waiting = set()
+    sched.deferred_waiting = set()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     update = StreamingUpdate(
         mm_features=None,

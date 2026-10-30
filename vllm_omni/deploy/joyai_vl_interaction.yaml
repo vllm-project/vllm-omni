@@ -1,5 +1,6 @@
 # Single-GPU JoyAI-VL-Interaction -> Qwen3-TTS all-sync profile.
 pipeline: joyai_vl_interaction
+session_mode: turn
 async_chunk: false
 trust_remote_code: true
 

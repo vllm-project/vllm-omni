@@ -396,25 +396,21 @@ class MimoAudioDummyInputsBuilder(BaseDummyInputsBuilder[MimoAudioProcessingInfo
 
 
 class MimoAudioMultiModalProcessor(BaseMultiModalProcessor[MimoAudioProcessingInfo]):
-    def _preprocess_hf_mm_data(
+    def _get_hf_mm_inputs(
         self,
-        mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-        mm_data, hf_processor_mm_kwargs = super()._preprocess_hf_mm_data(
-            mm_data,
-            hf_processor_mm_kwargs,
-        )
-        mm_data = dict(mm_data)
-        audios = mm_data.pop("audios", [])
-        if audios:
-            mm_data["audio"] = audios
-            feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
-            hf_processor_mm_kwargs = {
-                **hf_processor_mm_kwargs,
-                "sampling_rate": feature_extractor.sampling_rate,
-            }
-        return mm_data, hf_processor_mm_kwargs
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
+    ):
+        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_kwargs)
+        if hf_inputs.hf_data.get("audio"):
+            feature_extractor = self.info.get_feature_extractor(**hf_kwargs)
+            hf_inputs = hf_inputs._replace(
+                hf_kwargs={
+                    **hf_kwargs,
+                    "sampling_rate": feature_extractor.sampling_rate,
+                },
+            )
+        return hf_inputs
 
     def _get_mm_fields_config(
         self,
@@ -874,7 +870,9 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
+            f"{torch.accelerator.current_accelerator().type}:{torch.accelerator.current_device_index()}"
+            if torch.accelerator.is_available()
+            else "cpu"
         ),
         local_sampler: MiMoSampler | MiMoLocalSamplerTensor | None = None,
     ):
@@ -928,7 +926,9 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
+            f"{torch.accelerator.current_accelerator().type}:{torch.accelerator.current_device_index()}"
+            if torch.accelerator.is_available()
+            else "cpu"
         ),
         local_sampler: MiMoSampler | None = None,
     ):
@@ -1522,34 +1522,3 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             cursor = end
 
         return segments
-
-    def _get_past_len(self, past_key_values: DynamicCache | None) -> int:
-        if past_key_values is None:
-            return 0
-
-        if hasattr(past_key_values, "get_seq_length"):
-            try:
-                pl = past_key_values.get_seq_length()
-                if pl is not None:
-                    return int(pl)
-            except Exception as e:
-                logger.error(f"error happened: {e}")
-
-        if hasattr(past_key_values, "seen_tokens"):
-            try:
-                return int(past_key_values.seen_tokens)
-            except Exception as e:
-                logger.error(f"error happened: {e}")
-
-        try:
-            if hasattr(past_key_values, "layers") and len(past_key_values.layers) > 0:
-                k = past_key_values.layers[0].keys
-                return int(k.shape[-2])
-
-            if hasattr(past_key_values, "key_cache") and len(past_key_values.key_cache) > 0:
-                k = past_key_values.key_cache[0]
-                return int(k.shape[-2])
-        except Exception as e:
-            logger.error(f"error happened: {e}")
-
-        return 0
