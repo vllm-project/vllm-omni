@@ -1,0 +1,36 @@
+# Kokoro-82M deploy: single-stage non-autoregressive TTS (82M params, fp32).
+# Validated on 1x RTX A6000 48GB; peak activation memory is ~1 GiB per chunk.
+#
+# Each AR step synthesizes one <=510-phoneme chunk inside forward(), so the
+# engine only schedules steps: there is no KV cache, and max_tokens /
+# max_model_len bound the number of chunks per request, not audio length.
+#   * dtype=float32 -- the checkpoint's precision; the reference runs fp32.
+#   * enforce_eager=true -- chunk lengths vary, nothing is captured.
+#   * gpu_memory_utilization is a startup headroom check, not a KV budget;
+#     synthesis activations are allocated outside it.
+#
+# The checkpoint ships no tokenizer: the serving adapter sends a one-token
+# placeholder prompt and the text rides additional_information.
+# `tokenizer: gpt2` is a placeholder too, as in indextts2.yaml.
+async_chunk: false
+dtype: float32
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.1
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    skip_mm_profiling: true
+    skip_tokenizer_init: true
+    tokenizer: gpt2
+    default_sampling_params:
+      # The stop/continue token is chosen in-model; greedy just reads it back.
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      detokenize: false
