@@ -798,6 +798,8 @@ hardware baselines are separate for each concurrency. C16 covers two waves of
 sessions; it is not a sustained saturation or long-duration memory test.
 Execution failures, including OOM, continue to fail the nightly job. Local
 memory-limited runs do not replace validation on H100/B200.
+Artifact publication and completeness checks also remain mandatory in
+performance mode; they do not invoke answer judging.
 
 The primary percentile rows are P50/P95 TTFT, audio TTFP and RTF over individual
 responses (`--duplex-metric-aggregation response`). The default `session` mode
@@ -811,6 +813,9 @@ response-mode percentiles. Use `duplex_request_metrics` to reconstruct those
 distributions, taking responses from successful sessions as the summary does.
 TTFT/TTFP still prefer server timings when available, otherwise client receipt
 relative to response creation; the aggregation option does not change clocks.
+The `max_concurrent_requests` statistic counts sessions touching each whole-second
+bucket. At a wave boundary it can exceed the instantaneous concurrency because
+ending and starting sessions in the same second share a bucket.
 
 The configuration is named `c1_c8_c16_response_v2` to distinguish its baseline from
 older workloads. It has no answer-quality threshold or pre-filled hardware

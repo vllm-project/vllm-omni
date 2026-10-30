@@ -1235,17 +1235,51 @@ def test_variable_stage_workload_does_not_require_stage_metrics(extra_body):
     assert_result({"completed": 2}, {"extra_body": extra_body}, 2)
 
 
-def test_response_performance_requires_measurements_not_accuracy():
-    from tests.dfx.perf.scripts.run_benchmark import assert_result
-
-    params = {"dataset_name": "omni-duplex-eval", "duplex_performance_only": True}
+def _response_performance_result(dataset_name):
     result = {"completed": 16, "duplex_metric_aggregation": "response"}
+    if dataset_name == "omni-duplex-eval":
+        result["omni_duplex_eval"] = {"published": 16, "artifact_errors": []}
+    else:
+        result["omniinteract"] = {"total": 16, "success": 16, "failed": 0, "artifacts_complete": True}
     for metric in ("ttft", "audio_ttfp", "audio_rtf"):
         result[f"num_{metric}_samples"] = 16
         suffix = "" if metric == "audio_rtf" else "_ms"
         for percentile in (50, 95):
             result[f"p{percentile}_{metric}{suffix}"] = 1.0
+    return result
+
+
+@pytest.mark.parametrize("dataset_name", ["omni-duplex-eval", "omniinteract"])
+def test_response_performance_requires_measurements_not_accuracy(dataset_name):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    params = {"dataset_name": dataset_name, "duplex_performance_only": True}
+    result = _response_performance_result(dataset_name)
     assert_result(result, params, 16)
     result["num_audio_ttfp_samples"] = 0
     with pytest.raises(AssertionError, match="No measured audio_ttfp"):
         assert_result(result, params, 16)
+
+
+@pytest.mark.parametrize(
+    "dataset_name, field, value, message",
+    [
+        ("omni-duplex-eval", None, None, "summary is missing"),
+        ("omni-duplex-eval", "published", 15, "artifacts are incomplete"),
+        ("omni-duplex-eval", "artifact_errors", ["disk full"], "publication failed"),
+        ("omniinteract", None, None, "summary is missing"),
+        ("omniinteract", "artifacts_complete", False, "artifacts are incomplete"),
+        ("omniinteract", "success", 15, "requests did not all succeed"),
+    ],
+)
+def test_response_performance_rejects_missing_artifacts(dataset_name, field, value, message):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _response_performance_result(dataset_name)
+    summary_key = dataset_name.replace("-", "_")
+    if field is None:
+        del result[summary_key]
+    else:
+        result[summary_key][field] = value
+    with pytest.raises(AssertionError, match=message):
+        assert_result(result, {"dataset_name": dataset_name, "duplex_performance_only": True}, 16)

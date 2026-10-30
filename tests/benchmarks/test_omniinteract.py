@@ -1381,6 +1381,8 @@ def test_case_artifact_failures_do_not_discard_serving_metrics(tmp_path: Path, m
 
 
 def test_batch_artifact_failure_removes_partial_batch_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
     case, options = _case(tmp_path), _session_options(tmp_path)
     sample = _sample(case, options)
     result = oi.OmniInteractCaseResult(
@@ -1403,6 +1405,15 @@ def test_batch_artifact_failure_removes_partial_batch_files(tmp_path: Path, monk
     assert summary["artifact_errors"] == ["Batch artifact publication failed: batch disk full"]
     assert output.success
     assert not (options.output_root / "batch_summary.json").exists()
+
+    benchmark_result = {"completed": 1, "duplex_metric_aggregation": "response", "omniinteract": summary}
+    for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+        benchmark_result[f"num_{metric}_samples"] = 1
+        suffix = "" if metric == "audio_rtf" else "_ms"
+        for percentile in (50, 95):
+            benchmark_result[f"p{percentile}_{metric}{suffix}"] = 1.0
+    with pytest.raises(AssertionError, match="OmniInteract artifacts are incomplete"):
+        assert_result(benchmark_result, {"dataset_name": "omniinteract", "duplex_performance_only": True}, 1)
 
 
 @pytest.mark.parametrize(

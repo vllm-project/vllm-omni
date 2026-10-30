@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -67,3 +69,22 @@ def test_existing_local_directory_with_at_preserves_literal_name(monkeypatch, tm
     monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
     assert len(load_samples(str(dataset), split="PR_correction")) == 1
     assert calls == [(str(dataset), {"split": "PR_correction"})]
+
+
+@pytest.mark.parametrize("collapsed", [False, True])
+def test_home_relative_local_directory_preserves_at_and_split_fallback(monkeypatch, tmp_path, collapsed):
+    dataset = tmp_path / "dataset@revision"
+    dataset.mkdir()
+    home_relative = "~/" + os.path.relpath(dataset, Path.home())
+    calls = []
+
+    def fake_load_dataset(name, **kwargs):
+        assert Path(name).is_absolute() and Path(name).resolve() == dataset
+        calls.append(kwargs)
+        if collapsed and kwargs.get("split"):
+            raise ValueError("Unknown split PR_correction")
+        return [{"id": "0", "split": "PR_correction", "question_text": "The hat is blue."}]
+
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
+    assert len(load_samples(home_relative, split="PR_correction")) == 1
+    assert calls == ([{"split": "PR_correction"}, {}] if collapsed else [{"split": "PR_correction"}])

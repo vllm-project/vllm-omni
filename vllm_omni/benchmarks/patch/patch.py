@@ -697,6 +697,9 @@ def get_samples(args, tokenizer, **kwargs):
         identities = set()
         for index in range(count):
             cycle, offset = divmod(index, len(pool))
+            # Repeats can overlap: shared media/options must stay read-only.
+            # Prepared media is frozen bytes/tuples; stream cursors and playback
+            # state are created separately by each run_omniinteract_case call.
             request = replace(pool[offset], request_id=f"{args.request_id_prefix or ''}{index}")
             if isinstance(request, OmniInteractSampleRequest) and request.omniinteract_case is not None:
                 case = request.omniinteract_case

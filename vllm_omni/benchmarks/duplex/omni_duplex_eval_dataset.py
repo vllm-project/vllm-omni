@@ -363,7 +363,7 @@ def load_samples(
     ids: Iterable[str] | None = None,
 ) -> list[DuplexSample]:
     if isinstance(dataset, str | Path):
-        path = Path(str(dataset))
+        path = Path(str(dataset)).expanduser()
         if path.exists():
             # A directory or a ``.parquet`` file is a Hugging Face dataset
             # layout (e.g. a locally mirrored Omni-DuplexEval snapshot); only
