@@ -197,12 +197,14 @@ def test_mrv2_differing_top_level_metadata_matches_separate_accumulation():
 
     torch.testing.assert_close(payload["latent"], hidden)
     assert payload.metadata == {"spk": ["b", "c"], "a": ["x"], "b": ["y"]}
-    # The tensor side of each mismatched key is accumulated once, not dropped.
+    # Next stages read this snapshot, so they see the metadata value for a/b,
+    # as before MRv2. The tensor side lives only in the request accumulator,
+    # where it is kept once, not dropped or concatenated. Payload lookup
+    # prefers tensors, so indexing the accumulator returns them.
     accumulated = state.mm_accumulated
-    assert set(accumulated.tensors) == {"latent", "a", "b"}
-    torch.testing.assert_close(accumulated.tensors["latent"], hidden)
-    torch.testing.assert_close(accumulated.tensors["a"], torch.tensor([9]))
-    torch.testing.assert_close(accumulated.tensors["b"], torch.tensor([4]))
+    torch.testing.assert_close(accumulated["latent"], hidden)
+    torch.testing.assert_close(accumulated["a"], torch.tensor([9]))
+    torch.testing.assert_close(accumulated["b"], torch.tensor([4]))
 
 
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
