@@ -208,7 +208,7 @@ def test_candidate_with_the_baseline_identity_reuses_the_baseline_impl(attention
     assert layer._schedule_candidates["calibrated"].impl is not layer.attention
 
 
-def test_reused_baseline_impl_keeps_its_kwargs_and_fallback_calibration_after_stamping(attention_env):
+def test_reused_baseline_impl_keeps_its_fields_and_fallback_calibration_after_stamping(attention_env):
     """Preparing and stamping candidates leaves the shared baseline impl as the baseline configured it.
 
     ``skip_calibration={}`` canonicalizes like ``None`` and stamping treats both as "no curve of its
@@ -227,16 +227,18 @@ def test_reused_baseline_impl_keeps_its_kwargs_and_fallback_calibration_after_st
         _make_config(baseline=AttentionConfig(default=AttentionSpec(backend="SDPA")), schedule=schedule)
     )
     baseline = layer.attention
-    kwargs_before = dict(baseline.kwargs)
+    fields_before = dict(vars(baseline))
 
     assert layer._schedule_candidates["same"].impl is baseline
     assert layer._schedule_candidates["empty"].impl is baseline
+    assert fields_before["calibration"] is None  # preparation stamps nothing
 
     stamped = apply_to_pipeline(nn.ModuleDict({"attn": layer}), {"a": 0.5, "b": 1.0})
 
     assert stamped == 2  # the shared baseline impl once, the calibrated candidate once
-    assert baseline.kwargs == kwargs_before
-    assert baseline.calibration == (0.5, 1.0)
+    # Stamping replaces only the shared impl's curve; every other field keeps its prepared value.
+    assert vars(baseline) == {**fields_before, "calibration": (0.5, 1.0)}
+    assert baseline.kwargs is fields_before["kwargs"]
     assert layer._schedule_candidates["calibrated"].impl.calibration == (2.0, 3.0)
 
 
