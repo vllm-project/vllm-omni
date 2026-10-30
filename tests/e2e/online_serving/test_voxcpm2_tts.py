@@ -18,7 +18,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-MODEL = "openbmb/VoxCPM2"
+MODEL = os.environ.get("VOXCPM2_MODEL", "openbmb/VoxCPM2")
 DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 300.0
 MAX_CONCURRENT = 4
 
@@ -48,7 +48,7 @@ tts_server_params = [
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, online_client) -> None:
     """
@@ -73,7 +73,7 @@ def test_text_to_audio_001(omni_server, online_client) -> None:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002(omni_server, online_client) -> None:
     """

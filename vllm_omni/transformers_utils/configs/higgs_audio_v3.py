@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Configuration class for higgs-audio v3 (HiggsMultimodalQwen3) in vllm-omni.
 
 ``HiggsAudioV3Config.from_pretrained(model_path)`` returns a config with
@@ -95,6 +95,8 @@ class HiggsAudioV3Config(PretrainedConfig):
         audio_continuation_id: int | None = None,
         enable_flashinfer_api_unwrap: bool = True,
         enable_mlp_cudagraph: bool = True,
+        audio_full_sample_graph: bool | None = None,
+        codec_cuda_graph: bool | None = None,
         **kwargs: Any,
     ) -> None:
         # Legacy perf knob removed: Higgs v3 scheduler tokens now come from
@@ -131,8 +133,17 @@ class HiggsAudioV3Config(PretrainedConfig):
         self.audio_continuation_id = audio_continuation_id
         self.enable_flashinfer_api_unwrap = bool(enable_flashinfer_api_unwrap)
         self.enable_mlp_cudagraph = bool(enable_mlp_cudagraph)
+        self.audio_full_sample_graph = audio_full_sample_graph
+        self.codec_cuda_graph = codec_cuda_graph
 
         super().__init__(**kwargs)
+
+    def resolve_graph_defaults(self, *, use_v2_model_runner: bool) -> tuple[bool, bool]:
+        """Resolve sampler/codec graphs without mutating shared checkpoint config."""
+        return (
+            use_v2_model_runner if self.audio_full_sample_graph is None else self.audio_full_sample_graph,
+            use_v2_model_runner if self.codec_cuda_graph is None else self.codec_cuda_graph,
+        )
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs: Any) -> HiggsAudioV3Config:

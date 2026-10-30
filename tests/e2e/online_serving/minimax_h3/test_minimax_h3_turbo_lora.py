@@ -20,8 +20,8 @@ from ._common import (
     turbo_params,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.advanced_model, pytest.mark.diffusion, pytest.mark.slow]
-H100_TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
+TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
 
 
 @pytest.mark.skipif(
@@ -38,7 +38,7 @@ H100_TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
         pytest.param(
             turbo_params(TURBO_LORA),
             id="minimax_h3_dlo_turbo_lora_tp2",
-            marks=H100_TWO_CARD_MARKS,
+            marks=TWO_CARD_MARKS,
         )
     ],
     indirect=True,

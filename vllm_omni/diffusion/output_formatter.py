@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TypeGuard, cast
+from typing import Any, TypeGuard, cast
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type, supports_audio_output
@@ -91,11 +91,15 @@ def _metadata_from_legacy_payload(payload: dict[str, DiffusionPayloadValue]) -> 
     return metadata
 
 
+# Structured (non-media) payloads travel in ``multimodal_output`` under their own key.
+STRUCTURED_PAYLOAD_KEYS = frozenset({"actions", "trajectory", "segmentation", "video_segmentation"})
+
+
 def _infer_primary_payload_key(payload: DiffusionPayload) -> str | None:
     for key in ("video", "image", "text", "audio", "output"):
         if key in payload:
             return key
-    if set(payload).issubset({"actions", "trajectory"}):
+    if set(payload).issubset(STRUCTURED_PAYLOAD_KEYS):
         return None
     if "actions" in payload:
         return None
@@ -106,6 +110,7 @@ def format_empty_diffusion_outputs(
     request: OmniDiffusionRequest,
     *,
     finished: bool = True,
+    custom_output: dict[str, Any] | None = None,
 ) -> list[OmniRequestOutput]:
     return [
         OmniRequestOutput.from_diffusion(
@@ -114,6 +119,7 @@ def format_empty_diffusion_outputs(
             prompt=request.prompt,
             metrics={},
             latents=None,
+            custom_output=custom_output,
             finished=finished,
         )
     ]
@@ -185,6 +191,8 @@ def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) ->
         or bool(diffusion_output.started_event_ids)
         or bool(diffusion_output.active_event_ids)
         or bool(diffusion_output.completed_event_ids)
+        or bool(diffusion_output.coalesced_event_ids)
+        or bool(diffusion_output.streaming_metrics)
     )
     if not has_stream_data:
         return None
@@ -192,9 +200,19 @@ def _stream_metadata_from_diffusion_output(diffusion_output: DiffusionOutput) ->
         DiffusionMetadata,
         {
             "generation_chunk_index": diffusion_output.chunk_index,
+            **(
+                {"output_chunk_index": diffusion_output.chunk_index, "pacing": diffusion_output.streaming_metrics}
+                if diffusion_output.streaming_metrics
+                else {}
+            ),
             "started_event_ids": diffusion_output.started_event_ids,
             "active_event_ids": diffusion_output.active_event_ids,
             "completed_event_ids": diffusion_output.completed_event_ids,
+            **(
+                {"coalesced_event_ids": diffusion_output.coalesced_event_ids}
+                if diffusion_output.coalesced_event_ids
+                else {}
+            ),
         },
     )
 
@@ -245,8 +263,7 @@ def _has_non_audio_postprocess_payload(postprocess_output: DiffusionPostprocessO
         "video" in postprocess_output.outputs
         or "image" in postprocess_output.outputs
         or "text" in postprocess_output.metadata
-        or "actions" in postprocess_output.outputs
-        or "trajectory" in postprocess_output.outputs
+        or any(key in postprocess_output.outputs for key in STRUCTURED_PAYLOAD_KEYS)
         or _metadata_video_fps(postprocess_output.metadata) is not None
     )
 
@@ -259,7 +276,7 @@ def _build_multimodal_output(
     if postprocess_output.metadata:
         mm_output["metadata"] = postprocess_output.metadata
     for key, value in postprocess_output.outputs.items():
-        if key in {"audio", "actions", "trajectory"}:
+        if key == "audio" or key in STRUCTURED_PAYLOAD_KEYS:
             mm_output[key] = value
     if audio_sample_rate is not None:
         mm_output["audio_sample_rate"] = audio_sample_rate

@@ -60,7 +60,7 @@ tts_server_params = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_001(omni_server, online_client) -> None:
     """
@@ -92,7 +92,7 @@ def test_voice_001(omni_server, online_client) -> None:
             raise
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_002(omni_server, online_client) -> None:
     """
@@ -115,7 +115,7 @@ def test_voice_002(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_003(omni_server, online_client) -> None:
     """
@@ -138,7 +138,7 @@ def test_voice_003(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_sample_rate_001(omni_server, online_client) -> None:
     """The speech API resamples Qwen3-TTS output from native 24 kHz to 8 kHz."""
@@ -148,6 +148,9 @@ def test_sample_rate_001(omni_server, online_client) -> None:
         "stream": False,
         "response_format": "wav",
         "sample_rate": 8000,
+        # Narrow-band audio can make Whisper-small mishear "kilohertz".
+        # Recheck the same clip with a stronger ASR without relaxing parity.
+        "transcript_escalation_model": "large-v3",
         "task_type": "CustomVoice",
         "voice": "vivian",
     }
@@ -155,7 +158,7 @@ def test_sample_rate_001(omni_server, online_client) -> None:
     online_client.send_audio_speech_request(request_config)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_language_001(omni_server, online_client) -> None:
     """

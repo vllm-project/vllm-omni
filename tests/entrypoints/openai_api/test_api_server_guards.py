@@ -42,8 +42,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import signal
+from argparse import Namespace
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any, NoReturn
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -52,16 +58,87 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import State
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.serve.tokenize import api_router as tokenization_api_router
+from vllm.entrypoints.serve.tokenize.protocol import DetokenizeResponse, TokenizeResponse, TokenizerInfoResponse
+from vllm.exceptions import RetryableRequestError
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.entrypoints.openai import api_server
+from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class _FakeParallelConfig:
+    _api_process_rank: int
+
+
+@dataclass
+class _FakeVllmConfig:
+    parallel_config: _FakeParallelConfig
+
+
+def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
+    args = _minimal_args(_omni_stage_client_configs=[{"stage_addresses": {}}])
+    death_signal = mocker.patch.object(api_server, "set_death_signal")
+
+    with pytest.raises(RuntimeError, match="client configuration"):
+        api_server.run_omni_api_server_worker_proc(
+            "127.0.0.1:8000",
+            mocker.Mock(),
+            args,
+            {"client_count": 2, "client_index": -1},
+        )
+
+    death_signal.assert_called_once_with(signal.SIGTERM)
+
+
+@pytest.mark.asyncio
+async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
+    captured: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*_args, **kwargs):
+        captured.update(kwargs)
+        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
+    monkeypatch.setattr(api_server, "omni_init_app_state", lambda *_args: asyncio.sleep(0))
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)
+
+    async def fake_storage_start() -> None:
+        return None
+
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", fake_storage_start)
+
+    async def fake_serve_http(app, **_kwargs):
+        assert app.state.api_server_count == 2
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0)
+        return task
+
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+
+    args = _minimal_args(model="dummy")
+    config = {"client_count": 2, "client_index": 1, "stage_addresses": {}}
+
+    await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
+    assert captured["client_config"] is config
+
 
 # FastAPI/Starlette auto-adds HEAD on every GET route. Including HEAD here
 # would invent ("HEAD", path) entries for every GET and fail the current census.
 # TODO: extend this set and the expected census if @router.head / @router.options appear.
 _HTTP_METHODS = {"GET", "POST", "DELETE", "PUT", "PATCH"}
+
+
+def test_profiler_endpoints_detect_typed_stage_config():
+    stage = SimpleNamespace(profiler_config=SimpleNamespace(profiler="torch"))
+
+    assert api_server._should_enable_profiler_endpoints([stage])
+
 
 # Exact Omni router census on main. Update intentionally when routes change.
 _EXPECTED_ROUTER_ROUTES = {
@@ -79,10 +156,17 @@ _EXPECTED_ROUTER_ROUTES = {
     ("WEBSOCKET", "/v1/realtime"),
     ("WEBSOCKET", "/v1/realtime/robot/openpi"),
     ("WEBSOCKET", "/v1/duplex"),
+    ("POST", "/v1/realtime/sessions"),
+    ("POST", "/v1/realtime/sessions/{session_id}/step"),
+    ("POST", "/v1/realtime/sessions/{session_id}/reset"),
+    ("POST", "/v1/realtime/sessions/{session_id}/close"),
+    ("GET", "/v1/realtime/sessions/{session_id}/status"),
     ("GET", "/health"),
     ("GET", "/v1/models"),
     ("POST", "/v1/images/generations"),
     ("POST", "/v1/images/edits"),
+    ("POST", "/v1/images/segmentations"),
+    ("POST", "/v1/videos/segmentations"),
     ("POST", "/v1/videos"),
     ("POST", "/v1/videos/sync"),
     ("GET", "/v1/videos"),
@@ -119,6 +203,7 @@ _DIFFUSION_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_serving_realtime_robot",
+    "rl_rollout_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -147,15 +232,17 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "openai_streaming_speech",
     "openai_streaming_video",
     "openai_serving_duplex",
-    "openai_serving_realtime",
     "openai_serving_video",
     "openai_serving_realtime_robot",
+    "rl_rollout_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
+# The OpenPI robot server is None unless the policy declares policy_server_config.
 _MULTISTAGE_MUST_BE_NONE = {
     "openai_serving_duplex",
     "openai_serving_realtime_robot",
+    "rl_rollout_serving",
 }
 _MULTISTAGE_MUST_BE_WIRED = _MULTISTAGE_APP_STATE_KEYS - _MULTISTAGE_MUST_BE_NONE
 
@@ -286,6 +373,8 @@ class _FakeSocket:
 
 
 class _FakeEngineClient:
+    config_path: str | None = None
+
     def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
@@ -347,11 +436,51 @@ def test_router_openapi_paths_cover_http_manifest() -> None:
         assert method.lower() in paths[path], f"missing OpenAPI method {method} {path}"
 
 
+@pytest.mark.parametrize(
+    ("stage_configs", "expected"),
+    [
+        (None, False),
+        ([], False),
+        ([{}], False),
+        ([{"engine_args": None}], False),
+        ([{"engine_args": {}}], False),
+        ([{"engine_args": {"profiler_config": None}}], False),
+        ([{"engine_args": {"profiler_config": {}}}], False),
+        ([{"engine_args": {"profiler_config": {"profiler": None}}}], False),
+        ([{"engine_args": {"profiler_config": {"profiler": "torch"}}}], True),
+        ([{"engine_args": {"profiler_config": {"profiler": "cuda"}}}], True),
+        # Attribute-style stage/engine_args/profiler_config, not just dicts.
+        (
+            [SimpleNamespace(engine_args=SimpleNamespace(profiler_config=SimpleNamespace(profiler="torch")))],
+            True,
+        ),
+        (
+            [SimpleNamespace(engine_args=SimpleNamespace(profiler_config=None))],
+            False,
+        ),
+        # Any stage enabling the profiler is enough.
+        (
+            [{"engine_args": {}}, {"engine_args": {"profiler_config": {"profiler": "torch"}}}],
+            True,
+        ),
+    ],
+)
+def test_should_enable_profiler_endpoints_matches_stage_config(stage_configs, expected: bool) -> None:
+    """Lock the gate that decides whether /start_profile is registered.
+
+    vLLM-Omni enables the profiler endpoints from the stage config, matching
+    upstream vLLM v0.16.0+. Fails if the gate starts accepting a stage that
+    only half-declares ``profiler_config`` (present but with no ``profiler``),
+    stops supporting attribute-style configs, or stops scanning every stage.
+    """
+    assert api_server._should_enable_profiler_endpoints(stage_configs) is expected
+
+
 @pytest.mark.asyncio
 async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch) -> None:
     """Lock worker assembly: override, mount, storage, handlers, full census.
 
-    Fails if assembly stops replacing upstream chat/batch/models/profiler,
+    Fails if assembly stops replacing upstream chat/batch/models/health/profiler,
     deletes unrelated upstream routes, forgets Omni/profiler mounts, skips
     storage start, or drops Omni ``EngineDeadError`` / ``EngineGenerateError``
     handlers.
@@ -371,6 +500,10 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
         @app.get("/v1/models")
         async def upstream_models():
+            return {"owner": "upstream"}
+
+        @app.get("/health")
+        async def upstream_health():
             return {"owner": "upstream"}
 
         @app.post("/start_profile")
@@ -454,6 +587,7 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
         is api_server.create_batch_chat_completion
     )
     assert _single_http_route(routes, "GET", "/v1/models").endpoint is api_server.show_available_models
+    assert _single_http_route(routes, "GET", "/health").endpoint is api_server.health
     assert _single_http_route(routes, "POST", "/start_profile").endpoint is api_server.start_profile
     assert _single_http_route(routes, "POST", "/stop_profile").endpoint is api_server.stop_profile
 
@@ -474,13 +608,149 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
 
 @pytest.mark.asyncio
+async def test_profiler_env_var_without_stage_config_warns_and_skips_routes(monkeypatch, caplog) -> None:
+    """Lock the not-silent behavior when only ``VLLM_TORCH_PROFILER_DIR`` is set.
+
+    That variable was removed in vLLM v0.16.0 when profiling moved to
+    ``ProfilerConfig``. Omni reads it only as a migration diagnostic: a stale
+    value left in an environment or script is inert. Without this warning it
+    looks identical to a working setup: server starts, nothing logged,
+    /start_profile 404s. Fails if the routes get mounted from the env var
+    alone, or if the migration warning stops being emitted.
+    """
+
+    def fake_build_openai_app(args, supported_tasks):
+        return FastAPI()
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*_args, **_kwargs):
+        # No stage declares profiler_config, so the gate must stay closed.
+        yield _FakeEngineClient(
+            stage_configs=[{"engine_args": {}}],
+            vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=0)),
+        )
+
+    async def fake_omni_init_app_state(engine_client, state, args):
+        state.engine_client = engine_client
+
+    captured: dict[str, object] = {}
+
+    async def fake_serve_http(app, **_kwargs):
+        captured["served_app"] = app
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0)
+        return task
+
+    monkeypatch.setenv("VLLM_TORCH_PROFILER_DIR", "/tmp/omni-profiler-traces")
+    monkeypatch.setattr(api_server, "build_openai_app", fake_build_openai_app)
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda app, restrictions: None)
+
+    async def fake_storage_start():
+        captured["storage_started"] = True
+
+    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start))
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+
+    with caplog.at_level(logging.WARNING):
+        await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
+
+    served_app = captured["served_app"]._inner  # type: ignore[attr-defined]
+    manifest = _route_manifest(served_app.routes)
+    assert ("POST", "/start_profile") not in manifest
+    assert ("POST", "/stop_profile") not in manifest
+    assert "VLLM_TORCH_PROFILER_DIR" in caplog.text
+    assert "profiler_config" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_tokenization", [False, True], ids=["diffusion", "autoregressive"])
+@pytest.mark.parametrize("tokenizer_info_enabled", [False, True], ids=["no-info", "info"])
+async def test_api_server_assembly_exposes_only_supported_tokenization_routes(
+    monkeypatch, mocker, has_tokenization: bool, tokenizer_info_enabled: bool
+) -> None:
+    """Use the inherited HTTP routes: diffusion returns 404; AR still delegates."""
+    captured: dict[str, FastAPI] = {}
+    handler = mocker.create_autospec(api_server.ServingTokenization, instance=True)
+    handler.create_tokenize.return_value = TokenizeResponse(count=1, max_model_len=1024, tokens=[42])
+    handler.create_detokenize.return_value = DetokenizeResponse(prompt="hello")
+    handler.get_tokenizer_info.return_value = TokenizerInfoResponse(tokenizer_class="TestTokenizer")
+
+    # attach_router conditionally adds /tokenizer_info to its module-level router.
+    # Isolate that registration so the opt-in cannot leak between test cases.
+    monkeypatch.setattr(
+        tokenization_api_router.router,
+        "routes",
+        [route for route in tokenization_api_router.router.routes if getattr(route, "path", None) != "/tokenizer_info"],
+    )
+
+    def build_app_with_native_tokenization(args, _supported_tasks):
+        app = FastAPI()
+        app.state.args = args
+        tokenization_api_router.attach_router(app)
+        captured["app"] = app
+        return app
+
+    @asynccontextmanager
+    async def build_engine(*_args, **_kwargs):
+        yield _FakeEngineClient()
+
+    async def init_app_state(engine_client, state, _args):
+        state.engine_client = engine_client
+        state.serving_tokenization = handler if has_tokenization else None
+
+    async def serve_http(_app, **_kwargs):
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(api_server, "build_openai_app", build_app_with_native_tokenization)
+    monkeypatch.setattr(api_server, "build_async_omni", build_engine)
+    monkeypatch.setattr(api_server, "omni_init_app_state", init_app_state)
+    monkeypatch.setattr(api_server, "serve_http", serve_http)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", lambda: asyncio.sleep(0))
+
+    await api_server.omni_run_server_worker(
+        "127.0.0.1:8000", _FakeSocket(), _minimal_args(enable_tokenizer_info_endpoint=tokenizer_info_enabled)
+    )
+
+    app = captured["app"]
+    with TestClient(app, raise_server_exceptions=False) as client:
+        tokenize_response = client.post("/tokenize", json={"model": "demo-model", "prompt": "hello"})
+        detokenize_response = client.post("/detokenize", json={"model": "demo-model", "tokens": [42]})
+        info_response = client.get("/tokenizer_info")
+
+    expected_status = 200 if has_tokenization else 404
+    assert tokenize_response.status_code == detokenize_response.status_code == expected_status
+    assert info_response.status_code == (200 if has_tokenization and tokenizer_info_enabled else 404)
+    openapi_paths = app.openapi()["paths"]
+    assert ("/tokenize" in openapi_paths) == has_tokenization
+    assert ("/detokenize" in openapi_paths) == has_tokenization
+    assert ("/tokenizer_info" in openapi_paths) == (has_tokenization and tokenizer_info_enabled)
+    if has_tokenization:
+        assert tokenize_response.json()["tokens"] == [42]
+        assert detokenize_response.json() == {"prompt": "hello"}
+        handler.create_tokenize.assert_awaited_once()
+        handler.create_detokenize.assert_awaited_once()
+        assert handler.create_tokenize.await_args.args[0].prompt == "hello"
+        assert handler.create_detokenize.await_args.args[0].tokens == [42]
+        assert handler.get_tokenizer_info.await_count == int(tokenizer_info_enabled)
+        if tokenizer_info_enabled:
+            assert info_response.json() == {"tokenizer_class": "TestTokenizer"}
+    else:
+        assert tokenize_response.json() == detokenize_response.json() == {"detail": "Not Found"}
+        handler.create_tokenize.assert_not_awaited()
+        handler.create_detokenize.assert_not_awaited()
+        handler.get_tokenizer_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch) -> None:
     """Lock outermost timestamp middleware behavior.
 
     Fails if HTTP requests lose ``request_timestamp``, or WebSocket scopes
     start getting stamped / mutated incorrectly.
     """
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_build_openai_app(args, supported_tasks):
         return FastAPI()
@@ -508,8 +778,8 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
     middleware = captured["served_app"]
 
-    http_scope = {"type": "http", "state": {}}
-    ws_scope = {"type": "websocket"}
+    http_scope: dict[str, Any] = {"type": "http", "state": {}}
+    ws_scope: dict[str, Any] = {"type": "websocket"}
 
     async def _receive():
         return {"type": "http.disconnect"}
@@ -563,6 +833,182 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
                 websocket.receive_text()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("duplex_query", "expected_handler"),
+    [
+        (None, "duplex"),
+        ("1", "duplex"),
+        ("true", "duplex"),
+        ("on", "duplex"),
+        ("0", "turn_based"),
+        ("false", "turn_based"),
+    ],
+)
+async def test_realtime_route_defaults_to_configured_duplex_handler(
+    duplex_query: str | None, expected_handler: str
+) -> None:
+    calls: list[str] = []
+
+    class _DuplexHandler:
+        async def handle_realtime_session(self, _websocket) -> None:
+            calls.append("duplex")
+
+    class _TurnBasedHandler:
+        async def handle_websocket(self, _websocket) -> None:
+            calls.append("turn_based")
+
+    query_params = {} if duplex_query is None else {"duplex": duplex_query}
+    websocket = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                openai_serving_duplex=_DuplexHandler(),
+                openai_realtime_handler=_TurnBasedHandler(),
+            )
+        ),
+        query_params=query_params,
+    )
+
+    await api_server.realtime_websocket(websocket)
+
+    assert calls == [expected_handler]
+
+
+@pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime", "/v1/realtime?duplex=1"])
+@pytest.mark.parametrize(
+    ("replica_policy", "resume_supported", "reason"),
+    [
+        ("legacy", False, "replica_policy=least_sessions"),
+        ("legacy", True, "replica_policy=least_sessions"),
+        ("least_sessions", True, "resume routing"),
+        ("least_sessions", None, "resume routing"),
+    ],
+)
+def test_multi_api_duplex_reconnect_rejected_on_each_worker(
+    path: str, replica_policy: str, resume_supported: bool | None, reason: str
+) -> None:
+    class SessionHandler:
+        async def handle_realtime_session(self, _websocket) -> None:
+            pytest.fail("Multi-API requests must not access process-local sessions")
+
+    class PendingWarmup:
+        def is_set(self) -> bool:
+            raise AssertionError("Multi-API rejection must not wait for duplex warmup")
+
+    # Separate apps represent workers with independent frontend registries.
+    # Opening on A then reconnecting to B must reject at the same boundary.
+    for worker_index in (0, 1):
+        app = FastAPI()
+        app.state.api_server_count = 2
+        app.state.api_server_index = worker_index
+        app.state.engine_client = SimpleNamespace(
+            duplex_session_config=SimpleNamespace(replica_policy=replica_policy),
+            duplex_capabilities=SimpleNamespace(supports_session_resume=resume_supported),
+        )
+        app.state.openai_serving_duplex = SessionHandler()
+        app.state.duplex_warmup_done = PendingWarmup()
+        app.include_router(api_server.router)
+        with TestClient(app) as client, client.websocket_connect(path) as websocket:
+            error = websocket.receive_json()
+            assert error["code"] == "multi_api_duplex_unsupported"
+            assert reason in error["error"]
+            with pytest.raises(WebSocketDisconnect) as exc:
+                websocket.receive_text()
+            assert exc.value.code == 1008
+
+
+@pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime", "/v1/realtime?duplex=1"])
+def test_multi_api_duplex_nonresumable_least_sessions_reaches_each_worker(path: str) -> None:
+    class SessionHandler:
+        async def handle_realtime_session(self, websocket) -> None:
+            await websocket.accept()
+            await websocket.send_json({"type": "session.created"})
+            await websocket.close()
+
+    for worker_index in (0, 1):
+        app = FastAPI()
+        app.state.api_server_count = 2
+        app.state.api_server_index = worker_index
+        app.state.engine_client = SimpleNamespace(
+            duplex_session_config=SimpleNamespace(replica_policy="least_sessions"),
+            duplex_capabilities=SimpleNamespace(supports_session_resume=False),
+        )
+        app.state.openai_serving_duplex = SessionHandler()
+        app.include_router(api_server.router)
+        with TestClient(app) as client, client.websocket_connect(path) as websocket:
+            assert websocket.receive_json() == {"type": "session.created"}
+
+
+@pytest.mark.parametrize("count", [0, -1, True, "2"])
+def test_multi_api_duplex_invalid_topology_rejected(count: object) -> None:
+    app = FastAPI()
+    app.state.api_server_count = count
+    app.state.engine_client = SimpleNamespace(
+        duplex_session_config=SimpleNamespace(replica_policy="least_sessions"),
+        duplex_capabilities=SimpleNamespace(supports_session_resume=False),
+    )
+    app.include_router(api_server.router)
+    with TestClient(app) as client, client.websocket_connect("/v1/duplex") as websocket:
+        error = websocket.receive_json()
+        assert error["code"] == "multi_api_duplex_unsupported"
+        assert "initialized API worker topology" in error["error"]
+        with pytest.raises(WebSocketDisconnect) as exc:
+            websocket.receive_text()
+        assert exc.value.code == 1008
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplex_query", ["0", "false"])
+async def test_multi_api_nonduplex_realtime_bypasses_duplex_guard(monkeypatch, duplex_query: str) -> None:
+    calls: list[str] = []
+
+    class _TurnBasedHandler:
+        async def handle_websocket(self, _websocket) -> None:
+            calls.append("turn_based")
+
+    async def unexpected_guard(_websocket) -> NoReturn:
+        fail: Callable[[str], NoReturn] = pytest.fail
+        fail("Non-duplex requests must not use the duplex topology guard")
+
+    monkeypatch.setattr(api_server, "_reject_multi_api_duplex", unexpected_guard)
+    websocket = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                api_server_count=2,
+                openai_serving_duplex=object(),
+                openai_realtime_handler=_TurnBasedHandler(),
+            )
+        ),
+        query_params={"duplex": duplex_query},
+    )
+    await api_server.realtime_websocket(websocket)
+    assert calls == ["turn_based"]
+
+
+@pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime?duplex=1"])
+@pytest.mark.parametrize("replica_policy", ["legacy", "least_sessions"])
+@pytest.mark.parametrize("resume_supported", [False, True])
+def test_single_api_duplex_session_still_reaches_handler(
+    path: str, replica_policy: str, resume_supported: bool
+) -> None:
+    class SessionHandler:
+        async def handle_realtime_session(self, websocket) -> None:
+            await websocket.accept()
+            await websocket.send_json({"type": "session.created"})
+            await websocket.close()
+
+    app = FastAPI()
+    app.state.api_server_count = 1
+    app.state.engine_client = SimpleNamespace(
+        duplex_session_config=SimpleNamespace(replica_policy=replica_policy),
+        duplex_capabilities=SimpleNamespace(supports_session_resume=resume_supported),
+    )
+    app.state.openai_serving_duplex = SessionHandler()
+    app.include_router(api_server.router)
+    with TestClient(app) as client, client.websocket_connect(path) as websocket:
+        assert websocket.receive_json() == {"type": "session.created"}
+
+
 def test_health_without_engine_returns_stable_unhealthy_response() -> None:
     """Lock ``/health`` with no engine initialized.
 
@@ -609,14 +1055,16 @@ def test_images_generation_without_engine_preserves_service_unavailable_error() 
     assert exc_info.value.detail == "Multi-stage engine not initialized. Start server with a multi-stage omni model."
 
 
-def test_images_generation_without_multistage_chat_handler_preserves_unavailable_error(monkeypatch) -> None:
+def test_images_generation_without_multistage_chat_handler_preserves_unavailable_error() -> None:
     """Lock images generation when chat serving was not wired.
 
     Fails if multi-stage images stop requiring ``openai_serving_chat``, or the
     503 detail changes after images/chat ownership splits.
     """
     app = FastAPI()
-    app.state.engine_client = SimpleNamespace(stage_configs=[object(), object()])
+    # Prefer real stage_type input over monkeypatching ``get_stage_type``:
+    # ``_get_engine_and_model`` lives in ``app_state`` and binds utils directly.
+    app.state.engine_client = SimpleNamespace(stage_configs=[{"stage_type": "llm"}, {"stage_type": "diffusion"}])
     app.state.stage_configs = app.state.engine_client.stage_configs
     app.state.openai_serving_models = SimpleNamespace(base_model_paths=[SimpleNamespace(name="demo-model")])
     app.state.openai_serving_chat = None
@@ -624,7 +1072,6 @@ def test_images_generation_without_multistage_chat_handler_preserves_unavailable
 
     raw_request = _request_for(app, method="POST", path="/v1/images/generations")
     request = api_server.ImageGenerationRequest(prompt="a cat", model="demo-model")
-    monkeypatch.setattr(api_server, "get_stage_type", lambda _stage_cfg: "diffusion")
 
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(api_server.generate_images(request, raw_request))
@@ -651,6 +1098,132 @@ def test_speech_without_handler_preserves_not_found_http_error() -> None:
     assert exc_info.value.detail == "The model does not support Speech API"
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "detail"),
+    [
+        ("modalities", [123], "modalities must be a list of strings"),
+        ("logprobs", "yes", "logprobs must be a boolean"),
+    ],
+)
+def test_chat_completion_raw_body_guards_reject_lax_types(field, value, detail) -> None:
+    """The HTTP boundary rejects values that upstream Pydantic would coerce."""
+    app = FastAPI()
+    app.state.openai_serving_chat = None
+    app.state.serving_tokenization = None
+    app.add_api_route("/v1/chat/completions", api_server.create_chat_completion, methods=["POST"])
+    client = TestClient(app)
+
+    payload = {
+        "model": "demo-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": False,
+        field: value,
+    }
+    response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 400
+    assert detail in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        {"modalities": None},
+        {"logprobs": None},
+        {"modalities": None, "logprobs": None},
+    ],
+)
+def test_chat_completion_raw_body_guards_allow_null_defaults(raw_body) -> None:
+    """Explicit JSON null keeps the upstream request model's default behavior."""
+    api_server._validate_chat_completion_raw_body(raw_body)
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["http", "sse"])
+def test_chat_cache_miss_preserves_native_retryable_error_at_http_boundary(mocker, stream):
+    from tests.helpers.serving_chat import build_serving_chat
+
+    serving_chat = build_serving_chat()
+
+    async def failed_generation():
+        raise RetryableRequestError("Multi-modal processor cache miss.")
+        yield  # pragma: no cover - async generator boundary
+
+    async def create_completion(request, _raw_request):
+        generator = (
+            serving_chat.chat_completion_stream_generator
+            if request.stream
+            else serving_chat.chat_completion_full_generator
+        )
+        result = generator(
+            request=request,
+            result_generator=failed_generation(),
+            request_id="cache-miss-request",
+            model_name="demo-model",
+            conversation=[],
+            tokenizer=mocker.Mock(),
+            request_metadata=mocker.Mock(),
+        )
+        return result if request.stream else await result
+
+    mocker.patch.object(serving_chat, "create_chat_completion", side_effect=create_completion)
+    app = FastAPI()
+    app.state.openai_serving_chat = serving_chat
+    app.add_api_route("/v1/chat/completions", api_server.create_chat_completion, methods=["POST"])
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": stream,
+                "modalities": ["text"],
+            },
+        )
+
+    assert response.status_code == (200 if stream else 503)
+    if stream:
+        events = [json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if '"error"' in line]
+        error = events[0]["error"]
+        assert response.text.endswith("data: [DONE]\n\n")
+    else:
+        error = response.json()["error"]
+    assert error["type"] == "ServiceUnavailableError"
+    assert error["code"] == 503
+
+
+@pytest.mark.asyncio
+async def test_multi_api_allows_runtime_voice_upload_and_deletion() -> None:
+    # The speaker directory is shared by every API process, so these routes
+    # are not process-local; without a speech handler they report 404.
+    app = FastAPI()
+    app.state.api_server_count = 2
+    app.state.openai_serving_speech = None
+
+    upload = await api_server.upload_voice(
+        _request_for(app, method="POST", path="/v1/audio/voices"),
+        audio_sample=None,
+        speaker_embedding=None,
+        consent="consent-id",
+        name="probe",
+    )
+    deletion = await api_server.delete_voice("probe", _request_for(app, method="DELETE", path="/v1/audio/voices/probe"))
+
+    assert upload.status_code == deletion.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_multi_api_rejects_sleep_route() -> None:
+    app = FastAPI()
+    app.state.api_server_count = 2
+    raw_request = _request_for(app, method="POST", path="/v1/omni/sleep")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await api_server.omni_sleep(api_server.OmniSleepRequest(stage_ids=[0]), raw_request)
+
+    assert exc_info.value.status_code == 409
+    assert "process-local frontend state" in exc_info.value.detail
+
+
 def test_engine_error_json_response_includes_request_and_stage_fields(monkeypatch) -> None:
     """Lock shared ``EngineGenerateError`` JSON fields used by Omni handlers.
 
@@ -662,9 +1235,7 @@ def test_engine_error_json_response_includes_request_and_stage_fields(monkeypatc
     in P0.2 is not a false red.
     """
     app = FastAPI()
-    # TODO(P0.2): retarget this call if ``_register_omni_exception_handlers``
-    # leaves api_server (red here is a rename, not a surface regression).
-    api_server._register_omni_exception_handlers(app)
+    serve_errors._register_omni_exception_handlers(app)
     app.state.engine_client = SimpleNamespace(errored=True, engine=SimpleNamespace(is_alive=lambda: False))
     app.state.server = object()
     app.state.args = SimpleNamespace(log_error_stack=False)
@@ -672,7 +1243,7 @@ def test_engine_error_json_response_includes_request_and_stage_fields(monkeypatc
     req = _request_for(app, method="POST", path="/v1/chat/completions")
     req.state.request_metadata = SimpleNamespace(request_id="req-123")
 
-    monkeypatch.setattr(api_server, "terminate_if_errored", lambda **_kwargs: None)
+    monkeypatch.setattr(serve_errors, "terminate_if_errored", lambda **_kwargs: None)
 
     exc = EngineGenerateError("boom")
     exc.error_stage_id = 2  # type: ignore[attr-defined]
@@ -693,14 +1264,12 @@ def test_engine_dead_error_handler_registered_returns_json(monkeypatch) -> None:
     JSON with ``request_id``.
     """
     app = FastAPI()
-    # TODO(P0.2): retarget this call if ``_register_omni_exception_handlers``
-    # leaves api_server (red here is a rename, not a surface regression).
-    api_server._register_omni_exception_handlers(app)
+    serve_errors._register_omni_exception_handlers(app)
     app.state.engine_client = SimpleNamespace(errored=True, engine=SimpleNamespace(is_alive=lambda: False))
     app.state.server = object()
     app.state.args = SimpleNamespace(log_error_stack=False)
 
-    monkeypatch.setattr(api_server, "terminate_if_errored", lambda **_kwargs: None)
+    monkeypatch.setattr(serve_errors, "terminate_if_errored", lambda **_kwargs: None)
 
     handler = app.exception_handlers[EngineDeadError]
     req = _request_for(app)
@@ -719,17 +1288,15 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
     models), wires a handler that must stay None, or leaves a required
     handler as None.
     """
-    stage = SimpleNamespace(engine_args={})
+    stage = SimpleNamespace(stage_type="diffusion", engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage])
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
-    monkeypatch.setattr(api_server, "get_stage_type", lambda _cfg: "diffusion")
     monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
     monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
     monkeypatch.setattr(
@@ -763,24 +1330,26 @@ async def test_pure_diffusion_app_state_key_snapshot(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> None:
-    stage = SimpleNamespace(engine_args={})
+async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp_path) -> None:
+    stage = SimpleNamespace(stage_type="diffusion", engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage])
+    base = tmp_path / "base.yaml"
+    base.write_text("speech_cache:\n  resolve_max_bytes: 1234\n  speaker_max_bytes: 0\n")
+    deploy = tmp_path / "deploy.yaml"
+    deploy.write_text("base_config: base.yaml\nspeech_cache:\n  resolve_max_entries: 17\n")
+    engine.config_path = str(deploy)
     speech_kwargs = {}
 
     def _for_diffusion_factory(label: str):
-        @classmethod
         def _factory(cls, *args, **kwargs):
             return _marker(label)
 
-        return _factory
+        return classmethod(_factory)
 
-    @classmethod
     def _speech_factory(cls, *args, **kwargs):
         speech_kwargs.update(kwargs)
         return _marker("speech")
 
-    monkeypatch.setattr(api_server, "get_stage_type", lambda _cfg: "diffusion")
     monkeypatch.setattr(api_server.OmniOpenAIServingChat, "for_diffusion", _for_diffusion_factory("chat"))
     monkeypatch.setattr(api_server.OmniOpenAIServingChatBatch, "for_diffusion", _for_diffusion_factory("chat_batch"))
     monkeypatch.setattr(
@@ -790,7 +1359,7 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
     )
     monkeypatch.setattr(api_server.OmniOpenAIServingVideo, "for_diffusion", _for_diffusion_factory("video"))
     monkeypatch.setattr(api_server.OmniStreamingVideoOutputHandler, "__init__", lambda self, *a, **k: None)
-    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", _speech_factory)
+    monkeypatch.setattr(api_server.OmniOpenAIServingSpeech, "for_diffusion", classmethod(_speech_factory))
     monkeypatch.setattr(
         api_server.ServingRealtimeRobotOpenPI,
         "create_policy_server",
@@ -809,15 +1378,25 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
 
     assert speech_kwargs["allowed_local_media_path"] == "/allowed/media"
     assert speech_kwargs["allowed_media_domains"] == ["media.example.com"]
+    config = speech_kwargs["speech_cache_config"]
+    assert config.resolve_max_bytes == 1234
+    assert config.resolve_max_entries == 17
+    assert config.speaker_max_bytes == 0
 
 
 @pytest.mark.asyncio
-async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
+@pytest.mark.parametrize("ming3", [False, True, "tts"])
+@pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
+@pytest.mark.parametrize("policy_server", [False, True])
+async def test_multistage_app_state_key_snapshot(
+    monkeypatch, mocker, tmp_path, supported_tasks, ming3, policy_server
+) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
     left as None after init refactors — classic “route still registered,
-    handler never wired” failure mode.
+    handler never wired” failure mode. A multi-stage robot policy (one that
+    declares ``policy_server_config``) also gets the OpenPI server.
     """
     engine = _FakeEngineClient(
         stage_configs=[object(), object()],
@@ -827,6 +1406,7 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
             parallel_config=SimpleNamespace(_api_process_rank=0),
         ),
     )
+    mocker.patch.object(engine, "get_supported_tasks", return_value=supported_tasks)
 
     class _FakeModels:
         def __init__(self, *args, **kwargs):
@@ -837,12 +1417,27 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
 
     class _FakeCtor:
         def __init__(self, *args, **kwargs):
-            pass
+            self.args = args
+            self.kwargs = kwargs
+            self.warmup_calls = 0
+
+        def _has_ming3_talker_stage(self):
+            return ming3 is True
 
         def warmup(self):
-            return None
+            self.warmup_calls += 1
+
+    deploy = tmp_path / "deploy.yaml"
+    deploy.write_text("speech_cache:\n  resolve_max_bytes: 1024\n  speaker_max_bytes: 8\n")
+    engine.config_path = str(deploy)
+    speech_kwargs = {}
 
     class _FakeSpeech(_FakeCtor):
+        def __init__(self, *args, **kwargs):
+            speech_kwargs.update(kwargs)
+
+        _tts_model_type = "ming3_audio_tts" if ming3 == "tts" else None
+
         async def warmup(self):
             return None
 
@@ -867,16 +1462,133 @@ async def test_multistage_app_state_key_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(api_server, "OmniOpenAIServingAudioGenerate", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
-    monkeypatch.setattr(api_server, "OpenAIServingRealtime", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
-    monkeypatch.setattr(api_server, "should_enable_duplex_endpoint", lambda *_a, **_k: False)
+    from unittest.mock import AsyncMock
+
+    register = AsyncMock()
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.ming3_voices.register_model_voice_presets", register)
+    if policy_server:
+        monkeypatch.setattr(
+            api_server.ServingRealtimeRobotOpenPI,
+            "create_policy_server",
+            classmethod(lambda cls, *a, **k: _marker("openpi")),
+        )
 
     state = State()
-    await api_server.omni_init_app_state(engine, state, _minimal_args())
+    await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
+    assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
+    assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
+    assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
+    if (ming3 is True and "generate" in supported_tasks) or ming3 == "tts":
+        register.assert_awaited_once()
+        assert register.call_args.args[0] is state.openai_serving_speech
+        assert register.call_args.args[1] == _minimal_args().model
+        if ming3 is True:
+            assert state.openai_serving_chat._ming3_speech_service is state.openai_serving_speech
+        else:
+            assert not hasattr(state.openai_serving_chat, "_ming3_speech_service")
+    else:
+        register.assert_not_awaited()
 
+    disabled = (
+        set()
+        if "generate" in supported_tasks
+        else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
+    )
+    robot = {"openai_serving_realtime_robot"} if policy_server else set()
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=_MULTISTAGE_MUST_BE_WIRED,
-        must_be_none=_MULTISTAGE_MUST_BE_NONE,
+        must_be_wired=(_MULTISTAGE_MUST_BE_WIRED | robot) - disabled,
+        must_be_none=(_MULTISTAGE_MUST_BE_NONE - robot) | disabled,
     )
+    assert state.online_renderer.kwargs["log_error_stack"] is True
+    assert state.online_renderer.warmup_calls == 1
+    for service in (state.openai_serving_chat, state.openai_serving_chat_batch):
+        if "generate" in supported_tasks:
+            assert service.kwargs["online_renderer"] is state.online_renderer
+        else:
+            assert service is None
+    if "generate" in supported_tasks:
+        assert state.openai_serving_responses.args[2] is state.online_renderer
+    else:
+        assert state.openai_serving_responses is None
+
+
+@pytest.mark.parametrize("count", [None, 0, -1, "2", True])
+def test_process_local_guard_rejects_unknown_topology(count):
+    app = FastAPI()
+    if count is not None:
+        app.state.api_server_count = count
+    # CLI args cannot substitute for missing/invalid actual runtime state.
+    app.state.args = Namespace(api_server_count=1)
+    with pytest.raises(HTTPException) as exc:
+        api_server._reject_process_local_state_with_multiple_api_workers(_request_for(app), "Sleep")
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.parametrize(
+    "requested,config,expected",
+    [(None, None, 1), (1, None, 1), (2, {"client_count": 2}, 2), (None, {"client_count": 2}, 2)],
+)
+def test_api_topology_resolved_from_launch(requested, config, expected):
+    assert api_server._resolve_api_server_count(Namespace(api_server_count=requested), config) == expected
+
+
+@pytest.mark.parametrize(
+    "current,limit,expected", [(16, None, 4), (2, None, 2), (16, "8", 8), (2, "8", 2), (16, "0", 16)]
+)
+def test_api_server_torch_threads_are_capped(monkeypatch, current, limit, expected):
+    import torch
+
+    monkeypatch.delenv("VLLM_OMNI_API_SERVER_TORCH_THREADS", raising=False)
+    if limit is not None:
+        monkeypatch.setenv("VLLM_OMNI_API_SERVER_TORCH_THREADS", limit)
+    previous = torch.get_num_threads()
+    try:
+        torch.set_num_threads(current)
+        api_server._limit_api_server_torch_threads()
+        assert torch.get_num_threads() == expected
+    finally:
+        torch.set_num_threads(previous)
+
+
+@pytest.mark.parametrize("limit", ["-1", "invalid"])
+def test_api_server_rejects_invalid_torch_thread_limit(monkeypatch, limit):
+    monkeypatch.setenv("VLLM_OMNI_API_SERVER_TORCH_THREADS", limit)
+    with pytest.raises(ValueError, match="VLLM_OMNI_API_SERVER_TORCH_THREADS must be a non-negative integer"):
+        api_server._limit_api_server_torch_threads()
+
+
+@pytest.mark.parametrize("requested,config", [(2, None), (2, {}), (2, {"client_count": 1}), (2, {"client_count": "2"})])
+def test_api_topology_rejects_inconsistent_launch(requested, config):
+    with pytest.raises(ValueError):
+        api_server._resolve_api_server_count(Namespace(api_server_count=requested), config)
+
+
+@pytest.mark.parametrize("count,status", [(2, 409), (None, 503)])
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/v1/videos"),
+        ("GET", "/v1/videos"),
+        ("GET", "/v1/videos/job"),
+        ("GET", "/v1/videos/job/content"),
+        ("DELETE", "/v1/videos/job"),
+    ],
+)
+def test_video_lifecycle_guard_precedes_processing(monkeypatch, count, status, method, path):
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    if count is not None:
+        app.state.api_server_count = count
+    app.include_router(api_server.router)
+
+    async def forbidden_form():
+        pytest.fail("video form processing must not run before topology rejection")
+
+    app.dependency_overrides[api_server._parse_video_form] = forbidden_form
+    with TestClient(app) as client:
+        response = client.request(method, path)
+    assert response.status_code == status

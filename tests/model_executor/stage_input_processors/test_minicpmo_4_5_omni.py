@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.engine.orchestrator import StreamingInputState
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
     llm2tts,
@@ -21,16 +23,22 @@ def _output(
     latent: torch.Tensor,
     multimodal_output: dict | None = None,
     token_list: list[int] | None = None,
+    request_id: str = "req-1",
 ):
     mm_output = dict(multimodal_output or {})
     mm_output["latent"] = latent
+    if "duplex_prompt_token_ids" in mm_output and "latent_input_ids" not in mm_output:
+        forwarded_ids = [*prompt_ids, *output_ids]
+        assert len(forwarded_ids) == latent.shape[0]
+        mm_output["latent_input_ids"] = torch.tensor(forwarded_ids).reshape(-1, 1)
+        mm_output["latent_positions"] = torch.arange(len(forwarded_ids)).reshape(-1, 1)
     completion = SimpleNamespace(
         token_ids=output_ids if token_list is None else token_list,
         text="hello",
         multimodal_output=mm_output,
     )
     return SimpleNamespace(
-        request_id="req-1",
+        request_id=request_id,
         prompt_token_ids=prompt_ids,
         outputs=[completion],
     )
@@ -64,7 +72,7 @@ def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
 
     info = converted["model_intermediate_buffer"]
     assert info["ids"]["tts"] == output_ids
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[2:4])
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[2:4])
     assert converted["prompt_token_ids"] == [0, 0, 0, 0]
     assert info["meta"]["replace_streaming_prompt"] is True
     assert info["meta"]["next_stage_prompt_len"] == 4
@@ -91,12 +99,13 @@ def test_llm2tts_carries_request_ref_audio() -> None:
     )[0]
 
     info = converted["model_intermediate_buffer"]
-    assert info["codes"]["ref"] == ref_waveform.tolist()
+    assert torch.equal(unpack_handoff_tensor(info["codes"]["ref"]), ref_waveform)
     assert info["meta"]["ref_audio_sr"] == 22050
     assert info["ids"]["tts"] == [11, 12]
 
 
-def test_native_duplex_speak_segment_reaches_split_talker() -> None:
+@pytest.mark.parametrize("metadata_layout", ["scalar", "list", "tensor", "flat_tensor"])
+def test_native_duplex_speak_segment_reaches_split_talker(metadata_layout: str) -> None:
     prompt_ids = [101, 102]
     output_ids = [9304, 21, 22, 9308]
     latent = torch.arange(24, dtype=torch.float32).reshape(6, 4)
@@ -117,6 +126,17 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
             },
         },
     )
+    # Per-step boundary snapshots are accumulated as lists or concatenated
+    # tensors by the output processor before the native duplex handoff.
+    meta = source.outputs[0].multimodal_output["meta"]
+    if metadata_layout == "list":
+        meta.update({key: [value, value] for key, value in meta.items()})
+    elif metadata_layout in ("tensor", "flat_tensor"):
+        meta.update({key: torch.tensor([[value], [value]]) for key, value in meta.items()})
+    if metadata_layout == "flat_tensor":
+        mm_output = source.outputs[0].multimodal_output
+        mm_output.pop("meta")
+        mm_output.update({f"meta.{key}": value for key, value in meta.items()})
     context = SimpleNamespace(
         bridge_states={
             "duplex": {
@@ -139,6 +159,327 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert info["meta"]["segment_end"] is True
     assert info["duplex"]["epoch"] == 3
     assert info["duplex"]["turn_id"] == 7
+
+
+def test_native_duplex_uses_forwarded_row_ledger_after_later_audio_prefill() -> None:
+    prompt_ids = [101, 102]
+    output_ids = [9304, 21, 22, 9308]
+    row_ids = [101, 102, 9304, 21, 22, 999, 999]
+    latent = torch.arange(len(row_ids) * 4, dtype=torch.float32).reshape(-1, 4)
+    metadata = {
+        "tts_bos_token_id": 9301,
+        "tts_eos_token_id": 9302,
+        "listen_token_id": 9303,
+        "speak_token_id": 9304,
+        "chunk_eos_token_id": 9308,
+        "chunk_tts_eos_token_id": 9309,
+        "turn_eos_token_id": 9310,
+    }
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "latent_input_ids": torch.tensor(row_ids).reshape(-1, 1),
+            "latent_positions": torch.arange(len(row_ids)).reshape(-1, 1),
+            "meta": metadata,
+        },
+    )
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+
+    converted = llm2tts([source], prompt=[{}], _streaming_context=context)[0]
+
+    info = converted["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:5])
+
+
+def test_native_duplex_selects_latest_contiguous_forwarded_span() -> None:
+    prompt_ids = [101, 102]
+    output_ids = [9304, 21, 22, 9308]
+    row_ids = [101, 21, 22, 102, 9304, 21, 22, 999]
+    positions = [0, 1, 3, 4, 5, 6, 7, 8]
+    latent = torch.arange(len(row_ids) * 4, dtype=torch.float32).reshape(-1, 4)
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "latent_input_ids": torch.tensor(row_ids).reshape(-1, 1),
+            "latent_positions": torch.tensor(positions).reshape(-1, 1),
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+
+    converted = llm2tts([source], prompt=[{}], _streaming_context=context)[0]
+
+    info = converted["model_intermediate_buffer"]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[5:7])
+
+
+def test_native_duplex_rejects_missing_forwarded_terminal_token() -> None:
+    prompt_ids = [101, 102]
+    output_ids = [9304, 21, 9310, 9308]
+    row_ids = [101, 102, 9304, 21, 999, 999]
+    latent = torch.arange(len(row_ids) * 4, dtype=torch.float32).reshape(-1, 4)
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "latent_input_ids": torch.tensor(row_ids).reshape(-1, 1),
+            "latent_positions": torch.arange(len(row_ids)).reshape(-1, 1),
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+                "chunk_tts_eos_token_id": 9309,
+                "turn_eos_token_id": 9310,
+            },
+        },
+    )
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+
+    with pytest.raises(ValueError, match="missing own-token hidden states"):
+        llm2tts([source], prompt=[{}], _streaming_context=context)
+
+
+_NATIVE_META = {
+    "tts_bos_token_id": 9301,
+    "tts_eos_token_id": 9302,
+    "listen_token_id": 9303,
+    "speak_token_id": 9304,
+    "chunk_eos_token_id": 9308,
+    "chunk_tts_eos_token_id": 9309,
+    "turn_eos_token_id": 9310,
+}
+
+
+def _native_source(prompt_ids, output_ids, row_ids, positions=None):
+    latent = torch.arange(len(row_ids) * 4, dtype=torch.float32).reshape(-1, 4)
+    positions = list(range(len(row_ids))) if positions is None else positions
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "latent_input_ids": torch.tensor(row_ids).reshape(-1, 1),
+            "latent_positions": torch.tensor(positions).reshape(-1, 1),
+            "meta": dict(_NATIVE_META),
+        },
+    )
+    return source, latent
+
+
+def _native_handoff(source):
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+    return llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+
+def test_native_duplex_ledger_tolerates_async_lookahead_row_after_terminator() -> None:
+    """An async scheduler forwards the sampled chunk terminator in one extra
+    frame before the segment stop lands; its row trails the unit's rows and
+    must not shift the Talker slice."""
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 22, 9308],
+        row_ids=[101, 102, 9304, 21, 22, 9308],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:5])
+
+
+def test_native_duplex_ledger_without_forwarded_terminator() -> None:
+    """Synchronous scheduling never forwards the chunk terminator."""
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 22, 9308],
+        row_ids=[101, 102, 9304, 21, 22],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:5])
+
+
+def test_native_duplex_turn_eos_row_is_handed_to_talker() -> None:
+    """<|turn_eos|> is forwarded (it is not a stop token) and the model keeps
+    sampling until a chunk terminator; the Talker gets the turn_eos row and
+    nothing after it."""
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 9310, 77, 9308],
+        row_ids=[101, 102, 9304, 21, 9310, 77],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 9310]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:5])
+    assert info["meta"]["turn_end"] is True
+
+
+def test_native_duplex_ledger_anchors_on_unit_after_reinjected_listens() -> None:
+    """Listens from earlier units sit at the head of the segment delta but
+    were re-injected as prompt tokens, so they are not contiguous with this
+    unit's decode rows in the ledger. Anchor on the unit, not the segment."""
+    unit_end, unit, audio = 2, 1, 11
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9303, 9303, 9304, 21, 22, 9308],
+        row_ids=[9303, unit_end, unit, audio, 9303, unit_end, unit, audio, 9304, 21, 22],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[9:11])
+
+
+@pytest.mark.parametrize("previous_terminator_forwarded", [False, True])
+@pytest.mark.parametrize("current_terminator_forwarded", [False, True])
+def test_native_duplex_ledger_prefers_latest_repeat_of_the_unit(
+    previous_terminator_forwarded: bool, current_terminator_forwarded: bool
+) -> None:
+    previous_ids = [9304, 21, 22] + ([9308] if previous_terminator_forwarded else [])
+    current_ids = [9304, 21, 22] + ([9308] if current_terminator_forwarded else [])
+    current_start = len(previous_ids) + 1
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 22, 9308],
+        row_ids=[*previous_ids, 555, *current_ids],
+        positions=[*range(current_start), *range(10, 10 + len(current_ids))],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(
+        torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])),
+        latent[current_start + 1 : current_start + 3],
+    )
+
+
+def test_native_duplex_ledger_rejects_non_contiguous_positions() -> None:
+    source, _ = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 22, 9308],
+        row_ids=[101, 102, 9304, 21, 22],
+        positions=[0, 1, 2, 3, 9],
+    )
+
+    with pytest.raises(ValueError, match="missing own-token hidden states"):
+        _native_handoff(source)
+
+
+def test_native_duplex_mid_turn_tts_bos_slices_after_boundary() -> None:
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9301, 21, 22, 9308],
+        row_ids=[101, 102, 9301, 21, 22],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3:5])
+
+
+@pytest.mark.parametrize("opening", [9304, 9301])
+@pytest.mark.parametrize("turn_end", [True, False])
+def test_native_duplex_mid_unit_tts_bos_keeps_earlier_text(opening, turn_end) -> None:
+    # The policy rewrites a mid-turn <|listen|> into <|tts_bos|> anywhere in a
+    # unit. It is conditioning like text; it must not restart the slice and
+    # drop the words sampled before it.
+    tail = [9310, 9308] if turn_end else [9308]
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[opening, 21, 22, 9301, *tail],
+        row_ids=[101, 102, opening, 21, 22, 9301, *tail[:1]],
+    )
+
+    info = _native_handoff(source)
+
+    expected = [21, 22, 9301, 9310] if turn_end else [21, 22, 9301]
+    assert info["ids"]["tts"] == expected
+    torch.testing.assert_close(
+        torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[3 : 3 + len(expected)]
+    )
+    assert info.get("meta", {}).get("turn_end", False) is turn_end
+
+
+@pytest.mark.parametrize("terminator", [[9308], [9310, 9308]])
+def test_native_duplex_folded_boundary_with_mid_unit_tts_bos(terminator) -> None:
+    # A boundary folded as the last prompt token opens the unit even when the
+    # policy also rewrites a later listen into <|tts_bos|> inside it.
+    source, latent = _native_source(
+        prompt_ids=[101, 9301],
+        output_ids=[21, 22, 9301, *terminator],
+        row_ids=[101, 9301, 21, 22, 9301, *terminator[:-1]],
+    )
+
+    info = _native_handoff(source)
+
+    expected = [21, 22, 9301, *terminator[:-1]]
+    assert info["ids"]["tts"] == expected
+    torch.testing.assert_close(
+        torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[2 : 2 + len(expected)]
+    )
+
+
+@pytest.mark.parametrize("folded_decisions", [0, 1, 2])
+@pytest.mark.parametrize("bos_in_prompt", [False, True])
+def test_native_duplex_tts_bos_aligns_after_window_rebuild(folded_decisions, bos_in_prompt) -> None:
+    prompt_ids = [101] * 10
+    output_ids = [9303] * folded_decisions + [9301, 21, 22, 9308]
+    if bos_in_prompt:
+        prompt_ids[-1] = 9301
+        output_ids = [21, 22, 9308]
+    rows = len(prompt_ids) + len(output_ids) - folded_decisions
+    latent = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4)
+    forwarded_ids = (
+        prompt_ids[folded_decisions:] + output_ids if bos_in_prompt else prompt_ids + output_ids[folded_decisions:]
+    )
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "latent_input_ids": torch.tensor(forwarded_ids).reshape(-1, 1),
+            "latent_positions": torch.arange(len(forwarded_ids)).reshape(-1, 1),
+            "meta": {
+                "tts_bos_token_id": 9301,
+                "tts_eos_token_id": 9302,
+                "listen_token_id": 9303,
+                "speak_token_id": 9304,
+                "chunk_eos_token_id": 9308,
+            },
+        },
+    )
+    converted = llm2tts([source], prompt=[{}], _streaming_context=SimpleNamespace(bridge_states={}))[0]
+    info = converted["model_intermediate_buffer"]
+    assert info["ids"]["tts"] == [21, 22]
+    torch.testing.assert_close(torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"])), latent[-3:-1])
 
 
 def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
@@ -193,21 +534,47 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
     )
 
     first_input = llm2tts([first], prompt=[{}], _streaming_context=context)[0]
+    replayed_inputs = llm2tts([first], prompt=[{}], _streaming_context=context)
     second_input = llm2tts([second], prompt=[{}], _streaming_context=context)[0]
     context.bridge_states["duplex"]["model_turn_id"] = 8
     third_input = llm2tts([third], prompt=[{}], _streaming_context=context)[0]
+    restarted_input = llm2tts(
+        [
+            _output(
+                prompt_ids=prompt_ids,
+                output_ids=first_ids,
+                latent=torch.arange(24, dtype=torch.float32).reshape(6, 4),
+                multimodal_output={
+                    "duplex_prompt_token_ids": prompt_ids,
+                    "meta": token_ids,
+                },
+                request_id="req-2",
+            )
+        ],
+        prompt=[{}],
+        _streaming_context=context,
+    )[0]
 
     assert first_input["model_intermediate_buffer"]["ids"]["tts"] == [21, 22]
+    assert replayed_inputs == []
     assert second_input["model_intermediate_buffer"]["ids"]["tts"] == [23, 24]
     assert third_input["model_intermediate_buffer"]["ids"]["tts"] == [25, 26]
     assert first_input["model_intermediate_buffer"]["meta"]["turn_start"] is True
     assert second_input["model_intermediate_buffer"]["meta"]["turn_start"] is False
     assert third_input["model_intermediate_buffer"]["meta"]["turn_start"] is True
+    assert first_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 0
+    assert second_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 1
+    # A new turn keeps the same stage request, so its condition sequence stays
+    # monotonic; a new request/incarnation starts again from zero.
+    assert third_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 2
+    assert restarted_input["model_intermediate_buffer"]["meta"]["streaming_condition_seq"] == 0
     assert first_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
     assert "replace_streaming_prompt" not in second_input["model_intermediate_buffer"]["meta"]
     assert third_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_prompt_len"] == 3
+    assert first_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
+    assert third_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["prompt_token_ids"] == [0, 0, 0]
 
 
@@ -250,6 +617,100 @@ def test_native_duplex_transcript_decodes_the_talker_condition_slice() -> None:
     assert first_info["meta"]["native_duplex_segment_text"] == "杭州和"
     assert second_info["ids"]["tts"] == [24, 25]
     assert second_info["meta"]["native_duplex_segment_text"] == "上海之间大"
+
+
+@pytest.mark.parametrize(
+    "text,complete",
+    [
+        ("See you then.", True),
+        ("可以去看看哦。", True),
+        ('He said "go!"', True),
+        ("像之前电影当中的", False),
+        ("Wait, ", False),
+        ("", False),
+    ],
+)
+def test_native_duplex_turn_end_closes_text_only_after_a_sentence_end(text, complete) -> None:
+    source, _ = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 9310, 9308],
+        row_ids=[101, 102, 9304, 21, 9310],
+    )
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}},
+        source_token_decoder=lambda ids, **_: text if 21 in ids else "",
+    )
+
+    info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    assert info["meta"]["turn_end"] is True
+    assert info["meta"]["turn_text_ends_sentence"] is complete
+    # The condition is the forwarded rows plus <audio_bos>, with <text_eos> before it once closed.
+    assert info["meta"]["next_stage_prompt_len"] == len(info["ids"]["tts"]) + (2 if complete else 1)
+
+
+@pytest.mark.parametrize(
+    "unit_text,after_turn_eos,complete",
+    [
+        # The period sampled after <|turn_eos|> never reaches the Talker: the turn stops mid-sentence.
+        ("So the", ".", False),
+        # The word sampled after <|turn_eos|> is dropped from the handoff: the turn ends a sentence.
+        ("Sure, here it is.", "And", True),
+    ],
+)
+def test_native_duplex_turn_end_reads_only_the_text_handed_to_the_talker(unit_text, after_turn_eos, complete) -> None:
+    source, _ = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[9304, 21, 9310, 22, 9308],
+        row_ids=[101, 102, 9304, 21, 9310, 22],
+    )
+    token_text = {21: unit_text, 22: after_turn_eos}
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}},
+        source_token_decoder=lambda ids, **_: "".join(token_text.get(int(i), "") for i in ids),
+    )
+
+    info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [21, 9310]
+    assert info["meta"]["turn_end"] is True
+    assert info["meta"]["turn_text_ends_sentence"] is complete
+    assert info["meta"]["next_stage_prompt_len"] == len(info["ids"]["tts"]) + (2 if complete else 1)
+
+
+def test_native_duplex_turn_end_uses_the_last_text_of_the_turn() -> None:
+    prompt_ids = [101, 102]
+    token_text = {21: "Sure, here it is.", 22: "And", 23: "more."}
+
+    def output(token_ids: list[int]):
+        return _output(
+            prompt_ids=prompt_ids,
+            output_ids=token_ids,
+            latent=torch.zeros((len(prompt_ids) + len(token_ids), 1)),
+            multimodal_output={"duplex_prompt_token_ids": prompt_ids, "meta": dict(_NATIVE_META)},
+        )
+
+    context = StreamingInputState(
+        bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}},
+        source_token_decoder=lambda ids, **_: " ".join(token_text[int(i)] for i in ids if int(i) in token_text),
+    )
+    first_ids = [9304, 21, 9308]
+    first = llm2tts([output(first_ids)], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    # The turn ends in a unit that carries only <|turn_eos|>: the sentence ended in the unit before.
+    second = llm2tts([output([*first_ids, 9304, 9310, 9308])], prompt=[{}], _streaming_context=context)[0][
+        "model_intermediate_buffer"
+    ]
+    assert first["meta"]["turn_text_ends_sentence"] is False
+    assert second["meta"]["turn_end"] is True
+    assert second["meta"]["turn_text_ends_sentence"] is True
+
+    # The next turn starts over: a turn-end unit without text of its own does not
+    # inherit the previous turn's sentence end.
+    context.bridge_states["duplex"]["model_turn_id"] = 8
+    third_ids = [9304, 9310, 9308]
+    third = llm2tts([output(third_ids)], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    assert third["meta"]["turn_end"] is True
+    assert third["meta"]["turn_text_ends_sentence"] is False
 
 
 def test_native_duplex_requires_tokenizer_boundary_metadata() -> None:

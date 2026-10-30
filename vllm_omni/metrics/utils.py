@@ -20,6 +20,40 @@ FAILURE_REASONS = frozenset({"client_abort", "client_disconnect", "stage_error",
 DIFFUSION_METRICS_ONLY_REQUEST_ID = "__vllm_omni_diffusion_metrics__"
 
 
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int | float):
+        return float(value)
+    return default
+
+
+def _as_float_list(value: object) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, int | float) and not isinstance(item, bool)]
+
+
 def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
     if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
         return None
@@ -135,7 +169,7 @@ def diffusion_exception_metrics(exc: BaseException) -> dict[str, Any]:
     return dict(metrics) if isinstance(metrics, dict) else {}
 
 
-def sum_diffusion_stage_durations_ms(output: Any, suffix: str) -> float | None:
+def sum_diffusion_stage_durations_ms(output: Any, suffix: str | tuple[str, ...]) -> float | None:
     """Sum matching diffusion stage durations in milliseconds."""
     durations = getattr(output, "stage_durations", None)
     if not isinstance(durations, dict):
@@ -155,12 +189,35 @@ def sum_diffusion_stage_durations_ms(output: Any, suffix: str) -> float | None:
 
 
 def extract_diffusion_vae_decode_ms(output: Any) -> float | None:
-    return sum_diffusion_stage_durations_ms(output, ".vae.decode")
+    # Profiler keys are "<Class>.<target path>". Count decode and decode_latent
+    # on a module named "vae" or ending in "_vae": the default "vae.decode",
+    # MammothModa2 "gen_vae.decode" and MiniMax-H3 "video_vae.decode_latent".
+    return sum_diffusion_stage_durations_ms(
+        output, (".vae.decode", "_vae.decode", ".vae.decode_latent", "_vae.decode_latent")
+    )
 
 
 def extract_diffusion_denoise_ms(output: Any) -> float | None:
     """Extract denoise-loop time (transformer and per-step scheduler)."""
     return sum_diffusion_stage_durations_ms(output, ".diffuse")
+
+
+def coerce_bool(value: object, *, default: bool = False) -> bool:
+    """Coerce JSON / form / env-like values to bool.
+
+    Accepts ``bool``, numeric 0/1, and common truthy strings
+    (``\"1\"`` / ``\"true\"`` / ``\"yes\"`` / ``\"on\"``, case-insensitive).
+    ``None`` and unrecognized types return ``default``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
 
 
 def coerce_positive_int_scalar(value: object) -> int | None:
@@ -194,6 +251,34 @@ def coerce_positive_int_scalar(value: object) -> int | None:
             return None
     try:
         value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def coerce_positive_float_scalar(value: object) -> float | None:
+    """Coerce a scalar-like value to a positive float.
+
+    Handles plain numeric values, one-element tensor/numpy-like values via
+    ``.item()``, and list/tuple wrappers. Returns ``None`` when no positive
+    float can be extracted.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = coerce_positive_float_scalar(item)
+            if coerced is not None:
+                return coerced
+        return None
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            value = item()
+        except Exception:
+            return None
+    try:
+        value = float(value)
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
@@ -368,6 +453,43 @@ def count_image_pixels(value: object) -> int:
     if len(dims) == 3 and dims[-1] in (1, 3, 4):
         return dims[0] * dims[1]
     return dims[-2] * dims[-1]
+
+
+def count_video_frames(video: object) -> int | None:
+    """Return the frame count for common nested and tensor video layouts."""
+    if isinstance(video, Mapping):
+        for key in ("video", "frames", "images"):
+            if key in video:
+                return count_video_frames(video[key])
+        return None
+
+    if isinstance(video, (list, tuple)):
+        return len(video)
+
+    shape = getattr(video, "shape", None)
+    if shape is None:
+        return None
+    try:
+        dims = tuple(int(dim) for dim in shape)
+    except (TypeError, ValueError):
+        return None
+
+    if len(dims) == 5:
+        # Common layouts: [B, C, F, H, W] and [B, F, H, W, C].
+        if dims[-1] in (1, 3, 4):
+            return dims[1]
+        if dims[1] in (1, 3, 4):
+            return dims[2]
+        return dims[1]
+    if len(dims) == 4:
+        # Common layouts: [F, H, W, C] and [C, F, H, W].
+        if dims[-1] in (1, 3, 4):
+            return dims[0]
+        if dims[0] in (1, 3, 4):
+            return dims[1]
+        return dims[0]
+
+    return None
 
 
 def _build_field_defs(

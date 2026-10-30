@@ -363,6 +363,8 @@ class StageDiffusionClient(StageClientBase):
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        kv_transfer_params: dict[str, Any] | None = None,
+        payload_sender_info: dict[str, Any] | None = None,
     ) -> None:
         if self._engine_dead:
             raise EngineDeadError()
@@ -372,7 +374,7 @@ class StageDiffusionClient(StageClientBase):
             self.replica_id,
             request_id,
         )
-        self._request_socket.send(
+        self._send_request(
             self._encoder.encode(
                 {
                     "type": "add_request",
@@ -380,9 +382,23 @@ class StageDiffusionClient(StageClientBase):
                     "prompt": prompt,
                     "sampling_params": self._sampling_params_to_dict(sampling_params),
                     "kv_sender_info": kv_sender_info,
+                    "kv_transfer_params": kv_transfer_params,
+                    "payload_sender_info": payload_sender_info,
                 }
             )
         )
+
+    def _send_request(self, data: bytes) -> None:
+        # The subprocess can die before _engine_dead is set, and a blocking send to it never returns.
+        while True:
+            try:
+                self._request_socket.send(data, flags=zmq.NOBLOCK)
+                return
+            except zmq.Again:
+                if self._proc_manager is not None and not self._proc_manager.proc.is_alive():
+                    self._engine_dead = True
+                    raise EngineDeadError() from None
+                self._request_socket.poll(100, zmq.POLLOUT)
 
     def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
         self._drain_responses()
@@ -473,14 +489,21 @@ class StageDiffusionClient(StageClientBase):
             self._load_future = None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
-        self._request_socket.send(
-            self._encoder.encode(
-                {
-                    "type": "abort",
-                    "request_ids": list(request_ids),
-                }
+        if self._engine_dead:
+            return
+        try:
+            # The subprocess can die before _engine_dead is set, and a blocking send to it never returns.
+            self._request_socket.send(
+                self._encoder.encode(
+                    {
+                        "type": "abort",
+                        "request_ids": list(request_ids),
+                    }
+                ),
+                flags=zmq.NOBLOCK,
             )
-        )
+        except zmq.Again:
+            pass
 
     async def submit_interaction_async(
         self,
@@ -521,9 +544,7 @@ class StageDiffusionClient(StageClientBase):
 
         kwargs = kwargs or {}
         rpc_id = uuid.uuid4().hex
-        self._pending_rpcs.add(rpc_id)
-
-        self._request_socket.send(
+        self._send_request(
             self._encoder.encode(
                 {
                     "type": "collective_rpc",
@@ -535,6 +556,7 @@ class StageDiffusionClient(StageClientBase):
                 }
             )
         )
+        self._pending_rpcs.add(rpc_id)
 
         deadline = time.monotonic() + timeout if timeout else None
         # Wait for the matching RPC response, buffering result messages.
@@ -584,13 +606,28 @@ class StageDiffusionClient(StageClientBase):
 
     def shutdown(self) -> None:
         self._shutting_down = True
+        shutdown_requested = False
         try:
-            self._request_socket.send(self._encoder.encode({"type": "shutdown"}))
+            # A blocking send never returns once the subprocess is gone.
+            self._request_socket.send(self._encoder.encode({"type": "shutdown"}), flags=zmq.NOBLOCK)
+            shutdown_requested = True
         except Exception:
             pass
 
         if self._proc_manager is not None and self._proc_manager.proc.is_alive():
-            self._proc_manager.shutdown(timeout=10)
+            if self._proc_manager.distributed_executor_backend == "ray":
+                # Let the subprocess kill its remote actors before terminating it.
+                stopped = shutdown_requested and self._proc_manager.wait_for_shutdown(timeout=10.0)
+                if not stopped:
+                    logger.warning(
+                        "Stage-%d Ray diffusion subprocess did not stop within %.1fs; "
+                        "falling back to signal-based shutdown",
+                        self.stage_id,
+                        10.0,
+                    )
+                    self._proc_manager.shutdown(timeout=10.0)
+            else:
+                self._proc_manager.shutdown(timeout=10.0)
 
         self._request_socket.close(linger=0)
         self._response_socket.close(linger=0)

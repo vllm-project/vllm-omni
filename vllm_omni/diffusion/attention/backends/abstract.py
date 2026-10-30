@@ -7,6 +7,10 @@ from typing import Any, Generic, Literal, TypeVar
 
 import torch
 
+from vllm_omni.diffusion.attention.capabilities import (
+    ExecutionContext,
+    ExecutionPathResult,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -70,7 +74,46 @@ class AttentionBackend(ABC):
         return None
 
     @classmethod
-    def supports_attention_mask(cls) -> bool:
+    def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        """Return whether this backend can consume a nontrivial ``attn_mask``.
+
+        ``attention_spec`` is the resolved per-role config when the user picked
+        a backend explicitly. Implementations that depend on kernel variant
+        (for example FlashInfer cute-dsl vs fa2) must consult it so capability
+        probes match a runnable configuration.
+        """
+        del attention_spec
+        return False
+
+    @classmethod
+    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
+        """Whether a dense ``[B, 1|H, Q, KV]`` Boolean mask can be consumed natively.
+
+        The FlashAttention family only implements 2D key-validity masks (its
+        masked-varlen path asserts on 4D input), while SDPA, cuDNN, and Ascend
+        ``npu_fusion_attention`` consume the dense mask directly. The attention
+        layer uses this capability to route an incompatible dense-mask call to
+        SDPA for that call instead of letting the backend assert deep inside
+        the kernel wrapper.
+        """
+        del attention_spec
+        return False
+
+    @classmethod
+    def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
+        """Whether a 2D mask excludes K/V only, including when Q and K have equal lengths."""
+        del attention_spec
+        return False
+
+    @classmethod
+    def supports_cross_head_geometry(cls, q_heads: int, kv_heads: int) -> bool:
+        """Whether the backend accepts projected cross Q and K/V head counts."""
+        return q_heads == kv_heads
+
+    @classmethod
+    def supports_cross_pair_mask(cls, attention_spec: object | None = None) -> bool:
+        """Whether Boolean or additive [B, 1/H, Q, KV] restrictions are supported."""
+        del attention_spec
         return False
 
     @staticmethod
@@ -113,9 +156,25 @@ class AttentionBackend(ABC):
         when it unifies cache layouts across layers. Dense diffusion backends
         conservatively keep the default ``False``; a paged backend should
         override this only when its kernel actually follows that layout.
+
+        Since vLLM 0.29 this no longer rides on ``AttentionSpec``.  It selects
+        the block-outermost physical layout pinned on
+        ``CacheConfig.kv_cache_layout`` -- see
+        ``vllm_omni.diffusion.diffusion_kv.layout`` -- whose
+        ``is_block_outermost`` is what upstream reads when it sizes
+        ``KVCacheTensor`` regions.
         """
 
         return False
+
+    @classmethod
+    def resolve_capabilities(cls, context: ExecutionContext) -> ExecutionPathResult:
+        """Return conservative pre-construction capabilities.
+
+        Unmigrated backends remain advisory so introducing the contract cannot
+        reject an execution path that works today.
+        """
+        return ExecutionPathResult.unmigrated(cls.get_name(), context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,8 +259,12 @@ class AttentionMetadata:
     #     variable-length query/key sequences for FlashAttention.
     #   "max_seqlen_q" / "max_seqlen_k": maximum sequence lengths paired with
     #     the packed cu_seqlens tensors.
-    #   "valid_kv_length": int — contiguous valid K/V prefix length for a
-    #     backend that advertises supports_prefix_kv_slicing.
+    #   "valid_kv_length": int — contiguous valid K/V prefix length. Local
+    #     backends may slice it directly; ring backends trim each circulated
+    #     K/V block from the same global prefix.
+    #   "attention_mask_mode": "none" | "padding" | "arbitrary" — producer
+    #     assertion used by capability planning. "none" means a present mask
+    #     is semantically a no-op; absent means its contents are runtime-dependent.
     #   "npu_attn_varlen": bool — model opt-in for the NPU packed varlen path
     #     (TND npu_fusion_attention driven by cu_seqlens, mask never read).
     #     Requires the [real, pad] two-document packing contract; see
@@ -226,6 +289,38 @@ class AttentionMetadata:
     # Canonical mask-free view of structural suffix padding. Backends that do
     # not advertise supports_packed_mask_free ignore it.
     packed_padding: PackedPaddingMetadata | None = None
+    cross_kv_rows_validated: bool = False
+    cross_query_mask: torch.Tensor | None = None
+    cross_pair_mask_validated: bool = False
+
+    @classmethod
+    def for_cross_kv_mask(cls, mask: torch.Tensor, *, kv_slice: slice | None = None) -> "AttentionMetadata":
+        """Validate an immutable global KV mask once, before the layer stack.
+
+        For sequence-sharded K/V, supply the global mask and this rank's
+        ``kv_slice``. A local shard may be entirely padding even though the
+        global row is valid. The execution strategy gathers its local columns.
+        """
+        if mask.ndim != 2 or mask.dtype != torch.bool:
+            raise ValueError("Cross K/V mask must be a Boolean [B, KV_len] tensor")
+        if not bool(mask.any(dim=1).all()):
+            raise ValueError("Each cross-attention batch row must contain at least one valid K/V position")
+        local_mask = mask if kv_slice is None else mask[:, kv_slice]
+        return cls(attn_mask=local_mask, cross_kv_rows_validated=True, extra={"attention_mask_mode": "padding"})
+
+    @classmethod
+    def for_cross_pair_mask(cls, mask: torch.Tensor) -> "AttentionMetadata":
+        """Prepare immutable pair restrictions once, outside the layer stack.
+
+        True means allowed. Floating masks add finite biases or -inf. SDPA
+        returns zero for fully masked query rows. Separate Q validity can be
+        supplied through cross_query_mask without deleting any K/V positions.
+        """
+        if mask.ndim != 4 or not (mask.dtype == torch.bool or mask.is_floating_point()):
+            raise ValueError("Cross pair mask must be Boolean or floating [B, 1/H, Q, KV]")
+        if mask.is_floating_point() and not bool((torch.isfinite(mask) | torch.isneginf(mask)).all()):
+            raise ValueError("Cross pair mask cannot contain NaN or +inf")
+        return cls(attn_mask=mask, cross_pair_mask_validated=True, extra={"attention_mask_mode": "arbitrary"})
 
 
 T = TypeVar("T", bound=AttentionMetadata)
@@ -260,6 +355,21 @@ class AttentionImpl(ABC, Generic[T]):
         if kv_cache_dtype is None:
             return True
         return kv_cache_dtype in cls._supported_kv_cache_dtypes.get(platform_key, set())
+
+    def resolve_execution_path(
+        self,
+        context: ExecutionContext,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: T | None,
+    ) -> ExecutionPathResult:
+        """Resolve the complete path after backend initialization.
+
+        Subclasses report verified results; this inspection API does not enforce them.
+        """
+        del query, key, value, attn_metadata
+        return ExecutionPathResult.unmigrated(type(self).__name__, context)
 
     def forward(
         self,

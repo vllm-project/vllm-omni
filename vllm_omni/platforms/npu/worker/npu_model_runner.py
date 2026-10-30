@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import inspect
+from contextlib import AbstractContextManager
 from functools import partial
 from typing import Any
 
@@ -20,9 +22,11 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
-from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
+from vllm_omni.platforms.npu.native_rejection_sampler import restore_native_rejection_sampler
+from vllm_omni.platforms.npu.worker.aux_output import NPUAuxOutputMixin
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
@@ -34,37 +38,47 @@ else:
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
-class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
-    def initialize_kv_cache(self, kv_cache_config) -> None:
-        """Create the omni tensor prefix cache.
-
-        The omni prefix cache is used to store the hidden states of the prefix tokens
-        """
-        NPUModelRunner.initialize_kv_cache(self, kv_cache_config)
-        if self.omni_prefix_cache is None and self.cache_config.enable_prefix_caching:
-            # Read num_blocks back off self.kv_cache_config: vllm-ascend
-            # deepcopies the config it was handed, so the value it stored is the
-            # authoritative one, not our caller's argument.
-            num_blocks = self.kv_cache_config.num_blocks
-            self.omni_prefix_cache = OmniTensorPrefixCache(
-                num_blocks=num_blocks,
-                block_size=self.cache_config.block_size,
-                hidden_size=self.model_config.get_hidden_size(),
-                hs_dtype=self.dtype,
+class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
+    def initialize_kv_cache(
+        self, kv_cache_config, kv_cache_allocation_context: AbstractContextManager | None = None
+    ) -> None:
+        """Stage the omni prefix-cache config (hidden / mm tensors reused on hits)."""
+        # vllm-ascend's override only grew the ``kv_cache_allocation_context``
+        # parameter on the 0.30 line; probe the signature so one omni build
+        # drives both the 0.29 and the 0.30 vllm-ascend.
+        params = inspect.signature(NPUModelRunner.initialize_kv_cache).parameters
+        accepts_ctx = "kv_cache_allocation_context" in params
+        NPUModelRunner.initialize_kv_cache(
+            self,
+            kv_cache_config,
+            **({"kv_cache_allocation_context": kv_cache_allocation_context} if accepts_ctx else {}),
+        )
+        self._init_omni_aux_output(kv_cache_config)
+        if getattr(self, "_omni_prefix_cache_cfg", None) is None:
+            # Same gate as the GPU runner (pooling stage, kv_consumer /
+            # kv_both, hybrid kv groups). Read the config back off
+            # self.kv_cache_config: vllm-ascend deepcopies the one it was
+            # handed, so the stored value is the authoritative one.
+            # Controller runs in eager mode on NPU (no CUDA streams:
+            # dispatch() completes the copy+scatter synchronously). Built once
+            # on the first step via the inherited _ensure_omni_prefix_cache.
+            cfg = stage_prefix_cache_config(
+                kv_cache_config=self.kv_cache_config,
+                cache_config=self.cache_config,
+                kv_transfer_config=getattr(self.vllm_config, "kv_transfer_config", None),
+                scheduler_config=self.scheduler_config,
+                model_config=self.model_config,
+                is_pooling_model=self.is_pooling_model,
+                speculative_config=self.speculative_config,
+                model_cache_policy=self._omni_cache_policy,
             )
-            logger.info(
-                "Initialized omni prefix cache on NPU (num_blocks=%d, block_size=%d, hidden_size=%d). "
-                "Hidden-state cache is pinned host memory of roughly %.1f GiB; each per-token "
-                "multimodal output key allocates another tensor of the same block shape.",
-                num_blocks,
-                self.cache_config.block_size,
-                self.model_config.get_hidden_size(),
-                num_blocks
-                * self.cache_config.block_size
-                * self.model_config.get_hidden_size()
-                * self.dtype.itemsize
-                / (1024**3),
-            )
+            if cfg is not None:
+                self._omni_prefix_cache_cfg = cfg
+                logger.info(
+                    "Initialized omni prefix cache on NPU (eager mode, num_blocks=%d, block_size=%d).",
+                    cfg.num_blocks,
+                    cfg.block_size,
+                )
 
     def load_model(self, *args, **kwargs) -> None:
         if is_310p():
@@ -72,6 +86,13 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
             apply_model_patches(self.model_config)
         NPUModelRunner.load_model(self, *args, **kwargs)
+        # Before the first request verifies a draft: on 910_93 the patched
+        # Triton rejection kernels fault their warmup (skipped) and would be
+        # JIT-compiled mid-request otherwise, stalling every stage. See
+        # native_rejection_sampler for the chain. The runner's own config is
+        # passed because vLLM's set_current_vllm_config context only wraps
+        # its own load_model call, which has already returned here.
+        restore_native_rejection_sampler(self.vllm_config)
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
@@ -84,6 +105,8 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             if callable(candidate):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
+        self._snapshot_prefix_cache_model_policy(model)
+        self._pooler_payload_include_hidden_flag = bool(getattr(model, "omni_pooler_payload_include_hidden", True))
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()
@@ -126,6 +149,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
         randomize_inputs: bool = False,
+        skip_gdn_state_update: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.is_valid_runtime_mode()
@@ -257,7 +281,10 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
                 if self._has_gdn:
-                    self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                    if skip_gdn_state_update:
+                        self.gdn_query_start_loc.np.fill(0)
+                    else:
+                        self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
                     self.gdn_query_start_loc.copy_to_gpu()
 
                 if not profile_cpp:
@@ -275,6 +302,12 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 # rows as well so device-side metadata does not see stale block ids.
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
+                # Invalidate slots before backends copy metadata for dummy execution.
+                if not is_graph_capturing:
+                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                        blk_table = self.input_batch.block_table[kv_cache_gid]
+                        blk_table.slot_mapping.gpu.fill_(-1)
+
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -285,11 +318,10 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                     ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                     for_cudagraph_capture=is_graph_capturing,
                     num_scheduled_tokens_np=num_scheduled_tokens,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    skip_gdn_state_update=skip_gdn_state_update,
                 )
-                if not is_graph_capturing:
-                    for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
-                        blk_table = self.input_batch.block_table[kv_cache_gid]
-                        blk_table.slot_mapping.gpu.fill_(-1)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
@@ -324,8 +356,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
-            elif self.uses_xdrope_dim > 0:
-                positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
                 positions = self.positions[:num_tokens_padded]
 
@@ -433,7 +463,9 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             self._finalize_dump_data(dump=False)
             return hidden_states, hidden_states
 
-    def _model_forward(
+    # Ascend passes the padded token count positionally; keep its native
+    # signature when overriding the GPU helper in this multiple-inheritance adapter.
+    def _model_forward(  # type: ignore[override]
         self,
         num_tokens_padded: int,
         input_ids: torch.Tensor | None = None,
@@ -457,6 +489,12 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         forward_context = get_forward_context()
         assert forward_context is not None
 
+        # Match Ascend's runner: FULL replay needs the attention backend to
+        # select the updatable-graph path and refresh dynamic attention tasks.
+        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            if hasattr(self.model, "set_attn_backend"):
+                self.model.set_attn_backend(self.attn_backend)
+
         model_inputs: dict[str, Any] = {
             "input_ids": input_ids,
             "positions": positions,
@@ -466,6 +504,71 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             **model_kwargs_extra,
         }
         run_model = partial(self.model, **model_inputs)
+
+        # K-step (Talker multi-frame decode). A decode step that schedules K
+        # positions per request belongs to ``talker_multiframe``: it replays a
+        # captured decode graph once per frame and samples one codec frame per
+        # replay. The one-query path writes each frame's embedding straight into
+        # the buffer the graph reads; the wide path refreshes the per-frame
+        # inputs instead. Everything else (prefill, a mixed step, another stage)
+        # falls through to the ordinary single-forward path below.
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        frames = talker_multiframe.applies(self.model, model_kwargs_extra)
+        if frames <= 1 and talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):
+            # Falling through here would sample one frame from the last row of
+            # each span and report one stop row for a step that needs one per
+            # position: wrong codec tokens and wrong scheduler accounting, both
+            # silently. The preceding gate log says which check refused.
+            raise RuntimeError(
+                "MiniCPM-o scheduled a multi-token decode step that the multi-frame "
+                "loop declined; see the preceding '[minicpmo] multi-frame Talker "
+                "decode not engaged' line"
+            )
+        if frames > 1:
+            spans = [(int(start), int(end)) for start, end in model_kwargs_extra["request_token_spans"]]
+            narrow = talker_multiframe.begin_narrow_step(
+                runner=self,
+                forward_context=forward_context,
+                frames=frames,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                spans=spans,
+            )
+            graph_tokens = len(spans) if narrow is not None else num_tokens_padded
+            try:
+                model_output = talker_multiframe.run(
+                    model=self.model,
+                    run_model=run_model,
+                    after_forward=lambda: self._update_full_graph_params_if_needed(forward_context, graph_tokens),
+                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids,
+                    frames=frames,
+                    model_kwargs=model_kwargs,
+                    model_kwargs_extra=model_kwargs_extra,
+                    narrow=narrow,
+                )
+            finally:
+                talker_multiframe.end_narrow_step(forward_context, narrow)
+            # The vocab gate the multi-frame path needs, applied here because
+            # this is the wrapper the K-step runs through. The Talker's
+            # vLLM-level head is the two-wide continue/stop row, but input_batch
+            # reports vocab_size=0, and the rejection sampler's parse_output
+            # then masks every accepted token as out-of-vocab: the request comes
+            # back with nothing, the scheduler never rolls back the K tokens it
+            # advanced, and the next steps schedule a negative count -- the
+            # engine hangs right after the first 'engaged' step. Single-frame
+            # steps never took the branch that reads vocab_size; only the K-step
+            # does. The gate takes only "not None" from this argument: the width
+            # it writes is the two-wide stop row, never the width of whatever
+            # tensor it is handed.
+            stop_rows = getattr(self.model, "batch_stop_logits", None)
+            talker_multiframe.ensure_stop_token_vocab(
+                self,
+                stop_rows if stop_rows is not None else model_output.text_hidden_states,
+            )
+            self._omni_last_model_output = model_output
+            return model_output
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait.

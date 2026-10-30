@@ -8,6 +8,8 @@ import queue
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -15,6 +17,7 @@ from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
+from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -28,6 +31,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.interaction.mixin import InteractionMixin
+from vllm_omni.diffusion.interaction.types import (
+    ChunkMediaSpec,
+    InteractionChunkMetadata,
+)
 from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
@@ -45,10 +53,12 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.input_batch import InputBatch
-from vllm_omni.diffusion.worker.utils import RunnerOutput, StepRequestState
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput, StepRequestState
 from vllm_omni.errors import OmniClientError
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.data import (
+    OmniDiffusionSamplingParams,
+    OmniInteractionPrompt,
+)
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -101,6 +111,169 @@ class _StepPipeline:
         del kwargs
         self.decode_calls += 1
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
+
+
+class _ChunkedStepPipeline(_StepPipeline):
+    """Streaming stub: two chunks of two denoise steps each, one decode per chunk."""
+
+    supports_chunk_step_grouping = False
+
+    def prepare_encode(self, state, **kwargs):
+        del kwargs
+        self.prepare_calls += 1
+        state.timesteps = [torch.tensor(10), torch.tensor(5), torch.tensor(10), torch.tensor(5)]
+        state.latents = torch.tensor([0.0])
+        state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
+        state.chunk_num_steps = 2
+        state.total_chunks = 2
+        state.chunk_index = 0
+        state.step_in_chunk = 0
+        return state
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del noise_pred, kwargs
+        self.scheduler_calls += 1
+        state.step_in_chunk += 1
+        state.step_index = state.step_in_chunk
+
+    def post_decode(self, state, **kwargs):
+        del kwargs
+        self.decode_calls += 1
+        result = DiffusionOutput(output=torch.tensor([float(state.chunk_index)]))
+        state.chunk_index += 1
+        state.step_in_chunk = 0
+        return result
+
+
+class _ThreeStepChunkPipeline(_ChunkedStepPipeline):
+    """Streaming stub with enough steps to exercise an internal continuation."""
+
+    def prepare_encode(self, state, **kwargs):
+        state = super().prepare_encode(state, **kwargs)
+        state.timesteps = [torch.tensor(10), torch.tensor(5), torch.tensor(1)] * 2
+        state.chunk_num_steps = 3
+        return state
+
+
+class _InteractiveChunkedStepPipeline(_ThreeStepChunkPipeline):
+    def __init__(self):
+        super().__init__()
+        self.pending_interaction = None
+        self.applied_interactions = []
+
+    def peek_chunk_media(self, state):
+        del state
+        return ChunkMediaSpec(num_media_frames=1, fps=1.0, num_latent_frames=1)
+
+    def apply_interaction_at_chunk_boundary(self, state):
+        del state
+        self.applied_interactions.append(self.pending_interaction)
+
+    def prepare_next_chunk(self, state):
+        del state
+
+
+class _RecordingInteractionCoordinator:
+    """Minimal coordinator fake that records production submission and apply calls."""
+
+    needs_chunk_media = False
+
+    def __init__(self):
+        self.pending_event = None
+        self.enqueued_events = []
+        self.applied_events = []
+
+    def enqueue_parts(
+        self,
+        state,
+        *,
+        parts,
+        event_id,
+        received_at,
+        transition_chunks,
+    ):
+        del received_at, transition_chunks
+        prompt = parts[0][1]["prompt"]
+        self.pending_event = (event_id, prompt)
+        self.enqueued_events.append((state.request_id, event_id, prompt))
+
+    def maybe_prepare_initial_session(self, state, pipeline):
+        del state, pipeline
+        return InteractionChunkMetadata()
+
+    def apply_at_chunk_boundary(self, state, **kwargs):
+        del kwargs
+        assert self.pending_event is not None
+        event_id, prompt = self.pending_event
+        self.pending_event = None
+        self.applied_events.append((state.request_id, event_id, prompt))
+        return InteractionChunkMetadata(
+            started_event_ids=[event_id],
+            active_event_ids=[event_id],
+        )
+
+
+class _CoordinatedInteractiveChunkPipeline(InteractionMixin, _ThreeStepChunkPipeline):
+    """Interactive stub using the production chunk-boundary mixin."""
+
+    def __init__(self):
+        super().__init__()
+        self._interaction_coordinator = None
+
+    def peek_chunk_media(self, state):
+        del state
+        return ChunkMediaSpec(num_media_frames=1, fps=1.0, num_latent_frames=1)
+
+
+class _OneStepInteractiveChunkPipeline(_InteractiveChunkedStepPipeline):
+    """Interactive stub whose chunks reach their boundary in one step."""
+
+    def prepare_encode(self, state, **kwargs):
+        state = super().prepare_encode(state, **kwargs)
+        state.timesteps = [torch.tensor(10)] * 3
+        state.chunk_num_steps = 1
+        state.total_chunks = 3
+        return state
+
+
+class _BatchDependentChunkPipeline(_ThreeStepChunkPipeline):
+    """Streaming stub whose noise depends on the batch's latents and timesteps, so a stale batch shows."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen: list[tuple[float, float]] = []
+
+    def prepare_encode(self, state, **kwargs):
+        super().prepare_encode(state, **kwargs)
+        state.latents = torch.tensor([1.0])
+        return state
+
+    def denoise_step(self, input_batch, **kwargs):
+        self.denoise_calls += 1
+        latent = float(input_batch.latents.reshape(-1)[0])
+        timestep = float(input_batch.timesteps.reshape(-1)[0])
+        self.seen.append((latent, timestep))
+        return torch.full((input_batch.latents.shape[0], 1), latent + timestep)
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del kwargs
+        self.scheduler_calls += 1
+        state.latents = state.latents + noise_pred.reshape(-1)[0]
+        state.step_in_chunk += 1
+        state.step_index = state.step_in_chunk
+
+    def post_decode(self, state, **kwargs):
+        self.final_latent = state.latents.reshape(-1)[0].clone()
+        return super().post_decode(state, **kwargs)
+
+
+class _FailsMidChunkPipeline(_ThreeStepChunkPipeline):
+    """Streaming stub whose second denoise step of the first chunk raises."""
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        super().step_scheduler(state, noise_pred, **kwargs)
+        if state.chunk_index == 0 and state.step_in_chunk == 2:
+            raise RuntimeError("boom mid chunk")
 
 
 class _PerRequestErrorStepPipeline(_StepPipeline):
@@ -327,8 +500,9 @@ def _make_vllm_config():
 
 def _make_runner(
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY,
+    runner_cls: type[DiffusionModelRunner] = DiffusionModelRunner,
 ):
-    runner = object.__new__(DiffusionModelRunner)
+    runner = object.__new__(runner_cls)
     runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
@@ -480,6 +654,102 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("buffer_seconds", [None, 1.25])
+def test_chunk_boundary_defers_only_when_playback_feedback_is_enabled(monkeypatch, mocker, buffer_seconds):
+    from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+
+    pending: list[str] = []
+    applied: list[str] = []
+
+    class InteractivePipeline(_ChunkedStepPipeline):
+        def peek_chunk_media(self, state):
+            return ChunkMediaSpec(num_media_frames=12, fps=12.0, num_latent_frames=3)
+
+        def apply_interaction_at_chunk_boundary(self, state):
+            applied.extend(pending)
+            pending.clear()
+
+        def prepare_next_chunk(self, state):
+            state.latents = torch.tensor([float(len(applied))])
+
+    runner = _make_runner()
+    runner.od_config.streaming_output = True
+    runner.pipeline = InteractivePipeline()
+    runner._interaction_coordinator = mocker.Mock()
+    runner._interaction_coordinator.maybe_prepare_initial_session.return_value = None
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    request = _make_step_request(4)
+    request.sampling_params.streaming_buffer_seconds = buffer_seconds
+    first_wave = _make_scheduler_output(request)
+    if buffer_seconds is not None:
+        from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
+
+        first_wave.interaction_boundaries["req-1"] = InteractionBoundaryContext(boundary_at=0.0)
+    runner.execute_stepwise(first_wave)
+    output = runner.execute_stepwise(_make_cached_scheduler_output()).get_request_output("req-1")
+    assert output.result is not None and not output.finished
+    if buffer_seconds is not None:
+        assert output.streaming_next_media_duration == 1.0
+
+    # The transport/RPC loop can receive a key only after execute returns.
+    pending.append("key-release")
+    next_wave = _make_cached_scheduler_output(step_id=2)
+    if buffer_seconds is not None:
+        next_wave.interaction_boundaries["req-1"] = InteractionBoundaryContext(
+            boundary_at=1.0, window_opened_at=0.0, window_end_at=1.0
+        )
+    runner.execute_stepwise(next_wave)
+    assert applied == (["key-release"] if buffer_seconds is not None else [])
+    assert runner.input_batch.latents.item() == (1.0 if buffer_seconds is not None else 0.0)
+    if buffer_seconds is not None:
+        assert runner.input_batch.states[0].interaction_boundary == next_wave.interaction_boundaries["req-1"]
+
+
+@pytest.mark.cpu
+def test_playback_window_rejects_oversized_first_chunk_before_denoising(monkeypatch, mocker):
+    from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+
+    class InteractivePipeline(_ChunkedStepPipeline):
+        def peek_chunk_media(self, state):
+            return ChunkMediaSpec(num_media_frames=12, fps=12.0, num_latent_frames=3)
+
+        def apply_interaction_at_chunk_boundary(self, state):
+            pass
+
+        def prepare_next_chunk(self, state):
+            pass
+
+    runner = _make_runner()
+    runner.od_config.streaming_output = True
+    runner.pipeline = InteractivePipeline()
+    runner._interaction_coordinator = mocker.Mock()
+    runner._interaction_coordinator.maybe_prepare_initial_session.return_value = None
+    forward = mocker.spy(runner.pipeline, "denoise_step")
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    request = _make_step_request(4)
+    request.sampling_params.streaming_buffer_seconds = 0.75
+    output = runner.execute_stepwise(_make_scheduler_output(request)).get_request_output("req-1")
+    assert output.finished
+    assert "must fit a complete media chunk" in output.result.error
+    forward.assert_not_called()
+
+
+@pytest.mark.cpu
+def test_cleanup_wave_releases_last_state_and_batch_without_forward(monkeypatch):
+    runner = _make_runner()
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    runner.execute_stepwise(_make_scheduler_output(_make_step_request()))
+    assert runner.state_cache and runner.input_batch is not None
+    cleanup = _make_cached_scheduler_output(finished_req_ids={"req-1"})
+    cleanup.scheduled_cached_reqs = CachedRequestData.make_empty()
+    output = runner.execute_stepwise(cleanup)
+    assert output.runner_outputs == []
+    assert not runner.state_cache
+    assert runner.input_batch is None
+    assert runner.pipeline.denoise_calls == 1
+
+
+@pytest.mark.cpu
 def test_input_batch_cached_repack_refreshes_state_references_without_prompt_embeds():
     first_state = _make_input_batch_state("req-1", 1.0)
     batch = InputBatch.make_batch([first_state])
@@ -512,7 +782,39 @@ def test_input_batch_cached_repack_keeps_static_prompt_fields_for_same_compositi
 
 
 @pytest.mark.cpu
-def test_step_profiler_reports_denoise_step_as_diffuse():
+def test_make_batch_identity_mapping_never_reads_the_device_tensor_back(monkeypatch):
+    """The default index mapping is built on the host; reading it back from the device would sync every step."""
+
+    def forbidden(self, *args, **kwargs):
+        raise AssertionError("make_batch read a tensor back to the host")
+
+    monkeypatch.setattr(torch.Tensor, "tolist", forbidden)
+    monkeypatch.setattr(torch.Tensor, "cpu", forbidden)
+    states = [_make_input_batch_state("req-1", 1.0), _make_input_batch_state("req-2", 2.0)]
+
+    batch = InputBatch.make_batch(states)
+    repacked = InputBatch.make_batch(states, cached_batch=batch)
+
+    assert repacked is batch
+    assert list(batch.idx_mapping_np) == [0, 1]
+    assert batch.idx_mapping.dtype is torch.int32 and batch.idx_mapping.shape == (2,)
+    assert batch.request_ids == ["req-1", "req-2"]
+
+
+@pytest.mark.cpu
+def test_make_batch_explicit_mapping_still_selects_and_orders_states():
+    states = [_make_input_batch_state("req-1", 1.0), _make_input_batch_state("req-2", 2.0)]
+
+    batch = InputBatch.make_batch(states, idx_mapping=torch.tensor([1, 0]))
+
+    assert batch.request_ids == ["req-2", "req-1"]
+    assert list(batch.idx_mapping_np) == [1, 0]
+    torch.testing.assert_close(batch.latents, torch.tensor([[2.0], [1.0]]))
+
+
+@pytest.mark.cpu
+def test_step_profiler_reports_denoise_step_as_diffuse(monkeypatch):
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
     pipeline = _AutoDenoiseProfilerPipeline()
 
     assert pipeline.denoise_step() == "ok"
@@ -524,6 +826,13 @@ def test_step_profiler_reports_denoise_step_as_diffuse():
 @pytest.mark.cpu
 class TestRunner:
     """DiffusionModelRunner.execute_stepwise"""
+
+    @pytest.fixture(autouse=True)
+    def mock_platform_memory(self, monkeypatch):
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "is_available", lambda: True)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+        monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
 
     @pytest.mark.parametrize(
         ("diffusion_kv_mode", "should_cleanup"),
@@ -540,8 +849,7 @@ class TestRunner:
     ):
         runner = _make_runner(diffusion_kv_mode)
         cleanup = mocker.patch.object(runner, "remove_diffusion_kv_requests")
-        expected_output = object()
-        mocker.patch.object(runner, "_execute_stepwise_core", return_value=expected_output)
+        execute = mocker.patch.object(runner, "_execute_stepwise_core")
         scheduler_output = DiffusionSchedulerOutput(
             step_id=1,
             scheduled_new_reqs=[],
@@ -553,7 +861,8 @@ class TestRunner:
 
         output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
 
-        assert output is expected_output
+        assert output.runner_outputs == []
+        execute.assert_not_called()
         if should_cleanup:
             cleanup.assert_called_once_with(["finished-request"])
         else:
@@ -622,11 +931,208 @@ class TestRunner:
         assert second.result.error is None
         assert torch.equal(second.result.output, torch.tensor([2.0]))
         assert "req-1" not in runner.state_cache
+        assert runner.input_batch is None
 
         assert runner.pipeline.prepare_calls == 1
         assert runner.pipeline.denoise_calls == 2
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
+
+    @staticmethod
+    def _make_grouping_runner(pipeline, *, grouping: bool):
+        """An AR runner without KV (so it inherits the stepwise entry) over a streaming stub pipeline."""
+        from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
+
+        runner = _make_runner(runner_cls=ARDiffusionModelRunner)
+        runner.od_config.streaming_output = True
+        runner.kv_cache = None
+        runner.pipeline = pipeline
+        runner.pipeline.supports_chunk_step_grouping = grouping
+        return runner
+
+    @staticmethod
+    def _drive_to_completion(runner, num_steps=4):
+        outputs = [runner.execute_stepwise(_make_scheduler_output(_make_step_request(num_steps)))]
+        step = 1
+        while not outputs[-1].get_request_output("req-1").finished:
+            outputs.append(runner.execute_stepwise(_make_cached_scheduler_output(step_id=step)))
+            step += 1
+        return [o.get_request_output("req-1") for o in outputs]
+
+    @pytest.mark.parametrize(
+        ("pipeline_cls", "steps_per_chunk", "grouped_calls"),
+        [(_ChunkedStepPipeline, 2, [1, 2, 3, 4]), (_ThreeStepChunkPipeline, 3, [2, 3, 5, 6])],
+    )
+    @pytest.mark.parametrize("grouping", [False, True])
+    def test_ar_runner_leaves_the_chunk_boundary_step_for_a_fresh_call(
+        self, monkeypatch, grouping, pipeline_cls, steps_per_chunk, grouped_calls
+    ):
+        """Grouping runs the steps before each boundary in one call, without changing chunk outputs."""
+        runner = self._make_grouping_runner(pipeline_cls(), grouping=grouping)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        denoise_calls_after_each_call = []
+        original = runner.execute_stepwise
+
+        def counting(scheduler_output):
+            output = original(scheduler_output)
+            denoise_calls_after_each_call.append(runner.pipeline.denoise_calls)
+            return output
+
+        runner.execute_stepwise = counting
+
+        total_steps = 2 * steps_per_chunk
+        per_call = self._drive_to_completion(runner)
+
+        # Chunk outputs, and the steps they were emitted at, are identical.
+        emitted = [(o.step_index, float(o.result.output[0])) for o in per_call if o.result is not None]
+        assert emitted == [(steps_per_chunk, 0.0), (steps_per_chunk, 1.0)]
+        assert per_call[-1].finished is True
+        assert runner.pipeline.denoise_calls == total_steps and runner.pipeline.scheduler_calls == total_steps
+        assert runner.pipeline.decode_calls == 2
+        assert runner.pipeline.prepare_calls == 1
+        # The final step of each chunk runs in a fresh call, giving the
+        # scheduler control before the chunk boundary; with two-step chunks
+        # that leaves nothing to group.
+        assert denoise_calls_after_each_call == (grouped_calls if grouping else list(range(1, total_steps + 1)))
+        assert "req-1" not in runner.state_cache
+
+    def test_ar_runner_applies_interaction_queued_after_grouped_work_at_the_next_boundary(self, monkeypatch):
+        """An RPC serviced after grouped work still applies before the next chunk is prepared."""
+        pipeline = _CoordinatedInteractiveChunkPipeline()
+        runner = self._make_grouping_runner(pipeline, grouping=True)
+        coordinator = _RecordingInteractionCoordinator()
+        runner._interaction_coordinator = coordinator
+        pipeline._interaction_coordinator = coordinator
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
+        assert first.get_request_output("req-1").result is None
+        assert pipeline.denoise_calls == 2
+
+        runner.submit_interaction(
+            "req-1",
+            cast(
+                OmniInteractionPrompt,
+                {
+                    "event_id": "ui-update-1",
+                    "event": {"prompt": "updated prompt"},
+                },
+            ),
+        )
+        assert coordinator.enqueued_events == [("req-1", "ui-update-1", "updated prompt")]
+        boundary = runner.execute_stepwise(_make_cached_scheduler_output(step_id=1))
+
+        assert boundary.get_request_output("req-1").result is not None
+        assert pipeline.denoise_calls == 3
+        assert coordinator.applied_events == [("req-1", "ui-update-1", "updated prompt")]
+
+    def test_ar_runner_one_step_chunk_cannot_yield_before_its_boundary(self, monkeypatch):
+        """A one-step chunk retains baseline latency because no pre-boundary yield point exists."""
+        pipeline = _OneStepInteractiveChunkPipeline()
+        runner = self._make_grouping_runner(pipeline, grouping=True)
+        runner._interaction_coordinator = MagicMock()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(3)))
+
+        assert first.get_request_output("req-1").result is not None
+        assert pipeline.denoise_calls == 1
+        assert pipeline.applied_interactions == [None]
+
+        pipeline.pending_interaction = "updated prompt"
+        second = runner.execute_stepwise(_make_cached_scheduler_output(step_id=1))
+
+        assert second.get_request_output("req-1").result is not None
+        assert pipeline.applied_interactions == [None, "updated prompt"]
+
+    def test_ar_runner_continues_a_grouped_chunk_as_a_cached_request(self, monkeypatch):
+        """The first step admits the new request; every further step of the chunk is a cached-request continuation."""
+        runner = self._make_grouping_runner(_ThreeStepChunkPipeline(), grouping=True)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        seen = []
+        original_core = DiffusionModelRunner._execute_stepwise_core
+
+        def recording_core(self_, scheduler_output, **kwargs):
+            seen.append(scheduler_output)
+            return original_core(self_, scheduler_output, **kwargs)
+
+        monkeypatch.setattr(DiffusionModelRunner, "_execute_stepwise_core", recording_core)
+
+        first = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4), finished_req_ids={"old"}))
+
+        assert first.get_request_output("req-1").result is None
+        assert runner.pipeline.prepare_calls == 1
+        assert len(seen) == 2
+        assert [n.request_id for n in seen[0].scheduled_new_reqs] == ["req-1"]
+        continuation = seen[1]
+        assert continuation.scheduled_new_reqs == []
+        assert continuation.scheduled_cached_reqs.request_ids == ["req-1"]
+        assert continuation.finished_req_ids == set()
+        assert continuation.kv_prefetch_job is None and continuation.kv_connector_metadata is None
+        assert continuation.step_id == seen[0].step_id
+
+    def test_ar_runner_grouped_steps_see_the_same_inputs_as_per_step_calls(self, monkeypatch):
+        """Every grouped step sees the latents and timestep step_scheduler just advanced, exactly as per-step calls do."""
+        finals = {}
+        seen = {}
+        for grouping in (False, True):
+            runner = self._make_grouping_runner(_BatchDependentChunkPipeline(), grouping=grouping)
+            monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+            self._drive_to_completion(runner)
+            finals[grouping] = float(runner.pipeline.final_latent)
+            seen[grouping] = runner.pipeline.seen
+
+        # x -> 2x + t, in both modes:
+        # 1 -> 12 -> 29 -> 59 | 59 -> 128 -> 261 -> 523.
+        assert seen[False] == [(1.0, 10.0), (12.0, 5.0), (29.0, 1.0), (59.0, 10.0), (128.0, 5.0), (261.0, 1.0)]
+        assert seen[True] == seen[False]
+        assert finals[True] == finals[False] == 523.0
+
+    def test_ar_runner_grouped_chunk_stops_at_a_failing_step_and_drops_the_state(self, monkeypatch):
+        """A failure mid-chunk ends the grouped call with that step's error; nothing runs after it."""
+        runner = self._make_grouping_runner(_FailsMidChunkPipeline(), grouping=True)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        output = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
+
+        failed = output.get_request_output("req-1")
+        assert failed.finished is True
+        assert failed.result is not None and "boom mid chunk" in failed.result.error
+        assert runner.pipeline.denoise_calls == 2 and runner.pipeline.decode_calls == 0
+        assert "req-1" not in runner.state_cache
+
+    def test_ar_runner_fails_a_chunk_that_never_advances(self, monkeypatch):
+        pipeline = _ChunkedStepPipeline()
+        monkeypatch.setattr(pipeline, "step_scheduler", lambda *args, **kwargs: None)
+        runner = self._make_grouping_runner(pipeline, grouping=True)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        output = runner.execute_stepwise(_make_scheduler_output(_make_step_request(4)))
+        failed = output.get_request_output("req-1")
+        assert failed.finished
+        assert "within 2 denoise steps" in failed.result.error
+        assert pipeline.denoise_calls == 2
+        assert "req-1" not in runner.state_cache
+
+    def test_base_runner_never_groups_and_the_ar_policy_needs_capability_streaming_and_one_request(self, monkeypatch):
+        """The shared runner is one step per call; the AR runner groups only a lone streaming request that declares it."""
+        base = _make_runner()
+        base.od_config.streaming_output = True
+        base.pipeline = _ChunkedStepPipeline()
+        base.pipeline.supports_chunk_step_grouping = True
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        first = DiffusionModelRunner.execute_stepwise(base, _make_scheduler_output(_make_step_request(4)))
+        assert first.get_request_output("req-1").result is None and base.pipeline.denoise_calls == 1
+
+        ar = self._make_grouping_runner(_ChunkedStepPipeline(), grouping=False)
+        one = _make_cached_scheduler_output()
+        two = _make_batch_scheduler_output([_make_step_request(4), _make_step_request(4)])
+        two.scheduled_new_reqs[1].request_id = two.scheduled_new_reqs[1].req.request_id = "req-2"
+        assert ar._groups_chunk_steps(one) is False  # no capability declared
+        ar.pipeline.supports_chunk_step_grouping = True
+        assert ar._groups_chunk_steps(one) is True
+        assert ar._groups_chunk_steps(two) is False  # not for a batch
+        ar.od_config.streaming_output = False
+        assert ar._groups_chunk_steps(one) is False  # not without streaming output
 
     def test_stepwise_output_includes_stage_and_peak_metrics(self, monkeypatch):
         runner = _make_runner()
@@ -780,6 +1286,63 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 0
         assert runner.state_cache == {}
 
+    def test_peer_prepare_encode_failure_skips_interaction_session_initialization(self, monkeypatch):
+        """One rank's failure in ``_prepare_batch_inputs -> prepare_encode`` must be handled before all ranks initialize interaction sessions.
+
+        ``maybe_prepare_initial_session`` calls ``synchronized_monotonic_time()``
+        (a broadcast). If this rank's ``prepare_encode`` succeeded while a peer
+        failed, entering that broadcast while the peer enters the failure
+        all-reduce would hang.
+        """
+        from vllm_omni.diffusion.interaction.types import InteractionChunkMetadata
+
+        class _InteractionStepPipeline(_StepPipeline):
+            def __init__(self):
+                super().__init__()
+                self.prepare_next_chunk_calls = 0
+
+            def peek_chunk_media(self, state):
+                del state
+                return ChunkMediaSpec(num_media_frames=8, fps=16.0, num_latent_frames=8)
+
+            def apply_interaction_at_chunk_boundary(self, state):
+                del state
+
+            def prepare_next_chunk(self, state):
+                del state
+                self.prepare_next_chunk_calls += 1
+
+        runner = _make_runner()
+        pipeline = _InteractionStepPipeline()
+        runner.pipeline = pipeline
+        coordinator = MagicMock()
+        coordinator.maybe_prepare_initial_session.return_value = InteractionChunkMetadata(
+            started_event_ids=[],
+            active_event_ids=[],
+            completed_event_ids=[],
+        )
+        runner._interaction_coordinator = coordinator
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        # Peer failed during prepare_encode; this rank's local encode succeeds.
+        monkeypatch.setattr(
+            model_runner_module,
+            "_dit_any_rank_failed",
+            lambda local_failed: True,
+        )
+
+        req = _make_step_request(num_inference_steps=1)
+        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req))
+
+        output = result.get_request_output("req-1")
+        assert output.finished is True
+        assert output.result is not None
+        assert "another DiT rank" in (output.result.error or "")
+        assert pipeline.prepare_calls == 1
+        coordinator.maybe_prepare_initial_session.assert_not_called()
+        assert pipeline.prepare_next_chunk_calls == 0
+        assert pipeline.denoise_calls == 0
+        assert runner.state_cache == {}
+
     def test_receives_kv_payload_before_prepare_encode(self, monkeypatch):
         runner = _make_runner()
         captured: dict[str, object] = {}
@@ -894,7 +1457,7 @@ class _RecordingLoRAManager:
     def __init__(self) -> None:
         self.calls: list[tuple[object | None, float]] = []
 
-    def set_active_adapter(self, adapter, scale: float = 1.0) -> None:
+    def set_request_adapter(self, adapter, scale: float = 1.0) -> None:
         self.calls.append((adapter, scale))
 
 
@@ -1012,6 +1575,36 @@ class TestWorker:
         DiffusionWorker.execute_stepwise(worker, next_batch)
         assert "req-1" not in worker._step_lora_state
         assert worker._step_lora_state == {"req-2": (lora_request, 1.0)}
+
+    @pytest.mark.parametrize("error", [None, "decode failed"])
+    def test_terminal_output_retires_lora_state_without_another_wave(self, error):
+        terminal = RunnerOutput("done", finished=True, result=DiffusionOutput(error=error))
+        # A decoded chunk is not necessarily the final output of its request.
+        chunk = RunnerOutput("streaming", finished=False, result=DiffusionOutput(output=torch.ones(1)))
+        expected = BatchRunnerOutput.from_list([terminal, chunk])
+        worker = _make_step_worker(expected_output=expected)
+        scheduled = _make_batch_scheduler_output([_make_engine_request(rid) for rid in ("done", "streaming")])
+
+        output = worker.execute_stepwise(scheduled)
+
+        assert output is expected
+        assert worker._step_lora_state == {"streaming": (None, 1.0)}
+        assert torch.equal(chunk.result.output, torch.ones(1))
+
+    def test_runner_exception_retires_only_scheduled_lora_state(self):
+        worker = _make_step_worker()
+        worker._step_lora_state["unscheduled"] = (None, 0.5)
+
+        def fail(_):
+            raise RuntimeError("denoise failed")
+
+        worker.model_runner.execute_stepwise = fail
+        scheduled = _make_batch_scheduler_output([_make_engine_request(rid) for rid in ("first", "second")])
+
+        with pytest.raises(RuntimeError, match="denoise failed"):
+            worker.execute_stepwise(scheduled)
+
+        assert worker._step_lora_state == {"unscheduled": (None, 0.5)}
 
 
 @pytest.mark.cpu
@@ -1182,7 +1775,7 @@ class TestSupportedPipelines:
     """Step-execution protocol checks for supported pipelines."""
 
     def test_default_stage_config_includes_step_execution(self):
-        stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        stage_cfg = StageConfigFactory.create_default_diffusion(
             {
                 "step_execution": True,
             }

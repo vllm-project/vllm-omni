@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from https://github.com/FunAudioLLM/CosyVoice/tree/main/cosyvoice/flow/DiT
 # Refactored to use vllm_omni diffusion infrastructure for optimized attention backends
 
@@ -15,8 +15,10 @@ from torch import nn
 from vllm.logger import init_logger
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
+from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_batch_flow_profile
 
 logger = init_logger(__name__)
 
@@ -50,6 +52,22 @@ def get_pos_embed_indices(start, length, max_pos, scale=1.0):
     )
     pos = torch.where(pos < max_pos, pos, max_pos - 1)
     return pos
+
+
+def _normalize_attention_mask(mask: torch.Tensor | None, batch_size: int, seq_len: int) -> torch.Tensor | None:
+    if mask is None:
+        return None
+    if mask.dim() == 2:
+        attn_mask = mask
+    elif mask.dim() == 3 and mask.shape[1] == 1:
+        attn_mask = mask[:, 0]
+    elif mask.dim() == 4:
+        attn_mask = mask[:, 0, -1]
+    else:
+        return None
+    if attn_mask.shape != (batch_size, seq_len):
+        return None
+    return attn_mask.bool()
 
 
 class FeedForward(nn.Module):
@@ -114,42 +132,39 @@ class DiTAttention(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_len = x.shape[0], x.shape[1]
 
-        # Project to Q, K, V
-        query = self.to_q(x)
-        key = self.to_k(x)
-        value = self.to_v(x)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_qkv_projection"):
+            query = self.to_q(x)
+            key = self.to_k(x)
+            value = self.to_v(x)
 
-        # Apply rotary position embedding
-        if rope is not None:
-            freqs, xpos_scale = rope
-            q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
-            query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
-            key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_rope"):
+            if rope is not None:
+                freqs, xpos_scale = rope
+                q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+                query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
+                key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
-        # Reshape for attention: (batch, seq, heads, head_dim)
-        query = query.view(batch_size, seq_len, self.heads, self.dim_head)
-        key = key.view(batch_size, seq_len, self.heads, self.dim_head)
-        value = value.view(batch_size, seq_len, self.heads, self.dim_head)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_backend"):
+            # Reshape for attention: (batch, seq, heads, head_dim)
+            query = query.view(batch_size, seq_len, self.heads, self.dim_head)
+            key = key.view(batch_size, seq_len, self.heads, self.dim_head)
+            value = value.view(batch_size, seq_len, self.heads, self.dim_head)
 
-        # Use diffusion attention backend
-        # The diffusion Attention layer expects (batch, seq, heads, head_dim)
-        out = self.attn(query, key, value, attn_metadata=None)
+            # The diffusion Attention layer expects (batch, seq, heads, head_dim)
+            attn_mask = _normalize_attention_mask(mask, batch_size, seq_len)
+            attn_metadata = AttentionMetadata(attn_mask=attn_mask) if attn_mask is not None else None
+            out = self.attn(query, key, value, attn_metadata=attn_metadata)
 
-        # Some attention backends return a non-contiguous layout.
-        out = out.reshape(batch_size, seq_len, self.inner_dim)
-        out = out.to(query.dtype)
-
-        # Output projection
-        out = self.to_out(out)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_output_projection"):
+            # Some attention backends return a non-contiguous layout.
+            out = out.reshape(batch_size, seq_len, self.inner_dim)
+            out = out.to(x.dtype)
+            out = self.to_out(out)
 
         # Apply mask if provided
-        if mask is not None:
-            if mask.dim() == 2:
-                mask = mask.unsqueeze(-1)
-            elif mask.dim() == 4:
-                # (batch, heads, seq, seq) -> use last dim
-                mask = mask[:, 0, -1].unsqueeze(-1)
-            out = out.masked_fill(~mask.bool(), 0.0)
+        attn_mask = _normalize_attention_mask(mask, batch_size, seq_len)
+        if attn_mask is not None:
+            out = out.masked_fill(~attn_mask.unsqueeze(-1), 0.0)
 
         return out
 
@@ -172,18 +187,19 @@ class DiTBlock(nn.Module):
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
     def forward(self, x, t, mask=None, rope=None):
-        # pre-norm & modulation for attention input
-        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_adalayernorm_attention"):
+            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
 
-        # attention
-        attn_output = self.attn(x=norm, mask=mask, rope=rope)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention"):
+            attn_output = self.attn(x=norm, mask=mask, rope=rope)
 
-        # process attention output for input x
-        x = x + gate_msa.unsqueeze(1) * attn_output
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_attention_residual"):
+            x = x + gate_msa.unsqueeze(1) * attn_output
 
-        ff_norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        ff_output = self.ff(ff_norm)
-        x = x + gate_mlp.unsqueeze(1) * ff_output
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_layernorm_ffn"):
+            ff_norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+            ff_output = self.ff(ff_norm)
+            x = x + gate_mlp.unsqueeze(1) * ff_output
 
         return x
 
@@ -205,19 +221,20 @@ class CausalConvPositionEmbedding(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
-        if mask is not None:
-            mask = mask[..., None]
-            x = x.masked_fill(~mask, 0.0)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_causal_conv_position_embedding"):
+            if mask is not None:
+                mask = mask[..., None]
+                x = x.masked_fill(~mask, 0.0)
 
-        x = x.permute(0, 2, 1)
-        x = F.pad(x, (self.kernel_size - 1, 0, 0, 0))
-        x = self.conv1(x)
-        x = F.pad(x, (self.kernel_size - 1, 0, 0, 0))
-        x = self.conv2(x)
-        out = x.permute(0, 2, 1)
+            x = x.permute(0, 2, 1)
+            x = F.pad(x, (self.kernel_size - 1, 0, 0, 0))
+            x = self.conv1(x)
+            x = F.pad(x, (self.kernel_size - 1, 0, 0, 0))
+            x = self.conv2(x)
+            out = x.permute(0, 2, 1)
 
-        if mask is not None:
-            out = out.masked_fill(~mask, 0.0)
+            if mask is not None:
+                out = out.masked_fill(~mask, 0.0)
 
         return out
 
@@ -327,13 +344,15 @@ class InputEmbedding(nn.Module):
         self.conv_pos_embed = CausalConvPositionEmbedding(dim=out_dim)
 
     def forward(self, x, cond, text_embed, spks):
-        to_cat = [x, cond, text_embed]
-        if self.spk_dim > 0:
-            spks = repeat(spks, "b c -> b t c", t=x.shape[1])
-            to_cat.append(spks)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_input_projection"):
+            to_cat = [x, cond, text_embed]
+            if self.spk_dim > 0:
+                spks = repeat(spks, "b c -> b t c", t=x.shape[1])
+                to_cat.append(spks)
 
-        x = self.proj(torch.cat(to_cat, dim=-1))
-        x = self.conv_pos_embed(x) + x
+            x = self.proj(torch.cat(to_cat, dim=-1))
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_input_causal_conv"):
+            x = self.conv_pos_embed(x) + x
         return x
 
 
@@ -385,31 +404,37 @@ class DiT(nn.Module):
         self.num_decoding_left_chunks = num_decoding_left_chunks
 
     def forward(self, x, mask, mu, t, spks=None, cond=None):
-        x = x.transpose(1, 2)
-        mu = mu.transpose(1, 2)
-        cond = cond.transpose(1, 2)
-        spks = spks.unsqueeze(dim=1)
-        batch, seq_len = x.shape[0], x.shape[1]
-        if t.ndim == 0:
-            t = t.repeat(batch)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_prepare_inputs"):
+            x = x.transpose(1, 2)
+            mu = mu.transpose(1, 2)
+            cond = cond.transpose(1, 2)
+            spks = spks.unsqueeze(dim=1)
+            batch, seq_len = x.shape[0], x.shape[1]
+            if t.ndim == 0:
+                t = t.repeat(batch)
 
-        # t: conditioning time, c: context (text + masked cond audio), x: noised input audio
-        t = self.time_embed(t)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_time_embedding"):
+            t = self.time_embed(t)
         x = self.input_embed(x, cond, mu, spks.squeeze(1))
 
-        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_rope_and_mask"):
+            rope = self.rotary_embed.forward_from_seq_len(seq_len)
+            attn_mask = mask[:, 0].bool() if mask.dim() == 3 and mask.shape[1] == 1 else mask.bool()
 
         if self.long_skip_connection is not None:
             residual = x
 
-        attn_mask = mask.bool().repeat(1, x.size(1), 1).unsqueeze(dim=1)
-
-        for block in self.transformer_blocks:
-            x = block(x, t, mask=attn_mask.bool(), rope=rope)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_transformer_blocks"):
+            for block_index, block in enumerate(self.transformer_blocks):
+                with cosyvoice3_batch_flow_profile(f"cosyvoice3_dit_transformer_block_{block_index}"):
+                    x = block(x, t, mask=attn_mask.bool(), rope=rope)
 
         if self.long_skip_connection is not None:
-            x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
+            with cosyvoice3_batch_flow_profile("cosyvoice3_dit_long_skip_projection"):
+                x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
 
-        x = self.norm_out(x, t)
-        output = self.proj_out(x).transpose(1, 2)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_final_adalayernorm"):
+            x = self.norm_out(x, t)
+        with cosyvoice3_batch_flow_profile("cosyvoice3_dit_final_projection"):
+            output = self.proj_out(x).transpose(1, 2)
         return output

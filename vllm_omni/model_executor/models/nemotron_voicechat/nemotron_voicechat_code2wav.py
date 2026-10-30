@@ -82,9 +82,22 @@ class NemotronVoiceChatCode2Wav(nn.Module):
         self.enable_update_additional_information = True
         self.requires_raw_input_tokens = True
 
+        # Incremental streaming decode (hf_overrides.use_incremental_codec_cache):
+        # keep a CausalConv1dCache per request so each async chunk decodes ONLY
+        # its new frames — O(T) codec work — instead of re-decoding the whole
+        # cumulative prefix per chunk (O(T^2)). This is the codec-cache path
+        # NVIDIA's own serving stack runs (S2S_USE_CODEC_CACHE); the default
+        # stays the prefix re-decode, whose concatenation is bit-equal to the
+        # one-shot decode of the final stack.
+        self._use_codec_cache = bool(getattr(self.config, "use_incremental_codec_cache", False))
+        self.requires_request_ids = self._use_codec_cache
+        # Shared per-request causal-conv caches; ALSO used by duplex serving,
+        # whose per-segment payloads mark themselves with meta.codec_streaming
+        # + meta.request_id (independent of the hf_override).
+        self._stream_caches: dict[str, Any] = {}
+
         # Constructed in load_weights (owns the tts_model.audio_codec.* subtree).
         self.audio_codec: nn.Module | None = None
-        self._duplex_codec_caches: dict[str, object] = {}
 
     # ------------------------------------------------------------------
     # Runner-facing placeholder hooks.
@@ -130,6 +143,7 @@ class NemotronVoiceChatCode2Wav(nn.Module):
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
         runtime_additional_information: list[dict[str, Any]] | None = None,
+        request_ids: list[str] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         sr_tensor = torch.tensor(self._sample_rate, dtype=torch.int32)
@@ -189,25 +203,40 @@ class NemotronVoiceChatCode2Wav(nn.Module):
                 left_context_frames = max(int(runtime_info["meta.left_context_size"]), 0)
             if left_context_frames >= frames:
                 continue  # terminal empty chunk: all frames already emitted
-            lens = torch.tensor([frames], device=device, dtype=torch.long)
+            is_stream_chunk = (isinstance(meta, Mapping) and "left_context_size" in meta) or (
+                isinstance(runtime_info, Mapping) and "meta.left_context_size" in runtime_info
+            )
+            request_id = str(request_ids[i]) if request_ids is not None and i < len(request_ids) else None
             codec_cache = None
+            decode_codes = codes
             if codec_streaming:
+                # Duplex serving: the per-segment payload carries ONLY the new
+                # frames; continuity lives in the per-request causal-conv cache
+                # keyed by the talker-forwarded meta.request_id.
                 if not isinstance(cache_request_id, str) or not cache_request_id:
                     raise ValueError("Nemotron VoiceChat incremental codec input lacks meta.request_id")
                 from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_vae_codec import (
                     CausalConv1dCache,
                 )
 
-                codec_cache = self._duplex_codec_caches.setdefault(cache_request_id, CausalConv1dCache())
+                codec_cache = self._stream_caches.setdefault(cache_request_id, CausalConv1dCache())
+            elif self._use_codec_cache and is_stream_chunk and request_id is not None:
+                # Async-chunk streaming: cumulative payload; decode ONLY the
+                # frames past the already-emitted prefix, with the causal-conv
+                # left context carried in the per-request cache.
+                from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_vae_codec import (
+                    CausalConv1dCache,
+                )
+
+                codec_cache = self._stream_caches.setdefault(request_id, CausalConv1dCache())
+                decode_codes = codes[left_context_frames:]
+            lens = torch.tensor([decode_codes.shape[0]], device=device, dtype=torch.long)
             # NeMo decodes the codec strictly in fp32.
             with torch.autocast(device_type=device.type, enabled=False):
-                wav, wav_len = self.audio_codec.decode(
-                    codes.unsqueeze(0),
-                    lens,
-                    cache=codec_cache,
-                )
+                wav, wav_len = self.audio_codec.decode(decode_codes.unsqueeze(0), lens, cache=codec_cache)
             wav = wav.reshape(-1)[: int(wav_len.reshape(-1)[0])]
-            if left_context_frames > 0 and not codec_streaming:
+            if left_context_frames > 0 and codec_cache is None:
+                # Prefix re-decode path: slice off the samples already emitted.
                 wav = wav[left_context_frames * self._wav_per_frame :]
             audios[i] = wav.detach().to(dtype=torch.float32).cpu()
             logger.debug(
@@ -222,14 +251,14 @@ class NemotronVoiceChatCode2Wav(nn.Module):
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
 
-    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
-        for request_id in finished_req_ids:
-            self._duplex_codec_caches.pop(str(request_id), None)
-
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         raise TypeError(f"NemotronVoiceChatCode2Wav expected OmniOutput, got {type(model_outputs)}")
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        for request_id in finished_req_ids:
+            self._stream_caches.pop(str(request_id), None)
 
     # ------------------------------------------------------------------
     # Weights.

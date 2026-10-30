@@ -12,6 +12,11 @@ This guide focuses on vLLM-Omni's primary task endpoints. Compatible models
 may also expose standard routes inherited from vLLM, such as
 `POST /v1/completions`; those routes remain model- and task-dependent.
 
+`POST /tokenize`, `POST /detokenize`, and the opt-in `GET /tokenizer_info`
+require a model with a configured tokenization handler. Pure diffusion servers
+do not expose these routes and return HTTP 404; token counting is unavailable
+for those servers.
+
 ## Start and Verify the Server
 
 Start a model with the shared serving command:
@@ -43,12 +48,14 @@ Completions for conversational or heterogeneous omni pipelines, rather than as
 the default wrapper for every generation task.
 
 | Task | Endpoint | Request | Response | Details |
-|------|----------|---------|----------|---------|
+| ------ | ---------- | --------- | ---------- | --------- |
 | Conversation or multimodal understanding/generation | `POST /v1/chat/completions` | JSON | OpenAI-style JSON or SSE | [Chat Completions](chat_completions_api.md) |
 | Text-to-speech | `POST /v1/audio/speech` | JSON | Audio bytes or SSE | [Speech](speech_api.md) |
 | Sound, music, or ambient audio generation | `POST /v1/audio/generate` | JSON | Audio bytes | [Audio Generation](audio_generate_api.md) |
 | Text-to-image | `POST /v1/images/generations` | JSON | Base64 JSON or an image file | [Image Generation](image_generation_api.md) |
 | Image editing | `POST /v1/images/edits` | Multipart form | Base64 JSON or SSE | [Image Edit](image_edit_api.md) |
+| Promptable image segmentation | `POST /v1/images/segmentations` | Multipart form | Instance masks, boxes, scores (JSON) | [Image Segmentation](image_segmentation_api.md) |
+| Video concept segmentation and tracking | `POST /v1/videos/segmentations` | Multipart form | Per-frame tracked instance masks, boxes, scores (JSON); optional mask videos | [Video Segmentation](video_segmentation_api.md) |
 | Video generation (recommended) | `POST /v1/videos` | Multipart form | Asynchronous job JSON | [Videos](videos_api.md) |
 | Video generation (blocking) | `POST /v1/videos/sync` | Multipart form | Video bytes | [Videos](videos_api.md#synchronous-response) |
 
@@ -141,24 +148,34 @@ These WebSocket APIs have different event schemas and cannot be used
 interchangeably.
 
 | Workload | Endpoint | Interaction model | Details |
-|----------|----------|-------------------|---------|
+| ---------- | ---------- | ------------------- | --------- |
 | Incremental text input for speech synthesis | `WS /v1/audio/speech/stream` | Send text events and receive audio | [Streaming Text to Speech](speech_api.md#streaming-text-input-websocket) |
 | Live video understanding | `WS /v1/video/chat/stream` | Send video frames and receive text/audio | [Streaming Video Input](video_stream_api.md) |
-| Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_api.md) |
-| Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` or `WS /v1/duplex` | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
+| Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_openai_duplex_api.md) |
+| Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`) | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
 | Generated video chunks | `WS /v1/realtime/video` | Start a diffusion request and receive fragmented MP4 | [Streaming Video Output](streaming_video_output_api.md) |
 | Robot policy inference | `WS /v1/realtime/robot/openpi` | Send MessagePack observations and receive action arrays | [OpenPI Robot Policy](openpi_api.md) |
 
 All six routes are model- or configuration-dependent. In particular,
-`/v1/realtime` is not full duplex unless the client sets `duplex=1` and the
-deployment explicitly enables duplex sessions. Clients should also verify the
-duplex capability payload because the query-parameter form falls back to the
-ordinary realtime handler when duplex is unavailable.
+`/v1/realtime` is full duplex when the server is a duplex server: the model's
+pipeline declares a `duplex_plugin` and its deploy configuration sets
+`session_mode: duplex` (with `session_mode: turn` the same model boots the
+ordinary turn-based serving stack instead). On a duplex server a stock
+Realtime client needs no vendor query parameter; `duplex=0` opts out of native
+duplex and selects the turn-based Realtime handler. It runs generation on the
+same stages, alongside live websocket sessions, and opens no duplex session
+or consumes a `duplex_session.max_sessions` slot -- see
+[Full Duplex](full_duplex_api.md).
+Such a server serves the websocket route plus `POST /v1/chat/completions`,
+`/v1/models` and `/health`, and no other turn-based HTTP route. On a server
+that is not duplex, an explicit `?duplex=1` is refused rather than answered by
+the turn-based handler, so a client that requested duplex never silently gets
+the other protocol.
 
 ## Related Endpoints
 
 | Purpose | Endpoints | Reference |
-|---------|-----------|-----------|
+| --------- | ----------- | ----------- |
 | Discovery and readiness | `GET /health`, `GET /v1/models` | This page |
 | Batched conversations | `POST /v1/chat/completions/batch` | [Batch requests](chat_completions_api.md#batch-requests) |
 | Batched speech | `POST /v1/audio/speech/batch` | [Batch speech generation](speech_api.md#batch-speech-generation) |
@@ -168,11 +185,10 @@ ordinary realtime handler when duplex is unavailable.
 
 ## Standalone Experimental Servers
 
-PersonaPlex also provides a Moshi-compatible WebSocket server, while JoyVL
-provides a stateful interaction orchestrator in front of another model server.
-These are separate processes with their own routes; they are not additional
+JoyVL provides a stateful interaction orchestrator in front of another model
+server. It is a separate process with its own routes; they are not additional
 paths on every `vllm serve --omni` instance. See [Standalone Experimental
-Servers](standalone_servers.md) before deploying either one.
+Servers](standalone_servers.md) before deploying it.
 
 ## Compatibility Notes
 

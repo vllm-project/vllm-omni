@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
-Expanded end-to-end test for BAGEL in offline mode.
+Expanded end-to-end tests for BAGEL in offline mode.
 
-This test file primarily covers end-to-end tests for LoRA support (Stage 1 / DiT).
+Coverage:
+- LoRA scale / deactivation on Stage 1 DiT
 
-Validates that LoRA adapters are correctly loaded, applied with controllable
-scale, and cleanly deactivated.  Uses a synthetic rank-1 adapter targeting the
-first decoder layer's QKV projection.
-
-Assertions:
-  (a) LoRA at scale=1.0 visibly changes the output  (diff > 0.5)
-  (b) scale=2.0 produces a larger delta than scale=1.0  (linearity)
-  (c) The delta is bounded  (diff < 80, not corrupted)
-  (d) Deactivating LoRA exactly restores the baseline  (diff == 0)
+Sleep / wake (BagelPipeline TP=2 and coordinated dual-engine) lives in
+``tests/entrypoints/test_omni_sleep_mode.py`` as ``full_model`` H100 cases.
 """
 
 import json
@@ -133,17 +127,13 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 
 
 # ---------------------------------------------------------------------------
-# Test
+# LoRA scale / deactivation
 # ---------------------------------------------------------------------------
 
 
-pytestmark = [
-    pytest.mark.slow,
-    pytest.mark.diffusion,
-    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
-]
-
-
+@pytest.mark.slow
+@pytest.mark.diffusion
+@pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_lora_scale_and_deactivation(omni_runner: OmniRunner, tmp_path) -> None:
     """Validate LoRA effect, bounded perturbation, and clean deactivation."""

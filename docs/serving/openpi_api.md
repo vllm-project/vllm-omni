@@ -28,6 +28,33 @@ policy_server_config:
 Without this configuration, the WebSocket returns `Robot policy not available`
 and closes.
 
+### Multi-stage policies
+
+A policy can run as several stages, for example an autoregressive stage that
+reasons before a diffusion stage that acts. The diffusion stage declares
+`policy_server_config` as above and receives the observation; every other
+stage gets its deploy `default_sampling_params`, and an observation `seed`
+applies to all stages. The reply is the actions of the stage that returns
+them.
+
+When the first stage needs a prompt built from the observation (token ids,
+images), the diffusion stage's `model_config` also names
+`openpi_prompt_builder`, a class following the `OpenPIPromptBuilder` protocol
+in `vllm_omni/entrypoints/openpi/serving.py`. It is constructed with the
+engine's vLLM `ModelConfig` and the `policy_server_config` values, and its
+`build_prompt(obs)` returns the first stage's prompt. It is not sent to
+clients. In the deploy config:
+
+```yaml
+stages:
+  - stage_id: 1  # the diffusion stage
+    model_config:
+      policy_server_config:
+        action_horizon: 64
+        # ...
+      openpi_prompt_builder: my_package.policy.MyOpenPIPrompt
+```
+
 ## DreamZero Quick Start
 
 Start the bundled DreamZero deployment:
@@ -64,7 +91,7 @@ connect
   <- msgpack(policy_server_config)
 
 infer
-  -> msgpack({"endpoint": "infer", "session_id": "...", ...observation})
+  -> msgpack({"endpoint": "infer", "session_id": "...", "seed": <optional int>, ...observation})
   <- msgpack(ndarray | dict[str, ndarray])
 
 reset
@@ -92,6 +119,12 @@ frames are not observation messages.
 - The policy pipeline owns observation transforms and persistent model state,
   normally keyed by `session_id`; the API layer forwards the raw observation
   dictionary.
+- An optional integer `seed` in an inference message becomes the engine
+  request's `sampling_params.seed`. A policy whose sampling consumes the
+  request generator (GR00T-N1.7) returns the same action chunk for the same
+  observation and seed. If omitted, the engine assigns a random per-request
+  seed, so unseeded inferences are independent of each other. The API layer
+  consumes `seed`; it is not forwarded inside the observation.
 
 ## Limits and Errors
 
@@ -102,6 +135,8 @@ frames are not observation messages.
 - Inference failures return a generic `Internal inference error` without
   exposing an internal traceback.
 - Unsupported NumPy object, structured, and complex dtypes are rejected.
+- A configured `openpi_prompt_builder` that cannot be imported fails server
+  startup with an error naming the setting.
 
 Observation keys, camera layout, state tensors, and action shapes are defined
 by the loaded policy rather than by this transport. Read the handshake before

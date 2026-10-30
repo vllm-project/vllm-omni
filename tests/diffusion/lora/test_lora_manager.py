@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.lora.utils import get_supported_lora_modules
 
@@ -22,6 +23,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _DummyLoRALayer:
+    base_layer: torch.nn.Module
+
     def __init__(self, n_slices: int, output_slices: tuple[int, ...], tp_size: int = 1):
         self.n_slices = n_slices
         self.output_slices = output_slices
@@ -30,14 +33,38 @@ class _DummyLoRALayer:
             tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
         ] = []
         self.reset_calls: int = 0
+        self.suspend_calls: int = 0
+        self.resume_calls: int = 0
+        self.active_slices: tuple[bool, ...] = ()
+        self.suspended_slices: tuple[bool, ...] | None = None
 
     def set_lora(self, index: int, lora_a, lora_b):
         assert index == 0
         self.set_calls.append((lora_a, lora_b))
+        if isinstance(lora_b, list):
+            self.active_slices = tuple(b is not None for b in lora_b)
+        else:
+            self.active_slices = (True,)
+        self.suspended_slices = None
 
     def reset_lora(self, index: int):
         assert index == 0
         self.reset_calls += 1
+        self.active_slices = ()
+        self.suspended_slices = None
+
+    def suspend_lora(self) -> None:
+        if self.suspended_slices is not None:
+            return
+        self.suspended_slices = self.active_slices
+        self.active_slices = (False,) * len(self.active_slices)
+        self.suspend_calls += 1
+
+    def resume_lora(self) -> None:
+        if self.suspended_slices is not None:
+            self.active_slices = self.suspended_slices
+            self.suspended_slices = None
+        self.resume_calls += 1
 
 
 # Aliases for backward compatibility within this file
@@ -176,6 +203,460 @@ def test_lora_manager_keeps_dlo_lora_buffers_on_compute_device(monkeypatch):
     assert pipeline.transformer.foo.lora_buffer_device == torch.device("cpu")
 
 
+@pytest.mark.parametrize(
+    "target_modules",
+    [
+        ["experts.0.gate_proj"],
+        r".*\.experts\.\d+\.gate_proj$",
+    ],
+)
+def test_lora_manager_matches_scoped_moe_targets(monkeypatch, target_modules):
+    import vllm.model_executor.layers.fused_moe as upstream_moe
+
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _TargetMoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = SimpleNamespace(
+                is_act_and_mul=True,
+                num_experts=2,
+            )
+            self.global_num_experts = 2
+
+    monkeypatch.setattr(upstream_moe, "MoERunner", _TargetMoERunner)
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _DummyBaseLayerWithLoRA(layer),
+    )
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.experts = _TargetMoERunner()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    peft_helper = type(
+        "_PH",
+        (),
+        {"r": 1, "target_modules": target_modules},
+    )()
+    manager._replace_layers_with_lora(peft_helper)
+
+    assert "transformer.experts" in manager._lora_modules
+    assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA)
+
+
+def test_moe_punica_initializes_public_mapping_metadata(monkeypatch):
+    import vllm.lora.punica_wrapper as punica_module
+
+    class _FakePunica:
+        def __init__(self):
+            self.update_calls = []
+
+        def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size):
+            self.update_calls.append((mapping, lora_index_to_id, max_loras, vocab_size))
+
+    punica = _FakePunica()
+    monkeypatch.setattr(punica_module, "get_punica_wrapper", lambda *args, **kwargs: punica)
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager._moe_punica_wrapper = None
+    manager._max_lora_rank = 8
+    manager.max_cached_adapters = 1
+    manager.dtype = torch.bfloat16
+    manager.device = torch.device("cpu")
+    manager._max_num_batched_tokens = 8
+
+    assert manager._get_moe_punica_wrapper() is punica
+    assert len(punica.update_calls) == 1
+    mapping, lora_index_to_id, max_loras, vocab_size = punica.update_calls[0]
+    assert mapping.index_mapping == (0,) * 8
+    assert mapping.prompt_mapping == (0,)
+    assert lora_index_to_id == [None]
+    assert max_loras == 1
+    assert vocab_size == 0
+
+
+def test_moe_lora_context_is_prepared_at_init_when_capacity_is_set(monkeypatch):
+    calls: list[str] = []
+
+    def _ensure(self):
+        calls.append("ensure")
+
+    monkeypatch.setattr(DiffusionLoRAManager, "_ensure_moe_lora_context", _ensure)
+    DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_num_batched_tokens=8,
+    )
+    assert calls == ["ensure"]
+
+
+def test_moe_lora_context_is_skipped_without_token_capacity(monkeypatch):
+    calls: list[str] = []
+
+    def _replace(self):
+        calls.append("replace")
+
+    monkeypatch.setattr(DiffusionLoRAManager, "_replace_moe_runners_with_lora", _replace)
+    DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    assert calls == []
+
+
+def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
+    import vllm.model_executor.layers.fused_moe as upstream_moe
+
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _TargetMoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = SimpleNamespace(is_act_and_mul=True, num_experts=2)
+            self.global_num_experts = 2
+
+    monkeypatch.setattr(upstream_moe, "MoERunner", _TargetMoERunner)
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _DummyBaseLayerWithLoRA(layer),
+    )
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub),
+    )
+    monkeypatch.setattr(manager_mod.DiffusionLoRAManager, "_publish_moe_lora_context", lambda self: None)
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.experts = _TargetMoERunner()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_num_batched_tokens=8,
+    )
+
+    assert "transformer.experts" in manager._lora_modules
+    assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA)
+
+
+def test_publish_moe_lora_context_uses_no_lora_mapping_until_adapter_is_active(monkeypatch):
+    import vllm.lora.layers.fused_moe as fused_moe
+    import vllm.lora.punica_wrapper as punica_module
+
+    class _FakePunica:
+        def __init__(self):
+            self.update_calls = []
+
+        def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size):
+            self.update_calls.append((mapping, lora_index_to_id, max_loras, vocab_size))
+
+    class _FakeMoELoRA(fused_moe.FusedMoEWithLoRA):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.mappings = []
+            self.base_layer = torch.nn.Module()
+
+        def set_mapping(self, punica_wrapper):
+            self.mappings.append(punica_wrapper)
+
+        def set_lora(self, index, lora_a, lora_b):
+            raise AssertionError("MoE layer has no adapter weights in this test")
+
+        def reset_lora(self, index):
+            pass
+
+    punica = _FakePunica()
+    monkeypatch.setattr(punica_module, "get_punica_wrapper", lambda *args, **kwargs: punica)
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager._moe_punica_wrapper = None
+    manager._max_lora_rank = 8
+    manager.max_cached_adapters = 1
+    manager.dtype = torch.bfloat16
+    manager.device = torch.device("cpu")
+    manager._max_num_batched_tokens = 4
+    manager._active_adapter_id = None
+    wrapper = _FakeMoELoRA()
+    manager._lora_modules = {"transformer.experts": wrapper}
+
+    manager._publish_moe_lora_context()
+    mapping, lora_index_to_id, _, _ = punica.update_calls[-1]
+    assert mapping.index_mapping == (0,) * 4
+    assert lora_index_to_id == [None]
+    assert wrapper.mappings == [punica]
+
+
+def test_activation_republishes_moe_mapping_after_committing_the_adapter(monkeypatch):
+    """The mapping is derived from ``_active_adapter_id``; activating an
+    adapter must republish it, otherwise the MoE kernels keep taking the
+    no-LoRA fast path and silently drop the expert contribution."""
+    import vllm.lora.layers.fused_moe as fused_moe
+    import vllm.lora.punica_wrapper as punica_module
+
+    class _FakePunica:
+        def __init__(self):
+            self.update_calls = []
+
+        def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size):
+            self.update_calls.append((mapping, lora_index_to_id, max_loras, vocab_size))
+
+    class _FakeMoELoRA(fused_moe.FusedMoEWithLoRA):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.mappings = []
+            # Not a MoERunner, so the dense binding path treats this layer as
+            # carrying no weights for the adapter below.
+            self.base_layer = torch.nn.Module()
+
+        def set_mapping(self, punica_wrapper):
+            self.mappings.append(punica_wrapper)
+
+        def set_lora(self, index, lora_a, lora_b):
+            raise AssertionError("MoE layer has no adapter weights in this test")
+
+        def reset_lora(self, index):
+            pass
+
+    punica = _FakePunica()
+    monkeypatch.setattr(punica_module, "get_punica_wrapper", lambda *args, **kwargs: punica)
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    manager._max_num_batched_tokens = 4
+    manager._max_lora_rank = 8
+    manager._lora_modules = {"transformer.experts": _FakeMoELoRA()}
+
+    dense_layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules["transformer.foo"] = dense_layer
+    manager._registered_adapters = {
+        1: type(
+            "LM",
+            (),
+            {
+                "id": 1,
+                "loras": {
+                    "transformer.foo": LoRALayerWeights(
+                        module_name="transformer.foo",
+                        rank=2,
+                        lora_alpha=2,
+                        lora_a=torch.ones((2, 4)),
+                        lora_b=torch.ones((2, 2)),
+                    )
+                },
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    manager._activate_adapter(1, 0.5)
+
+    assert manager._active_adapter_id == 1
+    assert len(dense_layer.set_calls) == 1
+    # The binding-time publish still sees no active adapter; the post-commit
+    # publish is what switches the mapping to the adapter slot.
+    published = [(m.index_mapping, ids) for m, ids, _, _ in punica.update_calls]
+    assert published[0] == ((0,) * 4, [None])
+    assert published[-1] == ((1,) * 4, [1])
+
+
+def test_failed_activation_republishes_no_adapter_moe_mapping(monkeypatch):
+    class _FailingLoRALayer(_DummyLoRALayer):
+        def set_lora(self, index: int, lora_a, lora_b):
+            raise RuntimeError("bind failed")
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    manager._max_num_batched_tokens = 4
+    failing = _FailingLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {"transformer.foo": failing}
+    manager._registered_adapters = {
+        1: type(
+            "LM",
+            (),
+            {
+                "id": 1,
+                "loras": {
+                    "transformer.foo": LoRALayerWeights(
+                        module_name="transformer.foo",
+                        rank=2,
+                        lora_alpha=2,
+                        lora_a=torch.ones((2, 4)),
+                        lora_b=torch.ones((2, 2)),
+                    )
+                },
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    seen_adapter_ids: list[int | None] = []
+    publish = manager._publish_moe_lora_context
+
+    def _recording_publish() -> None:
+        seen_adapter_ids.append(manager._active_adapter_id)
+        publish()
+
+    monkeypatch.setattr(manager, "_publish_moe_lora_context", _recording_publish)
+
+    # Start with another adapter active so the mapping currently points at the
+    # adapter slot; a failed switch has to republish the no-adapter mapping.
+    manager._active_adapter_id = 7
+    manager._adapter_scales = {7: 0.5}
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        manager._activate_adapter(1, 0.5)
+
+    assert manager._active_adapter_id is None
+    assert failing.reset_calls == 1
+    # A failed activation rolls back to the no-adapter mapping.
+    assert seen_adapter_ids == [None]
+
+
+def test_moe_lora_token_capacity_is_validated_before_forward(monkeypatch):
+    import vllm_omni.diffusion.lora.utils as utils_mod
+
+    class _Runner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_forward_pre_hook(lambda *_args: None)
+
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class _Wrapper(torch.nn.Module):
+        def __init__(self, base_layer):
+            super().__init__()
+            self.base_layer = base_layer
+            self.adapter_enabled = torch.ones(1, dtype=torch.int)
+
+        def create_lora_weights(self, *_args, **_kwargs):
+            pass
+
+        def set_lora(self, *_args, **_kwargs):
+            pass
+
+        def reset_lora(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(utils_mod, "MoERunner", _Runner)
+    monkeypatch.setattr(utils_mod, "_select_moe_lora_wrapper_cls", lambda: _Wrapper)
+
+    wrapper = utils_mod.from_layer_diffusion(
+        _Runner(),
+        max_loras=1,
+        lora_config=SimpleNamespace(),  # type: ignore[arg-type]
+        packed_modules_list=[],
+        max_num_batched_tokens=8,
+    )
+
+    assert wrapper(torch.zeros((8, 4))).shape == (8, 4)
+    with pytest.raises(ValueError, match="token count 9 exceeds the configured capacity 8"):
+        wrapper(torch.zeros((9, 4)))
+
+
+def test_move_moe_lora_buffers_keeps_all_stacks_and_views_on_device():
+    from vllm_omni.diffusion.lora.utils import _move_moe_lora_buffers
+
+    wrapper = SimpleNamespace(
+        max_loras=1,
+        local_num_experts=2,
+        enable_moe_shared_loras=False,
+        _w13_slices=2,
+        w13_lora_a_stacked=(torch.ones((1, 2, 3, 4)), torch.ones((1, 2, 3, 4))),
+        w13_lora_b_stacked=(torch.ones((1, 2, 5, 3)), torch.ones((1, 2, 5, 3))),
+        w2_lora_a_stacked=(torch.ones((1, 2, 3, 5)),),
+        w2_lora_b_stacked=(torch.ones((1, 2, 4, 3)),),
+        adapter_enabled=torch.ones(2, dtype=torch.int),
+    )
+
+    _move_moe_lora_buffers(wrapper, torch.device("meta"))  # type: ignore[arg-type]
+
+    for stacks in (
+        wrapper.w13_lora_a_stacked,
+        wrapper.w13_lora_b_stacked,
+        wrapper.w2_lora_a_stacked,
+        wrapper.w2_lora_b_stacked,
+    ):
+        assert all(tensor.device.type == "meta" for tensor in stacks)
+    assert wrapper.adapter_enabled.device.type == "meta"
+    assert len(wrapper.lora_a_stacked) == len(wrapper.lora_b_stacked) == 6
+    assert [tensor.shape for tensor in wrapper.lora_a_stacked] == [
+        (3, 4),
+        (3, 5),
+        (3, 4),
+        (3, 4),
+        (3, 5),
+        (3, 4),
+    ]
+
+
+def test_lora_manager_homes_lora_buffers_to_compute_device_without_dlo(monkeypatch):
+    # Non-DLO deployments used to leave `_resident_lora_device` unset, so
+    # buffers created while the base weights were offloaded stayed on CPU
+    # after wake, and rank-growth reinit re-stranded them (#8817).
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _LoRALayer(DummyBaseLayerWithLoRA):
+        lora_buffer_device = None
+
+        def _set_diffusion_lora_buffer_device(self, device):
+            self.lora_buffer_device = device
+            self._diffusion_lora_buffer_device = device
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _LoRALayer)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _LoRALayer(layer),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    compute = torch.device("meta")
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=compute,
+        dtype=torch.bfloat16,
+    )
+
+    manager._replace_layers_with_lora(type("_PH", (), {"r": 1})())
+
+    layer = pipeline.transformer.foo
+    assert layer.lora_buffer_device == compute
+    # The recorded device is what create_lora_weights consults when a later
+    # rank increase re-allocates the buffers, so the second exposure from
+    # #8817 is pinned by this attribute as well.
+    assert layer._diffusion_lora_buffer_device == compute
+
+
 def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch):
     import vllm_omni.diffusion.lora.manager as manager_mod
 
@@ -268,7 +749,9 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
     assert torch.allclose(torch.cat([b0, b1, b2], dim=0), B * 0.5)
 
 
-def test_lora_manager_activates_packed_lora_from_sublayers():
+@pytest.mark.parametrize("name_prefix", ["transformer.blocks.0.attn.", "blocks.0.attn.", ""])
+@pytest.mark.parametrize("target_modules", [("to_q",), ("to_q", "to_v"), ("to_q", "to_k", "to_v")])
+def test_lora_manager_activates_packed_lora_from_sublayers(name_prefix, target_modules):
     pipeline = torch.nn.Module()
     bound_names = None
 
@@ -296,8 +779,10 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     rank = 2
     loras: dict[str, LoRALayerWeights] = {}
     for name, out_dim in zip(["to_q", "to_k", "to_v"], [2, 1, 1]):
-        loras[f"transformer.blocks.0.attn.{name}"] = LoRALayerWeights(
-            module_name=f"transformer.blocks.0.attn.{name}",
+        if name not in target_modules:
+            continue
+        loras[f"{name_prefix}{name}"] = LoRALayerWeights(
+            module_name=f"{name_prefix}{name}",
             rank=rank,
             lora_alpha=rank,
             lora_a=torch.ones((rank, 4)) * (1 if name == "to_q" else 2),
@@ -318,9 +803,15 @@ def test_lora_manager_activates_packed_lora_from_sublayers():
     assert len(lora_a_list) == 3
     assert len(lora_b_list) == 3
     # Scale should apply to B only.
-    assert torch.allclose(lora_b_list[0], torch.ones((2, rank)) * 3 * 2.0)
-    assert torch.allclose(lora_b_list[1], torch.ones((1, rank)) * 4 * 2.0)
-    assert torch.allclose(lora_b_list[2], torch.ones((1, rank)) * 4 * 2.0)
+    for index, name in enumerate(("to_q", "to_k", "to_v")):
+        if name in target_modules:
+            weights = loras[f"{name_prefix}{name}"]
+            assert torch.equal(lora_a_list[index], weights.lora_a)
+            assert torch.equal(lora_b_list[index], weights.lora_b * 2.0)
+        else:
+            assert lora_a_list[index] is None
+            assert lora_b_list[index] is None
+    assert manager._active_adapter_id == 1
     assert bound_names == frozenset(loras)
 
 
@@ -385,6 +876,144 @@ def test_lora_manager_rolls_back_all_layers_when_activation_fails():
     manager._activate_adapter(1, scale=1.0)
     assert manager._active_adapter_id == 1
     assert len(first.set_calls) == first_calls_after_success + 2
+
+
+def test_lora_manager_rejects_adapter_that_binds_no_layer():
+    """An adapter whose target modules match nothing must fail, not silently no-op."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {"transformer.blocks.0.attn.to_q": layer}
+    manager._expected_lora_modules = {"to_q"}
+
+    # Adapter-side name the engine does not expose, e.g. a diffusers-style
+    # checkpoint against a differently named engine layout.
+    mismatched = LoRALayerWeights(
+        module_name="unet.down_blocks.0.attn.to_q",
+        rank=2,
+        lora_alpha=2,
+        lora_a=torch.ones((2, 2)),
+        lora_b=torch.ones((2, 2)),
+    )
+    manager._registered_adapters = {
+        3: type(
+            "LM",
+            (),
+            {
+                "id": 3,
+                "loras": {"unet.down_blocks.0.attn.to_q": mismatched},
+                "get_lora": lambda self, key: self.loras.get(key),
+            },
+        )()
+    }
+
+    with pytest.raises(ValueError, match="binding is incomplete") as excinfo:
+        manager._activate_adapter(3, scale=1.0)
+
+    # The message must name what was received so the mismatch is diagnosable.
+    assert "bound=0/1" in str(excinfo.value)
+    assert "unet.down_blocks.0.attn.to_q" in str(excinfo.value)
+    assert "expected target modules in ['to_q']" in str(excinfo.value)
+
+    # Nothing was bound and the adapter must not be left marked active.
+    assert manager._active_adapter_id is None
+    assert layer.set_calls == []
+    assert layer.reset_calls >= 1
+
+
+def test_lora_manager_rejects_empty_adapter():
+    """An empty adapter must not be considered successfully bound."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {"transformer.attn.to_q": layer}
+    manager._registered_adapters = {1: LoRAModel(1, rank=2, loras={})}
+
+    with pytest.raises(ValueError, match="bound=0/0"):
+        manager._activate_adapter(1, scale=1.0)
+
+    assert manager._active_adapter_id is None
+    assert manager._suspended_adapter_id is None
+    assert 1 not in manager._adapter_scales
+    assert layer.set_calls == []
+    assert layer.active_slices == ()
+    assert layer.reset_calls >= 1
+
+
+@pytest.mark.parametrize("suspend_previous", [False, True])
+@pytest.mark.parametrize("unbound_name", ["transformer.attn.to_out.0", "transformer.attn.to_qkv"])
+def test_lora_manager_rejects_partial_binding_and_rolls_back(unbound_name, suspend_previous):
+    """A partial bind must clear uploaded weights and invalidate fast paths."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=2,
+    )
+    layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    packed_layer = _DummyLoRALayer(n_slices=3, output_slices=(2, 1, 1))
+    manager._lora_modules = {
+        "transformer.attn.to_out": layer,
+        "transformer.attn.to_qkv": packed_layer,
+    }
+    manager._expected_lora_modules = {"to_out", "to_qkv"}
+
+    def weights(name, value):
+        return LoRALayerWeights(
+            module_name=name,
+            rank=2,
+            lora_alpha=2,
+            lora_a=torch.full((2, 2), value),
+            lora_b=torch.full((2, 2), value),
+        )
+
+    valid_name = "transformer.attn.to_out"
+    previous = LoRAModel(1, rank=2, loras={valid_name: weights(valid_name, 1.0)})
+    # The extra weights either use an unmatched checkpoint name or have a B
+    # shape that cannot be split across the fused layer's four output rows.
+    partial = LoRAModel(
+        2,
+        rank=2,
+        loras={valid_name: weights(valid_name, 2.0), unbound_name: weights(unbound_name, 2.0)},
+    )
+    manager._registered_adapters = {1: previous, 2: partial}
+    manager._activate_adapter(1, scale=0.5)
+    if suspend_previous:
+        manager._deactivate_all_adapters()
+
+    with pytest.raises(ValueError, match="binding is incomplete") as excinfo:
+        manager._activate_adapter(2, scale=1.0)
+
+    assert "LoRA adapter 2" in str(excinfo.value)
+    assert unbound_name in str(excinfo.value)
+    assert valid_name not in str(excinfo.value).replace(unbound_name, "")
+    if unbound_name.endswith("to_qkv"):
+        assert "lora_b.shape[0]=2" in str(excinfo.value)
+        assert "sum(output_slices)=4" in str(excinfo.value)
+        assert "output_slices=(2, 1, 1)" in str(excinfo.value)
+    else:
+        assert "expected target modules in ['to_out', 'to_qkv']" in str(excinfo.value)
+    assert len(layer.set_calls) == 2
+    assert layer.reset_calls == 1
+    assert layer.active_slices == ()
+    assert packed_layer.active_slices == ()
+    assert manager._active_adapter_id is None
+    assert manager._suspended_adapter_id is None
+    assert 2 not in manager._adapter_scales
+
+    manager._activate_adapter(1, scale=0.5)
+    assert len(layer.set_calls) == 3
+    assert layer.resume_calls == 0
+    assert manager._active_adapter_id == 1
+    assert torch.equal(layer.set_calls[-1][1], previous.loras[valid_name].lora_b * 0.5)
 
 
 def _dummy_lora_request(adapter_id: int) -> LoRARequest:
@@ -482,6 +1111,146 @@ def test_lora_manager_warns_when_all_adapters_pinned(monkeypatch):
     assert set(manager.list_adapters()) == {1, 2}
 
 
+def _make_hunyuan_image3_pipeline(num_heads=4, num_kv_heads=2, head_dim=2, hidden_size=8):
+    """Use production hooks and the production base-weight splitter without
+    allocating the full checkpoint or initializing distributed workers.
+    """
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import HunyuanImage3Model
+    from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import HunyuanImage3Pipeline
+
+    model = HunyuanImage3Model.__new__(HunyuanImage3Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        attention_head_dim=head_dim,
+        hidden_size=hidden_size,
+    )
+    pipeline = HunyuanImage3Pipeline.__new__(HunyuanImage3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.model = model
+    pipeline.transformer = model
+    return pipeline
+
+
+def _make_hunyuan_image3_qkv_base():
+    """An un-initialized QKVParallelLinear instance for isinstance() checks.
+
+    Supply the type and checkpoint head metadata for binding-only tests.
+    The PEFT forward test below constructs the real distributed projection.
+    """
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+
+    layer = object.__new__(QKVParallelLinear)
+    layer.total_num_heads = 4
+    layer.total_num_kv_heads = 2
+    layer.head_size = layer.v_head_size = 2
+    return layer
+
+
+def test_lora_manager_activates_hunyuan_image3_fused_qkv_lora():
+    """A fused HI3 ``qkv_proj`` LoRA-B (GQA-interleaved in the adapter) is
+    de-interleaved to the block [Q; K; V] layout the QKV output slices expect,
+    with the namespace alias resolving the PEFT adapter tensors."""
+    manager = DiffusionLoRAManager(
+        pipeline=_make_hunyuan_image3_pipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    wrapper = "transformer.layers.0.self_attn.qkv_proj"
+    packed_layer = _DummyLoRALayer(
+        n_slices=3,
+        output_slices=(8, 4, 4),
+        tp_size=1,
+    )
+    # Use QKV type identity and checkpoint head metadata for the manager's
+    # de-interleave branch; the forward test below constructs real layers.
+    packed_layer.base_layer = _make_hunyuan_image3_qkv_base()
+    manager._lora_modules = {wrapper: packed_layer}
+
+    rank = 3
+    # GQA-interleaved fused QKV rows: [Q-group0, K0, V0, Q-group1, K1, V1].
+    interleaved = torch.arange(16, dtype=torch.bfloat16).unsqueeze(1).repeat(1, rank)
+    lora = LoRALayerWeights(
+        module_name="model.layers.0.self_attn.qkv_proj",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=torch.ones((rank, 8)),
+        lora_b=interleaved,
+    )
+    manager._registered_adapters = {
+        11: type(
+            "LM",
+            (),
+            {
+                "id": 11,
+                "loras": {"model.layers.0.self_attn.qkv_proj": lora},
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    manager._activate_adapter(11, 0.5)
+
+    assert packed_layer.reset_calls == 0
+    assert len(packed_layer.set_calls) == 1
+    lora_a_list, lora_b_list = packed_layer.set_calls[0]
+    assert len(lora_a_list) == 3 and len(lora_b_list) == 3
+    # De-interleaved full [Q; K; V] slices, scaled by the lora scale.
+    expected_q = torch.cat([interleaved[0:4], interleaved[8:12]], dim=0) * 0.5
+    expected_k = torch.cat([interleaved[4:6], interleaved[12:14]], dim=0) * 0.5
+    expected_v = torch.cat([interleaved[6:8], interleaved[14:16]], dim=0) * 0.5
+    assert torch.equal(lora_b_list[0], expected_q)
+    assert torch.equal(lora_b_list[1], expected_k)
+    assert torch.equal(lora_b_list[2], expected_v)
+
+
+def test_lora_manager_rejects_hunyuan_image3_qkv_lora_with_unexpected_rows():
+    """If the fused HI3 QKV layout cannot be established (wrong row count), the
+    manager must fail closed instead of applying the LoRA to wrong slices."""
+    manager = DiffusionLoRAManager(
+        pipeline=_make_hunyuan_image3_pipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    wrapper = "transformer.layers.0.self_attn.qkv_proj"
+    packed_layer = _DummyLoRALayer(n_slices=3, output_slices=(8, 4, 4))
+    packed_layer.base_layer = _make_hunyuan_image3_qkv_base()
+    manager._lora_modules = {wrapper: packed_layer}
+
+    rank = 3
+    # Row count (12) does not match the HI3 QKV layout (16): fail closed.
+    lora = LoRALayerWeights(
+        module_name="model.layers.0.self_attn.qkv_proj",
+        rank=rank,
+        lora_alpha=rank,
+        lora_a=torch.ones((rank, 8)),
+        lora_b=torch.arange(12 * rank, dtype=torch.bfloat16).view(-1, rank),
+    )
+    manager._registered_adapters = {
+        12: type(
+            "LM",
+            (),
+            {
+                "id": 12,
+                "loras": {"model.layers.0.self_attn.qkv_proj": lora},
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    with pytest.raises(ValueError, match="cannot establish HunyuanImage-3 fused-QKV layout"):
+        manager._activate_adapter(12, 0.5)
+
+    assert packed_layer.set_calls == []
+    assert packed_layer.reset_calls >= 1
+    assert manager._active_adapter_id is None
+
+
 def test_lora_manager_applies_multiple_scales_correctly(monkeypatch):
     """Ensure that the LoRA manager applies scales correctly when the
     active adapter receives a different scale, i.e., the rank is unchanged.
@@ -567,16 +1336,48 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
     assert torch.all(lora_a == 1)
     assert torch.all(lora_b == initial_scale)
 
-    # Increase the rank; this resets the buffers, so the adapter is activated again
+    # Increase the rank; this resets the buffers, so the adapter is activated again.
     manager._ensure_max_lora_rank(8)
 
     # Ensure we actually took the rank expansion path, which recreates
-    # and sets the weight buffets, but that the scale didn't change
+    # and sets the weight buffers, but that the scale didn't change.
     assert lora_model.transformer.foo.create_calls == 1
     assert len(lora_model.transformer.foo.set_calls) == 2
     lora_a, lora_b = lora_model.transformer.foo.set_calls[1]
     assert torch.all(lora_a == 1)
     assert torch.all(lora_b == initial_scale)
+
+
+def test_rank_growth_invalidates_moe_punica_before_republish(monkeypatch):
+    adapter_id = 7
+    lora_model = _DummyLM(rank=8)
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    manager._max_lora_rank = 8
+    manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
+    manager._registered_adapters = {adapter_id: lora_model}
+    manager._active_adapter_id = adapter_id
+    manager._adapter_scales = {adapter_id: 0.5}
+    manager._moe_punica_wrapper = object()
+
+    published_cache_values = []
+
+    def _publish_with_current_rank():
+        published_cache_values.append(manager._moe_punica_wrapper)
+        manager._moe_punica_wrapper = SimpleNamespace(max_lora_rank=manager._max_lora_rank)
+
+    monkeypatch.setattr(manager, "_bind_adapter_weights", lambda *_args: None)
+    monkeypatch.setattr(manager, "_publish_moe_lora_context", _publish_with_current_rank)
+
+    manager._ensure_max_lora_rank(128)
+
+    # The rank bump clears the punica cache before the first republish, and
+    # the reactivation publishes again once the adapter state is committed.
+    assert published_cache_values[0] is None
+    assert manager._moe_punica_wrapper.max_lora_rank == 128
 
 
 def test_scale_keys_are_rounded():
@@ -661,8 +1462,10 @@ def test_lora_manager_discovers_bagel_component(monkeypatch):
         lambda root, name, sub: fake_replace_submodule(root, name, sub, replace_calls),
     )
 
-    # Pipeline with a 'bagel' component (no 'transformer')
+    # Pipeline with a 'bagel' component (no 'transformer') declared via
+    # _lora_components, matching how BagelPipeline opts in.
     pipeline = torch.nn.Module()
+    pipeline._lora_components = ["bagel"]
     pipeline.bagel = torch.nn.Module()
     pipeline.bagel.language_model = torch.nn.Module()
     pipeline.bagel.language_model.qkv_proj = _FakeLinearBase()
@@ -723,3 +1526,223 @@ def test_lora_manager_discovers_unet_component(monkeypatch):
     assert "unet.down_block.proj" in manager._lora_modules
     # Verify the module was actually replaced in the tree (not just recorded)
     assert isinstance(pipeline.unet.down_block.proj, _DummyBaseLayerWithLoRA)
+
+
+def _suspend_harness(monkeypatch, adapter_id: int = 7, rank: int = 2):
+    """Manager wired to a single dummy layer, ready to activate `adapter_id`."""
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+
+    lora_model = _DummyLM(rank=rank)
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(manager, "_load_adapter", lambda _req: (lora_model, type("PH", (), {"r": rank})()))
+    manager._registered_adapters = {adapter_id: lora_model}
+    manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
+    return manager, lora_model.transformer.foo
+
+
+def test_reactivating_same_adapter_resumes_without_rebinding(monkeypatch):
+    """activate -> deactivate -> activate at the same scale must re-arm the
+    saved mask instead of re-uploading every layer."""
+    adapter_id = 7
+    req = _dummy_lora_request(adapter_id)
+    manager, layer = _suspend_harness(monkeypatch, adapter_id)
+
+    manager.set_active_adapter(req, lora_scale=0.5)
+    assert len(layer.set_calls) == 1
+    assert layer.active_slices == (True,)
+
+    manager.set_active_adapter(None)
+    assert manager._suspended_adapter_id == adapter_id
+    assert layer.suspend_calls == 1
+    assert layer.active_slices == (False,)
+    # Suspending must not tear the upload down.
+    assert layer.reset_calls == 0
+
+    manager.set_active_adapter(req, lora_scale=0.5)
+    assert layer.resume_calls == 1
+    assert len(layer.set_calls) == 1, "resume must not rebind"
+    assert layer.active_slices == (True,)
+    assert manager._active_adapter_id == adapter_id
+    assert manager._suspended_adapter_id is None
+
+
+def test_suspended_scope_restores_exact_scale_after_another_adapter(monkeypatch):
+    manager, layer = _suspend_harness(monkeypatch)
+    manager._registered_adapters[8] = manager._registered_adapters[7]
+    manager.set_active_adapter(_dummy_lora_request(7), lora_scale=0.123456)
+    original_b = layer.set_calls[-1][1].clone()
+    with manager.suspended():
+        manager.set_active_adapter(_dummy_lora_request(8), lora_scale=0.7)
+        with manager.suspended():
+            assert manager._active_adapter_id is None
+        assert manager._active_adapter_id == 8
+    assert manager._active_adapter_id == 7
+    torch.testing.assert_close(layer.set_calls[-1][1], original_b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("second_scale", [0.5, 0.25])
+def test_scale_or_adapter_change_forces_rebind(monkeypatch, second_scale):
+    """A different scale, or a different adapter, must take the full bind
+    path rather than re-arming a stale mask."""
+    adapter_id = 7
+    manager, layer = _suspend_harness(monkeypatch, adapter_id)
+
+    manager.set_active_adapter(_dummy_lora_request(adapter_id), lora_scale=0.5)
+    manager.set_active_adapter(None)
+    assert manager._suspended_adapter_id == adapter_id
+
+    # Same id at a new scale, or a different id entirely.
+    other_id = adapter_id if second_scale != 0.5 else adapter_id + 1
+    if other_id != adapter_id:
+        manager._registered_adapters[other_id] = manager._registered_adapters[adapter_id]
+
+    manager.set_active_adapter(_dummy_lora_request(other_id), lora_scale=second_scale)
+    assert len(layer.set_calls) == 2, "must rebind"
+    assert manager._suspended_adapter_id is None
+    assert manager._active_adapter_id == other_id
+
+
+def test_partial_packed_mask_survives_suspend_resume(monkeypatch):
+    """A packed layer where only some slices carry LoRA must come back with
+    the same mask, not an all-True one."""
+    adapter_id = 7
+    manager, layer = _suspend_harness(monkeypatch, adapter_id)
+
+    # Emulate a packed bind that left slice 1 empty.
+    layer.set_lora(0, [torch.ones(2, 2), None], [torch.ones(2, 2), None])
+    manager._active_adapter_id = adapter_id
+    manager._update_adapter_scale(adapter_id, 0.5)
+    assert layer.active_slices == (True, False)
+
+    manager.set_active_adapter(None)
+    assert layer.active_slices == (False, False)
+
+    manager.set_active_adapter(_dummy_lora_request(adapter_id), lora_scale=0.5)
+    assert layer.active_slices == (True, False), "mask must survive unchanged"
+
+
+def test_removing_suspended_adapter_drops_the_upload(monkeypatch):
+    """A removed adapter can never be resumed, so its weights must not stay
+    in the stacked buffers."""
+    adapter_id = 7
+    manager, layer = _suspend_harness(monkeypatch, adapter_id)
+
+    manager.set_active_adapter(_dummy_lora_request(adapter_id), lora_scale=0.5)
+    manager.set_active_adapter(None)
+    assert manager._suspended_adapter_id == adapter_id
+
+    manager.remove_adapter(adapter_id)
+    assert manager._suspended_adapter_id is None
+    assert layer.reset_calls == 1, "the upload must be torn down"
+    assert layer.suspended_slices is None
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_hunyuan_image3_peft_qkv_forward(tmp_path, monkeypatch, tp_size):
+    """Disk PEFT -> real manager/hooks -> vLLM sharding -> numerical forward.
+
+    TP4 also covers replicated KV heads. Only distributed rank discovery is
+    stubbed: projection construction, adapter loading and all LoRA operations
+    execute production code. The oracle indexes checkpoint rows explicitly.
+    """
+    import json
+
+    from safetensors.torch import save_file
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+
+    def cpu_unquantized_gemm(_layer, inputs, weight, bias=None):
+        return torch.nn.functional.linear(inputs, weight, bias)
+
+    # This numerical contract intentionally runs on CPU. Accelerator builds
+    # select the unquantized GEMM from the process-wide platform, which would
+    # otherwise dispatch CPU tensors to the ROCm-only custom operator.
+    monkeypatch.setattr(
+        linear,
+        "dispatch_unquantized_gemm",
+        lambda *_args, **_kwargs: cpu_unquantized_gemm,
+    )
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    rank = 2
+    a = torch.arange(16, dtype=torch.float32).reshape(rank, 8) / 16
+    b = torch.arange(32, dtype=torch.float32).reshape(16, rank) / 32
+    prefix = "base_model.model.model.layers.0.self_attn.qkv_proj"
+    save_file(
+        {f"{prefix}.lora_A.weight": a, f"{prefix}.lora_B.weight": b},
+        str(adapter_dir / "adapter_model.safetensors"),
+    )
+    (adapter_dir / "adapter_config.json").write_text(
+        json.dumps({"r": rank, "lora_alpha": rank, "target_modules": ["qkv_proj"]})
+    )
+    request = LoRARequest(lora_name="hi3", lora_int_id=6411, lora_path=str(adapter_dir))
+    x = torch.arange(24, dtype=torch.float32).reshape(3, 8) / 24
+    q_rows = [0, 1, 2, 3, 8, 9, 10, 11]
+    k_rows = [4, 5, 12, 13]
+    v_rows = [6, 7, 14, 15]
+    for tp_rank in range(tp_size):
+        monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: tp_size)
+        monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: tp_rank)
+        monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: tp_rank)
+        monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: tp_size)
+        with set_current_vllm_config(VllmConfig()):
+            pipeline = _make_hunyuan_image3_pipeline()
+            base = linear.QKVParallelLinear(8, 2, 4, 2, bias=False, params_dtype=torch.float32)
+            base.weight.data.zero_()
+            block = torch.nn.Module()
+            block.self_attn = torch.nn.Module()
+            block.self_attn.qkv_proj = base
+            pipeline.model.layers = torch.nn.ModuleList([block])
+            manager = DiffusionLoRAManager(pipeline, torch.device("cpu"), torch.float32)
+            manager.set_active_adapter(request, lora_scale=0.5)
+            wrapped = pipeline.model.layers[0].self_attn.qkv_proj
+            assert wrapped is not base
+            q_size = 8 // tp_size
+            kv_size = 4 // min(tp_size, 2)
+            kv_rank = tp_rank // max(tp_size // 2, 1)
+            rows = (
+                q_rows[tp_rank * q_size : (tp_rank + 1) * q_size]
+                + k_rows[kv_rank * kv_size : (kv_rank + 1) * kv_size]
+                + v_rows[kv_rank * kv_size : (kv_rank + 1) * kv_size]
+            )
+            expected = (x @ a.T) @ b[rows].T * 0.5
+            with torch.inference_mode():
+                torch.testing.assert_close(wrapped.apply(x), expected)
+                manager.set_active_adapter(None)
+                torch.testing.assert_close(wrapped.apply(x), torch.zeros_like(expected))
+                manager.set_active_adapter(request, lora_scale=0.5)
+                torch.testing.assert_close(wrapped.apply(x), expected)
+
+
+@pytest.mark.parametrize("projection", ["qkv_proj", "o_proj"])
+def test_hunyuan_image3_lora_namespace_is_model_scoped(projection):
+    from vllm.lora.lora_model import LoRAModel
+
+    name = f"model.layers.0.self_attn.{projection}"
+    weights = LoRALayerWeights(name, 2, 2, torch.ones(2, 8), torch.ones(8, 2))
+    adapter = LoRAModel(6411, 2, {name: weights})
+    wrapper = f"transformer.layers.0.self_attn.{projection}"
+    hi3 = DiffusionLoRAManager(_make_hunyuan_image3_pipeline(), torch.device("cpu"), torch.float32)
+    other = DiffusionLoRAManager(_DummyPipeline(), torch.device("cpu"), torch.float32)
+    assert hi3._get_lora_weights(adapter, wrapper) is weights
+    assert other._get_lora_weights(adapter, wrapper) is None
+
+
+@pytest.mark.parametrize("head_dim_key", ["head_dim", "attention_head_dim", None])
+def test_hunyuan_image3_real_qkv_hook_head_dimension(head_dim_key):
+    pipeline = _make_hunyuan_image3_pipeline()
+    del pipeline.model.config.attention_head_dim
+    if head_dim_key is not None:
+        setattr(pipeline.model.config, head_dim_key, 2)
+    b = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+    expected_rows = [0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]
+    torch.testing.assert_close(pipeline._deinterleave_fused_qkv_lora_b(b), b[expected_rows])
+    assert pipeline._deinterleave_fused_qkv_lora_b(b[:-1]) is None

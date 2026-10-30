@@ -249,7 +249,7 @@ def test_code2wav_reuses_and_clears_per_request_streaming_cache() -> None:
     model = NemotronVoiceChatCode2Wav.__new__(NemotronVoiceChatCode2Wav)
     nn.Module.__init__(model)
     model._sample_rate, model._num_quantizers, model._codebook_size, model._wav_per_frame = 22050, 31, 1024, 1764
-    model._duplex_codec_caches = {}
+    model._stream_caches = {}
     model.audio_codec = Codec()
 
     def info(codes):
@@ -258,6 +258,6 @@ def test_code2wav_reuses_and_clears_per_request_streaming_cache() -> None:
     model.forward(runtime_additional_information=info(torch.zeros((1, 31), dtype=torch.long)))
     model.forward(runtime_additional_information=info(torch.zeros((2, 31), dtype=torch.long)))
     assert model.audio_codec.caches[0] is model.audio_codec.caches[1]
-    assert "req" in model._duplex_codec_caches
+    assert "req" in model._stream_caches
     model.on_requests_finished({"req"})
-    assert "req" not in model._duplex_codec_caches
+    assert "req" not in model._stream_caches

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Adapted from nvidia/Nemotron-Labs-Audex-2B (Apache-2.0):
 #   inference_scripts_vllm/audioqa_scripts/audex_2b_vllm/audio_features.py
@@ -33,12 +33,13 @@ from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
+
+from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 
 SOUND_TOKEN = "<so_embedding>"
 SOUND_START_TOKEN = "<so_start>"
@@ -176,7 +177,7 @@ class AudexDummyInputsBuilder(BaseDummyInputsBuilder[AudexProcessingInfo]):
         return {"audio": self._get_dummy_audios(length=audio_len, num_audios=num_audios, overrides=overrides)}
 
 
-class AudexMultiModalProcessor(BaseMultiModalProcessor[AudexProcessingInfo]):
+class AudexMultiModalProcessor(OmniMultiModalProcessor[AudexProcessingInfo]):
     def _call_hf_processor(
         self,
         prompt: str,

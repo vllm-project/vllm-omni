@@ -37,7 +37,7 @@ Every model-centric e2e test must declare **exactly one** type marker:
 | **Diffusion X2I(&A&T) Model Test** | x2**i** / x2**a** / x2**t** — image, audio, text (non-video) | Qwen-Image*, BAGEL, FLUX, SD3, Z-Image, LongCat, DreamZero |
 | **Diffusion X2V Model Test** | x2**v** — video only | Wan2.2, HunyuanVideo 1.5, Wan VACE |
 
-PR labels for selective nightly runs: `diffusion-x2iat-test`, `diffusion-x2v-test` (plus `nightly-test` / `NIGHTLY=1`).
+PR label for L4 on a branch: `nightly-test` (jobs then filtered by `source_file_dependencies`). Scheduled `main` uses `NIGHTLY=1` and runs every nightly job. L5 Reliability / Perf use `weekly-test` with the same path filter; CPU coverage and the weekly E2E group are env-only (`WEEKLY=1` / `NON_CRITICAL=1`) and are not source-filtered.
 
 ## Level and Marker Mapping
 
@@ -238,7 +238,7 @@ pytest -s -v dfx/reliability/invalid_param_test/ -m "slow and L4"
 pytest -s -v dfx/reliability/invalid_param_test/test_invalid_image_generation.py::test_images_generations_invalid_requests -m "slow and H100"
 ```
 
-**Trigger:** `WEEKLY=1` or PR label `weekly-test`. Appending cases to existing scripts usually needs **no YAML edit** (directory sweep). No `source_file_dependencies` on weekly steps.
+**Trigger:** `WEEKLY=1` (all jobs) or PR label `weekly-test` (Reliability / Perf, filtered by `source_file_dependencies`). Appending cases to existing scripts usually needs **no YAML edit** (directory sweep).
 
 ### Platform-targeted examples
 

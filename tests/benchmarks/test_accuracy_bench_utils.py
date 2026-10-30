@@ -1,12 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # ruff: noqa: E402, I001
 import argparse
+import json
+import logging
 import math
 import os
 import sys
-import types
+from datetime import datetime
 from pathlib import Path
 
 import pytest
+import requests
 from PIL import Image
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -45,9 +51,300 @@ from benchmarks.accuracy.text_to_image.gbench import (
 from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     build_serve_common_argv,
     seed_tts_bench_argv,
+    videomme_bench_argv,
 )
-from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import sync_dataset_env_from_ns
+from tests.e2e.accuracy.helpers import (
+    _acc_result_filename,
+    _validate_seed_tts,
+    _write_accuracy_result_metadata,
+    parse_acc_benchmark_args,
+    seed_tts_eval_env,
+    sync_dataset_env_from_ns,
+)
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
+
+
+def test_videomme_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):
+    monkeypatch.setenv("VLLM_VIDEOMME_DATASET_PATH", "lmms-eval/Video-MME")
+    monkeypatch.delenv("VLLM_VIDEOMME_REPO", raising=False)
+    monkeypatch.delenv("VIDEOMME_ROOT", raising=False)
+
+    argv = videomme_bench_argv()
+
+    dataset_idx = argv.index("--dataset-path")
+    assert argv[argv.index("--dataset-name") + 1] == "videomme"
+    assert argv[dataset_idx + 1] == "lmms-eval/Video-MME"
+
+
+def test_videomme_bench_argv_uses_local_directory(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("VLLM_VIDEOMME_DATASET_PATH", str(tmp_path))
+    monkeypatch.delenv("VIDEOMME_ROOT", raising=False)
+
+    argv = videomme_bench_argv()
+
+    assert argv[argv.index("--dataset-path") + 1] == str(tmp_path.resolve())
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        (
+            "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "result_acc_Qwen3-Omni-30B-A3B-Instruct_daily_omni_20261014_164800.json",
+        ),
+        (
+            "openbmb/MiniCPM-o-4_5",
+            "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json",
+        ),
+        (
+            "/models/MiniCPM-o-4_5/",
+            "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json",
+        ),
+    ],
+)
+def test_acc_result_filename(model: str, expected: str) -> None:
+    when = datetime(2026, 10, 14, 16, 48, 0)
+    assert _acc_result_filename(model, "daily_omni", when=when) == expected
+
+
+def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import tests.helpers.hardware as hardware
+
+    monkeypatch.setattr(hardware, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "main")
+    path = tmp_path / "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json"
+    path.write_text(
+        json.dumps({"model_id": "openbmb/MiniCPM-o-4_5", "daily_omni_accuracy": 0.8}),
+        encoding="utf-8",
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    _write_accuracy_result_metadata(
+        path,
+        data,
+        {"min_daily_omni_accuracy": 0.77, "min_seed_tts_mean_sim": None},
+        dataset="daily_omni",
+    )
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["daily_omni_accuracy"] == 0.8
+    assert saved["dataset"] == "daily_omni"
+    assert saved["model_id"] == "openbmb/MiniCPM-o-4_5"
+    assert saved["baseline"] == {"min_daily_omni_accuracy": 0.77}
+    assert saved["Hardware"] == "H100"
+    assert saved["branch"] == "main"
+
+
+def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    import tests.helpers.hardware as hardware
+
+    def _boom() -> str:
+        raise RuntimeError("device_count unavailable")
+
+    monkeypatch.setattr(hardware, "get_runtime_resource_label", _boom)
+    monkeypatch.delenv("BUILDKITE_BRANCH", raising=False)
+    path = tmp_path / "result_acc_Qwen3-Omni-30B-A3B-Instruct_daily_omni_20261015_110000.json"
+    path.write_text(
+        json.dumps({"model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct", "daily_omni_accuracy": 0.8}),
+        encoding="utf-8",
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    with caplog.at_level(logging.WARNING):
+        _write_accuracy_result_metadata(
+            path,
+            data,
+            {"min_daily_omni_accuracy": 0.69},
+            dataset="daily_omni",
+        )
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["daily_omni_accuracy"] == 0.8
+    assert saved["dataset"] == "daily_omni"
+    assert saved["model_id"] == "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    assert saved["baseline"] == {"min_daily_omni_accuracy": 0.69}
+    assert saved["Hardware"] == ""
+    assert saved["branch"] == ""
+    assert "Hardware" in caplog.text
+
+
+def test_sync_dataset_env_preserves_videomme_hf_repo_id(monkeypatch):
+    ns = argparse.Namespace(
+        daily_omni_repo=None,
+        daily_omni_qa_json=None,
+        daily_omni_video_dir=None,
+        videomme_repo=None,
+        videomme_dataset_path="lmms-eval/Video-MME",
+        seed_tts_dataset_path=None,
+        seed_tts_root=None,
+    )
+
+    monkeypatch.delenv("VLLM_VIDEOMME_DATASET_PATH", raising=False)
+    sync_dataset_env_from_ns(ns)
+
+    assert os.environ["VLLM_VIDEOMME_DATASET_PATH"] == "lmms-eval/Video-MME"
+
+
+def test_validate_seed_tts_floor_fails_closed_when_score_is_missing():
+    base = {
+        "seed_tts_content_evaluated": 4,
+        "seed_tts_content_error_mean": 0.02,
+        "seed_tts_sim_mean": None,
+        "seed_tts_sim_evaluated": 0,
+        "seed_tts_utmos_mean": None,
+        "seed_tts_utmos_evaluated": 0,
+    }
+
+    missing = _validate_seed_tts(base, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.5)
+    assert any("seed_tts_sim_mean is missing" in err for err in missing)
+    assert any("seed_tts_utmos_mean is missing" in err for err in missing)
+
+    low = _validate_seed_tts(
+        {
+            **base,
+            "seed_tts_sim_mean": 0.70,
+            "seed_tts_sim_evaluated": 4,
+            "seed_tts_utmos_mean": 3.1,
+            "seed_tts_utmos_evaluated": 4,
+        },
+        max_mean_wer=0.05,
+        min_mean_sim=0.80,
+        min_mean_utmos=3.5,
+    )
+    assert any("seed_tts_sim_mean=0.700000" in err for err in low)
+    assert any("seed_tts_utmos_mean=3.100000" in err for err in low)
+
+    ok = _validate_seed_tts(
+        {
+            **base,
+            "seed_tts_sim_mean": 0.86,
+            "seed_tts_sim_evaluated": 4,
+            "seed_tts_utmos_mean": 4.1,
+            "seed_tts_utmos_evaluated": 4,
+        },
+        max_mean_wer=0.05,
+        min_mean_sim=0.80,
+        min_mean_utmos=3.5,
+    )
+    assert ok == []
+
+
+def test_seed_tts_floor_rejects_incomplete_sim_and_utmos_coverage():
+    """A mean above the floor must not pass when most utterances were not scored."""
+    partial = {
+        "seed_tts_content_evaluated": 1088,
+        "seed_tts_content_error_mean": 0.02,
+        "seed_tts_turn_count": 1088,
+        "seed_tts_request_failed": 0,
+        "seed_tts_no_pcm": 0,
+        "seed_tts_sim_mean": 0.90,
+        "seed_tts_sim_evaluated": 10,
+        "seed_tts_sim_failed": 1078,
+        "seed_tts_utmos_mean": 3.35,
+        "seed_tts_utmos_evaluated": 10,
+        "seed_tts_utmos_failed": 1078,
+    }
+    errs = _validate_seed_tts(partial, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10)
+    assert any("seed_tts_sim_evaluated=10" in err and "failed=1078" in err for err in errs)
+    assert any("seed_tts_utmos_evaluated=10" in err and "failed=1078" in err for err in errs)
+    assert not any("seed_tts_sim_mean=0.900000" in err for err in errs)
+    assert not any("seed_tts_utmos_mean=3.350000" in err for err in errs)
+
+
+@pytest.mark.parametrize(
+    ("timed_out_requests", "cancelled_after_timeout_requests"),
+    [(1, 0), (0, 3)],
+)
+def test_validate_seed_tts_rejects_high_scoring_partial_timeout_result(
+    timed_out_requests: int,
+    cancelled_after_timeout_requests: int,
+) -> None:
+    partial = {
+        "seed_tts_content_evaluated": 1,
+        "seed_tts_content_error_mean": 0.01,
+        "seed_tts_turn_count": 1,
+        "seed_tts_request_failed": 0,
+        "seed_tts_no_pcm": 0,
+        "seed_tts_sim_mean": 0.95,
+        "seed_tts_sim_evaluated": 1,
+        "seed_tts_sim_failed": 0,
+        "seed_tts_utmos_mean": 4.5,
+        "seed_tts_utmos_evaluated": 1,
+        "seed_tts_utmos_failed": 0,
+        "timed_out_requests": timed_out_requests,
+        "cancelled_after_timeout_requests": cancelled_after_timeout_requests,
+    }
+
+    errs = _validate_seed_tts(partial, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10)
+
+    assert any(
+        f"timed_out_requests={timed_out_requests}" in err
+        and f"cancelled_after_timeout_requests={cancelled_after_timeout_requests}" in err
+        for err in errs
+    )
+
+
+def test_seed_tts_floor_coverage_excludes_rows_the_scorer_never_sees():
+    """ASR failures skip SIM, empty audio skips UTMOS; neither is a coverage gap."""
+    result = {
+        "seed_tts_turn_count": 1088,
+        "seed_tts_request_failed": 0,
+        "seed_tts_no_pcm": 0,
+        "seed_tts_asr_failed": 2,
+        "seed_tts_empty_audio": 1,
+        "seed_tts_content_evaluated": 1086,
+        "seed_tts_content_error_mean": 0.02,
+        "seed_tts_sim_skipped_no_ref": 3,
+        "seed_tts_sim_mean": 0.86,
+        "seed_tts_sim_evaluated": 1083,
+        "seed_tts_sim_failed": 0,
+        "seed_tts_utmos_mean": 3.35,
+        "seed_tts_utmos_evaluated": 1087,
+        "seed_tts_utmos_failed": 0,
+    }
+    assert _validate_seed_tts(result, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10) == []
+
+    short = _validate_seed_tts(
+        {**result, "seed_tts_sim_evaluated": 1082, "seed_tts_utmos_evaluated": 1086},
+        max_mean_wer=0.05,
+        min_mean_sim=0.80,
+        min_mean_utmos=3.10,
+    )
+    assert any("seed_tts_sim_evaluated=1082" in err and "expected=1083" in err for err in short)
+    assert any("seed_tts_utmos_evaluated=1086" in err and "expected=1087" in err for err in short)
+
+
+def test_seed_tts_eval_env_enables_only_configured_floors(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("SEED_TTS_SIM_EVAL", raising=False)
+    monkeypatch.delenv("SEED_TTS_UTMOS_EVAL", raising=False)
+    ns = parse_acc_benchmark_args(
+        [
+            "--skip-daily-omni",
+            "--skip-videomme",
+            "--min-seed-tts-mean-sim",
+            "0.80",
+            "--seed-tts-eval-device",
+            "cuda:1",
+        ]
+    )
+
+    env = seed_tts_eval_env(ns)
+
+    assert env["SEED_TTS_WER_EVAL"] == "1"
+    assert env["SEED_TTS_SIM_EVAL"] == "1"
+    assert env["SEED_TTS_EVAL_DEVICE"] == "cuda:1"
+    assert "SEED_TTS_UTMOS_EVAL" not in env
+
+
+def test_seed_tts_eval_env_keeps_explicit_disable(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SEED_TTS_SIM_EVAL", "0")
+    ns = parse_acc_benchmark_args(["--skip-daily-omni", "--skip-videomme", "--min-seed-tts-mean-sim", "0.80"])
+
+    env = seed_tts_eval_env(ns)
+
+    assert "SEED_TTS_SIM_EVAL" not in env
 
 
 def test_seed_tts_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):
@@ -106,11 +403,9 @@ def test_resolve_seed_tts_root_downloads_only_requested_locale(monkeypatch, tmp_
         captured["allow_patterns"] = allow_patterns
         return str(downloaded_root)
 
-    monkeypatch.setitem(
-        sys.modules,
-        "huggingface_hub",
-        types.SimpleNamespace(snapshot_download=fake_snapshot_download),
-    )
+    from vllm_omni.transformers_utils import repo_utils
+
+    monkeypatch.setattr(repo_utils.hf_api(), "snapshot_download", fake_snapshot_download)
 
     resolved = resolve_seed_tts_root(
         "zhaochenyang20/seed-tts-eval",
@@ -272,7 +567,8 @@ def test_trajectory_judge_payload_collapses_six_frames_into_single_storyboard():
     assert judge_images[0].size == (24, 12)
 
 
-def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch):
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch, num_images):
     captured = {}
 
     class FakeResponse:
@@ -305,16 +601,46 @@ def test_image_edit_client_uses_openai_image_edit_endpoint(monkeypatch):
     output = client.generate_image_edit(
         model="Qwen/Qwen-Image-Edit",
         prompt="edit this image",
-        images=image,
+        images=image if num_images == 1 else [image] * num_images,
         width=512,
         height=512,
+        guidance_scale=2.5,
+        seed=42,
+        bot_task="think_recaption",
+        sys_type="en_unified",
     )
 
     assert output.size == (1, 1)
     assert captured["url"] == "http://127.0.0.1:8093/v1/images/edits"
     assert captured["data"]["prompt"] == "edit this image"
     assert captured["data"]["size"] == "512x512"
-    assert captured["files"][0][0] == "image"
+    assert len(captured["files"]) == num_images
+    assert all(field == ("image" if num_images == 1 else "image[]") for field, _ in captured["files"])
+    assert captured["data"]["guidance_scale"] == "2.5"
+    assert captured["data"]["seed"] == "42"
+    assert captured["data"]["bot_task"] == "think_recaption"
+    assert captured["data"]["sys_type"] == "en_unified"
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+def test_image_edit_client_preserves_server_error_detail(mocker, status_code):
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = b'{"error": "image input limit exceeded"}'
+    post = mocker.patch("benchmarks.accuracy.common.requests.post", return_value=response)
+    client = VllmOmniImageClient(base_url="http://127.0.0.1:8093")
+
+    with pytest.raises(requests.HTTPError, match="image input limit exceeded") as exc:
+        client.generate_image_edit(
+            model="test-model",
+            prompt="edit this image",
+            images=Image.new("RGB", (2, 2)),
+            width=512,
+            height=512,
+        )
+
+    assert exc.value.response is response
+    post.assert_called_once()
 
 
 def test_text_to_image_client_forwards_output_compression(monkeypatch):

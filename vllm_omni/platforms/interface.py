@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from enum import Enum
 from typing import Any
@@ -56,6 +57,11 @@ class OmniPlatform(Platform):
 
     def is_out_of_tree(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.OOT
+
+    @classmethod
+    def prepare_stage_engine(cls) -> None:
+        """Install platform runtime compatibility before constructing a stage engine."""
+        return None
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
@@ -301,6 +307,15 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def memory_reserved(cls, device: torch.device | int | None = None) -> int:
+        """Bytes reserved by this process's caching allocator on ``device``.
+
+        Device-wide ``get_device_memory`` counts every process; this is the
+        portable equivalent of ``torch.cuda.memory_reserved``.
+        """
+        return 0
+
+    @classmethod
     def create_autocast_context(
         cls,
         *,
@@ -329,7 +344,7 @@ class OmniPlatform(Platform):
     def set_device_control_env_var(cls, devices: str | int | None) -> None:
         import os
 
-        os.environ[cls.device_control_env_var] = devices
+        os.environ[cls.device_control_env_var] = "" if devices is None else str(devices)
 
     @classmethod
     def unset_device_control_env_var(cls) -> None:
@@ -356,6 +371,33 @@ class OmniPlatform(Platform):
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
 
         return CUDAGraphWrapper
+
+    def capture_graph(
+        self, capture: Callable[[], None], generators: Sequence[torch.Generator] = ()
+    ) -> torch.cuda.CUDAGraph | None:
+        """Capture ``capture`` into a model-owned device graph.
+
+        Returns ``None`` when the platform cannot capture; ``replay_graph`` then
+        runs the eager callable on the same static buffers instead.
+        """
+        from vllm.platforms import current_platform
+
+        if not self.is_cuda_alike():
+            return None
+        graph = torch.cuda.CUDAGraph()
+        for generator in generators:
+            graph.register_generator_state(generator)
+        # Share vLLM's pool, which is cached per platform class, with the runner's graphs.
+        with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool(), capture_error_mode="thread_local"):
+            capture()
+        return graph
+
+    @classmethod
+    def replay_graph(cls, graph: torch.cuda.CUDAGraph | None, eager: Callable[[], None]) -> None:
+        if graph is None:
+            eager()
+            return
+        graph.replay()
 
     @classmethod
     def set_forward_context(

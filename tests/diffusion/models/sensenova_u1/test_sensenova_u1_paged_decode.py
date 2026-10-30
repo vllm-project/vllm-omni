@@ -17,6 +17,7 @@ import torch
 from vllm.lora.layers import BaseLayerWithLoRA
 
 import vllm_omni.diffusion.models.sensenova_u1.paged_decode as paged_decode
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.sensenova_u1.paged_decode import (
     BLOCK_SIZE,
     BUCKETS,
@@ -29,7 +30,7 @@ from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 LAYERS, KV_HEADS, HEAD_DIM = 2, 4, 8
 N_HEADS = KV_HEADS * 2
@@ -60,6 +61,7 @@ def _dyn_cache(prefix, device=None):
     )
 
 
+@pytest.mark.cpu
 def test_bucket_rounds_up_and_is_block_aligned():
     assert _bucket_for(1) == 512
     assert _bucket_for(512) == 512
@@ -67,6 +69,7 @@ def test_bucket_rounds_up_and_is_block_aligned():
     assert _bucket_for(100_000) % BLOCK_SIZE == 0
 
 
+@pytest.mark.cpu
 def test_past_the_last_bucket_the_schedule_grows_in_steps():
     """Every bucket change reallocates the cache and re-captures the graph, so
     the tail of the schedule must not step by BLOCK_SIZE. A think edit with two
@@ -85,6 +88,7 @@ def test_past_the_last_bucket_the_schedule_grows_in_steps():
         assert grows <= 1, f"start {start}: {grows} reallocations over 1024 decode steps"
 
 
+@pytest.mark.cpu
 def test_prefix_survives_the_hand_off():
     dyn = _dyn_cache(37)
     paged = PagedDecodeCache.from_dynamic_cache(dyn, LAYERS, torch.device("cpu"), torch.float32)
@@ -94,6 +98,7 @@ def test_prefix_survives_the_hand_off():
         torch.testing.assert_close(stored, dyn.layers[i].keys[0].transpose(0, 1))
 
 
+@pytest.mark.cpu
 def test_write_back_restores_what_was_handed_over():
     """Decode is paged but the stage after it reads the ordinary cache."""
     dyn = _dyn_cache(21)
@@ -104,6 +109,7 @@ def test_write_back_restores_what_was_handed_over():
         torch.testing.assert_close(layer.keys, before)
 
 
+@pytest.mark.cpu
 def test_growing_keeps_the_tokens_already_stored():
     dyn = _dyn_cache(500)
     paged = PagedDecodeCache.from_dynamic_cache(dyn, LAYERS, torch.device("cpu"), torch.float32)
@@ -117,6 +123,7 @@ def test_growing_keeps_the_tokens_already_stored():
         torch.testing.assert_close(new.view(-1, KV_HEADS, HEAD_DIM)[:500], old)
 
 
+@pytest.mark.cpu
 def test_a_failed_grow_leaves_the_cache_on_its_old_buffers(monkeypatch):
     """A half-applied resize would strand a capture on freed storage.
 
@@ -154,6 +161,7 @@ def test_a_failed_grow_leaves_the_cache_on_its_old_buffers(monkeypatch):
     assert paged.length == before_length
 
 
+@pytest.mark.cpu
 def test_length_lives_in_device_tensors():
     """Both the attended length and the write slot must be tensors.
 
@@ -169,15 +177,20 @@ def test_length_lives_in_device_tensors():
 
 
 # ---------------------------------------------------------------------------
-# The capture contract. These need CUDA and the bundled flash-attention kernel.
+# The capture contract. Graph tests need a torch.cuda-compatible accelerator;
+# paged-attention equivalence also needs the bundled kernel's paged API.
 # ---------------------------------------------------------------------------
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+vllm_flash_attn_only = pytest.mark.skipif(
+    current_omni_platform.is_rocm(),
+    reason="vLLM's bundled FlashAttention extension is CUDA-only",
+)
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_paged_attention_matches_sdpa_over_the_same_buffer():
     import torch.nn.functional as F
 
@@ -217,8 +230,8 @@ def test_paged_attention_matches_sdpa_over_the_same_buffer():
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_captured_graph_follows_a_later_length():
     """One capture has to serve every length in the bucket.
 
@@ -278,8 +291,8 @@ def test_a_captured_graph_follows_a_later_length():
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_captured_graph_writes_each_step_to_its_own_slot():
     """The write slot has to be a device tensor, not a Python index.
 
@@ -339,8 +352,8 @@ def test_a_captured_graph_writes_each_step_to_its_own_slot():
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@vllm_flash_attn_only
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_whole_decode_loop_matches_the_unpaged_path():
     """Per-step kernel equivalence is not loop equivalence.
 
@@ -405,8 +418,7 @@ class _StubLM(torch.nn.Module):
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_the_decode_graph_captures_into_the_shared_platform_pool(monkeypatch):
     """``_decode_context`` builds a runner per request, so a private capture pool
     hands every request its own arena and never gives it back. Measured on a
@@ -484,6 +496,7 @@ class _AttnHost:
         return hidden_states * 2, None
 
 
+@pytest.mark.cpu
 def test_forward_und_sends_a_single_token_decode_to_the_paged_cache():
     """Goes through the real dispatch, so deleting the branch turns this red."""
     out = torch.randn(1, N_HEADS, 1, HEAD_DIM)
@@ -495,6 +508,7 @@ def test_forward_und_sends_a_single_token_decode_to_the_paged_cache():
     torch.testing.assert_close(got, out.reshape(1, 1, -1).contiguous() * 2)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "seq,mask",
     [(2, None), (1, torch.zeros(1, 1, 1, 1))],
@@ -508,6 +522,7 @@ def test_only_an_unmasked_single_token_step_takes_the_paged_path(seq, mask):
     assert len(host.sdpa_calls) == 1
 
 
+@pytest.mark.cpu
 def test_a_kernel_missing_any_kwarg_we_pass_is_not_supported(monkeypatch):
     """The call names every argument, so the probe has to cover every name.
 
@@ -545,13 +560,16 @@ def test_a_kernel_missing_any_kwarg_we_pass_is_not_supported(monkeypatch):
     assert paged_decode.paged_decode_supported(torch.device("cuda"), HEAD_DIM) is True
 
 
+@pytest.mark.cpu
 def test_only_q_k_and_v_reach_the_kernel_positionally(monkeypatch):
     """A positional standard argument binds to whatever a future wheel puts in
     that slot, and the probe above only checks that the names exist."""
-    seen = {}
+    seen_args: tuple[object, ...] = ()
+    seen_kwargs: dict[str, object] = {}
 
-    def recorder(*args, **kwargs):
-        seen["args"], seen["kwargs"] = args, kwargs
+    def recorder(*args: object, **kwargs: object):
+        nonlocal seen_args, seen_kwargs
+        seen_args, seen_kwargs = args, kwargs
         return torch.zeros(1, N_HEADS, HEAD_DIM)
 
     monkeypatch.setattr(paged_decode, "_flash_varlen", lambda: recorder)
@@ -564,8 +582,8 @@ def test_only_q_k_and_v_reach_the_kernel_positionally(monkeypatch):
         torch.zeros(1, KV_HEADS, 1, HEAD_DIM),
         1.0,
     )
-    assert len(seen["args"]) == 3, "only q, k and v may be positional"
-    assert set(seen["kwargs"]) == {
+    assert len(seen_args) == 3, "only q, k and v may be positional"
+    assert set(seen_kwargs) == {
         "max_seqlen_q",
         "cu_seqlens_q",
         "max_seqlen_k",
@@ -576,6 +594,7 @@ def test_only_q_k_and_v_reach_the_kernel_positionally(monkeypatch):
     }
 
 
+@pytest.mark.cpu
 def test_the_kill_switch_returns_no_cache(monkeypatch):
     """The recipe documents `VLLM_OMNI_SENSENOVA_PAGED_DECODE=0` as the way back
     to the ordinary cache, so the switch needs a test rather than only prose."""
@@ -607,6 +626,7 @@ def _pipeline_host(monkeypatch, device="cpu", language_model=None):
     return pipe_mod, host
 
 
+@pytest.mark.cpu
 def test_the_decode_context_is_reused_across_requests(monkeypatch):
     """A capture binds the addresses it recorded, so a cache built per request
     forces a capture per request. Two requests whose prefill fits the same
@@ -635,6 +655,7 @@ def test_the_decode_context_is_reused_across_requests(monkeypatch):
     assert bigger[0] is not first[0], "a prefill past the bucket must get new buffers"
 
 
+@pytest.mark.cpu
 def test_releasing_the_captures_forces_a_rebuild(monkeypatch):
     """Sleep level 2 discards the memory a capture recorded, so what the
     pipeline reuses across requests has to be droppable."""
@@ -657,6 +678,7 @@ class _FakeLoRAWrapper(BaseLayerWithLoRA):
         super().__init__()
 
 
+@pytest.mark.cpu
 def test_no_capture_crosses_a_request_once_lora_wrappers_are_installed(monkeypatch):
     """Base -> LoRA -> base. The reuse test cannot see an adapter change.
 
@@ -686,8 +708,7 @@ def test_no_capture_crosses_a_request_once_lora_wrappers_are_installed(monkeypat
 
 
 @cuda_only
-@pytest.mark.cuda
-@pytest.mark.L4
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_a_second_request_replays_the_first_capture(monkeypatch):
     """Reuse is only worth anything if the capture survives it."""
     dev = torch.device("cuda")
@@ -743,6 +764,7 @@ class _TextHost:
         return _Out(logits, past_key_values)
 
 
+@pytest.mark.cpu
 def test_text_decoding_uses_the_paged_context_too():
     """Image-to-text and text-to-text run their own decode loop. It used to call
     ``_ar_step`` without the context, so the paged path was documented but never
@@ -767,6 +789,7 @@ class _WarmupReq:
         self.prompts = [{"prompt": "", "modalities": ["image"]}]
 
 
+@pytest.mark.cpu
 def test_the_dummy_warmup_request_drives_one_decode_step(monkeypatch):
     """The dummy request is a text-to-image run with think off, so it exercises
     the prefill shape and never the decode one. Without this hook whatever the

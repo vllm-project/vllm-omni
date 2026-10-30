@@ -14,12 +14,18 @@ set -euo pipefail
 # shellcheck disable=SC1091
 source .buildkite/common/scripts/resolve_skip_ci.sh
 
+AMD_SUITE_SELECTOR=".buildkite/amd/scripts/select_test_suites.py"
+
 if [[ -z "${RUN_ALL:-}" ]]; then
     RUN_ALL=0
 fi
 
 if [[ -z "${NIGHTLY:-}" ]]; then
     NIGHTLY=0
+fi
+
+if [[ -z "${WEEKLY:-}" ]]; then
+    WEEKLY=0
 fi
 
 if [[ -z "${VLLM_CI_BRANCH:-}" ]]; then
@@ -30,31 +36,20 @@ if [[ -z "${AMD_MIRROR_HW:-}" ]]; then
     AMD_MIRROR_HW="amdproduction"
 fi
 
-fail_fast() {
-    DISABLE_LABEL="ci-no-fail-fast"
-    # If BUILDKITE_PULL_REQUEST != "false", then we check the PR labels using curl and jq
-    if [ "$BUILDKITE_PULL_REQUEST" != "false" ]; then
-        PR_LABELS=$(curl -s "https://api.github.com/repos/vllm-project/vllm-omni/pulls/$BUILDKITE_PULL_REQUEST" | jq -r '.labels[].name')
-        if [[ $PR_LABELS == *"$DISABLE_LABEL"* ]]; then
-            echo false
-        else
-            echo true
-        fi
-    else
-        echo false  # not a PR or BUILDKITE_PULL_REQUEST not set
+PR_LABELS=""
+# Explicit debug suites do not depend on PR labels.
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -z "${DEBUG_TEST_YAML:-}" ]]; then
+    if ! PR_LABELS=$(curl -fsSL \
+        "https://api.github.com/repos/vllm-project/vllm-omni/pulls/$BUILDKITE_PULL_REQUEST" \
+        | jq -r '.labels[].name'); then
+        echo "ERROR: Could not read PR labels; refusing to select an incorrect AMD test tier." >&2
+        exit 1
     fi
-}
+fi
 
-check_run_all_label() {
-    RUN_ALL_LABEL="ready-run-all-tests"
-    # If BUILDKITE_PULL_REQUEST != "false", then we check the PR labels using curl and jq
-    if [ "$BUILDKITE_PULL_REQUEST" != "false" ]; then
-        PR_LABELS=$(curl -s "https://api.github.com/repos/vllm-project/vllm-omni/pulls/$BUILDKITE_PULL_REQUEST" | jq -r '.labels[].name')
-        if [[ $PR_LABELS == *"$RUN_ALL_LABEL"* ]]; then
-            echo true
-        else
-            echo false
-        fi
+fail_fast() {
+    if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" ]]; then
+        echo true
     else
         echo false  # not a PR or BUILDKITE_PULL_REQUEST not set
     fi
@@ -64,7 +59,89 @@ if [[ -z "${COV_ENABLED:-}" ]]; then
     COV_ENABLED=0
 fi
 
+resolve_test_specs() {
+    local selected_specs
+    if ! selected_specs=$(python3 "$AMD_SUITE_SELECTOR" \
+        --branch "$BUILDKITE_BRANCH" \
+        --labels "$PR_LABELS" \
+        --debug-test-yaml "${DEBUG_TEST_YAML:-}" \
+        --nightly "$NIGHTLY" \
+        --weekly "$WEEKLY"); then
+        exit 1
+    fi
+
+    TEST_SPECS=()
+    while IFS= read -r suite_spec; do
+        [[ -z "$suite_spec" ]] && continue
+        TEST_SPECS+=("$suite_spec")
+    done <<< "$selected_specs"
+}
+
+filter_test_specs_by_skip_ci() {
+    local suite_spec level decision
+    local skip_all=0
+    local -a runnable_specs=()
+
+    for suite_spec in "${TEST_SPECS[@]}"; do
+        case "$suite_spec" in
+            READY_TESTS:*) level="l2" ;;
+            MERGE_TESTS:*) level="l3" ;;
+            NIGHTLY_TESTS:*)
+                # Explicit PR and scheduled nightly selections must survive
+                # L2/L3 diff gating, including docs-only main commits.
+                runnable_specs+=("$suite_spec")
+                continue
+                ;;
+            WEEKLY_TESTS:*)
+                # Scheduled release-line weekly survives docs-only skip-all.
+                # A PR weekly-test label, including one opened from release/vX.Y.Z, does not.
+                if is_release_line_push && [[ "${WEEKLY}" == "1" ]]; then
+                    runnable_specs+=("$suite_spec")
+                    continue
+                fi
+                if decision=$(python3 "$SKIP_CI_PY" gate amd l2); then
+                    if [[ "$decision" == "skip-all" ]]; then
+                        echo "Skipping AMD weekly suite due to skip-all decision."
+                        skip_all=1
+                        continue
+                    fi
+                fi
+                runnable_specs+=("$suite_spec")
+                continue
+                ;;
+            *)
+                echo "ERROR: unknown AMD test suite spec '$suite_spec'" >&2
+                exit 1
+                ;;
+        esac
+
+        if decision=$(python3 "$SKIP_CI_PY" gate amd "$level"); then
+            echo "Skipping AMD $level suite due to $decision decision."
+            [[ "$decision" == "skip-all" ]] && skip_all=1
+        else
+            runnable_specs+=("$suite_spec")
+        fi
+    done
+
+    TEST_SPECS=("${runnable_specs[@]}")
+    if [[ ${#TEST_SPECS[@]} -eq 0 ]]; then
+        if [[ $skip_all -eq 1 ]]; then
+            buildkite-agent annotate \
+                ":memo: CI skipped — docs or pytest skip-mark changes only" \
+                --style "info" 2>/dev/null || true
+        fi
+        echo "No AMD suites remain after skip-ci filtering."
+        exit 0
+    fi
+}
+
 upload_pipeline() {
+    local combined_test_yaml=""
+    local filtered_test_yaml=""
+    local has_nightly_suite=0
+    local suite_spec
+    local -a filter_args=()
+
     echo "Uploading pipeline..."
     # Install minijinja
     ls .buildkite || buildkite-agent annotate --style error 'Please merge upstream main branch for buildkite CI'
@@ -84,7 +161,7 @@ upload_pipeline() {
     # (WIP) Use pipeline generator instead of jinja template
     if [ -e ".buildkite/amd/pipeline_generator/pipeline_generator.py" ]; then
         python -m pip install click pydantic
-        python .buildkite/amd/pipeline_generator/pipeline_generator.py --run_all=$RUN_ALL --list_file_diff="$LIST_FILE_DIFF" --nightly="$NIGHTLY" --mirror_hw="$AMD_MIRROR_HW"
+        python .buildkite/amd/pipeline_generator/pipeline_generator.py --run_all="$RUN_ALL" --list_file_diff="$LIST_FILE_DIFF" --nightly="$NIGHTLY" --mirror_hw="$AMD_MIRROR_HW"
         buildkite-agent pipeline upload .buildkite/amd/pipeline.yaml
         exit 0
     fi
@@ -95,89 +172,51 @@ upload_pipeline() {
 
     FAIL_FAST=$(fail_fast)
 
+    if is_release_line_branch && [[ "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
+        # AMD checkouts are depth one. Read the first-parent object ID from
+        # the commit header without requiring the parent object locally.
+        VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
+    else
+        VLLM_AITER_MHA_TRUSTED_COMMIT=$DIFF_BASE
+    fi
+
     cd .buildkite/amd
 
-    # Select test definition file: merge suite for main, ready suite for PRs.
-    # For debugging, DEBUG_TEST_YAML accepts a comma-separated list containing
-    # "merge" and/or "ready" (case-insensitive). Multiple suites are combined
-    # before rendering so they share one amd-build step.
-    if [[ -n "${DEBUG_TEST_YAML:-}" ]]; then
-        declare -a DEBUG_TEST_SPECS=()
-        declare -A SEEN_DEBUG_TESTS=()
-        IFS=',' read -ra REQUESTED_DEBUG_TESTS <<< "${DEBUG_TEST_YAML,,}"
-
-        for requested_test in "${REQUESTED_DEBUG_TESTS[@]}"; do
-            # Permit readable values such as "ready, merge," and ignore the
-            # empty item produced by a trailing comma.
-            requested_test="${requested_test//[[:space:]]/}"
-            [[ -z "$requested_test" ]] && continue
-
-            if [[ -n "${SEEN_DEBUG_TESTS[$requested_test]:-}" ]]; then
-                echo "ERROR: duplicate DEBUG_TEST_YAML suite '$requested_test'" >&2
-                exit 1
-            fi
-            SEEN_DEBUG_TESTS[$requested_test]=1
-
-            case "$requested_test" in
-                ready)
-                    DEBUG_TEST_SPECS+=("READY_TESTS:test-amd-ready.yml")
-                    ;;
-                merge)
-                    DEBUG_TEST_SPECS+=("MERGE_TESTS:test-amd-merge.yml")
-                    ;;
-                *)
-                    echo "ERROR: DEBUG_TEST_YAML entries must be 'merge' or 'ready', got '$requested_test'" >&2
-                    exit 1
-                    ;;
-            esac
-        done
-
-        if [[ ${#DEBUG_TEST_SPECS[@]} -eq 0 ]]; then
-            echo "ERROR: DEBUG_TEST_YAML did not contain a test suite" >&2
-            exit 1
-        elif [[ ${#DEBUG_TEST_SPECS[@]} -eq 1 ]]; then
-            TEST_YAML="${DEBUG_TEST_SPECS[0]#*:}"
-        else
-            TEST_YAML=$(mktemp "${TMPDIR:-/tmp}/amd-debug-tests.XXXXXX.yml")
-            python - "$TEST_YAML" "${DEBUG_TEST_SPECS[@]}" <<'PY'
-import sys
-
-import yaml
-
-
-output_path, *suite_specs = sys.argv[1:]
-combined = {"env": {}, "steps": []}
-
-for suite_spec in suite_specs:
-    group_name, input_path = suite_spec.split(":", 1)
-    with open(input_path, encoding="utf-8") as test_file:
-        suite = yaml.safe_load(test_file)
-
-    for name, value in (suite.get("env") or {}).items():
-        previous = combined["env"].get(name, value)
-        if previous != value:
-            raise ValueError(
-                f"Conflicting environment value for {name}: {previous!r} != {value!r}"
-            )
-        combined["env"][name] = value
-
-    suite_steps = []
-    for entry in suite.get("steps") or []:
-        if "group" in entry:
-            suite_steps.extend(entry.get("steps") or [])
-        else:
-            suite_steps.append(entry)
-    combined["steps"].append({"group": group_name, "steps": suite_steps})
-
-with open(output_path, "w", encoding="utf-8") as output_file:
-    yaml.safe_dump(combined, output_file, sort_keys=False)
-PY
-        fi
-        echo "DEBUG_TEST_YAML override: using ${DEBUG_TEST_SPECS[*]}"
-    elif [[ $BUILDKITE_BRANCH == "main" ]]; then
-        TEST_YAML="test-amd-merge.yml"
+    # Multiple label-selected or debug-selected suites share one image build.
+    # When suites overlap, keep the first copy of an identical test step.
+    if [[ ${#TEST_SPECS[@]} -eq 1 ]]; then
+        TEST_YAML="${TEST_SPECS[0]#*:}"
     else
-        TEST_YAML="test-amd-ready.yml"
+        TEST_YAML=$(mktemp "${TMPDIR:-/tmp}/amd-selected-tests.XXXXXX.yml")
+        combined_test_yaml="$TEST_YAML"
+        python3 scripts/combine_test_suites.py "$TEST_YAML" "${TEST_SPECS[@]}"
+    fi
+    echo "AMD test suites: ${TEST_SPECS[*]}"
+
+    for suite_spec in "${TEST_SPECS[@]}"; do
+        if [[ "$suite_spec" == NIGHTLY_TESTS:* ]]; then
+            has_nightly_suite=1
+            break
+        fi
+    done
+    if [[ $has_nightly_suite -eq 1 ]]; then
+        filtered_test_yaml=$(mktemp "${TMPDIR:-/tmp}/amd-filtered-tests.XXXXXX.yml")
+        filter_args=(
+            python3 scripts/filter_test_suite.py
+            "$TEST_YAML"
+            "$filtered_test_yaml"
+            --changed-files "$file_diff"
+            --pipeline-path test-amd-nightly.yml
+            --pull-request "${BUILDKITE_PULL_REQUEST:-false}"
+            --debug-test-yaml "${DEBUG_TEST_YAML:-}"
+            --scheduled-nightly "$NIGHTLY"
+        )
+        if [[ ${#TEST_SPECS[@]} -gt 1 ]]; then
+            filter_args+=(--group-name NIGHTLY_TESTS)
+        fi
+        "${filter_args[@]}"
+        TEST_YAML="$filtered_test_yaml"
+        echo "Prepared AMD nightly jobs using PR/scheduled source-filter policy."
     fi
 
     (
@@ -191,40 +230,72 @@ PY
             -D mirror_hw="$AMD_MIRROR_HW" \
             -D fail_fast="$FAIL_FAST" \
             -D vllm_use_precompiled="$VLLM_USE_PRECOMPILED" \
-            -D vllm_merge_base_commit="$(git merge-base origin/main HEAD)" \
+            -D vllm_merge_base_commit="$DIFF_BASE" \
+            -D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT" \
             -D cov_enabled="$COV_ENABLED" \
             -D vllm_ci_branch="$VLLM_CI_BRANCH" \
             | sed '/^[[:space:]]*$/d' \
             > pipeline.yaml
     )
     cat pipeline.yaml
-    if [[ "$TEST_YAML" == "${TMPDIR:-/tmp}/amd-debug-tests."*.yml ]]; then
-        rm -f -- "$TEST_YAML"
+    if [[ -n "$filtered_test_yaml" ]]; then
+        rm -f -- "$filtered_test_yaml"
+    fi
+    if [[ -n "$combined_test_yaml" ]]; then
+        rm -f -- "$combined_test_yaml"
     fi
     buildkite-agent artifact upload pipeline.yaml
     buildkite-agent pipeline upload pipeline.yaml
     exit 0
 }
 
-get_diff() {
-    git diff --name-only --diff-filter=ACMDR "$(git merge-base origin/main HEAD)"
+# First parent for a release-line push. A depth-one checkout has the commit
+# but not its parent object, so deepen once before diffing. Failure falls
+# back to RUN_ALL=1 instead of aborting under set -e. That uploads every
+# suite. The wheel choice is the precompiled block below: a preset
+# VLLM_USE_PRECOMPILED is kept; otherwise RUN_ALL=1 builds from source.
+release_line_parent_base() {
+    if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
+        git rev-parse 'HEAD^'
+        return 0
+    fi
+    echo "AMD release-line checkout cannot resolve HEAD^; deepening by 1." >&2
+    if ! git fetch --deepen=1; then
+        return 1
+    fi
+    if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
+        git rev-parse 'HEAD^'
+        return 0
+    fi
+    return 1
 }
 
-get_diff_main() {
-    git diff --name-only --diff-filter=ACMDR HEAD~1
-}
-
-file_diff=$(get_diff)
-if [[ $BUILDKITE_BRANCH == "main" ]]; then
-    file_diff=$(get_diff_main)
-fi
-
-# Early exit: unified skip-ci (docs / skip marks) and CI-yaml-only level targeting.
-if [[ $BUILDKITE_BRANCH == "main" ]]; then
-    gate_bootstrap_ci amd l3
+# Choose the diff base before any git command that can fail the bootstrap.
+# A release-line push must not call merge-base origin/main: that ref is often
+# absent on a fresh shallow checkout, and set -e would skip the upload.
+# An unresolvable parent sets RUN_ALL=1 because the diff is unknown. Do not
+# claim a from-source wheel build here: if VLLM_USE_PRECOMPILED is already
+# set, the block below keeps that value.
+DIFF_BASE=""
+if is_release_line_push; then
+    if ! DIFF_BASE=$(release_line_parent_base); then
+        echo "release-line parent is unavailable; running all AMD tests (RUN_ALL=1)." >&2
+        RUN_ALL=1
+        DIFF_BASE=""
+    fi
 else
-    gate_bootstrap_ci amd l2
+    DIFF_BASE=$(git merge-base origin/main HEAD)
 fi
+
+file_diff=""
+if [[ -n "$DIFF_BASE" ]]; then
+    file_diff=$(git diff --name-only --diff-filter=ACMDR "$DIFF_BASE")
+fi
+
+# Resolve PR tier labels before skip-ci so ready/merge suites can be filtered
+# independently while an explicitly selected nightly suite passes through.
+resolve_test_specs
+filter_test_specs_by_skip_ci
 
 patterns=(
     "docker/Dockerfile"
@@ -274,29 +345,20 @@ for file in $file_diff; do
     fi
 done
 
-# Check for ready-run-all-tests label
-LABEL_RUN_ALL=$(check_run_all_label)
-if [[ $LABEL_RUN_ALL == true ]]; then
-    RUN_ALL=1
-    NIGHTLY=1
-    echo "Found 'ready-run-all-tests' label. Running all tests including optional tests."
-fi
-
-# Decide whether to use precompiled wheels
-# Relies on existing patterns array as a basis.
+# Decide whether to use precompiled wheels.
+# Relies on the existing patterns array and RUN_ALL decision above. A
+# caller-provided value wins, including when an unknown diff set RUN_ALL=1.
 if [[ -n "${VLLM_USE_PRECOMPILED:-}" ]]; then
     echo "VLLM_USE_PRECOMPILED is already set to: $VLLM_USE_PRECOMPILED"
 elif [[ $RUN_ALL -eq 1 ]]; then
     export VLLM_USE_PRECOMPILED=0
-    echo "Detected critical changes, building wheels from source"
+    echo "Detected critical or unknown changes, building wheels from source"
 else
     export VLLM_USE_PRECOMPILED=1
     echo "No critical changes, using precompiled wheels"
 fi
 
 
-LIST_FILE_DIFF=$(get_diff | tr ' ' '|')
-if [[ $BUILDKITE_BRANCH == "main" ]]; then
-    LIST_FILE_DIFF=$(get_diff_main | tr ' ' '|')
-fi
+# Same base as file_diff. Do not resolve origin/main a second time.
+LIST_FILE_DIFF=$(printf '%s' "$file_diff" | tr ' ' '|')
 upload_pipeline

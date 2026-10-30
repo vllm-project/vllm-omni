@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
 import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
 
+from tests.helpers.kv_layout import build_kv_cache_tensor
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVAdmissionError, DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVContext, DiffusionKVRequest
 
@@ -24,29 +25,162 @@ def _config(num_blocks: int) -> KVCacheConfig:
     )
     return KVCacheConfig(
         num_blocks=num_blocks,
-        kv_cache_tensors=[KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=["layer0"])],
+        kv_cache_tensors=[build_kv_cache_tensor(spec, num_blocks, ["layer0"])],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer0"], kv_cache_spec=spec)],
     )
 
 
-def _request(public_id: str, sequence_id: int, *, seq_len: int = 8, kv_contexts=()) -> DiffusionKVRequest:
+def _request(
+    public_id: str,
+    sequence_id: int,
+    *,
+    prefix_len: int = 4,
+    target_len: int = 4,
+    seq_len: int = 8,
+    cache_token_ids=(),
+    mm_features=(),
+    kv_contexts=(),
+) -> DiffusionKVRequest:
     return DiffusionKVRequest(
         f"{public_id}/diffusion-kv/{sequence_id}",
         sequence_id=sequence_id,
-        prefix_len=4,
-        target_len=4,
+        prefix_len=prefix_len,
+        target_len=target_len,
         seq_len=seq_len,
+        cache_token_ids=cache_token_ids,
+        mm_features=mm_features,
         kv_contexts=kv_contexts,
     )
 
 
-def _manager(num_blocks: int, *, max_model_len: int = 64) -> DiffusionKVCacheManager:
+def _manager(
+    num_blocks: int,
+    *,
+    max_model_len: int = 64,
+    enable_prefix_caching: bool = False,
+) -> DiffusionKVCacheManager:
     return DiffusionKVCacheManager(
         _config(num_blocks),
         max_model_len=max_model_len,
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
+        enable_prefix_caching=enable_prefix_caching,
     )
+
+
+def test_successful_request_publishes_prefix_for_a_warm_hit() -> None:
+    manager = _manager(8, enable_prefix_caching=True)
+    cold = _request("cold", 0, cache_token_ids=range(4))
+
+    cold_metadata = manager.reserve_request("cold", (cold,))
+    assert cold_metadata is not None
+    assert cold_metadata.sequences[0].cached_prefix_len == 0
+    cold_prefix_block = cold_metadata.sequences[0].block_ids[0][0]
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    warm = _request("warm", 0, cache_token_ids=range(4))
+    warm_metadata = manager.reserve_request("warm", (warm,))
+
+    assert warm_metadata is not None
+    assert warm_metadata.sequences[0].cached_prefix_len == 4
+    assert warm_metadata.sequences[0].block_ids[0][0] == cold_prefix_block
+    # Metadata contains both the shared hit and the newly allocated target.
+    assert len(warm_metadata.sequences[0].block_ids[0]) == 2
+
+    manager.free_request("warm")
+    assert warm.num_computed_tokens == 0
+    assert warm.shared_prefix_boundary == 0
+
+
+def test_prefix_hash_root_is_stable_across_manager_instances() -> None:
+    first_manager = _manager(8, enable_prefix_caching=True)
+    second_manager = _manager(8, enable_prefix_caching=True)
+    first = _request("first", 0, cache_token_ids=range(4))
+    second = _request("second", 0, cache_token_ids=range(4))
+
+    first_manager._prepare_block_hashes((first,))
+    second_manager._prepare_block_hashes((second,))
+
+    assert first.block_hashes == second.block_hashes
+
+
+def test_warm_hit_fits_at_the_same_capacity_as_the_cold_request() -> None:
+    manager = _manager(3, enable_prefix_caching=True)
+    cold = _request("cold", 0, cache_token_ids=range(4))
+    assert manager.reserve_request("cold", (cold,)) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    warm = _request("warm", 0, cache_token_ids=range(4))
+    metadata = manager.reserve_request("warm", (warm,))
+
+    assert metadata is not None
+    assert metadata.sequences[0].cached_prefix_len == 4
+
+
+def test_unpublished_request_does_not_become_a_prefix_hit() -> None:
+    manager = _manager(8, enable_prefix_caching=True)
+    failed = _request("failed", 0, cache_token_ids=range(4))
+    assert manager.reserve_request("failed", (failed,)) is not None
+    manager.free_request("failed")
+
+    retry = _request("retry", 0, cache_token_ids=range(4))
+    metadata = manager.reserve_request("retry", (retry,))
+
+    assert metadata is not None
+    assert metadata.sequences[0].cached_prefix_len == 0
+
+
+def test_partial_prefix_hit_recomputes_from_the_first_changed_block() -> None:
+    manager = _manager(10, enable_prefix_caching=True)
+    cold = _request(
+        "cold",
+        0,
+        prefix_len=8,
+        seq_len=12,
+        cache_token_ids=range(8),
+    )
+    assert manager.reserve_request("cold", (cold,)) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    warm = _request(
+        "warm",
+        0,
+        prefix_len=8,
+        seq_len=12,
+        cache_token_ids=(*range(4), 100, 101, 102, 103),
+    )
+    metadata = manager.reserve_request("warm", (warm,))
+
+    assert metadata is not None
+    assert metadata.sequences[0].cached_prefix_len == 4
+    assert len(metadata.sequences[0].block_ids[0]) == 3
+
+
+def test_cfg_rows_use_the_minimum_warm_hit_as_one_execution_boundary() -> None:
+    manager = _manager(16, enable_prefix_caching=True)
+    for public_id, tokens in (("seed-a", range(8)), ("seed-b", (*range(4), 20, 21, 22, 23))):
+        request = _request(public_id, 0, prefix_len=8, seq_len=12, cache_token_ids=tokens)
+        assert manager.reserve_request(public_id, (request,)) is not None
+        manager.publish_request(public_id)
+        manager.free_request(public_id)
+
+    requests = (
+        _request("warm", 0, prefix_len=8, seq_len=12, cache_token_ids=range(8)),
+        _request(
+            "warm",
+            1,
+            prefix_len=8,
+            seq_len=12,
+            cache_token_ids=(*range(4), 30, 31, 32, 33),
+        ),
+    )
+    metadata = manager.reserve_request("warm", requests)
+
+    assert metadata is not None
+    assert [sequence.cached_prefix_len for sequence in metadata.sequences] == [4, 4]
 
 
 def test_reserve_and_free_multi_cfg_request() -> None:

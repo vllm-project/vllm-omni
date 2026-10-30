@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for VoxCPM2 talker per-request state lifecycle."""
 
 from __future__ import annotations
@@ -72,6 +72,99 @@ def _seed_cached_decode(talker, req_id: str):
 
 
 class TestStateEvictionContract:
+    def test_eager_optimizations_do_not_require_torch_inductor(self, monkeypatch) -> None:
+        from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker as tk
+
+        class FakeEstimator:
+            pass
+
+        class FakeFeatDecoder:
+            def __init__(self, estimator) -> None:
+                self.estimator = estimator
+                self.mean_mode = False
+
+        class FakeTTS:
+            def __init__(self, estimator) -> None:
+                self.feat_decoder = FakeFeatDecoder(estimator)
+
+        talker = _make_bare_talker()
+        estimator = FakeEstimator()
+        talker._tts = FakeTTS(estimator)
+        _, _, RuntimeConfig = _voxcpm2_talker_mod()
+        talker._runtime_config = RuntimeConfig()
+        talker._enable_torch_compile = False
+
+        applied: list[str] = []
+
+        def install_qkv(*_args, **_kwargs) -> int:
+            applied.append("qkv")
+            return 12
+
+        def install_mlp(*_args, **_kwargs) -> int:
+            applied.append("mlp")
+            return 12
+
+        def install_zero_dt(*_args, **_kwargs) -> bool:
+            applied.append("zero_dt")
+            return True
+
+        monkeypatch.setattr(
+            tk,
+            "_install_locdit_fused_qkv",
+            install_qkv,
+        )
+        monkeypatch.setattr(
+            tk,
+            "_install_locdit_fused_mlp",
+            install_mlp,
+        )
+        monkeypatch.setattr(
+            tk,
+            "_install_locdit_zero_dt_cache",
+            install_zero_dt,
+        )
+
+        talker._setup_execution_optimizations()
+
+        assert applied == ["qkv", "mlp", "zero_dt"]
+        assert talker._eager_optimizations_applied is True
+        assert not hasattr(estimator, "_compiled")
+
+    def test_profiler_drops_invalid_accelerator_graph_events(self, monkeypatch) -> None:
+        from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker as tk
+
+        timer = tk._PerfTimer(enabled=False)
+        timer._enabled = True
+
+        class InvalidEvent:
+            def elapsed_time(self, _end) -> float:
+                raise RuntimeError("event recorder null")
+
+        timer._pairs.append(("captured", InvalidEvent(), object()))
+        monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+
+        assert timer.breakdown() == ""
+        assert timer._pairs == []
+
+    def test_profiler_disables_device_without_timing_events(self, monkeypatch) -> None:
+        from vllm_omni.model_executor.models.voxcpm2 import voxcpm2_talker as tk
+
+        class DeviceWithoutEvents:
+            pass
+
+        monkeypatch.setattr(
+            torch,
+            "get_device_module",
+            lambda _device: DeviceWithoutEvents(),
+        )
+
+        timer = tk._PerfTimer(enabled=True)
+        timer.start("cpu")
+
+        assert timer._enabled is False
+        assert timer._device_module is None
+        assert timer._starts == {}
+
     def test_runtime_config_normalizes_mutually_exclusive_paths(self) -> None:
         _, _, RuntimeConfig = _voxcpm2_talker_mod()
 
@@ -295,6 +388,7 @@ class TestChunkedPrefillContract:
         talker._get_multichar_zh_split = lambda: {}
         talker._perf = _NoopPerf()
         talker._enable_torch_compile = False
+        talker._setup_execution_optimizations = lambda: None
         talker._setup_cfm_buffers = lambda: None
         talker._run_cfm_for_state = lambda *_args: torch.ones(1, 1, 4)
 
@@ -940,3 +1034,63 @@ class TestAudioEmitCoalescing:
         assert all(not chunk.is_cuda for chunk in audio)
         torch.testing.assert_close(audio[0], torch.tensor([1.0, 2.0]))
         torch.testing.assert_close(audio[1], torch.tensor([3.0]))
+
+
+@pytest.mark.parametrize(
+    "tail_patches,batched,audio_emit_every,limit_source",
+    [
+        (1, False, 1, "request"),
+        (2, False, 2, "model"),
+        (1, True, 1, "request"),
+        (2, True, 1, "model"),
+        (1, True, 2, "request"),
+        (2, True, 2, "model"),
+    ],
+)
+def test_v1_length_limit_flushes_pending_patches(tail_patches, batched, audio_emit_every, limit_source) -> None:
+    _, RState, _ = _voxcpm2_talker_mod()
+    talker = _make_bare_talker()
+    talker._vae_decode_every = 3
+    talker._audio_emit_every = audio_emit_every
+    talker._enable_batched_vae_decode = batched
+    talker._feat_dim = 1
+    talker._n_decode_pad_frames = 1
+    talker._device = torch.device("cpu")
+    talker._tts = _FakeAudioTTS()
+    talker._perf = _NoopPerf()
+    talker.config = SimpleNamespace(hidden_size=4)
+    talker._side_dtype = torch.float32
+    talker.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=10 if limit_source == "model" else 100)
+    )
+    states = []
+    for req_id, computed in (("ending", 8), ("running", 7)):
+        state = RState(request_id=req_id, precomputed_is_stopping=False)
+        state.pending_vae_latents_gpu = [torch.ones(1, 1) for _ in range(tail_patches - 1)]
+        state.last_audio_patch_gpu = torch.ones(1, 1)
+        talker._active_states[req_id] = state
+        talker.preprocess(
+            input_ids=torch.zeros(1, dtype=torch.long),
+            input_embeds=None,
+            request_id=req_id,
+            _omni_is_prefill=False,
+            _omni_num_computed_tokens=computed,
+            _omni_prompt_len=5,
+            _omni_max_tokens=5 if limit_source == "request" else 100,
+        )
+        states.append(state)
+    calls = []
+
+    def decode(feat):
+        calls.append(feat.shape)
+        return feat.repeat_interleave(2, dim=-1)
+
+    talker._run_vae_decode = decode
+    output = talker._collect_audio_batch(states)
+    assert calls == [(1, 1, tail_patches)]
+    torch.testing.assert_close(output["ending"], torch.ones(tail_patches * 2))
+    assert output["running"] is None
+    assert states[0].pending_vae_latents_gpu == []
+    assert states[0].pending_audio_chunks_gpu == []
+    assert len(states[1].pending_vae_latents_gpu) == tail_patches
+    assert not states[0].is_stopping

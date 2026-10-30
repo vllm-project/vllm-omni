@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Shared denoise execution primitives for LTX pipelines."""
 
@@ -578,12 +578,6 @@ class LTXPhaseExecutor:
             video_audio_step_adapter=video_audio_step_adapter,
         )
         video_coords, audio_coords = prepare_rope_coords_stage(pipeline, forward_ctx, latents, audio_latents)
-        ring_degree = getattr(pipeline.od_config.parallel_config, "ring_degree", 1) or 1
-        if padded_audio_num_frames > original_audio_num_frames and ring_degree > 1:
-            raise ValueError(
-                "LTX audio padding requires an attention mask, which Ring sequence parallelism does not support. "
-                "Use Ulysses-only SP or choose a request whose audio latent length is divisible by the SP size."
-            )
         denoise_ctx = LTXDenoiseContext(
             latents=latents,
             audio_latents=audio_latents,

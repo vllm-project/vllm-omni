@@ -11,13 +11,14 @@ import base64
 import io
 import uuid
 import zipfile
+from collections.abc import AsyncIterator
 from enum import Enum
 from http import HTTPStatus
 from typing import Any, Literal
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 
@@ -25,12 +26,21 @@ from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 
+_FILE_RESPONSE_CHUNK_SIZE = 64 * 1024
+
 _IMAGE_FILE_METADATA = {
     "jpg": ("jpg", "image/jpeg"),
     "jpeg": ("jpeg", "image/jpeg"),
     "png": ("png", "image/png"),
     "webp": ("webp", "image/webp"),
 }
+
+
+async def _iter_file_chunks(data: bytes) -> AsyncIterator[memoryview]:
+    """Yield fixed-size chunks of an in-memory payload."""
+    view = memoryview(data)
+    for offset in range(0, len(view), _FILE_RESPONSE_CHUNK_SIZE):
+        yield view[offset : offset + _FILE_RESPONSE_CHUNK_SIZE]
 
 
 class ResponseFormat(str, Enum):
@@ -48,6 +58,8 @@ class ImageGenerationRequest(BaseModel):
     Follows the OpenAI Images API specification with vllm-omni extensions
     for advanced diffusion parameters.
     """
+
+    model_config = ConfigDict(extra="allow")
 
     # Required fields
     prompt: str = Field(..., description="Text description of the desired image(s)")
@@ -175,6 +187,21 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
     )
+    output_compression: int = Field(
+        default=100,
+        ge=0,
+        le=100,
+        description=(
+            "Compression level 0-100. For 'jpeg'/'webp' this is the encoder "
+            "quality. For 'png' 100 keeps the fastest, least-compressed "
+            "encode and lower values trade encode time for smaller payloads "
+            "(100 -> compress_level 0, 1 -> compress_level 9)."
+        ),
+    )
+    return_stage_metrics: bool | None = Field(
+        default=None,
+        description="Return stage metrics for benchmark clients.",
+    )
 
 
 class ImageData(BaseModel):
@@ -220,7 +247,7 @@ class ImageGenerationResponse(BaseModel):
             image_bytes = base64.b64decode(self.data[0].b64_json)
             filename = f"image_{uuid.uuid4().hex[:8]}.{extension}"
             return StreamingResponse(
-                io.BytesIO(image_bytes),
+                _iter_file_chunks(image_bytes),
                 media_type=media_type,
                 headers={
                     "Content-Disposition": f'attachment; filename="{filename}"',
@@ -236,7 +263,7 @@ class ImageGenerationResponse(BaseModel):
             zip_bytes = zip_buffer.getvalue()
             filename = f"images_{uuid.uuid4().hex[:8]}.zip"
             return StreamingResponse(
-                io.BytesIO(zip_bytes),
+                _iter_file_chunks(zip_bytes),
                 media_type="application/zip",
                 headers={
                     "Content-Disposition": f'attachment; filename="{filename}"',
@@ -286,3 +313,32 @@ class ImageEditStreamError(BaseModel):
 
 
 ImageEditStreamResponse = ImageEditARDeltaChunk | ImageEditImageChunk | ImageEditStreamError
+
+
+class SegmentationMaskFormat(str, Enum):
+    """Encoding of each instance mask in an image segmentation response."""
+
+    PNG = "png"  # base64 single-channel PNG, 255 inside the instance
+    RLE = "rle"  # COCO uncompressed RLE: column-major run lengths starting with background
+
+
+class SegmentationRLE(BaseModel):
+    size: list[int] = Field(..., description="[height, width] of the mask")
+    counts: list[int] = Field(..., description="Alternating background/foreground run lengths, column-major")
+
+
+class ImageSegmentationInstance(BaseModel):
+    score: float = Field(..., description="Instance confidence in [0, 1]")
+    box: list[float] = Field(..., description="[x0, y0, x1, y1] in input-image pixels")
+    mask: str | SegmentationRLE = Field(..., description="Base64 PNG or COCO RLE, per mask_format")
+
+
+class ImageSegmentationResponse(BaseModel):
+    """Instances of the prompted concept in one image, ordered by descending score."""
+
+    created: int = Field(..., description="Unix timestamp of when segmentation completed")
+    model: str | None = Field(None, description="Served model name")
+    width: int = Field(..., description="Input image width in pixels")
+    height: int = Field(..., description="Input image height in pixels")
+    mask_format: SegmentationMaskFormat
+    data: list[ImageSegmentationInstance]

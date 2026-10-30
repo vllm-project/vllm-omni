@@ -1,0 +1,927 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+"""Typed duplex events: pure ``to_realtime()`` rendering and the stateful Realtime projection."""
+
+from __future__ import annotations
+
+import base64
+import inspect
+
+import pytest
+
+from vllm_omni.engine.duplex import events as events_module
+from vllm_omni.engine.duplex.commands import CancelResponse, ClearOutputAudio, DeleteItem, TruncateItem
+from vllm_omni.engine.duplex.events import (
+    REALTIME_ERROR_TYPES_BY_CODE,
+    AudioDelta,
+    DuplexEvent,
+    DuplexRawEvent,
+    ErrorEvent,
+    InputCommitted,
+    ItemAdded,
+    ItemCreated,
+    ItemDone,
+    Listen,
+    OutputItemAdded,
+    OverlapDecision,
+    ResponseDone,
+    SessionClosed,
+    SessionCreated,
+    SessionExpired,
+    SessionHeartbeatAck,
+    SessionReplaced,
+    SessionResumed,
+    SessionResyncRequired,
+    Speak,
+    TextDelta,
+    TranscriptDelta,
+    TranscriptDone,
+    TurnEvent,
+    error_event,
+)
+from vllm_omni.engine.duplex.realtime_events import (
+    RealtimeProjectionState,
+    discard_pending_commit_item,
+    project_internal_event,
+    realtime_session_payload,
+    resolve_cancel_response,
+    resolve_clear_output_audio,
+    resolve_delete_item,
+    resolve_truncate_item,
+    retrieve_item_events,
+)
+from vllm_omni.protocol.realtime.session import RealtimeInputDefaults
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+#: Classes whose wire object carries ``session_id`` by contract.
+_SESSION_ID_ON_WIRE = {
+    SessionClosed,
+    SessionExpired,
+    SessionHeartbeatAck,
+    Listen,
+    TurnEvent,
+    OverlapDecision,
+    SessionResumed,
+    SessionReplaced,
+    SessionResyncRequired,
+}
+#: Classes whose wire object carries ``epoch`` by contract.
+_EPOCH_ON_WIRE = {Listen, TurnEvent, OverlapDecision}
+
+
+def _public_event_classes() -> list[type[DuplexEvent]]:
+    classes = [
+        getattr(events_module, name)
+        for name in events_module.__all__
+        if inspect.isclass(getattr(events_module, name)) and issubclass(getattr(events_module, name), DuplexEvent)
+    ]
+    assert len(classes) > 40
+    return [cls for cls in classes if cls is not DuplexEvent]
+
+
+@pytest.mark.parametrize("event_cls", _public_event_classes(), ids=lambda cls: cls.__name__)
+def test_to_realtime_renders_wire_type_event_id_and_documented_fields(event_cls: type[DuplexEvent]):
+    event = event_cls(session_id="duplex-hidden", epoch=7)
+
+    wire = event.to_realtime()
+
+    assert wire["type"] == event.type
+    assert wire["event_id"] == event.event_id
+    assert wire["event_id"].startswith("event_")
+    if event_cls is DuplexRawEvent:
+        assert wire["type"] == "duplex."
+    else:
+        assert wire["type"] == event_cls.wire_type
+    if event_cls in _SESSION_ID_ON_WIRE:
+        assert wire["session_id"] == "duplex-hidden"
+    else:
+        assert "session_id" not in wire
+    if event_cls in _EPOCH_ON_WIRE:
+        assert wire["epoch"] == 7
+    else:
+        assert "epoch" not in wire
+    # Every value is plain JSON (mappings / sequences are copied into dict / list).
+    for value in wire.values():
+        assert isinstance(value, str | int | float | bool | dict | list) or value is None
+
+
+def test_optional_wire_fields_are_omitted_when_none():
+    created = SessionCreated(session={"id": "sid"})
+    assert created.optional_wire_fields == frozenset({"attachment_generation", "resume_token"})
+    wire = created.to_realtime()
+    assert "attachment_generation" not in wire
+    assert "resume_token" not in wire
+    assert wire["session"] == {"id": "sid"}
+
+    with_resume = SessionCreated(session={"id": "sid"}, attachment_generation=2, resume_token="tok").to_realtime()
+    assert with_resume["attachment_generation"] == 2
+    assert with_resume["resume_token"] == "tok"
+
+    delta = AudioDelta(response_id="resp_1", item_id="item_resp_1", delta="AAAA").to_realtime()
+    assert "sample_rate_hz" not in delta
+    assert "metadata" not in delta
+    assert delta["format"] == "pcm16"
+    assert delta["output_index"] == 0
+    assert delta["content_index"] == 0
+
+    transcript = TranscriptDelta(response_id="resp_1", item_id="item_resp_1", delta="hi").to_realtime()
+    assert "metadata" not in transcript
+    assert (
+        TranscriptDelta(
+            response_id="resp_1",
+            item_id="item_resp_1",
+            delta="hi",
+            metadata={"vllm_omni": {"response_request_metrics": {"ttft_ms": 200.0}}},
+        ).to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"]
+        == 200.0
+    )
+
+    anonymous_listen = Listen(session_id="sid", epoch=0, details={"reason": "silence"}).to_realtime()
+    assert "response_id" not in anonymous_listen
+    assert "id" not in anonymous_listen["response"]
+    assert anonymous_listen["response"]["status"] == "listening"
+    assert anonymous_listen["response"]["metadata"] == {"reason": "silence"}
+
+    bound_listen = Listen(session_id="sid", epoch=0, response_id="resp_1").to_realtime()
+    assert bound_listen["response_id"] == "resp_1"
+    assert bound_listen["response"]["id"] == "resp_1"
+
+
+def test_error_event_maps_codes_to_openai_error_types_and_echoes_client_event_id():
+    assert REALTIME_ERROR_TYPES_BY_CODE["resource_exhausted"] == "rate_limit_error"
+    assert REALTIME_ERROR_TYPES_BY_CODE["internal_error"] == "server_error"
+    assert REALTIME_ERROR_TYPES_BY_CODE["bad_event"] == "invalid_request_error"
+
+    error = ErrorEvent(
+        code="resource_exhausted",
+        message="too many sessions",
+        related_event_id="evt_client",
+        param="session",
+        extra={"retryable": True},
+    )
+
+    assert error.error_type == "rate_limit_error"
+    assert error.text == "too many sessions"
+    assert error.error == {
+        "type": "rate_limit_error",
+        "code": "resource_exhausted",
+        "message": "too many sessions",
+        "event_id": "evt_client",
+        "param": "session",
+        "retryable": True,
+    }
+    wire = error.to_realtime()
+    assert wire["type"] == "error"
+    assert wire["error"] == error.error
+    # The server event id and the echoed client event id are distinct.
+    assert wire["event_id"] != "evt_client"
+    assert ErrorEvent(code="never-seen-code").error_type == "invalid_request_error"
+
+
+def test_error_event_helper_normalizes_optional_client_event_id_and_param():
+    event = error_event("bad_event", "nope", event_id="evt_1", param="item", extra={"retryable": False})
+    assert isinstance(event, ErrorEvent)
+    assert event.related_event_id == "evt_1"
+    assert event.param == "item"
+    assert event.error["retryable"] is False
+
+    anonymous = error_event("bad_event", "nope", event_id=42, param="")
+    assert anonymous.related_event_id is None
+    assert anonymous.param is None
+    assert "event_id" not in anonymous.error
+    assert "param" not in anonymous.error
+
+
+def test_audio_delta_decodes_base64_and_invalid_payloads_yield_none():
+    raw = bytes(range(16))
+    delta = AudioDelta(delta=base64.b64encode(raw).decode("ascii"), format="pcm16", sample_rate_hz=24000)
+
+    assert delta.audio == raw
+    assert delta.to_realtime()["sample_rate_hz"] == 24000
+    assert AudioDelta(delta="@@not base64@@").audio is None
+
+
+def test_session_closed_and_expired_are_the_only_terminal_events():
+    closed = SessionClosed(session_id="sid", reason="client_close", details={"type": "session.closed"})
+    expired = SessionExpired(session_id="sid", reason="idle_timeout")
+
+    assert closed.is_terminal is True
+    assert expired.is_terminal is True
+    assert closed.to_realtime() == {
+        "type": "session.closed",
+        "event_id": closed.event_id,
+        "session_id": "sid",
+        "reason": "client_close",
+        "event": {"type": "session.closed"},
+    }
+    assert expired.to_realtime() == {
+        "type": "session.expired",
+        "event_id": expired.event_id,
+        "session_id": "sid",
+        "reason": "idle_timeout",
+    }
+    non_terminal = [cls for cls in _public_event_classes() if cls().is_terminal]
+    assert non_terminal == [SessionClosed, SessionExpired]
+
+
+def test_generic_accessors_expose_response_item_text_and_status():
+    assert TextDelta(response_id="resp_1", item_id="item_resp_1", delta="hi").text == "hi"
+    assert TranscriptDone(transcript="done").text == "done"
+    assert OutputItemAdded(item={"id": "item_1"}).item_id == "item_1"
+    assert ItemAdded(item={"id": 3}).item_id is None
+    assert ResponseDone(response={"status": "cancelled"}).status == "cancelled"
+    assert ResponseDone().status is None
+    assert TurnEvent(event="user_started", turn_state="user_speaking").response_id is None
+    assert TurnEvent().audio is None
+
+
+def test_raw_event_prefixes_internal_type_and_wraps_details():
+    raw = DuplexRawEvent(internal_type="model.custom", details={"type": "model.custom", "value": (1, 2)})
+
+    assert raw.type == "duplex.model.custom"
+    assert raw.to_realtime() == {
+        "type": "duplex.model.custom",
+        "event_id": raw.event_id,
+        "event": {"type": "model.custom", "value": [1, 2]},
+    }
+
+
+def test_turn_event_and_overlap_decision_carry_session_identity_on_the_wire():
+    turn = TurnEvent(session_id="sid", epoch=2, event="barge_in", turn_state="barge_in").to_realtime()
+    assert turn == {
+        "type": "turn.event",
+        "event_id": turn["event_id"],
+        "session_id": "sid",
+        "event": "barge_in",
+        "turn_state": "barge_in",
+        "epoch": 2,
+    }
+    decision = OverlapDecision(
+        session_id="sid", epoch=2, policy="listen_only", action="ignore", reason="short", details={"ms": 300}
+    ).to_realtime()
+    assert decision["policy"] == "listen_only"
+    assert decision["action"] == "ignore"
+    assert decision["metadata"] == {"ms": 300}
+    assert decision["session_id"] == "sid"
+
+
+# ---- RealtimeProjectionState / project_internal_event ----
+
+
+def _types(events: list[DuplexEvent]) -> list[str]:
+    return [event.type for event in events]
+
+
+def test_projection_of_the_main_internal_event_sequence():
+    state = RealtimeProjectionState(session_id="duplex-proj", model="test-model", initial_session_update=True)
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+
+    created = project_internal_event(state, {"type": "session.created", "session": {"voice": "alloy"}})
+    assert _types(created) == ["session.created", "session.updated"]
+    assert isinstance(created[0], SessionCreated)
+    session_payload = created[0].session
+    assert session_payload["id"] == "duplex-proj"
+    assert session_payload["model"] == "test-model"
+    assert session_payload["voice"] == "alloy"
+    assert session_payload["input_audio_format"] == "pcm16"
+    assert session_payload["output_audio_format"] == "pcm16"
+    assert state.initial_session_update is False
+    # The extra session.updated is a one-shot for the opening session.update.
+    assert _types(project_internal_event(state, {"type": "session.created", "session": {}})) == ["session.created"]
+
+    response_created = project_internal_event(
+        state, {"type": "response.created", "response_id": "resp_1", "modalities": ["audio", "text"]}
+    )
+    assert _types(response_created) == [
+        "response.created",
+        "conversation.item.added",
+        "conversation.item.created",
+        "response.output_item.added",
+        "response.content_part.added",
+    ]
+    assert state.active_response_id == "resp_1"
+    assert response_created[0].response_id == "resp_1"
+    assert response_created[0].to_realtime()["response"]["status"] == "in_progress"
+    assert isinstance(response_created[1], ItemAdded)
+    assert isinstance(response_created[2], ItemCreated)
+    assert response_created[1].item_id == "item_resp_1"
+    assert response_created[3].item_id == "item_resp_1"
+    assert response_created[4].to_realtime()["part"] == {"type": "audio", "transcript": ""}
+
+    audio_delta = project_internal_event(
+        state,
+        {"type": "response.output_audio.delta", "response_id": "resp_1", "audio": pcm, "text": "hi", "format": "pcm16"},
+    )
+    assert _types(audio_delta) == ["response.output_audio.delta", "response.output_audio_transcript.delta"]
+    assert isinstance(audio_delta[0], AudioDelta)
+    assert audio_delta[0].delta == pcm
+    assert audio_delta[0].format == "pcm16"
+    assert audio_delta[0].item_id == "item_resp_1"
+    assert audio_delta[1].text == "hi"
+    # Deltas accumulate in the projection; the stored item is materialized at
+    # retrieval boundaries, not on every delta.
+    assert state.conversation_items["item_resp_1"]["content"] == []
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "hi"
+
+    done = project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+    assert _types(done) == [
+        "response.output_audio.done",
+        "response.output_audio_transcript.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "conversation.item.done",
+        "response.done",
+        "rate_limits.updated",
+    ]
+    assert done[1].text == "hi"
+    assert isinstance(done[4], ItemDone)
+    assert done[4].item["status"] == "completed"
+    assert isinstance(done[5], ResponseDone)
+    assert done[5].status == "completed"
+    assert done[5].response["output"][0]["content"][0] == {"type": "output_audio", "transcript": "hi"}
+    assert state.active_response_id is None
+    # A duplicate terminal for the same response is idempotent.
+    assert project_internal_event(state, {"type": "response.done", "response_id": "resp_1"}) == []
+
+    committed = project_internal_event(
+        state, {"type": "input.committed", "message": {"role": "user", "content": "hello"}, "input_commit_seq": 1}
+    )
+    assert _types(committed) == [
+        "conversation.item.added",
+        "conversation.item.created",
+        "input_audio_buffer.committed",
+        "conversation.item.done",
+    ]
+    assert isinstance(committed[2], InputCommitted)
+    assert committed[2].previous_item_id == "item_resp_1"
+    assert committed[2].item_id == committed[0].item_id
+    assert committed[2].to_realtime()["event"]["input_commit_seq"] == 1
+    assert committed[0].item["content"] == [{"type": "input_text", "text": "hello"}]
+
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_2"})
+    project_internal_event(state, {"type": "response.output_audio.delta", "response_id": "resp_2", "audio": pcm})
+    cancelled = project_internal_event(
+        state, {"type": "audio.cancelled", "response_id": "resp_2", "reason": "barge_in", "committed_ms": 0}
+    )
+    assert _types(cancelled) == [
+        "response.output_audio.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "conversation.item.done",
+        "response.done",
+        "rate_limits.updated",
+    ]
+    assert cancelled[4].status == "cancelled"
+    assert cancelled[4].response["status_details"] == {"type": "cancelled", "reason": "barge_in"}
+    assert state.active_response_id is None
+
+    closed = project_internal_event(state, {"type": "session.closed", "reason": "client_close"})
+    assert _types(closed) == ["session.closed"]
+    assert closed[0].is_terminal is True
+    assert closed[0].to_realtime()["reason"] == "client_close"
+
+
+def test_projection_of_output_audio_buffer_clear_emits_cleared_before_terminals():
+    state = RealtimeProjectionState(session_id="duplex-clear")
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.output_audio.delta", "response_id": "resp_1", "audio": pcm})
+
+    cleared = project_internal_event(
+        state, {"type": "audio.cancelled", "reason": "output_audio_buffer_clear", "committed_ms": 250}
+    )
+
+    assert _types(cleared)[:2] == ["output_audio_buffer.cleared", "response.output_audio.done"]
+    assert cleared[0].response_id == "resp_1"
+    assert _types(cleared)[-2:] == ["response.done", "rate_limits.updated"]
+    assert state.item_truncation_cursors["item_resp_1"] == (0, 250)
+
+
+@pytest.mark.parametrize("reason", ["turn_detected", "barge_in", "output_audio_buffer_clear"])
+@pytest.mark.parametrize("committed_ms", [1000, 10000])
+def test_completed_response_cancellation_only_clears_pending_playback(reason, committed_ms):
+    state = RealtimeProjectionState(session_id="duplex-playback")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+
+    cancelled = project_internal_event(
+        state,
+        {
+            "type": "audio.cancelled",
+            "response_id": "resp_1",
+            "reason": reason,
+            "committed_ms": committed_ms,
+            "playback": {"sent_ms": 10000, "committed_ms": committed_ms},
+        },
+    )
+
+    if reason == "output_audio_buffer_clear" or committed_ms < 10000:
+        assert _types(cancelled) == ["output_audio_buffer.cleared"]
+        assert cancelled[0].response_id == "resp_1"
+    else:
+        assert cancelled == []
+
+
+@pytest.mark.parametrize("explicit_response_id", [False, True])
+def test_clear_latest_completed_response_reaches_playback_owner(explicit_response_id):
+    state = RealtimeProjectionState(session_id="duplex-clear")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+
+    control = resolve_clear_output_audio(
+        state, ClearOutputAudio(response_id="resp_1" if explicit_response_id else None, event_id="clear_1")
+    )
+
+    # Generation completion does not prove the client has drained its audio.
+    # A cleared event must follow the engine clearing its playback cursor.
+    assert control.events == []
+    assert control.payloads == [
+        {
+            "type": "output_audio_buffer.clear",
+            "reason": "output_audio_buffer.clear",
+            "response_id": "resp_1",
+            "realtime_event_id": "clear_1",
+        }
+    ]
+
+
+@pytest.mark.parametrize("new_response_finished", [False, True])
+def test_late_clear_of_completed_response_does_not_touch_new_response(new_response_finished):
+    state = RealtimeProjectionState(session_id="duplex-clear")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_2"})
+    if new_response_finished:
+        project_internal_event(state, {"type": "response.done", "response_id": "resp_2"})
+
+    control = resolve_clear_output_audio(state, ClearOutputAudio(response_id="resp_1"))
+
+    assert control.payloads == []
+    assert _types(control.events) == ["output_audio_buffer.cleared"]
+    assert control.events[0].response_id == "resp_1"
+    assert state.active_response_id == (None if new_response_finished else "resp_2")
+    assert state.last_response_id == "resp_2"
+
+
+def test_one_truncate_command_truncates_retrieved_transcript_once():
+    state = RealtimeProjectionState(session_id="duplex-truncate")
+    state.conversation_items["item_resp_1"] = {
+        "id": "item_resp_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_audio", "transcript": "abcdefghij", "audio_duration_ms": 10_000}],
+    }
+
+    control = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=4_000), has_audio=True)
+    # The runner executes this signal and projects its acknowledgement.
+    signal = control.payloads[0]
+    payload = signal["payload"]
+    assert isinstance(payload, dict)
+    assert signal["event"] == "conversation.item.truncate"
+    project_internal_event(state, {"type": "conversation.item.truncated", **payload})
+
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "abcd"
+    # Keep the cursor: later output must not restore the untruncated item.
+    assert state.item_truncation_cursors["item_resp_1"] == (0, 4_000)
+
+
+def test_truncate_ack_after_response_done_keeps_the_resolved_prefix():
+    state = RealtimeProjectionState(session_id="duplex-truncate-done")
+    item_id = "item_resp_1"
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": "AAA=",
+            "text": "abcdefghij",
+            "audio_duration_ms": 10_000,
+            "audio_text_marks": [{"text_chars": 10, "audio_end_ms": 10_000}],
+        },
+    )
+
+    control = resolve_truncate_item(state, TruncateItem(item_id=item_id, audio_end_ms=4_000), has_audio=True)
+    assert control.events == []
+    done = next(
+        event
+        for event in project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+        if isinstance(event, ResponseDone)
+    )
+    assert done.response["output"][0]["content"][0]["transcript"] == "abcd"
+    assert state.conversation_items[item_id]["content"][0]["transcript"] == "abcd"
+
+    # The engine acknowledges the resolved command after the response is done.
+    ack = {"type": "conversation.item.truncated", "item_id": item_id, "audio_end_ms": 4_000}
+    project_internal_event(state, ack)
+    project_internal_event(state, ack)
+    assert retrieve_item_events(state, {"item_id": item_id})[0].item["content"][0]["transcript"] == "abcd"
+
+    # A later, shorter cutoff uses the original transcript; a longer cutoff
+    # cannot restore text that the engine has already removed from history.
+    for audio_end_ms, expected in ((2_000, "ab"), (6_000, "ab")):
+        control = resolve_truncate_item(state, TruncateItem(item_id=item_id, audio_end_ms=audio_end_ms), has_audio=True)
+        assert control.events == []
+        project_internal_event(
+            state, {"type": "conversation.item.truncated", "item_id": item_id, "audio_end_ms": audio_end_ms}
+        )
+        assert retrieve_item_events(state, {"item_id": item_id})[0].item["content"][0]["transcript"] == expected
+
+
+def test_response_history_materializes_only_at_retrieval_boundary():
+    state = RealtimeProjectionState(session_id="duplex-lazy")
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    for text in ("brave", " new", " world"):
+        project_internal_event(
+            state,
+            {"type": "response.output_audio.delta", "response_id": "resp_1", "audio": pcm, "text": text},
+        )
+        # Deltas accumulate in the projection without rebuilding the stored copy.
+        assert state.conversation_items["item_resp_1"]["content"] == []
+
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "brave new world"
+    retrieved_again = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved_again["item"] == retrieved["item"]
+
+
+def test_text_deltas_materialize_output_text_part_at_retrieval():
+    state = RealtimeProjectionState(session_id="duplex-lazy-text")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1", "modalities": ["text"]})
+    for piece in ("foo", "bar", "baz"):
+        project_internal_event(state, {"type": "response.text.delta", "response_id": "resp_1", "delta": piece})
+        assert state.conversation_items["item_resp_1"]["content"] == []
+
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"] == [{"type": "output_text", "text": "foobarbaz"}]
+
+
+def test_audio_text_marks_dedupe_and_sort_once_per_boundary():
+    state = RealtimeProjectionState(session_id="duplex-marks")
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    deltas = [
+        ("ab", [{"text_chars": 2, "audio_end_ms": 100}]),
+        ("cd", [{"text_chars": 4, "audio_end_ms": 50}]),  # out of order across deltas
+        ("ef", [{"text_chars": 2, "audio_end_ms": 100}, {"text_chars": 6, "audio_end_ms": 200}]),
+    ]
+    for text, marks in deltas:
+        project_internal_event(
+            state,
+            {
+                "type": "response.output_audio.delta",
+                "response_id": "resp_1",
+                "audio": pcm,
+                "text": text,
+                "audio_text_marks": marks,
+            },
+        )
+        assert state.conversation_items["item_resp_1"]["content"] == []
+
+    expected_marks = [
+        {"text_chars": 4, "audio_end_ms": 50},
+        {"text_chars": 2, "audio_end_ms": 100},
+        {"text_chars": 6, "audio_end_ms": 200},
+    ]
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["audio_text_marks"] == expected_marks
+
+    done = project_internal_event(state, {"type": "response.done", "response_id": "resp_1"})
+    assert done[4].item["content"][0]["audio_text_marks"] == expected_marks
+    assert done[4].item["content"][0]["transcript"] == "abcdef"
+
+
+@pytest.mark.parametrize("terminal", ["response.done", "audio.cancelled"])
+def test_truncate_command_validates_against_materialized_in_progress_item(terminal):
+    state = RealtimeProjectionState(session_id="duplex-truncate-live")
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": pcm,
+            "text": "abcdefghij",
+            "audio_duration_ms": 10_000,
+            "audio_text_marks": [{"text_chars": 10, "audio_end_ms": 10_000}],
+        },
+    )
+    assert state.conversation_items["item_resp_1"]["content"] == []
+
+    rejected = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=20_000), has_audio=True)
+    assert rejected.payloads == []
+    assert len(rejected.events) == 1
+
+    accepted = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=4_000), has_audio=True)
+    assert accepted.events == []
+    assert accepted.payloads[0]["event"] == "conversation.item.truncate"
+
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "abcd"
+    # The engine acknowledgement must not cut the materialized item a second time.
+    project_internal_event(
+        state, {"type": "conversation.item.truncated", "item_id": "item_resp_1", "audio_end_ms": 4_000}
+    )
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+    assert retrieved["item"]["content"][0]["transcript"] == "abcd"
+    # The cursor survives retrieval so the terminal item stays truncated.
+    done = project_internal_event(state, {"type": terminal, "response_id": "resp_1", "committed_ms": 4_000})
+    assert done[4].item["content"][0]["transcript"] == "abcd"
+
+
+def test_repeated_audio_text_marks_do_not_accumulate_between_boundaries():
+    state = RealtimeProjectionState(session_id="duplex-repeated-marks")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    marks = [{"text_chars": 2, "audio_end_ms": 100}, {"text_chars": 4, "audio_end_ms": 200}]
+    for _ in range(2):
+        for _ in range(100):
+            project_internal_event(
+                state,
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": "resp_1",
+                    "audio": "AAA=",
+                    "audio_text_marks": marks,
+                },
+            )
+        # A producer may repeat cumulative marks without the client retrieving
+        # the item. Pending storage must be bounded by the distinct marks.
+        assert len(state.response_states["resp_1"].pending_audio_text_marks) <= len(marks)
+        retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].to_realtime()
+        assert retrieved["item"]["content"][0]["audio_text_marks"] == marks
+
+
+def test_projection_leaves_error_to_typed_emit_sites():
+    # Errors are constructed typed (``error_event``) at the emit site; the projector
+    # has no ``error`` branch and falls back to the raw wrapper for such a dict.
+    state = RealtimeProjectionState(session_id="duplex-err")
+
+    projected = project_internal_event(state, {"type": "error", "code": "bad_event", "error": "nope"})
+
+    assert len(projected) == 1
+    assert isinstance(projected[0], DuplexRawEvent)
+    assert projected[0].type == "duplex.error"
+    assert projected[0].to_realtime()["event"]["code"] == "bad_event"
+
+
+def test_queued_conversation_item_events_are_snapshots_not_shared_with_state():
+    """#7636 Issue 11: later deltas must not rewrite already-queued item events."""
+    state = RealtimeProjectionState(session_id="duplex-snap")
+    created = project_internal_event(
+        state, {"type": "response.created", "response_id": "resp_1", "modalities": ["audio", "text"]}
+    )
+    added = next(event for event in created if isinstance(event, ItemAdded))
+    output_added = next(event for event in created if isinstance(event, OutputItemAdded))
+    queued_item = added.item
+    assert queued_item is output_added.item or queued_item == output_added.item
+    assert queued_item is not state.conversation_items["item_resp_1"]
+
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": pcm,
+            "text": "later",
+            "format": "pcm16",
+        },
+    )
+
+    assert state.conversation_items["item_resp_1"]["content"] == []
+    retrieved = retrieve_item_events(state, {"item_id": "item_resp_1"})[0].item
+    assert retrieved["content"][0]["transcript"] == "later"
+    # Queued event still shows the snapshot taken at response.created.
+    assert queued_item["content"] == []
+    assert queued_item["status"] == "in_progress"
+
+
+def test_explicit_input_committed_id_removes_matching_pending_commit():
+    """#7636 Issue 12: explicit realtime_item_id must still pop the pending queue."""
+    state = RealtimeProjectionState(session_id="duplex-commit")
+    state.pending_commit_item_ids.extend(["item_a", "item_b"])
+
+    committed = project_internal_event(
+        state,
+        {
+            "type": "input.committed",
+            "realtime_item_id": "item_a",
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
+    assert state.pending_commit_item_ids == ["item_b"]
+    assert committed[0].item_id == "item_a"
+
+    # Without an explicit id, FIFO still pairs with the remaining pending entry.
+    second = project_internal_event(
+        state,
+        {"type": "input.committed", "message": {"role": "user", "content": "world"}},
+    )
+    assert state.pending_commit_item_ids == []
+    assert second[0].item_id == "item_b"
+
+
+def test_projected_session_updated_keeps_the_nested_input_sample_rate():
+    """A flat ``pcm16`` must not hide ``audio.input.format.rate`` on the projected session.
+
+    ``session.updated`` keeps the client's nested format object and also fills
+    ``input_audio_format``. ``audio/pcm`` becomes ``pcm16``, which has no rate,
+    so the 24000 Hz declaration has to survive into the append defaults.
+    """
+    state = RealtimeProjectionState(session_id="duplex-rate", model="test-model")
+    nested_audio = {"input": {"format": {"type": "audio/pcm", "rate": 24000}}}
+    state.apply_session_defaults({"audio": nested_audio})
+    # ``as_public_dict`` retains that audio block; projection then adds the flat format.
+    session = realtime_session_payload(
+        state,
+        {"id": "duplex-rate", "model": "test-model", "audio": nested_audio, "response_format": "wav"},
+    )
+    assert session["input_audio_format"] == "pcm16"
+    assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+
+    defaults = RealtimeInputDefaults().with_session_payload(session)
+    assert defaults.input_audio_format == "pcm16"
+    assert defaults.input_sample_rate_hz == 24000
+
+
+def test_flat_format_does_not_borrow_a_different_nested_rate():
+    """A fresh defaults object ignores a mismatched nested rate and stays at 16000.
+
+    There is no previously accepted rate, so the dataclass default remains.
+    """
+    defaults = RealtimeInputDefaults().with_session_payload(
+        {
+            "input_audio_format": "pcm_f32le",
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}},
+        }
+    )
+    assert defaults.input_audio_format == "pcm_f32le"
+    assert defaults.input_sample_rate_hz == 16000
+
+
+def test_flat_format_switch_keeps_a_previously_accepted_rate():
+    """A later flat switch that omits a rate keeps the rate already accepted.
+
+    Format and rate are partial updates. The leftover nested ``audio/pcm`` rate
+    is a different encoding, so it is not borrowed, but the connection does not
+    fall back to 16000 either.
+    """
+    accepted = RealtimeInputDefaults().with_session_payload(
+        {"audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}}}
+    )
+    assert accepted.input_sample_rate_hz == 24000
+    switched = accepted.with_session_payload(
+        {
+            "input_audio_format": "pcm_f32le",
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}},
+        }
+    )
+    assert switched.input_audio_format == "pcm_f32le"
+    assert switched.input_sample_rate_hz == 24000
+
+
+def test_discard_pending_commit_item_clears_aborted_head():
+    """#7636 Issue 12: commit_aborted must not leave a pending id behind."""
+    state = RealtimeProjectionState(session_id="duplex-abort")
+    state.pending_commit_item_ids.extend(["item_abort", "item_keep"])
+    discard_pending_commit_item(state)
+    assert state.pending_commit_item_ids == ["item_keep"]
+    discard_pending_commit_item(state, "item_keep")
+    assert state.pending_commit_item_ids == []
+
+
+def test_response_speak_projection_keeps_vllm_omni_request_metrics():
+    state = RealtimeProjectionState(session_id="duplex-proj", model="test-model")
+    project_internal_event(state, {"type": "response.created", "response_id": "resp_1"})
+    metrics = {
+        "source": "server_monotonic_request_start",
+        "ttft_ms": 200.0,
+        "measurement_origin": {"ttft": "text", "ttfp": "audio"},
+    }
+
+    events = project_internal_event(
+        state,
+        {
+            "type": "response.speak",
+            "response_id": "resp_1",
+            "session_id": "duplex-proj",
+            "epoch": 0,
+            "model_speak": True,
+            "vllm_omni": {"response_request_metrics": metrics},
+        },
+    )
+
+    assert _types(events) == ["response.speak"]
+    assert isinstance(events[0], Speak)
+    assert events[0].to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]["ttft_ms"] == 200.0
+
+
+def test_text_then_audio_projects_ttft_on_transcript_and_ttfp_on_audio_delta():
+    state = RealtimeProjectionState(session_id="duplex-proj", model="test-model")
+    project_internal_event(
+        state, {"type": "response.created", "response_id": "resp_1", "modalities": ["audio", "text"]}
+    )
+    ttft = {
+        "source": "server_monotonic_request_start",
+        "ttft_ms": 200.0,
+        "measurement_origin": {"ttft": "text", "ttfp": "audio"},
+    }
+
+    text_only = project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": "",
+            "text": "hi",
+            "session_id": "duplex-proj",
+            "epoch": 0,
+            "model_speak": True,
+            "vllm_omni": {"response_request_metrics": ttft},
+        },
+    )
+
+    assert _types(text_only) == ["response.output_audio_transcript.delta"]
+    assert isinstance(text_only[0], TranscriptDelta)
+    text_metrics = text_only[0].to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
+    assert text_metrics["ttft_ms"] == 200.0
+    assert "ttfp_ms" not in text_metrics
+
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    ttfp = {
+        "source": "server_monotonic_request_start",
+        "ttft_ms": 200.0,
+        "ttfp_ms": 400.0,
+        "measurement_origin": {"ttft": "text", "ttfp": "audio"},
+    }
+    audio = project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": pcm,
+            "text": "",
+            "format": "pcm16",
+            "vllm_omni": {"response_request_metrics": ttfp},
+        },
+    )
+
+    assert "response.output_audio.delta" in _types(audio)
+    audio_delta = next(event for event in audio if event.type == "response.output_audio.delta")
+    assert isinstance(audio_delta, AudioDelta)
+    audio_metrics = audio_delta.to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
+    assert audio_metrics["ttft_ms"] == 200.0
+    assert audio_metrics["ttfp_ms"] == 400.0
+
+
+@pytest.mark.parametrize("terminal", ["response.done", "audio.cancelled", "audio_end_of_turn"])
+def test_completed_projections_release_buffers_and_reject_late_output(terminal):
+    state = RealtimeProjectionState(session_id="duplex-retention")
+    for index in range(32):
+        response_id = f"finished-{index}"
+        item_id = f"item_{response_id}"
+        project_internal_event(state, {"type": "response.created", "response_id": response_id})
+        project_internal_event(state, {"type": "response.text.delta", "response_id": response_id, "delta": "hello"})
+        project_internal_event(
+            state, {"type": "response.output_audio.delta", "response_id": response_id, "text": "hello"}
+        )
+        ending = (
+            {"type": "response.output_audio.delta", "end_of_turn": True}
+            if terminal == "audio_end_of_turn"
+            else {"type": terminal}
+        )
+        events = project_internal_event(state, {**ending, "response_id": response_id})
+        assert _types(events).count("response.done") == 1
+        assert response_id not in state.response_states
+        assert retrieve_item_events(state, {"item_id": item_id})[0].to_realtime()["item"]["content"]
+        resolve_delete_item(state, DeleteItem(item_id=item_id))
+        for late_type in ("response.done", "response.text.delta", "response.output_audio.delta", "response.speak"):
+            assert (
+                project_internal_event(
+                    state, {"type": late_type, "response_id": response_id, "delta": "late", "text": "late"}
+                )
+                == []
+            )
+        assert item_id not in state.conversation_items
+        assert not state.response_states
+
+    # An arbitrarily old deleted response remains inactive without tombstones.
+    cancelled = resolve_cancel_response(state, CancelResponse(response_id="finished-0"))
+    assert not cancelled.payloads
+    assert cancelled.events[0].code == "response_not_active"
+    # Retiring an older draining reply must preserve the newer live reply.
+    project_internal_event(state, {"type": "response.created", "response_id": "draining"})
+    project_internal_event(state, {"type": "response.created", "response_id": "active"})
+    project_internal_event(state, {"type": "response.done", "response_id": "draining"})
+    assert set(state.response_states) == {"active"}
+    assert state.active_response_id == "active"
+    project_internal_event(state, {"type": "response.done", "response_id": "active"})
+    assert not state.response_states

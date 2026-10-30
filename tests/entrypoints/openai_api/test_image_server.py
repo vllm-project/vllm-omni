@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Tests for async image generation API endpoints.
 
@@ -24,11 +24,13 @@ from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import _check_max_generated_image_size, _DiffusionServingModels, router
+from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64,
     parse_size,
 )
+from vllm_omni.entrypoints.openai.images.helpers import _check_max_generated_image_size
+from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.errors import GuardrailViolationError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -219,7 +221,7 @@ def test_client(mock_async_diffusion):
     app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
     from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
-    from vllm_omni.entrypoints.openai.api_server import _DiffusionServingModels
+    from vllm_omni.entrypoints.openai.models.serving import _DiffusionServingModels
 
     app.state.openai_serving_models = _DiffusionServingModels(
         [BaseModelPath(name="Qwen/Qwen-Image", model_path="Qwen/Qwen-Image")]
@@ -432,6 +434,90 @@ def async_omni_stage_configs_only_client():
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1792,
+    )
+    return TestClient(app)
+
+
+@pytest.fixture
+def mammoth_moda2_test_client():
+    """MammothModa2-style pipeline: AR (llm) + generation-LLM DiT stage.
+
+    The DiT stage is ``stage_type == "llm"`` with ``final_output_type ==
+    "image"`` (no classical diffusion stage) — the legacy topology
+    MammothModa2 served before #7134 migrated it to the shared diffusion
+    runtime. Regression guard for the 503 (stage discovery) and the T2I
+    envelope / max_tokens wiring on that compat path.
+    """
+    from fastapi import FastAPI
+
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            stage_configs = [
+                SimpleNamespace(
+                    stage_type="llm",
+                    is_comprehension=False,
+                    engine_args=SimpleNamespace(model_arch="MammothModa2ForConditionalGeneration"),
+                ),
+                SimpleNamespace(
+                    stage_type="llm",
+                    is_comprehension=False,
+                    final_output=True,
+                    final_output_type="image",
+                    engine_args=SimpleNamespace(model_arch="MammothModa2ForConditionalGeneration"),
+                ),
+            ]
+            default_sampling_params_list = [
+                SamplingParams(temperature=1.0, max_tokens=16),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+                # Real AsyncOmni engines always carry stage_clients (read by
+                # get_diffusion_od_config); edits-endpoint tests walk through
+                # helpers that touch it before any stage-type gate.
+                stage_clients=[],
+            )
+            self.default_sampling_params_list = default_sampling_params_list
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGB", (64, 64), color="green")]
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None, **kwargs):
+            if sampling_params_list is not None:
+                self.captured_sampling_params_list = sampling_params_list
+            else:
+                self.captured_sampling_params_list = [sampling_params]
+            self.captured_prompt = prompt
+            images = [img.copy() for img in self._images]
+            yield MockGenerationResult(images)
+
+        def __class_getitem__(cls, item):
+            return cls
+
+    app = FastAPI()
+    app.include_router(router)
+
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
+    app.state.stage_configs = [
+        SimpleNamespace(stage_type="llm"),
+        SimpleNamespace(stage_type="llm", final_output=True, final_output_type="image"),
+    ]
+    app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name="Mammoth/MammothModa2-Preview", model_path="Mammoth/MammothModa2-Preview")]
+    )
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":50, "generator_device":"cpu"}}',
+        max_generated_image_size=1024 * 1024,
     )
     return TestClient(app)
 
@@ -847,7 +933,7 @@ def test_image_edits_streaming_returns_ar_delta_then_image(streaming_image_edit_
     assert payloads[0]["index"] == 0
     assert payloads[1]["delta"] == " done"
     assert payloads[2]["output_format"] == "png"
-    assert payloads[2]["size"] == "16x16"
+    assert payloads[2]["size"] == "32x24"
 
     image_payload = payloads[2]["data"][0]
     img = Image.open(io.BytesIO(base64.b64decode(image_payload["b64_json"])))
@@ -1717,7 +1803,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
         img = Image.open(io.BytesIO(img_bytes))
         assert img.format.lower() == "jpeg"
         assert data["output_format"] == "jpeg"
-        assert data["size"] == "16x24"
+        assert data["size"] == "64x64"
 
 
 def test_image_edit_layers_and_resolution(async_omni_test_client):
@@ -1894,6 +1980,7 @@ def test_image_edit_parameter_default_single_stage(test_client):
 
     assert captured_sampling_params.width == 24
     assert captured_sampling_params.height == 16
+    assert (captured_sampling_params.height_not_provided, captured_sampling_params.width_not_provided) == (True, True)
     assert captured_sampling_params.num_outputs_per_prompt == 1
     assert captured_sampling_params.num_inference_steps == 4
     assert captured_sampling_params.guidance_scale == 7.5
@@ -1909,6 +1996,40 @@ def test_image_edit_parameter_default_single_stage(test_client):
         },
     )
     assert response.status_code == 400
+
+
+def test_image_edit_explicit_size_marks_canvas_provided_single_stage(test_client):
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((24, 16)))],
+        data={"prompt": "hello world.", "size": "16x24"},
+    )
+
+    assert response.status_code == 200
+    sampling = test_client.app.state.engine_client.captured_sampling_params_list[0]
+    assert (sampling.height, sampling.width) == (24, 16)
+    assert (sampling.height_not_provided, sampling.width_not_provided) == (False, False)
+
+
+def test_image_edit_response_size_reports_generated_image_single_stage(test_client):
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((24, 16)))],
+        data={"prompt": "hello world.", "size": "16x24"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["size"] == "64x64"
+
+
+def test_generate_images_response_size_reports_generated_image(test_client):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "n": 1, "size": "1024x1024"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["size"] == "64x64"
 
 
 def test_image_edit_compression_jpeg(test_client):
@@ -2126,7 +2247,7 @@ def test_normalize_image():
     """Test _normalize_image with various input types"""
     import numpy as np
 
-    from vllm_omni.entrypoints.openai.api_server import _normalize_image
+    from vllm_omni.entrypoints.openai.images.helpers import _normalize_image
 
     # Test PIL Image input
     img = Image.new("RGB", (64, 64), color="red")
@@ -2163,14 +2284,14 @@ def test_extract_images_from_result():
     """Test _extract_images_from_result with various result formats"""
     import numpy as np
 
-    from vllm_omni.entrypoints.openai.api_server import _extract_images_from_result
+    from vllm_omni.entrypoints.openai.images.helpers import _extract_images_from_result
 
     # Test empty result
     class EmptyResult:
         pass
 
-    result = EmptyResult()
-    images = _extract_images_from_result(result)
+    empty_result = EmptyResult()
+    images = _extract_images_from_result(empty_result)
     assert images == []
 
     # Test nested batch: [np.array(shape=(3, 64, 64, 3))]
@@ -2180,8 +2301,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [batch]
 
-    result = BatchResult()
-    images = _extract_images_from_result(result)
+    batch_result = BatchResult()
+    images = _extract_images_from_result(batch_result)
     assert len(images) == 3
     assert all(isinstance(img, Image.Image) for img in images)
     assert all(img.size == (64, 64) for img in images)
@@ -2191,8 +2312,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (64, 64, 3), dtype=np.uint8)]
 
-    result = DictRequestOutput()
-    images = _extract_images_from_result(result)
+    dict_result = DictRequestOutput()
+    images = _extract_images_from_result(dict_result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
 
@@ -2201,8 +2322,8 @@ def test_extract_images_from_result():
         def __init__(self):
             self.images = [np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8)]
 
-    result = AttrRequestOutput()
-    images = _extract_images_from_result(result)
+    attr_result = AttrRequestOutput()
+    images = _extract_images_from_result(attr_result)
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)
@@ -2312,3 +2433,259 @@ def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_on
         assert captured_prompt["prompt"].count("<img>") == 2, (
             f"N=2 reference images must emit 2 <img> placeholders in AR prompt; got {captured_prompt[KEY].count(IMG)} -- prompt: {captured_prompt[KEY]!r}"
         )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Pre-existing gap, not introduced by this change: the /v1/images/edits route in "
+        "api_server.py never calls resolve_stop_token_ids at all (grep: api_server.py has "
+        "no stop_token_ids reference), so the AR stage keeps SamplingParams' default empty "
+        "list. The omitted-bot_task fix landed in serving_chat.py, which is the only "
+        "production caller; that path is covered by "
+        "test_serving_chat_multistage_generation.py::"
+        "test_build_multistage_generation_inputs_omitted_bot_task_matches_prompt_default. "
+        "Wiring the images/edits route through the same seam needs a tokenizer in that "
+        "scope and a decision on whether HunyuanImage3 it2i should resolve AR stop tokens "
+        "unconditionally (today the whole AR block is gated on an explicit bot_task / "
+        "use_system_prompt / system_prompt), so it is tracked separately."
+    ),
+)
+def test_image_edits_omitted_bot_task_stop_tokens_match_prompt_default(
+    async_omni_stage_configs_only_client,
+):
+    """Regression: an omitted bot_task must resolve identically for the AR
+    prompt and its stop_token_ids.
+
+    build_prompt/build_prompt_tokens default an omitted bot_task per-task
+    (e.g. "think" for the base "it2i" task, since it isn't itself a key in
+    _TASK_PRESETS). resolve_stop_token_ids must land on that same default
+    to compute the matching stop set. Passing the raw (still-None) outer
+    bot_task variable to resolve_stop_token_ids -- instead of mirroring
+    build_kwargs's own omitted-or-not "bot_task" entry -- made it normalize
+    bot_task=None instead of "think", so it fell through to the full
+    <img_ratio_*> stop range instead of the think/recaption-only pair.
+
+    An explicit (non-"auto") size is required to reach this: with
+    need_ratio=True (size="auto"), resolve_stop_token_ids returns the full
+    ratio range regardless of bot_task, so the two code paths only visibly
+    disagree once a concrete size selects the narrower think/recaption stop
+    set.
+    """
+    from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
+    )
+
+    img = make_test_image_bytes((64, 64))
+    response = async_omni_stage_configs_only_client.post(
+        "/v1/images/edits",
+        files=[("image", img)],
+        data={
+            "prompt": "make it neon",
+            "size": "512x512",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = async_omni_stage_configs_only_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+
+    ar_params = captured[0]
+    expected_stop_token_ids = [
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
+    ]
+    assert ar_params.stop_token_ids == expected_stop_token_ids, (
+        f"omitted bot_task with an explicit size must resolve stop_token_ids "
+        f"for the default 'think' bot_task ({expected_stop_token_ids}); got "
+        f"{ar_params.stop_token_ids} -- this is the full ratio range, meaning "
+        "resolve_stop_token_ids disagreed with build_prompt_tokens's default."
+    )
+
+
+def test_generate_images_mammoth_moda2_llm_dit_pipeline_accepted(mammoth_moda2_test_client):
+    """Regression: /v1/images/generations must not 503 on generation-LLM DiT stages.
+
+    A generation-LLM DiT stage (``stage_type == "llm"`` with
+    ``final_output_type == "image"``, MammothModa2's topology before #7134):
+    stage discovery previously required a classical diffusion stage and
+    returned 503 (issue #7199).
+    """
+    response = mammoth_moda2_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a mammoth in the snow",
+            "n": 1,
+            "size": "1024x1024",
+            "seed": 7,
+        },
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert len(data["data"]) == 1
+
+
+def test_generate_images_mammoth_moda2_llm_dit_rejects_multiple_outputs(mammoth_moda2_test_client):
+    """Regression: n > 1 must be rejected on the LLM-typed DiT path.
+
+    The LLM engine path for generation-LLM DiT stages produces exactly one
+    image per request; accepting ``n > 1`` used to silently drop the extra
+    outputs (review on PR #7293). The request must fail fast with 400 instead.
+    """
+    response = mammoth_moda2_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a mammoth in the snow",
+            "n": 4,
+            "size": "1024x1024",
+            "seed": 7,
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "exactly one image" in response.text
+
+
+def test_generate_images_mammoth_moda2_t2i_envelope_and_max_tokens(mammoth_moda2_test_client):
+    """Regression: the registry T2I builder drives the AR prompt + max_tokens.
+
+    The AR stage must receive the <|image start|>W*H<|image token|> envelope,
+    the structural additional_information, and max_tokens sized from the AR
+    grid (ar_height * (ar_width + 1) + 1) instead of SamplingParams' default.
+    """
+    response = mammoth_moda2_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a mammoth in the snow",
+            "n": 1,
+            "size": "1024x1024",
+            "seed": 7,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = mammoth_moda2_test_client.app.state.engine_client
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt["prompt"].endswith("<|image start|>64*64<|image token|>")
+    addi = captured_prompt["additional_information"]
+    assert addi["omni_task"] == ["t2i"]
+    assert addi["ar_width"] == [64]
+    assert addi["ar_height"] == [64]
+
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+    assert captured[0].max_tokens == 64 * 65 + 1
+    assert captured[0].seed == 7
+
+
+def test_generate_images_mammoth_moda2_extra_args_routed_to_both_stages(mammoth_moda2_test_client):
+    """Regression: declared extra_body params reach AR and DiT extra_args.
+
+    text_guidance_scale / cfg_range / num_inference_steps are declared by the
+    MammothModa2 registry spec; the DiT stage (llm-typed) reads them from
+    sampling_params.extra_args, so the serving layer must route them there.
+    """
+    response = mammoth_moda2_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a mammoth in the snow",
+            "n": 1,
+            "size": "1024x1024",
+            "seed": 7,
+            "text_guidance_scale": 4.5,
+            "cfg_range": [0.0, 0.8],
+            "num_inference_steps": 30,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = mammoth_moda2_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+    for stage_params in captured:
+        extra_args = getattr(stage_params, "extra_args", None) or {}
+        assert extra_args.get("text_guidance_scale") == 4.5
+        assert extra_args.get("cfg_range") == [0.0, 0.8]
+        assert extra_args.get("num_inference_steps") == 30
+
+
+def test_generate_images_mammoth_moda2_migrated_topology_keeps_t2i_builder(mammoth_moda2_test_client):
+    """Regression: the T2I builder must stay active after #7134's migration.
+
+    Once MammothModa2's DiT stage is migrated to the shared diffusion runtime
+    (``stage_type == "diffusion"``, see #7134), the pipeline contains a
+    classical diffusion stage while stage 0 still needs the AR envelope/grid
+    metadata. An earlier guard skipped the registry T2I builder whenever any
+    diffusion stage was present, which would silently drop the
+    <|image start|>W*H<|image token|> envelope and additional_information
+    after the migration. Dispatch must be by resolved model class, not by
+    pipeline topology.
+    """
+    engine = mammoth_moda2_test_client.app.state.engine_client
+    # Simulate the post-#7134 topology in place: stage 1 becomes a classical
+    # diffusion stage (final_output metadata moves onto it unchanged).
+    engine.engine.stage_configs[1] = SimpleNamespace(
+        stage_type="diffusion",
+        is_comprehension=False,
+        final_output=True,
+        final_output_type="image",
+        engine_args=SimpleNamespace(model_arch="MammothModa2ForConditionalGeneration"),
+    )
+    mammoth_moda2_test_client.app.state.stage_configs = list(engine.engine.stage_configs)
+
+    response = mammoth_moda2_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a mammoth in the snow",
+            "n": 1,
+            "size": "1024x1024",
+            "seed": 7,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt["prompt"].endswith("<|image start|>64*64<|image token|>"), (
+        "the registry T2I builder must still wrap the AR prompt when the "
+        "pipeline contains a classical diffusion stage (post-#7134 topology)"
+    )
+    addi = captured_prompt["additional_information"]
+    assert addi["omni_task"] == ["t2i"]
+    assert addi["ar_width"] == [64]
+    assert addi["ar_height"] == [64]
+
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[0].max_tokens == 64 * 65 + 1
+
+
+def test_image_edits_mammoth_moda2_llm_dit_pipeline_rejected(mammoth_moda2_test_client):
+    """Regression: /v1/images/edits stays diffusion-only for now.
+
+    MammothModa2 is admitted to /v1/images/generations via the LLM-typed DiT
+    stage, but image edits (img2img) were never validated for it. Keep the
+    pre-existing diffusion-stage gate on the edits endpoint so the widened
+    generations acceptance does not silently admit it here.
+    """
+    img = make_test_image_bytes((64, 64))
+    response = mammoth_moda2_test_client.post(
+        "/v1/images/edits",
+        files=[("image", img)],
+        data={"prompt": "make it neon", "size": "512x512"},
+    )
+    assert response.status_code == 503, response.text
+    assert "No diffusion stage found" in response.json()["detail"]
+
+
+def test_is_image_generation_stage_matrix():
+    """Unit-test the stage classifier used by the image serving endpoints."""
+    from vllm_omni.entrypoints.openai.utils import is_image_generation_stage
+
+    assert is_image_generation_stage(SimpleNamespace(stage_type="diffusion"))
+    assert is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type="image"))
+    assert is_image_generation_stage({"stage_type": "llm", "final_output": True, "final_output_type": "images"})
+    assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type="text"))
+    assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=False))
+    assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type=None))

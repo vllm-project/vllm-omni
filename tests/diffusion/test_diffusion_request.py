@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import random
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
+from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -63,6 +66,23 @@ def test_non_dummy_request_is_not_identified_as_dummy_run():
     assert not OmniDiffusionRequest.is_dummy_run_request_id(None)
 
 
+def test_step_scheduler_separates_full_forward_fallback_from_step_requests():
+    scheduler = StepScheduler()
+    scheduler.initialize(SimpleNamespace())
+    scheduler.max_num_running_reqs = 2
+    text_request = _make_request()
+    text_request.use_step_execution = False
+    image_request = _make_request()
+    image_request.request_id = "image-request"
+
+    scheduler.add_request(text_request)
+    scheduler.add_request(image_request)
+    output = scheduler.schedule()
+
+    assert output.scheduled_request_ids == [text_request.request_id]
+    assert output.num_waiting_reqs == 1
+
+
 def test_tp_seed_same_across_ranks_and_varies_across_requests():
     random.seed(0)
     n_requests = 5
@@ -73,6 +93,31 @@ def test_tp_seed_same_across_ranks_and_varies_across_requests():
 
     # Seeds must vary across requests (non-determinism preserved).
     assert len(set(seeds)) == n_requests, f"Expected {n_requests} unique seeds but got {len(set(seeds))}: {seeds}"
+
+
+@pytest.mark.parametrize("seed", [-(2**63), -1, 0, 17, 2**63 - 1, "17", np.int64(17)])
+def test_extra_args_seed_remains_model_owned(seed, monkeypatch):
+    monkeypatch.setattr("vllm_omni.diffusion.request.random.randint", lambda *_: 123)
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "test"},
+        sampling_params=OmniDiffusionSamplingParams(extra_args={"seed": seed}),
+        request_id="request-test",
+    )
+
+    assert request.sampling_params.seed == 123
+    assert request.sampling_params.extra_args["seed"] is seed
+
+
+@pytest.mark.parametrize("seed", [-(2**63), -1, 0, 42, 2**63 - 1, np.int64(42)])
+def test_canonical_seed_does_not_remove_model_owned_extra_seed(seed):
+    request = OmniDiffusionRequest(
+        prompt={"prompt": "test"},
+        sampling_params=OmniDiffusionSamplingParams(seed=seed, extra_args={"seed": 17}),
+        request_id="request-test",
+    )
+
+    assert request.sampling_params.seed == seed
+    assert request.sampling_params.extra_args["seed"] == 17
 
 
 def _request_with_guidance(**sampling_kwargs) -> OmniDiffusionRequest:

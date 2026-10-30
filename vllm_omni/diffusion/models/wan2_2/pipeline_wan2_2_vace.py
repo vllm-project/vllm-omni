@@ -16,7 +16,7 @@ determined by which inputs are provided (no explicit mode flag):
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace
+from copy import copy
 
 import PIL.Image
 import torch
@@ -28,6 +28,9 @@ from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     load_wan_weights_with_optional_gate,
+    refresh_cache_for_denoise_schedule,
+    resolve_wan_boundary_ratio,
+    resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
@@ -60,6 +63,8 @@ def create_vace_transformer_from_config(
     config: dict,
     quant_config: QuantizationConfig | None = None,
     prefix: str = "",
+    *,
+    component: str = "transformer",
 ) -> WanVACETransformer3DModel:
     """Create WanVACETransformer3DModel from config dict."""
     kwargs = {}
@@ -97,6 +102,7 @@ def create_vace_transformer_from_config(
         kwargs["vace_layers"] = config["vace_layers"]
     if "vace_in_channels" in config:
         kwargs["vace_in_channels"] = config["vace_in_channels"]
+    quant_config = resolve_wan_transformer_quant_config(config, quant_config, component)
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
     if prefix:
@@ -190,6 +196,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     All VACE modes (T2V, R2V, V2V, MV2V) are handled by varying the inputs.
     """
 
+    # VACE's forward() defaults to 50 steps, not the base pipeline's 40.
+    default_num_inference_steps: int = 50
+
     def __init__(
         self,
         *,
@@ -198,14 +207,20 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     ):
         # VACE defaults to flow_shift=3.0 for 480p (base WAN T2V uses 5.0 for 720p)
         if od_config.flow_shift is None:
-            od_config = replace(od_config, flow_shift=3.0)
+            # Preserve runtime-only config provenance (including compact
+            # offload aliases) instead of rerunning dataclass __post_init__.
+            od_config = copy(od_config)
+            od_config.flow_shift = 3.0
 
         super().__init__(od_config=od_config, prefix=prefix)
 
-    def _create_transformer(self, config: dict) -> WanVACETransformer3DModel:
+    def _create_transformer(self, config: dict, component: str = "transformer") -> WanVACETransformer3DModel:
         """Build VACE transformer. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
-        return create_vace_transformer_from_config(config, quant_config=quant_config)
+        # Startup metadata describes the first expert, not a user policy for both.
+        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
+            quant_config = None
+        return create_vace_transformer_from_config(config, quant_config=quant_config, component=component)
 
     def diffuse(
         self,
@@ -494,7 +509,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         negative_prompt: str | None = None,
         height: int = 480,
         width: int = 832,
-        num_inference_steps: int = 50,
+        num_inference_steps: int | None = None,
         guidance_scale: float = 5.0,
         frame_num: int = 81,
         output_type: str | None = "np",
@@ -563,7 +578,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         height = common.height or height
         width = common.width or width
         num_frames = common.num_frames or frame_num
-        num_inference_steps = common.num_inference_steps or num_inference_steps
+        num_inference_steps = common.num_inference_steps or num_inference_steps or self.default_num_inference_steps
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         generator = req.collate_request_generators(num_outputs_per_prompt, None)
         request_latents = req.collate_request_tensors("latents", None)
@@ -687,7 +702,10 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         )
 
         # Set up scheduler
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        if self._sample_solver == "unipc":
+            self.scheduler.set_timesteps(num_inference_steps, device=device, shift=self._flow_shift)
+        else:
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
@@ -696,11 +714,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         # stays None and diffuse() uses the same transformer for every step.
         boundary_timestep = None
         if self.transformer_2 is not None:
-            boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-            if boundary_ratio is None:
-                boundary_ratio = 0.875
-                logger.warning_once("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
+            boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="Wan2.2 VACE")
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         latents = self.diffuse(
             latents=latents,

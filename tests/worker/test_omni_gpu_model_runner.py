@@ -3,20 +3,249 @@
 
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
+from vllm.utils.torch_utils import weak_ref_tensors
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.cudagraph_dispatcher import CUDAGraphMode
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import (
     OmniGPUModelRunner,
+    _build_prefill_token_mask,
     _filter_mrope_kwargs_for_model,
 )
+from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    ("prompt_lens", "computed", "scheduled", "expected"),
+    [
+        ([1], [0], [1], [True]),  # single-token prefill
+        ([4, 8], [4, 2], [1, 3], [False, True, True, True]),  # mixed decode/prefill
+        ([5], [4], [2], [True, False]),  # prompt remainder then decode
+    ],
+)
+def test_build_prefill_token_mask_tracks_request_ranges(prompt_lens, computed, scheduled, expected):
+    mask = _build_prefill_token_mask(prompt_lens, computed, scheduled, torch.device("cpu"))
+    actual = [bool(mask)] * sum(scheduled) if isinstance(mask, bool) else mask.tolist()
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("req_ids", "prompt_lens", "computed", "scheduled", "flat_ids", "expected_mask"),
+    [
+        pytest.param(
+            ["decode", "prefill"],
+            [8, 5],
+            [8, 0],
+            [1, 5],
+            [90, 100, 101, 102, 103, 104],
+            [False, True, True, True, True, True],
+            id="decode-before-prefill",
+        ),
+        pytest.param(
+            ["short", "long", "decode"],
+            [2, 6, 6],
+            [0, 1, 6],
+            [2, 3, 1],
+            [10, 11, 20, 21, 22, 30],
+            [True, True, True, True, True, False],
+            id="different-prefill-lengths",
+        ),
+        pytest.param(
+            ["remainder"],
+            [5],
+            [4],
+            [2],
+            [40, 41],
+            [True, False],
+            id="prompt-remainder-then-decode",
+        ),
+    ],
+)
+def test_runner_prefill_mask_matches_flattened_input_order(
+    req_ids, prompt_lens, computed, scheduled, flat_ids, expected_mask
+):
+    """The runner's request metadata must align with its flat GPU token buffer."""
+
+    class CaptureModel:
+        def embed_input_ids(self, input_ids, **kwargs):
+            self.input_ids = input_ids.detach().clone()
+            self.kwargs = kwargs
+            return input_ids.to(dtype=torch.float32).unsqueeze(-1)
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_ids = SimpleNamespace(gpu=torch.tensor(flat_ids, dtype=torch.long))
+    runner.input_batch = SimpleNamespace(
+        req_ids=req_ids,
+        num_prompt_tokens=prompt_lens,
+        num_computed_tokens_cpu=computed,
+    )
+    runner.requests = {req_id: SimpleNamespace(mm_features=[]) for req_id in req_ids}
+    runner.model = CaptureModel()
+    scheduler_output = SimpleNamespace(num_scheduled_tokens=dict(zip(req_ids, scheduled, strict=True)))
+
+    result = OmniGPUModelRunner._embed_scheduled_input_ids_with_prefill_mask(
+        runner,
+        scheduler_output,
+        len(flat_ids),
+        multimodal_embeddings=[],
+        is_multimodal=torch.zeros(len(flat_ids), dtype=torch.bool),
+    )
+
+    assert result.shape == (len(flat_ids), 1)
+    assert runner.model.input_ids.tolist() == flat_ids
+    mask = runner.model.kwargs["prefill_token_mask"]
+    actual_mask = [bool(mask)] * len(flat_ids) if isinstance(mask, bool) else mask.tolist()
+    assert actual_mask == expected_mask
+
+
+def test_runner_skips_prefill_mask_for_multimodal_step(monkeypatch: pytest.MonkeyPatch):
+    """Multimodal steps must not allocate a mask that CosyVoice3 ignores."""
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("prefill mask should not be built for multimodal steps")
+
+    monkeypatch.setattr("vllm_omni.worker.gpu_model_runner._build_prefill_token_mask", fail_if_called)
+
+    class CaptureModel:
+        def embed_input_ids(self, input_ids, **kwargs):
+            self.kwargs = kwargs
+            return input_ids.to(dtype=torch.float32).unsqueeze(-1)
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_ids = SimpleNamespace(gpu=torch.tensor([10, 11], dtype=torch.long))
+    runner.input_batch = SimpleNamespace(
+        req_ids=["audio"],
+        num_prompt_tokens=[2],
+        num_computed_tokens_cpu=[0],
+    )
+    runner.requests = {"audio": SimpleNamespace(mm_features=[object()])}
+    runner.model = CaptureModel()
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"audio": 2})
+
+    result = OmniGPUModelRunner._embed_scheduled_input_ids_with_prefill_mask(
+        runner,
+        scheduler_output,
+        2,
+        multimodal_embeddings=[],
+        is_multimodal=torch.tensor([True, True]),
+    )
+
+    assert result.shape == (2, 1)
+    assert runner.model.kwargs["prefill_token_mask"] is False
+
+
+def test_runner_keeps_prefill_mask_for_multimodal_prompt_continuation():
+    """A multimodal request can have text-only prompt tokens in a later window."""
+
+    class CaptureModel:
+        def embed_input_ids(self, input_ids, **kwargs):
+            self.kwargs = kwargs
+            return input_ids.to(dtype=torch.float32).unsqueeze(-1)
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_ids = SimpleNamespace(gpu=torch.tensor([6562, 6563], dtype=torch.long))
+    runner.input_batch = SimpleNamespace(
+        req_ids=["audio"],
+        num_prompt_tokens=[4],
+        num_computed_tokens_cpu=[2],
+    )
+    runner.requests = {"audio": SimpleNamespace(mm_features=[object()])}
+    runner.model = CaptureModel()
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"audio": 2})
+
+    result = OmniGPUModelRunner._embed_scheduled_input_ids_with_prefill_mask(
+        runner,
+        scheduler_output,
+        2,
+        multimodal_embeddings=[],
+        is_multimodal=torch.tensor([False, False]),
+    )
+
+    assert result.shape == (2, 1)
+    assert runner.model.kwargs["prefill_token_mask"] is True
+
+
+def test_runner_keeps_prefill_mask_for_mixed_text_and_multimodal_step():
+    """Mixed batches must retain the mask for text-only request segments."""
+
+    class CaptureModel:
+        def embed_input_ids(self, input_ids, **kwargs):
+            self.kwargs = kwargs
+            return input_ids.to(dtype=torch.float32).unsqueeze(-1)
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.input_ids = SimpleNamespace(gpu=torch.tensor([6562, 0, 0, 0], dtype=torch.long))
+    runner.input_batch = SimpleNamespace(
+        req_ids=["text", "audio"],
+        num_prompt_tokens=[1, 3],
+        num_computed_tokens_cpu=[0, 0],
+    )
+    runner.requests = {
+        "text": SimpleNamespace(mm_features=[]),
+        "audio": SimpleNamespace(mm_features=[object()]),
+    }
+    runner.model = CaptureModel()
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"text": 1, "audio": 3})
+
+    result = OmniGPUModelRunner._embed_scheduled_input_ids_with_prefill_mask(
+        runner,
+        scheduler_output,
+        4,
+        multimodal_embeddings=[torch.zeros(1, 1)],
+        is_multimodal=torch.tensor([False, True, True, True]),
+    )
+
+    assert result.shape == (4, 1)
+    assert runner.model.kwargs["prefill_token_mask"] is True
+
+
+def test_model_forward_preserves_omni_payload_after_graph_weak_ref(monkeypatch):
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    payload = {
+        "latent": hidden,
+        "latent_input_ids": torch.tensor([[21], [22]]),
+        "latent_positions": torch.tensor([[10], [11]]),
+    }
+    original = OmniOutput(text_hidden_states=hidden, multimodal_outputs=payload)
+    # CUDAGraphWrapper weak-references its outputs both at capture and replay.
+    # vLLM converts NamedTuple outputs into plain tuples along this path.
+    # Only the CUDA storage-alias primitive is replaced for this CPU test;
+    # the upstream container conversion is exercised unchanged.
+    monkeypatch.setattr("vllm.utils.torch_utils.weak_ref_tensor", lambda value: value)
+    replay = weak_ref_tensors(original)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: replay)
+
+    output = runner._model_forward()
+    output_hidden, output_payload = runner.extract_multimodal_outputs(output)
+
+    assert isinstance(output, OmniOutput)
+    torch.testing.assert_close(output_hidden, hidden)
+    assert output_payload is payload
+
+
+def test_model_forward_keeps_auxiliary_hidden_tuple(monkeypatch):
+    hidden = torch.ones(2, 4)
+    auxiliary = (hidden, hidden.clone(), None, None)
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(have_multimodal_outputs=True)
+    runner._build_model_kwargs_extra = lambda: {}
+    monkeypatch.setattr(GPUModelRunner, "_model_forward", lambda *_args, **_kwargs: auxiliary)
+
+    assert runner._model_forward() is auxiliary
 
 
 def _runner_for_talker_graph_init(
@@ -97,6 +326,81 @@ class DummyBuffer:
         self.gpu = t
 
 
+class _InputIdsCopiedError(RuntimeError):
+    """Stop the real runner preparation immediately after its GPU input copy."""
+
+
+class RunnerBuffer:
+    """CPU/GPU buffer used to exercise the real GPUModelRunner input layout."""
+
+    def __init__(self, size: int, dtype: torch.dtype):
+        self.cpu = torch.zeros(size, dtype=dtype)
+        self.gpu = torch.zeros(size, dtype=dtype)
+        self.np = self.cpu.numpy()
+
+    def copy_to_gpu(self, count: int | None = None) -> None:
+        count = self.cpu.numel() if count is None else count
+        self.gpu[:count].copy_(self.cpu[:count])
+
+
+class InputIdsRunnerBuffer(RunnerBuffer):
+    def copy_to_gpu(self, count: int | None = None) -> None:
+        super().copy_to_gpu(count)
+        raise _InputIdsCopiedError
+
+
+class DummyBlockTable:
+    def commit_block_table(self, num_reqs: int) -> None:
+        pass
+
+    def compute_slot_mapping(self, num_reqs, query_start_loc, positions) -> None:
+        pass
+
+
+class PrefillMaskInputBatch:
+    def __init__(self):
+        self.req_ids = ["decode", "short_prefill", "long_prefill", "prefill_decode"]
+        self.req_id_to_index = {req_id: i for i, req_id in enumerate(self.req_ids)}
+        self.num_prompt_tokens = np.array([3, 1, 4, 3], dtype=np.int32)
+        self.num_computed_tokens_cpu_tensor = torch.tensor([3, 0, 1, 2], dtype=torch.int32)
+        self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+        self.token_ids_cpu_tensor = torch.tensor(
+            [
+                [0, 0, 0, 10, 0],
+                [20, 0, 0, 0, 0],
+                [0, 30, 31, 32, 0],
+                [0, 0, 40, 41, 0],
+            ],
+            dtype=torch.int32,
+        )
+        self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        self.req_prompt_embeds = {}
+        self.prev_req_id_to_index = {}
+        self.prev_sampled_token_ids = None
+        self.block_table = DummyBlockTable()
+
+    @property
+    def num_reqs(self) -> int:
+        return len(self.req_ids)
+
+
+class PrefillMaskSchedulerOutput:
+    def __init__(self):
+        self.num_scheduled_tokens = {
+            "decode": 1,
+            "short_prefill": 1,
+            "long_prefill": 3,
+            "prefill_decode": 2,
+        }
+        self.total_num_scheduled_tokens = sum(self.num_scheduled_tokens.values())
+
+
+class DummyScheduledRequest:
+    def __init__(self, num_tokens: int):
+        self.num_tokens = num_tokens
+        self.mm_features: list[object] = []
+
+
 class DummyInputBatch:
     """A minimal input batch that only provides `req_ids`."""
 
@@ -108,7 +412,8 @@ class DummyInputBatch:
 class DummyReqState:
     """A minimal request state container."""
 
-    pass
+    mm_features: list[str]
+    additional_information_cpu: dict
 
 
 def test_model_forward_passes_request_ids_to_decode_metadata(monkeypatch):
@@ -233,6 +538,117 @@ def test_filter_mrope_kwargs_preserves_flexible_model_kwargs():
     assert _filter_mrope_kwargs_for_model(FlexibleMRoPEModel(), kwargs) is kwargs
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        pytest.param(SimpleNamespace(supports_prefill_token_mask=True), True, id="supported"),
+        pytest.param(SimpleNamespace(), False, id="unsupported"),
+    ],
+)
+def test_load_model_caches_prefill_token_mask_capability(mocker, model, expected):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner._maybe_enable_output_token_ids_for_model_sampler = mocker.Mock()
+    runner._init_talker_mtp = mocker.Mock()
+    runner._prewarm_attention_capture_workspaces = mocker.Mock()
+    mocker.patch("vllm_omni.worker.gpu_model_runner.GPUModelRunner.load_model")
+
+    OmniGPUModelRunner.load_model(runner)
+
+    assert runner._supports_prefill_token_mask is expected
+
+
+def test_build_prefill_token_mask_marks_single_token_prefill():
+    mask = _build_prefill_token_mask([1], [0], [1], torch.device("cpu"))
+
+    assert mask is True
+
+
+def test_build_prefill_token_mask_skips_decode():
+    mask = _build_prefill_token_mask([1], [1], [1], torch.device("cpu"))
+
+    assert mask is False
+
+
+def test_build_prefill_token_mask_handles_mixed_batch():
+    mask = _build_prefill_token_mask(
+        # Match the scheduler-owned NumPy arrays used by InputBatch.
+        prompt_lens=np.array([3, 1], dtype=np.int32),
+        num_computed_tokens=np.array([3, 0], dtype=np.int32),
+        num_scheduled_tokens=[1, 1],
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(mask, torch.tensor([False, True]))
+
+
+def test_build_prefill_token_mask_handles_prompt_decode_boundary():
+    mask = _build_prefill_token_mask(
+        prompt_lens=[3],
+        num_computed_tokens=[2],
+        num_scheduled_tokens=[2],
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(mask, torch.tensor([True, False]))
+
+
+def test_runner_aligns_prefill_mask_with_flattened_scheduled_tokens(mocker):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner._supports_prefill_token_mask = True
+    runner.input_batch = PrefillMaskInputBatch()
+    runner.input_ids = InputIdsRunnerBuffer(7, torch.int32)
+    runner.model = SimpleNamespace(embed_input_ids=mocker.Mock(return_value=torch.empty(7, 4)))
+    runner.requests = {
+        req_id: DummyScheduledRequest(num_tokens)
+        for req_id, num_tokens in zip(runner.input_batch.req_ids, [4, 1, 4, 4], strict=True)
+    }
+    runner.arange_np = np.arange(16, dtype=np.int32)
+    runner.query_pos = RunnerBuffer(16, torch.int32)
+    runner.query_start_loc = RunnerBuffer(8, torch.int32)
+    runner.optimistic_seq_lens_cpu = torch.zeros(8, dtype=torch.int32)
+    runner.prev_positions = RunnerBuffer(8, torch.int32)
+    runner.discard_request_mask = RunnerBuffer(8, torch.bool)
+    runner.num_accepted_tokens_event = None
+    runner.num_accepted_tokens = RunnerBuffer(8, torch.int32)
+    runner.mamba_prev_last_scheduled_idx = None
+    runner.use_async_spec_decode = False
+    runner.num_computed_tokens = torch.zeros(8, dtype=torch.int32)
+    runner.req_indices = RunnerBuffer(16, torch.int32)
+    runner.num_scheduled_tokens = RunnerBuffer(8, torch.int32)
+    runner.positions = torch.zeros(16, dtype=torch.int64)
+    runner.seq_lens = torch.zeros(8, dtype=torch.int32)
+    runner.enable_prompt_embeds = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    # Upstream vLLM initializes this in GPUModelRunner.__init__; this fixture
+    # bypasses construction with object.__new__.
+    runner._pp_recv_work = None
+    scheduler_output = PrefillMaskSchedulerOutput()
+    scheduled_tokens = np.array([1, 1, 3, 2], dtype=np.int32)
+
+    # Exercise vLLM's real _prepare_inputs token-index calculation and its
+    # normal _prepare_input_ids CPU-to-GPU path. The sentinel stops immediately
+    # after the copy so the test does not need unrelated attention metadata.
+    with pytest.raises(_InputIdsCopiedError):
+        runner._prepare_inputs(scheduler_output, scheduled_tokens)
+
+    runner._embed_scheduled_input_ids_with_prefill_mask(
+        scheduler_output,
+        num_scheduled_tokens=7,
+        multimodal_embeddings=[],
+        is_multimodal=torch.zeros(7, dtype=torch.bool),
+    )
+
+    input_ids = runner.model.embed_input_ids.call_args.args[0]
+    prefill_token_mask = runner.model.embed_input_ids.call_args.kwargs["prefill_token_mask"]
+    assert torch.equal(input_ids, torch.tensor([10, 20, 30, 31, 32, 40, 41]))
+    assert torch.equal(
+        prefill_token_mask,
+        torch.tensor([False, True, True, True, True, True, False]),
+    )
+
+
 def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     # Create an instance without calling OmniGPUModelRunner.__init__
     runner = object.__new__(OmniGPUModelRunner)
@@ -241,6 +657,8 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     runner.input_batch = DummyInputBatch(list(req_ids))
     runner.requests = {rid: DummyReqState() for rid in req_ids}
     runner.model_intermediate_buffer = {}
+    # Mirrors OmniGPUModelRunner.__init__; this stub bypasses initialization.
+    runner._supports_prefill_token_mask = False
 
     # query_start_loc.cpu[req_index] is used to locate the token position
     # in the flattened `inputs_embeds`.
@@ -564,6 +982,39 @@ def test_update_additional_information_deserializes_new_request_payload():
     )
 
 
+@pytest.mark.parametrize("replace_payload", [False, True])
+def test_resumed_streaming_payload_converts_to_typed_model_input(replace_payload):
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.data_entry_keys import to_struct
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.replace_runtime_additional_information = replace_payload
+    payload = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"req_id": ["r1"], "stream_finished": torch.tensor(False)},
+    }
+    new_req = OmniNewRequestData(
+        req_id="r1",
+        prompt_token_ids=[1, 2],
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        lora_request=None,
+        model_intermediate_buffer=payload,
+    )
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req, "r1")
+    # CosyVoice and other typed-payload consumers perform this conversion
+    # after the runner adds its resume metadata.
+    result = to_struct(runner.model_intermediate_buffer["r1"])
+    assert result.meta.resumable is True
+    assert result.meta.num_processed_tokens == 0
+    assert result.meta.req_id == ["r1"]
+    torch.testing.assert_close(result.codes.audio, payload["codes"]["audio"])
+
+
 def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
     from vllm_omni.engine.serialization import serialize_additional_information
 
@@ -768,8 +1219,10 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 def test_full_payload_output_accumulation_hook_matrix():
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
-    assert not _make_full_payload_accumulation_runner(
-        model_stage="code2wav", final_output=True
+    # A stage may publish a user-visible output and still feed another stage
+    # (Qwen3-Omni thinker publishes text while sending audio state to talker).
+    assert _make_full_payload_accumulation_runner(
+        model_stage="thinker", final_output=True
     )._should_accumulate_full_payload_output()
     assert not _make_full_payload_accumulation_runner(
         model_stage="token2audio",
@@ -789,8 +1242,8 @@ def test_full_payload_output_accumulation_hook_matrix():
 
 def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
     runner = object.__new__(GPUARModelRunner)
-    runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
     runner.omni_prefix_cache = prefix_cache
+    runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
     runner.model_config = SimpleNamespace(
         model_arch="IndexTTS25TalkerForConditionalGeneration",
         model_stage="indextts2_5_talker",
@@ -878,3 +1331,898 @@ def test_maybe_attach_mimo_audio_req_infos_no_req_state_returns_input():
 
     # When no req_state, helper should be a no-op.
     assert result is req_infos
+
+
+def _make_phase_runner(monkeypatch, rows, *, batched_decode):
+    """Exercise real preprocessing and MTP routing with CPU model buffers.
+
+    Each row is (request id, prompt length, computed tokens, scheduled tokens).
+    Only model computation and the device forward context are replaced.
+    """
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+    runner = _make_runner(req_ids=tuple(row[0] for row in rows))
+    total = sum(row[3] for row in rows)
+    runner.supports_mm_inputs = False
+    runner.enable_prompt_embeds = False
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    runner.has_talker_mtp = True
+    runner.model_config = SimpleNamespace(is_encoder_decoder=False)
+    runner.vllm_config.model_config.async_chunk = True
+    runner._init_model_kwargs = dict
+    runner.input_ids = DummyBuffer(torch.arange(total, dtype=torch.int64))
+    runner.inputs_embeds = DummyBuffer(torch.zeros(total, 4))
+    runner.positions = torch.arange(total)
+    runner.input_batch.num_computed_tokens_cpu = [row[2] for row in rows]
+    offsets = [0]
+    for rid, prompt_len, _, scheduled in rows:
+        runner.requests[rid].prompt_token_ids = list(range(prompt_len))
+        offsets.append(offsets[-1] + scheduled)
+        # Runner-owned metadata must override stale model/intermediate state.
+        runner.model_intermediate_buffer[rid] = {
+            "_omni_is_prefill": "stale",
+            "_omni_prompt_len": -1,
+            "_omni_num_computed_tokens": -1,
+        }
+    runner.query_start_loc.cpu = torch.tensor(offsets, dtype=torch.int32)
+    calls = []
+    batch_calls = []
+
+    def preprocess(input_ids, input_embeds, **info):
+        calls.append(("normal", dict(info)))
+        embeds = input_ids.float().view(-1, 1).expand(-1, 4).clone()
+        updates = {}
+        if not info["_omni_is_prefill"]:
+            updates["mtp_inputs"] = (torch.zeros_like(embeds), torch.zeros_like(embeds))
+        return input_ids, embeds, updates
+
+    def preprocess_decode_batch(input_ids, req_infos):
+        batch_calls.append([info["request_id"] for info in req_infos])
+        calls.extend(("batch", dict(info)) for info in req_infos)
+        embeds = input_ids.float().view(-1, 1).expand(-1, 4).clone()
+        return input_ids, embeds, torch.zeros_like(embeds), torch.zeros_like(embeds), [{} for _ in req_infos]
+
+    runner.model = SimpleNamespace(
+        has_preprocess=True,
+        preprocess=preprocess,
+        talker_mtp_output_key=("codes", "audio"),
+    )
+    if batched_decode:
+        runner.model.preprocess_decode_batch = preprocess_decode_batch
+    output = SchedulerOutput(
+        total_num_scheduled_tokens=total,
+        num_scheduled_tokens={row[0]: row[3] for row in rows},
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    return runner, output, calls, batch_calls
+
+
+@pytest.mark.parametrize("batched_decode", [False, True], ids=["normal", "batch"])
+@pytest.mark.parametrize("order", ["interleaved", "reversed", "adjacent"])
+def test_preprocess_phase_contract_mixed_batch(monkeypatch, batched_decode, order):
+    rows = [
+        ("decode-before", 5, 5, 1),
+        ("tail", 5, 4, 1),
+        ("decode-after", 5, 6, 1),
+        ("single-prompt", 1, 0, 1),
+        ("cached-prefill", 8, 4, 3),
+        ("multi-token-decode", 5, 5, 2),
+    ]
+    if order == "reversed":
+        rows.reverse()
+    elif order == "adjacent":
+        rows = [rows[1], rows[0], rows[2], *rows[3:]]
+    runner, scheduled, calls, batch_calls = _make_phase_runner(monkeypatch, rows, batched_decode=batched_decode)
+    _, embeds, *_ = runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    if batched_decode:
+        decode_order = [rid for rid, _, _, _ in rows if rid.startswith("decode-")]
+        expected_batches = [decode_order] if order == "adjacent" else [[rid] for rid in decode_order]
+        assert batch_calls == expected_batches
+    else:
+        assert batch_calls == []
+    assert len(calls) == len(rows)
+    offset = 0
+    code_index = 0
+    for (route, info), (rid, prompt_len, computed, span) in zip(calls, rows, strict=True):
+        assert info["request_id"] == rid
+        assert type(info["_omni_prompt_len"]) is int
+        assert type(info["_omni_num_computed_tokens"]) is int
+        assert type(info["_omni_is_prefill"]) is bool
+        assert info["_omni_prompt_len"] == prompt_len
+        assert info["_omni_num_computed_tokens"] == computed
+        assert info["_omni_is_prefill"] == (computed < prompt_len)
+        mtp_eligible = rid in {"decode-before", "decode-after"}
+        assert route == ("batch" if batched_decode and mtp_eligible else "normal")
+        expected = torch.arange(offset, offset + span).float().view(-1, 1).expand(-1, 4)
+        torch.testing.assert_close(embeds[offset : offset + span], expected + int(mtp_eligible))
+        assert ("codes" in runner.model_intermediate_buffer[rid]) == mtp_eligible
+        if mtp_eligible:
+            torch.testing.assert_close(
+                runner.model_intermediate_buffer[rid]["codes"]["audio"],
+                torch.tensor([[code_index]], dtype=torch.int64),
+                rtol=0,
+                atol=0,
+            )
+            code_index += 1
+        offset += span
+
+
+@pytest.mark.parametrize("batched_decode", [False, True], ids=["normal", "batch"])
+def test_preprocess_one_token_chunked_prefill_tail_then_decode(monkeypatch, batched_decode):
+    # Replay a five-token prompt split at a four-token scheduling budget.
+    runner, scheduled, calls, _ = _make_phase_runner(monkeypatch, [("r", 5, 0, 4)], batched_decode=batched_decode)
+    runner._preprocess(scheduled, 4)
+    assert calls[-1][1]["_omni_is_prefill"] is True
+    assert "codes" not in runner.model_intermediate_buffer["r"]
+
+    for computed, is_prefill in [(4, True), (5, False)]:
+        runner.input_batch.num_computed_tokens_cpu = [computed]
+        scheduled.total_num_scheduled_tokens = 1
+        scheduled.num_scheduled_tokens = {"r": 1}
+        runner.query_start_loc.cpu = torch.tensor([0, 1], dtype=torch.int32)
+        runner.input_ids.gpu[0] = 42
+        _, embeds, *_ = runner._preprocess(scheduled, 1)
+        route, info = calls[-1]
+        assert info["_omni_is_prefill"] is is_prefill
+        assert info["_omni_num_computed_tokens"] == computed
+        assert info["_omni_prompt_len"] == 5
+        assert route == ("batch" if batched_decode and not is_prefill else "normal")
+        torch.testing.assert_close(embeds, torch.full((1, 4), 42.0 if is_prefill else 43.0))
+        assert ("codes" in runner.model_intermediate_buffer["r"]) == (not is_prefill)
+
+
+class DecodeOnlyPreprocessModel:
+    has_preprocess = True
+
+    def __init__(self, *, rewrite_ids=False, invalid_output=None):
+        self.rewrite_ids = rewrite_ids
+        self.invalid_output = invalid_output
+        self.calls = []
+
+    @staticmethod
+    def embed_input_ids(input_ids, **kwargs):
+        return input_ids.float().view(-1, 1).expand(-1, 4).clone()
+
+    def preprocess(self, input_ids, input_embeds, **info):
+        self.calls.append(("scalar", [info["request_id"]], [info["_omni_is_prefill"]]))
+        return input_ids, self.embed_input_ids(input_ids), {}
+
+    def preprocess_decode_batch(self, *, input_ids, req_infos):
+        self.calls.append(
+            ("batch", [info["request_id"] for info in req_infos], [info["_omni_is_prefill"] for info in req_infos])
+        )
+        ids = input_ids + 100 if self.rewrite_ids else input_ids
+        embeds = self.embed_input_ids(ids) + 10
+        updates = [{"decode_marker": info["request_id"]} for info in req_infos]
+        if self.invalid_output == "embeddings":
+            embeds = embeds[:-1]
+        elif self.invalid_output == "ids":
+            ids = ids[:-1]
+        elif self.invalid_output == "updates":
+            updates = updates[:-1]
+        return ids, embeds, updates
+
+
+def _without_mtp_buffers(runner):
+    runner.has_talker_mtp = False
+    for name in ("talker_mtp", "talker_mtp_input_ids", "talker_mtp_inputs_embeds", "last_talker_hidden", "text_step"):
+        delattr(runner, name)
+
+
+@pytest.mark.parametrize("rewrite_ids", [False, True], ids=["original-ids", "replaced-ids"])
+@pytest.mark.parametrize("order", ["interleaved", "reversed", "adjacent"])
+def test_decode_batch_without_mtp_preserves_mixed_rows_and_buffers(monkeypatch, rewrite_ids, order):
+    rows = [
+        ("cfg-uncond", 5, 5, 1),
+        ("prefill-tail", 5, 4, 1),
+        ("cfg-cond", 5, 6, 1),
+        ("single-prompt", 1, 0, 1),
+        ("multi-token-decode", 5, 5, 2),
+    ]
+    if order == "reversed":
+        rows.reverse()
+    elif order == "adjacent":
+        rows = [rows[1], rows[0], rows[2], *rows[3:]]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel(rewrite_ids=rewrite_ids)
+    runner.model = model
+    total = scheduled.total_num_scheduled_tokens
+    runner.inputs_embeds = DummyBuffer(torch.full((total + 2, 4), -99.0))
+    ids_buffer = runner.input_ids.gpu
+    embeds_buffer = runner.inputs_embeds.gpu
+    output_ids, output_embeds, *_ = runner._preprocess(scheduled, total)
+    assert output_ids.data_ptr() == ids_buffer.data_ptr()
+    assert output_embeds.data_ptr() == embeds_buffer.data_ptr()
+    assert torch.equal(embeds_buffer[total:], torch.full((2, 4), -99.0))
+    seen = [
+        (route, rid, prefill) for route, ids, phases in model.calls for rid, prefill in zip(ids, phases, strict=True)
+    ]
+    offset = 0
+    for (route, rid, prefill), (expected_id, prompt, computed, span) in zip(seen, rows, strict=True):
+        eligible = span == 1 and computed >= prompt
+        assert rid == expected_id
+        assert prefill == (computed < prompt)
+        assert route == ("batch" if eligible else "scalar")
+        expected_ids = torch.arange(offset, offset + span) + (100 if eligible and rewrite_ids else 0)
+        assert torch.equal(output_ids[offset : offset + span], expected_ids)
+        expected_embeds = expected_ids.float().view(-1, 1).expand(-1, 4) + (10 if eligible else 0)
+        torch.testing.assert_close(output_embeds[offset : offset + span], expected_embeds)
+        info = runner.model_intermediate_buffer[rid]
+        assert info.get("decode_marker") == (rid if eligible else None)
+        offset += span
+
+
+def test_decode_batch_without_mtp_accepts_wrapper_input_ids_none(monkeypatch):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel()
+    runner.model = model
+    runner.supports_mm_inputs = True
+    runner.maybe_get_ec_connector_output = _noop_forward_context
+    runner.encoder_cache = {}
+    runner._execute_mm_encoder = lambda output: None
+    runner._gather_mm_embeddings = lambda output: ([], None)
+    runner._extract_mm_kwargs = lambda output: {}
+    runner._prepare_mm_inputs = lambda size: (None, runner.inputs_embeds.gpu[:size])
+    ids, embeds, *_ = runner._preprocess(scheduled, 2)
+    assert ids.data_ptr() == runner.input_ids.gpu.data_ptr()
+    assert model.calls == [("batch", ["first", "second"], [False, False])]
+    torch.testing.assert_close(embeds, torch.tensor([[10.0] * 4, [11.0] * 4]))
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        pytest.param([0, 2, 3], id="gap"),
+        pytest.param([1, 0, 2], id="reversed"),
+        pytest.param([0, 0, 1], id="duplicate"),
+        pytest.param([-1, 0, 1], id="negative-contiguous-start"),
+        pytest.param([1, 2, 3], id="contiguous-out-of-bounds"),
+    ],
+)
+def test_decode_batch_without_mtp_rejects_invalid_offsets_before_model_hook(monkeypatch, offsets):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = DecodeOnlyPreprocessModel(rewrite_ids=True)
+    runner.model = model
+    scalar_hook = Mock(wraps=model.preprocess)
+    batch_hook = Mock(wraps=model.preprocess_decode_batch)
+    monkeypatch.setattr(model, "preprocess", scalar_hook)
+    monkeypatch.setattr(model, "preprocess_decode_batch", batch_hook)
+    runner.query_start_loc.cpu = torch.tensor(offsets, dtype=torch.int32)
+    runner.inputs_embeds = DummyBuffer(torch.full((4, 4), -99.0))
+    ids_before = runner.input_ids.gpu.clone()
+    embeds_before = runner.inputs_embeds.gpu.clone()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Non-MTP batched decode preprocessing requires contiguous in-bounds token offsets",
+    ):
+        runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+
+    # These checks remain active when the runner is imported under python -O.
+    scalar_hook.assert_not_called()
+    batch_hook.assert_not_called()
+    torch.testing.assert_close(runner.input_ids.gpu, ids_before, rtol=0, atol=0)
+    torch.testing.assert_close(runner.inputs_embeds.gpu, embeds_before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("invalid", ["embeddings", "ids", "updates"])
+def test_decode_batch_without_mtp_rejects_incomplete_outputs(monkeypatch, invalid):
+    rows = [("first", 5, 5, 1), ("second", 5, 6, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    runner.model = DecodeOnlyPreprocessModel(invalid_output=invalid)
+    before = runner.inputs_embeds.gpu.clone()
+    with pytest.raises(ValueError, match="decode preprocessing"):
+        runner._preprocess(scheduled, 2)
+    assert torch.equal(runner.inputs_embeds.gpu, before)
+
+
+@pytest.mark.parametrize("supports_boundaries", [False, True])
+def test_multimodal_embeddings_receive_opt_in_host_request_boundaries(supports_boundaries):
+    runner = object.__new__(OmniGPUModelRunner)
+    received = {}
+
+    def embed(ids, **kwargs):
+        received.update(kwargs)
+        return ids
+
+    runner.model = SimpleNamespace(supports_embed_input_ids_query_start_loc=supports_boundaries, embed_input_ids=embed)
+    runner.input_batch = SimpleNamespace(num_reqs=3)
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 6, 7, 11, 999]))
+    runner.input_ids = SimpleNamespace(gpu=torch.arange(16))
+    mm = [torch.ones(2, 4), torch.ones(1, 4)]
+    mask = torch.tensor([True] * 4 + [False] * 3 + [True] * 3 + [False])
+
+    result = runner._embed_multimodal_input_ids(11, mm, mask)
+
+    torch.testing.assert_close(result, torch.arange(11))
+    assert received["multimodal_embeddings"] is mm
+    assert received["is_multimodal"] is mask
+    if supports_boundaries:
+        assert received["query_start_loc"] == [0, 6, 7, 11]
+    else:
+        assert "query_start_loc" not in received
+
+
+class BatchFilledRowsModel:
+    has_preprocess = True
+
+    def __init__(self, filled, *, fills_rows=True):
+        self.filled = set(filled)
+        self.preprocess_batch_fills_rows = fills_rows
+        self.batch_kwargs: dict = {}
+        self.calls = []
+
+    def preprocess_batch(self, *, req_ids, model_intermediate_buffer, device, **layout):
+        self.batch_kwargs = {"req_ids": list(req_ids), **layout}
+        if not layout:
+            return None
+        for i, req_id in enumerate(req_ids):
+            if req_id in self.filled:
+                s = layout["token_offsets"][i]
+                layout["inputs_embeds"][s] = 100.0 + i
+                layout["input_ids"][s] = -i
+        return set(self.filled)
+
+    def preprocess(self, input_ids, input_embeds, **info):
+        self.calls.append(info["request_id"])
+        return input_ids, input_ids.float().view(-1, 1).expand(-1, 4).clone(), {"marker": info["request_id"]}
+
+
+def test_batch_filled_rows_skip_the_per_request_preprocess(monkeypatch):
+    rows = [("live-a", 5, 4, 1), ("prefill", 8, 0, 3), ("live-b", 6, 5, 1)]
+    runner, scheduled, _, _ = _make_phase_runner(monkeypatch, rows, batched_decode=False)
+    _without_mtp_buffers(runner)
+    model = BatchFilledRowsModel({"live-a", "live-b"})
+    runner.model = model
+
+    ids, embeds, *_ = runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+    assert model.calls == ["prefill"]
+    assert model.batch_kwargs["req_ids"] == ["live-a", "prefill", "live-b"]
+    torch.testing.assert_close(embeds[0], torch.full((4,), 100.0))
+    torch.testing.assert_close(embeds[4], torch.full((4,), 102.0))
+    assert ids.tolist() == [0, 1, 2, 3, -2]
+
+
+def test_batch_preprocess_without_fill_opt_in_keeps_the_legacy_hook(monkeypatch):
+    runner, scheduled, _, _ = _make_phase_runner(
+        monkeypatch, [("live-a", 5, 4, 1), ("live-b", 6, 5, 1)], batched_decode=False
+    )
+    _without_mtp_buffers(runner)
+    model = BatchFilledRowsModel({"live-a"}, fills_rows=False)
+    runner.model = model
+    runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+    assert model.batch_kwargs == {"req_ids": ["live-a", "live-b"]} and model.calls == ["live-a", "live-b"]
+
+
+# ---------------------------------------------------------------------------
+# LMCache HS chunk-boundary buffering tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeHSStore:
+    """Records every store_hidden_states call so tests can assert behavior."""
+
+    def __init__(self):
+        self.calls = []
+
+    def store_hidden_states(self, token_ids, hidden_states, *, layer_idx=0, token_offset=0):
+        self.calls.append(
+            SimpleNamespace(
+                token_ids=list(token_ids),
+                hidden_states=hidden_states.clone(),
+                layer_idx=layer_idx,
+                token_offset=token_offset,
+            )
+        )
+
+
+def _make_lmcache_runner(chunk_size=4, hidden_size=2, req_id="r1", token_capacity=64):
+    """Build a runner stub wired with the LMCache HS path but no real engine."""
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = ()
+    runner._hs_pending_buffer = {}
+    runner._hs_saved_boundary = {}
+    runner._hs_buffer_origin = {}
+    runner._hs_mm_features = {}
+
+    hs_store = _FakeHSStore()
+    engine = SimpleNamespace(
+        hidden_state_store=hs_store,
+        config=SimpleNamespace(chunk_size=chunk_size),
+    )
+    adapter = SimpleNamespace(lmcache_engine=engine)
+    runner._get_lmcache_adapter = lambda: adapter
+
+    runner.input_batch = SimpleNamespace(
+        req_ids=[req_id],
+        req_id_to_index={req_id: 0},
+        num_computed_tokens_cpu=torch.tensor([0]),
+        token_ids_cpu=torch.arange(token_capacity).reshape(1, token_capacity),
+    )
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0]))
+    return runner, hs_store
+
+
+def _drive_step(runner, sched, num_computed, hs_rows, hidden_size=2):
+    """Simulate one forward: update num_computed_tokens_cpu and feed HS."""
+    runner.input_batch.num_computed_tokens_cpu = torch.tensor([num_computed])
+    hidden_states = torch.arange(hs_rows * hidden_size, dtype=torch.float32).reshape(hs_rows, hidden_size) + (
+        num_computed * 100.0
+    )
+    sched_out = SimpleNamespace(num_scheduled_tokens={"r1": sched})
+    LMCacheHiddenStateMixin._maybe_store_hs_to_lmcache(
+        runner,
+        hidden_states,
+        None,
+        num_tokens_unpadded=hs_rows,
+        scheduler_output=sched_out,
+    )
+
+
+def test_hs_lmcache_prefill_stores_full_chunks_only():
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # Prefill 10 tokens, chunk_size 4 → new_boundary = 8 (chunks [0:4],[4:8]).
+    _drive_step(runner, sched=10, num_computed=0, hs_rows=10)
+
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 0
+    assert call.token_ids == list(range(8))
+    assert call.hidden_states.shape == (8, 2)
+    assert runner._hs_saved_boundary["r1"] == 8
+    # The trailing 2 rows stay in the buffer for the next boundary crossing.
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 2
+
+
+def _drive_positioned_step(runner, sched, num_computed, hidden_size=2):
+    """One forward whose every HS row is stamped with its absolute position."""
+    runner.input_batch.num_computed_tokens_cpu = torch.tensor([num_computed])
+    positions = torch.arange(num_computed, num_computed + sched, dtype=torch.float32)
+    hidden_states = positions.unsqueeze(1).repeat(1, hidden_size)
+    LMCacheHiddenStateMixin._maybe_store_hs_to_lmcache(
+        runner,
+        hidden_states,
+        None,
+        num_tokens_unpadded=sched,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={"r1": sched}),
+    )
+
+
+def _stored_positions(call):
+    return [int(v) for v in call.hidden_states[:, 0].tolist()]
+
+
+def test_hs_store_keeps_absolute_positions_after_an_unaligned_hit():
+    """A full-prompt hit leaves num_computed one short of the chunk boundary.
+
+    The buffer then starts mid-chunk. Storing its first rows at the rounded-down
+    boundary would file them under earlier token positions than they hold.
+    """
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # LMCache covered 8 tokens; vLLM must recompute the last one, so the
+    # request arrives with num_computed=7.
+    for step, num_computed in enumerate(range(7, 12)):
+        _drive_positioned_step(runner, sched=1, num_computed=num_computed)
+
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 8
+    assert _stored_positions(call) == [8, 9, 10, 11]
+    assert call.token_ids == list(range(12))
+    assert runner._hs_saved_boundary["r1"] == 12
+
+
+def test_hs_store_positions_stay_aligned_across_two_chunks():
+    """The second flush must continue where the first stopped, not re-skip."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    for num_computed in range(7, 20):
+        _drive_positioned_step(runner, sched=1, num_computed=num_computed)
+
+    assert [c.token_offset for c in hs_store.calls] == [8, 12, 16]
+    assert [_stored_positions(c) for c in hs_store.calls] == [
+        [8, 9, 10, 11],
+        [12, 13, 14, 15],
+        [16, 17, 18, 19],
+    ]
+
+
+def test_hs_store_from_a_cold_request_starts_at_zero():
+    """Rounding up must not shift a request that had no hit at all."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    _drive_positioned_step(runner, sched=10, num_computed=0)
+
+    assert len(hs_store.calls) == 1
+    assert hs_store.calls[0].token_offset == 0
+    assert _stored_positions(hs_store.calls[0]) == list(range(8))
+
+
+def test_hs_lmcache_decode_buffers_until_boundary():
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # Step 1: prefill exactly 2 full chunks (8 tokens, no remainder).
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+    assert len(hs_store.calls) == 1
+    assert runner._hs_saved_boundary["r1"] == 8
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 0
+    hs_store.calls.clear()
+
+    # Decode tokens 9, 10, 11 — chunk [8:12] not yet full, must not flush.
+    for nc in (8, 9, 10):
+        _drive_step(runner, sched=1, num_computed=nc, hs_rows=1)
+    assert hs_store.calls == []
+    assert runner._hs_saved_boundary["r1"] == 8
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 3
+
+    # Decode token 12 completes the chunk [8:12]; one flush expected.
+    _drive_step(runner, sched=1, num_computed=11, hs_rows=1)
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 8
+    assert call.token_ids == list(range(12))
+    assert call.hidden_states.shape == (4, 2)
+    assert runner._hs_saved_boundary["r1"] == 12
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 0
+
+
+def test_hs_lmcache_drop_pending_state():
+    runner, _ = _make_lmcache_runner()
+    runner._hs_pending_buffer["r1"] = {"hidden": [torch.zeros((2, 2))]}
+    runner._hs_saved_boundary["r1"] = 4
+
+    runner._drop_hs_pending_state("r1")
+
+    assert "r1" not in runner._hs_pending_buffer
+    assert "r1" not in runner._hs_saved_boundary
+    # Dropping an unknown req_id must be a no-op (idempotent).
+    runner._drop_hs_pending_state("unknown")
+
+
+class _RaisingHSStore(_FakeHSStore):
+    def store_hidden_states(self, token_ids, hidden_states, *, layer_idx=0, token_offset=0):
+        raise RuntimeError("store failed")
+
+
+def test_hs_lmcache_store_failure_keeps_boundary_and_buffer():
+    """#6b: a failed store must not advance the boundary or trim the buffer."""
+    runner, _ = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+    runner._get_lmcache_adapter().lmcache_engine.hidden_state_store = _RaisingHSStore()
+
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+
+    assert runner._hs_saved_boundary.get("r1", 0) == 0
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 8
+
+
+def test_hs_lmcache_regression_resets_state():
+    """#3: num_computed regressing below the saved boundary (preempt) resets state."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+    assert runner._hs_saved_boundary["r1"] == 8
+    hs_store.calls.clear()
+
+    # Request comes back with fewer computed tokens than we had flushed.
+    _drive_positioned_step(runner, sched=4, num_computed=2)
+
+    # Without the reset, new_boundary (4) <= stale 8 would skip flushing forever.
+    # The buffer now starts at token 2, so the first storable chunk is [4:8) and
+    # nothing is written until it fills -- storing these four rows at offset 0
+    # would file tokens 2..5 as 0..3.
+    assert runner._hs_saved_boundary["r1"] == 4
+    assert hs_store.calls == []
+
+    _drive_positioned_step(runner, sched=2, num_computed=6)
+
+    assert len(hs_store.calls) == 1
+    assert hs_store.calls[0].token_offset == 4
+    assert _stored_positions(hs_store.calls[0]) == [4, 5, 6, 7]
+
+
+class _FakeRetrieveStore:
+    """retrieve_hidden_states returns a configurable per-layer prefix (or None)."""
+
+    def __init__(self, rows_by_layer):
+        self._rows_by_layer = rows_by_layer
+
+    def retrieve_hidden_states(self, token_ids, *, layer_idx=0):
+        rows = self._rows_by_layer.get(layer_idx)
+        if rows is None:
+            return None
+        return torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
+
+
+def _make_restore_runner(rows_by_layer, num_computed=8, chunk_size=4, mm_keys=()):
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = mm_keys
+    runner._hs_mm_features = {}
+    engine = SimpleNamespace(
+        hidden_state_store=_FakeRetrieveStore(rows_by_layer),
+        config=SimpleNamespace(chunk_size=chunk_size),
+    )
+    runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={"r1": 0},
+        num_prompt_tokens=torch.tensor([64]),
+        token_ids_cpu=torch.arange(64).reshape(1, 64),
+    )
+    sched_out = SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)])
+    return runner, sched_out
+
+
+def test_restore_incomplete_hs_sets_no_payload():
+    """#2: a missing required layer must not produce a partial payload."""
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_restore_runner(rows_by_layer={-1: None})  # "hidden" (idx -1) misses
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert runner._restored_mm.get("r1") is None
+
+
+def test_restore_full_hs_sets_payload():
+    """#2: all required layers present -> payload is set."""
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_restore_runner(rows_by_layer={-1: 8})  # "hidden" (idx -1) full-length
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert "hidden" in runner._restored_mm["r1"]
+    assert runner._restored_mm["r1"]["hidden"].shape[0] == 8
+
+
+def test_restore_remaps_mm_layers_to_flattened_payload_keys():
+    """Qwen3-Omni-style captures must land under the flattened payload keys.
+
+    Only models exposing talker_config.accept_hidden_layer populate
+    _lmcache_hs_mm_keys, so this path never runs on Qwen2.5-Omni.
+    """
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_restore_runner(
+        rows_by_layer={-1: 8, 0: 8, 24: 8},  # "hidden" (-1) plus captures 0 and 24
+        mm_keys=("0", "24"),
+    )
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert set(runner._restored_mm["r1"]) == {"hidden", "hidden_states.layer_0", "hidden_states.layer_24"}
+
+
+def test_pooler_payload_casts_restored_prefix_to_batch_dtype(monkeypatch):
+    """#5: LMCache returns CPU float32; prepending onto bf16 activations must not raise."""
+    import vllm_omni.worker.gpu_ar_model_runner as ar_mod
+
+    monkeypatch.setattr(
+        ar_mod, "build_omni_mm_payload", lambda **kwargs: {"mm0": torch.ones(2, 2, dtype=torch.bfloat16)}
+    )
+
+    runner = object.__new__(GPUARModelRunner)
+    restored_mm = {
+        "r1": {
+            "hidden": torch.zeros(3, 2, dtype=torch.float32),
+            "mm0": torch.zeros(3, 2, dtype=torch.float32),
+        }
+    }
+
+    payload = GPUARModelRunner._build_omni_pooler_payload(
+        runner,
+        restored_mm=restored_mm,
+        rid="r1",
+        idx=0,
+        start=0,
+        end=2,
+        hidden_states_cpu=None,
+        req_hidden_states_cpu={"r1": torch.ones(2, 2, dtype=torch.bfloat16)},
+        combined_hidden_states=None,
+        combined_multimodal_outputs=None,
+        mm_cpu=None,
+        audio_sparse_output=False,
+        sparse_mm_index={},
+        hidden_seq_len=2,
+        scheduled_seq_len=2,
+    )
+
+    # Both the "hidden" tap and the mm layer are prepended in the batch's dtype.
+    assert payload["hidden"].dtype == torch.bfloat16
+    assert payload["hidden"].shape[0] == 5
+    assert payload["mm0"].dtype == torch.bfloat16
+    assert payload["mm0"].shape[0] == 5
+
+
+def test_hs_lmcache_store_slices_per_request_in_multi_request_batch():
+    """#11: each request must buffer only its own rows of the flattened batch HS."""
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = ()
+    runner._hs_pending_buffer = {}
+    runner._hs_saved_boundary = {}
+    runner._hs_buffer_origin = {}
+    runner._hs_mm_features = {}
+
+    hs_store = _FakeHSStore()
+    engine = SimpleNamespace(hidden_state_store=hs_store, config=SimpleNamespace(chunk_size=4))
+    runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
+
+    # r0 occupies rows 0..3, r1 rows 4..7 of the flattened batch.
+    runner.input_batch = SimpleNamespace(
+        req_ids=["r0", "r1"],
+        req_id_to_index={"r0": 0, "r1": 1},
+        num_computed_tokens_cpu=torch.tensor([0, 0]),
+        token_ids_cpu=torch.arange(128).reshape(2, 64),
+    )
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 4]))
+
+    # Row i is filled with value i so provenance is checkable.
+    hidden_states = torch.arange(8, dtype=torch.float32).reshape(8, 1).repeat(1, 2)
+    sched_out = SimpleNamespace(num_scheduled_tokens={"r0": 4, "r1": 4})
+
+    LMCacheHiddenStateMixin._maybe_store_hs_to_lmcache(
+        runner, hidden_states, None, num_tokens_unpadded=8, scheduler_output=sched_out
+    )
+
+    assert len(hs_store.calls) == 2
+    by_offset = {tuple(c.token_ids[:1]): c.hidden_states for c in hs_store.calls}
+    # r0 stored rows 0..3, r1 stored rows 4..7 -- not the batch's first 4 twice.
+    assert torch.equal(hs_store.calls[0].hidden_states[:, 0], torch.tensor([0.0, 1.0, 2.0, 3.0]))
+    assert torch.equal(hs_store.calls[1].hidden_states[:, 0], torch.tensor([4.0, 5.0, 6.0, 7.0]))
+    assert len(by_offset) == 2
+
+
+# ---------------------------------------------------------------------------
+# LMCache HS restore: one consumer, and a short store is a failure
+# ---------------------------------------------------------------------------
+
+
+class _StubHSStore:
+    """Returns a fixed-length prefix for every layer."""
+
+    def __init__(self, rows: int, hidden_size: int = 2):
+        self.rows = rows
+        self.hidden_size = hidden_size
+
+    def retrieve_hidden_states(self, token_ids, *, layer_idx=0):
+        if self.rows <= 0:
+            return None
+        return torch.ones(self.rows, self.hidden_size)
+
+
+def _make_stub_restore_runner(*, stored_rows, num_computed=8, prompt_tokens=16):
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._has_lmcache = True
+    runner._lmcache_hs_mm_keys = ()
+    runner._hs_mm_features = {}
+    engine = SimpleNamespace(
+        hidden_state_store=_StubHSStore(stored_rows),
+        config=SimpleNamespace(chunk_size=4),
+    )
+    runner._get_lmcache_adapter = lambda: SimpleNamespace(lmcache_engine=engine)
+    runner.input_batch = SimpleNamespace(
+        req_id_to_index={"r1": 0},
+        num_prompt_tokens=[prompt_tokens],
+        token_ids_cpu=torch.arange(64).reshape(1, 64),
+    )
+    sched_out = SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req_id="r1", num_computed_tokens=num_computed)])
+    return runner, sched_out
+
+
+def test_hs_restore_stashes_the_prefix_for_the_pooler_payload():
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_stub_restore_runner(stored_rows=8)
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert set(runner._restored_mm) == {"r1"}
+    assert runner._restored_mm["r1"]["hidden"].shape[0] == 8
+
+
+def test_hs_restore_skips_everything_when_the_store_is_short():
+    pytest.importorskip("lmcache", reason="the restore path keys through lmcache helpers")
+
+    runner, sched_out = _make_stub_restore_runner(stored_rows=5)
+
+    LMCacheHiddenStateMixin._maybe_restore_hs_from_lmcache(runner, sched_out)
+
+    assert runner._restored_mm == {}
+
+
+def test_hs_store_short_write_does_not_advance_the_boundary():
+    """A full pool stops the store early and returns normally, not by raising."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+    hs_store.store_hidden_states = lambda *a, **k: 0
+
+    _drive_step(runner, sched=8, num_computed=0, hs_rows=8)
+
+    assert runner._hs_saved_boundary.get("r1", 0) == 0
+    assert sum(t.shape[0] for t in runner._hs_pending_buffer["r1"]["hidden"]) == 8
+
+
+def test_hs_store_after_a_restore_still_flushes():
+    """A restored prefix was never buffered, so the boundary must start past it."""
+    runner, hs_store = _make_lmcache_runner(chunk_size=4, hidden_size=2)
+
+    # Request arrives with 4 tokens already restored and 4 scheduled.
+    _drive_step(runner, sched=4, num_computed=4, hs_rows=4)
+
+    assert runner._hs_saved_boundary["r1"] == 8
+    assert len(hs_store.calls) == 1
+    call = hs_store.calls[0]
+    assert call.token_offset == 4
+    assert call.hidden_states.shape == (4, 2)
+
+
+def test_keyed_token_ids_hash_multimodal_spans():
+    """Hidden states share the KV chunk keys, which have mm spans hashed.
+
+    Asserts that the span is rewritten and that the rewrite is stable, not what
+    the values are. The keys only have to match whatever LMCache derives for the
+    KV they ride with, and we get that by calling the same helper it does --
+    LMCache has changed both the helper's name and its per-position output
+    before, and pinning either breaks this test without telling us anything
+    about our own contract.
+    """
+    pytest.importorskip("lmcache", reason="lmcache not installed")
+
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner.input_batch = SimpleNamespace(token_ids_cpu=torch.arange(16).reshape(1, 16))
+    placeholder = SimpleNamespace(offset=4, length=3)
+    runner._hs_mm_features = {"r1": (["ab" * 16], [placeholder])}
+
+    keyed = runner._keyed_token_ids(0, "r1", 10)
+    again = runner._keyed_token_ids(0, "r1", 10)
+
+    # Only the span is touched, and the same request keys the same way twice.
+    assert keyed[:4] == [0, 1, 2, 3]
+    assert keyed[7:] == [7, 8, 9]
+    assert keyed[4:7] != [4, 5, 6]
+    assert keyed == again
+
+
+def test_keyed_token_ids_pass_through_without_multimodal_spans():
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner.input_batch = SimpleNamespace(token_ids_cpu=torch.arange(16).reshape(1, 16))
+    runner._hs_mm_features = {}
+
+    assert runner._keyed_token_ids(0, "r1", 5) == [0, 1, 2, 3, 4]
+
+
+def test_take_restored_mm_removes_only_the_requested_ids():
+    """The payload builder can run late, so it consumes a snapshot, not live state."""
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    runner._restored_mm = {
+        "r1": {"hidden": torch.ones(2, 2)},
+        "r2": {"hidden": torch.ones(3, 2)},
+    }
+
+    taken = runner._take_restored_mm(["r1"])
+
+    assert set(taken) == {"r1"}
+    assert set(runner._restored_mm) == {"r2"}
+
+
+def test_take_restored_mm_is_empty_without_lmcache():
+    runner = object.__new__(LMCacheHiddenStateMixin)
+    assert runner._take_restored_mm(["r1"]) == {}

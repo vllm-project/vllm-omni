@@ -13,18 +13,22 @@ list of supported architectures across all modalities, see
 ## Supported Models
 
 | Model | HuggingFace repo | Stages | Voice cloning | Streaming | Special modes | Sample rate |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
+| AuK | `tencent/AuK`, `tencent/AuK-Flash` (assembled with `tools/prepare_auk_checkpoint.py`) | 2 (thinker encoder + DiT) | ✓ | — | instruction-driven editing, enhancement, separation; no example script (use `vllm_omni.model_extras.auk`) | 24 kHz |
+| Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | dual-AR | ✓ | ✓ | 11 languages | 44.1 kHz |
+| Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | 2 (talker + codec) | ✓ | ✓ (async chunk) | voice design / voice direction (`--instruction`) | 24 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 24 kHz |
+| Fish Audio Drama 3 | `fishaudio/drama-3` | 2 (AR + DAC codec) | ✓ | ✓ (online) | speaker and event tags; no example script | 44.1 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
-| Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning WIP) | — (serving WIP) | zero-shot | 22.05 kHz |
+| Gepard-1.0 | `nineninesix/gepard-1.0` | single (native AR + NanoCodec) | — (zero-shot; cloning later) | ✓ (online) | zero-shot | 22.05 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | 2 (AR + audio VAE) | ✓ | ✓ | style / IP / dialect / TTA / podcast | 44.1 kHz |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
+| VibeVoice-1.5B | `vibevoice/VibeVoice-1.5B-hf` | 1 (LLM_AR, eager) | ✓ (optional) | — | offline only; no example script (use `vllm_omni.model_executor.models.vibevoice.prompt`) | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
-| dots.tts | `rednote-hilab/dots.tts-soar` | single (native AR) | — (not wired yet) | — | — | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
@@ -40,7 +44,65 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
     --ref-text  "Transcript of the reference audio."
 ```
 
-`--ref-audio` and `--ref-text` are optional (text-only synthesis works without them) and must be provided together for voice cloning. The exotic scripts — Qwen3-TTS, Voxtral TTS, CosyVoice3 — accept additional model-specific flags documented in their per-model section below. Qwen3-TTS in particular uses its own argparse surface (`--query-type`, `--audio-path`, etc.) and does not follow the common shape; see its section.
+For most models, `--ref-audio` and `--ref-text` are optional for text-only synthesis but must be provided together for voice cloning. OmniVoice also accepts `--ref-audio` without `--ref-text` and transcribes the reference lazily with Whisper. Qwen3-TTS, Voxtral TTS, and CosyVoice3 accept additional model-specific flags documented in their sections below. Qwen3-TTS uses its own argparse surface with options such as `--query-type` and `--audio-path`, so it does not follow the common command shape.
+
+---
+
+## Audio8 TTS Preview
+
+0.6B DualAR text-to-speech model (Audio8) with its own 44.1 kHz neural audio
+codec: a slow AR transformer predicts one semantic token per codec frame, and a
+4-layer fast AR predicts that frame's remaining 9 codebooks.
+
+### Prerequisites
+
+No extra packages: the codec architecture ships in tree and its weights
+(`codec.pth`) come with the checkpoint.
+
+### Quick start
+
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --text "Welcome to Audio8 TTS, a compact multilingual text to speech model."
+```
+
+### Voice cloning
+
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --text "Welcome to Audio8 TTS." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text  "The exact transcript of the reference recording."
+```
+
+The reference transcript must match what is actually spoken in the clip;
+a mismatch degrades both stability and speaker similarity.
+
+### Streaming
+
+```bash
+python examples/offline_inference/text_to_speech/audio8_tts/end2end.py \
+    --text "Welcome to Audio8 TTS." --streaming
+```
+
+### Notes
+
+- Output: 44.1 kHz mono WAV; the codec emits ~21.5 frames/s (2048 samples per frame).
+- Context is 2048 packed text+audio positions, so `max_model_len` is 2048.
+- Greedy decoding (`temperature: 0`) is degenerate for this checkpoint — it
+  ends the utterance almost immediately. Keep the deploy defaults
+  (`temperature 0.7`, `top_k 50`, `top_p 0.9`), which also match
+  `generation_config.json`.
+- Repetition-Aware Sampling is applied to the semantic token: a repeat inside
+  the last 10 frames is re-drawn from a flatter distribution instead of being
+  masked out.
+- `--num-prompts 4` smoke-tests concurrency (stage 0 runs `max_num_seqs: 4`).
+
+### Measured behaviour (1x H20, shared GPU)
+
+`--streaming` on a 58-character English sentence: TTFA ~0.74 s (4-frame first
+chunk), 7 chunks, 1.55 s wall for 3.16 s of audio (RTF ~0.49). Treat these as
+smoke-test magnitudes, not a benchmark.
 
 ---
 
@@ -49,12 +111,14 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
 2-stage TTS pipeline (`talker` + `code2wav`) at 24 kHz.
 
 ### Prerequisites
+
 ```bash
 uv pip install -e .
 # Includes soundfile, onnxruntime, x-transformers, einops via requirements.
 ```
 
 Download the model snapshot:
+
 ```python
 from huggingface_hub import snapshot_download
 snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512',
@@ -62,15 +126,18 @@ snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512',
 ```
 
 If your downloaded checkpoint lacks `config.json`, add it:
+
 ```json
 {
     "model_type": "cosyvoice3",
     "architectures": ["CosyVoice3Model"]
 }
 ```
+
 This is required because `AutoConfig.register("cosyvoice3", CosyVoice3Config)` only registers the class mapping; the loader still reads `model_type` from `config.json` to select the class.
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
     --model pretrained_models/Fun-CosyVoice3-0.5B \
@@ -78,9 +145,11 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ```
 
 ### Voice cloning
+
 If `--ref-audio` is omitted, the script downloads the upstream
 [`zero_shot_prompt.wav`](https://github.com/FunAudioLLM/CosyVoice/blob/main/asset/zero_shot_prompt.wav) from the CosyVoice repo into the current directory.
 To use your own clip, pass `--ref-audio /path/to/reference.wav`, and modify `--prompt-text` correspondingly.
+
 ```bash
 python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
     --model pretrained_models/Fun-CosyVoice3-0.5B \
@@ -90,9 +159,11 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ```
 
 ### Streaming
+
 Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/cosyvoice3.yaml`. Pass `--no-async-chunk` on `vllm serve` to switch to the legacy synchronous path.
 
 ### Notes
+
 - Stage 0 (`talker`) emits speech tokens; stage 1 (`code2wav`) runs flow matching + HiFiGAN to synthesize waveform.
 - Deploy config auto-loads from `vllm_omni/deploy/cosyvoice3.yaml` based on HF `model_type`. Pass `--deploy-config <path>` to override.
 
@@ -103,6 +174,7 @@ Streaming is enabled by default via `async_chunk: true` in `vllm_omni/deploy/cos
 2-stage TTS pipeline (AR + DiT flow-matching) at 24 kHz. Every request requires reference audio and its transcript for zero-shot voice cloning.
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
     --model zai-org/GLM-TTS \
@@ -113,12 +185,14 @@ python examples/offline_inference/text_to_speech/glm_tts/end2end.py \
 ```
 
 ### Architecture
-```
+
+```text
 Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24 kHz)
         (Llama-based)    (32k vocab)      (Flow Matching)
 ```
 
 ### Notes
+
 - `--ref-audio` and `--ref-text` are **required** together; GLM-TTS does not support text-only synthesis.
 - Reference audio should be 3-10 seconds.
 - First run may be slow due to lazy loading of WhisperVQ tokenizer and CampPlus ONNX speaker embedder.
@@ -127,22 +201,64 @@ Text → [Stage 0: AR] → Speech Tokens → [Stage 1: DiT + HiFT] → Audio (24
 
 ---
 
+## Fish Audio Drama 3
+
+35B-total / 3B-active MoE TTS at 44.1 kHz with the same DAC codec stage as
+Fish Speech S2 Pro. There is no separate example script: build the request
+with `additional_information` and size the placeholder prompt with
+`estimate_prompt_len_from_additional_information`, which returns the exact
+prompt row count. See the [Drama 3 recipe](../../../recipes/fishaudio/Drama-3.md) for details.
+
+```python
+import soundfile as sf
+import torch
+from transformers import AutoTokenizer
+
+from vllm_omni import Omni
+from vllm_omni.model_executor.models.fish_omni.fish_omni_model import FishOmniForConditionalGeneration
+
+
+def main() -> None:
+    model = "fishaudio/drama-3"
+    wav, sample_rate = sf.read("reference.wav", dtype="float32")
+    info = {
+        "text": "The quarterly report is due on Thursday, so please finish it by noon.",
+        "ref_text": "Transcript of the reference audio.",
+        "ref_audio_wav": torch.from_numpy(wav),
+        "ref_audio_sr": sample_rate,
+    }
+    prompt_len = FishOmniForConditionalGeneration.estimate_prompt_len_from_additional_information(
+        info, tokenizer=AutoTokenizer.from_pretrained(model)
+    )
+    omni = Omni(model=model)
+    for output in omni.generate([{"prompt_token_ids": [1] * prompt_len, "additional_information": info}]):
+        audio = output.outputs[0].multimodal_output["audio"]
+        audio = torch.cat(audio, dim=-1) if isinstance(audio, list) else audio
+        sf.write("output.wav", audio.float().cpu().numpy().reshape(-1), samplerate=44100)
+
+
+if __name__ == "__main__":  # Omni starts its stages in subprocesses.
+    main()
+```
+
+Leave out `ref_text`, `ref_audio_wav` and `ref_audio_sr` for synthesis without a reference voice.
+
+---
+
 ## Fish Speech S2 Pro
 
 4B dual-AR text-to-speech model from FishAudio with the DAC codec at 44.1 kHz.
-
-### Prerequisites
-```bash
-pip install fish-speech
-```
+No extra packages are required; the DAC codec is vendored in vLLM-Omni.
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
     --text "Hello, this is a test of the Fish Speech text to speech system."
 ```
 
 ### Voice cloning
+
 ```bash
 python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
     --text "Hello, this is a cloned voice." \
@@ -151,14 +267,17 @@ python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
 ```
 
 ### Streaming
+
 ```bash
 python examples/offline_inference/text_to_speech/fish_speech/end2end.py \
     --text "Hello, this is a streaming test." \
     --streaming
 ```
+
 Streaming requires `async_chunk: true` in the deploy config.
 
 ### Notes
+
 - Output: 44.1 kHz mono WAV.
 - DAC codec weights (`codec.pth`) are loaded lazily from the model directory.
 
@@ -169,6 +288,7 @@ Streaming requires `async_chunk: true` in the deploy config.
 Dense 0.5B two-stage TTS pipeline (`AR + flow` + audio VAE) at 44.1 kHz. The example covers style, IP voice, music-only generation, text-to-audio events, emotion, dialect, zero-shot cloning, podcast, speech+BGM, and speech+environment-sound cases.
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
     --case style \
@@ -177,6 +297,7 @@ python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
 ```
 
 ### Voice cloning
+
 ```bash
 python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
     --case zero_shot \
@@ -187,6 +308,7 @@ python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
 ```
 
 ### Streaming
+
 ```bash
 python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
     --case basic \
@@ -197,6 +319,7 @@ python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
 ```
 
 ### Notes
+
 - `style`, `ip`, `bgm`, and `tta` do not require reference audio.
 - Reference-audio cases use `--ref-audio`; `zero_shot` also requires `--ref-text`.
 - `podcast` uses multiple references via `--ref-audio-paths`.
@@ -209,14 +332,17 @@ python examples/offline_inference/text_to_speech/ming_tts/end2end.py \
 Standalone talker-only deployment of Ming-flash-omni-2.0 at 44.1 kHz. Voice is controlled through caption fields (`风格` / `IP` / `语速`/`基频`/`音量`) rather than reference audio.
 
 ### Prerequisites
+
 The example calls into `vllm_omni.model_executor.models.ming_flash_omni.prompt_utils` for the default prompt and instruction builder; no extra pip install on top of the base vLLM-Omni install.
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/ming_flash_omni_tts/end2end.py --case style
 ```
 
 ### Cases
+
 ```bash
 # ASMR-style whisper (caption-driven)
 python examples/offline_inference/text_to_speech/ming_flash_omni_tts/end2end.py --case style
@@ -231,6 +357,7 @@ python examples/offline_inference/text_to_speech/ming_flash_omni_tts/end2end.py 
 Override the default text per case with `--text`, write to a custom path with `--output`.
 
 ### Notes
+
 - Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../../ming_flash_omni/).
 - Deploy config: `vllm_omni/deploy/ming_flash_omni_tts.yaml` (single GPU, `enforce_eager`, `max_num_seqs: 1`).
 - Decode defaults from the Ming cookbook: `max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`, `use_zero_spk_emb=True`.
@@ -244,6 +371,7 @@ Single-stage 0.1B AR LM + MOSS-Audio-Tokenizer-Nano codec at 48 kHz mono (mixed 
 > **No built-in speaker presets.** `--ref-audio` is required on every call. Default `--mode voice_clone` matches upstream's recommended workflow; `--mode continuation` is exposed for completeness but upstream's continuation-with-prompt path emits very short / near-silent output, so it is rarely useful in practice. Sample reference clips ship in the upstream repo under [`assets/audio/`](https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/main/assets/audio) (e.g. `zh_1.wav`, `en_2.wav`, `jp_2.wav`).
 
 ### Quick start
+
 ```bash
 # Fetch a sample reference clip (one-off, user-scoped cache).
 REF_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/moss-tts-nano"
@@ -255,9 +383,11 @@ python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
     --text "你好，这是MOSS-TTS-Nano的语音合成演示。" \
     --ref-audio "$REF_DIR/zh_1.wav"
 ```
+
 The first run downloads `OpenMOSS-Team/MOSS-TTS-Nano` and `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano` from Hugging Face.
 
 ### Reproducible runs
+
 ```bash
 python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
     --text "Deterministic test." \
@@ -266,6 +396,7 @@ python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
 ```
 
 ### Notes
+
 - Output: 48 kHz mono WAV (the tokenizer is internally stereo at 48 kHz; the wrapper averages to mono before reaching the engine).
 - Deploy config: `vllm_omni/deploy/moss_tts_nano.yaml` (auto-loaded; override with `--deploy-config`).
 - Default `--max-new-frames 375` ≈ 14 s of audio; raise for longer outputs.
@@ -276,15 +407,18 @@ python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
 
 ## OmniVoice
 
-Zero-shot multilingual TTS supporting 600+ languages, with three modes (auto / clone / design).
+OmniVoice creates speech in more than 600 languages. It supports text-to-speech without a reference clip, voice cloning, and voice design.
 
 ### Prerequisites
+
 ```bash
 huggingface-cli download k2-fsa/OmniVoice
 ```
-Voice cloning requires `transformers>=5.3.0`. Auto and design modes work with `transformers>=4.57.0`.
+
+Voice cloning requires `transformers>=5.3.0`. Automatic voice and voice design use `transformers>=4.57.0`.
 
 ### Quick start (auto voice)
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -292,6 +426,9 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ```
 
 ### Voice cloning
+
+With an explicit transcript, voice cloning does not load Whisper:
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -300,7 +437,32 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --ref-text  "This is the reference transcription."
 ```
 
+Omit `--ref-text` to use automatic transcription. The default OmniVoice deploy config loads Whisper on the worker device when the first request needs it. Set `load_asr_on_startup: true` in `additional_config.omnivoice_asr` to load it during worker startup. Set `asr_device: "cuda:0"` or `asr_device: "cpu"` in the same block to override the worker device:
+
+```bash
+python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
+    --model k2-fsa/OmniVoice \
+    --text "hello" \
+    --ref-audio trump_ref.wav
+```
+
+### Reference audio processing
+
+OmniVoice prepares the reference clip before it transcribes the clip or builds the voice cloning input. It performs these steps:
+
+- It converts the clip to mono and resamples it to 24 kHz.
+- It measures the original root mean square (RMS) level. When the RMS is greater than zero and below `0.1`, it raises the waveform level to `0.1` and keeps the original RMS for output volume control.
+- When `--ref-text` is omitted, it trims a clip longer than 20 seconds at a detected silence.
+- It removes middle silence and trims silence at both edges whether the transcript is automatic or supplied by the caller.
+- It aligns the sample count down to the audio tokenizer hop size.
+- When `--ref-text` is omitted, it sends the prepared waveform to Whisper.
+- It adds a final period for English text or a Chinese full stop for Chinese text when the reference text has no ending punctuation.
+- It sends the same prepared waveform to the audio tokenizer.
+
+After decoding, OmniVoice applies silence removal, RMS scaling, fades, and padding only to voice-cloning output. Text-only output returns the decoder tensor unchanged. Output audio is mono at 24 kHz.
+
 ### Voice design
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -309,6 +471,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ```
 
 ### Language hint
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -317,6 +480,7 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ```
 
 ### Seed for Reproducibility
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -325,8 +489,14 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 ```
 
 ### Notes
+
 - Stage 0 (Generator): Qwen3-0.6B with 32-step iterative unmasking.
 - Stage 1 (Decoder): HiggsAudioV2 RVQ + DAC at 24 kHz.
+- The default deploy config uses `openai/whisper-large-v3-turbo` for lazy ASR on
+  the worker device. Set `load_asr_on_startup: true` in `additional_config.omnivoice_asr`
+  to load it during worker startup. Set `asr_device` in the same block to use a
+  different GPU or the CPU. Supplying `--ref-text` avoids ASR.
+- Generated audio remains mono at 24 kHz.
 
 ---
 
@@ -335,13 +505,16 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 3-task-variant TTS with 24 kHz output. Has its own argparse surface (this script does not follow the common `--text` / `--ref-audio` shape).
 
 ### Prerequisites
+
 For ROCm builds, replace `onnxruntime` with `onnxruntime-rocm`:
+
 ```bash
 pip uninstall onnxruntime
 pip install onnxruntime-rocm
 ```
 
 ### Task variants
+
 - `CustomVoice`: predefined speaker (speaker ID) with optional style instruction.
 - `VoiceDesign`: text + descriptive instruction designs a new voice.
 - `Base`: voice cloning from reference audio + transcript.
@@ -365,22 +538,27 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py --query-ty
 ```
 
 ### Streaming
+
 ```bash
 python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
     --query-type CustomVoice \
     --streaming \
     --output-dir /tmp/out_stream
 ```
+
 Streaming requires `async_chunk: true` in the deploy config.
 
 ### Word Timestamps
+
 Word-level timestamps are currently a serving-path feature: launch
 `vllm-omni serve` with `--forced-aligner` and request `word_timestamps`
 (see `examples/online_serving/text_to_speech/README.md`). An offline
 example is not provided in this release.
 
 ### Batched decoding
+
 The Code2Wav stage supports batched decoding through the SpeechTokenizer. Pass multiple prompts via `--txt-prompts` and set `--batch-size` accordingly. To raise `max_num_seqs` on either stage, create an overlay based on `vllm_omni/deploy/qwen3_tts.yaml` and pass it with `--deploy-config`:
+
 ```bash
 python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
     --query-type CustomVoice \
@@ -388,9 +566,11 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
     --batch-size 4 \
     --deploy-config /path/to/qwen3_tts_batched.yaml
 ```
+
 `--batch-size` must match a CUDA-graph capture size (1, 2, 4, 8, 16…).
 
 ### Notes
+
 - Run `--help` for the full argument surface.
 - See `qwen3_tts/end2end.py` for the prompt-length-estimation logic the Talker uses.
 
@@ -401,6 +581,7 @@ python examples/offline_inference/text_to_speech/qwen3_tts/end2end.py \
 Single-stage native AR TTS at 22.05 kHz. Pipeline: `Qwen3.5 backbone → 32 FSQ codebook heads (one frame/step) → NeMo NanoCodec`. Backbone runs under vLLM paged attention; the 32-head sampling + learned embedding feedback ride the native-AR runner hooks. `enforce_eager` (CUDA graph is a perf follow-up).
 
 ### Prerequisites
+
 The NanoCodec decoder needs NeMo (NVIDIA Open Model License), installed separately:
 
 ```bash
@@ -430,19 +611,22 @@ failure rather than an environment one. The PyTorch sampler it falls back to cos
 here.
 
 ### Quick start (zero-shot, default voice)
+
 ```bash
 python examples/offline_inference/text_to_speech/gepard/end2end.py \
     --text "Hello, this is a Gepard demo."
 ```
 
 ### Voice cloning
+
 Not yet — PR1 is zero-shot only (the learned `null_prefix` default voice). Reference-audio cloning (`ref_compressor` speaker prefix) is a follow-up PR.
 
 ### Notes
+
 - Output: 22.05 kHz mono WAV.
 - First run downloads two checkpoints, not one: the model itself, and the NanoCodec decoder it names in `codec_id` (`nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps` by default). Both are fetched automatically; expect the first startup to be correspondingly slower.
-- Offline only for now; the `/v1/audio/speech` adapter is a follow-up PR.
-- Deploy config: `vllm_omni/deploy/gepard.yaml` (the example's default; copy it and pass `--deploy-config` to change it).
+- Offline and online: `examples/offline_inference/text_to_speech/gepard/end2end.py` and `/v1/audio/speech` (see the [online Gepard section](../../online_serving/text_to_speech/README.md#gepard-10)).
+- Deploy config: `vllm_omni/deploy/gepard.yaml` (the example's default; copy it and pass `--deploy-config` to change it). Online serving **must** pass `--deploy-config vllm_omni/deploy/gepard.yaml` because the checkpoint self-identifies as `qwen3_5_text`.
 - Generation length and reproducibility are stage settings, not script flags. One output token is one audio frame, so `max_tokens` in the YAML is the frame budget; `seed` makes the in-model 32-head sampling reproducible. The script deliberately passes no `SamplingParams`: one supplied by a caller replaces the stage defaults wholesale rather than merging, which would drop the pipeline's stop token and run every request to `max_tokens`.
 - Text length: short texts are repeated internally to match the training layout (the checkpoint's `text_repetition` block); the upper bound is the stage's `max_model_len`, enforced by the engine. Empty text is rejected rather than voiced.
 - `VLLM_GEPARD_GREEDY=1` swaps the 32-head Gumbel-max sampling for argmax, for reproducible comparisons that do not depend on a seed.
@@ -452,13 +636,15 @@ Not yet — PR1 is zero-shot only (the learned `null_prefix` default voice). Ref
 Single-stage native AR TTS at 48 kHz. Pipeline: `feat_encoder → MiniCPM4 → FSQ → residual_lm → LocDiT → AudioVAE`.
 
 ### Prerequisites
+
 ```bash
 pip install voxcpm
 # or, for a local source checkout:
-export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/voxcpm
+pip install -e /path/to/voxcpm
 ```
 
 ### Quick start
+
 ```bash
 python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
     --model openbmb/VoxCPM2 \
@@ -466,7 +652,9 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 ```
 
 ### Voice cloning
+
 Pass a reference audio for isolated cloning, or both `--ref-audio` + `--ref-text` for prompt continuation:
+
 ```bash
 python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
     --text "Hello, this is a voice clone demo." \
@@ -475,36 +663,13 @@ python examples/offline_inference/text_to_speech/voxcpm2/end2end.py \
 ```
 
 ### Streaming
+
 Streaming is exposed through the online OpenAI Speech API (`stream=true`). See [`examples/online_serving/text_to_speech/voxcpm2/gradio_demo.py`](../../online_serving/text_to_speech/voxcpm2/gradio_demo.py) for an AudioWorklet-based gapless streaming player; the offline `end2end.py` script does not expose a streaming path.
 
 ### Notes
+
 - Output: 48 kHz mono WAV.
 - Deploy config: `vllm_omni/deploy/voxcpm2.yaml` (auto-loaded by HF `model_type`).
-
----
-
-## dots.tts
-
-Single-stage native AR TTS at 48 kHz (rednote-hilab). Pipeline: `Qwen2.5-1.5B base LM → DiT (10-step Euler flow matching) → patch_encoder AR loopback → AudioVAE (streaming decode)`. Same "vLLM-native base LM + side-path computation" pattern as VoxCPM2, with a plain Qwen2 backbone instead of MiniCPM4 and no FSQ / residual LM stage.
-
-### Quick start
-```bash
-python examples/offline_inference/text_to_speech/dots_tts/end2end.py \
-    --model rednote-hilab/dots.tts-soar \
-    --text "Hello, this is a test of dots TTS running on vLLM Omni."
-```
-
-### Voice cloning
-Not wired in this release — generation is zero-shot only. The CAM++ x-vector speaker encoder weights load, but `end2end.py` has no `--ref-audio`/`--ref-text` flags yet.
-
-### Streaming
-The AudioVAE decoder has an internal streaming path (`init_stream_state` / `stream_step` / `stream_flush`) used to avoid boundary artifacts between 160 ms patches, but it is not yet exposed through an online serving endpoint or example.
-
-### Notes
-- Output: 48 kHz mono WAV.
-- Deploy config: `vllm_omni/deploy/dots_tts.yaml` (auto-loaded by HF `model_type`).
-- Checkpoints: `rednote-hilab/dots.tts-soar` is the validated default. `dots.tts-base` shares the same architecture but is unvalidated in this repo. `dots.tts-mf` (MeanFlow, 2-4 step) is not supported yet.
-- Known limitation: no CUDA graph capture and no batched side-path computation yet, so concurrent requests do not currently scale (each request's DiT Euler steps run serially). See `recipes/rednote-hilab/dots.tts.md` for details and the roadmap.
 
 ---
 
@@ -538,10 +703,10 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
     --lang ja \
     --text "こんにちは、音声合成のテストです。" \
     --ref-audio /path/to/reference.wav
-
 ```
 
 ### Emotion control
+
 ```bash
 # Emotion from reference audio
 python examples/offline_inference/text_to_speech/indextts2/end2end.py \
@@ -566,6 +731,7 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
 ```
 
 ### Notes
+
 - `--ref-audio` is **required** — neither version provides text-only synthesis.
 - IndexTTS-2.5 Stage 0 (AR Talker) generates mel codes from text + reference audio using plain vLLM sampling. It does not reproduce the official default `num_beams=3` beam search. For parity comparisons, run upstream with `num_beams=1`; output quality can differ from the official beam-search result.
 - IndexTTS-2.5 accepts language codes such as `zh`, `en`, `zhen` (mixed Chinese/English), `ja`, and `yue`. `Mandarin` is a vLLM-Omni convenience alias for `zh`. Japanese (`ja`) uses `fugashi` tokenization and produces audio, but it does not automatically expand numbers, dates, or percentages; write those inputs as readable Japanese text before calling the model. Use `--no-text-normalization` only when the input is already normalized.
@@ -581,12 +747,15 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
 Voxtral-4B-TTS (Mistral). Has its own argparse surface; uses voice presets and the `mistral_common` `SpeechRequest` protocol.
 
 ### Prerequisites
+
 Latest `mistral_common` with `SpeechRequest` support:
+
 ```bash
 pip install -e /path/to/mistral-common  # or upgrade from PyPI when available
 ```
 
 ### Quick start (voice preset)
+
 ```bash
 python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
     --write-audio --voice cheerful_female \
@@ -595,6 +764,7 @@ python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
 ```
 
 ### Voice cloning (capability gated upstream)
+
 ```bash
 python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
     --write-audio \
@@ -604,15 +774,93 @@ python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
 ```
 
 ### Streaming + concurrency
+
 ```bash
 python examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
     --num-prompts 32 --concurrency 8 --streaming --write-audio --voice neutral_female \
     --model mistralai/Voxtral-4B-TTS-2603 \
     --text "..."
 ```
+
 Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-TTS-2603`).
 
 ### Notes
+
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
+
+---
+
+## Breeze-TTS-2
+
+Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder → bundled Qwen3-TTS codec) at 24 kHz mono. The prompt builder picks one of four templates automatically: plain, voice design (`--instruction`), clone (`--ref-audio` + `--ref-text`), or voice direction (reference + `--instruction`).
+
+### Quick start
+
+```bash
+python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
+    --model BreezeBlue/Breeze-TTS-2 \
+    --text "Hello, this is Breeze TTS 2 running on vLLM Omni."
+```
+
+### Voice direction
+
+```bash
+python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
+    --text "We need to discuss what happened last night." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "The exact transcript of the reference audio." \
+    --instruction "Speak slowly with a restrained, serious tone."
+```
+
+### Notes
+
+- Output: 24 kHz mono WAV; `--max-new-tokens` caps generated frames (80 ms each).
+- Speaker tags `--voice S0`..`S9` (default `S0`) select the timbre in non-reference modes; with `--ref-audio` the timbre comes from the reference clip.
+- Deploy config: `vllm_omni/deploy/breeze_tts_2.yaml` (auto-loaded by HF `model_type`); see [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the online-serving recipe.
+
+## VibeVoice
+
+Single-stage eager offline TTS for the native Transformers checkpoint `vibevoice/VibeVoice-1.5B-hf` (single speaker, 24 kHz mono). There is no example script; build the prompt with the model's helper:
+
+```python
+import soundfile as sf
+import torch
+from vllm import SamplingParams
+
+from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.model_executor.models.vibevoice.prompt import render_vibevoice_prompt
+
+text = "Hello from VibeVoice."
+cloned = {
+    "prompt": render_vibevoice_prompt(text),
+    "multi_modal_data": {"audio": sf.read("reference.wav", dtype="float32")},  # (waveform, sample_rate)
+}
+no_reference = {"prompt": render_vibevoice_prompt(text, reference=False)}
+omni = Omni(model="vibevoice/VibeVoice-1.5B-hf")  # loads vllm_omni/deploy/vibevoice.yaml
+try:
+    for name, prompt in (("cloned", cloned), ("no_reference", no_reference)):
+        output = omni.generate([prompt], [SamplingParams(max_tokens=2048)])[0].outputs[0]
+        mm = output.multimodal_output
+        audio = mm.get("audio")
+        if audio is None:
+            audio = mm.get("model_outputs")
+        if audio is None:
+            raise RuntimeError("VibeVoice returned no audio.")
+        if isinstance(audio, list):
+            if not audio:
+                raise RuntimeError("VibeVoice returned empty audio.")
+            audio = torch.cat([torch.as_tensor(chunk).reshape(-1) for chunk in audio])
+        else:
+            audio = torch.as_tensor(audio).reshape(-1)
+        sf.write(f"{name}.wav", audio.detach().cpu().numpy(), 24000)
+finally:
+    omni.close()
+```
+
+### Notes
+
+- Reference audio: at most one clip, any channel layout and sample rate (mixed to mono, resampled to 24 kHz), up to 60 s. A reference prompt without audio is rejected.
+- Without a reference there is no default voice, as in Transformers: the voice is sampled per request from the diffusion noise, so it changes between requests. Pass a reference for a stable voice.
+- Limits: offline `Omni` only, eager, single speaker, no streaming and no `/v1/audio/speech`. See [`recipes/Microsoft/VibeVoice-1.5B-H100.md`](../../../recipes/Microsoft/VibeVoice-1.5B-H100.md).
