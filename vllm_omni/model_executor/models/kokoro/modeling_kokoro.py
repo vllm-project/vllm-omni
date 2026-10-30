@@ -38,6 +38,7 @@ from vllm_omni.model_executor.models.kokoro.kokoro_modules import KokoroNetwork,
 from vllm_omni.model_executor.models.kokoro.text_frontend import (
     DEFAULT_VOICE,
     KokoroTextFrontend,
+    list_voices,
     phonemes_to_ids,
     resolve_lang_code,
     resolve_voices_dir,
@@ -85,7 +86,7 @@ class KokoroForConditionalGeneration(nn.Module):
     has_postprocess = False
     enable_update_additional_information = True
     # The checkpoint is a single ``kokoro-v1_0.pth``; voicepacks are separate
-    # ``voices/*.pt`` files resolved on demand.
+    # ``voices/*.pt`` files, all loaded in ``load_weights()``.
     allow_patterns_overrides = ["*.pth"]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -99,7 +100,7 @@ class KokoroForConditionalGeneration(nn.Module):
         self.network.eval()
         self.frontend = KokoroTextFrontend()
 
-        self._voices_dir: str | None = None
+        # Every voice pack, loaded on the device in load_weights().
         self._voicepacks: dict[str, torch.Tensor] = {}
         self._stream_gens: dict[str, Iterator[tuple[torch.Tensor | None, bool]]] = {}
         # Requests that already yielded their last chunk. With async scheduling
@@ -133,18 +134,24 @@ class KokoroForConditionalGeneration(nn.Module):
         # English model on first use), which would otherwise stall the first
         # request.
         self.frontend.warmup("a")
+        # Load every voice pack now (54 x 510 x 256 fp32, ~28 MB): a lazy load
+        # would put hub and disk I/O inside forward(), stalling the whole batch.
+        voices_dir = resolve_voices_dir(self.model_path, self.revision)
+        self._voicepacks = {
+            voice: torch.load(os.path.join(voices_dir, f"{voice}.pt"), map_location="cpu", weights_only=True).to(
+                self._device
+            )
+            for voice in list_voices(voices_dir)
+        }
+        if not self._voicepacks:
+            raise ValueError(f"Kokoro checkpoint has no voices/*.pt packs in {voices_dir}")
         return {f"network.{n}" for n, _ in self.network.named_parameters()}
 
     def _voicepack(self, voice: str) -> torch.Tensor:
+        # A lookup, never a path: offline voice names skip the adapter's check.
         pack = self._voicepacks.get(voice)
         if pack is None:
-            if self._voices_dir is None:
-                self._voices_dir = resolve_voices_dir(self.model_path, self.revision)
-            path = os.path.join(self._voices_dir, f"{voice}.pt")
-            if not os.path.isfile(path):
-                raise ValueError(f"Unknown Kokoro voice {voice!r}")
-            pack = torch.load(path, map_location="cpu", weights_only=True).to(self._device)
-            self._voicepacks[voice] = pack
+            raise ValueError(f"Unknown Kokoro voice {voice!r}")
         return pack
 
     # ------------------------------------------------------------------
@@ -180,6 +187,10 @@ class KokoroForConditionalGeneration(nn.Module):
         for i, ps in enumerate(chunks):
             input_ids = torch.tensor([phonemes_to_ids(ps, self.config.vocab)], dtype=torch.long, device=self._device)
             try:
+                # The style vector is picked by phoneme count; the frontend caps
+                # chunks at MAX_PHONEMES, which must not outgrow the pack.
+                if not 0 < len(ps) <= pack.shape[0]:
+                    raise ValueError(f"chunk has {len(ps)} phonemes; voice packs cover 1-{pack.shape[0]}")
                 with torch.inference_mode():
                     audio, _ = self.network(input_ids, pack[len(ps) - 1], speed, generator)
             except Exception:

@@ -9,6 +9,7 @@ The network runs with random weights at the real Kokoro-82M shapes.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 import torch
@@ -230,17 +231,16 @@ class _NoWarmupFrontend(KokoroTextFrontend):
         pass
 
 
-def _bare_model(config: KokoroConfig) -> KokoroForConditionalGeneration:
+def _bare_model(config: KokoroConfig, model_path: str = "unused") -> KokoroForConditionalGeneration:
     """A model instance without vLLM engine construction."""
     model = KokoroForConditionalGeneration.__new__(KokoroForConditionalGeneration)
     nn.Module.__init__(model)
     model.config = config
-    model.model_path = "unused"
+    model.model_path = model_path
     model.revision = None
     model._device = torch.device("cpu")
     model.network = KokoroNetwork(config).eval()
     model.frontend = _NoWarmupFrontend()
-    model._voices_dir = None
     model._voicepacks = {}
     model._stream_gens = {}
     model._finished_keys = set()
@@ -248,14 +248,38 @@ def _bare_model(config: KokoroConfig) -> KokoroForConditionalGeneration:
     return model
 
 
-def test_load_weights_from_pth_items(network: KokoroNetwork) -> None:
+def _checkpoint_dir(tmp_path: Path, voices: tuple[str, ...] = ("af_heart", "bm_george")) -> str:
+    (tmp_path / "voices").mkdir()
+    for voice in voices:
+        torch.save(torch.randn(MAX_PHONEMES, 1, 256), tmp_path / "voices" / f"{voice}.pt")
+    return str(tmp_path)
+
+
+def test_load_weights_from_pth_items(network: KokoroNetwork, tmp_path: Path) -> None:
     checkpoint = _reference_layout_checkpoint(network)
-    model = _bare_model(_config())
+    model = _bare_model(_config(), _checkpoint_dir(tmp_path))
     # vLLM's .pt iterator yields the checkpoint's top-level items.
     loaded = model.load_weights(iter(checkpoint.items()))
     assert loaded == {f"network.{n}" for n, _ in model.network.named_parameters()}
     for (name, got), (_, want) in zip(model.network.state_dict().items(), network.state_dict().items()):
         torch.testing.assert_close(got, want, msg=name)
+
+
+def test_load_weights_preloads_every_voice_and_rejects_other_names(network: KokoroNetwork, tmp_path: Path) -> None:
+    """No voice I/O is left for forward(), and offline names never become paths."""
+    model = _bare_model(_config(), _checkpoint_dir(tmp_path))
+    model.load_weights(iter(_reference_layout_checkpoint(network).items()))
+    assert sorted(model._voicepacks) == ["af_heart", "bm_george"]
+    (tmp_path / "x.pt").write_bytes(b"")
+    for name in ("af_sky", "../x", "voices/af_heart"):
+        with pytest.raises(ValueError, match="Unknown Kokoro voice"):
+            model._voicepack(name)
+
+
+def test_load_weights_rejects_checkpoint_without_voices(network: KokoroNetwork, tmp_path: Path) -> None:
+    model = _bare_model(_config(), _checkpoint_dir(tmp_path, voices=()))
+    with pytest.raises(ValueError, match="no voices"):
+        model.load_weights(iter(_reference_layout_checkpoint(network).items()))
 
 
 def test_load_weights_rejects_mismatched_checkpoint(network: KokoroNetwork) -> None:
@@ -389,6 +413,17 @@ def test_rows_without_a_request_id_finish_without_synthesis() -> None:
     assert all(o.numel() == 0 for o in outputs)
     assert tokens == [KOKORO_STOP_TOKEN_ID] * 3
     assert m.created == []
+
+
+def test_chunk_longer_than_the_voicepack_fails_only_its_request() -> None:
+    class _OneLongChunk:
+        def phoneme_chunks(self, text: str, lang_code: str) -> list[str]:
+            return ["a" * 6]
+
+    model = _bare_model(_config())
+    model.frontend = _OneLongChunk()
+    model._voicepacks = {"af_heart": torch.randn(5, 1, 256)}
+    assert list(model._create_stream_gen({"text": ["hi"], "voice": ["af_heart"]})) == [(None, True)]
 
 
 def test_failed_request_is_flagged_and_stops() -> None:
