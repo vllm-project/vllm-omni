@@ -24,6 +24,12 @@ class OmniServingCapability(Enum):
     """Serving capabilities that pipelines can shut down."""
 
     COMPLETIONS = RouteTarget("/v1/completions", frozenset({"POST"}))
+    CHAT_COMPLETIONS = RouteTarget("/v1/chat/completions", frozenset({"POST"}))
+    CHAT_COMPLETIONS_BATCH = RouteTarget("/v1/chat/completions/batch", frozenset({"POST"}))
+    RESPONSES = RouteTarget("/v1/responses", frozenset({"POST"}))
+    MESSAGES = RouteTarget("/v1/messages", frozenset({"POST"}))
+    INVOCATIONS = RouteTarget("/invocations", frozenset({"POST"}))
+    GENERATE_TOKENS = RouteTarget("/inference/v1/generate", frozenset({"POST"}))
     IMAGE_EDITS = RouteTarget("/v1/images/edits", frozenset({"POST"}))
 
     @property
@@ -44,7 +50,7 @@ class EndpointRestriction:
 def build_rejection_handler(reason: str):
     """Build a rejection handler for a given endpoint for the provided reason."""
 
-    async def rejection_handler(raw_request: Request):
+    async def rejection_handler(_raw_request: Request):
         error = create_error_response(message=reason)
         return JSONResponse(
             content=error.model_dump(),
@@ -57,7 +63,7 @@ def build_rejection_handler(reason: str):
 def shutdown_unsupported_routes(
     app: FastAPI,
     endpoint_restrictions: tuple[EndpointRestriction, ...],
-):
+) -> None:
     """Given an initialized FastAPI server instance and a set of model specific endpoint
     restrictions, remove the restricted routes and patch a handler that returns 400.
     """

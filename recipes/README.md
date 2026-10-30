@@ -31,12 +31,19 @@ Example layout:
 recipes/
   lerobot/
     Pi0.md
+    Pi05.md
   Qwen/
     Qwen3-Omni-H100.md
     Qwen3-TTS-A100.md
   Tencent/
     Covo-Audio-Chat-L40S.md
 ```
+
+## FastH3
+
+Use the [FastH3 family guide](./FastVideo/README.md) to choose a release,
+or go directly to [FastH3 RefOmni Single Card](<./FastVideo/FastH3 RefOmni Single Card.md>)
+for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 
 ## Available Recipes
 
@@ -52,14 +59,22 @@ recipes/
 | [`BreezeBlue/Breeze-TTS-2.md`](./BreezeBlue/Breeze-TTS-2.md) | Online + offline TTS (plain / voice design / voice clone / voice direction, streaming PCM) | 1x NVIDIA L20 48GB |
 | [`ByteDance/Lance.md`](./ByteDance/Lance.md) | Unified AR+diffusion: text/img/video gen + understanding (Lance 3B) | 1x B300 / A100 80GB |
 | [`circlestone-labs/Anima.md`](./circlestone-labs/Anima.md) | Native single-file text-to-image serving | 1x AMD MI300X |
-| [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H100 80GB |
+| [`FastVideo/FastH3.md`](./FastVideo/FastH3.md) | FastH3 four-step Preview V1 T2VA adapter | CUDA with a compatible dense or VSA attention backend |
+| [`FastVideo/FastH3-V2.md`](./FastVideo/FastH3-V2.md) | FastH3 V2 eight-step T2VA checkpoint | CUDA with FastVideo tile64 or FlashInfer on SM120/SM121; full-model qualification pending |
+| [`FastVideo/FastH3-Omni.md`](./FastVideo/FastH3-Omni.md) | FastH3 Omni eight-step Ref2VA, multi-GPU serving | Shared eight-GPU profile; PRO 5000 baseline in recipe |
+| [FastH3 RefOmni Single Card](<./FastVideo/FastH3 RefOmni Single Card.md>) | Single-card installation, serving, and generation guide | RTX 4090 / 5090 / DGX Spark / RTX PRO 6000 Blackwell |
+| [`facebook/SAM3.1-H200.md`](./facebook/SAM3.1-H200.md) | Promptable image segmentation (text and exemplar boxes) | 1x H200 141GB |
+| [`facebook/SAM3-Video-H200.md`](./facebook/SAM3-Video-H200.md) | Video concept segmentation and tracking (text prompts) | 1x H200 141GB |
+| [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
+| [`inclusionAI/Ming-3.0-audio-flash.md`](./inclusionAI/Ming-3.0-audio-flash.md) | Online multilingual ASR and speech QA with optional 44.1 kHz speech output | 4x 80GB GPU / 2x H200 141GB |
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |
 | [`inclusionAI/Ming-omni-tts.md`](./inclusionAI/Ming-omni-tts.md) | Offline + online dense Ming TTS/audio generation | 1x H100 80GB / 1x AMD MI300X (ROCm 7.2) |
 | [`k2-fsa/OmniVoice.md`](./k2-fsa/OmniVoice.md) | Offline and online multilingual text-to-speech | 1x AMD MI300X (ROCm 7.2) |
 | [`lerobot/Pi0.md`](./lerobot/Pi0.md) | Online OpenPI serving for the π0 vision-language-action policy | 1x H200 141GB |
+| [`lerobot/Pi05.md`](./lerobot/Pi05.md) | Online OpenPI serving for the π0.5 vision-language-action policy | 1x H100 80GB |
 | [`IndexTeam/IndexTTS-2.md`](./IndexTeam/IndexTTS-2.md) | Online serving for voice-cloned TTS with optional emotion control | 1x L4 24GB or larger CUDA GPU |
 | [`IndexTeam/IndexTTS-2_5.md`](./IndexTeam/IndexTTS-2_5.md) | Online + offline multilingual voice-cloned TTS with native speed and emotion control | 1x NVIDIA H20 96GB |
 | [`Microsoft/VibeVoice-1.5B-H100.md`](./Microsoft/VibeVoice-1.5B-H100.md) | Offline single-speaker TTS with optional voice clone (eager) | 1x H100 80GB |
@@ -79,6 +94,7 @@ recipes/
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
+| [`SandAI/MAGI-2-preview-NPU.md`](./SandAI/MAGI-2-preview-NPU.md) | Online Preview-stage T2VA at 272p | 4x NPU, 112 GiB each; TP1/SP4 eager |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
 | [`TaoLiveAIGC/TaoMate-H3.md`](./TaoLiveAIGC/TaoMate-H3.md) | Realtime streaming presenter: MiniMax-H3 + TaoMate LoRA on the AR-Diffusion runtime | 2x H200-class FP8 (USP2) or 4x BF16 (USP4) |
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
@@ -88,7 +104,7 @@ recipes/
 | [`OpenBMB/VoxCPM2.md`](./OpenBMB/VoxCPM2.md) | Online + offline TTS with native AR pipeline (48 kHz, 30+ languages) | 1x RTX 4090 24GB / 1x Ascend 910B3 64GB |
 | [`OpenMOSS/MOSS-TTS.md`](./OpenMOSS/MOSS-TTS.md) | Online + offline multilingual TTS (MOSS-TTS family, 8B) | 1x H100 80GB |
 | [`OpenMOSS/MOSS-TTS-Nano-NPU.md`](./OpenMOSS/MOSS-TTS-Nano-NPU.md) | Online multilingual voice-cloned TTS | 1x Ascend 910B3 64GB |
-| [`Physis-AI/CausVid-Wan.md`](./Physis-AI/CausVid-Wan.md) | Experimental offline Noisy KV / Chunk PP on CausVid Wan 2.1 1.3B | Multi-GPU CUDA (qualify with S=T+1) |
+| [`Physis-AI/CausVid-Wan.md`](./Physis-AI/CausVid-Wan.md) | Experimental offline Noisy KV / Chunk PP on CausVid Wan 2.1 1.3B | Multi-GPU CUDA (SF: S=1; Latest-KV: S=D+1) |
 | [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |
 | [`NVIDIA/NemotronLabs-VoiceChat.md`](./NVIDIA/NemotronLabs-VoiceChat.md) | Offline speech-to-speech voice chat (11B, frame-locked 12.5 Hz, 3-stage thinker/talker/code2wav) | 1x H100 80GB |
 | [`NVIDIA/SANA-WM.md`](./NVIDIA/SANA-WM.md) | First-frame image-to-video serving with camera control | 1x 24GB+ CUDA GPU; ~40GB disk |
@@ -105,7 +121,7 @@ recipes/
 | [`Tencent/Covo-Audio-Chat.md`](./Tencent/Covo-Audio-Chat.md) | Online serving for audio chat | 1x A100 80GB |
 | [`Tencent/HunyuanImage-3.0-Instruct.md`](./Tencent/HunyuanImage-3.0-Instruct.md) | DiT-only text-to-image serving and benchmark, including ModelOpt mixed FP8/NVFP4 | 4x H100/H800 80GB / 2x B200 |
 | [`Tencent/HunyuanVideo-1.5.md`](./Tencent/HunyuanVideo-1.5.md) | Offline text-to-video (HunyuanVideo-1.5 Diffusers) | 1x Intel Arc Pro B70 32GB |
-| [`Tongyi-MAI/Z-Image-Turbo.md`](./Tongyi-MAI/Z-Image-Turbo.md) | Offline few-step text-to-image (Z-Image-Turbo) | 1x Intel Arc Pro B70 32GB |
+| [`Tongyi-MAI/Z-Image-Turbo.md`](./Tongyi-MAI/Z-Image-Turbo.md) | Offline few-step text-to-image; online text-to-image and image-editing serving | 1x Intel Arc Pro B70 32GB / 1x RTX 5880 48GB |
 | [`Wan-AI/Wan2.2-T2V.md`](./Wan-AI/Wan2.2-T2V.md) | Text-to-video serving (Wan2.2 14B) with Skip-Softmax sparse attention | 8x H20/H100/A100 / 1x datacenter Blackwell (B200/B300) / 1x Intel Arc Pro B70 32GB |
 | [`Wan-AI/Wan2.2-TI2V-5B-A100.md`](./Wan-AI/Wan2.2-TI2V-5B-A100.md) | Unified 720p text-to-video and image-to-video serving (Wan2.2 5B) | 1x A100-SXM4-80GB |
 | [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md) | Image-to-video serving (Wan2.2 14B) | 8x Ascend NPU (A2/A3) |

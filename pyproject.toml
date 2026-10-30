@@ -34,6 +34,15 @@ classifiers = [
 
 [project.optional-dependencies]
 
+ming-tn = [
+    "pynini",
+    "inflect",
+]
+
+watermarking = [
+    "audioseal>=0.2,<1.0",
+]
+
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
@@ -68,6 +77,7 @@ dev = [
     "zhon==2.1.1",
     "zhconv==1.4.3",
     "funasr==1.3.29",
+    "audioseal==0.2.0", # for audio watermarking tests
     "lpips==0.1.4", # for quantization fp8
     "orjson==3.11.9", # to make v1/embeddings API fast
     "voxcpm==2.0.3", # for VoxCPM2 path-locating in tests
@@ -76,6 +86,8 @@ dev = [
     # Provides top-level cosyvoice2; do not co-install stepaudio2-minicpmo,
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
+    # Hopper dense FA3. Optional at runtime (#7735, #9201); nightly installs [dev].
+    "fa3-fwd==0.0.3",
 ]
 
 demo = [
@@ -132,6 +144,11 @@ vsa = [
     "fastvideo-kernel==0.3.4",
 ]
 
+# Public cuDNN BSA API with native tile64/tile128 kernels.
+cudnn-bsa = [
+    "nvidia-cudnn-frontend==1.31.0",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
@@ -184,6 +201,7 @@ include = ["vllm_omni*"]
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
 ]
+"vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "LICENSE.Ming", "NOTICE"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
@@ -311,6 +329,7 @@ markers = [
     "RTX5090: [hardware-resource] [cuda] Tests that require an RTX 5090 GPU (SM120, compute capability 12.0)",
     "MI325: [hardware-resource] [rocm] Tests that require MI325 GPU (AMD/ROCm)",
     "B60: [hardware-resource] [xpu] Tests that require Intel Arc Pro B60 XPU",
+    "B70: [hardware-resource] [xpu] Tests that require Intel Arc Pro B70 XPU",
     "S5000: [hardware-resource] [musa] Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: [hardware-resource] [npu] Tests that require A2 NPU",
     "A3: [hardware-resource] [npu] Tests that require A3 NPU",
@@ -394,6 +413,9 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+# Ascend TBE (Tensor Boost Engine), the CANN operator compiler — an
+# abbreviation, not a typo of "the".
+TBE = "TBE"
 # Step-Audio reasoning parser streams `</think>` tokens split across chunks
 # (e.g. "</" + "thi" + "nk>"). The fragment "thi" appears literally in its
 # parser logic and tests and is not a typo of "the"/"this".

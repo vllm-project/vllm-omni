@@ -7,12 +7,13 @@ import os
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
@@ -69,6 +70,10 @@ def _register_omni_hf_configs() -> None:
             IndexTTS2Config,
             IndexTTS25Config,
         )
+        from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
+            LingV3TTSConfig,
+            Ming3TTSConfig,
+        )
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MingDenseConfig,
             MingMoeConfig,
@@ -88,6 +93,9 @@ def _register_omni_hf_configs() -> None:
         )
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
+        from vllm_omni.transformers_utils.configs.ming3_audio import (
+            BailingMoeV3AudioConfig,
+        )
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
@@ -106,12 +114,15 @@ def _register_omni_hf_configs() -> None:
         ("breeze", BreezeConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
+        ("ming3_tts", Ming3TTSConfig),
+        ("lingv3_tts", LingV3TTSConfig),
         ("indextts2", IndexTTS2Config),
         ("indextts2_5", IndexTTS25Config),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
         ("personaplex", PersonaPlexConfig),
+        ("bailing_moe_v3_audio", BailingMoeV3AudioConfig),
         ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
@@ -149,6 +160,89 @@ def register_omni_models_to_vllm():
     import vllm_omni.reasoning  # noqa: F401
 
 
+def _build_lmcache_connector_config(lmcache_config: dict) -> dict:
+    """Build a single LMCacheConnectorV1 config from omni_kv_config."""
+    lmcache_extra: dict = {}
+    if isinstance(lmcache_config, dict):
+        for key, value in lmcache_config.items():
+            prefixed = key if key.startswith("lmcache.") else f"lmcache.{key}"
+            lmcache_extra[prefixed] = value
+    # Omni stages need hidden states alongside KV; enable by default so the
+    # HiddenStateStore is created. User can override via lmcache_config.
+    lmcache_extra.setdefault("lmcache.enable_hidden_state_cache", True)
+    _warn_if_hidden_state_pool_undersized(lmcache_extra)
+    return {
+        "kv_connector": "LMCacheConnectorV1",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": lmcache_extra,
+    }
+
+
+def _warn_if_hidden_state_pool_undersized(lmcache_extra: dict) -> None:
+    """Warn when hidden states will be evicted before the KV they belong to.
+
+    The two pools evict independently, so a smaller hidden-state pool drops rows
+    whose KV is still resident. The engine then skips a prefill it cannot supply
+    conditioning for, and the request silently degrades.
+    """
+    # LMCache's own defaults are already undersized, so an absent key is the
+    # case worth warning about rather than one to skip.
+    hs_size = lmcache_extra.get("lmcache.max_hidden_state_cpu_size", 2.0)
+    kv_size = lmcache_extra.get("lmcache.max_local_cpu_size", 5.0)
+    try:
+        if float(hs_size) >= float(kv_size):
+            return
+    except (TypeError, ValueError):
+        return
+    logger.warning(
+        "max_hidden_state_cpu_size (%s GB) is smaller than max_local_cpu_size "
+        "(%s GB): hidden states will be evicted while their KV survives, and "
+        "those requests fall back to a partial restore.",
+        hs_size,
+        kv_size,
+    )
+
+
+def _set_lmcache_env(args: "OmniEngineArgs") -> None:
+    """Set LMCACHE_CONFIG_FILE env var from omni_kv_config if present."""
+    if not args.omni_kv_config:
+        return
+    kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
+    lmcache_config = kv_store.get("lmcache_config")
+    if isinstance(lmcache_config, dict):
+        config_file = lmcache_config.get("config_file")
+        if config_file and isinstance(config_file, str) and config_file.strip():
+            os.environ["LMCACHE_CONFIG_FILE"] = config_file.strip()
+
+
+def _map_offload_config(args: "OmniEngineArgs") -> None:
+    """Map omni_kv_config to vLLM's KV transfer infrastructure."""
+    if not args.omni_kv_config:
+        return
+    kv_store = args.omni_kv_config.get("kv_store_config", {}) if isinstance(args.omni_kv_config, dict) else {}
+
+    lmcache_config = kv_store.get("lmcache_config")
+
+    if lmcache_config:
+        # LMCacheConnectorV1 only (OffloadingConnector removed due to
+        # per-step CPU overhead; LMCache handles CPU KV offloading).
+        entry = _build_lmcache_connector_config(lmcache_config)
+
+        from vllm.config.kv_transfer import KVTransferConfig
+
+        kv_role = kv_store.get("kv_role", "kv_both")
+        args.kv_transfer_config = KVTransferConfig(
+            kv_connector=entry["kv_connector"],
+            kv_connector_extra_config=entry.get("kv_connector_extra_config", {}),
+            kv_role=kv_role,
+        )
+
+        logger.info(
+            "[Omni] kv_transfer_config: kv_connector=%s",
+            args.kv_transfer_config.kv_connector,
+        )
+
+
 @dataclass
 class OmniEngineArgs(EngineArgs):
     """Engine arguments for omni models, extending base EngineArgs.
@@ -177,6 +271,9 @@ class OmniEngineArgs(EngineArgs):
         async_chunk: If set to True, perform async chunk
         session_mode: Request lifecycle mode, either turn-based or duplex
         worker_type: Model Type, e.g., "ar" or "generation"
+        scheduling_metadata_adapter: Optional dotted path of a runner-side
+            adapter that translates incoming payload metadata into typed
+            scheduler-visible updates. If None, the default adapter is used.
         task_type: Model-defined startup task type. Consumers validate the
             supported values and decide whether it selects request behavior,
             task-specific weights, or both.
@@ -208,7 +305,9 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
@@ -222,6 +321,7 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
+    scheduling_metadata_adapter: str | None = None
     # Dotted path of a per-stage pooling-output decoder applied worker-side.
     pooling_output_decoder: str | None = None
     task_type: str | None = None
@@ -238,6 +338,82 @@ class OmniEngineArgs(EngineArgs):
     # for library callers (#7564); registered pipelines may consume it through
     # their own stage_cli_aliases or deploy YAML.
     text_encoder_tp_size: int | None = None
+    # The rest of the diffusion block is owned by ``OrchestratorArgs`` for
+    # top-level CLI parsing and deploy redistribution, but stage engines
+    # consume the same keys. Declared here for the same reason as
+    # ``text_encoder_tp_size`` above: ``from_cli_args`` keeps only dataclass
+    # fields, so an undeclared knob is silently dropped before it reaches the
+    # diffusion stage (#8503). The parallel knobs of #8037 are covered by
+    # #8041; ``enable_ar_profiler``/``log_file``/``replica_id``/
+    # ``omni_replica_address`` stay orchestrator-only. Mirrored in
+    # ``SHARED_FIELDS`` since both classes now declare them.
+    num_gpus: int | None = None
+    model_class_name: str | None = None
+    hsdp_weight_load_strategy: str | None = None
+    diffusion_load_format: str | None = None
+    lora_path: list[str] | None = None
+    lora_backend: str | None = None
+    lora_scale: float | None = None
+    diffusers_load_kwargs: str | None = None
+    diffusers_call_kwargs: str | None = None
+    diffusion_quantization_config: str | None = None
+    diffusion_attention_backend: str | None = None
+    fastvideo_vsa_topk: int | None = None
+    diffusion_attention_config: str | None = None
+    diffusion_compile_granularity: str | None = None
+    diffusion_compile_dynamic: bool | None = None
+    enable_cuda_graph_decode: bool | None = None
+    cache_backend: str | None = None
+    cache_config: str | None = None
+    video_output_transport: dict[str, object] | None = None
+    enable_cache_dit_summary: bool | None = None
+    step_execution: bool | None = None
+    vae_use_slicing: bool | None = None
+    vae_use_tiling: bool | None = None
+    vae_fast_path: str | None = None
+    vae_encode_fast_path: str | None = None
+    enable_multithread_weight_load: bool | None = None
+    enable_broadcast_weight_load: bool | None = None
+    num_weight_load_threads: int | None = None
+    diffusion_offload_config: dict[str, Any] | None = None
+    enable_cpu_offload: bool | None = None
+    enable_layerwise_offload: bool | None = None
+    enable_distributed_layerwise_offload: bool | None = None
+    dlo_use_allgather: bool | None = None
+    dlo_resident_layers: int | None = None
+    host_weight_runtime_mode: str | None = None
+    host_weight_runtime_root: str | None = None
+    dlo_host_registration_limit_gib: float | None = None
+    boundary_ratio: float | None = None
+    flow_shift: float | None = None
+    diffusion_kv_cache_dtype: str | None = None
+    diffusion_kv_cache_skip_steps: str | None = None
+    diffusion_kv_cache_skip_layers: str | None = None
+    default_sampling_params: str | None = None
+    max_generated_image_size: int | None = None
+    tts_max_instructions_length: int | None = None
+    enable_diffusion_pipeline_profiler: bool | None = None
+    # Diffusion parallel knobs registered by the serve CLI (``--usp``,
+    # ``--ulysses-mode``, ``--ring-degree``, ``--allgather-degree``,
+    # ``--use-hsdp``, ``--hsdp-*``, ``--cfg-parallel-size``,
+    # ``--vae-patch-parallel-size``, ``--vae-parallel-mode``) and consumed by
+    # ``DiffusionParallelConfig`` through the generic diffusion fallback.
+    # Declared here for the same reason as ``text_encoder_tp_size`` above:
+    # ``from_cli_args`` keeps only dataclass fields, so an undeclared knob is
+    # silently reset to its default (#7652). They are also listed in
+    # SHARED_FIELDS because this change declares them on both classes, and
+    # invariant 1 below requires the overlap to stay a subset of that set.
+    ulysses_degree: int | None = None
+    ulysses_mode: str | None = None
+    ulysses_a2a_permute: bool | None = None
+    ring_degree: int | None = None
+    allgather_degree: int | None = None
+    use_hsdp: bool | None = None
+    hsdp_shard_size: int | None = None
+    hsdp_replicate_size: int | None = None
+    cfg_parallel_size: int | None = None
+    vae_patch_parallel_size: int | None = None
+    vae_parallel_mode: str | None = None
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -279,6 +455,8 @@ class OmniEngineArgs(EngineArgs):
             self.requires_full_payload_input or self.custom_process_next_stage_input_func or connector_role is not None
         )
         validate_worker_omni_connector(self.worker_cls, needs_connector)
+        _map_offload_config(self)
+        _set_lmcache_env(self)
         super().__post_init__()
         # The NPU runner implements the auxiliary connector on its legacy
         # execution path; CUDA/ROCm Omni stages use the V2 implementation.
@@ -445,7 +623,9 @@ class OmniEngineArgs(EngineArgs):
             async_chunk=self.async_chunk,
             session_mode=self.session_mode,
             retains_state_across_chunks=self.retains_state_across_chunks,
+            supports_pending_generation=self.supports_pending_generation,
             supports_running_prefix_cache_reset=self.supports_running_prefix_cache_reset,
+            recompute_preemption=self.recompute_preemption,
             use_v2_model_runner=self.use_v2_model_runner,
             supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,
             active_stream_window=self.active_stream_window,
@@ -453,6 +633,7 @@ class OmniEngineArgs(EngineArgs):
             model_stage=self.model_stage,
             model_arch=self.model_arch,
             worker_type=self.worker_type,
+            scheduling_metadata_adapter=self.scheduling_metadata_adapter,
             pooling_output_decoder=self.pooling_output_decoder,
             engine_output_type=self.engine_output_type,
             final_output=self.final_output,
@@ -556,6 +737,9 @@ class OrchestratorArgs:
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
 
+    # === Output Processing ===
+    watermark_config: WatermarkConfig | None = None
+
     # === Forced aligner (orchestrator injects a pooling stage; never a per-stage knob) ===
     forced_aligner: str | None = None
     forced_aligner_config: str | None = None
@@ -577,6 +761,8 @@ class OrchestratorArgs:
     model_class_name: str | None = None
     hsdp_weight_load_strategy: str | None = None
     diffusion_load_format: str | None = None
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: list[str] | None = None
     lora_backend: str | None = None
     lora_scale: float | None = None
@@ -619,6 +805,7 @@ class OrchestratorArgs:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = 64
     dlo_resident_layers: int = 0
     host_weight_runtime_mode: str = "disabled"
     host_weight_runtime_root: str | None = None
@@ -656,6 +843,69 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "log_stats",  # both want the flag
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
+        # Diffusion engine args (#8503): the orchestrator owns them for
+        # top-level CLI parsing and deploy redistribution, and the stage
+        # engine forwards them to OmniDiffusionConfig. The parallel knobs of
+        # #8037 join this set via #8041.
+        "num_gpus",
+        "model_class_name",
+        "hsdp_weight_load_strategy",
+        "diffusion_load_format",
+        "lora_path",
+        "lora_backend",
+        "lora_scale",
+        "diffusers_load_kwargs",
+        "diffusers_call_kwargs",
+        "diffusion_quantization_config",
+        "diffusion_attention_backend",
+        "fastvideo_vsa_topk",
+        "diffusion_attention_config",
+        "diffusion_compile_granularity",
+        "diffusion_compile_dynamic",
+        "enable_cuda_graph_decode",
+        "cache_backend",
+        "cache_config",
+        "video_output_transport",
+        "enable_cache_dit_summary",
+        "step_execution",
+        "vae_use_slicing",
+        "vae_use_tiling",
+        "vae_fast_path",
+        "vae_encode_fast_path",
+        "enable_multithread_weight_load",
+        "enable_broadcast_weight_load",
+        "num_weight_load_threads",
+        "diffusion_offload_config",
+        "enable_cpu_offload",
+        "enable_layerwise_offload",
+        "enable_distributed_layerwise_offload",
+        "dlo_use_allgather",
+        "dlo_resident_layers",
+        "host_weight_runtime_mode",
+        "host_weight_runtime_root",
+        "dlo_host_registration_limit_gib",
+        "boundary_ratio",
+        "flow_shift",
+        "diffusion_kv_cache_dtype",
+        "diffusion_kv_cache_skip_steps",
+        "diffusion_kv_cache_skip_layers",
+        "default_sampling_params",
+        "max_generated_image_size",
+        "tts_max_instructions_length",
+        "enable_diffusion_pipeline_profiler",
+        # Diffusion parallel knobs: the orchestrator sizes the deployment from
+        # them, the engine forwards them to DiffusionParallelConfig.
+        "ulysses_degree",
+        "ulysses_mode",
+        "ulysses_a2a_permute",
+        "ring_degree",
+        "allgather_degree",
+        "use_hsdp",
+        "hsdp_shard_size",
+        "hsdp_replicate_size",
+        "cfg_parallel_size",
+        "vae_patch_parallel_size",
+        "vae_parallel_mode",
     }
 )
 

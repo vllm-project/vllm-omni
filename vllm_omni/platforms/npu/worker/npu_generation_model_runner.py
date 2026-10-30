@@ -38,7 +38,7 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.utils.mm_outputs import partition_payload_list
+from vllm_omni.utils.mm_outputs import partition_payload_list, split_mapping_outputs
 from vllm_omni.worker.mixins import maybe_unpad_input_ids
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -591,22 +591,17 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 for out in multimodal_outputs_raw:
                     per_req_payloads.append({"model_outputs": to_host.copy(out) if out is not None else None})
             elif isinstance(multimodal_outputs_raw, Mapping):
-                num_reqs = self.input_batch.num_reqs
-                for i in range(num_reqs):
-                    mm_payload = {}
-                    for key, out in multimodal_outputs_raw.items():
-                        if isinstance(out, list):
-                            if len(out) != num_reqs:
-                                raise ValueError(
-                                    f"Multimodal output list for key '{key}' has length {len(out)} "
-                                    f"but expected {num_reqs} (one entry per request)."
-                                )
-                            mm_payload[key] = to_host.copy(out[i])
-                        elif isinstance(out, torch.Tensor):
-                            mm_payload[key] = to_host.copy(out)
-                        else:
-                            logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                    per_req_payloads.append(_ensure_tensor_values(mm_payload))
+                # Copy through the batch so a mapping payload keeps the same
+                # asynchronous D2H as the tensor and list branches above. A
+                # plain ``tensor.to("cpu")`` here blocks the caller per tensor.
+                per_req_payloads = [
+                    _ensure_tensor_values(payload)
+                    for payload in split_mapping_outputs(
+                        multimodal_outputs_raw,
+                        self.input_batch.num_reqs,
+                        to_host.copy,
+                    )
+                ]
             else:
                 raise RuntimeError("Unsupported diffusion output type")
         if not use_async_output:

@@ -105,7 +105,7 @@ _FAST_PATH_STAGE_CONFIG = modify_stage_config(
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize(
     "omni_server",
     [OmniServerParams(model=MODEL, stage_config_path=_FAST_PATH_STAGE_CONFIG, server_args=["--trust-remote-code"])],
@@ -131,7 +131,7 @@ def test_cached_predictor_streaming_audio(omni_server, online_client, run_level)
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", default_tts_server_params, indirect=True)
 def test_default_cuda_graph_startup(omni_server) -> None:
     """Verify both stages start with the shipped CUDA Graph configuration.
@@ -152,7 +152,7 @@ def test_default_cuda_graph_startup(omni_server) -> None:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, online_client, run_level) -> None:
     """
@@ -179,7 +179,7 @@ def test_text_to_audio_001(omni_server, online_client, run_level) -> None:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002(omni_server, online_client, run_level) -> None:
     """

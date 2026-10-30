@@ -277,6 +277,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         # Neither AR stage has a postprocess, so step outputs can use the
         # runner's async snapshot instead of a blocking per-step D2H.
         self.use_async_omni_output = self.model_stage in {"llm", "tts"}
+        # Code2Wav consumes codec codes and metadata, not Talker hidden states.
+        # Keep the Thinker hidden-state handoff, but avoid snapshotting and
+        # transporting an unused hidden tensor on every Talker decode step.
+        self.omni_pooler_payload_include_hidden = self.model_stage != "tts"
 
         if self.model_stage == "llm" and is_duplex and self._use_v2_model_runner:
             # Only the duplex Thinker exposes the MRv2 batch-preprocess hook.

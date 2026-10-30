@@ -22,6 +22,19 @@ def test_common_diffusion_marks_are_checked_in_helper(kind, monkeypatch):
     assert check_test_marks.get_files_missing_markers([path]) == {path: ["Level", "Hardware"]}
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/dfx/reliability/test_qwen3_omni.py",
+        "tests/dfx/reliability/test_wan22.py",
+        "tests/dfx/reliability/test_hunyuan_image.py",
+        "tests/dfx/reliability/test_minicpmo_4_5.py",
+    ],
+)
+def test_reliability_model_files_carry_marks(path):
+    assert check_test_marks.get_files_missing_markers([path]) == {}
+
+
 def test_unrelated_tests_cannot_inherit_diffusion_marks(monkeypatch):
     path = "tests/test_missing_marks.py"
     monkeypatch.setattr(check_test_marks, "read_test_file", lambda filename: "get_parametrized_options(settings)")
@@ -163,6 +176,52 @@ def test_hardware_contract_rejects_inherited_cpu_accelerator_marks(source):
 )
 def test_hardware_contract_preserves_valid_cpu_and_accelerator_selections(source):
     assert check_test_marks.hardware_contract_errors(source) == []
+
+
+def test_hardware_contract_rejects_rocm_and_nvidia_only():
+    source = '@pytest.mark.nvidia_only\n@hardware_test(res={"cuda": "L4", "rocm": "MI325"})\ndef test_kernel(): pass'
+    assert check_test_marks.hardware_contract_errors(source) == ["Conflicting rocm/nvidia_only marks"]
+
+
+def test_hardware_contract_keeps_separate_nvidia_and_rocm_params():
+    source = (
+        "@pytest.mark.parametrize(\n"
+        '    "case",\n'
+        "    [pytest.param(1, marks=pytest.mark.nvidia_only),\n"
+        '     pytest.param(2, marks=hardware_marks(res={"rocm": "MI325"}))],\n'
+        ")\ndef test_kernel(case): pass"
+    )
+    assert check_test_marks.hardware_contract_errors(source) == []
+
+
+def test_hardware_contract_combines_class_and_method_parameter_marks():
+    source = (
+        "@pytest.mark.parametrize(\n"
+        '    "backend",\n'
+        '    [pytest.param("rocm", marks=hardware_marks(res={"rocm": "MI325"}))],\n'
+        ")\nclass TestKernel:\n"
+        "    @pytest.mark.parametrize(\n"
+        '        "dependency",\n'
+        '        [pytest.param("nvidia", marks=pytest.mark.nvidia_only)],\n'
+        "    )\n"
+        "    def test_kernel(self, backend, dependency): pass"
+    )
+    assert check_test_marks.hardware_contract_errors(source) == ["Conflicting rocm/nvidia_only marks"]
+
+
+def test_hardware_contract_combines_stacked_parameter_marks():
+    source = (
+        "@pytest.mark.parametrize(\n"
+        '    "backend",\n'
+        '    [pytest.param("rocm", marks=hardware_marks(res={"rocm": "MI325"}))],\n'
+        ")\n"
+        "@pytest.mark.parametrize(\n"
+        '    "dependency",\n'
+        '    [pytest.param("nvidia", marks=pytest.mark.nvidia_only)],\n'
+        ")\n"
+        "def test_kernel(backend, dependency): pass"
+    )
+    assert check_test_marks.hardware_contract_errors(source) == ["Conflicting rocm/nvidia_only marks"]
 
 
 def test_existing_mixed_cpu_cuda_params_remain_per_item():

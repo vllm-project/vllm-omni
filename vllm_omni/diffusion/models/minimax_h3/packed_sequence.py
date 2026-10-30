@@ -529,6 +529,15 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     video_sl = slice(audio_sl.stop, audio_sl.stop + video_rows)
     pad_sl = slice(video_sl.stop, seq_len)
 
+    # Keep each reference (and each AV component) separate for VSA pooling.
+    # Modality tags alone cannot distinguish adjacent references of one kind.
+    prefix_slices = [text_sl]
+    for item in block_slices:
+        slices = [item[key] for key in ("audio_sl", "visual_sl") if key in item]
+        prefix_slices.extend(sorted(slices, key=lambda span: span.start))
+    prefix_slices.append(audio_sl)
+    prefix_segments = tuple(span.stop - span.start for span in prefix_slices if span.stop > span.start)
+
     # This is deliberately tensor-free metadata. It is constructed once by
     # the denoise branch and consumed by every attention layer without a
     # device-to-host synchronization.
@@ -723,6 +732,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "latent_grid": torch.tensor([latent_t, ph, pw], dtype=torch.int64),
         "video_row_start": torch.tensor(video_sl.start, dtype=torch.int64),
         "video_spans": tuple(video_spans),
+        "vsa_prefix_segments": prefix_segments,
     }
 
 

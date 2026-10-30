@@ -20,6 +20,7 @@ import janus
 from vllm.logger import init_logger
 
 from vllm_omni.config.omni_config import BaseVllmOmniStageConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -31,7 +32,12 @@ from vllm_omni.distributed.omni_coordinator import (
     RoundRobinBalancer,
 )
 from vllm_omni.engine.arg_utils import is_frontend_only
-from vllm_omni.engine.cuda_mps import CudaMPSServer, physical_gpu_uuid
+from vllm_omni.engine.cuda_mps import (
+    CudaMPSServer,
+    CudaMPSUnavailableError,
+    physical_gpu_uuid,
+    resolve_operator_pipe_directory,
+)
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     RegisterRemoteReplicaMessage,
@@ -175,6 +181,7 @@ class StageRuntime:
         parallel_stage_init: bool = False,
         log_stats: bool = False,
         client_config: OmniClientConfig | None = None,
+        watermark_config: WatermarkConfig | None = None,
     ) -> None:
         self._stage_configs = stage_configs
         self._model = model
@@ -190,6 +197,7 @@ class StageRuntime:
         # keeps the legacy per-device LOCK_EX serialization.
         self._parallel_stage_init = parallel_stage_init
         self._log_stats = log_stats
+        self._watermark_config = watermark_config
         self._num_stages = len(stage_configs)
         self._client_count = int((client_config or {}).get("client_count", 1))
         self._client_index = int((client_config or {}).get("client_index", 0))
@@ -210,6 +218,8 @@ class StageRuntime:
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
         self._mps_servers: dict[str, CudaMPSServer] = {}
+        # GPU UUID -> operator pipe (None = private) whose MPS startup failed.
+        self._mps_unavailable_gpus: dict[str, str | None] = {}
 
     @staticmethod
     def _client_addresses_from_zmq(addresses: Any) -> dict[str, str]:
@@ -580,24 +590,48 @@ class StageRuntime:
             else getattr(runtime_cfg, "cuda_mps", False)
         )
 
+    @staticmethod
+    def _disable_cuda_mps(runtime_cfg: Any) -> None:
+        if isinstance(runtime_cfg, dict):
+            runtime_cfg["cuda_mps"] = False
+        elif runtime_cfg is not None:
+            runtime_cfg.cuda_mps = False
+
     def _validate_mps_topology(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         for plan in stage_plans:
             for replica in plan.replicas:
-                runtime_cfg = getattr(replica.stage_cfg, "runtime_config", getattr(replica.stage_cfg, "runtime", None))
-                if not self._mps_enabled(runtime_cfg):
+                stage_runtime_cfg = getattr(
+                    replica.stage_cfg, "runtime_config", getattr(replica.stage_cfg, "runtime", None)
+                )
+                # Launch reads metadata.runtime_cfg, which may be a per-replica copy.
+                runtime_cfgs = [stage_runtime_cfg]
+                if replica.metadata.runtime_cfg is not stage_runtime_cfg:
+                    runtime_cfgs.append(replica.metadata.runtime_cfg)
+                if not any(self._mps_enabled(cfg) for cfg in runtime_cfgs):
                     continue
                 if replica.launch_mode != "local" or replica.metadata.stage_type == "diffusion":
-                    raise ValueError("cuda_mps currently supports local EngineCore stages only")
-                if self._parallel_stage_init:
-                    raise ValueError(
-                        "cuda_mps requires parallel_stage_init=false for physical GPU initialization locks"
+                    logger.warning(
+                        "cuda_mps disabled: only local EngineCore stages are supported (launch_mode=%s stage_type=%s)",
+                        replica.launch_mode,
+                        replica.metadata.stage_type,
                     )
+                    for cfg in runtime_cfgs:
+                        self._disable_cuda_mps(cfg)
+                    continue
+                if self._parallel_stage_init:
+                    logger.warning(
+                        "cuda_mps disabled: parallel_stage_init cannot share the physical GPU initialization lock"
+                    )
+                    for cfg in runtime_cfgs:
+                        self._disable_cuda_mps(cfg)
 
     def _mps_environment(self, devices: str | None, runtime_cfg: Any) -> dict[str, str]:
         if not self._mps_enabled(runtime_cfg):
             return {}
         if not current_omni_platform.is_cuda() or devices is None or len(devices.split(",")) != 1:
-            raise ValueError("cuda_mps currently requires a local CUDA stage on exactly one explicit GPU")
+            logger.warning("cuda_mps disabled: need exactly one explicit CUDA GPU, got %r", devices)
+            self._disable_cuda_mps(runtime_cfg)
+            return {}
         runtime_env = runtime_cfg.get("env") if isinstance(runtime_cfg, Mapping) else getattr(runtime_cfg, "env", None)
         pipe_directory = (
             str(runtime_env["CUDA_MPS_PIPE_DIRECTORY"])
@@ -605,11 +639,25 @@ class StageRuntime:
             else None
         )
         uuid = physical_gpu_uuid(devices.strip())
-        if uuid not in self._mps_servers:
-            self._mps_servers[uuid] = CudaMPSServer(uuid, pipe_directory=pipe_directory)
-        server = self._mps_servers[uuid]
-        if pipe_directory is not None and (pipe_directory or None) != server.operator_pipe_directory:
+        server = self._mps_servers.get(uuid)
+        if server is not None:
+            selected_pipe = server.operator_pipe_directory
+        elif uuid in self._mps_unavailable_gpus:
+            selected_pipe = self._mps_unavailable_gpus[uuid]
+        else:
+            try:
+                server = self._mps_servers[uuid] = CudaMPSServer(uuid, pipe_directory=pipe_directory)
+            except CudaMPSUnavailableError as exc:
+                logger.warning("cuda_mps disabled for %s: %s", uuid, exc)
+                self._mps_unavailable_gpus[uuid] = resolve_operator_pipe_directory(pipe_directory)
+                self._disable_cuda_mps(runtime_cfg)
+                return {}
+            selected_pipe = server.operator_pipe_directory
+        if pipe_directory is not None and (pipe_directory or None) != selected_pipe:
             raise ValueError(f"Conflicting CUDA_MPS_PIPE_DIRECTORY settings for stages sharing GPU {uuid}")
+        if server is None:
+            self._disable_cuda_mps(runtime_cfg)
+            return {}
         return server.env
 
     def _close_mps_servers(self) -> None:
@@ -683,7 +731,12 @@ class StageRuntime:
             visible_baseline=self._init_visible_devices_baseline,
         )
         if self._mps_enabled(runtime_cfg) and (physical is None or not physical.isdigit()):
-            raise ValueError("cuda_mps requires one numeric physical GPU for initialization locking")
+            logger.warning(
+                "cuda_mps disabled for stage %s: need one numeric physical GPU, got %r",
+                stage_id,
+                physical,
+            )
+            self._disable_cuda_mps(runtime_cfg)
         return physical
 
     # ---- Internal methods ----
@@ -868,6 +921,7 @@ class StageRuntime:
                     engine_args_dict=engine_args_dict,
                     api_process_count=self._client_count,
                     api_process_rank=self._api_process_rank,
+                    watermark_config=self._watermark_config,
                 )
 
             for replica_id in range(num_replicas):
@@ -1385,7 +1439,10 @@ class StageRuntime:
             clients: list[StagePoolClient] = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
-            if plan.replicas[0].metadata.stage_type != "diffusion":
+            metadata = plan.replicas[0].metadata
+            # Initialize watermarkers based on the output type as needed
+            watermarkers = StagePool.initialize_watermarkers(metadata.final_output_type, self._watermark_config)
+            if metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 if stage_vllm_config is None:
                     raise RuntimeError(f"Stage {plan.stage_id} is missing vllm_config")
@@ -1401,6 +1458,8 @@ class StageRuntime:
                     clients,
                     output_processor=output_processor,
                     stage_vllm_config=stage_vllm_config,
+                    watermarkers=watermarkers,
+                    strict_watermarking=self._watermark_config is not None and self._watermark_config.strict,
                 )
             )
 
@@ -1435,6 +1494,7 @@ class DistStageRuntime(StageRuntime):
         omni_master_port: int,
         tokenizer: str | None = None,
         log_stats: bool = False,
+        watermark_config: WatermarkConfig | None = None,
         omni_dp_size_local: int = 1,
         omni_heartbeat_timeout: float = 30.0,
         omni_lb_policy: str = "random",
@@ -1450,6 +1510,7 @@ class DistStageRuntime(StageRuntime):
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
+            watermark_config=watermark_config,
         )
         self._single_stage_id_filter = single_stage_id_filter
         self._omni_master_address = omni_master_address
@@ -1781,6 +1842,7 @@ def create_stage_runtime(
     request_queue: janus.Queue[EngineQueueMessage] | None = None,
     log_stats: bool = False,
     client_config: OmniClientConfig | None = None,
+    watermark_config: WatermarkConfig | None = None,
 ) -> StageRuntime:
     """Factory: select StageRuntime or DistStageRuntime."""
     if single_stage_mode:
@@ -1795,6 +1857,7 @@ def create_stage_runtime(
             tokenizer=tokenizer,
             parallel_stage_init=parallel_stage_init,
             log_stats=log_stats,
+            watermark_config=watermark_config,
             single_stage_id_filter=single_stage_id_filter,
             omni_master_address=omni_master_address,
             omni_master_port=omni_master_port,
@@ -1813,4 +1876,5 @@ def create_stage_runtime(
         parallel_stage_init=parallel_stage_init,
         log_stats=log_stats,
         client_config=client_config,
+        watermark_config=watermark_config,
     )

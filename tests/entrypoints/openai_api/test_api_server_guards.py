@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import signal
 from argparse import Namespace
 from collections.abc import Callable
@@ -164,6 +165,8 @@ _EXPECTED_ROUTER_ROUTES = {
     ("GET", "/v1/models"),
     ("POST", "/v1/images/generations"),
     ("POST", "/v1/images/edits"),
+    ("POST", "/v1/images/segmentations"),
+    ("POST", "/v1/videos/segmentations"),
     ("POST", "/v1/videos"),
     ("POST", "/v1/videos/sync"),
     ("GET", "/v1/videos"),
@@ -235,6 +238,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "enable_server_load_tracking",
     "server_load_metrics",
 }
+# The OpenPI robot server is None unless the policy declares policy_server_config.
 _MULTISTAGE_MUST_BE_NONE = {
     "openai_serving_duplex",
     "openai_serving_realtime_robot",
@@ -432,6 +436,46 @@ def test_router_openapi_paths_cover_http_manifest() -> None:
         assert method.lower() in paths[path], f"missing OpenAPI method {method} {path}"
 
 
+@pytest.mark.parametrize(
+    ("stage_configs", "expected"),
+    [
+        (None, False),
+        ([], False),
+        ([{}], False),
+        ([{"engine_args": None}], False),
+        ([{"engine_args": {}}], False),
+        ([{"engine_args": {"profiler_config": None}}], False),
+        ([{"engine_args": {"profiler_config": {}}}], False),
+        ([{"engine_args": {"profiler_config": {"profiler": None}}}], False),
+        ([{"engine_args": {"profiler_config": {"profiler": "torch"}}}], True),
+        ([{"engine_args": {"profiler_config": {"profiler": "cuda"}}}], True),
+        # Attribute-style stage/engine_args/profiler_config, not just dicts.
+        (
+            [SimpleNamespace(engine_args=SimpleNamespace(profiler_config=SimpleNamespace(profiler="torch")))],
+            True,
+        ),
+        (
+            [SimpleNamespace(engine_args=SimpleNamespace(profiler_config=None))],
+            False,
+        ),
+        # Any stage enabling the profiler is enough.
+        (
+            [{"engine_args": {}}, {"engine_args": {"profiler_config": {"profiler": "torch"}}}],
+            True,
+        ),
+    ],
+)
+def test_should_enable_profiler_endpoints_matches_stage_config(stage_configs, expected: bool) -> None:
+    """Lock the gate that decides whether /start_profile is registered.
+
+    vLLM-Omni enables the profiler endpoints from the stage config, matching
+    upstream vLLM v0.16.0+. Fails if the gate starts accepting a stage that
+    only half-declares ``profiler_config`` (present but with no ``profiler``),
+    stops supporting attribute-style configs, or stops scanning every stage.
+    """
+    assert api_server._should_enable_profiler_endpoints(stage_configs) is expected
+
+
 @pytest.mark.asyncio
 async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_router(monkeypatch) -> None:
     """Lock worker assembly: override, mount, storage, handlers, full census.
@@ -561,6 +605,63 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert "/v1/chat/completions" in openapi_paths
     assert "/v1/models" in openapi_paths
     assert "/health" in openapi_paths
+
+
+@pytest.mark.asyncio
+async def test_profiler_env_var_without_stage_config_warns_and_skips_routes(monkeypatch, caplog) -> None:
+    """Lock the not-silent behavior when only ``VLLM_TORCH_PROFILER_DIR`` is set.
+
+    That variable was removed in vLLM v0.16.0 when profiling moved to
+    ``ProfilerConfig``. Omni reads it only as a migration diagnostic: a stale
+    value left in an environment or script is inert. Without this warning it
+    looks identical to a working setup: server starts, nothing logged,
+    /start_profile 404s. Fails if the routes get mounted from the env var
+    alone, or if the migration warning stops being emitted.
+    """
+
+    def fake_build_openai_app(args, supported_tasks):
+        return FastAPI()
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*_args, **_kwargs):
+        # No stage declares profiler_config, so the gate must stay closed.
+        yield _FakeEngineClient(
+            stage_configs=[{"engine_args": {}}],
+            vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=0)),
+        )
+
+    async def fake_omni_init_app_state(engine_client, state, args):
+        state.engine_client = engine_client
+
+    captured: dict[str, object] = {}
+
+    async def fake_serve_http(app, **_kwargs):
+        captured["served_app"] = app
+        task = asyncio.create_task(asyncio.sleep(0))
+        await asyncio.sleep(0)
+        return task
+
+    monkeypatch.setenv("VLLM_TORCH_PROFILER_DIR", "/tmp/omni-profiler-traces")
+    monkeypatch.setattr(api_server, "build_openai_app", fake_build_openai_app)
+    monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_omni_init_app_state)
+    monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda app, restrictions: None)
+
+    async def fake_storage_start():
+        captured["storage_started"] = True
+
+    monkeypatch.setattr(api_server, "STORAGE_MANAGER", SimpleNamespace(start=fake_storage_start))
+    monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
+
+    with caplog.at_level(logging.WARNING):
+        await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), _minimal_args())
+
+    served_app = captured["served_app"]._inner  # type: ignore[attr-defined]
+    manifest = _route_manifest(served_app.routes)
+    assert ("POST", "/start_profile") not in manifest
+    assert ("POST", "/stop_profile") not in manifest
+    assert "VLLM_TORCH_PROFILER_DIR" in caplog.text
+    assert "profiler_config" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1284,13 +1385,18 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ming3", [False, True, "tts"])
 @pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
-async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks) -> None:
+@pytest.mark.parametrize("policy_server", [False, True])
+async def test_multistage_app_state_key_snapshot(
+    monkeypatch, mocker, tmp_path, supported_tasks, ming3, policy_server
+) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
     left as None after init refactors — classic “route still registered,
-    handler never wired” failure mode.
+    handler never wired” failure mode. A multi-stage robot policy (one that
+    declares ``policy_server_config``) also gets the OpenPI server.
     """
     engine = _FakeEngineClient(
         stage_configs=[object(), object()],
@@ -1315,6 +1421,9 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
             self.kwargs = kwargs
             self.warmup_calls = 0
 
+        def _has_ming3_talker_stage(self):
+            return ming3 is True
+
         def warmup(self):
             self.warmup_calls += 1
 
@@ -1326,6 +1435,8 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     class _FakeSpeech(_FakeCtor):
         def __init__(self, *args, **kwargs):
             speech_kwargs.update(kwargs)
+
+        _tts_model_type = "ming3_audio_tts" if ming3 == "tts" else None
 
         async def warmup(self):
             return None
@@ -1352,23 +1463,44 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+    from unittest.mock import AsyncMock
+
+    register = AsyncMock()
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.ming3_voices.register_model_voice_presets", register)
+    if policy_server:
+        monkeypatch.setattr(
+            api_server.ServingRealtimeRobotOpenPI,
+            "create_policy_server",
+            classmethod(lambda cls, *a, **k: _marker("openpi")),
+        )
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
+    if (ming3 is True and "generate" in supported_tasks) or ming3 == "tts":
+        register.assert_awaited_once()
+        assert register.call_args.args[0] is state.openai_serving_speech
+        assert register.call_args.args[1] == _minimal_args().model
+        if ming3 is True:
+            assert state.openai_serving_chat._ming3_speech_service is state.openai_serving_speech
+        else:
+            assert not hasattr(state.openai_serving_chat, "_ming3_speech_service")
+    else:
+        register.assert_not_awaited()
 
     disabled = (
         set()
         if "generate" in supported_tasks
         else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
     )
+    robot = {"openai_serving_realtime_robot"} if policy_server else set()
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=_MULTISTAGE_MUST_BE_WIRED - disabled,
-        must_be_none=_MULTISTAGE_MUST_BE_NONE | disabled,
+        must_be_wired=(_MULTISTAGE_MUST_BE_WIRED | robot) - disabled,
+        must_be_none=(_MULTISTAGE_MUST_BE_NONE - robot) | disabled,
     )
     assert state.online_renderer.kwargs["log_error_stack"] is True
     assert state.online_renderer.warmup_calls == 1

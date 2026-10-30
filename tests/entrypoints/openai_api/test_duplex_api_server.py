@@ -16,6 +16,7 @@ from starlette.datastructures import State
 from starlette.websockets import WebSocketDisconnect
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 
+import vllm_omni.entrypoints.duplex.openai as duplex_openai
 from vllm_omni.config import stage_config
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
@@ -25,6 +26,7 @@ from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import api_server
+from vllm_omni.entrypoints.openai.realtime import connection as realtime_connection
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -141,6 +143,58 @@ class _FakeDuplexOmni(DuplexOmni):
 class _FakeModels:
     def __init__(self, *args, **kwargs) -> None:
         self.base_model_paths = kwargs.get("base_model_paths") or []
+
+
+def test_realtime_handler_reads_both_vad_model_paths() -> None:
+    config = DuplexSessionRuntimeConfig(
+        server_vad_model_path="/silero.onnx",
+        semantic_vad_model_path="/smart-turn.onnx",
+    )
+    engine = SimpleNamespace(engine=SimpleNamespace(duplex_session_config=config))
+
+    handler = OpenAIRealtimeHandler.from_engine_client(engine)
+
+    assert handler._vad_backend_provider.model_path == "/silero.onnx"
+    assert handler._semantic_vad_backend_provider.model_path == "/smart-turn.onnx"
+
+
+@pytest.mark.asyncio
+async def test_realtime_handler_passes_both_vad_providers(monkeypatch) -> None:
+    created = []
+
+    class _RecordingConnection:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            created.append(self)
+
+        async def handle_connection(self) -> None:
+            return None
+
+    async def _no_warmup(_websocket) -> None:
+        return None
+
+    monkeypatch.setattr(realtime_connection, "OpenAIFullDuplexConnection", _RecordingConnection)
+    monkeypatch.setattr(duplex_openai, "wait_for_duplex_warmup", _no_warmup)
+    config = DuplexSessionRuntimeConfig(
+        server_vad_model_path="/silero.onnx",
+        semantic_vad_model_path="/smart-turn.onnx",
+    )
+    handler = OpenAIRealtimeHandler.from_engine_client(
+        SimpleNamespace(engine=SimpleNamespace(duplex_session_config=config))
+    )
+    state = SimpleNamespace(
+        diffusion_engine=None,
+        engine_client=object(),
+        openai_serving_chat=object(),
+        openai_serving_models=_FakeModels(base_model_paths=[BaseModelPath(name="demo-model", model_path="demo-model")]),
+        args=Namespace(tool_call_parser=None, enable_auto_tool_choice=False),
+    )
+    websocket = SimpleNamespace(app=SimpleNamespace(state=state), query_params={})
+
+    await handler.handle_websocket(websocket)
+
+    assert created[0].kwargs["vad_backend_provider"] is handler._vad_backend_provider
+    assert created[0].kwargs["semantic_vad_backend_provider"] is handler._semantic_vad_backend_provider
 
 
 def _minimal_args(**overrides) -> SimpleNamespace:
