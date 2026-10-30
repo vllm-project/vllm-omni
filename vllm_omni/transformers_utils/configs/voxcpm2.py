@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import math
 
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 
 
 class VoxCPM2Config(PretrainedConfig):
@@ -123,14 +122,15 @@ class VoxCPM2Config(PretrainedConfig):
         # -- RoPE scaling (longrope) --
         raw_rope = lm.get("rope_scaling", rope_scaling)
         if raw_rope is not None:
-            self.rope_scaling = dict(raw_rope)
+            self.rope_scaling: dict | None = dict(raw_rope)
             # HF expects "rope_type" not "type"
             if "type" in self.rope_scaling:
                 self.rope_scaling["rope_type"] = self.rope_scaling.pop("type")
             # longrope requires "factor" (used by HF validation)
             if "factor" not in self.rope_scaling:
                 self.rope_scaling["factor"] = 1.0
-            rope_config_validation(self)
+            self.standardize_rope_params()
+            self.validate_rope()
 
             # vllm's MiniCPMAttention reads config.rope_parameters (a dict
             # with rope_type, theta, scaling factors, etc.).  HF transformers
