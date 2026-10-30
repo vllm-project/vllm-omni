@@ -575,6 +575,7 @@ class TestRequestModeDispatch:
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
+            diffusion_attention_schedule=None,
         )
         executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
         scheduler_output = _make_sched_output("A", "B")
