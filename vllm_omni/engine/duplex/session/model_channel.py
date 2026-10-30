@@ -40,10 +40,12 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputDecision,
     DuplexStageSubmission,
     duplex_data_plane_request_info,
+    duplex_is_auxiliary_request,
     duplex_same_turn_request_ids,
     duplex_session_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import (
+    DuplexInputCapacityError,
     DuplexRuntimeConfigError,
     coerce_int,
     payload_turn_id,
@@ -54,6 +56,7 @@ from vllm_omni.engine.duplex.session.context import CommittedInputContinuation, 
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallRegistrationError
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
@@ -252,6 +255,7 @@ class ModelChannel:
         input_audio_part: dict[str, object] | None = None,
         input_audio_parts: dict[str, dict[str, object] | None] | None = None,
         on_append_accepted: Callable[[float], None] | None = None,
+        on_append_prepared: Callable[[], None] | None = None,
     ) -> tuple[bool, bool]:
         session = self._ctx.session
         if not session.capabilities.supports_input_append:
@@ -271,6 +275,7 @@ class ModelChannel:
                 final=final,
                 operation_id=operation_id,
                 expected_epoch=expected_epoch,
+                on_append_prepared=on_append_prepared,
                 input_audio_part=input_audio_part,
                 remaining_transcription_input=(
                     CommittedInputContinuation(remaining_input, input_audio_parts or {})
@@ -278,7 +283,7 @@ class ModelChannel:
                     else None
                 ),
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, DuplexInputCapacityError):
             raise
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
@@ -324,9 +329,12 @@ class ModelChannel:
         expected_epoch: int | None,
         input_audio_part: dict[str, object] | None,
         remaining_transcription_input: CommittedInputContinuation | None = None,
+        on_append_prepared: Callable[[], None] | None = None,
     ) -> dict[str, object] | None:
         """Submit one planned append to the stage port and bind the resulting stage request."""
         session = self._ctx.session
+        # Session stats: the chunk's in-engine interval starts when its append is taken up.
+        accepted_ns = session.perf.now_ns() if session.perf is not None else 0
         if self._ctx.stage_port.stage_count == 0:
             raise RuntimeError("duplex_data_plane_has_no_stage")
         fence = helpers.append_fence(session, payload)
@@ -340,7 +348,7 @@ class ModelChannel:
         if not resumable and session.stage_request_submitted(stage_id, request_id):
             stale_ephemeral_id = request_id
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
-            stale_keys = list(session.request_resources.keys())
+            stale_keys = [key for key in session.request_resources if not duplex_is_auxiliary_request(key[1])]
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
             concurrent_turn = session.capabilities.supports_concurrent_turn_requests and (
                 self._ctx.run.concurrent_turn_requests_released
@@ -410,9 +418,11 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
+            conversation, conversation_item_ids = session.history_snapshot()
             prompt_session = {
                 **request_context.session_config,
-                "conversation": list(session.history),
+                "conversation": list(conversation),
+                "conversation_item_ids": conversation_item_ids,
                 "modalities": list(session.response_config.modalities),
             }
             prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
@@ -438,17 +448,35 @@ class ModelChannel:
                 raise DuplexFenceMismatchError(session.fence, fence)
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
+            if on_append_prepared is not None:
+                on_append_prepared()
             prompt = dict(append_plan.prompt)
-            runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
-            submission = DuplexStageSubmission(
-                context=request_context,
-                prompt=prompt,
-                already_submitted=already_submitted,
-                resumable=resumable,
-            )
-            if remaining_transcription_input is not None:
-                self._input_transcriptions[request_id] = remaining_transcription_input
-            submission_result = await self._ctx.stage_port.submit(submission)
+            perf, perf_chunk = session.perf, None
+            if perf is not None:
+                # Before submit: a live resumable request can report spans while it awaits.
+                perf_chunk = perf.open_chunk(
+                    epoch=fence.epoch,
+                    seq=reservation.update.seq,
+                    turn_id=reservation.update.turn_id,
+                    turn_seq=reservation.update.turn_seq,
+                    submitted_ns=accepted_ns,
+                )
+                prompt = with_perf_chunk(prompt, perf_chunk)
+            try:
+                runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
+                submission = DuplexStageSubmission(
+                    context=request_context,
+                    prompt=prompt,
+                    already_submitted=already_submitted,
+                    resumable=resumable,
+                )
+                if remaining_transcription_input is not None:
+                    self._input_transcriptions[request_id] = remaining_transcription_input
+                submission_result = await self._ctx.stage_port.submit(submission)
+            except BaseException:
+                if perf is not None and perf_chunk is not None:
+                    perf.drop_chunk(perf_chunk)
+                raise
             try:
                 if submission_result.request_id != request_id or submission_result.stage_id != stage_id:
                     raise RuntimeError("duplex stage adapter returned a mismatched submission result")
@@ -476,6 +504,8 @@ class ModelChannel:
                 session.bind_stage_request(stage_id, request_id, fence=fence)
                 self._ctx.plugin.commit_append_plan(request_id)
             except BaseException:
+                if perf is not None and perf_chunk is not None:
+                    perf.drop_chunk(perf_chunk)
                 try:
                     await self._ctx.stage_port.cleanup([request_id], abort=True)
                 except Exception as cleanup_exc:
@@ -512,6 +542,19 @@ class ModelChannel:
                     }
                 ],
             }
+        except DuplexInputCapacityError:
+            resource = session.request_resources.get((stage_id, request_id))
+            if resource is not None and not resource.submitted:
+                try:
+                    await self._ctx.stage_port.cleanup([request_id])
+                except Exception:
+                    logger.warning("Rejected duplex input retains its resource for teardown", exc_info=True)
+                else:
+                    session.release_resources_for_request_ids([request_id])
+                    self._ctx.manager.unregister_request(request_id)
+            if not resumable:
+                self._ctx.plugin.data_plane.close_stream(request_id)
+            raise
         except BaseException:
             self._input_transcriptions.pop(request_id, None)
             if not resumable:
@@ -549,9 +592,13 @@ class ModelChannel:
             next_fence = session.sync_fence()
             if next_fence.epoch > cancelled_fence.epoch:
                 stale_request_ids = session.prepare_cancel_fence(cancelled_fence, next_fence)
-                if stale_request_ids:
-                    await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
-                session.release_fence(cancelled_fence)
+            else:
+                stale_request_ids = []
+            if stale_request_ids:
+                await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
+                # Keep failed aborts owned for teardown retry. Release only the
+                # captured ids, not resources added while cleanup was awaiting.
+                session.release_resources_for_request_ids(stale_request_ids)
             session.touch_lease(DuplexLeaseActivity.SIGNAL)
         except asyncio.CancelledError:
             raise
@@ -698,6 +745,15 @@ class ModelChannel:
         return engine_output
 
     async def on_stage_output_item(self, item: StageOutput) -> CommittedInputContinuation | None:
+        perf = self._ctx.session.perf
+        try:
+            return await self._on_stage_output_item(item)
+        finally:
+            if perf is not None:
+                # A chunk's turn cannot be final before its outputs are handled.
+                perf.mark_handled(item.context.perf_chunks)
+
+    async def _on_stage_output_item(self, item: StageOutput) -> CommittedInputContinuation | None:
         session = self._ctx.session
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
             return None
@@ -1359,6 +1415,8 @@ class ModelChannel:
             response_request_metrics=response_request_metrics,
         )
         self._out.emit(payload)
+        if session.perf is not None and mark_duration_ms is not None and isinstance(response_id, str):
+            session.perf.record_audio(response_id=response_id, duration_ms=mark_duration_ms - previous_sent_ms)
         if self._ctx.run.closing:
             return close_reason, emitted_response
         if (
@@ -1411,6 +1469,8 @@ class ModelChannel:
                             "playback": playback,
                         }
                     )
+                    if session.perf is not None:
+                        session.perf.end_response(drained_response_id)
                 return close_reason, emitted_response
             if isinstance(data_plane_request_id, str) and not auto_response:
                 data_plane.close_stream(data_plane_request_id)

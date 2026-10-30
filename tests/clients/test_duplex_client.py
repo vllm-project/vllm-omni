@@ -1412,6 +1412,20 @@ def test_summarize_session_request_metrics_averages_audio_turns():
     }
 
 
+def test_summarize_session_request_metrics_counts_turns_with_final_server_stats():
+    summary = summarize_session_request_metrics(
+        [
+            {"busy_rtf": 0.2, "stall_ratio": 0.5, "server_stats_final": True},
+            {"busy_rtf": None, "stall_ratio": None, "server_stats_final": False},
+        ],
+        session_id="sess-1",
+    )
+    # The means cover one turn; the count says so.
+    assert summary["busy_rtf"]["count"] == 1
+    assert (summary["audio_turn_count"], summary["server_stats_final_count"]) == (2, 1)
+    assert "server_stats_final_count" not in summarize_session_request_metrics([{"rtf": 0.5}], session_id="s")
+
+
 def test_summarize_session_request_metrics_includes_client_append_fields():
     summary = summarize_session_request_metrics(
         [

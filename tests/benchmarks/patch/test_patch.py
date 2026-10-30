@@ -43,7 +43,7 @@ from vllm_omni.benchmarks.patch.patch import (
     async_request_openai_realtime_duplex,
     should_request_stage_metrics,
 )
-from vllm_omni.clients.duplex import EventCollector
+from vllm_omni.clients.duplex import DuplexProtocolError, DuplexSessionClosedError, EventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 
@@ -181,6 +181,11 @@ async def test_seed_tts_realtime_duplex_exports_per_request_metrics(monkeypatch)
             if event["type"] != "response.create":
                 return
             self._emit_response()
+
+        async def turn_session_stats(self, response_id):
+            # A server without duplex_session.collect_stats adds no server-side fields.
+            del response_id
+            return {}
 
         def _emit_response(self):
             self.response_count += 1
@@ -2385,3 +2390,96 @@ async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snaps
 def test_compact_request_stage_metrics_drops_empty_snapshots(snapshot):
     """Empty chat-omni snapshots must not make every result persist request_stage_metrics."""
     assert patch._compact_request_stage_metrics(snapshot) is None
+
+
+# --------------------------------------------------------------------------- #
+# Server-side session stats in the Seed-TTS probe (RFC #8325)                 #
+# --------------------------------------------------------------------------- #
+
+
+def _stats_turn(response_id: str, *, final: bool = True) -> dict:
+    return {
+        "response_ids": [response_id],
+        "final": final,
+        "status": "done",
+        "chunks": [
+            {"submitted_ns": 0, "done_ns": 20_000_000, "stage_work": [{"stage_id": 0, "spans": [[0, 10_000_000]]}]}
+        ],
+        "audio": [{"duration_ms": 100.0}],
+    }
+
+
+class _StatsClient:
+    """Answers ``get_session_stats`` from a script of replies, exceptions or delays."""
+
+    def __init__(self, replies):
+        self.session_info = {"capabilities": {"supports_session_stats": True}}
+        self.replies = list(replies)
+        self.timeouts: list[float] = []
+
+    async def get_session_stats(self, *, timeout_s: float):
+        self.timeouts.append(timeout_s)
+        reply = self.replies.pop(0) if self.replies else {"turns": [_stats_turn("r1", final=False)]}
+        if isinstance(reply, BaseException):
+            raise reply
+        if isinstance(reply, float):
+            # Like the real client: a reply slower than the timeout is a timeout.
+            await asyncio.sleep(min(reply, timeout_s))
+            if reply > timeout_s:
+                raise asyncio.TimeoutError("timed out waiting for session.stats")
+            return {"turns": [_stats_turn("r1", final=False)]}
+        return reply
+
+
+def _probe(client) -> patch._RealtimeTTSProbe:
+    probe = patch._RealtimeTTSProbe("ws://unused")
+    probe._client = client
+    return probe
+
+
+@pytest.mark.asyncio
+async def test_turn_session_stats_polls_until_final_and_reports_the_stages() -> None:
+    client = _StatsClient([{"turns": [_stats_turn("r1", final=False)]}, {"turns": [_stats_turn("r1")]}])
+    stats = await _probe(client).turn_session_stats("r1", timeout_s=2.0)
+    assert stats["server_stats_final"] is True
+    assert stats["busy_rtf"] == 0.1
+    assert stats["server_stage_ids"] == [0]
+
+
+@pytest.mark.asyncio
+async def test_turn_session_stats_stops_without_numbers_when_a_stage_reported_no_work() -> None:
+    reply = {"stages": [{"stage_id": stage_id} for stage_id in (0, 1, 2)], "turns": [_stats_turn("r1")]}
+    client = _StatsClient([reply])
+    stats = await _probe(client).turn_session_stats("r1", timeout_s=2.0)
+    assert (stats["server_stats_final"], stats["busy_rtf"]) == (False, None)
+    assert stats["server_missing_stage_ids"] == [1, 2]
+    # The turn is already final, so polling stops at once.
+    assert len(client.timeouts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        asyncio.TimeoutError("no reply"),
+        DuplexSessionClosedError("closed"),
+        DuplexProtocolError("stats disabled", code="session_stats_disabled"),
+    ],
+)
+async def test_a_failed_stats_query_leaves_the_turn_without_server_numbers(failure: Exception) -> None:
+    stats = await _probe(_StatsClient([failure])).turn_session_stats("r1", timeout_s=2.0)
+    assert stats["server_stats_final"] is False
+    assert stats["busy_rtf"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_late_non_final_reply_stops_at_the_overall_deadline() -> None:
+    client = _StatsClient([0.15, 0.15, 0.15])
+    started = time.monotonic()
+    stats = await _probe(client).turn_session_stats("r1", timeout_s=0.3)
+    elapsed = time.monotonic() - started
+    assert stats["server_stats_final"] is False
+    assert elapsed < 0.45
+    # Each query gets only the time left, never a fresh full timeout.
+    assert client.timeouts[0] == pytest.approx(0.3, abs=0.02)
+    assert all(later < client.timeouts[0] for later in client.timeouts[1:])

@@ -366,12 +366,91 @@ steps:
 - group: ":card_index_dividers: E2E Test"
   steps:
     - label: "Omni Model Test Qwen2-5-Omni"
-      agent_pool: mi300_4
+      agent_pool: mi300_2
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 180
+      artifact_paths:
+        - artifacts/rocm-qwen25-omni-merge/**/*
       commands:
         - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-        - pytest -s -v tests/e2e/*/test_qwen2_5_omni_expansion.py --run-level "core_model"
+        - export ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen25-omni-merge"
+        - mkdir -p "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]"
+            "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_audio_in_video_boundaries[False-omni_server0]"
+            "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_audio_in_video_boundaries[True-omni_server0]"
+            "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_text_to_text_001[omni_server0]"
+            "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_speaker_001[Chelsie-omni_server0]"
+            "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_speaker_001[ETHAN-omni_server0]"
+            "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py::test_mix_to_audio[omni_runner0-rocm]"
+            "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py::test_text_to_text[omni_runner0-rocm]"
+          )
+          printf '%s\n' "$${nodes[@]}" | sort > \
+            "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/expected-nodes.txt"
+          pytest -q \
+            tests/e2e/online_serving/test_qwen2_5_omni_expansion.py \
+            tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py \
+            -m 'slow and rocm and MI325 and cards_2' \
+            --collect-only \
+            --run-level 'core_model' \
+            --shard-id=0 --num-shards=1 \
+            | tee "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/collection.log"
+          sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+            "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/collection.log" \
+            | sort > "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/collected-nodes.txt"
+          if ! diff -u \
+            "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/expected-nodes.txt" \
+            "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/collected-nodes.txt"
+          then
+            echo "Qwen2.5-Omni MERGE collection drifted from the 8 marked nodes" >&2
+            exit 1
+          fi
+        - |
+          if (
+            trap - ERR
+            set +e
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v -ra \
+              tests/e2e/online_serving/test_qwen2_5_omni_expansion.py \
+              tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py \
+              -m 'slow and rocm and MI325 and cards_2' \
+              --run-level 'core_model' \
+              --shard-id=0 --num-shards=1 \
+              --junitxml="$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/pytest.log"
+            exit "$${PIPESTATUS[0]}"
+          ); then
+            status=0
+          else
+            status=$$?
+          fi
+          tail -n 100 "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/pytest.log" > \
+            "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/pytest-summary.txt"
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          if tests != 8 or skipped != 0:
+              print(
+                  f"Expected exactly eight executed Qwen2.5-Omni MERGE tests; "
+                  f"reported tests={tests}, skipped={skipped}.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(5)
+          ' "$$ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
 
     - label: "Omni Model Test Qwen3-Omni"
       agent_pool: mi300_2
@@ -394,6 +473,65 @@ steps:
           tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
           -m 'advanced_model and rocm and MI325 and not nvidia_only'
           --run-level 'advanced_model'
+
+    - label: "Qwen3-Omni SHM Leak Test"
+      agent_pool: mi300_2
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 50
+      artifact_paths:
+        - artifacts/rocm-qwen3-omni-shm-leak/**/*
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - export ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-shm-leak"
+        - mkdir -p "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR"
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 1
+          tests/e2e/online_serving/test_qwen3_omni_shm_leak.py
+          -m 'advanced_model and rocm and MI325 and cards_2 and not nvidia_only'
+          --run-level 'advanced_model'
+          --shard-id=0 --num-shards=1
+        - |
+          if (
+            trap - ERR
+            set +e
+            timeout --signal=TERM --kill-after=2m 45m \
+              pytest -s -v -ra tests/e2e/online_serving/test_qwen3_omni_shm_leak.py \
+              -m 'advanced_model and rocm and MI325 and cards_2 and not nvidia_only' \
+              --run-level 'advanced_model' \
+              --shard-id=0 --num-shards=1 \
+              --junitxml="$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest.log"
+            exit "$${PIPESTATUS[0]}"
+          ); then
+            status=0
+          else
+            status=$$?
+          fi
+          tail -n 100 "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest.log" > \
+            "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest-summary.txt"
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          if tests != 1 or skipped != 0:
+              print(
+                  f"Expected exactly one executed Qwen3-Omni SHM leak test; "
+                  f"reported tests={tests}, skipped={skipped}.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(5)
+          ' "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
 
     - label: "Qwen3-TTS CustomVoice E2E Test · Shard %N/%t"
       agent_pool: mi300_1
