@@ -625,6 +625,33 @@ async def _persist_latent_edit_source(
     )
 
 
+async def validate_latent_continuation_source(
+    handler: OmniOpenAIServingVideo,
+    request: VideoGenerationRequest,
+) -> str | None:
+    """Return ``extra_params["continue_from"]`` once it names a completed job of this server."""
+    source = (request.extra_params or {}).get("continue_from")
+    if source is None:
+        return None
+    if not handler.supports_latent_continuation:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="continue_from is not supported by this model.",
+        )
+    if not isinstance(source, str) or not source:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="continue_from must be a video id returned by POST /v1/videos.",
+        )
+    job = await VIDEO_STORE.get(source)
+    if job is None or job.status != VideoGenerationStatus.COMPLETED:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"continue_from video {source!r} is unknown or has not completed.",
+        )
+    return source
+
+
 def _validate_latent_edit_inputs(
     handler: OmniOpenAIServingVideo,
     *,

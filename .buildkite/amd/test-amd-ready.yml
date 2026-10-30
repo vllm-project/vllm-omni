@@ -474,6 +474,71 @@ steps:
           DEVICE_REDUCTION_READY
 
 
+    - label: "ROCm · Tiny Diffusion Base GPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      # Keep this broad integration/determinism matrix on the reference
+      # backend. Existing READY diffusion jobs cover the ROCm default/AITER
+      # path without making two cold JIT builds dominate this serial lane.
+      env:
+        DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+      # One-card core_model groups, serial. The 60-minute step leaves ten
+      # minutes around the 50-minute command. Do not copy CUDA xdist -n 4.
+      timeout_in_minutes: 60
+      artifact_paths:
+        - "artifacts/rocm-tiny-diffusion-base/**/*"
+      commands:
+        - |
+          timeout --signal=TERM --kill-after=1m 50m bash <<'TINY_DIFFUSION_BASE_READY'
+          set -euo pipefail
+          export TINY_DIFFUSION_BASE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-tiny-diffusion-base"
+          mkdir -p "$$TINY_DIFFUSION_BASE_ARTIFACT_DIR"
+          nodes=(
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[AnimaPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2KleinPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cpu_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[layerwise_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit+cpu_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaVideoPipeline[cache_dit+layerwise_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[SanaImageToVideoPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImagePipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImagePipeline[tea_cache]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[LongCatImageEditPipeline[tea_cache]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[Flux2Pipeline[cache_dit+layerwise_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImageEditPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[QwenImageEditPlusPipeline]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusion3Pipeline[cache_dit+layerwise_offload]]"
+            "tests/model_tests/diffusion/test_common_offline.py::test_pipeline_on_supported_tasks[StableDiffusionXLPipeline[cpu_offload]]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[AnimaPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[Flux2KleinPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImagePipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImageEditPipeline]"
+            "tests/model_tests/diffusion/test_common_online.py::test_online_on_supported_tasks[QwenImageEditPlusPipeline]"
+          )
+          printf '%s\n' "$${nodes[@]}" | sort > /tmp/tiny-diffusion-base-ready-expected.txt
+          pytest -q \
+            "$${nodes[@]}" \
+            -m "core_model and diffusion and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --collect-only \
+            | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+            | sort > /tmp/tiny-diffusion-base-ready-collected.txt
+          if ! diff -u /tmp/tiny-diffusion-base-ready-expected.txt /tmp/tiny-diffusion-base-ready-collected.txt; then
+            echo "Tiny diffusion base READY collection drifted from the pinned one-card nodes" >&2
+            exit 1
+          fi
+          pytest -s -v \
+            "$${nodes[@]}" \
+            -m "core_model and diffusion and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --junitxml="$$TINY_DIFFUSION_BASE_ARTIFACT_DIR/pytest.xml"
+          TINY_DIFFUSION_BASE_READY
+
+
 ## ISSUE depends on `diffusers` package: https://github.com/huggingface/diffusers/issues/13274
 # - label: "Audio Generation Model Test"
 #   agent_pool: mi300_1

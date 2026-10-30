@@ -169,6 +169,7 @@ from vllm_omni.entrypoints.openai.protocol.rollout import (
     CreateSessionRequest,
     RolloutStepRequest,
 )
+from vllm_omni.entrypoints.openai.protocol.run import RunRequest
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
     VideoGenerationRequest,
@@ -185,6 +186,7 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
+from vllm_omni.entrypoints.openai.serving_run import ServingRun, run_endpoint_restrictions
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -210,6 +212,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _run_video_generation_job,
     _status_code_for_video_failure,
     _unpack_video_generation_result,
+    validate_latent_continuation_source,
     video_response_from_request,
 )
 from vllm_omni.entrypoints.openai.video.segmentation.helpers import (
@@ -455,6 +458,9 @@ async def omni_run_server_worker(
             shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
+
+        # Shutdown run requests unless we enabled it directly
+        shutdown_unsupported_routes(app, run_endpoint_restrictions())
 
         # Start background processes
         await STORAGE_MANAGER.start()
@@ -775,6 +781,7 @@ async def _init_duplex_app_state(
         "openai_streaming_video_output",
         "openai_serving_realtime_robot",
         "anthropic_serving_messages",
+        "run_serving",
     ):
         setattr(state, attribute, None)
     state.openai_serving_duplex = OmniDuplexSessionHandler(duplex_omni=engine_client)
@@ -950,6 +957,7 @@ async def omni_init_app_state(
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
+    state.run_serving = ServingRun(engine_client)
 
     # Initialize the API surface for the selected engine, not just the model.
     if isinstance(engine_client, DuplexOmni):
@@ -1982,6 +1990,28 @@ async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
     return True
 
 
+@router.post("/v1/run", dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def run_stage(request: RunRequest, raw_request: Request):
+    """Run one pipeline stage and return its encoded result; see `ServingRun`."""
+    serving: ServingRun | None = raw_request.app.state.run_serving
+    if serving is None:
+        return _unsupported_api_response(raw_request, "Run API")
+    request_id = f"run-{random_uuid()}"
+    raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+    try:
+        response = await serving.run(request, request_id=request_id)
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except OmniClientError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ValueError as exc:
+        # Includes stage_input payloads that fail to decode.
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+    return response.model_dump(exclude_none=True)
+
+
 # RL Rollout serving (RFC #3747, P0)
 
 
@@ -2971,7 +3001,9 @@ async def create_video(
     task: asyncio.Task[None] | None = None
     ref = None
     try:
+        continue_from = await validate_latent_continuation_source(handler, request)
         ref = video_response_from_request(effective_model_name, request)
+        ref.remixed_from_video_id = continue_from
         await VIDEO_STORE.upsert(ref.id, ref)
         task = asyncio.create_task(
             _run_video_generation_job(
@@ -3043,6 +3075,7 @@ async def create_video_sync(
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
+        await validate_latent_continuation_source(handler, request)
         video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
             await asyncio.wait_for(
                 handler.generate_video_bytes(
