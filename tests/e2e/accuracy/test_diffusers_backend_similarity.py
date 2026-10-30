@@ -88,9 +88,10 @@ SEED = 42
 SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 30.0
 
-# A single-shot latency measurement on this benchmark is dominated by CI variance
-# (see issue #5108). Warm up once, then report the median of several timed runs.
-NUM_TIMED_RUNS = 2
+# Warm up once, then take the median of an odd number of timed requests.
+# Two samples make np.median their mean, so one spike still moves the gate
+# (issues #5108, #9449).
+NUM_TIMED_RUNS = 3
 
 VIDEO_PROMPT = "The bear in the image dances happily"
 VIDEO_WIDTH = 832
@@ -335,10 +336,9 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
     )
-    # Latency is checked against a warmed median of NUM_TIMED_RUNS runs (see the
-    # _run_* helpers), so the assertion reflects steady-state rather than a single
-    # cold shot -- which is what previously made this check flaky (issue #5108).
-    # Correctness is additionally gated by the SSIM/PSNR assertions above.
+    # Latency is the median of NUM_TIMED_RUNS warmed requests. The count is odd,
+    # so one spiked sample is dropped (issues #5108, #9449). Correctness is
+    # additionally gated by the SSIM/PSNR assertions above.
     assert vllm_latency <= latency_threshold, (
         f"VLLM latency ({vllm_latency:.2f}ms) is greater than "
         f"{latency_threshold_factor * 100}% more than Diffusers latency "

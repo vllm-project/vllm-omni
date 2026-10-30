@@ -11,7 +11,10 @@ from tests.helpers.mark import hardware_marks
 from tests.worker.test_gpu_generation_model_runner import _make_runner
 from vllm_omni.worker.gpu_generation_model_runner import _AsyncGenerationOutput
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [
+    pytest.mark.core_model,
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
+]
 
 
 @pytest.mark.parametrize("kind", ["tensor", "list", "mapping"])

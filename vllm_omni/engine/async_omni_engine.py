@@ -33,6 +33,7 @@ from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
     EngineQueueMessage,
     InteractionMessage,
+    NextStageInputMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
@@ -224,6 +225,7 @@ class AsyncOmniEngine(OmniEngineBase):
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
+        yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
@@ -369,7 +371,13 @@ class AsyncOmniEngine(OmniEngineBase):
                 # process_inputs() leaves external_req_id unset, so we need to set it to the
                 # orchestrator request_id to find the correct req_state in Orchestrator.request_states.
                 request.external_req_id = request_id
-                request = apply_omni_final_stage_metadata(request, final_stage_id)
+                # A run request's yielded stage returns its payload when the next stage takes a full payload.
+                return_stage_payload = (
+                    yield_stage_id is not None and self.stage_pools[yield_stage_id + 1].takes_full_payload_input
+                )
+                request = apply_omni_final_stage_metadata(
+                    request, final_stage_id, return_stage_payload=return_stage_payload
+                )
 
                 # Registration with stage 0's output processor is deferred to the
                 # orchestrator thread (see Orchestrator._handle_add_request), which
@@ -397,6 +405,7 @@ class AsyncOmniEngine(OmniEngineBase):
             request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
             request_artifact_dirs=request_artifact_dirs or None,
+            yield_stage_id=yield_stage_id,
             entry_stage_id=entry_stage_id,
             lora_request=lora_request,
         )
@@ -518,6 +527,7 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
+        yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
@@ -542,6 +552,7 @@ class AsyncOmniEngine(OmniEngineBase):
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            yield_stage_id=yield_stage_id,
             entry_stage_id=entry_stage_id,
             kv_hints=kv_hints,
         )
@@ -581,6 +592,7 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
+        yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
     ) -> tuple[StageSubmissionMessage, list[AddCompanionRequestMessage]]:
         """Build the ADD message plus CFG companions without enqueueing."""
@@ -608,6 +620,7 @@ class AsyncOmniEngine(OmniEngineBase):
                 data_parallel_rank=data_parallel_rank,
                 reasoning_ended=reasoning_ended,
                 resumable=resumable,
+                yield_stage_id=yield_stage_id,
                 entry_stage_id=entry_stage_id,
                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
             )
@@ -840,6 +853,7 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
+        yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
     ) -> None:
         """Async add_request API.
@@ -865,6 +879,7 @@ class AsyncOmniEngine(OmniEngineBase):
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            yield_stage_id=yield_stage_id,
             entry_stage_id=entry_stage_id,
             **({"kv_hints": kv_hints} if kv_hints is not None else {}),
         )
@@ -894,6 +909,10 @@ class AsyncOmniEngine(OmniEngineBase):
                 request_id,
                 len(companions),
             )
+
+    async def add_next_stage_input_async(self, msg: NextStageInputMessage) -> None:
+        """Send a next stage input returned by an earlier request to the Orchestrator."""
+        self.request_queue.sync_q.put(msg)
 
     def add_streaming_update(
         self,
