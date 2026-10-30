@@ -69,6 +69,94 @@ steps:
           - export VLLM_ROCM_USE_AITER=1
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
 
+  - group: ":full_moon: Qwen3-Omni Scale and Performance MI300 Nightly"
+    steps:
+      - label: "Qwen3-Omni Multi-Replica Correctness"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_qwen3_omni_function
+        env:
+          QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-multi-replica-correctness"
+          QWEN3_OMNI_EXPECTED_GPUS: "4"
+          QWEN3_OMNI_EXPECTED_RESULTS: "0"
+          QWEN3_OMNI_EXPECTED_TESTS: "3"
+          QWEN3_OMNI_MARK_EXPRESSION: "full_model and omni and rocm and MI325 and cards_4"
+          QWEN3_OMNI_TEST_TARGET: tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
+          QWEN3_OMNI_TIMEOUT: 165m
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-multi-replica-correctness/**/*
+        commands:
+          - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
+
+      - label: "Qwen3-Omni No-Async-Chunk Perf"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 300
+        source_file_dependencies: omni_qwen3_omni_perf
+        env:
+          QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-no-async-chunk-perf"
+          QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json
+          QWEN3_OMNI_EXPECTED_GPUS: "2"
+          QWEN3_OMNI_EXPECTED_RESULTS: "8"
+          QWEN3_OMNI_EXPECTED_TESTS: "4"
+          QWEN3_OMNI_MARK_EXPRESSION: "full_model and omni and rocm and MI325 and cards_2"
+          QWEN3_OMNI_TEST_TARGET: tests/dfx/perf/scripts/run_benchmark.py
+          QWEN3_OMNI_TIMEOUT: 285m
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-no-async-chunk-perf/**/*
+        commands:
+          - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
+
+      - label: "Qwen3-Omni Async-Chunk Perf"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_qwen3_omni_perf
+        env:
+          QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-async-chunk-perf"
+          QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
+          QWEN3_OMNI_EXPECTED_GPUS: "2"
+          QWEN3_OMNI_EXPECTED_RESULTS: "6"
+          QWEN3_OMNI_EXPECTED_TESTS: "6"
+          QWEN3_OMNI_MARK_EXPRESSION: "full_model and omni and rocm and MI325 and cards_2"
+          QWEN3_OMNI_TEST_TARGET: tests/dfx/perf/scripts/run_benchmark.py
+          QWEN3_OMNI_TIMEOUT: 165m
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-async-chunk-perf/**/*
+        commands:
+          - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
+
+      - label: "Qwen3-Omni Multi-Replica Perf"
+        # The AMD CI cluster has 1-, 2-, and 4-GPU queues, but no 3-GPU
+        # queue. Run the three-device topology on the existing 4-GPU queue;
+        # the config and cards_3 mark keep the fourth GPU out of the workload.
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_qwen3_omni_perf
+        env:
+          QWEN3_OMNI_ARTIFACT_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-multi-replica-perf"
+          QWEN3_OMNI_CONFIG_FILE: tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
+          QWEN3_OMNI_EXPECTED_GPUS: "4"
+          QWEN3_OMNI_EXPECTED_RESULTS: "7"
+          QWEN3_OMNI_EXPECTED_TESTS: "4"
+          QWEN3_OMNI_MARK_EXPRESSION: "slow and omni and rocm and MI325 and cards_3"
+          QWEN3_OMNI_TEST_TARGET: tests/dfx/perf/scripts/run_benchmark.py
+          QWEN3_OMNI_TIMEOUT: 165m
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-multi-replica-perf/**/*
+        commands:
+          - bash .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
+
   # The seven ROCm nodes in tests/examples/online_serving/test_qwen2_5_omni.py
   # already select Qwen/Qwen2.5-Omni-7B on MI325 with two cards. Keep AITER off
   # so this documentation lane does not pay for a cold JIT build.
@@ -974,6 +1062,248 @@ steps:
 
             exit "$$status"
 
+  - group: ":full_moon: Voxtral TTS Perf MI300 Nightly"
+    steps:
+      - label: "Voxtral TTS Perf"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: tts_voxtral_tts_perf
+        env:
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-voxtral-tts-perf/benchmark-results"
+        artifact_paths:
+          - artifacts/rocm-voxtral-tts-perf/**/*
+        commands:
+          - export ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-voxtral-tts-perf"
+          - |
+            rm -rf "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR"
+            mkdir -p "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/benchmark-results"
+          # Latency, throughput, and stress. No MI325 numeric baseline yet.
+          - |
+            nodes=(
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_latency_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_throughput_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_stress_seed-tts-text]"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --test-config-file tests/dfx/perf/tests/test_tts.json \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and tts and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} Voxtral TTS perf nodes, found $$count." >&2
+              cat "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt"; then
+                echo "Voxtral TTS perf node was not collected: $$node" >&2
+                cat "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_latency_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_throughput_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_stress_seed-tts-text]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$${nodes[@]}" \
+                --test-config-file tests/dfx/perf/tests/test_tts.json \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and tts and rocm and MI325 and cards_1" --run-level full_model \
+                --junitxml="$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 3 or skipped != 0:
+                print(
+                    f"Expected exactly three executed Voxtral TTS perf tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
+              -name 'result_test_voxtral_tts_*.json' -print | sort > \
+              "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/result-files.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              result_count=$$(wc -l < "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/result-files.txt" | tr -d '[:space:]')
+              if [[ "$$result_count" != 3 ]]; then
+                echo "Expected exactly 3 Voxtral TTS result JSON files, found $$result_count." >&2
+                cat "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/result-files.txt" >&2
+                status=5
+              fi
+            fi
+            (exit "$$status")
+
+  - group: ":full_moon: Qwen3-TTS Perf MI300 Nightly"
+    steps:
+      - label: "Qwen3-TTS Perf"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: tts_qwen3_tts_perf
+        env:
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-perf/benchmark-results"
+        artifact_paths:
+          - artifacts/rocm-qwen3-tts-perf/**/*
+        commands:
+          - export ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-perf"
+          - |
+            rm -rf "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR"
+            mkdir -p "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/benchmark-results"
+          # Latency, throughput sweeps, and stress. No MI325 numeric baseline yet.
+          - |
+            nodes=(
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_latency_seed-tts]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_throughput_seed-tts]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design]"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --test-config-file tests/dfx/perf/tests/test_tts.json \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and tts and rocm and MI325 and cards_2" --run-level full_model \
+              > "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} Qwen3-TTS perf nodes, found $$count." >&2
+              cat "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt"; then
+                echo "Qwen3-TTS perf node was not collected: $$node" >&2
+                cat "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_latency_seed-tts]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_throughput_seed-tts]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$${nodes[@]}" \
+                --test-config-file tests/dfx/perf/tests/test_tts.json \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and tts and rocm and MI325 and cards_2" --run-level full_model \
+                --junitxml="$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 8 or skipped != 0:
+                print(
+                    f"Expected exactly eight executed Qwen3-TTS perf tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
+              -name 'result_test_qwen3_tts_*.json' -print | sort > \
+              "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/result-files.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import json, sys
+            from pathlib import Path
+
+            manifest = Path(sys.argv[1])
+            paths = [Path(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
+            expected = {
+                "test_qwen3_tts_base": 4,
+                "test_qwen3_tts_customvoice": 5,
+                "test_qwen3_tts_voicedesign": 5,
+            }
+            counts = {name: 0 for name in expected}
+            if len(paths) != 14:
+                print(f"Expected exactly 14 Qwen3-TTS result JSON files, found {len(paths)}.", file=sys.stderr)
+                raise SystemExit(5)
+            for path in paths:
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"Unreadable Qwen3-TTS result JSON {path}: {exc}", file=sys.stderr)
+                    raise SystemExit(5) from exc
+                matches = [name for name in expected if path.name.startswith(f"result_{name}_")]
+                if len(matches) != 1:
+                    print(f"Unexpected Qwen3-TTS result filename: {path.name}", file=sys.stderr)
+                    raise SystemExit(5)
+                counts[matches[0]] += 1
+            if counts != expected:
+                print(f"Expected Qwen3-TTS result split {expected}, found {counts}.", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/result-files.txt"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
   - group: ":microscope: Tiny Diffusion Multi-GPU MI300 Nightly"
     steps:
       - label: "ROCm · Tiny Diffusion Multi-GPU · 2-GPU"
@@ -1038,88 +1368,113 @@ steps:
               "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest-summary.txt"
             exit "$$status"
 
-  - group: ":full_moon: Qwen3-Omni Seed-TTS Realtime Perf MI300 Nightly"
+  - group: ":full_moon: MiniCPM-o 4.5 Perf MI300 Nightly"
     steps:
-      - label: "Qwen3-Omni Seed-TTS Realtime Perf"
-        agent_pool: mi300_2
+      - label: "MiniCPM-o 4.5 Perf"
+        agent_pool: mi300_1
         depends_on: amd-build
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
-        source_file_dependencies: omni_qwen3_omni_seed_tts_perf
+        source_file_dependencies: omni_minicpmo_4_5_perf
         env:
-          BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-seed-tts-perf/benchmark-results"
+          BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-4-5-perf/benchmark-results"
         artifact_paths:
-          - artifacts/rocm-qwen3-omni-seed-tts-perf/**/*
+          - artifacts/rocm-minicpmo-4-5-perf/**/*
         commands:
-          - export ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-seed-tts-perf"
-          - mkdir -p "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/benchmark-results"
-          - >-
-            python3 -c 'from huggingface_hub import hf_hub_download;
-            from vllm_omni.engine.duplex.vad import SILERO_VAD_FILENAME, SILERO_VAD_REPO_ID,
-            SILERO_VAD_REVISION, SileroVADBackendProvider;
-            path = hf_hub_download(repo_id=SILERO_VAD_REPO_ID, filename=SILERO_VAD_FILENAME,
-            revision=SILERO_VAD_REVISION); SileroVADBackendProvider().get(); print(path)'
-          # Measure the explicit and VAD realtime cases. No MI300 baseline yet.
+          - export ROCM_MINICPMO_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-4-5-perf"
           - |
-            nodes=(
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_omni_seed_tts_realtime-explicit]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_omni_seed_tts_realtime-vad]"
-            )
-            pytest --collect-only -q "$${nodes[@]}" \
-              --test-config-file tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json \
-              -m "full_model and omni and rocm and MI325 and cards_2" --run-level full_model \
-              > "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/collection.txt"
+            rm -rf "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR"
+            mkdir -p "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/benchmark-results"
+          # One pytest node. Its five concurrency points stay inside the test.
+          # No MI300 baseline yet, so do not pass --assert-baseline.
+          - |
+            node="tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_minicpmo_4_5-seed-tts]"
+            pytest --collect-only -q "$$node" \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/collection.txt"
             count=$$(awk '/::/ { n++ } END { print n + 0 }' \
-              "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/collection.txt")
-            if [[ "$$count" != "$${#nodes[@]}" ]]; then
-              echo "Expected exactly $${#nodes[@]} Qwen3-Omni Seed-TTS realtime nodes, found $$count." >&2
-              cat "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
+              "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one MiniCPM-o 4.5 perf node, found $$count." >&2
+              cat "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/collection.txt" >&2
               exit 5
             fi
-            for node in "$${nodes[@]}"; do
-              if ! grep -Fq "$$node" "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/collection.txt"; then
-                echo "Qwen3-Omni Seed-TTS realtime node was not collected: $$node" >&2
-                cat "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
-                exit 5
-              fi
-            done
-          - |
-            set +e
-            nodes=(
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_omni_seed_tts_realtime-explicit]"
-              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_omni_seed_tts_realtime-vad]"
-            )
-            timeout --signal=TERM --kill-after=2m 165m \
-              pytest -s -v -ra "$${nodes[@]}" \
-              --test-config-file tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json \
-              -m "full_model and omni and rocm and MI325 and cards_2" --run-level full_model \
-              --junitxml="$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/pytest.xml" \
-              2>&1 | tee "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/pytest.log"
-            status=$${PIPESTATUS[0]}
-            set -e
-            tail -n 100 "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/pytest.log" > \
-              "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/pytest-summary.txt"
-            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
-              -name 'result_test_qwen3_omni_seed_tts_realtime_*.json' -print | sort > \
-              "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/result-files.txt"
-            if [[ "$$status" == 0 ]]; then
-              result_count=$$(wc -l < "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/result-files.txt" | tr -d '[:space:]')
-              if [[ "$$result_count" != 2 ]]; then
-                echo "Expected exactly 2 Qwen3-Omni Seed-TTS result JSON files, found $$result_count." >&2
-                cat "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/result-files.txt" >&2
-                status=5
-              fi
-              for name in explicit vad; do
-                matches=$$(grep -Fc "_$${name}_" \
-                  "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/result-files.txt" || true)
-                if [[ "$$matches" != 1 ]]; then
-                  echo "Expected exactly one Qwen3-Omni Seed-TTS $$name result JSON, found $$matches." >&2
-                  status=5
-                fi
-              done
+            if grep -q "test_minicpmo_4_5_a2" "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/collection.txt"; then
+              echo "A2 MiniCPM-o perf node must not run on this MI300 job." >&2
+              exit 5
             fi
-            exit "$$status"
+          - |
+            if (
+              trap - ERR
+              set +e
+              node="tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_minicpmo_4_5-seed-tts]"
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$$node" \
+                --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
+                --junitxml="$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 1 or skipped != 0:
+                print(
+                    f"Expected exactly one executed MiniCPM-o 4.5 perf test; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
+              -name 'result_test_minicpmo_4_5_*.json' -print | sort > \
+              "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/result-files.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import json, sys
+            from pathlib import Path
+
+            manifest = Path(sys.argv[1])
+            paths = [Path(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
+            if len(paths) != 5:
+                print(f"Expected exactly 5 MiniCPM-o 4.5 result JSON files, found {len(paths)}.", file=sys.stderr)
+                raise SystemExit(5)
+            for path in paths:
+                if path.name.startswith("result_test_minicpmo_4_5_a2_"):
+                    print(f"A2 MiniCPM-o result must not be produced by this MI300 job: {path.name}", file=sys.stderr)
+                    raise SystemExit(5)
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"Unreadable MiniCPM-o 4.5 result JSON {path}: {exc}", file=sys.stderr)
+                    raise SystemExit(5) from exc
+            ' "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/result-files.txt"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
 
   - group: ":full_moon: Omni-DuplexEval MI300 Nightly"
     steps:
@@ -1133,8 +1488,9 @@ steps:
           BENCHMARK_DIR: tests/dfx/perf/results
           ACC_BENCH_RESULT_DIR: tests/e2e/accuracy/omni_duplex_eval/results
         artifact_paths:
-          - artifacts/rocm-omni-duplex-eval/**/*
-          - tests/dfx/perf/results/omni_duplex_eval_minicpmo_4_5/**/*
+          - artifacts/rocm-omni-duplex-eval/collection.txt
+          - tests/dfx/perf/results/*.json
+          - tests/e2e/accuracy/omni_duplex_eval/results/*.json
         commands:
           - export ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-omni-duplex-eval"
           - mkdir -p "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR"
@@ -1153,22 +1509,670 @@ steps:
               exit 5
             fi
           - |
-            set +e
-            timeout --signal=TERM --kill-after=2m 220m \
+            timeout --signal=INT --kill-after=2m 220m \
               pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
               --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json \
-              -m "full_model and omni and rocm and MI325 and cards_2" --run-level full_model \
-              --junitxml="$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/pytest.xml" \
-              2>&1 | tee "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/pytest.log"
-            status=$${PIPESTATUS[0]}
-            set -e
-            if [[ -d tests/e2e/accuracy/omni_duplex_eval/results ]]; then
-              mkdir -p "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/results"
-              cp -a tests/e2e/accuracy/omni_duplex_eval/results/. "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/results/"
-            fi
-            if [[ -d tests/dfx/perf/results ]]; then
-              mkdir -p "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/perf"
-              cp -a tests/dfx/perf/results/. "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/perf/"
-            fi
+              -m "full_model and omni and rocm and MI325 and cards_2" --run-level full_model
 
-            exit "$$status"
+  - group: ":full_moon: Qwen-Image Backend Similarity MI300 Nightly"
+    steps:
+      - label: "Qwen-Image Diffusers Backend Similarity"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_qwen_image_accuracy
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-backend-similarity/**/*
+        commands:
+          - export ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-backend-similarity"
+          - mkdir -p "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/e2e/accuracy/test_diffusers_backend_similarity.py \
+              -k "2i_matches_diffusers" \
+              -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one Qwen-Image backend similarity node, found $$count." >&2
+              cat "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            if ! grep -Fq "test_diffusers_backend_t2i_matches_diffusers" \
+              "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt"; then
+              echo "Qwen-Image backend similarity node was not collected." >&2
+              cat "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra tests/e2e/accuracy/test_diffusers_backend_similarity.py \
+                -k "2i_matches_diffusers" \
+                -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+                --junitxml="$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/accuracy/"
+            fi
+            tail -n 100 "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 1 or skipped != 0:
+                print(
+                    f"Expected exactly one executed Qwen-Image backend similarity test; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  - group: ":full_moon: Entrypoints Full MI300 Nightly"
+    steps:
+      - label: "Qwen3-Omni Duplex Playback"
+        agent_pool: mi300_2
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_qwen3_omni_duplex_playback_function
+        artifact_paths:
+          - artifacts/rocm-qwen3-omni-duplex-playback/**/*
+        commands:
+          - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          - export ROCM_QWEN3_OMNI_DUPLEX_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-duplex-playback"
+          - mkdir -p "$$ROCM_QWEN3_OMNI_DUPLEX_ARTIFACT_DIR"
+          - |
+            set -euo pipefail
+            bash .buildkite/amd/scripts/assert-pytest-collection.sh 40 \
+              tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py::TestQwen3OmniDuplexPlayback::test_speech_interrupts_playback_full \
+              -m 'full_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
+              --run-level full_model \
+              --shard-id=0 --num-shards=1 \
+              2>&1 | tee "$$ROCM_QWEN3_OMNI_DUPLEX_ARTIFACT_DIR/collection.log"
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra \
+                tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py::TestQwen3OmniDuplexPlayback::test_speech_interrupts_playback_full \
+                -m 'full_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
+                --run-level full_model \
+                --shard-id=0 --num-shards=1 \
+                --junitxml="$$ROCM_QWEN3_OMNI_DUPLEX_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN3_OMNI_DUPLEX_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_QWEN3_OMNI_DUPLEX_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN3_OMNI_DUPLEX_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 40 or skipped != 0:
+                print(
+                    f"Expected exactly 40 executed Qwen3-Omni duplex playback tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN3_OMNI_DUPLEX_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      - label: "BAGEL Sleep Mode"
+        agent_pool: mi300_2
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_bagel_sleep_function
+        artifact_paths:
+          - artifacts/rocm-bagel-sleep/**/*
+        commands:
+          - export ROCM_BAGEL_SLEEP_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-bagel-sleep"
+          - mkdir -p "$$ROCM_BAGEL_SLEEP_ARTIFACT_DIR"
+          - |
+            set -euo pipefail
+            bash .buildkite/amd/scripts/assert-pytest-collection.sh 3 \
+              tests/entrypoints/test_omni_sleep_mode.py::TestBagelDiffusionSleepMode \
+              -m 'full_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
+              --run-level full_model \
+              --shard-id=0 --num-shards=1 \
+              2>&1 | tee "$$ROCM_BAGEL_SLEEP_ARTIFACT_DIR/collection.log"
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra tests/entrypoints/test_omni_sleep_mode.py::TestBagelDiffusionSleepMode \
+                -m 'full_model and omni and rocm and MI325 and cards_2 and not nvidia_only' \
+                --run-level full_model \
+                --shard-id=0 --num-shards=1 \
+                --junitxml="$$ROCM_BAGEL_SLEEP_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_BAGEL_SLEEP_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_BAGEL_SLEEP_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_BAGEL_SLEEP_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 3 or skipped != 0:
+                print(
+                    f"Expected exactly three executed BAGEL sleep-mode tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_BAGEL_SLEEP_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  - group: ":full_moon: Wan2.2 Function 1 GPU Group"
+    steps:
+      - label: "Wan2.2 Function 1 GPU"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_wan22_function
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-wan22-function-1gpu/**/*
+        commands:
+          - export ROCM_WAN22_FN_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-wan22-function-1gpu"
+          - mkdir -p "$$ROCM_WAN22_FN_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[t2v_cpu_offload]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[i2v_cpu_offload]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[ti2v_cpu_offload]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_cache_dit]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_cache_dit]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_cache_dit]"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} Wan2.2 function 1-GPU nodes, found $$count." >&2
+              cat "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" \
+                "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt"; then
+                echo "Wan2.2 function 1-GPU node was not collected: $$node" >&2
+                cat "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[t2v_cpu_offload]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[i2v_cpu_offload]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[ti2v_cpu_offload]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_cache_dit]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_cache_dit]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_cache_dit]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v "$${nodes[@]}" \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+                --junitxml="$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 6 or skipped != 0:
+                print(
+                    f"Expected exactly six executed Wan2.2 function 1-GPU tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  - group: ":full_moon: Wan2.2 Function 2 GPU Group"
+    steps:
+      - label: "Wan2.2 Function 2 GPU"
+        agent_pool: mi300_2
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_wan22_function
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-wan22-function-2gpu/**/*
+        commands:
+          - export ROCM_WAN22_FN_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-wan22-function-2gpu"
+          - mkdir -p "$$ROCM_WAN22_FN_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_cfg_parallel]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_ulysses_sp]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_tp_vae_patch]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_hsdp]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_ring_atten]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_cfg_parallel]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_ulysses_sp]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_tp_vae_patch]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_hsdp]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_ring_atten]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_cfg_parallel]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_ulysses_sp]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_tp_vae_patch]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_hsdp]"
+              "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_ring_atten]"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and diffusion and rocm and MI325 and cards_2" --run-level full_model \
+              > "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} Wan2.2 function 2-GPU nodes, found $$count." >&2
+              cat "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" \
+                "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt"; then
+                echo "Wan2.2 function 2-GPU node was not collected: $$node" >&2
+                cat "$$ROCM_WAN22_FN_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_cfg_parallel]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_ulysses_sp]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_tp_vae_patch]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_hsdp]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_t2v_ring_atten]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_cfg_parallel]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_ulysses_sp]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_tp_vae_patch]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_hsdp]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_i2v_ring_atten]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_cfg_parallel]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_ulysses_sp]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_tp_vae_patch]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_hsdp]"
+                "tests/e2e/online_serving/test_wan22_expansion.py::test_wan22_diffusion_features[cuda_ti2v_ring_atten]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v "$${nodes[@]}" \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and diffusion and rocm and MI325 and cards_2" --run-level full_model \
+                --junitxml="$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 15 or skipped != 0:
+                print(
+                    f"Expected exactly fifteen executed Wan2.2 function 2-GPU tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_WAN22_FN_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  - group: ":full_moon: Qwen-Image Expansion MI300 Nightly"
+    steps:
+      - label: "Qwen-Image Expansion 1 GPU"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_qwen_image_function
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-expansion-1gpu/**/*
+        commands:
+          - export ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-expansion-1gpu"
+          - mkdir -p "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[cpu_offload]"
+              "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[step_execution]"
+              "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[cache_tea_cache]"
+              "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[layerwise_offload]"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} Qwen-Image expansion 1-GPU nodes, found $$count." >&2
+              cat "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" \
+                "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/collection.txt"; then
+                echo "Qwen-Image expansion 1-GPU node was not collected: $$node" >&2
+                cat "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[cpu_offload]"
+                "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[step_execution]"
+                "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[cache_tea_cache]"
+                "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[layerwise_offload]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v "$${nodes[@]}" \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+                --junitxml="$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 4 or skipped != 0:
+                print(
+                    f"Expected exactly four executed Qwen-Image expansion 1-GPU tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN_IMAGE_EXPANSION_1GPU_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+      - label: "Qwen-Image Expansion 2 GPU"
+        agent_pool: mi300_2
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_qwen_image_function
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-expansion-2gpu/**/*
+        commands:
+          - export ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-expansion-2gpu"
+          - mkdir -p "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[ulysses_2]"
+              "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[ring_2]"
+              "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[cfg_parallel_2]"
+              "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[vae_patch_parallel_2]"
+              "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[parallel_hsdp]"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and diffusion and rocm and MI325 and cards_2" --run-level full_model \
+              > "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} Qwen-Image expansion 2-GPU nodes, found $$count." >&2
+              cat "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" \
+                "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/collection.txt"; then
+                echo "Qwen-Image expansion 2-GPU node was not collected: $$node" >&2
+                cat "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[ulysses_2]"
+                "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[ring_2]"
+                "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[cfg_parallel_2]"
+                "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[vae_patch_parallel_2]"
+                "tests/e2e/online_serving/test_qwen_image_expansion.py::test_qwen_image[parallel_hsdp]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v "$${nodes[@]}" \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and diffusion and rocm and MI325 and cards_2" --run-level full_model \
+                --junitxml="$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 5 or skipped != 0:
+                print(
+                    f"Expected exactly five executed Qwen-Image expansion 2-GPU tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN_IMAGE_EXPANSION_2GPU_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
+  - group: ":full_moon: MiniCPM-o 4.5 Duplex MI300 Nightly"
+    steps:
+      - label: "MiniCPM-o 4.5 Duplex Function"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_minicpmo_4_5_duplex_function
+        artifact_paths:
+          - artifacts/rocm-minicpmo-duplex/**/*
+        commands:
+          - export ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-duplex"
+          - mkdir -p "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py::test_duplex_admission_and_expiry_reaper"
+              "tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py::test_duplex_soft_interrupt"
+              "tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py::test_duplex_server_vad_hard_interrupt"
+              "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_continuous_input[basic-False-three-stage-single-gpu]"
+              "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_continuous_input[context-False-three-stage-single-gpu]"
+              "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_continuous_input[context-True-three-stage-single-gpu]"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} MiniCPM-o duplex nodes, found $$count." >&2
+              cat "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt"; then
+                echo "MiniCPM-o duplex node was not collected: $$node" >&2
+                cat "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py::test_duplex_admission_and_expiry_reaper"
+                "tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py::test_duplex_soft_interrupt"
+                "tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py::test_duplex_server_vad_hard_interrupt"
+                "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_continuous_input[basic-False-three-stage-single-gpu]"
+                "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_continuous_input[context-False-three-stage-single-gpu]"
+                "tests/e2e/online_serving/test_minicpmo_4_5_window.py::test_window_continuous_input[context-True-three-stage-single-gpu]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v "$${nodes[@]}" \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
+                --junitxml="$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 6 or skipped != 0:
+                print(
+                    f"Expected exactly six executed MiniCPM-o duplex tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")

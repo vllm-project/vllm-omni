@@ -899,7 +899,8 @@ def test_cpu_codec_transport_preserves_embedding_and_owns_delta(device, dtype, c
 
 
 @pytest.mark.parametrize("use_snapshot", [False, True])
-def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_snapshot) -> None:
+@pytest.mark.parametrize("include_hidden", [False, True])
+def test_cpu_codec_transport_routes_owned_payloads(monkeypatch, use_snapshot, include_hidden) -> None:
     from types import SimpleNamespace
 
     from tests.worker.test_gpu_ar_model_runner import _make_async_output_runner
@@ -927,9 +928,10 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     assert [value.device.type for value in mm["codes"]["audio"]] == ["cpu"] * 3
     assert [value.shape for value in mm["codes"]["audio"]] == [(1, 1), (0, 1), (1, 1)]
     if use_snapshot:
-        snapshot = _snapshot_tensor_payload_to_cpu_async(
-            {"hidden_states": hidden, "multimodal_outputs": mm}, copy_stream=None, pin_memory=False
-        )
+        payload = {"multimodal_outputs": mm}
+        if include_hidden:
+            payload["hidden_states"] = hidden
+        snapshot = _snapshot_tensor_payload_to_cpu_async(payload, copy_stream=None, pin_memory=False)
         assert snapshot._ready_event is None
         snapshot.wait()
         mm = snapshot.payload["multimodal_outputs"]
@@ -937,7 +939,7 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
         assert mm["codes"]["audio"][0].tolist() == [[0]]
 
     runner = _make_async_output_runner(engine_output_type="latent")
-    assert runner._pooler_payload_include_hidden_flag is True
+    runner._pooler_payload_include_hidden_flag = include_hidden
     runner.requests = {rid: object() for rid in req_ids}
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, ids: ("latent", ids))
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -945,7 +947,7 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     output = runner._build_omni_model_runner_output_from_snapshot(
         scheduler_output=SimpleNamespace(total_num_scheduled_tokens=3, num_scheduled_tokens=dict.fromkeys(req_ids, 1)),
-        hidden_states=hidden,
+        hidden_states=hidden if include_hidden else hidden[:0],
         staged_hidden_states_cpu=None,
         multimodal_outputs=mm,
         req_ids_output_copy=req_ids,
@@ -975,7 +977,10 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     assert [payload["meta.finished"].item() for payload in output.inter_stage_outputs] == [False, True, False]
     assert all(payload["codes.audio"].device.type == "cpu" for payload in output.inter_stage_outputs)
     for index, payload in enumerate(output.inter_stage_outputs):
-        torch.testing.assert_close(payload["hidden"], hidden[index : index + 1])
+        if include_hidden:
+            torch.testing.assert_close(payload["hidden"], hidden[index : index + 1])
+        else:
+            assert "hidden" not in payload
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

@@ -218,6 +218,13 @@ class OpenAIFullDuplexConnection:
     async def _handle_session_update(self, event: types.SessionUpdateEvent):
         s = self.session
         candidate_config = merge_session_config(s.config, event.session)
+        # For watermarking, the OpenAI session model keeps it as an extra field for now
+        session_extra = event.session.model_extra or {}
+        if "watermarking" in session_extra and not isinstance(session_extra["watermarking"], bool):
+            await self._send_error(
+                "session.watermarking must be a boolean", "invalid_request_error", event_id=event.event_id
+            )
+            return
         try:
             candidate_config = self._sanitize_session_config(candidate_config, s.config)
         except _UnsupportedAudioFormatError as exc:
@@ -897,6 +904,14 @@ class OpenAIFullDuplexConnection:
         except Exception:
             logger.debug("Failed to send failure response.done for %s", response_id, exc_info=True)
 
+    @staticmethod
+    def _build_opt_kwargs_from_model_extras(model_extra: dict[str, Any] | None) -> dict[str, Any]:
+        """build any optional kwargs to generate from the passed model_extra."""
+        opt_kwargs = {}
+        if model_extra and "watermarking" in model_extra:
+            opt_kwargs["watermarking"] = model_extra["watermarking"]
+        return opt_kwargs
+
     async def _run_response_inner(self, response_id, response, s, active, engine_input: EngineInput):
         previous_item_id = s.items[-1].id if s.items else None
         modalities = response.modalities
@@ -1108,11 +1123,13 @@ class OpenAIFullDuplexConnection:
                     thinker_params_configured = True
 
         sampling_params_list = self.chat_handler._fix_audio_stream_output_kinds(sampling_params_list, modalities)
+        opt_kwargs = self._build_opt_kwargs_from_model_extras(s.config.model_extra)
         gen = self.engine.generate(
             prompt=engine_input,
             request_id=active.request_id,
             sampling_params_list=sampling_params_list,
             output_modalities=modalities,
+            **opt_kwargs,
         )
 
         try:

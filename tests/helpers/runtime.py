@@ -588,6 +588,14 @@ class OmniServerStageCli(OmniServer):
 
         raise RuntimeError(f"OmniServerStageCli failed to start within {max_wait} seconds")
 
+    def read_stage_logs(self) -> dict[int, str]:
+        """Return the log each stage subprocess has written so far, keyed by stage id."""
+        logs: dict[int, str] = {}
+        for stage_id, log_path in self._stage_log_paths.items():
+            if log_path and log_path.exists():
+                logs[stage_id] = log_path.read_text(encoding="utf-8", errors="replace")
+        return logs
+
     def _dump_stage_logs_for_debug(self, head_lines: int = 300, tail_lines: int = 500) -> None:
         """Tail each stage's subprocess log back to stdout on teardown.
 
