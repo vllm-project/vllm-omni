@@ -504,7 +504,7 @@ def test_audio_to_audio(omni_server, online_client, run_level: str) -> None:
     # generating an audio prompt via `generate_synthetic_audio`.
     # 'audio-prompt.wav' asks the question "What is the capital of China?"
     # Since the generate function must define the duration as an int
-    # it is impossible to accuractly match the duration to the spoken length of the input phrase.
+    # it is impossible to accurately match the duration to the spoken length of the input phrase.
     # Because of this short prompts can cause looping in the phrase
     audio_data_url = get_asset_path("qwen3_omni/audio-prompt.wav", as_data_url=True)
     messages = dummy_messages_from_mix_data(
