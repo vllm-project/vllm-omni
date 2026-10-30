@@ -5,6 +5,8 @@
 
 import pytest
 
+pytest.importorskip("matplotlib")
+
 from benchmarks.tts.plot_results import print_comparison_table
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
