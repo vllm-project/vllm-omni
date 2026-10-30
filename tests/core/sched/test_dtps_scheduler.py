@@ -279,5 +279,5 @@ class TestDTPSScheduler:
 
     def test_aging_s_configurable(self):
         """aging_s can be overridden via constructor."""
-        sched = DTPSScheduler(stage_id=0, dit_load_threshold=2, aging_s=50.0)
-        assert sched.aging_s == 50.0
+        sched = DTPSScheduler(stage_id=0, dit_load_threshold=2, aging_s=30.0)
+        assert sched.aging_s == 30.0

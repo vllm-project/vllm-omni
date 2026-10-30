@@ -30,7 +30,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
-_DEFAULT_AGING_S = 100.0
+_DEFAULT_AGING_S = 50.0
 _DEFAULT_DIT_LOAD_THRESHOLD = 2
 _DIT_INFLIGHT_MAX_AGE_S = 1.0
 

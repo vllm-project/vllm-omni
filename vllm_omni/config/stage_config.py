@@ -591,8 +591,6 @@ class StageDeployConfig:
     # AR-stage DiT-load-aware scheduling (DTPS): when True, the AR scheduler
     # reorders its waiting queue by task type + downstream DiT load.
     dit_load_aware: bool | None = None
-    dit_load_threshold: int | None = None
-    aging_s: float | None = None
     # Hybrid-mamba stages (e.g. the NemotronVoiceChat thinker's NemotronH
     # backbone) pin the SSM state dtype; projected onto vLLM CacheConfig.
     mamba_ssm_cache_dtype: str | None = None
