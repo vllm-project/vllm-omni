@@ -11,7 +11,11 @@ import torch
 
 from vllm_omni.diffusion.attention import layer as layer_mod
 from vllm_omni.diffusion.attention.backends import flash_attn, rainfusion_attn
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    PackedPaddingMetadata,
+    VideoTokenLayout,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 _DEFAULT_SKIP_STEPS = frozenset({0, 1, 38, 39})
@@ -111,6 +115,128 @@ def test_packed_metadata_never_reaches_quant_runtime(runtime):
     with pytest.raises(ValueError, match="packed/varlen"):
         flash().forward_npu(q, q, q, metadata)
     runtime.quant_attention.assert_not_called()
+
+
+def packed_padding(q_length, kv_length, *, total_q=128, total_kv=128):
+    return PackedPaddingMetadata(
+        q_length=q_length,
+        kv_length=kv_length,
+        cu_seqlens_q=torch.tensor([0, total_q], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, total_kv], dtype=torch.int32),
+    )
+
+
+def packed_metadata(method, q_length, kv_length, **extra):
+    return AttentionMetadata(
+        packed_padding=packed_padding(q_length, kv_length),
+        extra={
+            "kv_cache_dtype": method,
+            "cu_seqlens_q": torch.tensor([0, 96, 128], dtype=torch.int32),
+            "cu_seqlens_k": torch.tensor([0, 96, 128], dtype=torch.int32),
+            "max_seqlen_q": 96,
+            "max_seqlen_k": 96,
+            "npu_attn_varlen": True,
+            **extra,
+        },
+    )
+
+
+@pytest.mark.parametrize("method", ["fp8", "mxfp8"])
+def test_packed_quant_trims_kv_to_valid_prefix(runtime, method):
+    q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
+    k = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
+    v = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
+    assert flash().forward_npu(q, k, v, packed_metadata(method, 128, 104)) is q
+    args, kwargs = runtime.quant_attention.call_args
+    # Padding rows of Q are never consumed, so Q keeps the packed length; the
+    # padding document must not reach the softmax, so K/V lose it.
+    assert args[0] is q
+    assert args[1].shape == (1, 104, 2, 64) and args[2].shape == (1, 104, 2, 64)
+    assert args[1].is_contiguous() and args[2].is_contiguous()
+    torch.testing.assert_close(args[1], k[:, :104])
+    torch.testing.assert_close(args[2], v[:, :104])
+    assert kwargs["layout"] == "BSND" and kwargs["precision"] == method
+    assert kwargs["q_rot"] is kwargs["k_rot"]
+
+
+def test_packed_quant_aligned_sequence_is_not_trimmed(runtime):
+    q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
+    assert flash().forward_npu(q, q, q, packed_metadata("fp8", 128, 128)) is q
+    args, _ = runtime.quant_attention.call_args
+    assert args[0] is q and args[1] is q and args[2] is q
+
+
+def test_packed_quant_bnsd_trims_dim2_and_materializes(runtime):
+    q = torch.randn(1, 2, 128, 64, dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 128, 64, dtype=torch.bfloat16)
+    flash(layout="BNSD").forward_npu(q, k, k, packed_metadata("fp8", 128, 96))
+    args, kwargs = runtime.quant_attention.call_args
+    assert args[0] is q
+    assert args[1].shape == (1, 2, 96, 64) and args[2].shape == (1, 2, 96, 64)
+    # A BNSD crop leaves row gaps; the quant preprocess must see contiguous input.
+    assert args[1].is_contiguous() and args[2].is_contiguous()
+    torch.testing.assert_close(args[1], k[:, :, :96])
+    assert kwargs["layout"] == "BNSD"
+
+
+def test_packed_quant_keeps_reference_kv_prefix(runtime):
+    # Compact reference-KV reuse prepends cached rows to K/V: q_length excludes
+    # them while kv_length already covers them, so neither side is trimmed.
+    q = torch.randn(1, 80, 2, 64, dtype=torch.bfloat16)
+    k = torch.randn(1, 96, 2, 64, dtype=torch.bfloat16)
+    metadata = AttentionMetadata(
+        packed_padding=packed_padding(80, 96, total_q=80, total_kv=96),
+        extra={"kv_cache_dtype": "mxfp8", "npu_attn_varlen": True},
+    )
+    flash().forward_npu(q, k, k, metadata)
+    args, _ = runtime.quant_attention.call_args
+    assert args[0] is q and args[1] is k
+
+
+def test_packed_quant_rejects_mxfp4(runtime):
+    q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="mxfp4"):
+        flash().forward_npu(q, q, q, packed_metadata("mxfp4", 128, 96))
+    runtime.quant_attention.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "q_length,kv_length,error",
+    [(128, 200, "kv_length"), (200, 128, "q_length"), (0, 96, "q_length")],
+)
+def test_packed_quant_rejects_lengths_outside_the_packed_sequence(runtime, q_length, kv_length, error):
+    q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
+    metadata = packed_metadata("fp8", 128, 96)
+    metadata.packed_padding = packed_padding(q_length, kv_length)
+    with pytest.raises(ValueError, match=error):
+        flash().forward_npu(q, q, q, metadata)
+    runtime.quant_attention.assert_not_called()
+
+
+@pytest.mark.parametrize("contract", ["mask", "spans"])
+def test_packed_quant_still_rejects_masks_and_piecewise(runtime, contract):
+    q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
+    metadata = packed_metadata("fp8", 128, 96)
+    if contract == "mask":
+        metadata.attn_mask = torch.ones(1, 128, dtype=torch.bool)
+    else:
+        metadata.full_attn_spans = [[(0, 128)]]
+    with pytest.raises(ValueError, match="caller masks" if contract == "mask" else "piecewise"):
+        flash().forward_npu(q, q, q, metadata)
+    runtime.quant_attention.assert_not_called()
+
+
+def test_packed_padding_without_legacy_packed_keys_is_accepted(runtime):
+    # The crop keys on the producer-validated packed_padding view, not on the
+    # legacy cu_seqlens/npu_attn_varlen markers.
+    q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16)
+    metadata = AttentionMetadata(
+        packed_padding=packed_padding(128, 96),
+        extra={"kv_cache_dtype": "fp8"},
+    )
+    flash().forward_npu(q, q, q, metadata)
+    args, _ = runtime.quant_attention.call_args
+    assert args[1].shape == (1, 96, 2, 64)
 
 
 def make_layer(runtime, monkeypatch, method="mxfp8", skip_steps=_DEFAULT_SKIP_STEPS):

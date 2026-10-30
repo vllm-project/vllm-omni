@@ -257,6 +257,24 @@ first, then `start_step`; do not compensate by lowering `sparsity` alone.
 These pairings were validated at 1344x768 / 50 steps only; re-evaluate for
 other resolutions or step counts.
 
+#### Quantized dense attention (packed)
+
+Runtime Q/K/V quantization for the packed dense self-attention path, served by
+MindIE-SD `quant_attention`. K/V are trimmed to the packed valid prefix before
+the runtime call, so no mask is materialized:
+
+```bash
+  --diffusion-kv-cache-dtype fp8 \
+  --diffusion-kv-cache-skip-steps "0,1" \
+  --diffusion-kv-cache-skip-layers "0"
+```
+
+- `fp8` and `mxfp8` are supported on the packed path; `mxfp4` is rejected.
+- `MINDIE_SD_FA_TYPE` is ignored while quantization is active.
+- Incompatible with `ring_degree > 1`.
+- The skip selectors are a starting point, not a benchmarked optimum; compare
+  against the unquantized run before production use.
+
 ## HTTP API examples
 
 The request contract is identical to the GPU recipe; see
@@ -286,7 +304,6 @@ exact power-of-two input pre-scaling (`laser_input_scale=256`) so the
 kernel's fp16 workspace cannot overflow on outlier activations. Measured on
 the FastH3 four-step Dense configuration below, T2VA 15 s at 1344x768, this
 kernel reduced end-to-end latency from ~73 s to ~57 s (about 22%).
-
 
 ## FastH3 four-step on A3
 
@@ -459,8 +476,8 @@ These describe the validated shapes rather than a general throughput guarantee.
 > through the offload backend's per-tensor transform hook, but is left as future
 > work pending upstream design discussion.
 
+## Switching tasks in requests
 
-## HTTP API examples
 Switch tasks via `extra_params.task` (`t2va` / `fl2va` / `ref2va`); FL2VA and
 Ref2VA additionally pass `input_references` (first-frame image, reference
 video/audio). The full parameter table lives in the GPU recipe.

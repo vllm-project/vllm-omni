@@ -161,6 +161,21 @@ Append to switch the DiT to MXFP4 online quantization:
 
 and remove `--enable-distributed-layerwise-offload`.
 
+#### Quantized dense attention (packed)
+
+Runtime Q/K/V quantization for the packed dense self-attention path, served by
+MindIE-SD `quant_attention` (K/V trimmed to the packed valid prefix):
+
+```bash
+  --diffusion-kv-cache-dtype fp8 \
+  --diffusion-kv-cache-skip-steps "0,1" \
+  --diffusion-kv-cache-skip-layers "0"
+```
+
+`fp8` and `mxfp8` are supported on the packed path; `mxfp4` is rejected, and
+`MINDIE_SD_FA_TYPE` is ignored while quantization is active. Compare against the
+unquantized run before production use.
+
 ## Request examples
 
 Identical to the eight-card recipe; see

@@ -5,7 +5,7 @@ import json
 import sys
 from contextlib import contextmanager, nullcontext
 from multiprocessing.reduction import ForkingPickler
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, TypeVar
 from unittest.mock import Mock, create_autospec, patch
 
@@ -1561,6 +1561,7 @@ def _fake_packed_attention(
     *,
     prefix_kv_slicing: bool = False,
     supports_multi_doc: bool = False,
+    mask_free: bool = False,
 ):
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3Attention,
@@ -1579,7 +1580,7 @@ def _fake_packed_attention(
 
         @classmethod
         def supports_packed_mask_free(cls) -> bool:
-            return False
+            return mask_free
 
     class FakeAttention(torch.nn.Module):
         attn_backend = FakeBackend
@@ -1596,6 +1597,52 @@ def _fake_packed_attention(
     torch.nn.Module.__init__(attention)
     attention.attention = FakeAttention()
     return attention
+
+
+def test_packed_quantized_attention_trims_kv_to_the_published_prefix(monkeypatch):
+    """H3's packed mask-free metadata must reach the MT-SD quant runtime.
+
+    The model publishes packed_padding (q_length=used, kv_length=used) and
+    keeps Q at the packed length; only the padding document is removed from
+    K/V, which is what makes a packed request eligible for quantized FA.
+    """
+    from vllm_omni.diffusion.attention.backends import flash_attn
+
+    runtime = ModuleType("mindiesd")
+    quant_attention = Mock(side_effect=lambda q, k, v, **kwargs: q)
+    setattr(runtime, "quant_attention", quant_attention)
+    monkeypatch.setitem(sys.modules, "mindiesd", runtime)
+
+    attention = _fake_packed_attention("FLASH_ATTN", mask_free=True)
+    q = torch.randn(8, 2, 4)
+    k = torch.randn(8, 2, 4)
+    attention._run_packed_attention(
+        q,
+        k,
+        k,
+        cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+        max_seqlen=5,
+        packed_total=8,
+    )
+    metadata = attention.attention.metadata
+    assert metadata.packed_padding.q_length == 5
+    assert metadata.packed_padding.kv_length == 5
+
+    metadata.extra["kv_cache_dtype"] = "fp8"
+    impl = flash_attn.FlashAttentionImpl(
+        num_heads=2,
+        head_size=4,
+        softmax_scale=0.5,
+        qkv_layout="BSND",
+    )
+    out = impl.forward_npu(q.unsqueeze(0), k.unsqueeze(0), k.unsqueeze(0), metadata)
+
+    args, kwargs = quant_attention.call_args
+    assert args[0].shape == (1, 8, 2, 4), "padding Q rows are never consumed downstream"
+    assert args[1].shape == (1, 5, 2, 4) and args[2].shape == (1, 5, 2, 4)
+    torch.testing.assert_close(args[1], k[:5].unsqueeze(0))
+    assert out.shape == (1, 8, 2, 4)
+    assert kwargs["layout"] == "BSND" and kwargs["precision"] == "fp8"
 
 
 def test_packed_attention_drops_prefix_semantics_for_a_co_batched_layout():

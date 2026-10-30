@@ -199,7 +199,7 @@ Backend support for `fp8`:
 | Backend | Platform | Notes |
 | --- | --- | --- |
 | `FLASH_ATTN` | CUDA (SM90 Hopper) | FA3 FP8 |
-| `FLASH_ATTN` | Ascend NPU | MindIE-SD `quant_attention` with Hadamard Q/K rotation; also `mxfp8`, `mxfp4` |
+| `FLASH_ATTN` | Ascend NPU | MindIE-SD `quant_attention` with Hadamard Q/K rotation; also `mxfp8`, `mxfp4`. Packed `[real, pad]` sequences (which publish `packed_padding`) trim K/V to the valid prefix and support `fp8`/`mxfp8` only |
 | `RAINFUSION_ATTN` | Ascend NPU | Block-sparse fp8/mxfp4 |
 
 Backends not listed here reject the knob at startup with the list of compatible
@@ -207,8 +207,11 @@ options. Quantization is lossy; validate image/video quality against the
 unquantized baseline before enabling it in production.
 
 CUDA FP8 attention returns the input dtype (BF16 or FP16), casting FA3's BF16
-output when needed. This path currently accepts dense inputs without caller
+output when needed. The CUDA path currently accepts dense inputs without caller
 masks, packed-sequence metadata, or piecewise spans; incompatible requests fail explicitly.
+On Ascend NPU, packed sequences are accepted when the producer publishes
+`packed_padding` — K/V are trimmed to the valid prefix, which is equivalent to
+masking the padding document out.
 FP8 attention requires FA3 on SM90 and a head dimension divisible by 16 and at
 most 256; unsupported FA implementations are rejected.
 

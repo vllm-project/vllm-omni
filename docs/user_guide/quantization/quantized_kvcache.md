@@ -31,7 +31,12 @@ The platform implementations use different quantization runtimes:
   to FA3, broadcasting each scalar to `(batch_size, num_kv_heads)`.
 - Ascend NPU passes the BF16/FP16 Q/K/V and `precision=fp8`, `mxfp8`, or
   `mxfp4` to MindIE-SD `quant_attention`, which performs the vendor-side
-  quantization and attention within that runtime call.
+  quantization and attention within that runtime call. For a model that packs
+  its sequence as `[real, pad]` and publishes the valid prefix in
+  `AttentionMetadata.packed_padding`, the NPU backend trims K/V to that prefix
+  before the runtime call, so the padding document never enters the softmax;
+  Q keeps its packed length because the model selects valid rows downstream.
+  Packed attention supports `fp8` and `mxfp8` only.
 
 Persistent KV storage quantization is a separate cache lifecycle and is not
 part of this option.
@@ -39,7 +44,8 @@ part of this option.
 CUDA FP8 attention returns the input dtype (BF16 or FP16), casting FA3's BF16
 output back to FP16 when needed by the model's output projection. The current
 CUDA path requires dense inputs without caller masks, packed-sequence
-metadata, or piecewise spans. Dynamic quantization adds reductions,
+metadata, or piecewise spans; the NPU packed path above is the Ascend
+equivalent. Dynamic quantization adds reductions,
 conversions, and kernel launches, so enabling it can increase latency,
 especially for short sequences. Faster generation or lower peak memory use
 is not guaranteed.
@@ -69,6 +75,7 @@ an incompatible explicit configuration.
 | --- | --- | --- | --- |
 | Wan2.2 | Self-attention on Ascend NPU | NPU interface and T2V smoke tested | Compare quality and latency against a BF16 baseline before production use |
 | Wan2.2 | Self-attention on CUDA SM90 | Full-video E2E exercised | Experimental: quality differences and latency overhead observed |
+| MiniMax-H3 | Packed self-attention on Ascend NPU | Interface covered by CPU dispatch-contract tests only | `fp8` and `mxfp8` on the packed mask-free path; quality and latency must be measured on device |
 | Other diffusion models | Eligible DiT full-attention FA on Ascend NPU or CUDA SM90 | Not tested | Validate `diffusion_kv_cache_dtype="fp8"` and the skip-step/layer settings for each model |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
@@ -129,7 +136,7 @@ The legacy keyword aliases `kv_cache_dtype`, `kv_cache_skip_steps`, and
 
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
-| `diffusion_kv_cache_dtype` | str \| None | `None` | Dense diffusion attention compute precision selector (historical `kv_cache` name; it does not select persistent cache storage). CUDA SM90 dense FA supports `fp8`; NPU dense FA supports `fp8`, `mxfp8`, and `mxfp4`; NPU BSA supports `fp8` and `mxfp4` |
+| `diffusion_kv_cache_dtype` | str \| None | `None` | Dense diffusion attention compute precision selector (historical `kv_cache` name; it does not select persistent cache storage). CUDA SM90 dense FA supports `fp8`; NPU dense FA supports `fp8`, `mxfp8`, and `mxfp4`; NPU packed dense FA supports `fp8` and `mxfp8`; NPU BSA supports `fp8` and `mxfp4` |
 | `diffusion_kv_cache_skip_steps` | str \| None | `None` | Denoising step selector to keep in native dtype, for example `"0,1,4-6"` |
 | `diffusion_kv_cache_skip_layers` | str \| None | `None` | Transformer layer selector to keep in native dtype, for example `"0-2,10"` |
 
@@ -205,3 +212,45 @@ python -m pytest tests/platforms/npu/quant/test_kv_quant_npu.py \
 
 A skipped NPU test is not a pass. Validate generated video quality against a
 floating-point run with the same prompt, seed, resolution, and step count.
+
+## MiniMax-H3 packed attention on Ascend
+
+MiniMax-H3 runs self-attention over one packed `[real, pad]` sequence and
+publishes the valid prefix in `AttentionMetadata.packed_padding`. The NPU
+Flash Attention backend consumes that view: Q keeps the packed length, K/V are
+trimmed to `kv_length`, and the resulting dense 4D call goes to MindIE-SD
+`quant_attention`. Trimming is equivalent to masking, because the padding
+document is a strict suffix, so no mask is materialized and no automatic
+precision fallback is attempted.
+
+| Attention path | `backend` | Supported `diffusion_kv_cache_dtype` |
+| --- | --- | --- |
+| Packed dense FA | `FLASH_ATTN` | `fp8`, `mxfp8` |
+
+Sparse backends (`RAINFUSION_ATTN`, `FASTVIDEO_VSA`) keep their own precision
+rules; this section covers the packed dense path only.
+
+```bash
+vllm-omni serve <minimax-h3-model> --omni \
+    --diffusion-kv-cache-dtype fp8 \
+    --diffusion-kv-cache-skip-steps "0,1" \
+    --diffusion-kv-cache-skip-layers "0"
+```
+
+Notes:
+
+- `mxfp4` is rejected on the packed path: that runtime re-pads K/V to a
+  multiple of 512 rows and lets the padded rows participate in the softmax,
+  which does not preserve the packed contract.
+- `MINDIE_SD_FA_TYPE=ascend_laser_attention` is consulted only by the
+  floating-point `attention_forward` path; `quant_attention` ignores it while
+  quantization is active.
+- KV quantization is rejected at startup when `ring_degree > 1`. Ulysses and
+  AllGather-KV sequence parallelism are supported: they hand the backend the
+  full global sequence (Ulysses) or a local Q shard with globally gathered K/V
+  (AllGather-KV), and `packed_padding` already carries the matching lengths.
+- This integration is covered by CPU dispatch-contract tests
+  (`tests/diffusion/attention/test_mindie_runtime.py`,
+  `tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py`). On-device
+  quality and latency are not measured in this change; benchmark them against a
+  floating-point run with the same prompt, seed, resolution, and step count.

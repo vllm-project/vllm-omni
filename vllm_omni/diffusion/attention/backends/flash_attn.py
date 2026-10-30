@@ -11,7 +11,12 @@ import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    PackedPaddingMetadata,
+)
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
@@ -84,6 +89,48 @@ _fa4_dense_attention_op = torch.ops.vllm_omni.fa4_dense_attention
 
 
 _PACKED_KEYS = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
+
+# Sequence axis per Q/K/V layout: (B, S, N, D) vs (B, N, S, D).
+_LAYOUT_SEQ_DIM = {"BSND": 1, "BNSD": 2}
+
+
+def _packed_quant_kv_length(
+    method: str,
+    layout: str,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    packed: PackedPaddingMetadata,
+) -> tuple[str | None, int | None]:
+    """Resolve the K/V prefix a packed quantized request may attend.
+
+    Returns ``(reason, None)`` when the request cannot run, else
+    ``(None, kv_length)`` where ``kv_length`` is ``None`` when no trim is
+    needed. Query keeps its full length, matching the float prefix-KV-slice
+    path: rows past the packed q_length are padding, and the model selects
+    valid rows downstream, so their outputs are never consumed.
+    """
+    seq_dim = _LAYOUT_SEQ_DIM.get(layout)
+    if seq_dim is None:
+        return f"packed attention needs a BSND or BNSD qkv layout, got {layout!r}", None
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        return "packed quantized FA requires four-dimensional Q/K/V", None
+    head_dim = query.shape[-1]
+    if head_dim <= 0 or head_dim & (head_dim - 1):
+        return "generated Hadamard rotations require a power-of-two head size", None
+    kv_seq = key.shape[seq_dim]
+    if value.shape[seq_dim] != kv_seq:
+        return "packed quantized FA requires matching K/V sequence lengths", None
+    if method == "mxfp4":
+        return (
+            "packed attention is not supported with mxfp4; its 512-row sequence "
+            "re-padding does not preserve the packed contract"
+        ), None
+    if not 0 < packed.q_length <= query.shape[seq_dim]:
+        return f"packed q_length={packed.q_length} does not fit query sequence length {query.shape[seq_dim]}", None
+    if not 0 < packed.kv_length <= kv_seq:
+        return f"packed kv_length={packed.kv_length} does not fit K/V sequence length {kv_seq}", None
+    return None, (None if packed.kv_length == kv_seq else packed.kv_length)
 
 
 class _FlashAttentionMetadataPlan(NamedTuple):
@@ -1066,19 +1113,34 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     def _validate_quant_request(
         self,
         method: str,
+        layout: str,
         query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
-    ) -> None:
+    ) -> int | None:
+        """Validate a quantized request; return the packed K/V prefix to keep."""
         extra = attn_metadata.extra if attn_metadata else {}
+        packed = attn_metadata.packed_padding if attn_metadata is not None else None
+        packed_extra = any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k")) or bool(
+            extra.get("npu_attn_varlen")
+        )
         reason = None
+        kv_length = None
         if self.causal:
             reason = "causal quantized FA is not supported"
-        elif any(name in extra for name in ("cu_seqlens_q", "cu_seqlens_k")) or extra.get("npu_attn_varlen"):
+        elif packed_extra and packed is None:
+            # Packed markers without the producer-validated crop view: the
+            # padding document cannot be excluded from the softmax.
             reason = "packed/varlen metadata requires the float attention path"
         elif attn_metadata is not None and attn_metadata.full_attn_spans is not None:
             reason = "piecewise attention requires the float attention path"
         elif attn_metadata is not None and attn_metadata.attn_mask is not None:
             reason = "caller masks require the float attention path"
+        elif packed is not None:
+            # The producer publishes the exact valid prefix, so a packed
+            # request can run quantized after trimming K/V to kv_length.
+            reason, kv_length = _packed_quant_kv_length(method, layout, query, key, value, packed)
         elif method in ("fp8", "mxfp8", "mxfp4") and (
             query.ndim != 4 or query.shape[-1] <= 0 or query.shape[-1] & (query.shape[-1] - 1)
         ):
@@ -1089,6 +1151,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "Set diffusion_kv_cache_dtype to a supported method, or set it to "
                 "'auto'. Automatic precision fallback is not performed."
             )
+        return kv_length
 
     def forward_fa_quant_npu(
         self,
@@ -1100,7 +1163,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         extra = attn_metadata.extra if attn_metadata else {}
         method = extra.get("kv_cache_dtype", "fp8")
         layout = self.qkv_layout or "BSND"
-        self._validate_quant_request(method, query, attn_metadata)
+        kv_length = self._validate_quant_request(method, layout, query, key, value, attn_metadata)
         try:
             runtime = self._load_quant_runtime(method)
         except ImportError as exc:
@@ -1118,6 +1181,24 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             rotation = get_quant_attention_rotation(query.device, query.dtype, query.shape[-1])
             kwargs.update(q_rot=rotation, k_rot=rotation)
         logger.info_once("NPU attention uses MindIE-SD %s Runtime, layout=%s.", method, layout)
+        if kv_length is not None:
+            # Mask-free packed attention: the padding document is a strict
+            # suffix, so attending only the valid K/V prefix is identical to
+            # masking it out.
+            index = [slice(None)] * query.ndim
+            index[_LAYOUT_SEQ_DIM[layout]] = slice(0, kv_length)
+            key, value = key[tuple(index)], value[tuple(index)]
+            # A BSND crop keeps the size-1 batch axis contiguous; a BNSD crop
+            # leaves row gaps, which the quant preprocess must not see.
+            if not key.is_contiguous():
+                key = key.contiguous()
+            if not value.is_contiguous():
+                value = value.contiguous()
+            logger.info_once(
+                "NPU attention trims packed K/V to the valid prefix, kv_length=%d, layout=%s.",
+                kv_length,
+                layout,
+            )
         # Execution errors propagate. Never retry with another precision.
         return runtime(query, key, value, **kwargs)
 
@@ -1313,6 +1394,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """
         self._warn_fa_deterministic_non_dense("piecewise-npu")
         logger.debug("Using piecewise NPU attention for mixed causal/full mask")
+        assert attn_metadata.full_attn_spans is not None  # Checked by the caller.
         return piecewise_attn(
             query,
             key,
