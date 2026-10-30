@@ -21,7 +21,8 @@ from vllm_omni.diffusion.attention.backends.fastvideo_vsa import FastVideoVSABac
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNAttentionBackend
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, resolve_request_attention_schedule
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig
 from vllm_omni.diffusion.forward_context import (
     bind_attention_schedule,
     get_attention_schedule_profile,
@@ -925,6 +926,33 @@ def test_scheduled_step_batch_at_one_progress_is_packed():
             InputBatch.make_batch(states), states=states
         )
     torch.testing.assert_close(serial_velocity, packed_velocity)
+
+
+def test_inherited_and_explicit_equal_schedules_resolve_to_one_hashable_value_and_pack():
+    """The runner stores each request's schedule resolved against the service config.
+
+    An omitted schedule and the same ranges sent explicitly resolve to equal tuples of frozen
+    ranges, so the pipeline gate sees one schedule and packs them. The scheduler keeps these two
+    requests in different batches (the key also records whether the request sent a schedule), so
+    this exercises the pipeline gate directly.
+    """
+    service = AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig()}, default=[{"start": 0, "end": None, "profile": "sparse"}]
+    )
+    inherited = resolve_request_attention_schedule(OmniDiffusionSamplingParams(), service)
+    explicit = resolve_request_attention_schedule(
+        OmniDiffusionSamplingParams(attention_schedule=[{"start": 0, "end": None, "profile": "sparse"}]), service
+    )
+    assert inherited == explicit == _sparse_schedule()
+    assert type(inherited) is tuple and hash(inherited) == hash(explicit)
+
+    model = _ProgressRecordingModel()
+    states = _same_progress_states(model, [inherited, explicit])
+    with set_forward_context(), bind_attention_schedule(inherited):
+        _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
+
+    sigmas = states[0].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    assert model.progress == [(1, float(sigmas[1]), 4, "sparse", 2)]
 
 
 @pytest.mark.parametrize(
