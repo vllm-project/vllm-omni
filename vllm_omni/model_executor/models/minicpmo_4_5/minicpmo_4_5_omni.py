@@ -628,7 +628,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
     @property
     def preprocess_batch_fills_rows(self) -> bool:
-        return self.model_stage == "tts"
+        return self.model_stage == "tts" and self.talker.emb_code[0].weight.device.type == "cuda"
 
     def _preprocess_talker_decode_rows(
         self,

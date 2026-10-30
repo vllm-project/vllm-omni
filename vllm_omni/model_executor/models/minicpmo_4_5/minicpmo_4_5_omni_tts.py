@@ -2561,7 +2561,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 quiet_stop_frames=_TURN_END_QUIET_STOP_FRAMES,
             )
             batch_codec_output = (
-                len(gpu_rows) == len(infos)
+                device.type == "cuda"
+                and len(gpu_rows) == len(infos)
                 and all(code is not None for _, _, code in gpu_rows)
                 and len(spans) == len(infos)
                 and all(end - start == 1 for start, end in spans)

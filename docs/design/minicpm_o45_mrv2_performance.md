@@ -274,7 +274,7 @@ overlay to disable that part.
 
 ## V1 Talker decode bookkeeping
 
-The V1 Talker uses the existing batch-preprocess row-fill hook for batches
+The CUDA V1 Talker uses the existing batch-preprocess row-fill hook for batches
 containing only one-token decode requests with initialized audio state. It
 checks the current request order, token offsets and prompt boundaries on every
 step; it does not cache metadata by batch size. New admissions, preemption
@@ -282,7 +282,7 @@ resumes, mixed prefill/decode and K-step execution keep the generic path.
 The hook preserves condition metadata and updates only the live decode fields
 and the empty codec delta; the Talker still owns the sampled-id snapshot.
 
-For a full device-decode batch, codec ids, validity and completion flags stay
+For a full CUDA decode batch, codec ids, validity and completion flags stay
 batched until the runner's owned output snapshot has been copied. The output
 finalizer then restores per-request tensors and scalar completion flags.
 Mixed batches retain row-wise output. CPU placeholders are allocated only for
