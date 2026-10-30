@@ -56,12 +56,21 @@ def test_invalid_window_bounds(low, high):
 
 @pytest.mark.parametrize("real", [np.float32, np.float64])
 def test_numpy_window_bounds_are_accepted_as_floats(real):
-    """Offline callers may pass numpy scalars; they are stored as float, so batch keys match parsed JSON."""
+    """Offline callers may pass numpy scalars; they are stored as float, matching parsed JSON when exact."""
     (window,) = parse_attention_sigma_schedule([{"low": real(0.25), "high": real(1.0), "profile": "p"}])
     assert type(window.low) is float and type(window.high) is float
     assert (window.low, window.high) == (0.25, 1.0)
     assert window == parse_attention_sigma_schedule([{"low": 0.25, "high": 1.0, "profile": "p"}])[0]
     assert select_attention_profile_by_sigma((window,), 1.0) == "p"
+
+    # 0.1 is not exact in float32, so that window keeps the float32 value and differs from JSON 0.1.
+    (inexact,) = parse_attention_sigma_schedule([{"low": real(0.1), "high": 1.0, "profile": "p"}])
+    assert type(inexact.low) is float
+    if real is np.float32:
+        assert inexact.low == 0.10000000149011612
+        assert inexact != parse_attention_sigma_schedule([{"low": 0.1, "high": 1.0, "profile": "p"}])[0]
+    else:
+        assert inexact == parse_attention_sigma_schedule([{"low": 0.1, "high": 1.0, "profile": "p"}])[0]
 
 
 @pytest.mark.parametrize("low", [np.float32("nan"), np.float64(-0.5), np.bool_(False)])
