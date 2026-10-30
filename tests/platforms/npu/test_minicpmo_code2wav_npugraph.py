@@ -340,6 +340,82 @@ def test_hift_npugraph_matches_eager_with_source_cache():
         torch.testing.assert_close(actual[1], legacy[1], rtol=0, atol=0)
 
 
+@torch.inference_mode()
+def test_hift_npugraph_replay_from_parts_matches_concatenated_replay():
+    from tests.model_executor.models.minicpmo_4_5.test_cuda_graph_wrapper import (
+        _DeterministicSineGen,
+        _F0Predictor,
+    )
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import HiFTGenerator
+    from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import HiFTGraphWrapper
+
+    prepare_code2wav_graph_runtime()
+    hift = (
+        HiFTGenerator(
+            base_channels=32,
+            sampling_rate=24000,
+            upsample_rates=[8, 5, 3],
+            upsample_kernel_sizes=[16, 11, 7],
+            source_resblock_kernel_sizes=[7, 7, 11],
+            source_resblock_dilation_sizes=[[1, 3, 5]] * 3,
+            f0_predictor=_F0Predictor(),
+        )
+        .npu()
+        .eval()
+    )
+    hift.m_source.l_sin_gen = _DeterministicSineGen(hift.nb_harmonics + 1)
+    token2wav = SimpleNamespace(
+        hift=hift,
+        flow=SimpleNamespace(encoder=nn.Identity(), token_mel_ratio=2),
+        mel_cache_len=2,
+        source_cache_len=960,
+    )
+    wrapper = HiFTGraphWrapper(token2wav, {"codec_chunk_frames": 2, "codec_left_context_frames": 3}, [1, 2])
+    wrapper.capture()
+
+    # Continuation shape (mel cache + chunk, source cache present): the
+    # segmented writes into the static input must equal the regular replay
+    # of the materialized concatenation.
+    old_mel = torch.randn(2, 80, 2, device="npu")
+    chunk_mel = torch.randn(2, 80, 4, device="npu")
+    cache_source = torch.randn(2, 1, 960, device="npu")
+    expected = wrapper.replay(torch.cat((old_mel, chunk_mel), dim=2), cache_source)
+    actual = wrapper.replay_from_parts(old_mel, chunk_mel, cache_source)
+    assert actual is not None
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference, rtol=1e-4, atol=1e-5)
+
+    # The decode path blends overlap in place, so replay outputs must be
+    # owned storage: zeroing them may not poison the next replay, and the
+    # source output must not alias the captured static buffer.
+    key = (2, 6, 960)
+    assert actual[1].data_ptr() != wrapper.static_cache_source_outputs[key].data_ptr()
+    actual[0].fill_(0.0)
+    replayed = wrapper.replay_from_parts(old_mel, chunk_mel, cache_source)
+    for value, reference in zip(replayed, expected, strict=True):
+        torch.testing.assert_close(value, reference, rtol=1e-4, atol=1e-5)
+
+    # A first chunk (no mel/source cache) also takes the segmented path.
+    first_mel = torch.randn(1, 80, 4, device="npu")
+    empty_old = torch.zeros(1, 80, 0, device="npu")
+    empty_cache = torch.zeros(1, 1, 0, device="npu")
+    expected_first = wrapper.replay(first_mel, empty_cache)
+    actual_first = wrapper.replay_from_parts(empty_old, first_mel, empty_cache)
+    assert actual_first is not None
+    for value, reference in zip(actual_first, expected_first, strict=True):
+        torch.testing.assert_close(value, reference, rtol=1e-4, atol=1e-5)
+
+    # An uncaptured batch is a clean miss: no capture, no partial static writes.
+    assert (
+        wrapper.replay_from_parts(
+            torch.randn(3, 80, 2, device="npu"),
+            torch.randn(3, 80, 4, device="npu"),
+            torch.randn(3, 1, 960, device="npu"),
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 @torch.inference_mode()
 def test_hift_stft_preserves_fft_precision_inside_autocast(dtype):

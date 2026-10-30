@@ -1294,9 +1294,21 @@ def test_fade_in_out_limits_overlap_to_available_previous_audio():
 
     actual = BatchedToken2Wav._fade_in_out(speech, previous, window)
 
-    expected = speech.clone()
-    expected[..., :3] = speech[..., :3] * window[:3] + previous * window[-3:]
+    expected = torch.arange(6, dtype=torch.float32).reshape(1, -1)
+    expected[..., :3] = expected[..., :3] * window[:3] + previous * window[-3:]
     torch.testing.assert_close(actual, expected)
+    assert actual.data_ptr() == speech.data_ptr()
+
+
+def test_fade_in_out_without_previous_audio_preserves_input_storage():
+    speech = torch.arange(6, dtype=torch.float32).reshape(1, -1)
+    previous = torch.empty((1, 0), dtype=torch.float32)
+    window = torch.hamming_window(8, periodic=False)
+
+    actual = BatchedToken2Wav._fade_in_out(speech, previous, window)
+
+    torch.testing.assert_close(actual, speech)
+    assert actual.data_ptr() == speech.data_ptr()
 
 
 def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():

@@ -649,6 +649,31 @@ class BatchedToken2Wav(nn.Module):
             return self.hift.inference(mel, source_cache)
         return self.hift_graph_wrapper.replay(mel, source_cache)
 
+    @staticmethod
+    def _hift_cache_batch(states: list[BatchedToken2WavState], name: str) -> torch.Tensor:
+        if len(states) == 1:
+            return states[0].hift_cache[name]
+        return torch.cat([state.hift_cache[name] for state in states], dim=0)
+
+    def _hift_from_parts(
+        self, old_mel: torch.Tensor, chunk_mel: torch.Tensor, source_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        outputs = None
+        if self.hift_graph_wrapper is not None:
+            outputs = self.hift_graph_wrapper.replay_from_parts(old_mel, chunk_mel, source_cache)
+        if outputs is None:
+            mel = torch.cat((old_mel, chunk_mel), dim=2)
+            speech, source = self._hift_inference(mel, source_cache)
+            return speech, source, mel[..., -self.mel_cache_len :].detach()
+        speech, source = outputs
+        total_frames = int(old_mel.shape[2] + chunk_mel.shape[2])
+        keep = min(self.mel_cache_len, total_frames) if self.mel_cache_len else total_frames
+        if keep <= chunk_mel.shape[2]:
+            next_mel = chunk_mel[..., chunk_mel.shape[2] - keep :]
+        else:
+            next_mel = torch.cat((old_mel[..., -(keep - chunk_mel.shape[2]) :], chunk_mel), dim=2)
+        return speech, source, next_mel.detach()
+
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
         cached = self._prompt_features.get(cache_key)
@@ -1905,17 +1930,17 @@ class BatchedToken2Wav(nn.Module):
         previous: torch.Tensor,
         window: torch.Tensor,
     ) -> torch.Tensor:
+        """Blend the overlap into ``speech`` in place and return its storage."""
         overlap = min(
             int(window.shape[0] // 2),
             int(speech.shape[-1]),
             int(previous.shape[-1]),
         )
-        result = speech.clone()
         if overlap > 0:
-            result[..., :overlap] = (
-                result[..., :overlap] * window[:overlap] + previous[..., -overlap:] * window[-overlap:]
+            speech[..., :overlap] = (
+                speech[..., :overlap] * window[:overlap] + previous[..., -overlap:] * window[-overlap:]
             )
-        return result
+        return speech
 
     def decode_batch(
         self,
@@ -2065,20 +2090,19 @@ class BatchedToken2Wav(nn.Module):
         for cache, row_prompt_len in zip(new_flow, prompt_lengths, strict=True):
             for name in ("conformer_att_cache", "estimator_att_cache"):
                 cache[name] = _trim_streaming_cache(cache[name], row_prompt_len)
-        old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
-        old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
-        old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
-        mel = torch.cat((old_mel, chunk_mel), dim=2)
+        old_mel = self._hift_cache_batch(states, "mel")
+        old_source = self._hift_cache_batch(states, "source")
+        old_speech = self._hift_cache_batch(states, "speech")
         self._watchdog.phase(
             "decode/hift",
-            {"batch_size": batch_size, "mel_frames": int(mel.shape[2])},
+            {"batch_size": batch_size, "mel_frames": int(old_mel.shape[2] + chunk_mel.shape[2])},
         )
-        speech, source = self._hift_inference(mel, old_source)
+        speech, source, next_mel = self._hift_from_parts(old_mel, chunk_mel, old_source)
         if old_speech.shape[-1] > 0:
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)
         next_hift = {
-            "mel": mel[..., -self.mel_cache_len :].detach(),
+            "mel": next_mel,
             "source": source[..., -self.source_cache_len :].detach(),
             "speech": speech[..., -self.source_cache_len :].detach(),
         }
@@ -2300,28 +2324,33 @@ class BatchedToken2Wav(nn.Module):
             )
             vocoder_groups.setdefault(key, []).append(row)
         for (hidden_length, last_chunk, *_), rows in vocoder_groups.items():
-            old_mel = torch.cat([states[row].hift_cache["mel"] for row in rows], dim=0)
-            old_source = torch.cat([states[row].hift_cache["source"] for row in rows], dim=0)
-            old_speech = torch.cat([states[row].hift_cache["speech"] for row in rows], dim=0)
-            group_mel = torch.cat(
-                [chunk_mel[row : row + 1, :, :hidden_length] for row in rows],
-                dim=0,
-            )
-            mel = torch.cat((old_mel, group_mel), dim=2)
+            group_states = [states[row] for row in rows]
+            old_mel = self._hift_cache_batch(group_states, "mel")
+            old_source = self._hift_cache_batch(group_states, "source")
+            old_speech = self._hift_cache_batch(group_states, "speech")
+            if len(rows) == 1:
+                # A single-row group reuses the per-row view instead of
+                # materializing a one-element concatenation.
+                group_mel = chunk_mel[rows[0] : rows[0] + 1, :, :hidden_length]
+            else:
+                group_mel = torch.cat(
+                    [chunk_mel[row : row + 1, :, :hidden_length] for row in rows],
+                    dim=0,
+                )
             self._watchdog.phase(
                 "decode/hift",
                 {
                     "batch_size": len(rows),
-                    "mel_frames": int(mel.shape[2]),
+                    "mel_frames": int(old_mel.shape[2] + group_mel.shape[2]),
                     "ragged_rows": rows,
                 },
             )
-            speech, source = self._hift_inference(mel, old_source)
+            speech, source, next_mel = self._hift_from_parts(old_mel, group_mel, old_source)
             if old_speech.shape[-1] > 0:
                 window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
                 speech = self._fade_in_out(speech, old_speech, window)
             next_hift = {
-                "mel": mel[..., -self.mel_cache_len :].detach(),
+                "mel": next_mel,
                 "source": source[..., -self.source_cache_len :].detach(),
                 "speech": speech[..., -self.source_cache_len :].detach(),
             }
