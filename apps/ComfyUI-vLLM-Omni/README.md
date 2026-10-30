@@ -225,6 +225,26 @@ Record the server commit, model/adapter, input assets, prompt, settings, and out
 alongside the result. Local schema or mocked-server checks do not establish H3
 generation quality or replace this real-model validation.
 
+#### MiniMax H3 Character Replacement
+
+Download [Character Swap V1.5](https://huggingface.co/akatz-ai/MiniMax-H3-Character-Swap-LoRA) on the machine running vLLM-Omni:
+
+```bash
+hf download akatz-ai/MiniMax-H3-Character-Swap-LoRA h3_character_swap_v1.5.safetensors --local-dir /models
+```
+
+In **LoRA(Character Swap)**, set `local_path` to `/models/h3_character_swap_v1.5.safetensors`, enable the adapter and start with `scale=1.0`. Leave `int_id=0` for automatic identification. Start the service with `--lora-backend peft`; for Swap + Turbo composition, use `--max-cpu-loras 3`. The target image supplies appearance, the video supplies motion and scene structure, and the prompt identifies which person to replace. FastH3-Omni + Swap requires a server that supports request-level LoRA for that checkpoint.
+
+Load [MiniMax-H3 Character Replacement](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement.json),
+select your own target image and motion video, and replace both `/models/...`
+adapter paths with server-local files. This template uses reference conditioning,
+not pixel-locked editing, and saves generated audio. Supply the complete reference
+video and target duration. Enable long_video and select continuation for the existing
+latent-tail continuation mode. Adjust continuation_window_frames and
+continuation_overlap_frames to set the window length and overlap. Reference video
+and audio are reused across windows, rather than sliced to each source interval.
+Inspect continuity and source action timing; output may include frame-alignment padding.
+
 ### MiniMax H3 Text to Video
 
 Import [the H3 text-to-video template](example_workflows/MiniMax_H3_Text_to_Video.json)
@@ -344,10 +364,7 @@ A guided request:
 - keeps the usual routing: guides alone are T2VA, with `first_frame` /
   `last_frame` FL2VA, with **Video References** Ref2VA. References keep their
   `<Picture N>` / `<Video N>` / `<Audio N>` numbering;
-- needs base H3 weights: **FastH3 Deployment**, a request **LoRA** with a
-  non-zero scale (including Turbo), and **Latent Mask Editing** are rejected
-  before upload. Other server-side restrictions (cache acceleration, distilled
-  schedules, continuation, `audio_mode=lock_source`) are reported by the server.
+- rejects active request-level LoRA with timeline guides before upload; set its scale to zero or disconnect it. FastH3 Omni may forward guides without an active request-level LoRA. Server-side restrictions remain authoritative.
 
 Use a vLLM-Omni server that includes timeline guides
 ([#8838](https://github.com/vllm-project/vllm-omni/pull/8838)). Older servers
@@ -357,6 +374,8 @@ guide support, so the node cannot detect this for you.
 The served model name must match the H3 model spec (for example, start the
 server with `--served-model-name MiniMaxAI/MiniMax-H3`); otherwise the node
 refuses to send guides, for example to a server named only by its model path.
+
+The [Character Replacement](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement.json) example uses two boundary images at frames 0 and 21, ordinary Generate Video requests, and native crop/concatenation nodes. **Reverse Image Batch** reverses the frame order of any `IMAGE` batch; it has no model, VAE, request, or queue logic. The supplied segment lengths reproduce a 27-second example; another source needs matching contexts, prompts, and cut values. Loader filenames are placeholders. The FastH3 + Swap + guides combination requires the compatible experimental backend described above.
 
 Validate the node and the request contract locally with:
 

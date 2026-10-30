@@ -89,10 +89,11 @@ class StepBatchSamplingParamsKey:
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
 
-    # LoRA identity. Requests with different adapters or scales must run in
-    # separate batches so the worker can activate exactly one adapter per step.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
+    # LoRA identity. Requests with different adapter combinations or scales
+    # must run in separate batches so the worker can activate exactly one
+    # adapter (or one composed multi-LoRA adapter) per step. Normalized via
+    # ``build_lora_batch_key``; None when no LoRA is active.
+    lora_key: tuple[tuple[int, float], ...] | None = None
 
 
 @dataclass(frozen=True, eq=True)
@@ -155,9 +156,8 @@ class RequestBatchSamplingParamsKey:
     # from being admitted to the same request batch.
     condition_key: tuple[Any, ...] | None = None
 
-    # LoRA identity.
-    lora_int_id: int | None = None
-    lora_scale: float = 1.0
+    # LoRA identity. See StepBatchSamplingParamsKey.lora_key.
+    lora_key: tuple[tuple[int, float], ...] | None = None
 
 
 @dataclass
