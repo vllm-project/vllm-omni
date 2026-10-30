@@ -77,6 +77,7 @@ class _FakeParallelConfig:
 @dataclass
 class _FakeVllmConfig:
     parallel_config: _FakeParallelConfig
+    shutdown_timeout: int = 0
 
 
 def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
@@ -95,13 +96,15 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
+@pytest.mark.parametrize("shutdown_timeout", [0, 60])
+async def test_omni_run_server_worker_forwards_client_config(monkeypatch, shutdown_timeout):
     captured: dict[str, object] = {}
+    vllm_config = _FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1))
 
     @asynccontextmanager
     async def fake_build_async_omni(*_args, **kwargs):
         captured.update(kwargs)
-        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        yield _FakeEngineClient(vllm_config=vllm_config)
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
     monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
@@ -115,13 +118,14 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     async def fake_serve_http(app, **_kwargs):
         assert app.state.api_server_count == 2
+        assert vllm_config.shutdown_timeout == shutdown_timeout
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task
 
     monkeypatch.setattr(api_server, "serve_http", fake_serve_http)
 
-    args = _minimal_args(model="dummy")
+    args = _minimal_args(model="dummy", shutdown_timeout=shutdown_timeout)
     config = {"client_count": 2, "client_index": 1, "stage_addresses": {}}
 
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
@@ -382,6 +386,7 @@ class _FakeEngineClient:
         self.input_processor = object()
         self.renderer = object()
         self.errored = False
+        self.is_shutting_down = False
         self.vllm_config = vllm_config
 
     async def get_vllm_config(self):
@@ -744,7 +749,8 @@ async def test_api_server_assembly_exposes_only_supported_tokenization_routes(
 
 
 @pytest.mark.asyncio
-async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch) -> None:
+@pytest.mark.parametrize("shutting_down", [False, True])
+async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch, shutting_down) -> None:
     """Lock outermost timestamp middleware behavior.
 
     Fails if HTTP requests lose ``request_timestamp``, or WebSocket scopes
@@ -757,7 +763,9 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
 
     @asynccontextmanager
     async def fake_build_async_omni(*_args, **_kwargs):
-        yield _FakeEngineClient()
+        engine = _FakeEngineClient()
+        engine.is_shutting_down = shutting_down
+        yield engine
 
     async def fake_omni_init_app_state(engine_client, state, args):
         state.engine_client = engine_client
@@ -784,8 +792,10 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     async def _receive():
         return {"type": "http.disconnect"}
 
-    async def _send(_message):
-        return None
+    messages = []
+
+    async def _send(message):
+        messages.append(message)
 
     called = {"http": False, "websocket": False}
 
@@ -796,11 +806,15 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     await middleware(http_scope, _receive, _send)
     await middleware(ws_scope, _receive, _send)
 
-    assert called["http"] is True
     assert called["websocket"] is True
-    assert "request_timestamp" in http_scope["state"]
-    assert isinstance(http_scope["state"]["request_timestamp"], float)
     assert "request_timestamp" not in ws_scope.get("state", {})
+    if shutting_down:
+        assert called["http"] is False
+        assert messages[0]["status"] == 503
+        assert json.loads(messages[1]["body"])["error"]["type"] == "ServiceUnavailableError"
+    else:
+        assert called["http"] is True
+        assert isinstance(http_scope["state"]["request_timestamp"], float)
 
 
 @pytest.mark.parametrize(

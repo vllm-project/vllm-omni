@@ -503,6 +503,8 @@ async def omni_run_server_worker(
                 shutdown_timeout=getattr(args, "shutdown_timeout", 0),
             )
         else:
+            # The launcher reads this server-wide timeout from the stage-backed config.
+            vllm_config.shutdown_timeout = getattr(args, "shutdown_timeout", 0)
             logger.info(
                 "Starting vLLM API server %d on %s",
                 vllm_config.parallel_config._api_process_rank,
@@ -525,6 +527,19 @@ async def omni_run_server_worker(
 
             async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
                 if scope["type"] == "http":
+                    if getattr(engine_client, "is_shutting_down", False):
+                        response = JSONResponse(
+                            {
+                                "error": {
+                                    "message": "Server is shutting down",
+                                    "type": "ServiceUnavailableError",
+                                    "code": 503,
+                                }
+                            },
+                            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        )
+                        await response(scope, receive, send)
+                        return
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
 

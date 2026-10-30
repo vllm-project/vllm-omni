@@ -472,6 +472,12 @@ def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_ove
         _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
 
 
+@pytest.mark.parametrize("pipeline_key", ["moss_tts_realtime", "hunyuan_image3_dit"])
+def test_from_pipeline_config_accepts_server_shutdown_timeout(pipeline_key):
+    config = _from_pipeline_key(pipeline_key, cli_overrides={"shutdown_timeout": 60})
+    assert config.stage_configs
+
+
 @pytest.mark.parametrize(
     ("engine_extras", "unowned_field"),
     [
