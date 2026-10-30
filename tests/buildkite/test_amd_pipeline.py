@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
@@ -3590,3 +3591,179 @@ def test_tiny_diffusion_base_ready_pins_one_card_nodes() -> None:
         AMD_NIGHTLY_PIPELINE,
     )
     assert all("cards_1" not in marker for marker in _marker_expressions(nightly))
+
+
+_MRV2_DUPLEX_READY_LABEL = "ROCm · MiniCPM-o 4.5 MRv2 Duplex Coverage"
+_MRV2_DUPLEX_READY_MARKER = "advanced_model and omni and rocm and MI325 and cards_1"
+_MRV2_DUPLEX_FILE = "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py"
+_MRV2_DUPLEX_NODES = (
+    f"{_MRV2_DUPLEX_FILE}::test_mrv2_duplex_overlapping_turns[1-mrv2-real-weights]",
+    f"{_MRV2_DUPLEX_FILE}::test_mrv2_duplex_overlapping_turns[2-mrv2-real-weights]",
+    f"{_MRV2_DUPLEX_FILE}::test_mrv2_duplex_overlapping_turns[4-mrv2-real-weights]",
+    (f"{_MRV2_DUPLEX_FILE}::test_mrv2_duplex_new_session_during_long_response[mrv2-real-weights]"),
+    (f"{_MRV2_DUPLEX_FILE}::test_mrv2_duplex_server_answers_image_chat_from_the_image[mrv2-real-weights]"),
+)
+_MRV2_DUPLEX_JUNIT_MESSAGE = "Expected exactly five executed MiniCPM-o MRv2 duplex tests"
+
+
+def _quoted_ready_nodes(command: str) -> tuple[str, ...]:
+    body = command.split(")", 1)[0]
+    return tuple(re.findall(r'"(tests/[^"]+)"', body))
+
+
+def _minijinja_bin() -> str | None:
+    found = shutil.which("minijinja-cli")
+    if found:
+        return found
+    cargo = Path.home() / ".cargo" / "bin" / "minijinja-cli"
+    if cargo.is_file():
+        return str(cargo)
+    return None
+
+
+def _walk_rendered_steps(steps: list[dict]):
+    for step in steps:
+        if step.get("label"):
+            yield step
+        yield from _walk_rendered_steps(step.get("steps", []))
+
+
+def _rendered_ready_step(label: str) -> dict:
+    """Render READY and return the leaf whose label ends with ``label``."""
+    minijinja = _minijinja_bin()
+    if minijinja is None:
+        pytest.skip("minijinja-cli is required to render the AMD READY pipeline")
+    assert minijinja is not None
+    result = subprocess.run(
+        [
+            minijinja,
+            str(AMD_TEMPLATE),
+            str(AMD_READY_PIPELINE),
+            "-D",
+            "branch=feature",
+            "-D",
+            "list_file_diff=.buildkite/amd/test-amd-ready.yml",
+            "-D",
+            "run_all=0",
+            "-D",
+            "nightly=0",
+            "-D",
+            "mirror_hw=amdproduction",
+            "-D",
+            "fail_fast=true",
+            "-D",
+            "vllm_use_precompiled=1",
+            "-D",
+            "vllm_merge_base_commit=HEAD",
+            "-D",
+            "cov_enabled=0",
+            "-D",
+            "vllm_ci_branch=main",
+            "-D",
+            "vllm_aiter_mha_trusted_commit=test",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    rendered = yaml.safe_load(result.stdout)
+    matches = [step for step in _walk_rendered_steps(rendered["steps"]) if step["label"].endswith(label)]
+    assert len(matches) == 1, [step["label"] for step in matches]
+    return matches[0]
+
+
+def test_minicpmo_mrv2_duplex_ready_pins_five_one_card_nodes() -> None:
+    """READY qualifies five one-card MRv2 duplex cases without gating them.
+
+    ``--run-level advanced_model`` keeps real weights. ``core_model`` would
+    rewrite the deploy YAML to dummy ``load_format``.
+    """
+    step = _find_step(_MRV2_DUPLEX_READY_LABEL, AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    node_lists = command.split("nodes=(")[1:]
+    quoted = tuple(_quoted_ready_nodes(part) for part in node_lists)
+    source = Path(_MRV2_DUPLEX_FILE).read_text(encoding="utf-8")
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["depends_on"] == "amd-build"
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 45
+    assert step["artifact_paths"] == ["artifacts/rocm-minicpmo-45-mrv2-duplex/**/*"]
+    assert "VLLM_ROCM_USE_AITER" not in step.get("env", {})
+    assert "timeout --signal=TERM --kill-after=1m 35m" in command
+    assert "timeout 45m" not in command
+    assert command.count(_MRV2_DUPLEX_READY_MARKER) == 2
+    assert _marker_expressions(step) == ["$$marker", _MRV2_DUPLEX_READY_MARKER]
+    assert command.count("--run-level advanced_model") == 2
+    assert "core_model" not in command
+    assert quoted == (_MRV2_DUPLEX_NODES, _MRV2_DUPLEX_NODES)
+    assert len(_MRV2_DUPLEX_NODES) == 5
+    assert _MRV2_DUPLEX_JUNIT_MESSAGE in command
+    assert "--junitxml=" in command
+    assert "pytest.log" not in command
+    assert "pytest-summary.txt" not in command
+    assert "PIPESTATUS" not in command
+    assert "tee " not in command
+    assert "VLLM_ROCM_USE_AITER" not in command
+    assert source.count('res={"cuda": "H100", "rocm": "MI325"}, num_cards=1') == 3
+    assert 'res={"cuda": "H100"}, num_cards=' not in source
+    for function_name in (
+        "def test_mrv2_duplex_overlapping_turns(",
+        "def test_mrv2_duplex_new_session_during_long_response(",
+        "def test_mrv2_duplex_server_answers_image_chat_from_the_image(",
+    ):
+        head, _, _ = source.partition(function_name)
+        assert '"rocm": "MI325"' in head[-300:]
+    ready_text = AMD_READY_PIPELINE.read_text(encoding="utf-8")
+    assert ready_text.count(f'label: "{_MRV2_DUPLEX_READY_LABEL}"') == 1
+    for pipeline_path in (AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert _MRV2_DUPLEX_FILE not in text
+
+
+def test_minicpmo_mrv2_duplex_ready_renders_nonblocking() -> None:
+    """NonBlocking renders soft_fail true on queue amd_mi300_1."""
+    rendered = _rendered_ready_step(_MRV2_DUPLEX_READY_LABEL)
+    assert rendered["agents"]["queue"] == "amd_mi300_1"
+    assert rendered["depends_on"] == "amd-build"
+    assert rendered["soft_fail"] is True
+    assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
+    assert rendered["timeout_in_minutes"] == 45
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 5, 0, None, 0),
+        (0, 5, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 5, 0, None, 1),
+        (0, 5, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_minicpmo_mrv2_duplex_ready_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    """The MRv2 duplex job fails closed unless exactly five cases execute."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label=_MRV2_DUPLEX_READY_LABEL,
+        command_fragment='pytest -s -v "$${nodes[@]}"',
+        expected_message=_MRV2_DUPLEX_JUNIT_MESSAGE,
+        artifact_env="ROCM_MINICPMO_MRV2_DUPLEX_ARTIFACT_DIR",
+        job_id_prefix="minicpmo-mrv2-duplex-ready-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )

@@ -1072,6 +1072,68 @@ steps:
           fi
           (exit "$$status")
 
+    - label: "ROCm · MiniCPM-o 4.5 MRv2 Duplex Coverage"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 45
+      artifact_paths:
+        - artifacts/rocm-minicpmo-45-mrv2-duplex/**/*
+      commands:
+        - export ROCM_MINICPMO_MRV2_DUPLEX_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-45-mrv2-duplex"
+        - mkdir -p "$$ROCM_MINICPMO_MRV2_DUPLEX_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[1-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[2-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[4-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_new_session_during_long_response[mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_server_answers_image_chat_from_the_image[mrv2-real-weights]"
+          )
+          marker="advanced_model and omni and rocm and MI325 and cards_1"
+          pytest --collect-only -q "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "$$marker" --run-level advanced_model \
+            > "$$ROCM_MINICPMO_MRV2_DUPLEX_ARTIFACT_DIR/collection.txt"
+          count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+            "$$ROCM_MINICPMO_MRV2_DUPLEX_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != "$${#nodes[@]}" ]]; then
+            echo "Expected exactly $${#nodes[@]} MiniCPM-o MRv2 duplex nodes, found $$count." >&2
+            cat "$$ROCM_MINICPMO_MRV2_DUPLEX_ARTIFACT_DIR/collection.txt" >&2
+            exit 1
+          fi
+          for node in "$${nodes[@]}"; do
+            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_MRV2_DUPLEX_ARTIFACT_DIR/collection.txt"; then
+              echo "MiniCPM-o MRv2 duplex node was not collected: $$node" >&2
+              exit 1
+            fi
+          done
+        - |
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[1-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[2-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_overlapping_turns[4-mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_new_session_during_long_response[mrv2-real-weights]"
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py::test_mrv2_duplex_server_answers_image_chat_from_the_image[mrv2-real-weights]"
+          )
+          status=0
+          timeout --signal=TERM --kill-after=1m 35m \
+            pytest -s -v "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "advanced_model and omni and rocm and MI325 and cards_1" --run-level advanced_model \
+            --junitxml="$$ROCM_MINICPMO_MRV2_DUPLEX_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 5 and skipped == 0; print(f"Expected exactly five executed MiniCPM-o MRv2 duplex tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_MRV2_DUPLEX_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
 - group: ":card_index_dividers: E2E Test"
   steps:
     - label: "Qwen3-TTS E2E Test"

@@ -31,7 +31,7 @@ _SERVER = OmniServerParams(
 )
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
 @pytest.mark.parametrize("sessions", [1, 2, 4])
 def test_mrv2_duplex_overlapping_turns(omni_server, tmp_path: Path, sessions: int):
@@ -68,7 +68,7 @@ def test_mrv2_duplex_overlapping_turns(omni_server, tmp_path: Path, sessions: in
         assert session["error_count"] == 0, session
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
 def test_mrv2_duplex_new_session_during_long_response(omni_server):
     # Unequal prompts and a delayed second session prevent identical clients
@@ -100,7 +100,7 @@ def test_mrv2_duplex_new_session_during_long_response(omni_server):
     assert str(first["transcript"]).strip() != str(second["transcript"]).strip()
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
 def test_mrv2_duplex_server_answers_image_chat_from_the_image(omni_server, openai_client):
     """The duplex Thinker also serves /v1/chat/completions: its image features must reach the prompt."""
