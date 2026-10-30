@@ -418,7 +418,7 @@ def rotate_keys(keys: torch.Tensor, delta: int, inv_freq: torch.Tensor) -> torch
 
 
 def rotate_cached_keys(
-    k_pool: torch.Tensor,
+    k_pool: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
     *,
     block_ids: list[int],
     positions: torch.Tensor,
@@ -442,6 +442,21 @@ def rotate_cached_keys(
     """
     if positions.numel() == 0:
         return 0
+
+    # Ascend keeps K and V in separate tensors. Operate on the original K
+    # storage only; stacking the pair would rotate a copy and leave KV stale.
+    if isinstance(k_pool, (tuple, list)):
+        if len(k_pool) != 2:
+            raise ValueError("split KV cache must contain exactly K and V")
+        k_pool = k_pool[0]
+
+    # Ascend's standard paged layout can flatten heads into the last axis:
+    # (num_blocks, block_size, num_kv_heads * head_dim).
+    if k_pool.dim() == 3:
+        head_dim = inv_freq.numel() * 2
+        if block_size is None or k_pool.shape[1] != block_size or k_pool.shape[2] % head_dim:
+            raise ValueError(f"unsupported flattened key cache shape {tuple(k_pool.shape)}")
+        k_pool = k_pool.view(k_pool.shape[0], block_size, -1, head_dim)
 
     if k_pool.dim() == 5:
         if k_pool.shape[0] == 2:

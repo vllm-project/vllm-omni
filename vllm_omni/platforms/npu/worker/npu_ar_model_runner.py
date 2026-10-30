@@ -342,6 +342,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
+        # The parent installs the scheduler's compacted block table and token
+        # counts. Apply the matching worker-side rotation/history eviction before
+        # forward, without compacting or decrementing the logical state again.
+        from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+        GPUARModelRunner._maybe_apply_duplex_window_reanchor(self, scheduler_output)
         return deferred_state_corrections_fn
 
     def _make_buffer(self, *size, dtype, numpy=True):
