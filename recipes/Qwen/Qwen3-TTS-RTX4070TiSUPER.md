@@ -12,8 +12,9 @@
 ## When to use this recipe
 
 Serving Qwen3-TTS on a 16 GB consumer card. The 0.6B CustomVoice checkpoint is
-the smallest Qwen3-TTS deployment and runs with the bundled deploy config
-unmodified, so no `gpu_memory_utilization` override is required at this size.
+the smallest Qwen3-TTS deployment and, at the measured commit, ran with the
+bundled deploy config unmodified, so no `gpu_memory_utilization` override was
+required at this size.
 
 ## Supported model contract
 
@@ -43,6 +44,7 @@ qualified on this card; the 1.7B checkpoints were not measured here.
 - PyTorch: 2.13.0+cu132
 - vLLM version: 0.29.0
 - vLLM-Omni version or commit: `01a2f93256975c7ff9565c5414b0fe0225bc4765`
+- Model runner: V1, the `qwen3_tts.yaml` default at this commit
 
 ## Command
 
@@ -52,9 +54,15 @@ vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
     --omni --port 8091
 ```
 
-The default deploy config runs unmodified on this card. Both stages (talker and
-code2wav) share GPU 0 at `gpu_memory_utilization: 0.3` each, so the `0.15`
-profile documented for the RTX 4090 is not needed here.
+At the commit above, the default deploy config ran unmodified on this card.
+Both stages (talker and code2wav) shared GPU 0 at `gpu_memory_utilization: 0.3`
+each, so the `0.15` profile documented for the RTX 4090 was not needed here.
+
+Since that commit, [#7930](https://github.com/vllm-project/vllm-omni/pull/7930)
+made the experimental Model Runner V2 (`model_runner: v2`) the default for
+Qwen3-TTS on CUDA and lowered stage 0 `max_num_batched_tokens` from 32768 to
+512. The memory and startup figures below were measured on the V1 runner and
+have not been re-checked on current main, so they may differ there.
 
 ## Verification
 
@@ -89,7 +97,7 @@ runs the English prompt produced between 6.3 s and 11.7 s of audio.
 ## Notes
 
 - Memory usage: **9753 MiB / 16376 MiB** at idle and **9768 MiB / 16376 MiB**
-  peak under a burst of 8 concurrent requests, with the default deploy config.
+  peak under a burst of 8 concurrent requests, at the measured commit.
   These are whole-device totals; the desktop compositor and background
   applications on this host hold about 1.0 GiB, measured at 1045 MiB immediately
   before startup and 1015 MiB immediately after shutdown. The server therefore
@@ -98,9 +106,9 @@ runs the English prompt produced between 6.3 s and 11.7 s of audio.
   2.01 GiB (18,816 tokens, 4.59x maximum concurrency at 4,096 tokens per
   request), CUDA graphs 0.17 GiB, peak activation 0.81 GiB; stage 1 (code2wav)
   weights 0.48 GiB, CUDA graphs 0.18 GiB.
-- Startup reaches `Application startup complete` in about 80 s once the
+- Startup reaches `Application startup complete` in 64-79 s once the
   FlashInfer sampling-kernel cache is warm. The first run on a cold cache took
-  roughly 2.5 minutes.
+  about 158 s, including a one-time JIT compile of that kernel.
 - Known limitations: the memory figures cover short prompts at a concurrency of
   8 over roughly 5 s of sampling; other text lengths and concurrency levels were
   not measured. Whisper transcription reproduces the sentence frame every time,
