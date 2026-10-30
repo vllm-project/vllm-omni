@@ -224,6 +224,45 @@ def test_content_and_reminder_completion_budget_stays_at_1200(judge_http):
     assert judge_http.call_args.kwargs["json"]["max_tokens"] == 1200
 
 
+def _evaluate_with_cap(sample_paths, sample_id, max_side):
+    sample, response, score = sample_paths
+    path = score.with_name(f"{sample_id}.json")
+    judge = judge_module.DuplexJudge("http://unused", "judge")
+    evaluator.evaluate_sample(replace(sample, id=sample_id), response, path, judge, judge_frame_max_side=max_side)
+    return path
+
+
+@pytest.mark.parametrize("max_side", [None, 768], ids=["source", "capped"])
+def test_summary_records_a_uniform_judge_frame_max_side(sample_paths, judge_http, max_side):
+    judge_http.return_value = _reply('{"success_score": 1}')
+    _evaluate_with_cap(sample_paths, "first", max_side)
+    path = _evaluate_with_cap(sample_paths, "second", max_side)
+    summary = evaluator.summarize_scores(path.parent)
+    assert summary["samples"] == 2
+    assert summary["judge_frame_max_side"] == max_side
+
+
+def test_summary_rejects_mixed_judge_frame_max_side(sample_paths, judge_http):
+    judge_http.return_value = _reply('{"success_score": 1}')
+    _evaluate_with_cap(sample_paths, "first", 1920)
+    path = _evaluate_with_cap(sample_paths, "second", 768)
+    with pytest.raises(ValueError, match=r"mixes judge_frame_max_side values \[1920, 768\]"):
+        evaluator.summarize_scores(path.parent)
+
+
+def test_summary_treats_a_score_without_the_field_as_source_resolution(sample_paths, judge_http):
+    judge_http.return_value = _reply('{"success_score": 1}')
+    path = _evaluate_with_cap(sample_paths, "first", None)
+    legacy = json.loads(path.read_text())
+    del legacy["judge_frame_max_side"]
+    path.with_name("legacy.json").write_text(json.dumps(legacy))
+    assert evaluator.summarize_scores(path.parent)["judge_frame_max_side"] is None
+
+    _evaluate_with_cap(sample_paths, "capped", 1920)
+    with pytest.raises(ValueError, match="mixes judge_frame_max_side"):
+        evaluator.summarize_scores(path.parent)
+
+
 @pytest.mark.parametrize(
     ("replies", "missing_field"),
     [

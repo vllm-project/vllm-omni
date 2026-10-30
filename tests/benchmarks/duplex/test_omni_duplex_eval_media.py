@@ -239,10 +239,11 @@ class TestExtractJpeg:
         assert scaled.size == (160, 90)
 
     @staticmethod
-    def test_max_side_leaves_smaller_frames_unchanged(tmp_path: Path) -> None:
+    @pytest.mark.parametrize("max_side", [320, 640], ids=["equal", "larger"])
+    def test_max_side_leaves_frames_within_limit_unchanged(tmp_path: Path, max_side: int) -> None:
         path = tmp_path / "small.mp4"
         path.write_bytes(_make_synthetic_mp4(duration=0.5, fps=10, width=320, height=180))
-        assert extract_jpeg(path, timestamp=0.0, max_side=320) == extract_jpeg(path, timestamp=0.0)
+        assert extract_jpeg(path, timestamp=0.0, max_side=max_side) == extract_jpeg(path, timestamp=0.0)
 
     @staticmethod
     def test_raises_value_error_for_no_video(tmp_path: Path) -> None:
