@@ -69,6 +69,49 @@ class CodecLoadingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already loaded"):
                 model.load_weights(iter(()))
 
+    def test_quantized_reference_checked_after_bf16_native_load_is_promoted(self):
+        source = torch.nn.Linear(4, 4, dtype=torch.float32).state_dict()
+        calibration = {name: value.bfloat16().float() for name, value in source.items()}
+        events = []
+
+        class Decoder(torch.nn.Linear):
+            def precompute_snake_caches(self):
+                events.append(("cache", self.weight.dtype))
+
+        def initialize(instance, **kwargs):
+            torch.nn.Module.__init__(instance)
+            instance.decoder = Decoder(4, 4, dtype=torch.bfloat16)
+
+        def load(instance, weights):
+            instance.decoder.load_state_dict(source)
+            events.append(("load", instance.decoder.weight.dtype))
+            return {"decoder.weight", "decoder.bias"}
+
+        def install(decoder, precision, packed, reference, compute_dtype):
+            self.assertEqual(precision, "fp8")
+            for name, value in decoder.state_dict().items():
+                self.assertEqual(value.dtype, torch.float32)
+                self.assertTrue(torch.equal(value, calibration[name]))
+            events.append(("reference", decoder.weight.dtype))
+            decoder.to(dtype=compute_dtype)
+            return ["test"]
+
+        config = _VllmConfig(
+            model_config=_ModelConfig(model="unused", hf_config=_CodecConfig(drvexo_codec_compute_dtype="bfloat16"))
+        )
+        with (
+            patch.object(code2wav.Qwen3TTSCode2Wav, "__init__", initialize),
+            patch.object(code2wav.Qwen3TTSCode2Wav, "load_weights", load),
+            patch.object(code2wav, "resolve_codec_quantization", return_value=("fp8", "packed", "reference")),
+            patch(
+                "vllm_omni.model_executor.models.drvexo_speech_8b.codec_quantization.install_packed_codec_linears",
+                install,
+            ),
+        ):
+            model = code2wav.DRVEXOSpeech8BCode2Wav(vllm_config=config)
+            model.load_weights(iter(()))
+        self.assertEqual(events, [("load", torch.bfloat16), ("reference", torch.float32), ("cache", torch.bfloat16)])
+
     def test_invalid_dtype_fails_before_parent_constructor(self):
         config = _VllmConfig(model_config=_ModelConfig2(hf_config=_CodecConfig(drvexo_codec_compute_dtype="fp4")))
         with patch.object(code2wav.Qwen3TTSCode2Wav, "__init__") as parent:

@@ -38,6 +38,10 @@ class DRVEXOSpeech8BCode2Wav(Qwen3TTSCode2Wav):
         if self.codec_quantization:
             from .codec_quantization import install_packed_codec_linears
 
+            # Calibration used native BF16 loading followed by FP32 promotion.
+            # Current Qwen3-TTS keeps the configured load dtype; restore that
+            # boundary before checking exact reference values or replacing linears.
+            self.decoder.float()
             precision, packed, reference = self.codec_quantization
             layers = install_packed_codec_linears(self.decoder, precision, packed, reference, dtype)
             logging.getLogger(__name__).info(
