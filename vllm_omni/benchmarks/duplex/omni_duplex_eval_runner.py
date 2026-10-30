@@ -687,6 +687,7 @@ async def generate_sample(
     server_errors: list[str] = []
     input_committed = False
     stream_start: float | None = None
+    session_stats: dict[str, object] | None = None
     async with client:
         await client.configure(
             model,
@@ -812,6 +813,13 @@ async def generate_sample(
             # diagnosis, not folded into ``error`` and not a retry reason.
             ack_timeout = str(exc) or "playback ack timed out"
             logger.warning("DuplexEval: playback ack not delivered for sample %s: %s", sample.id, exc)
+        session_stats: dict[str, object] | None = None
+        if _session_capabilities(client).get("supports_session_stats") is True:
+            try:
+                fetched = await client.get_session_stats(timeout_s=5.0)
+            except (TimeoutError, ConnectionError):
+                fetched = None
+            session_stats = fetched or None
         try:
             await _close_duplex_session(client, timeout_s=_FINAL_CLOSE_TIMEOUT_S)
         except TimeoutError as exc:
@@ -855,6 +863,7 @@ async def generate_sample(
         collector,
         stream_start=stream_start if stream_start is not None else 0.0,
         session_id=sample.id,
+        session_stats=session_stats,
     )
     errors = []
     # Server-side failures are recorded apart from the timeouts below, which are

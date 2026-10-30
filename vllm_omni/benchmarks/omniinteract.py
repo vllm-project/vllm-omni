@@ -1068,6 +1068,9 @@ class _RealtimeSession:
             raise ConnectionError("Realtime session failed") from error
         raise ConnectionError("Realtime session closed before the requested event arrived")
 
+    async def get_session_stats(self, *, timeout_s: float = 5.0) -> dict[str, object]:
+        return await self._client.get_session_stats(timeout_s=timeout_s)
+
     async def close_session(self, *, timeout_s: float = 20.0) -> None:
         await self._client.close(timeout_s=timeout_s)
         if self._consume_task is not None:
@@ -1088,6 +1091,7 @@ def _populate_response_metrics(
     collector: EventCollector,
     *,
     stream_start: float,
+    session_stats: dict[str, object] | None = None,
 ) -> None:
     from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
 
@@ -1095,6 +1099,7 @@ def _populate_response_metrics(
         collector,
         stream_start=stream_start,
         session_id=result.session_id,
+        session_stats=session_stats,
     )
     result.output_tokens = bundle.output_tokens
     result.duplex_request_metrics = bundle.request_metrics
@@ -1257,6 +1262,16 @@ async def run_omniinteract_case(
                     )
                 await playback.acknowledge(client, playback.end_s)
                 _raise_if_session_terminated(client.events, session_from, warnings=playback.warnings)
+                session_stats: dict[str, object] | None = None
+                if _session_capabilities(client).get("supports_session_stats") is True:
+                    from vllm_omni.clients.duplex import DuplexClientError
+
+                    try:
+                        fetched = await client.get_session_stats(timeout_s=5.0)
+                    except (asyncio.TimeoutError, DuplexClientError) as exc:
+                        logger.warning("OmniInteract session stats unavailable: %s", exc)
+                    else:
+                        session_stats = fetched or None
                 close_from = len(client.events.events)
                 await client.close_session(timeout_s=min(config.timeout_s, 20.0))
             except Exception:
@@ -1272,7 +1287,7 @@ async def run_omniinteract_case(
             result.latency_s = time.monotonic() - started_at
             result.input_audio_chunks, result.input_video_frames = chunks, frame_count
             result.pacing_mean_lag_s, result.pacing_max_lag_s = mean_lag, max_lag
-            _populate_response_metrics(result, client.events, stream_start=stream_start)
+            _populate_response_metrics(result, client.events, stream_start=stream_start, session_stats=session_stats)
             await asyncio.to_thread(
                 prepare_success_artifacts,
                 config.output_root,

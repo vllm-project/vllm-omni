@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from vllm_omni.benchmarks.duplex_session_metrics import (
+    apply_session_stats_to_request_metrics,
     build_duplex_metrics_report,
     collect_duplex_session_metrics,
     duplex_response_latency_metrics,
@@ -123,6 +124,27 @@ def test_response_latency_counts_every_response_once_across_sessions():
     assert duplex_response_latency_metrics([]) == {}
 
 
+def test_response_latency_flattens_busy_rtf_and_stall_ratio():
+    rows: list[dict[str, object]] = [
+        {"busy_rtf": 0.2, "stall_ratio": 0.1},
+        {"busy_rtf": 0.2, "stall_ratio": 0.1},
+        {"busy_rtf": 0.2, "stall_ratio": 0.1},
+        {"busy_rtf": 0.4, "stall_ratio": 0.3},
+        {"busy_rtf": None, "stall_ratio": float("nan")},
+    ]
+
+    metrics = duplex_response_latency_metrics(rows)
+
+    assert metrics["num_duplex_busy_rtf_samples"] == 4
+    assert metrics["mean_duplex_busy_rtf"] == 0.25
+    assert metrics["median_duplex_busy_rtf"] == 0.2
+    assert metrics["p99_duplex_busy_rtf"] == 0.4
+    assert metrics["num_duplex_stall_ratio_samples"] == 4
+    assert metrics["mean_duplex_stall_ratio"] == 0.15
+    assert metrics["median_duplex_stall_ratio"] == 0.1
+    assert metrics["p99_duplex_stall_ratio"] == 0.3
+
+
 def test_report_and_console_expose_the_flat_latency_keys(capsys):
     collector = EventCollector()
     _turn(collector, "r1", 10.0, text_s=0.3, audio_s=0.4)
@@ -134,6 +156,8 @@ def test_report_and_console_expose_the_flat_latency_keys(capsys):
     )
     assert "mean_duplex_client_ttfp_ms" not in report
     assert "mean_duplex_client_rtf" not in report
+    assert "mean_duplex_busy_rtf" not in report
+    assert "mean_duplex_stall_ratio" not in report
     assert report["mean_duplex_response_ttfp_ms"] == 150.0
     assert bundle.request_metrics[0]["response_created_to_first_audio_ms"] == 400.0
 
@@ -252,3 +276,46 @@ def test_an_audio_turn_missing_a_stages_spans_gets_no_numbers() -> None:
     # A listen turn needs no work from the speaking stages.
     listen = {**turn, "status": "listen", "audio": []}
     assert session_stats_turn_metrics(listen, stage_ids=[0, 1, 2])["final"] is True
+
+
+def test_apply_session_stats_is_skipped_without_a_snapshot() -> None:
+    rows: list[dict[str, object]] = [{"response_id": "r1"}]
+    apply_session_stats_to_request_metrics(rows, None)
+    assert "busy_rtf" not in rows[0]
+
+
+def test_collect_attaches_session_stats_and_flattens_busy_rtf(capsys) -> None:
+    collector = EventCollector()
+    _turn(collector, "r1", 10.0, text_s=0.3, audio_s=0.4)
+    stats = {
+        "stages": [{"stage_id": 0}, {"stage_id": 1}, {"stage_id": 2}],
+        "turns": [
+            {
+                "response_ids": ["r1"],
+                "final": True,
+                "status": "done",
+                "epoch": 0,
+                "turn_id": 0,
+                "chunks": [_stats_chunk(1, 0, 20, {0: [(0, 10)], 1: [(10, 5)], 2: [(15, 5)]})],
+                "audio": [_audio(100.0)],
+            }
+        ],
+    }
+
+    bundle = collect_duplex_session_metrics(collector, stream_start=9.0, session_id="s", session_stats=stats)
+    (metric,) = bundle.request_metrics
+    assert metric["busy_rtf"] == 0.2
+    assert metric["stall_ratio"] == 0.0
+    assert metric["server_stats_final"] is True
+    assert bundle.session_metrics["busy_rtf"]["mean"] == 0.2
+
+    report = build_duplex_metrics_report(
+        request_metrics=bundle.request_metrics,
+        session_metrics=[bundle.session_metrics],
+    )
+    assert report["mean_duplex_busy_rtf"] == 0.2
+    assert report["mean_duplex_stall_ratio"] == 0.0
+    print_duplex_response_latency_metrics(duplex_response_latency_metrics(bundle.request_metrics))
+    printed = capsys.readouterr().out
+    assert "Mean busy RTF:" in printed
+    assert "Mean stall ratio:" in printed
