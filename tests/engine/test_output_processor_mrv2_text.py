@@ -202,6 +202,8 @@ def test_mrv2_differing_top_level_metadata_matches_separate_accumulation():
     # where it is kept once, not dropped or concatenated. Payload lookup
     # prefers tensors, so indexing the accumulator returns them.
     accumulated = state.mm_accumulated
+    # Iteration yields tensor keys, then metadata keys: a/b once in each, no extras.
+    assert sorted(accumulated) == ["a", "a", "b", "b", "latent", "spk"]
     torch.testing.assert_close(accumulated["latent"], hidden)
     torch.testing.assert_close(accumulated["a"], torch.tensor([9]))
     torch.testing.assert_close(accumulated["b"], torch.tensor([4]))
