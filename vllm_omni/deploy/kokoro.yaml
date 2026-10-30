@@ -6,6 +6,9 @@
 # max_model_len bound the number of chunks per request, not audio length.
 #   * dtype=float32 -- the checkpoint's precision; the reference runs fp32.
 #   * enforce_eager=true -- chunk lengths vary, nothing is captured.
+#   * max_num_seqs=4 -- a step synthesizes its requests one after another
+#     (no batched forward yet), so a higher value adds concurrency but delays
+#     each request's next chunk by the others' passes.
 #   * gpu_memory_utilization is a startup headroom check, not a KV budget;
 #     synthesis activations are allocated outside it.
 #
