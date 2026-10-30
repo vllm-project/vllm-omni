@@ -10,6 +10,7 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import (
+    convert_audio_bytes_to_text,
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
@@ -491,7 +492,7 @@ def test_text_to_audio_long_output_001(omni_server, online_client) -> None:
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_audio_to_audio(omni_server, online_client) -> None:
+def test_audio_to_audio(omni_server, online_client, run_level: str) -> None:
     """
     Input Modal: audio
     Output Modal: audio
@@ -499,7 +500,13 @@ def test_audio_to_audio(omni_server, online_client) -> None:
     Datasets: single request
     """
 
-    audio_data_url = get_asset_path("audio-prompt.wav", as_data_url=True)
+    # Load `audio-prompt.wav` file rather than synthetically
+    # generating an audio prompt via `generate_synthetic_audio`.
+    # 'audio-prompt.wav' asks the question "What is the capital of China?"
+    # Since the generate function must define the duration as an int
+    # it is impossible to accuractly match the duration to the spoken length of the input phrase.
+    # Because of this short prompts can cause looping in the phrase
+    audio_data_url = get_asset_path("qwen3_omni/audio-prompt.wav", as_data_url=True)
     messages = dummy_messages_from_mix_data(
         audio_data_url=audio_data_url,
         system_prompt=get_system_prompt(),
@@ -511,4 +518,9 @@ def test_audio_to_audio(omni_server, online_client) -> None:
         "modalities": ["audio"],
     }
 
-    online_client.send_omni_request(request_config)
+    response = online_client.send_omni_request(request_config)
+    assert response[0].audio_bytes is not None
+
+    if run_level in {"advanced_model", "full_model"}:
+        transcription = convert_audio_bytes_to_text(response[0].audio_bytes, language="en").lower()
+        assert "beijing" in transcription
