@@ -149,7 +149,6 @@ async def test_h3_inactive_continuation_settings_are_not_uploaded(api_calls, lon
         long_video_mode=mode,
         continuation_window_frames=311,
         continuation_overlap_frames=39,
-        continuation_slice_reference_video=True,
     )
     await _generate(_references(1, 0, 0), model_params=params)
     fields = api_calls.call_args_list[0].kwargs["data"]._fields
@@ -159,7 +158,6 @@ async def test_h3_inactive_continuation_settings_are_not_uploaded(api_calls, lon
         assert continuation == {
             "continuation_window_frames": 311,
             "continuation_overlap_frames": 39,
-            "continuation_slice_reference_video": True,
         }
     else:
         assert continuation == {}

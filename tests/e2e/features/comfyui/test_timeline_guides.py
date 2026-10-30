@@ -684,13 +684,29 @@ async def test_generate_video_node_rejects_fast_h3_guides_before_upload(api_call
     fast_h3 = {"url": "http://localhost/v1", "model": H3}
     chain = _chain((36, {"image": _image()}))
     validation = VLLMOmniGenerateVideo.VALIDATE_INPUTS(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain)
-    assert isinstance(validation, str) and "not FastH3" in validation
-    with pytest.raises(ValueError, match="not FastH3"):
+    assert isinstance(validation, str) and "FastH3 Preview" in validation
+    with pytest.raises(ValueError, match="FastH3 Preview"):
         await VLLMOmniGenerateVideo().generate(
             **_node_inputs(url="u", model="m", fast_h3=fast_h3, timeline_guides=chain)
         )
     api_calls.assert_not_called()
     assert encoders == []
+
+
+async def test_fast_omni_deployment_forwards_guides_and_preserves_seed(api_calls):
+    deployment = {"url": "http://localhost/v1", "model": "FastVideo/FastVideo-FastH3-Omni-8-Step-V1", "variant": "Omni"}
+    chain = _chain((0, {"image": _image()}), (21, {"image": _image()}))
+    assert VLLMOmniGenerateVideo.VALIDATE_INPUTS(
+        url="u", model="m", fast_h3=deployment, timeline_guides=chain
+    ) is True
+    await VLLMOmniGenerateVideo().generate(**_node_inputs(
+        fast_h3=deployment, timeline_guides=chain,
+        sampling_params=DiffusionSamplingParams({"seed": 123, "num_inference_steps": 50}),
+    ))
+    assert _value(api_calls, "model") == deployment["model"]
+    assert _value(api_calls, "num_inference_steps") == "8"
+    assert _value(api_calls, "seed") == "123"
+    assert len(json.loads(_value(api_calls, "timeline_guides"))) == 2
 
 
 async def test_generate_video_node_rejects_noop_latent_edit_with_guides(api_calls, encoders):

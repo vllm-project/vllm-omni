@@ -275,6 +275,32 @@ def test_unguided_context_is_unchanged():
     assert context["visual_condition_shapes"] == [(1, 4, 2)]
 
 
+def test_fast_omni_accepts_timeline_guides():
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3OmniCheckpointSpec
+    from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
+
+    pipeline = _guide_pipeline()
+    pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
+    pipeline._base_schedule_by_partition["ref2va"] = DMD2SigmaSchedule.from_metadata(
+        pipeline._fasth3_checkpoint.release_metadata()
+    )
+    media = _media(
+        task="ref2va",
+        timeline_guides=_prepare(
+            [{"frame_index": 7, "image": _two_tone(96, 64)}, {"frame_index": -1, "image": _two_tone(96, 64)}]
+        ),
+    )
+    conditioning = _conditioning(media)
+    sampling = _sampling()
+    sampling.num_inference_steps = 8
+    sampling.guidance_scale = 1.0
+    sampling.guidance_scale_2 = 1.0
+    context = pipeline._prepare_encoder_conditioning_inputs(conditioning, sampling)
+
+    assert context["guide_blocks"] == [dict(block) for block in conditioning.guide_blocks]
+    assert context["visual_condition_shapes"] == [(1, 4, 6), (1, 4, 6)]
+
+
 def test_guides_are_rejected_across_a_separate_encoder_stage():
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.model_executor.stage_input_processors.minimax_h3 import prepare_encoder_prompt
