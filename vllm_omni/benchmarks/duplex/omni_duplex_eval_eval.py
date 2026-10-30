@@ -373,6 +373,15 @@ def summarize_scores(score_root: str | Path) -> dict[str, Any]:
             row = _read(path)
             row.setdefault("split", path.parent.name)
             rows.append(row)
+    # evaluate skips samples that already have a score, so a rerun with another
+    # cap would otherwise average different judge inputs. Scores from before the
+    # cap existed have no field and used source resolution, the same as None.
+    frame_max_sides = {row.get("judge_frame_max_side") for row in rows}
+    if len(frame_max_sides) > 1:
+        raise ValueError(
+            f"{score_root} mixes judge_frame_max_side values {sorted(frame_max_sides, key=str)}; "
+            "rerun evaluate with --overwrite and one value"
+        )
     rtd_temporal = [
         row["temporal"]["summary"] | {"content_score": row.get("content", {}).get("content_score", 0.0)}
         for row in rows
@@ -380,6 +389,8 @@ def summarize_scores(score_root: str | Path) -> dict[str, Any]:
     ]
     pr = [{"task_type": row.get("task_type"), **row.get("pr", {})} for row in rows if "pr" in row]
     result = {"protocol_pin": PROTOCOL_PIN, "samples": len(rows)}
+    if rows:
+        result["judge_frame_max_side"] = frame_max_sides.pop()
     if rtd_temporal:
         by_task: dict[str, list[dict[str, float]]] = {}
         for row in rows:
