@@ -515,6 +515,38 @@ def test_text_encoder_allgather_accepts_matching_precomputed_embedding_paths(mon
     executor.collective_rpc.assert_called_once()
 
 
+def _make_hsdp_request_executor(monkeypatch, prompts):
+    executor, scheduled = _make_request_executor(monkeypatch, prompts, allgather=False)
+    executor.od_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=8, hsdp_data_parallel=True),
+    )
+    return executor, scheduled
+
+
+def test_hsdp_data_parallel_wave_sends_all_envelopes_in_one_rpc(monkeypatch):
+    executor, scheduled = _make_hsdp_request_executor(monkeypatch, ["a", "b"])
+    results = [DiffusionOutput(output="first"), DiffusionOutput(output="second")]
+    executor.collective_rpc = Mock(return_value=[{"dp_rank": rank, "output": out} for rank, out in enumerate(results)])
+
+    output = executor.execute_request(scheduled)
+
+    assert [item.result for item in output.runner_outputs] == results
+    executor.collective_rpc.assert_called_once()
+    assert executor.collective_rpc.call_args.args == ("execute_model",)
+    assert executor.collective_rpc.call_args.kwargs["args"][0] is scheduled.scheduled_new_reqs
+
+
+def test_hsdp_data_parallel_execute_batch_skips_pipeline_batching(monkeypatch):
+    executor, scheduled = _make_hsdp_request_executor(monkeypatch, ["a", "b"])
+    executor.execute_request = Mock(return_value="per-request")
+    executor.collective_rpc = Mock()
+
+    assert executor.execute_batch(scheduled) == "per-request"
+
+    executor.execute_request.assert_called_once_with(scheduled)
+    executor.collective_rpc.assert_not_called()
+
+
 @pytest.mark.parametrize("allgather", [False, True])
 def test_single_request_allgather_timeout_option(monkeypatch, allgather):
     executor, scheduled = _make_request_executor(monkeypatch, ["prompt"], allgather=allgather)
