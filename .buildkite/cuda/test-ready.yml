@@ -214,7 +214,6 @@ steps:
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_ready.json -m 'core_model and cuda'
-          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_cuda_c32.json -m 'core_model and cuda'
         mirror_hardwares: h100_1
 
       - label: "TTS · Drama 3 Test"

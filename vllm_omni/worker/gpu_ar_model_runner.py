@@ -124,6 +124,11 @@ def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
 def _copy_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
     if isinstance(value, _PackedTensorPayload):
         flat = _copy_tensor_payload_to_cpu(value.tensor, pin_memory)
+        if value.shapes and all(shape == value.shapes[0] for shape in value.shapes):
+            # Decode rows commonly have identical codec/state shapes. One
+            # batch view avoids a slice and view dispatch for every request.
+            rows = flat.view(len(value.shapes), *value.shapes[0]).unbind(0)
+            return rows if value.is_tuple else list(rows)
         items = []
         offset = 0
         for shape in value.shapes:
