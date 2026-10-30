@@ -805,15 +805,9 @@ vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
 
 Deploy config auto-loads from `vllm_omni/deploy/voxcpm2.yaml`. Pass `--deploy-config <path>` to override or `--stage-N-<field> <value>` for per-stage runtime tweaks.
 
-On CUDA, the default uses Model Runner V2 with incremental VAE decoding
-(`vae_decode_every: 1`, `audio_emit_every: 3`). Other platforms retain their
-non-incremental audio path. To opt out on CUDA, remove the `platforms.cuda`
-section from `vllm_omni/deploy/voxcpm2.yaml` and set top-level `model_runner: v1`.
-The base stage retains the V1 settings (`vae_decode_every: 3`,
-`audio_emit_every: 1`, batched VAE enabled).
+The default uses Model Runner V2 with incremental VAE decoding (`vae_decode_every: 1`, `audio_emit_every: 3`). Ascend retains its non-incremental MRV2 audio path. Incremental VAE currently requires CUDA MRV2 per-patch unified graphs; this default does not establish support on other platforms.
 
-Changing only `model_runner` does not disable incremental VAE, which requires
-CUDA MRV2 per-patch unified graphs.
+To opt out on CUDA, use a local copy of `voxcpm2.yaml` with top-level `model_runner: v1` and set `enable_incremental_vae: false`, `vae_decode_every: 3`, `audio_emit_every: 1`, and `enable_batched_vae_decode: true` under `stages[0].engine_extras.hf_overrides.voxcpm2_runtime_config`. Pass the local copy with `--deploy-config /absolute/path/to/voxcpm2-v1.yaml`. Changing only `model_runner` does not disable incremental VAE.
 
 ### Sending requests
 

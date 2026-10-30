@@ -1,11 +1,11 @@
 # VoxCPM2 deploy: single-stage AR pipeline with per-request state batching.
-# CUDA defaults to MRV2 with incremental VAE decoding.
-# The base audio settings retain the V1 opt-out path.
-# On Ascend the platform section below selects MRV2 by default.
+# MRV2 with incremental VAE decoding is the default.
+# Ascend explicitly disables incremental VAE and uses ordinary decoding.
 # Runs on large (H20 141GB) and small (24GB L4) cards alike: the KV cache is
 # pinned to a right-sized budget instead of ballooning to fill the card.
 #
 # VoxCPM2-local runtime knobs are passed through hf_overrides.
+model_runner: v2
 async_chunk: false
 dtype: bfloat16
 
@@ -33,18 +33,20 @@ stages:
     devices: "0"
     engine_extras:
       hf_overrides:
-        voxcpm2_runtime_config: &voxcpm2_runtime
+        voxcpm2_runtime_config:
           # LocDiT generation settings affect synthesis quality. Keep the defaults
           # unless alternative values have been validated for your workload.
           inference_timesteps: 10
           cfg_value: 2.0
           cfg_cutoff_ratio: 1.0
 
-          # vae_decode_every / audio_emit_every are intentionally not pinned
-          # here: runtime_config.py applies per-runner defaults (v1: 2/1,
-          # MRV2 v2: 1/3), so v2 overlays do not inherit v1 cadence values.
+          audio_emit_every: 3
+          vae_decode_every: 1
+          enable_incremental_vae: true
+          enable_exact_patch_batch: false
           enable_batched_cfm: true
-          enable_batched_vae_decode: true
+          # Incremental unified graphs batch VAE internally.
+          enable_batched_vae_decode: false
           coalesce_audio_d2h: true
           enable_loc_dit_fused_qkv: true
           enable_loc_dit_fused_mlp: true
@@ -64,21 +66,12 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
-  cuda:
+  npu:
     model_runner: v2
     stages:
       - stage_id: 0
         engine_extras:
           hf_overrides:
             voxcpm2_runtime_config:
-              <<: *voxcpm2_runtime
-              vae_decode_every: 1
-              audio_emit_every: 3
-              enable_incremental_vae: true
-              enable_exact_patch_batch: false
-              # Incremental unified graphs batch VAE internally.
-              enable_batched_vae_decode: false
-  # Ascend runs the AR stage on Model Runner V2. Audio stays on the packed
-  # per-request path because incremental VAE decoding needs CUDA graphs.
-  npu:
-    model_runner: v2
+              # Incremental VAE requires CUDA per-patch unified graphs.
+              enable_incremental_vae: false

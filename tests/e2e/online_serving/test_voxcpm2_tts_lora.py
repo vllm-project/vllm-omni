@@ -62,8 +62,7 @@ def omni_server(request, run_level, tmp_path_factory):
         max_num_batched_tokens=2048,
     )
     stage["default_sampling_params"]["max_tokens"] = 256
-    # This test runs on CUDA, whose platform override supplies the runtime config.
-    runtime = config["platforms"]["cuda"]["stages"][0]["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
+    runtime = stage["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
     runtime.update(startup_lora_path=str(directory), unified_decode_graph_max_batch_size=4)
     deploy_path = directory / "deploy.yaml"
     deploy_path.write_text(yaml.safe_dump(config))
