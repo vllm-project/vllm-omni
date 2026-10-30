@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.kokoro.configuration_kokoro import (
 from vllm_omni.model_executor.models.kokoro.kokoro_modules import KokoroNetwork, fold_weight_norm
 from vllm_omni.model_executor.models.kokoro.text_frontend import (
     DEFAULT_VOICE,
+    MAX_PHONEMES,
     KokoroTextFrontend,
     list_voices,
     phonemes_to_ids,
@@ -137,12 +138,24 @@ class KokoroForConditionalGeneration(nn.Module):
         # Load every voice pack now (54 x 510 x 256 fp32, ~28 MB): a lazy load
         # would put hub and disk I/O inside forward(), stalling the whole batch.
         voices_dir = resolve_voices_dir(self.model_path, self.revision)
-        self._voicepacks = {
-            voice: torch.load(os.path.join(voices_dir, f"{voice}.pt"), map_location="cpu", weights_only=True).to(
-                self._device
+        # One [1, 2 * style_dim] style vector per chunk length, so a pack needs
+        # a row for every length up to MAX_PHONEMES.
+        row_shape = (1, 2 * self.config.style_dim)
+        self._voicepacks = {}
+        for voice in list_voices(voices_dir):
+            pack = torch.load(os.path.join(voices_dir, f"{voice}.pt"), map_location="cpu", weights_only=True)
+            valid = (
+                isinstance(pack, torch.Tensor)
+                and pack.ndim == 3
+                and pack.shape[0] >= MAX_PHONEMES
+                and tuple(pack.shape[1:]) == row_shape
             )
-            for voice in list_voices(voices_dir)
-        }
+            if not valid:
+                found = tuple(pack.shape) if isinstance(pack, torch.Tensor) else type(pack).__name__
+                raise ValueError(
+                    f"Kokoro voice pack {voice!r} is {found}; expected shape ({MAX_PHONEMES}+, 1, {row_shape[1]})"
+                )
+            self._voicepacks[voice] = pack.to(self._device)
         if not self._voicepacks:
             raise ValueError(f"Kokoro checkpoint has no voices/*.pt packs in {voices_dir}")
         return {f"network.{n}" for n, _ in self.network.named_parameters()}
@@ -185,8 +198,10 @@ class KokoroForConditionalGeneration(nn.Module):
         generator = torch.Generator(device=self._device)
         generator.manual_seed(int(seed) if seed is not None else random.randrange(2**63))
         for i, ps in enumerate(chunks):
-            input_ids = torch.tensor([phonemes_to_ids(ps, self.config.vocab)], dtype=torch.long, device=self._device)
             try:
+                input_ids = torch.tensor(
+                    [phonemes_to_ids(ps, self.config.vocab)], dtype=torch.long, device=self._device
+                )
                 # The style vector is picked by phoneme count; the frontend caps
                 # chunks at MAX_PHONEMES, which must not outgrow the pack.
                 if not 0 < len(ps) <= pack.shape[0]:

@@ -15,6 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.model_executor.models.kokoro import modeling_kokoro
 from vllm_omni.model_executor.models.kokoro.configuration_kokoro import (
     KOKORO_CONTINUE_TOKEN_ID,
     KOKORO_STOP_TOKEN_ID,
@@ -276,6 +277,18 @@ def test_load_weights_preloads_every_voice_and_rejects_other_names(network: Koko
             model._voicepack(name)
 
 
+@pytest.mark.parametrize(
+    "bad_pack",
+    [torch.randn(10, 1, 256), torch.randn(MAX_PHONEMES, 1, 128), torch.randn(MAX_PHONEMES, 256), {"pack": 1}],
+    ids=["too-few-rows", "wrong-style-dim", "wrong-rank", "not-a-tensor"],
+)
+def test_load_weights_rejects_malformed_voice_pack(network: KokoroNetwork, tmp_path: Path, bad_pack) -> None:
+    model = _bare_model(_config(), _checkpoint_dir(tmp_path))
+    torch.save(bad_pack, tmp_path / "voices" / "af_bad.pt")
+    with pytest.raises(ValueError, match="voice pack 'af_bad'"):
+        model.load_weights(iter(_reference_layout_checkpoint(network).items()))
+
+
 def test_load_weights_rejects_checkpoint_without_voices(network: KokoroNetwork, tmp_path: Path) -> None:
     model = _bare_model(_config(), _checkpoint_dir(tmp_path, voices=()))
     with pytest.raises(ValueError, match="no voices"):
@@ -423,6 +436,21 @@ def test_chunk_longer_than_the_voicepack_fails_only_its_request() -> None:
     model = _bare_model(_config())
     model.frontend = _OneLongChunk()
     model._voicepacks = {"af_heart": torch.randn(5, 1, 256)}
+    assert list(model._create_stream_gen({"text": ["hi"], "voice": ["af_heart"]})) == [(None, True)]
+
+
+def test_chunk_prep_error_fails_only_its_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _OneChunk:
+        def phoneme_chunks(self, text: str, lang_code: str) -> list[str]:
+            return ["abc"]
+
+    def broken_ids(phonemes: str, vocab: dict[str, int]) -> list[int]:
+        raise RuntimeError("device error")
+
+    monkeypatch.setattr(modeling_kokoro, "phonemes_to_ids", broken_ids)
+    model = _bare_model(_config())
+    model.frontend = _OneChunk()
+    model._voicepacks = {"af_heart": torch.randn(MAX_PHONEMES, 1, 256)}
     assert list(model._create_stream_gen({"text": ["hi"], "voice": ["af_heart"]})) == [(None, True)]
 
 
