@@ -77,7 +77,10 @@ def test_ovis_attention_fused_matches_eager(_dist_env, double_stream, batch, txt
     attn = attn.to(torch.bfloat16).eval()
     with torch.no_grad():
         for p in attn.parameters():
-            p.copy_((0.02 * torch.randn(p.shape, device="cuda")).to(p.dtype) if p.dim() > 1 else p)
+            if p.dim() > 1:
+                p.normal_(0, 0.02)
+            else:
+                p.zero_()
         for n in (attn.norm_q, attn.norm_k) + ((attn.norm_added_q, attn.norm_added_k) if double_stream else ()):
             n.weight.uniform_(0.5, 1.5)
     hidden = torch.randn(batch, img if double_stream else txt + img, _DIM, device="cuda", dtype=torch.bfloat16)
@@ -110,6 +113,7 @@ def test_ovis_attention_fused_matches_eager(_dist_env, double_stream, batch, txt
         for expected, actual in zip(eager_qkv, attention.call_args.args):
             assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
     for e, f in zip(eager if double_stream else (eager,), fused if double_stream else (fused,)):
+        assert torch.isfinite(e).all()
         assert torch.equal(f.view(torch.int16), e.view(torch.int16))
 
 
