@@ -188,6 +188,7 @@ class TestHiggsAudioV3OnlineHappyPath:
         with online_client.client.audio.speech.with_streaming_response.create(
             model=omni_server.model,
             input=long_text,
+            voice=None,
             response_format="pcm",
             extra_body={"stream_format": "audio"},
             timeout=DEFAULT_SPEECH_TIMEOUT_S,
@@ -226,9 +227,14 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": 300.0,
-                # ~90 sentences of speech at 25 fps: expect well over a
-                # minute of audio; floor generously below that.
-                "min_audio_bytes": 2_000_000,
+                # Normalize the generation cap across profiles (the V1
+                # high-throughput profile ships a lower Stage-0 max_tokens
+                # than the default). The byte floor stays generous-under
+                # dummy weights: audio-eos timing is weight-dependent, so
+                # only require ~20 s of synthesized audio to prove the long
+                # input completes rather than truncating.
+                "max_new_tokens": 1900,
+                "min_audio_bytes": 1_000_000,
             }
         )
 
