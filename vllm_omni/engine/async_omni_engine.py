@@ -47,7 +47,15 @@ class AsyncOmniEngine(OmniEngineBase):
     """Turn-based engine used by ``Omni`` / ``AsyncOmni``."""
 
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
+        orchestrator_kwargs["dit_load_aware"] = self._detect_dit_load_aware()
         return Orchestrator(**orchestrator_kwargs)
+
+    def _detect_dit_load_aware(self) -> bool:
+        for cfg in self.stage_configs:
+            ea = getattr(cfg, "engine_args", None)
+            if getattr(ea, "dit_load_aware", False):
+                return True
+        return False
 
     # ---- request helpers ----
 
