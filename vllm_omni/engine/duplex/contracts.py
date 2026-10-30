@@ -102,6 +102,9 @@ class DuplexOutputContext:
     segment_finished: bool
     segment_token_ids: tuple[int, ...] = ()
     segment_output_metadata: Mapping[str, object] = field(default_factory=dict)
+    # Set by the engine on a finished ``response_judge`` stage output that
+    # needs no reply; the turn then ends like a model listen decision.
+    response_judge_rejected: bool = False
     # Session stats (RFC #8325): the (epoch, seq) chunks this output finishes
     # handling for. Their spans reach the ledger directly (``on_stage_work``).
     perf_chunks: frozenset[tuple[int, int]] = frozenset()

@@ -3034,6 +3034,9 @@ class OrchestratorBase:
                 return
 
             final_stage_id = req_state.final_stage_id
+            # async-chunk may have prewarmed stages past this one; they will
+            # never receive input, so abort them instead of waiting for timeout.
+            prewarmed_downstream = any(stage > src_stage_id for stage in req_state.stage_submit_ts)
             final_pool = self.stage_pools[final_stage_id]
             final_output_type = getattr(final_pool.stage_client, "final_output_type", None)
             terminal_output = _build_terminal_empty_output(
@@ -3063,7 +3066,9 @@ class OrchestratorBase:
                     stage_submit_ts=submit_ts,
                 )
             )
-            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+            await self._cleanup_request_ids(
+                [req_id, *self._cfg_tracker.cleanup_parent(req_id)], abort=prewarmed_downstream
+            )
             return
 
         self._annotate_next_stage_inputs(src_stage_id, req_state, next_inputs)

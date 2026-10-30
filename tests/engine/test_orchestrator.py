@@ -3416,6 +3416,52 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prewarmed", [True, False])
+async def test_empty_next_input_aborts_only_prewarmed_downstream(prewarmed: bool) -> None:
+    """A non-judged pipeline whose bridge yields no input ends the request with an empty output.
+
+    Stages that async-chunk prewarm already submitted can never receive input
+    now, so they are aborted; without a prewarm nothing is aborted (unchanged).
+    """
+    clients = [FakeStageClient(final_output=index == 4) for index in range(5)]
+    pools = _build_stage_pools(
+        [[client] for client in clients],
+        output_processors=[FakeOutputProcessor() for _ in clients],
+        stage_vllm_configs=[SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in clients],
+    )
+    output_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-empty-bridge",
+        sampling_params_list=[_sampling_params() for _ in clients],
+        final_stage_id=4,
+    )
+    submitted = [0, 1, 4] if prewarmed else [0, 1]
+    for stage_id in submitted:
+        # Bind the request where it actually ran (and where async-chunk prewarmed it).
+        await pools[stage_id].submit_initial(
+            "req-empty-bridge", req_state, SimpleNamespace(request_id="req-empty-bridge", prompt_token_ids=[1])
+        )
+        req_state.stage_submit_ts[stage_id] = float(stage_id)
+    orchestrator.request_states["req-empty-bridge"] = req_state
+    stage_output = SimpleNamespace(request_id="req-empty-bridge", finished=True, outputs=[])
+
+    await orchestrator._forward_to_next_stage("req-empty-bridge", 1, stage_output, req_state)
+
+    message = output_queue.get_nowait()
+    assert message.finished and message.stage_id == 4
+    assert "req-empty-bridge" not in orchestrator.request_states
+    aborted = [index for index, client in enumerate(clients) if client.abort_calls]
+    assert aborted == ([0, 1, 4] if prewarmed else [])
+    assert clients[2].add_request_calls == []
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_preserves_scheduler_stats_only_outputs():
     pool = object.__new__(StagePool)
     stats_outputs = OmniEngineCoreOutputs(scheduler_stats=SimpleNamespace())
