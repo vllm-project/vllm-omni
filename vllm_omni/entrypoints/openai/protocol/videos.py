@@ -18,6 +18,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraints, field_validator, model_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
+from vllm_omni.entrypoints.openai.protocol.images import SegmentationRLE
 from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
 
 # Bound int request fields to avoid overflow issues.
@@ -69,6 +70,18 @@ class VideoParams(BaseModel):
             return f"{self.width}x{self.height}"
         else:
             return None
+
+
+class StreamingPacingConfig(BaseModel):
+    """Canonical request-level playback pacing policy for realtime video."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    mode: Literal["client_playhead"] = "client_playhead"
+    max_lead_ms: float = Field(default=1000.0, gt=0, le=10_000, allow_inf_nan=False)
+    max_output_bytes: int = Field(default=64 * 1024 * 1024, gt=0, le=_INT64_MAX, strict=True)
+    idle_timeout_s: float = Field(default=30.0, gt=0, le=86_400, allow_inf_nan=False)
 
 
 class FileImageReference(BaseModel):
@@ -205,6 +218,18 @@ class VideoGenerationRequest(BaseModel):
         description="Frames per second for output video",
     )
     num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames to generate")
+    streaming_pacing: StreamingPacingConfig | None = Field(
+        default=None,
+        description="Canonical realtime playback pacing policy; requires session.playback feedback.",
+    )
+    streaming_buffer_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        le=10,
+        strict=True,
+        allow_inf_nan=False,
+        description="Maximum generated media lead, including the next chunk; requires session.playback updates.",
+    )
     aspect_ratio: str | None = Field(
         default=None,
         description=(
@@ -248,6 +273,19 @@ class VideoGenerationRequest(BaseModel):
         if value not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {value!r}")
         return value
+
+    @model_validator(mode="after")
+    def normalize_streaming_pacing(self) -> "VideoGenerationRequest":
+        """Canonicalize pacing into ``streaming_pacing``; derive the lead alias."""
+        if self.streaming_pacing is not None and self.streaming_buffer_seconds is not None:
+            raise ValueError("use streaming_pacing or streaming_buffer_seconds, not both")
+        if self.streaming_buffer_seconds is not None:
+            self.streaming_pacing = StreamingPacingConfig(max_lead_ms=self.streaming_buffer_seconds * 1000.0)
+        if self.streaming_pacing is not None and self.streaming_pacing.enabled:
+            self.streaming_buffer_seconds = self.streaming_pacing.max_lead_ms / 1000.0
+        else:
+            self.streaming_buffer_seconds = None
+        return self
 
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")
     num_inference_steps: int | None = Field(
@@ -335,6 +373,12 @@ class VideoGenerationRequest(BaseModel):
     # ``guide_files`` uploads and attaches the decoded guide media and the
     # request-owned temporary files here.
     _timeline_guide_input: Any = PrivateAttr(default=None)
+
+    # Cleanup paths are populated by the multipart parser, never by clients.
+    _control_reference_paths: list[str] = PrivateAttr(default_factory=list)
+    # MiniMax H3 control uploads by role (``control_path``/``source_path``/``mask_path``),
+    # forwarded in ``multi_modal_data`` so client-supplied ``extra_params`` cannot name paths.
+    _minimax_h3_control_media: dict[str, str] = PrivateAttr(default_factory=dict)
 
     # Generic model-specific parameters
     extra_params: dict[str, Any] | None = Field(
@@ -500,3 +544,36 @@ class VideoListResponse(BaseModel):
     has_more: bool = Field(..., description="Whether there are more items available.")
     data: list[VideoResponse] = Field(..., description="Array of video job records.")
     object: Literal["list"] = Field(default="list", description="Object type identifier for list responses.")
+
+
+class VideoSegmentationInstance(BaseModel):
+    id: int = Field(..., description="Object id, stable across the frames of one video")
+    score: float = Field(..., description="Detection confidence in [0, 1] of the object when it was first found")
+    box: list[float] = Field(..., description="[x0, y0, x1, y1] in input-video pixels")
+    mask: SegmentationRLE
+
+
+class VideoSegmentationFrame(BaseModel):
+    frame_index: int
+    instances: list[VideoSegmentationInstance]
+
+
+class VideoSegmentationObject(BaseModel):
+    id: int
+    prompt: str = Field(..., description="The text prompt whose concept this object matched")
+    mask_video: str | None = Field(
+        None, description="Base64 H.264 MP4 of the object's mask over the whole video (white inside), if requested"
+    )
+
+
+class VideoSegmentationResponse(BaseModel):
+    """Every tracked instance of the prompted concepts, frame by frame."""
+
+    created: int = Field(..., description="Unix timestamp of when segmentation completed")
+    model: str | None = Field(None, description="Served model name")
+    width: int = Field(..., description="Input video width in pixels")
+    height: int = Field(..., description="Input video height in pixels")
+    num_frames: int
+    fps: float | None = Field(None, description="Input frame rate, when the container reports one")
+    objects: list[VideoSegmentationObject]
+    frames: list[VideoSegmentationFrame]

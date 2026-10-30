@@ -313,6 +313,27 @@ self._compiled_model_fwd = torch.compile(
 The historical benchmark results above use re-prefill. It remains the default
 for Qwen3-TTS and the shared Qwen3-Omni predictor.
 
+### Fused MRv2 serving boundaries
+
+The single-stage `qwen3_tts_fused_single_gpu.yaml` profile decodes PCM in the
+Talker process. Its CUDA MRv2 prefill path builds a projected text embedding
+table before KV profiling (about 0.6 GB for the 1.7B checkpoint). V1,
+two-stage deployments and non-NVIDIA platforms do not allocate that table.
+Exact conditioned Talker inputs for preemption replay use additional storage
+per active request after KV profiling; keep the headroom documented in the YAML.
+
+The fused Talker sampler registers only when its platform and processor list
+are supported. Installed logits-processor plugins keep the stock sampler and
+immediate request-state flush ordering. Unsupported sampling settings retain
+the stock registration, including rejection sampling. `compute_logits` keeps
+the codec vocabulary mask for both sampling and prompt logprobs.
+
+The PDL predictor requires NVIDIA Hopper or newer. A predictor with capacity
+above 64 retains the cuBLAS weights and selects that path for batches above
+64. These optimizations do not change reference/speaker encoder precision or
+the default attention backend. Reference encoding uses the main BF16 path;
+backend-specific throughput measurements should use explicit overrides.
+
 ### Experimental Qwen3-TTS single-GPU throughput profile
 
 The opt-in `qwen3_tts_high_concurrency_mrv2_single_gpu.yaml` profile uses a

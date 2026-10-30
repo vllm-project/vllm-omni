@@ -417,6 +417,7 @@ vllm serve fishaudio/drama-3 --omni --port 8091
 ```
 
 The deploy config auto-loads from `vllm_omni/deploy/fish_omni.yaml` (the HF `model_type` on the checkpoint is `fish_omni`).
+On Ascend, the same command uses the `npu` profile: Model Runner V2 with tensor parallel 2 and expert parallel across two 910B cards, and the DAC stage sharing the second card. See the recipe.
 
 ### Voice cloning
 
@@ -726,7 +727,7 @@ Then open <http://localhost:7860> in your browser.
 
 ## OmniVoice
 
-Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **auto voice** only; voice cloning and voice design are available offline.
+OmniVoice creates speech in more than 600 languages. It supports text-to-speech without a reference clip, voice cloning, and voice design.
 
 ### Prerequisites
 
@@ -734,7 +735,7 @@ Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **
 huggingface-cli download k2-fsa/OmniVoice
 ```
 
-Voice cloning (offline) needs `transformers>=5.3.0`; auto voice works with `transformers>=4.57.0`.
+Voice cloning needs `transformers>=5.3.0`. The default OmniVoice deploy config loads `openai/whisper-large-v3-turbo` lazily on the worker device when `ref_text` is missing. Set `load_asr_on_startup: true` in `additional_config.omnivoice_asr` to load it during worker startup. Set `asr_device: "cuda:0"` or `asr_device: "cpu"` in the same block to override the worker device.
 
 ### Launch
 
@@ -759,6 +760,11 @@ python speech_client.py \
 --ref-audio /path/to/ref_audio.wav \
 --ref-text "Bonjour, comment allez-vous?"
 
+# Voice cloning with automatic reference transcription
+python speech_client.py \
+--text "hello" \
+--ref-audio /path/to/ref_audio.wav
+
 # Style instruction (voice design-style control)
 python speech_client.py \
 --text "Bonjour, comment allez-vous?" \
@@ -770,6 +776,23 @@ python speech_client.py --text "Hello, how are you?" --seed 42
 ```
 
 The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`, `--seed`, and `--output`.
+
+### Reference audio and output processing
+
+The explicit `--ref-text` path avoids Whisper. With the default config, missing `ref_text` loads `openai/whisper-large-v3-turbo` on the worker device during the first request that needs transcription. Set `load_asr_on_startup: true` in `additional_config.omnivoice_asr` to move that load to worker startup. Set `asr_device` in the same block to choose another GPU or the CPU.
+
+OmniVoice prepares the reference clip before it transcribes the clip or builds the voice cloning input. It performs these steps:
+
+- It converts the clip to mono and resamples it to 24 kHz.
+- It measures the original root mean square (RMS) level. When the RMS is greater than zero and below `0.1`, it raises the waveform level to `0.1` and keeps the original RMS for output volume control.
+- When `--ref-text` is omitted, it trims a clip longer than 20 seconds at a detected silence. Supplied text skips this special long-audio trim.
+- It removes middle silence and trims silence at both edges whether the transcript is automatic or supplied by the caller.
+- It aligns the sample count down to the audio tokenizer hop size.
+- When `--ref-text` is omitted, it sends the prepared waveform to Whisper.
+- It adds a final period for English text or a Chinese full stop for Chinese text when the reference text has no ending punctuation.
+- It sends the same prepared waveform to the audio tokenizer.
+
+After decoding, OmniVoice applies silence removal, RMS scaling, fades, and padding only to voice-cloning output. Text-only output returns the decoder tensor unchanged. Output audio is mono at 24 kHz.
 
 ## Qwen3-TTS
 
@@ -802,10 +825,10 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 ```
 
 This mode supports local EngineCore stages only; headless or remote stage
-deployments are not supported. Runtime voice upload and deletion are disabled
-with multiple API frontends because their registries are process-local.
-Built-in voices, inline `ref_audio`, and voices restored from `custom_voice_dir`
-at startup are supported.
+deployments are not supported. Built-in voices, inline `ref_audio`, voices
+restored from `custom_voice_dir` at startup, and runtime voice upload and
+deletion are supported: all API frontends share the uploaded-voice directory
+(`SPEAKER_SAMPLES_DIR`).
 
 ### Executor backend
 
@@ -861,9 +884,9 @@ checkpoint. When a request names an uploaded voice, the server infers
 `task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
 CustomVoice speakers and require a CustomVoice checkpoint.
 
-The runtime upload and delete routes require a single API frontend; with
-`--api-server-count > 1`, use inline `ref_audio` or restore precomputed voices
-from `custom_voice_dir` at startup.
+Uploaded voices live in `SPEAKER_SAMPLES_DIR`; with `--api-server-count > 1`
+every API process shares that directory, so a voice uploaded or deleted through
+one process is used or rejected consistently by all of them.
 
 ### Precomputed custom voices
 

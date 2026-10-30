@@ -34,6 +34,7 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
         model_config=SimpleNamespace(hf_config=SimpleNamespace(), multimodal_config=None, model_stage="llm")
     )
     wrapper = MiniCPMO45OmniForConditionalGeneration(vllm_config=config)
+    assert wrapper.omni_pooler_payload_include_hidden
     hidden = torch.randn(2, 4)
     wrapper.thinker.forward = MagicMock(return_value=hidden)
     token_buffer = torch.tensor([99692, 3837, 0, 0])
@@ -57,6 +58,7 @@ def test_multimodal_runner_preserves_forwarded_token_identities(monkeypatch):
     # profiling. It must retain the existing embeddings-only input path.
     config.model_config.model_stage = "tts"
     runner.model = MiniCPMO45OmniForConditionalGeneration(vllm_config=config)
+    assert not runner.model.omni_pooler_payload_include_hidden
     talker_ids, talker_embeds = GPUModelRunner._prepare_mm_inputs(runner, 2)
     assert talker_ids is None
     torch.testing.assert_close(talker_embeds, embed_buffer[:2])

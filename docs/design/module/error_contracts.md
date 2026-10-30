@@ -68,6 +68,18 @@ This document owns semantic classification, fatal versus request-scoped
 failure, cross-process error context, compatibility policy, sanitization, and
 offline, HTTP, SSE, WebSocket, and asynchronous-job rendering rules.
 
+For ordinary requests, an EngineCore multimodal cache miss carries the missing
+hashes internally until the owning sender cache is invalidated. The frontend
+raises vLLM's `RetryableRequestError`, preserving `ServiceUnavailableError`
+with code 503 in HTTP and SSE responses. Cache feedback for cancelled requests
+is applied without failing an unrelated request; other engine errors keep their
+existing classification.
+
+Offline generation discards non-fatal request-scoped errors whose requests
+are no longer registered, including queued errors from an aborted batch.
+Global errors and fatal errors still propagate, even when a fatal error
+names a request that has already been removed.
+
 `engine/messages.py` remains primarily owned by the I/O contract; this page
 owns the semantics of its error fields. Route and serving files remain
 primarily owned by `entrypoints.md`; this page owns their rendering

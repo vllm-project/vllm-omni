@@ -21,6 +21,10 @@ logger = init_logger(__name__)
 
 COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION = (0, 1)
 COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
+COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE = (
+    "Follow the {hint_names} control video precisely: shape, contour, silhouette, position, and motion of every "
+    "visible structure must align with the {hint_names} signal at every frame."
+)
 # Mirrors the WAN VAE's temporal compression. Authoritative value is
 # ``self.vae.config.scale_factor_temporal`` at runtime; this constant exists so
 # off-line / API code that runs before the pipeline is constructed can compute

@@ -9,12 +9,15 @@ import asyncio
 import time as _time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.output_processor import RequestState
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.config.watermarking import ALGORITHM_KEY, WatermarkConfig
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
@@ -23,13 +26,14 @@ from vllm_omni.distributed.omni_coordinator import (
     ReplicaStatus,
 )
 from vllm_omni.distributed.omni_coordinator.load_balancer import Task
+from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt, OmniSamplingParams
 from vllm_omni.metrics import (
     count_audio_frames,
     count_image_pixels,
@@ -42,6 +46,9 @@ from vllm_omni.metrics.utils import (
     coerce_positive_int_scalar,
     iter_mm_outputs,
 )
+from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.watermarking import WATERMARKER_REGISTRY, Watermarker
+from vllm_omni.watermarking.utils import watermark_outputs
 
 if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
@@ -97,6 +104,28 @@ class StagePool:
     ``range(pool.num_replicas)`` to skip the gaps.
     """
 
+    _watermarker_registry: ClassVar[Mapping[str, Mapping[str, type[Watermarker]]]] = WATERMARKER_REGISTRY
+
+    @classmethod
+    def initialize_watermarkers(
+        cls,
+        final_output_type: str | None,
+        watermark_config: WatermarkConfig | None,
+    ) -> dict[str, Watermarker]:
+        """Construct configured watermarkers for a logical stage."""
+        watermarkers: dict[str, Watermarker] = {}
+
+        if watermark_config is None:
+            return watermarkers
+
+        for modality, watermarker_types in cls._watermarker_registry.items():
+            config = watermark_config.modalities.get(modality)
+            if config is not None and modality == final_output_type:
+                # Algorithm already validated by WatermarkConfig, no need to do it again here
+                watermarkers[modality] = watermarker_types[cast(str, config[ALGORITHM_KEY])]()
+                logger.info("Initialized watermarker for modality %s", modality)
+        return watermarkers
+
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
     # A replica that dies mid-release never answers; without a bound its background release never finishes.
@@ -124,6 +153,8 @@ class StagePool:
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
+        watermarkers: Mapping[str, Watermarker] | None = None,
+        strict_watermarking: bool = False,
     ) -> None:
         if isinstance(clients, list):
             normalized_clients: list[StagePoolClient] = list(clients)
@@ -146,6 +177,9 @@ class StagePool:
         # and the task sending them (also the strong reference keeping it alive).
         self._pending_releases: dict[int, dict[str, None]] = {}
         self._release_flushers: dict[int, asyncio.Task[None]] = {}
+        self._watermarkers = watermarkers if watermarkers is not None else {}
+        self._strict_watermarking = strict_watermarking
+        self._watermark_lock = asyncio.Lock()
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
@@ -157,6 +191,8 @@ class StagePool:
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
         self._audio_frames_by_request: dict[str, int] = {}
         self._audio_sample_rate_by_request: dict[str, int] = {}
+        # Tracks which requests should apply watermarking
+        self._request_watermarking: dict[str, bool] = {}
 
         # Distributed-mode state. Populated by add_client / remove_client.
         self._addr_to_replica_id: dict[str, int] = {}
@@ -480,6 +516,26 @@ class StagePool:
 
     # ---- Legacy (non-distributed) route binding ----
 
+    def bind_request_to_replica(self, request_id: str, replica_id: int) -> int:
+        """Bind a real request to a required local replica, without selecting a fallback.
+
+        Call before input preprocessing or sender metadata construction, then
+        pass the same pin to submission to recheck availability. Session
+        reservations belong to the duplex placement owner, not this ledger.
+        """
+        if self._hub is not None or self._lb is not None:
+            raise StageUnavailableError("pinned replica routing is only supported for local stage pools")
+        if not self.is_replica_available(replica_id):
+            raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is unavailable")
+        bound = self.get_bound_replica_id(request_id)
+        if bound is not None and bound != replica_id:
+            raise StageUnavailableError(
+                f"stage {self.stage_id} request {request_id} is bound to replica {bound}, "
+                f"conflicting with pinned replica {replica_id}"
+            )
+        self._request_bindings[request_id] = replica_id
+        return replica_id
+
     def get_bound_replica_id(self, request_id: str) -> int | None:
         """Return the currently bound replica id for *request_id* if present.
 
@@ -543,6 +599,7 @@ class StagePool:
         """Drop the route binding for *request_id* in this stage."""
         self._request_bindings.pop(request_id, None)
         self._affinity.pop(request_id, None)
+        self._request_watermarking.pop(request_id, None)
         self._output_timestamps_by_request.pop(str(request_id), None)
         self._non_empty_first_output_timestamps_by_request.pop(str(request_id), None)
         self._audio_frames_by_request.pop(str(request_id), None)
@@ -768,6 +825,11 @@ class StagePool:
         stage_metrics.vllm_tpot_ms = float(native_text_metrics.get("vllm_tpot_ms") or 0.0)
         stage_metrics.vllm_itl_ms = float(native_text_metrics.get("vllm_itl_ms") or 0.0)
         stage_metrics.vllm_itls_ms = list(native_text_metrics.get("vllm_itls_ms") or [])
+        # An absent key means the phase was not observed; keep it None, not 0.
+        stage_metrics.vllm_queued_ms = native_text_metrics.get(defs.VLLM_QUEUED_MS)
+        stage_metrics.vllm_prefill_ms = native_text_metrics.get(defs.VLLM_PREFILL_MS)
+        stage_metrics.vllm_decode_ms = native_text_metrics.get(defs.VLLM_DECODE_MS)
+        stage_metrics.vllm_num_preemptions = native_text_metrics.get(defs.VLLM_NUM_PREEMPTIONS)
         return stage_metrics
 
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
@@ -857,7 +919,7 @@ class StagePool:
 
     def _infer_audio_sample_rate(
         self,
-        mm_output: dict[str, Any] | None = None,
+        mm_output: Mapping[str, Any] | None = None,
         *,
         use_default: bool = True,
     ) -> int:
@@ -1007,6 +1069,11 @@ class StagePool:
             if self._audio_sample_rate_by_request.get(rid, 0) <= 0 and audio_sample_rate > 0:
                 self._audio_sample_rate_by_request[rid] = audio_sample_rate
 
+    def maybe_update_watermarking_state(self, request_id: str, params: OmniSamplingParams | PoolingParams) -> None:
+        should_watermark = not isinstance(params, PoolingParams) and params.watermarking is not False
+        if self._watermarkers:
+            self._request_watermarking[request_id] = should_watermark
+
     # ---- Stage-local admission ----
 
     async def submit_initial(
@@ -1017,6 +1084,7 @@ class StagePool:
         *,
         prompt_text: Any = None,
         affinity_request_id: str | None = None,
+        pinned_replica_id: int | None = None,
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
         expected_replica_id: int | None = None,
@@ -1036,18 +1104,25 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
+            if pinned_replica_id is not None:
+                replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+            else:
+                replica_id = await self._pick_or_select(
+                    request_id,
+                    affinity_request_id=affinity_request_id,
+                )
+            client = self._diffusion_client(replica_id)
+            self.maybe_update_watermarking_state(request_id, params)
+            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            return replica_id
+
+        if pinned_replica_id is not None:
+            replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+        else:
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
-            client = self._diffusion_client(replica_id)
-            await client.add_request_async(request_id, request, params, **submit_kwargs)
-            return replica_id
-
-        replica_id = await self._pick_or_select(
-            request_id,
-            affinity_request_id=affinity_request_id,
-        )
         # A request whose multimodal cache keys name a replica must not move: that
         # replica's sender-cache entries may omit media the new one never received.
         if expected_replica_id is not None and replica_id != expected_replica_id:
@@ -1056,9 +1131,9 @@ class StagePool:
                 f"stage {self.stage_id} replica {expected_replica_id} keyed by {request_id} became "
                 "unavailable before submit"
             )
-        client = self.clients[replica_id]
-        if client is None:
+        if self.clients[replica_id] is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        self.maybe_update_watermarking_state(request_id, params)
         try:
             self.output_processor.add_request(
                 request=request,
@@ -1073,19 +1148,33 @@ class StagePool:
 
         try:
             await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
-        except Exception:
-            self.release_binding(request_id)
-            rollback = getattr(self.output_processor, "remove_request", None)
-            if callable(rollback):
-                try:
-                    rollback(request_id)
-                except Exception as rollback_error:
-                    logger.warning(
-                        "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                        request_id,
-                        self.stage_id,
-                        rollback_error,
-                    )
+        except BaseException:
+            # Sending can fail or be cancelled after the engine accepted the
+            # request. Abort while its replica binding is still available.
+            try:
+                await self.abort_requests([request_id])
+            except (Exception, asyncio.CancelledError) as abort_error:
+                # Keep routing and processor state so owner cleanup can retry.
+                # A second cancellation must not replace the submission error.
+                logger.warning(
+                    "[StagePool] Failed to abort rejected submission for req=%s stage-%s: %r",
+                    request_id,
+                    self.stage_id,
+                    abort_error,
+                )
+            else:
+                self.release_binding(request_id)
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    try:
+                        rollback(request_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                            request_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
             raise
         return replica_id
 
@@ -1096,6 +1185,7 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
+        pinned_replica_id: int | None = None,
         submit_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
@@ -1103,14 +1193,20 @@ class StagePool:
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
-        replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None or self.clients[replica_id] is None:
-            replica_id = await self._pick_or_select(request_id)
+        if pinned_replica_id is not None:
+            replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+        else:
+            bound_replica_id = self.get_bound_replica_id(request_id)
+            if bound_replica_id is None or self.clients[bound_replica_id] is None:
+                replica_id = await self._pick_or_select(request_id)
+            else:
+                replica_id = bound_replica_id
 
         client = self.clients[replica_id]
         if client is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
+        self.maybe_update_watermarking_state(request_id, params)
         if self.stage_type == "diffusion":
             if isinstance(request, list):
                 raise ValueError(
@@ -1226,11 +1322,14 @@ class StagePool:
             return []
         client = cast(StagePoolLLMClient, raw_client)
         processor = self.output_processor
+        watermark_failed_request_ids = await self._process_watermark_outputs(raw_outputs.outputs)
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
             iteration_stats,
         )
+        if self._watermarkers:
+            self._discard_completed_llm_watermark_state(raw_outputs.outputs, processor.request_states)
         # Use the same wall-clock source as OrchestratorRequestState.stage_submit_ts.
         # EngineCoreOutputs.timestamp may use a different clock base, which would
         # make TTFO negative and get clamped to 0.
@@ -1238,10 +1337,21 @@ class StagePool:
 
         if processed.reqs_to_abort:
             await client.abort_requests_async(processed.reqs_to_abort)
+            if self._watermarkers:
+                async with self._watermark_lock:
+                    self._discard_watermark_state(processed.reqs_to_abort)
 
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)
 
+        if watermark_failed_request_ids:
+            # Replace outputs that could not be watermarked with terminal errors
+            request_outputs = [
+                output for output in processed.request_outputs if output.request_id not in watermark_failed_request_ids
+            ]
+            return request_outputs + [
+                self._watermark_error_output(request_id) for request_id in watermark_failed_request_ids
+            ]
         return processed.request_outputs
 
     async def poll_llm_raw_output(
@@ -1283,6 +1393,64 @@ class StagePool:
             return None
         return cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
 
+    def _discard_completed_llm_watermark_state(
+        self,
+        outputs: list[Any],
+        request_states: Mapping[str, RequestState],
+    ) -> None:
+        """Discard watermark state for completed LLM requests."""
+        request_ids = [
+            output.request_id
+            for output in outputs
+            if isinstance(output, OmniEngineCoreOutput) and output.request_id not in request_states
+        ]
+        self._discard_watermark_state(request_ids)
+
+    def _should_watermark(self, request_id: str) -> bool:
+        """Indicates whether a given request should watermark or not."""
+        if request_id in self._request_watermarking:
+            return self._request_watermarking[request_id]
+        if self.get_bound_replica_id(request_id) is not None:
+            raise RuntimeError(f"Missing watermarking state for active request {request_id}")
+        return False
+
+    async def _process_watermark_outputs(self, outputs: list[Any]) -> set[str]:
+        """Watermark outputs off-loop while serializing state access.
+
+        Returns the request ids that must fail because their outputs could not be
+        watermarked in strict mode. If we aren't running in strict mode, return the
+        empty set, since we'll just keep the unwatermarked outputs.
+        """
+        watermark_failed_request_ids: set[str] = set()
+        if self._watermarkers and (
+            outputs := [output for output in outputs if self._should_watermark(output.request_id)]
+        ):
+            async with self._watermark_lock:
+                worker = asyncio.create_task(asyncio.to_thread(watermark_outputs, outputs, self._watermarkers))
+                try:
+                    watermark_failed_request_ids = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    await worker
+                    raise
+        return watermark_failed_request_ids if self._strict_watermarking else set()
+
+    @staticmethod
+    def _watermark_error_output(request_id: str) -> OmniRequestOutput:
+        """Build the terminal error output for a request that failed strict watermarking."""
+        return OmniRequestOutput.from_error(request_id, "Failed to watermark output")
+
+    async def process_diffusion_output(self, output: OmniRequestOutput) -> OmniRequestOutput:
+        """Watermark one diffusion output without blocking the event loop."""
+        if await self._process_watermark_outputs([output]):
+            return self._watermark_error_output(output.request_id)
+        return output
+
+    def _discard_watermark_state(self, request_ids: list[str]) -> None:
+        """Discard retained watermark state for the given requests."""
+        for watermarker in self._watermarkers.values():
+            for request_id in request_ids:
+                watermarker.discard_request_state(request_id)
+
     # ---- Stage-local control plane ----
 
     async def abort_requests(self, request_ids: list[str]) -> list[tuple[str, Any]]:
@@ -1302,12 +1470,13 @@ class StagePool:
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
             replica_id = self.get_bound_replica_id(request_id)
-            if replica_id is None or self.clients[replica_id] is None:
+            if replica_id is None:
                 logger.debug("[StagePool] abort: no live binding for req=%s in stage-%s", request_id, self.stage_id)
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
         abort_outputs: list[tuple[str, Any]] = []
+        watermark_abort_ids: list[str] = []
         is_diffusion = self.stage_type == "diffusion"
         for replica_id, replica_request_ids in request_ids_by_replica.items():
             # Orchestrator ids are OP external ids; EngineCore may use a
@@ -1336,14 +1505,20 @@ class StagePool:
                     aborted = self._output_processor.abort_requests(replica_request_ids, internal=False)
                     if aborted:
                         engine_abort_ids = list(aborted)
+            watermark_abort_ids.extend(engine_abort_ids)
             client = self.clients[replica_id]
-            if client is None:
-                continue
-            await client.abort_requests_async(engine_abort_ids)
+            if client is not None:
+                await client.abort_requests_async(engine_abort_ids)
+            # An evicted engine cannot produce further output. Release its
+            # retained processor state without sending another abort RPC.
             if not is_diffusion and self._output_processor is not None:
                 commit = getattr(self._output_processor, "commit_aborted_request_state", None)
                 if callable(commit):
                     commit(replica_request_ids, internal=False)
+
+        if self._watermarkers:
+            async with self._watermark_lock:
+                self._discard_watermark_state(watermark_abort_ids)
 
         return abort_outputs
 

@@ -18,13 +18,14 @@ one private pool; a replay's results stay valid until the next replay.
 from __future__ import annotations
 
 import math
-import weakref
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 import torch
 from vllm.logger import init_logger
+
+from vllm_omni.utils.cuda_stream import create_cuda_stream
 
 from .cuda_graph_wrapper import _graph_api, _graph_execution_context
 from .encoder_graph import NPUEncoderGraphRunners
@@ -58,35 +59,13 @@ def _precision_state() -> tuple[object, ...]:
     )
 
 
-def _new_capture_stream(device):
-    # torch.cuda.Stream() draws from a round-robin pool: retaining the Python
-    # object does not prevent another graph from capturing on the same stream.
-    # PyTorch reset() clears cuBLAS workspaces for the entire capture stream,
-    # including workspaces still referenced by other graphs. Own a CUDA stream
-    # outside that pool so retiring one slot cannot invalidate a live peer.
-    from cuda.bindings import runtime
-
-    from vllm_omni.platforms import current_omni_platform
-
-    previous_device = current_omni_platform.current_device()
-    current_omni_platform.set_device(device)
-    try:
-        error, handle = runtime.cudaStreamCreateWithFlags(runtime.cudaStreamNonBlocking)
-        if error != runtime.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"Cannot create Code2Wav capture stream: {error}")
-        stream = torch.cuda.ExternalStream(int(handle), device=device)
-    finally:
-        current_omni_platform.set_device(torch.device(device.type, previous_device))
-    weakref.finalize(stream, runtime.cudaStreamDestroy, handle)
-    return stream
-
-
 class FlowEncoderGraphs:
     """Shared-arena continuation graphs and exact-shape CUDA/NPU fallback.
 
     ``encode_fn(tokens, cnn_cache=, att_cache=)`` supplies the continuation
     body. ``chunk_forward`` additionally accepts ``last_chunk`` for generic
-    calls. Startup capture freezes admission; unseen shapes then run eager.
+    calls. Startup capture freezes admission by default; opt-in exact-shape capture
+    can retain repeated tail and prompt shapes in a separate bounded cache.
 
     Caches use the encoder layouts: ``cnn_cache`` ``(rows, channels, width)``,
     ``att_cache`` ``(depth, rows, heads, frames, 2 * head_dim)``; a chunk of
@@ -106,6 +85,7 @@ class FlowEncoderGraphs:
         held_tensors: Callable[[], Sequence[torch.Tensor]] = tuple,
         max_graphs: int = 8,
         capture_after: int = 2,
+        capture_after_precapture: bool = False,
         eager_min_batch: int | None = None,
         chunk_forward: Callable | None = None,
     ) -> None:
@@ -135,7 +115,8 @@ class FlowEncoderGraphs:
         self.eager_min_batch = None if eager_min_batch is None else int(eager_min_batch)
         if self.eager_min_batch is not None and self.eager_min_batch < 1:
             raise ValueError("encoder graph eager_min_batch must be >= 1")
-        # Startup precapture turns this off so serving only replays those graphs.
+        # Keep runtime capture opt-in after the shared continuation arena is ready.
+        self.capture_after_precapture = bool(capture_after_precapture)
         self.capture_on_request = True
         self.exact_graphs = {}
         self.seen = OrderedDict()
@@ -180,7 +161,7 @@ class FlowEncoderGraphs:
             self._capture_stream = (
                 api.Stream(device=device)
                 if device.type == "npu" or torch.version.hip is not None
-                else _new_capture_stream(device)
+                else create_cuda_stream(device)
             )
         side = self._capture_stream
         side.wait_stream(current)
@@ -630,7 +611,7 @@ class FlowEncoderGraphs:
         if existing is not None and existing[0] == device:
             return existing[1]
         pool = torch.cuda.graph_pool_handle()
-        stream = _new_capture_stream(device)
+        stream = create_cuda_stream(device)
         static = torch.zeros(1, device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):

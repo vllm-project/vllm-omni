@@ -42,6 +42,11 @@ lists `path:line` findings, but keeps the same confidence and severity bar.
 
 ## Reference guide
 
+Before reviewing, read the relevant entries in
+[Review and issue lessons](../../../docs/contributing/ci/lessons.md). Verify their
+linked evidence against the current diff and revision; historical examples are
+not proof of a new defect.
+
 Load references in review order: process, one primary module contract, matching
 feature designs, evidence checks, then delivery. Every file is linked directly
 below; do not load unrelated module references.

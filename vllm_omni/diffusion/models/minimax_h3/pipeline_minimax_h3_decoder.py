@@ -18,8 +18,10 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import resolve_minimax_h3_partition
 
+from .latent_cache import trim_decoded_overlap
 from .pipeline_minimax_h3 import (
     MiniMaxH3Pipeline,
+    _MiniMaxH3EncodedOutput,
     _prepare_minimax_h3_video_output,
     get_minimax_h3_post_process_func,
 )
@@ -106,6 +108,7 @@ class MiniMaxH3DecoderPipeline(
             raise OmniClientError("MiniMax H3 decoder supports one request at a time")
         payload = request.prompts[0]["additional_information"]["minimax_h3_decode"]
         videos, audios = [], []
+        frame_counts = []
         for video_latent, audio_latent in zip(payload["video_latents"], payload["audio_latents"], strict=True):
             video_latent = video_latent.to(self.device)
             audio_latent = audio_latent.to(self.device)
@@ -118,11 +121,16 @@ class MiniMaxH3DecoderPipeline(
                         width=payload["width"],
                         video_codec_options=payload["video_codec_options"],
                         batch_frames=payload["preencode_batch_frames"],
+                        frame_counts=frame_counts,
+                        trim=payload.get("trim"),
                     )
                 )
                 audios.append(None)
             else:
                 video, audio = self.decode(video_latent, audio_latent, height=payload["height"], width=payload["width"])
+                if payload.get("trim") is not None:
+                    # A continuation's hidden overlap was decoded only as causal context.
+                    video, audio = trim_decoded_overlap(video, audio, **payload["trim"])
                 video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
                 videos.append(video)
                 audios.append(audio)
@@ -136,7 +144,9 @@ class MiniMaxH3DecoderPipeline(
             video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
             audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
-            output=(video, audio),
+            output=(
+                _MiniMaxH3EncodedOutput(video=video, frame_counts=frame_counts) if frame_counts else (video, audio)
+            ),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )

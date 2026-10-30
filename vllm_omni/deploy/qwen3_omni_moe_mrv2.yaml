@@ -10,8 +10,9 @@
 # When the stages share one GPU, run them under NVIDIA MPS (see
 # docs/configuration/stage_configs.md); startup warns when no MPS server is found.
 #
-# MRv2 downstream stages support turn-based sessions only: realtime (resumable)
-# requests and duplex sessions need the V1 chunk adapter.
+# Turn-based sessions use this profile. Duplex sessions use
+# qwen3_omni_duplex_mrv2.yaml. Resumable streaming input uses the V1 chunk
+# adapter.
 base_config: qwen3_omni_moe.yaml
 
 connectors:
@@ -34,6 +35,8 @@ connectors:
 stages:
   - stage_id: 0
     model_runner: v2
+    # The base profile's Thinker prefix cache is validated on V1 only.
+    enable_prefix_caching: false
   - stage_id: 1
     model_runner: v2
   - stage_id: 2

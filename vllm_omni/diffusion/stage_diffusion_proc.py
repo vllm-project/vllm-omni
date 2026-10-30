@@ -15,6 +15,7 @@ import multiprocessing.connection
 import signal
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -29,7 +30,6 @@ from vllm.v1.engine.utils import (
     CoreEngine,
     CoreEngineLaunch,
     EngineZmqAddresses,
-    wait_for_engine_startup,
 )
 from vllm.v1.utils import shutdown
 
@@ -44,6 +44,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackEncoder,
 )
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.engine.stage_init_deadline import wait_for_engine_startup_with_deadline
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -73,6 +74,7 @@ class StageDiffusionProc:
     """
 
     DIFFUSION_PROC_DEAD = b"DIFFUSION_PROC_DEAD"
+    _DEAD_SENTINEL_SEND_TIMEOUT_S = 5.0
 
     def __init__(self, model: str, od_config: OmniDiffusionConfig) -> None:
         self._model = model
@@ -80,15 +82,17 @@ class StageDiffusionProc:
         self._engine: DiffusionEngine | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
-        # Set by ``run_loop`` to the live dispatch task dict so
+        # Set by ``_run_loop`` to the live dispatch task dict so
         # :attr:`queue_length` can report in-flight requests for the
         # OmniCoordinator heartbeat hook.
         self._active_tasks: dict[str, asyncio.Task] | None = None
         # Set when a request-handler detects that the engine's multiproc
         # executor has died (e.g. a worker process crashed and the executor's
-        # monitor thread closed it). Once set, ``run_loop`` breaks out so the
-        # outer ``except``/``finally`` can send ``DIFFUSION_PROC_DEAD`` and
-        # ``ReplicaStatus.DOWN``, then the subprocess exits non-zero. Without
+        # monitor thread closed it). Once set, ``_run_loop`` raises and its
+        # ``except`` sends ``DIFFUSION_PROC_DEAD`` *before* its ``finally``
+        # drains ``rpc_task`` (which may wait on a blocked executor RPC
+        # thread); ``run_loop`` then releases the sockets and the subprocess
+        # exits non-zero. Keep that notify-before-drain order. Without
         # this, the run_loop would swallow per-request errors and keep
         # serving 500s indefinitely while heartbeats still report UP.
         self._fatal_event: asyncio.Event | None = None
@@ -261,17 +265,34 @@ class StageDiffusionProc:
         LoRA methods remap arguments and post-process results to match
         the contract that ``AsyncOmni`` provides.
         """
+        # Feedback only changes condition-protected host state and must not
+        # wait behind an executor RPC for the current GPU chunk.
+        if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
+            assert self._engine is not None
+            return getattr(self._engine, method)(*args, **(kwargs or {}))
+
         loop = asyncio.get_running_loop()
 
+        async def run_executor(method: Callable[..., Any], *method_args: Any) -> Any:
+            """Finish a worker-thread RPC before propagating task cancellation."""
+            future = loop.run_in_executor(self._executor, method, *method_args)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # Cancelling the asyncio wrapper does not cancel the thread.
+                # Drain the shielded future before run_loop closes the engine
+                # and executor, so teardown cannot race a live collective RPC.
+                try:
+                    await asyncio.shield(future)
+                except BaseException:
+                    pass
+                raise
+
         if method == "profile":
+            assert self._engine is not None
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
-            return await loop.run_in_executor(
-                self._executor,
-                self._engine.profile,
-                is_start,
-                profile_prefix,
-            )
+            return await run_executor(partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})))
 
         if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.
@@ -281,8 +302,7 @@ class StageDiffusionProc:
 
                 if not isinstance(lora_request, LoRARequest):
                     lora_request = msgspec.convert(lora_request, LoRARequest)
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "add_lora",
                 timeout,
@@ -293,8 +313,7 @@ class StageDiffusionProc:
             return all(results) if isinstance(results, list) else results
 
         if method == "remove_lora":
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "remove_lora",
                 timeout,
@@ -305,8 +324,7 @@ class StageDiffusionProc:
             return all(results) if isinstance(results, list) else results
 
         if method == "list_loras":
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "list_loras",
                 timeout,
@@ -323,8 +341,7 @@ class StageDiffusionProc:
 
         if method == "pin_lora":
             lora_id = args[0] if args else kwargs.get("adapter_id")
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "pin_lora",
                 timeout,
@@ -336,8 +353,7 @@ class StageDiffusionProc:
 
         # Fall back to DiffusionEngine.collective_rpc for all other methods
         # (e.g. worker extension RPCs like "test_extension_name").
-        return await loop.run_in_executor(
-            self._executor,
+        return await run_executor(
             self._engine.collective_rpc,
             method,
             timeout,
@@ -357,12 +373,63 @@ class StageDiffusionProc:
     ) -> None:
         """Async event loop handling ZMQ messages from StageDiffusionClient."""
         ctx = zmq.asyncio.Context()
+        request_socket: zmq.asyncio.Socket | None = None
+        response_socket: zmq.asyncio.Socket | None = None
+        response_connected = False
+        dead_notified = False
 
-        request_socket = ctx.socket(zmq.PULL)
-        request_socket.connect(request_address)
+        async def notify_client_dead() -> None:
+            # Send the death sentinel so the client can detect the fatal
+            # failure promptly (mirrors EngineCoreProc._send_engine_dead).
+            # A PUSH socket without a connected peer blocks on send, so skip
+            # the sentinel in that case and bound the send so a stuck client
+            # cannot hang teardown.
+            nonlocal dead_notified
+            if dead_notified or not response_connected or response_socket is None:
+                return
+            dead_notified = True
+            try:
+                response_socket.setsockopt(zmq.LINGER, 4000)
+                await asyncio.wait_for(
+                    response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD),
+                    timeout=StageDiffusionProc._DEAD_SENTINEL_SEND_TIMEOUT_S,
+                )
+            except Exception:
+                logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
+                # The client is not draining responses; do not let close()
+                # linger flushing queued messages past the send timeout.
+                response_socket.setsockopt(zmq.LINGER, 0)
 
-        response_socket = ctx.socket(zmq.PUSH)
-        response_socket.connect(response_address)
+        try:
+            request_socket = ctx.socket(zmq.PULL)
+            response_socket = ctx.socket(zmq.PUSH)
+            # Connect the response side first so a request-side connect
+            # failure can still be reported to the client.
+            response_socket.connect(response_address)
+            response_connected = True
+            request_socket.connect(request_address)
+            await self._run_loop(request_socket, response_socket, notify_client_dead)
+        except Exception:
+            # Covers connect and loop initialization failures; dispatch
+            # failures have already notified the client inside _run_loop.
+            await notify_client_dead()
+            raise
+        finally:
+            self._active_tasks = None
+            self._fatal_event = None
+            if request_socket is not None:
+                request_socket.close()
+            if response_socket is not None:
+                response_socket.close()
+            ctx.term()
+
+    async def _run_loop(
+        self,
+        request_socket: zmq.asyncio.Socket,
+        response_socket: zmq.asyncio.Socket,
+        notify_client_dead: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Initialize and dispatch requests within the transport lifetime."""
 
         encoder = OmniMsgpackEncoder()
         decoder = OmniMsgpackDecoder()
@@ -455,6 +522,50 @@ class StageDiffusionProc:
             finally:
                 tasks.pop(request_id, None)
 
+        async def _dispatch_rpc(msg: dict[str, Any]) -> None:
+            rpc_id = msg["rpc_id"]
+            try:
+                result = await self._handle_collective_rpc(
+                    msg["method"],
+                    msg.get("timeout"),
+                    tuple(msg.get("args", ())),
+                    msg.get("kwargs", {}),
+                )
+                await response_socket.send(
+                    encoder.encode(
+                        {
+                            "type": "rpc_result",
+                            "rpc_id": rpc_id,
+                            "result": result,
+                        }
+                    )
+                )
+            except Exception as e:
+                logger.exception("Collective RPC %s failed: %s", msg["method"], e)
+                await response_socket.send(
+                    encoder.encode(
+                        {
+                            "type": "error",
+                            "rpc_id": rpc_id,
+                            "error": str(e),
+                        }
+                    )
+                )
+                # Collective RPCs run through the same multiproc
+                # executor — a closed executor means every future
+                # RPC fails the same way, so tear down promptly.
+                if self._is_executor_dead():
+                    self._signal_fatal_engine_failure(f"collective_rpc {msg['method']} (rpc_id={rpc_id}): {e!s}")
+
+        rpc_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
+
+        async def _rpc_worker() -> None:
+            while True:
+                await _dispatch_rpc(await rpc_queue.get())
+
+        # Preserve ordinary RPC order while recv handles playback and aborts.
+        rpc_task = asyncio.create_task(_rpc_worker(), name="diffusion-rpc-worker")
+
         try:
             while True:
                 # Await recv and fatal_event concurrently so the loop wakes
@@ -464,7 +575,7 @@ class StageDiffusionProc:
                 fatal_task: asyncio.Task = asyncio.ensure_future(fatal_event.wait())
                 try:
                     done, pending = await asyncio.wait(
-                        [recv_task, fatal_task],
+                        [recv_task, fatal_task, rpc_task],
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 finally:
@@ -473,6 +584,8 @@ class StageDiffusionProc:
                             waiter.cancel()
                             with contextlib.suppress(asyncio.CancelledError, Exception):
                                 await waiter
+                if rpc_task in done:
+                    await rpc_task
                 if fatal_event.is_set():
                     raise RuntimeError(
                         "StageDiffusionProc executor reported permanent failure; tearing down the diffusion subprocess."
@@ -502,66 +615,40 @@ class StageDiffusionProc:
                         self._engine.abort(rid)
 
                 elif msg_type == "collective_rpc":
-                    rpc_id = msg["rpc_id"]
-                    try:
-                        result = await self._handle_collective_rpc(
-                            msg["method"],
-                            msg.get("timeout"),
-                            tuple(msg.get("args", ())),
-                            msg.get("kwargs", {}),
-                        )
-                        await response_socket.send(
-                            encoder.encode(
-                                {
-                                    "type": "rpc_result",
-                                    "rpc_id": rpc_id,
-                                    "result": result,
-                                }
-                            )
-                        )
-                    except Exception as e:
-                        logger.exception("Collective RPC %s failed: %s", msg["method"], e)
-                        await response_socket.send(
-                            encoder.encode(
-                                {
-                                    "type": "error",
-                                    "rpc_id": rpc_id,
-                                    "error": str(e),
-                                }
-                            )
-                        )
-                        # Collective RPCs run through the same multiproc
-                        # executor — a closed executor means every future
-                        # RPC fails the same way, so tear down promptly.
-                        if self._is_executor_dead():
-                            self._signal_fatal_engine_failure(
-                                f"collective_rpc {msg['method']} (rpc_id={rpc_id}): {e!s}"
+                    if msg["method"] in (
+                        "update_streaming_playback",
+                        "track_streaming_interaction",
+                        "release_streaming_output",
+                    ):
+                        await _dispatch_rpc(msg)
+                    else:
+                        try:
+                            rpc_queue.put_nowait(msg)
+                        except asyncio.QueueFull:
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "error",
+                                        "rpc_id": msg["rpc_id"],
+                                        "error": "Too many pending collective RPCs",
+                                    }
+                                )
                             )
 
                 elif msg_type == "shutdown":
                     break
 
         except Exception:
-            # Send the death sentinel so the client can detect the
-            # fatal failure promptly (mirrors EngineCoreProc._send_engine_dead).
-            try:
-                response_socket.setsockopt(zmq.LINGER, 4000)
-                await response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD)
-            except Exception:
-                logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
+            # Notify before draining rpc_task: cancelling it waits for any
+            # in-flight executor RPC thread, which may block for a long time.
+            await notify_client_dead()
             raise
 
         finally:
+            rpc_task.cancel()
             for task in tasks.values():
                 task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-            self._active_tasks = None
-            self._fatal_event = None
-            request_socket.close()
-            response_socket.close()
-            ctx.term()
+            await asyncio.gather(rpc_task, *tasks.values(), return_exceptions=True)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -827,7 +914,7 @@ class StageDiffusionProcManager:
     def _wait_until_started(self, handshake_address: str, stage_init_timeout: int) -> None:
         try:
             with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
-                wait_for_engine_startup(
+                wait_for_engine_startup_with_deadline(
                     handshake_socket,
                     [CoreEngine(index=0, local=True)],
                     SimpleNamespace(
@@ -848,6 +935,9 @@ class StageDiffusionProcManager:
                         # during handshake is still detected.
                         watched_frontend_processes=[self.proc],
                     ),
+                    timeout=stage_init_timeout,
+                    kill_processes=lambda: shutdown([self.proc]),
+                    stage_label=f"Diffusion stage process {self.proc.name}",
                 )
         except Exception:
             shutdown([self.proc])

@@ -31,6 +31,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.torch_compile import log_torch_compile_stats
 
 logger = init_logger(__name__)
 
@@ -720,6 +721,8 @@ class CodePredictorWrapper(nn.Module):
 
     ``code_predictor_kv_cache`` (CUDA, opt-in) switches to incremental K/V
     decoding: at large batches the re-prefill FLOPs are not negligible.
+    Eager execution defaults to KV reuse on MPS (except FP16); other
+    eager platforms can opt in. Set false to disable it.
     """
 
     _kv_cache_enabled: bool = False
@@ -900,6 +903,17 @@ class CodePredictorWrapper(nn.Module):
                 self._capture_npu_graphs()
                 logger.info("code_predictor: eager mode + NPU graphs")
             else:
+                cache_config = self._stage_connector_extra_config(self._vllm_config)
+                device = next(self.model.parameters()).device
+                self._kv_cache_enabled = (
+                    not current_omni_platform.is_cuda()
+                    and self._model_dtype != torch.float16
+                    and self._parse_bool_config(cache_config.get("code_predictor_kv_cache", device.type == "mps"))
+                )
+                if self._kv_cache_enabled:
+                    self._compiled_kv_fwd = self.model.forward_cached
+                    self._ensure_kv_steps(device)
+                    logger.info("code_predictor: eager mode + incremental K/V decoding")
                 logger.warning_once("code_predictor: torch.compile disabled")
             return
 
@@ -926,8 +940,9 @@ class CodePredictorWrapper(nn.Module):
                 dynamic=self._short_kv_enabled,
                 options={"epilogue_fusion": False},
             )
-        with torch._dynamo.config.patch(cache_size_limit=self._compile_cache_size_limit()):
-            self._warmup_buckets()
+        with log_torch_compile_stats(logger, "code_predictor"):
+            with torch._dynamo.config.patch(cache_size_limit=self._compile_cache_size_limit()):
+                self._warmup_buckets()
 
         if self._kv_cache_enabled:
             # Fifteen short steps per call: they rely on the runner capturing

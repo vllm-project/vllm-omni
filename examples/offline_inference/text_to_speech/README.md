@@ -27,6 +27,7 @@ list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
+| VibeVoice-1.5B | `vibevoice/VibeVoice-1.5B-hf` | 1 (LLM_AR, eager) | ✓ (optional) | — | offline only; no example script (use `vllm_omni.model_executor.models.vibevoice.prompt`) | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | 2 (AR talker + S2Mel DiT + BigVGAN) | ✓ (required) | — | emotion control (`--emo-audio`, `--emo-text`, `--emo-vector`) | 22.05 kHz |
 | IndexTTS-2.5 | native `checkpoints/` bundle | 2 (AR talker + EnhancedCodec + S2Mel DiT + BigVGAN) | ✓ (required) | — | multilingual (`--lang`) + emotion control | 22.05 kHz |
@@ -43,7 +44,7 @@ python examples/offline_inference/text_to_speech/<model>/end2end.py \
     --ref-text  "Transcript of the reference audio."
 ```
 
-`--ref-audio` and `--ref-text` are optional (text-only synthesis works without them) and must be provided together for voice cloning. The exotic scripts — Qwen3-TTS, Voxtral TTS, CosyVoice3 — accept additional model-specific flags documented in their per-model section below. Qwen3-TTS in particular uses its own argparse surface (`--query-type`, `--audio-path`, etc.) and does not follow the common shape; see its section.
+For most models, `--ref-audio` and `--ref-text` are optional for text-only synthesis but must be provided together for voice cloning. OmniVoice also accepts `--ref-audio` without `--ref-text` and transcribes the reference lazily with Whisper. Qwen3-TTS, Voxtral TTS, and CosyVoice3 accept additional model-specific flags documented in their sections below. Qwen3-TTS uses its own argparse surface with options such as `--query-type` and `--audio-path`, so it does not follow the common command shape.
 
 ---
 
@@ -406,7 +407,7 @@ python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
 
 ## OmniVoice
 
-Zero-shot multilingual TTS supporting 600+ languages, with three modes (auto / clone / design).
+OmniVoice creates speech in more than 600 languages. It supports text-to-speech without a reference clip, voice cloning, and voice design.
 
 ### Prerequisites
 
@@ -414,7 +415,7 @@ Zero-shot multilingual TTS supporting 600+ languages, with three modes (auto / c
 huggingface-cli download k2-fsa/OmniVoice
 ```
 
-Voice cloning requires `transformers>=5.3.0`. Auto and design modes work with `transformers>=4.57.0`.
+Voice cloning requires `transformers>=5.3.0`. Automatic voice and voice design use `transformers>=4.57.0`.
 
 ### Quick start (auto voice)
 
@@ -426,6 +427,8 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 
 ### Voice cloning
 
+With an explicit transcript, voice cloning does not load Whisper:
+
 ```bash
 python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --model k2-fsa/OmniVoice \
@@ -433,6 +436,30 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
     --ref-audio ref.wav \
     --ref-text  "This is the reference transcription."
 ```
+
+Omit `--ref-text` to use automatic transcription. The default OmniVoice deploy config loads Whisper on the worker device when the first request needs it. Set `load_asr_on_startup: true` in `additional_config.omnivoice_asr` to load it during worker startup. Set `asr_device: "cuda:0"` or `asr_device: "cpu"` in the same block to override the worker device:
+
+```bash
+python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
+    --model k2-fsa/OmniVoice \
+    --text "hello" \
+    --ref-audio trump_ref.wav
+```
+
+### Reference audio processing
+
+OmniVoice prepares the reference clip before it transcribes the clip or builds the voice cloning input. It performs these steps:
+
+- It converts the clip to mono and resamples it to 24 kHz.
+- It measures the original root mean square (RMS) level. When the RMS is greater than zero and below `0.1`, it raises the waveform level to `0.1` and keeps the original RMS for output volume control.
+- When `--ref-text` is omitted, it trims a clip longer than 20 seconds at a detected silence.
+- It removes middle silence and trims silence at both edges whether the transcript is automatic or supplied by the caller.
+- It aligns the sample count down to the audio tokenizer hop size.
+- When `--ref-text` is omitted, it sends the prepared waveform to Whisper.
+- It adds a final period for English text or a Chinese full stop for Chinese text when the reference text has no ending punctuation.
+- It sends the same prepared waveform to the audio tokenizer.
+
+After decoding, OmniVoice applies silence removal, RMS scaling, fades, and padding only to voice-cloning output. Text-only output returns the decoder tensor unchanged. Output audio is mono at 24 kHz.
 
 ### Voice design
 
@@ -465,6 +492,11 @@ python examples/offline_inference/text_to_speech/omnivoice/end2end.py \
 
 - Stage 0 (Generator): Qwen3-0.6B with 32-step iterative unmasking.
 - Stage 1 (Decoder): HiggsAudioV2 RVQ + DAC at 24 kHz.
+- The default deploy config uses `openai/whisper-large-v3-turbo` for lazy ASR on
+  the worker device. Set `load_asr_on_startup: true` in `additional_config.omnivoice_asr`
+  to load it during worker startup. Set `asr_device` in the same block to use a
+  different GPU or the CPU. Supplying `--ref-text` avoids ASR.
+- Generated audio remains mono at 24 kHz.
 
 ---
 
@@ -671,7 +703,6 @@ python examples/offline_inference/text_to_speech/indextts2/end2end.py \
     --lang ja \
     --text "こんにちは、音声合成のテストです。" \
     --ref-audio /path/to/reference.wav
-
 ```
 
 ### Emotion control
@@ -788,3 +819,48 @@ python examples/offline_inference/text_to_speech/breeze_tts_2/end2end.py \
 - Output: 24 kHz mono WAV; `--max-new-tokens` caps generated frames (80 ms each).
 - Speaker tags `--voice S0`..`S9` (default `S0`) select the timbre in non-reference modes; with `--ref-audio` the timbre comes from the reference clip.
 - Deploy config: `vllm_omni/deploy/breeze_tts_2.yaml` (auto-loaded by HF `model_type`); see [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the online-serving recipe.
+
+## VibeVoice
+
+Single-stage eager offline TTS for the native Transformers checkpoint `vibevoice/VibeVoice-1.5B-hf` (single speaker, 24 kHz mono). There is no example script; build the prompt with the model's helper:
+
+```python
+import soundfile as sf
+import torch
+from vllm import SamplingParams
+
+from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.model_executor.models.vibevoice.prompt import render_vibevoice_prompt
+
+text = "Hello from VibeVoice."
+cloned = {
+    "prompt": render_vibevoice_prompt(text),
+    "multi_modal_data": {"audio": sf.read("reference.wav", dtype="float32")},  # (waveform, sample_rate)
+}
+no_reference = {"prompt": render_vibevoice_prompt(text, reference=False)}
+omni = Omni(model="vibevoice/VibeVoice-1.5B-hf")  # loads vllm_omni/deploy/vibevoice.yaml
+try:
+    for name, prompt in (("cloned", cloned), ("no_reference", no_reference)):
+        output = omni.generate([prompt], [SamplingParams(max_tokens=2048)])[0].outputs[0]
+        mm = output.multimodal_output
+        audio = mm.get("audio")
+        if audio is None:
+            audio = mm.get("model_outputs")
+        if audio is None:
+            raise RuntimeError("VibeVoice returned no audio.")
+        if isinstance(audio, list):
+            if not audio:
+                raise RuntimeError("VibeVoice returned empty audio.")
+            audio = torch.cat([torch.as_tensor(chunk).reshape(-1) for chunk in audio])
+        else:
+            audio = torch.as_tensor(audio).reshape(-1)
+        sf.write(f"{name}.wav", audio.detach().cpu().numpy(), 24000)
+finally:
+    omni.close()
+```
+
+### Notes
+
+- Reference audio: at most one clip, any channel layout and sample rate (mixed to mono, resampled to 24 kHz), up to 60 s. A reference prompt without audio is rejected.
+- Without a reference there is no default voice, as in Transformers: the voice is sampled per request from the diffusion noise, so it changes between requests. Pass a reference for a stable voice.
+- Limits: offline `Omni` only, eager, single speaker, no streaming and no `/v1/audio/speech`. See [`recipes/Microsoft/VibeVoice-1.5B-H100.md`](../../../recipes/Microsoft/VibeVoice-1.5B-H100.md).
