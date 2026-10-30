@@ -10,7 +10,6 @@ from vllm_omni.diffusion.models.minimax_h3.continuation import (
 )
 from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
 from vllm_omni.errors import OmniClientError
-from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderConditioning
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -48,28 +47,8 @@ def test_continuation_retains_prefix_and_global_stereo_timeline(total, window, v
         audio_t=audio_t,
         locked_audio_rows=source.reshape(-1, 32),
     )
-    conditions = [
-        MiniMaxH3EncoderConditioning(
-            hidden_states=hidden,
-            token_tags=tags,
-            task="ref2va",
-            height=32,
-            width=32,
-            num_frames=total,
-            latent_t=kwargs["latent_t"],
-            audio_t=audio_t,
-        )
-        for hidden, tags in texts
-    ]
-    if vary_prompts:
-        kwargs.update(text_embeddings=texts[0][0], text_tags=texts[0][1])
     video, audio = diffuse_continuation(
-        sample,
-        kwargs,
-        window_frames=window,
-        overlap_frames=22,
-        window_conditioning=iter(conditions[1:]) if vary_prompts else None,
-        media_time_origin=len(texts[-1][0]) if vary_prompts else None,
+        sample, kwargs, window_frames=window, overlap_frames=22, text_conditioning=texts if vary_prompts else None
     )
     torch.testing.assert_close(audio, source.permute(0, 2, 1))
     plan = plan_continuation_windows(total, window, 22)
@@ -265,9 +244,9 @@ def test_request_encodes_only_window_prompts_and_prepares_references_once(monkey
     assert len(prepared_inputs) == len(encoded_media) == 1
     assert all(item.media is prepared_inputs[0].media for item in encoded)
     if prompt_count is not None:
-        conditions = context["continuation_conditioning"]
-        assert len(conditions) == 7
-        assert conditions[0].hidden_states is context["text_embeddings"]
-        assert [int(condition.hidden_states[0, 0]) for condition in conditions] == list(range(1, 8))
+        texts = context["continuation_text_conditioning"]
+        assert len(texts) == 7
+        assert texts[0][0] is context["text_embeddings"]
+        assert [int(hidden[0, 0]) for hidden, _ in texts] == list(range(1, 8))
     else:
-        assert "continuation_conditioning" not in context
+        assert "continuation_text_conditioning" not in context

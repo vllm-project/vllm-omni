@@ -74,7 +74,7 @@ def _minimaxh3_params_builder(
         "long_video_mode",
         "continuation_window_frames",
         "continuation_overlap_frames",
-        "continuation_slice_reference_video",
+        "latent_upscale",
     ):
         if key in params:
             merged_extra_params[key] = params.pop(key)
@@ -138,7 +138,7 @@ _MODEL_PIPELINE_SPECS: dict[str, Spec] = {
             }
         ],
     },
-    r"MiniMax-H3(/FL2VA|/Ref2VA)?": {
+    r"MiniMax-H3(/FL2VA|/Ref2VA)?|FastVideo-FastH3-Omni-8-Step-V1": {
         "stages": ["diffusion"],
         "modes": [
             {

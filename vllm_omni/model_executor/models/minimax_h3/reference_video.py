@@ -163,9 +163,7 @@ def _probe_video(path: str) -> dict[str, Any]:
     }
 
 
-def _validate_reference_video_metadata(
-    meta: dict[str, Any], *, index: int, source: str, allow_long_video: bool = False
-) -> None:
+def _validate_reference_video_metadata(meta: dict[str, Any], *, index: int, source: str) -> None:
     width = int(meta["width"])
     height = int(meta["height"])
     if (
@@ -181,12 +179,10 @@ def _validate_reference_video_metadata(
     if not MINIMAX_H3_MIN_REFERENCE_FPS <= fps <= MINIMAX_H3_MAX_REFERENCE_FPS:
         raise OmniClientError(f"reference video {index} FPS must be in [23.976, 60], got {fps:.3f}")
     duration = float(meta["duration"])
-    if not math.isfinite(duration) or duration < MINIMAX_H3_MIN_REFERENCE_DURATION:
-        raise OmniClientError(
-            f"reference video {index} duration must be finite and at least 2 seconds, got {duration:.3f}"
-        )
-
-    if not allow_long_video and duration > MINIMAX_H3_MAX_REFERENCE_DURATION:
+    if (
+        not math.isfinite(duration)
+        or not MINIMAX_H3_MIN_REFERENCE_DURATION <= duration <= MINIMAX_H3_MAX_REFERENCE_DURATION
+    ):
         raise OmniClientError(f"reference video {index} duration must be in [2, 15] seconds, got {duration:.3f}")
 
     raw_file_size = meta.get("file_size")
@@ -435,7 +431,6 @@ def prepare_reference_videos(
     target_frame_count: int,
     workdir: str,
     start_time_seconds: Any = None,
-    allow_long_video: bool = False,
 ) -> list[dict[str, Any]]:
     if isinstance(values, (str, os.PathLike)):
         values = [values]
@@ -461,7 +456,7 @@ def prepare_reference_videos(
             )
         source = str(value)
         meta = _probe_video(source)
-        _validate_reference_video_metadata(meta, index=index, source=source, allow_long_video=allow_long_video)
+        _validate_reference_video_metadata(meta, index=index, source=source)
         start = 0.0 if item_start is None else float(item_start)
         if not math.isfinite(start) or start < 0 or start >= float(meta["duration"]):
             raise OmniClientError(f"reference video {index} start_time_seconds is outside the source duration")
@@ -470,15 +465,14 @@ def prepare_reference_videos(
             raise OmniClientError(
                 f"reference video {index} must provide at least 2 seconds after start_time_seconds, got {duration:.3f}"
             )
-        if not allow_long_video:
-            remaining_duration = MINIMAX_H3_MAX_REFERENCE_TOTAL_DURATION - total_duration
-            if duration > remaining_duration:
-                if duration - remaining_duration > MINIMAX_H3_REFERENCE_DURATION_EPSILON:
-                    raise OmniClientError("reference videos must be at most 15 seconds in total")
-                duration = remaining_duration
-                if duration < MINIMAX_H3_MIN_REFERENCE_DURATION:
-                    raise OmniClientError("reference videos must be at most 15 seconds in total")
-            total_duration += duration
+        remaining_duration = MINIMAX_H3_MAX_REFERENCE_TOTAL_DURATION - total_duration
+        if duration > remaining_duration:
+            if duration - remaining_duration > MINIMAX_H3_REFERENCE_DURATION_EPSILON:
+                raise OmniClientError("reference videos must be at most 15 seconds in total")
+            duration = remaining_duration
+            if duration < MINIMAX_H3_MIN_REFERENCE_DURATION:
+                raise OmniClientError("reference videos must be at most 15 seconds in total")
+        total_duration += duration
         width, height = _reference_video_shape(meta["width"], meta["height"])
         item_workdir = Path(workdir) / f"video_{index}"
         item_workdir.mkdir(parents=True)

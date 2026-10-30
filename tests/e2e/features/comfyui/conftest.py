@@ -100,6 +100,8 @@ def _setup_comfyui_test_environment():
         throw_exception_if_processing_interrupted=lambda: None,
     )
 
+    sys.modules["folder_paths"] = ModuleType("folder_paths")
+
     # Install mock modules BEFORE importing any comfyui_vllm_omni code
     sys.modules["comfy_api"] = mock_comfy_api
     sys.modules["comfy_api.input"] = mock_comfy_api_input

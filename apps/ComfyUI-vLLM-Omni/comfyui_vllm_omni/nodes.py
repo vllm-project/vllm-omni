@@ -43,7 +43,7 @@ FASTH3_FPS = 24
 # spec has to be named outright rather than recovered from that alias.
 FASTH3_SPEC_MODEL = "MiniMax-H3"
 _FASTH3_GUIDES_ERROR = (
-    "timeline_guides require base MiniMax-H3 weights, not FastH3; disconnect fast_h3 or timeline_guides."
+    "timeline_guides are not supported by FastH3 Preview; select Omni with a compatible backend."
 )
 
 
@@ -255,7 +255,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
             return "Provide either frame or first_frame/last_frame, not both."
         if references is not None and (first_frame is not None or last_frame is not None):
             return "Provide either first_frame/last_frame or references, not both."
-        if fast_h3 is not None and timeline_guides is not None:
+        if fast_h3 is not None and fast_h3.get("variant", "Preview") == "Preview" and timeline_guides is not None:
             return _FASTH3_GUIDES_ERROR
         if (
             fast_h3 is not None
@@ -299,7 +299,7 @@ class VLLMOmniGenerateVideo(_VLLMOmniGenerateBase):
         spec_model = model
 
         if fast_h3 is not None:
-            if timeline_guides is not None:
+            if fast_h3.get("variant", "Preview") == "Preview" and timeline_guides is not None:
                 raise ValueError(_FASTH3_GUIDES_ERROR)
             if fast_h3.get("variant", "Preview") == "Preview" and any(
                 value is not None for value in (frame, first_frame, last_frame, references)
@@ -1138,7 +1138,11 @@ class VLLMOmniMiniMaxH3Params:
                 ),
                 "continuation_window_frames": ("INT", {"default": 311, "min": 107, "max": 345, "step": 17}),
                 "continuation_overlap_frames": ("INT", {"default": 39, "min": 5, "max": 328, "step": 17}),
-                "continuation_slice_reference_video": ("BOOLEAN", {"default": True}),
+                "latent_upscale": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "step": 0.1,
+                     "tooltip": "0: disabled. 2: double width and height. Requires a server-loaded latent upscaler."},
+                ),
             },
         }
 
@@ -1153,7 +1157,7 @@ class VLLMOmniMiniMaxH3Params:
         long_video_mode: Literal["full", "continuation"] = "full",
         continuation_window_frames: int = 311,
         continuation_overlap_frames: int = 39,
-        continuation_slice_reference_video: bool = True,
+        latent_upscale: float = 0.0,
         **kwargs,
     ) -> tuple[MiniMaxH3ModelSpecificParams]:
         params = MiniMaxH3ModelSpecificParams(kwargs)
@@ -1164,10 +1168,23 @@ class VLLMOmniMiniMaxH3Params:
                 params.update(
                     continuation_window_frames=continuation_window_frames,
                     continuation_overlap_frames=continuation_overlap_frames,
-                    continuation_slice_reference_video=continuation_slice_reference_video,
                 )
+        params["latent_upscale"] = latent_upscale if latent_upscale > 0 else False
         params["type"] = "minimax_h3"
         return (params,)
+
+
+class VLLMOmniReverseImageBatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",)}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "reverse"
+    CATEGORY = "vLLM-Omni/Media"
+
+    def reverse(self, images: torch.Tensor) -> tuple[torch.Tensor]:
+        return (images.flip(0),)
 
 
 class VLLMOmniVideoReferences:
