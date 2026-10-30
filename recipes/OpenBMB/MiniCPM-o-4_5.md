@@ -72,16 +72,14 @@ Code2Wav consumes them through a shared-memory async connector.
 
 ### Default model runner
 
-The default deployment uses Model Runner V2 for all three stages on CUDA.
-NPU, XPU, ROCm and MUSA retain Model Runner V1. The Thinker hands its complete
-payload to Talker (`async_chunk: false` on CUDA stage 0); Talker and Code2Wav
-continue streaming chunks. The explicit `minicpmo_4_5_duplex_mrv2.yaml` profile
-remains available.
+The default deployment uses Model Runner V1 for all three stages, including
+CUDA. The Thinker hands its complete payload to Talker (`async_chunk: false`
+on CUDA stage 0); Talker and Code2Wav continue streaming chunks.
 
-The ordinary turn profile also inherits CUDA MRv2 and keeps Thinker prefix
-caching disabled, matching the existing MRv2 turn profile. To compare against
-MRv1, use a deploy overlay with `platforms.cuda.model_runner: v1` while keeping
-other settings unchanged.
+To opt into Model Runner V2 on CUDA, use `minicpmo_4_5_duplex_mrv2.yaml`
+or `minicpmo_4_5_turn_mrv2.yaml` for the corresponding serving mode.
+The ordinary turn profile also defaults to V1 and keeps Thinker prefix
+caching disabled.
 
 ### Single-device concurrency
 

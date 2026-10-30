@@ -25,12 +25,12 @@ def _resolve_cuda_stages(monkeypatch, filename):
     return config, merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
 
 
-@pytest.mark.parametrize("filename", ["minicpmo_4_5.yaml", _DEPLOY])
-def test_duplex_mrv2_cuda_profile(monkeypatch, filename) -> None:
+@pytest.mark.parametrize("filename,use_v2", [("minicpmo_4_5.yaml", False), (_DEPLOY, True)])
+def test_duplex_mrv2_cuda_profile(monkeypatch, filename, use_v2) -> None:
     config, stages = _resolve_cuda_stages(monkeypatch, filename)
     assert config.session_mode == "duplex"
-    # All three stages use MRv2; there is no hidden Talker fallback.
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
+    # All three stages follow the default or explicit opt-in runner.
+    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [use_v2] * 3
     # Stage 0 duplex preprocessing stays on the synchronous path while the
     # downstream stages keep streaming chunk transfer.
     assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]

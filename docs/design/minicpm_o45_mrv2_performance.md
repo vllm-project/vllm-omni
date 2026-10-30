@@ -1,9 +1,9 @@
 # MiniCPM-o 4.5 MRv2 profiles
 
-The default `minicpmo_4_5.yaml` now selects MRv2 for all three CUDA stages.
-Other platforms retain MRv1. CUDA stage 0 uses a full-payload handoff; downstream
-stages retain streaming chunks. The ordinary turn profile disables Thinker
-prefix caching because MRv2 does not merge cached Thinker rows.
+The default `minicpmo_4_5.yaml` selects MRv1 for all three stages, including
+CUDA. Explicit MRv2 profiles opt in on CUDA. CUDA stage 0 uses a full-payload
+handoff; downstream stages retain streaming chunks. The ordinary turn profile
+keeps Thinker prefix caching disabled with either runner.
 
 Turn mode uses the stage-level MRv2 contracts from #8184. Thinker emits live
 latent metadata outside graph replay; Talker keeps codec history and EOS
@@ -22,8 +22,8 @@ ordinary TF32 for CFM DiT GEMMs within Code2Wav forward/capture only
 `input_precision="tf32"` on tiled attention). This is not compensated TF32x3.
 The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
 is independent. HiFT stays IEEE FP32. TF32 changes rounding.
-Duplex defaults to MRv2 on CUDA; `minicpmo_4_5_duplex_mrv2.yaml` remains an
-explicit alias for this runner selection. Other platforms keep V1. Turn results
+Duplex defaults to MRv1; `minicpmo_4_5_duplex_mrv2.yaml` opts into MRv2
+on CUDA. Other platforms keep V1. Turn results
 do not establish duplex performance or interruption correctness.
 
 The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
@@ -129,8 +129,8 @@ or reference normalization policy.
 
 ## Full-duplex MRv2
 
-`minicpmo_4_5_duplex_mrv2.yaml` explicitly selects the same three-stage CUDA
-MRv2 runner as the default duplex profile; non-CUDA platforms keep V1.
+`minicpmo_4_5_duplex_mrv2.yaml` opts all three CUDA stages into MRv2;
+the default duplex profile and non-CUDA platforms keep V1.
 Stage 0 keeps `async_chunk: false` because the Thinker has no async producer:
 as on V1, the orchestrator hands each finished segment to `llm2tts`.
 The Talker reuses the streaming prompt recipe (full attention extends its KV
@@ -290,9 +290,9 @@ rows without a device result. Snapshot ownership remains necessary even when
 all rows share one tensor: producer buffers may be overwritten on the next
 step.
 
-These shortcuts target V1. The default CUDA MRv2 Talker already skips identity
+These shortcuts target V1. The opt-in CUDA MRv2 Talker already skips identity
 decode preprocessing and emits device batches, so a V1 improvement alone does
-not establish a speedup for the default MRv2 deployment.
+not establish a speedup for the opt-in MRv2 deployment.
 
 ## Reference reuse across concurrent bursts
 

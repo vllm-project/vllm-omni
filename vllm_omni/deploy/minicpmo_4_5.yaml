@@ -1,6 +1,6 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
 pipeline: minicpmo_4_5
-# CUDA selects the native MRv2 path below; other platforms retain MRv1.
+# Use MRv1 by default; explicit MRv2 profiles opt in on CUDA.
 model_runner: v1
 async_chunk: true
 # Use minicpmo_4_5_turn.yaml to select the ordinary turn-based serving engine.
@@ -163,7 +163,6 @@ stages:
 
 platforms:
   cuda:
-    model_runner: v2
     # Private MPS for colocated CUDA stages. NPU does not read this block.
     # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
     # init, or a stage that is not one numeric GPU disables MPS and continues. Set false
@@ -171,7 +170,7 @@ platforms:
     cuda_mps: true
     stages:
       - stage_id: 0
-        # MRv2 sends the completed Thinker payload to Talker through the
+        # Send the completed Thinker payload to Talker through the
         # orchestrator; only Talker -> Code2Wav streams connector chunks.
         async_chunk: false
         # Match the CUDA Thinker backend used for Transformers accuracy validation.

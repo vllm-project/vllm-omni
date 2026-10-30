@@ -3253,7 +3253,7 @@ class TestPlatformOverrides:
     def test_recommended_native_runner_platform_defaults(self, platform, filename, pipeline_key):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        expect_v2 = platform == "cuda"
+        expect_v2 = platform == "cuda" and filename != "minicpmo_4_5.yaml"
         assert deploy.model_runner == ("v2" if expect_v2 else "v1")
 
         # The selection must reach the live worker-dispatch consumer, not just

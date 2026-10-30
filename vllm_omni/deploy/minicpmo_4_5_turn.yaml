@@ -4,8 +4,7 @@ session_mode: turn
 
 stages:
   - stage_id: 0
-    # The default CUDA MRv2 Thinker does not merge cached prefix rows.
-    # Non-CUDA platforms also retain their existing cache-disabled behavior.
+    # Keep prefix caching disabled when selecting either runner.
     enable_prefix_caching: false
 
 platforms:
