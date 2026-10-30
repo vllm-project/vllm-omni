@@ -699,7 +699,7 @@ def mock_async_omni(
 
 
 @pytest.fixture
-def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
+def api_server(server_case: ServerCase, mock_async_omni, tmp_path, single_threaded_cpu):
     """Set up a API server in background process from command line with parametrized model name and mocked AsyncOmni."""
     # Override the STORAGE_MANAGER path to a writable temp directory before
     # forking the server subprocess.  The default /tmp/storage may be owned
@@ -731,12 +731,9 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
 
     # The mocks live in this process, so the server must be forked, not spawned.
     # xdist workers may already have switched the global start method to spawn.
-    # Shrink the parent thread pools first so the fork does not inherit a live OpenMP pool.
-    import os
-
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    torch.set_num_threads(1)
+    # single_threaded_cpu caps the parent thread pools before this fork and
+    # restores them after the test, so later tests on the worker are unaffected.
+    del single_threaded_cpu
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("API server fixture forks so the child inherits the mocked engine")
     # typeshed types get_context() as BaseContext, which does not declare Process.
