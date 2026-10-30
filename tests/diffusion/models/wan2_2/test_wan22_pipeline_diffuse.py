@@ -756,3 +756,78 @@ def test_load_weights_keeps_trained_vsa_gate(monkeypatch) -> None:
 
     assert pipeline.has_gate_compress_weights is True
     assert gate.to_gate_compress is original_gate
+
+
+class _StubGraphedForward:
+    """Stands in for the platform graph class: always on, records the step calls."""
+
+    def __init__(self, module: nn.Module, *, name: str, **kwargs) -> None:
+        self.module, self.name, self.enabled = module, name, True
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs) -> torch.Tensor:
+        self.calls.append(kwargs)
+        return self.module(**kwargs)
+
+
+@pytest.fixture
+def graph_platform(monkeypatch):
+    import vllm_omni.diffusion.distributed.utils as dist_utils
+    import vllm_omni.diffusion.graph as graph_mod
+
+    monkeypatch.setattr(graph_mod.current_omni_platform, "get_graphed_forward_cls", lambda: _StubGraphedForward)
+    monkeypatch.setattr(dist_utils, "get_local_device", lambda: torch.device("cpu"))
+
+
+def _graph_od_config(**overrides) -> SimpleNamespace:
+    od_config = SimpleNamespace(
+        diffusion_use_graph=True,
+        enforce_eager=False,
+        cache_backend="none",
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        diffusion_kv_cache_skip_step_indices=None,
+    )
+    vars(od_config).update(overrides)
+    return od_config
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expect_runner"),
+    [
+        ({}, True),
+        ({"diffusion_kv_cache_skip_step_indices": (1,)}, True),
+        ({"diffusion_kv_cache_dtype": "fp8", "diffusion_kv_cache_skip_step_indices": (1,)}, False),
+    ],
+    ids=["on", "skip-steps-without-kv-quant", "fp8-kv-skip-steps"],
+)
+def test_denoise_graph_runner_refuses_step_dependent_kv_quant(graph_platform, overrides, expect_runner):
+    # Wan publishes denoise_step_idx every step, so skip_steps would switch the
+    # KV dtype per step; a replay would keep the capture step's choice.
+    od_config = _graph_od_config(**overrides)
+
+    assert (_make_pipeline()._build_denoise_graph_runner(od_config) is not None) == expect_runner
+
+
+def test_denoise_graph_runner_gets_the_expert_by_name(graph_platform):
+    # The graph class rejects module arguments, and the name keys one graph per expert.
+    class _Expert(nn.Module):
+        def __init__(self, scale: float) -> None:
+            super().__init__()
+            self.scale = scale
+
+        def forward(self, *, hidden_states: torch.Tensor, return_dict: bool) -> tuple[torch.Tensor]:
+            return (hidden_states * self.scale,)
+
+    pipeline = _make_pipeline()
+    pipeline.transformer, pipeline.transformer_2 = _Expert(2.0), _Expert(3.0)
+    pipeline._denoise_graph_runner = pipeline._build_denoise_graph_runner(_graph_od_config())
+    x = torch.ones(2)
+
+    high = pipeline.predict_noise(current_model=pipeline.transformer, hidden_states=x, return_dict=False)
+    low = pipeline.predict_noise(current_model=pipeline.transformer_2, hidden_states=x, return_dict=False)
+
+    torch.testing.assert_close(high, x * 2)
+    torch.testing.assert_close(low, x * 3)
+    assert [call["component"] for call in pipeline._denoise_graph_runner.calls] == ["transformer", "transformer_2"]

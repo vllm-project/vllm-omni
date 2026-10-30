@@ -20,6 +20,7 @@ from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -28,6 +29,7 @@ from vllm_omni.diffusion.forward_context import (
     is_forward_context_available,
     set_forward_context_denoise_step_idx,
 )
+from vllm_omni.diffusion.graph import build_denoise_graph_runner
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -435,6 +437,8 @@ class HunyuanImage3Pipeline(
             self.timestep_r_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
         self.lm_head = nn.Linear(self.hf_config.hidden_size, self.hf_config.vocab_size, bias=False)
         self.vllm_config = get_current_vllm_config()
+        self._denoise_graph_runner = self._build_denoise_graph_runner()
+        self._denoise_forward_logged = False
         self.post_init()
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
@@ -471,6 +475,80 @@ class HunyuanImage3Pipeline(
             return split_qkv(lora_b)
         except (RuntimeError, ValueError):
             return None
+
+    def _build_denoise_graph_runner(self) -> GraphedForward | None:
+        """Set up device-graph replay for the denoise steps, if it is safe here.
+
+        Returns None (stay eager) unless the request opts in and nothing in the
+        configuration makes a step depend on which step it is; see
+        :func:`build_denoise_graph_runner`. With a runner, the prompt KV keeps its
+        storage across requests so one capture can serve more than one request.
+        """
+        runner = build_denoise_graph_runner(self.od_config, self._denoise_graph_forward, "HunyuanImage3 DiT")
+        if runner is not None:
+            for layer in self.model.layers:
+                layer.self_attn.image_attn.retain_prompt_kv_storage = True
+        return runner
+
+    def _denoise_graph_forward(self, **model_inputs: Any) -> torch.Tensor:
+        """The graph body: one non-first denoise step, reduced to its one tensor.
+
+        Restricting the captured output to ``diffusion_prediction`` keeps the
+        replay contract simple, so refuse loudly rather than silently dropping a
+        second output that some future configuration starts producing.
+        """
+        output = self.forward_call(**model_inputs, first_step=False)
+        for name in ("logits", "past_key_values", "hidden_states", "attentions"):
+            if getattr(output, name, None) is not None:
+                raise RuntimeError(
+                    f"HunyuanImage3 denoise graph cannot carry output {name!r}; run with diffusion_use_graph=false."
+                )
+        return output["diffusion_prediction"]
+
+    def _denoise_forward(self, model_inputs: dict[str, Any], *, first_step: bool) -> CausalMMOutputWithPast:
+        """Run one denoise step, replaying a device graph once one is captured.
+
+        The first step is always eager: it prefills the prompt KV cache and runs
+        a different shape, so it has nothing in common with the steps that follow.
+        """
+        runner = self._denoise_graph_runner
+        if not self._denoise_forward_logged:
+            self._denoise_forward_logged = True
+            logger.info(
+                "HunyuanImage3 denoise step: runner=%s, first_step=%s, mode=%r",
+                "on" if runner is not None else "off",
+                first_step,
+                model_inputs.get("mode"),
+            )
+        if runner is None or first_step or model_inputs.get("mode") != "gen_image":
+            output = self.forward_call(**model_inputs, first_step=first_step)
+            if first_step:
+                self._sync_denoise_graphs_with_prompt_kv()
+            return output
+        return CausalMMOutputWithPast(diffusion_prediction=runner(**model_inputs))
+
+    def _sync_denoise_graphs_with_prompt_kv(self) -> None:
+        """Drop graphs the prefill step just orphaned, and reset the flags.
+
+        The prefill re-derives the cached prompt KV for every request. Where it
+        could keep the previous storage the graphs stay valid and only the
+        contents changed; where it could not, a replay would read the previous
+        request's buffers, so those graphs have to go.
+        """
+        reallocated = False
+        for layer in self.model.layers:
+            mgr = layer.self_attn.image_attn
+            reallocated = reallocated or getattr(mgr, "prompt_kv_reallocated", False)
+            mgr.prompt_kv_reallocated = False
+        if reallocated:
+            self._invalidate_denoise_graphs("prefill reallocated the cached prompt KV")
+
+    def _invalidate_denoise_graphs(self, reason: str) -> None:
+        """Drop captured graphs that would replay against freed buffers."""
+        runner = getattr(self, "_denoise_graph_runner", None)
+        if runner is not None and runner.num_graphs:
+            logger.debug("%s: dropping %d captured denoise graph(s) (%s)", runner.name, runner.num_graphs, reason)
+            runner.clear()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
@@ -800,12 +878,16 @@ class HunyuanImage3Pipeline(
         row_branches: list[int],
     ) -> None:
         if states[0].step_index == 0:
+            # Clear the active pointers only: the prefill of this request is about to
+            # publish its own prompt KV, and the manager keeps the storage so that
+            # publish can write through it rather than stranding a captured graph.
             for layer in self.model.layers:
                 mgr = layer.self_attn.image_attn
                 mgr.image_kv_cache_map = None
                 mgr.image_kv_cache_lens = None
             return
 
+        reallocated = False
         for layer_idx, layer in enumerate(self.model.layers):
             rows_k, rows_v, lens = [], [], []
             for state_idx, branch in zip(row_state_indexes, row_branches):
@@ -814,11 +896,13 @@ class HunyuanImage3Pipeline(
                 rows_v.append(cache["value"][branch : branch + 1])
                 lens.append(cache["lens"][branch : branch + 1])
             mgr = layer.self_attn.image_attn
-            mgr.image_kv_cache_map = (
-                self._pad_tensor_rows(rows_k),
-                self._pad_tensor_rows(rows_v),
-            )
-            mgr.image_kv_cache_lens = torch.cat(lens, dim=0).to(device=mgr.image_kv_cache_map[0].device)
+            key = self._pad_tensor_rows(rows_k)
+            value = self._pad_tensor_rows(rows_v)
+            mgr.set_prompt_kv_cache(key, value, torch.cat(lens, dim=0).to(device=key.device))
+            reallocated = reallocated or mgr.prompt_kv_reallocated
+            mgr.prompt_kv_reallocated = False
+        if reallocated:
+            self._invalidate_denoise_graphs("restored prompt KV cache landed in new buffers")
 
     def _capture_prompt_kv_cache(
         self,
@@ -2321,7 +2405,7 @@ class HunyuanImage3Pipeline(
         set_forward_context_denoise_step_idx(context_step_index)
         try:
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                model_output = self.forward_call(**model_inputs, first_step=first_step)
+                model_output = self._denoise_forward(model_inputs, first_step=first_step)
                 pred = model_output["diffusion_prediction"]
         finally:
             set_forward_context_denoise_step_idx(None)

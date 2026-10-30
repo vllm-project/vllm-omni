@@ -521,9 +521,15 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_compile_transformer_scopes_inductor_cudagraphs_to_decode_graph(monkeypatch):
-    model = SimpleNamespace(enable_cuda_graph_decode=True)
+@pytest.mark.parametrize(
+    ("decode_graph", "denoise_graph"),
+    [(True, False), (False, True)],
+    ids=["decode-graph", "denoise-graph"],
+)
+def test_compile_transformer_scopes_inductor_cudagraphs_to_graph_layers(monkeypatch, decode_graph, denoise_graph):
+    model = SimpleNamespace(enable_cuda_graph_decode=decode_graph)
     runner = _make_compile_runner(model)
+    runner.od_config.diffusion_use_graph = denoise_graph
     compile_calls = []
 
     def _regionally_compile(target, *args, **kwargs):

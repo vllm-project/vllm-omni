@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import functools
 import re
 import time
@@ -12,6 +15,14 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+def _sync_if_useful() -> None:
+    # Level Zero rejects a host synchronize inside a graph capture with
+    # UR_RESULT_ERROR_UNSUPPORTED_FEATURE. Skipping it there costs nothing:
+    # capture records kernels without running them.
+    if current_omni_platform.is_available() and not current_omni_platform.is_graph_capturing():
+        current_omni_platform.synchronize()
+
+
 def profiler(name: str, func: Callable, instance: Any) -> Callable:
     """Timing a function execution."""
     metric_name = f"{name.rsplit('.', 1)[0]}.diffuse" if name.endswith(".denoise_step") else name
@@ -20,14 +31,12 @@ def profiler(name: str, func: Callable, instance: Any) -> Callable:
     def wrapper(*args, **kwargs) -> Any:
         if name == f"{instance.__class__.__name__}.forward":
             instance.clear_profiler_records()
-        if current_omni_platform.is_available():
-            current_omni_platform.synchronize()
+        _sync_if_useful()
         start_time = time.perf_counter()
         try:
             return func(*args, **kwargs)
         finally:
-            if current_omni_platform.is_available():
-                current_omni_platform.synchronize()
+            _sync_if_useful()
             duration = time.perf_counter() - start_time
             logger.info(f"[DiffusionPipelineProfiler] {metric_name} took {duration:.6f}s")
             # record the profiling data: duration of stages

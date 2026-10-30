@@ -1608,6 +1608,31 @@ def test_scale_or_adapter_change_forces_rebind(monkeypatch, second_scale):
     assert manager._active_adapter_id == other_id
 
 
+def test_adapter_state_changes_invalidate_denoise_graphs(monkeypatch):
+    """Captured denoise graphs froze the LoRA masks and scale, so every change of
+    the active adapter must drop them; repeating the same adapter must not."""
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    reasons: list[str] = []
+    monkeypatch.setattr(manager_mod, "invalidate_denoise_graphs", reasons.append)
+    adapter_id = 7
+    req = _dummy_lora_request(adapter_id)
+    manager, _ = _suspend_harness(monkeypatch, adapter_id)
+
+    manager.set_active_adapter(req, lora_scale=0.5)
+    assert len(reasons) == 1
+    manager.set_active_adapter(req, lora_scale=0.5)
+    assert len(reasons) == 1, "same adapter and scale keeps the graphs"
+    manager.set_active_adapter(None)
+    assert len(reasons) == 2
+    manager.set_active_adapter(None)
+    assert len(reasons) == 2
+    manager.set_active_adapter(req, lora_scale=0.5)  # re-arm the suspended upload
+    assert len(reasons) == 3
+    manager.set_active_adapter(req, lora_scale=0.25)
+    assert len(reasons) == 4
+
+
 def test_partial_packed_mask_survives_suspend_resume(monkeypatch):
     """A packed layer where only some slices carry LoRA must come back with
     the same mask, not an all-True one."""

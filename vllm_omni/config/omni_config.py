@@ -873,6 +873,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     # model (Qwen-Image-2.1) together with enforce_eager, which lives in the
     # shared engine config.
     enable_cuda_graph_decode: bool = True
+    diffusion_use_graph: bool = False
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False

@@ -106,6 +106,7 @@ nav:
         - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
         - VDN-H3 Hybrid Attention: user_guide/diffusion/attention_backends/vdnh3_attn.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
+      - Denoise Step Graphs: user_guide/diffusion/denoise_graph.md
       - Wan VAE Decoder Fast Path: user_guide/diffusion/vae_fast_path.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md

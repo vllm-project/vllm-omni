@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as hy3_transformer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
-from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo
+from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import ImageInfo, ImageKVCacheManager
 from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     _STEP_AR_KV,
     _STEP_CFG_FACTOR,
@@ -40,6 +42,11 @@ def _pipeline():
     )
     pipeline.hf_config = SimpleNamespace(cfg_distilled=False, use_meanflow=False)
     pipeline._pipeline = SimpleNamespace()
+    pipeline._denoise_graph_runner = None
+    pipeline._denoise_forward_logged = False
+    pipeline.model = SimpleNamespace(
+        layers=[SimpleNamespace(self_attn=SimpleNamespace(image_attn=SimpleNamespace(retain_prompt_kv_storage=False)))]
+    )
     return pipeline
 
 
@@ -569,3 +576,107 @@ def test_distilled_step_supplies_guidance_and_meanflow_timestep(monkeypatch):
     torch.testing.assert_close(output, torch.tensor([[1.0]]))
     torch.testing.assert_close(captured["guidance"], torch.tensor([2500.0], dtype=torch.bfloat16))
     torch.testing.assert_close(captured["timesteps_r"], torch.tensor([0.25]))
+
+
+class _StubGraphedForward:
+    """Stands in for the platform graph class, which is off on CPU."""
+
+    def __init__(self, module: torch.nn.Module, *, name: str, **kwargs) -> None:
+        self.module, self.name, self.enabled = module, name, True
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expect_runner"),
+    [
+        ({"diffusion_use_graph": False}, False),
+        ({"diffusion_use_graph": True}, True),
+        ({"diffusion_use_graph": True, "diffusion_kv_cache_skip_step_indices": (1,)}, True),
+        (
+            {
+                "diffusion_use_graph": True,
+                "diffusion_kv_cache_dtype": "fp8",
+                "diffusion_kv_cache_skip_step_indices": (1,),
+            },
+            False,
+        ),
+        ({"diffusion_use_graph": True, "cache_backend": "cache_dit"}, False),
+    ],
+    ids=["off", "on", "skip-steps-without-kv-quant", "fp8-kv-skip-steps", "cache-backend"],
+)
+def test_denoise_graph_runner_is_built_only_when_step_independent(monkeypatch, overrides, expect_runner):
+    import vllm_omni.diffusion.distributed.utils as dist_utils
+    import vllm_omni.diffusion.graph as graph_mod
+
+    monkeypatch.setattr(graph_mod.current_omni_platform, "get_graphed_forward_cls", lambda: _StubGraphedForward)
+    monkeypatch.setattr(dist_utils, "get_local_device", lambda: torch.device("cpu"))
+    pipeline = _pipeline()
+    pipeline.od_config = SimpleNamespace(**{**vars(pipeline.od_config), **overrides})
+
+    assert (pipeline._build_denoise_graph_runner() is not None) == expect_runner
+    # Only a runner needs the prompt KV to keep its storage across requests.
+    assert pipeline.model.layers[0].self_attn.image_attn.retain_prompt_kv_storage == expect_runner
+
+
+@pytest.mark.parametrize("retain", [False, True], ids=["graphs-off", "graphs-on"])
+def test_set_prompt_kv_cache_writes_through_only_with_graphs(retain):
+    mgr = object.__new__(ImageKVCacheManager)
+    torch.nn.Module.__init__(mgr)
+    mgr.retain_prompt_kv_storage = retain
+    mgr._prompt_kv_storage = None
+    mgr._prompt_kv_lens_storage = None
+    mgr.prompt_kv_reallocated = False
+    first = (torch.zeros(1, 2, 1, 4), torch.zeros(1, 2, 1, 4), torch.tensor([2]))
+    second = (torch.ones(1, 2, 1, 4), torch.ones(1, 2, 1, 4), torch.tensor([1]))
+
+    mgr.set_prompt_kv_cache(*first)
+    mgr.prompt_kv_reallocated = False
+    mgr.set_prompt_kv_cache(*second)
+
+    key, value = mgr.image_kv_cache_map
+    torch.testing.assert_close(key, second[0])
+    torch.testing.assert_close(value, second[1])
+    torch.testing.assert_close(mgr.image_kv_cache_lens, second[2])
+    # Graphs on: the second request lands in the first request's storage. Off: plain rebinding, as on main.
+    assert (key is first[0]) == retain
+    assert (key is second[0]) == (not retain)
+    assert mgr.prompt_kv_reallocated is False
+
+
+def test_denoise_forward_replays_only_later_gen_image_steps():
+    pipeline = _pipeline()
+    eager_calls: list[object] = []
+    runner_calls: list[str] = []
+
+    def forward_call(**kwargs):
+        eager_calls.append(kwargs["first_step"])
+        return {"diffusion_prediction": torch.zeros(1)}
+
+    def runner(**kwargs):
+        runner_calls.append(kwargs["mode"])
+        return torch.ones(1)
+
+    pipeline.forward_call = forward_call
+    pipeline._denoise_graph_runner = runner
+    pipeline._sync_denoise_graphs_with_prompt_kv = lambda: eager_calls.append("sync")
+
+    pipeline._denoise_forward({"mode": "gen_image"}, first_step=True)
+    pipeline._denoise_forward({"mode": "gen_text"}, first_step=False)
+    output = pipeline._denoise_forward({"mode": "gen_image"}, first_step=False)
+
+    assert eager_calls == [True, "sync", False]
+    assert runner_calls == ["gen_image"]
+    torch.testing.assert_close(output["diffusion_prediction"], torch.ones(1))
+
+
+@pytest.mark.parametrize(("capturing", "raises"), [(False, True), (True, False)])
+def test_reuse_prompt_kv_debug_check_skipped_during_capture(monkeypatch, capturing, raises):
+    mgr = ImageKVCacheManager.__new__(ImageKVCacheManager)
+    mgr.image_kv_cache_map = (torch.zeros(1, 2, 1, 4), torch.zeros(1, 2, 1, 4))
+    mgr.image_kv_cache_lens = torch.tensor([2])
+    monkeypatch.setattr(hy3_transformer_module.logger, "isEnabledFor", lambda level: True)
+    monkeypatch.setattr(hy3_transformer_module, "is_capturing", lambda device: capturing)
+    key = value = torch.zeros(1, 3, 1, 4)
+    bad_positions = torch.tensor([[7, 8, 9]])  # does not follow the cached prompt length 2
+
+    with pytest.raises(AssertionError) if raises else contextlib.nullcontext():
+        mgr._reuse_prompt_kv(key, value, seq_len=5, bs=1, position_ids=bad_positions)
