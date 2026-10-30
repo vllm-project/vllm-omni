@@ -1403,28 +1403,34 @@ class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # FP32 router (HF: `with torch.autocast('cuda', enabled=False): ...`
-        # plus `if self.wg.weight.dtype == torch.float32: hidden_states.float()`).
-        # ``self.gate.weight`` is fp32 (params_dtype=torch.float32), so the
-        # ReplicatedLinear matmul runs in fp32 once we cast the input.
-        router_logits, _ = self.gate(hidden_states.float())
+        # Keep the complete routing decision outside autocast. HF explicitly
+        # disables autocast around this block; casting only the input to fp32
+        # is insufficient on NPU because the backend may still lower the
+        # linear/softmax/topk sequence to bf16. A changed top-k boundary can
+        # select a different expert and then change later AR tokens and KV.
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            # FP32 router (HF: `with torch.autocast('cuda', enabled=False): ...`
+            # plus `if self.wg.weight.dtype == torch.float32: hidden_states.float()`).
+            # ``self.gate.weight`` is fp32 (params_dtype=torch.float32), so the
+            # ReplicatedLinear matmul runs in fp32 once we cast the input.
+            router_logits, _ = self.gate(hidden_states.float())
 
-        # softmax + topk + clamp-divide renormalization, all in fp32 — matches
-        # ``HunyuanTopKGate.easy_topk`` exactly.
-        gates = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
-        topk_weights, topk_indices = torch.topk(gates, self.top_k, dim=-1)
-        weight_sums = topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights / weight_sums.clamp(min=1e-8)
+            # softmax + topk + clamp-divide renormalization, all in fp32 —
+            # matches ``HunyuanTopKGate.easy_topk`` exactly.
+            gates = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+            topk_weights, topk_indices = torch.topk(gates, self.top_k, dim=-1)
+            weight_sums = topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights / weight_sums.clamp(min=1e-8)
 
-        # Cast topk weights to model dtype for the expert MLP combine.
-        # HF: ``topk_weights = topk_weights.to(hidden_states.dtype)`` (line 1207).
-        topk_weights = topk_weights.to(hidden_states.dtype)
+            # Cast topk weights to model dtype for the expert MLP combine.
+            # HF: ``topk_weights = topk_weights.to(hidden_states.dtype)``.
+            topk_weights = topk_weights.to(hidden_states.dtype)
 
-        # Pack (weights, indices) into the ``router_logits`` slot so
-        # ``_hunyuan_image3_unpack_packed_topk`` can pull them back out
-        # inside ``SharedFusedMoE``. Both halves are stored as fp32 for
-        # transport — the indices get cast back to int32 on unpack.
-        packed_routing = torch.cat([topk_weights.float(), topk_indices.to(torch.float32)], dim=-1)
+            # Pack (weights, indices) into the ``router_logits`` slot so
+            # ``_hunyuan_image3_unpack_packed_topk`` can pull them back out
+            # inside ``SharedFusedMoE``. Both halves are stored as fp32 for
+            # transport — the indices get cast back to int32 on unpack.
+            packed_routing = torch.cat([topk_weights.float(), topk_indices.to(torch.float32)], dim=-1)
 
         # vllm 0.20+ FusedMoE merges shared-experts internally and runs the
         # TP all-reduce inside its forward (we no longer pass
