@@ -92,6 +92,7 @@ def _register_omni_hf_configs() -> None:
             Qwen3TTSConfig,
         )
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+        from vllm_omni.transformers_utils.configs.drvexo_speech_8b import DRVEXOSpeech8BConfig
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.ming3_audio import (
             BailingMoeV3AudioConfig,
@@ -125,6 +126,7 @@ def _register_omni_hf_configs() -> None:
         ("bailing_moe_v3_audio", BailingMoeV3AudioConfig),
         ("nemotron_voicechat", NemotronVoiceChatConfig),
         ("cosyvoice3", CosyVoice3Config),
+        ("drvexo_speech_8b", DRVEXOSpeech8BConfig),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
         ("voxcpm2", VoxCPM2Config),
@@ -144,6 +146,8 @@ def register_omni_models_to_vllm():
     from vllm_omni.model_executor.models.registry import _OMNI_MODELS
 
     _register_omni_hf_configs()
+
+    from vllm_omni.model_executor.models.drvexo_speech_8b import loader as _drvexo_loader  # noqa: F401
 
     # Unconditionally (re)register every omni arch into the upstream global
     # ModelRegistry: vLLM 0.27 added some omni archs (e.g.

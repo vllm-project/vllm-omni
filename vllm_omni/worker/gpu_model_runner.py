@@ -1489,6 +1489,11 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         if nstp is not None and len(nstp) == len(self.input_batch.req_ids):
             try:
                 model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
+                if getattr(self.model, "requires_request_computed_tokens", False):
+                    model_kwargs_extra["request_computed_tokens"] = [
+                        int(self.input_batch.num_computed_tokens_cpu[index])
+                        for index in range(len(self.input_batch.req_ids))
+                    ]
                 if requires_request_sample_eligibility(self.model):
                     model_kwargs_extra["request_sample_eligible"] = [
                         bool(

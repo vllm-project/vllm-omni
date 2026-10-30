@@ -65,3 +65,14 @@ adapter live under `platforms/npu/models/` and `platforms/npu/quant/`. Shared
 model code selects these adapters lazily on NPU; CUDA keeps the upstream
 implementations. Generic eager kernels and request-history snapshots remain
 in the shared model implementation.
+
+## DRVEXO component views
+
+DRVEXO registers a `drvexo_unified` local-only loader through the existing
+plugin and declares its Thinker/Talker/Codec topology in the pipeline
+registry. Stage-local JSON views resolve namespaced tensors in one root
+safetensors index; they do not materialize another checkpoint. The Thinker
+reuses upstream Qwen3 execution and adds an audio encoder/input projector
+and explicit final-prefill candidate scoring. Stage transitions remain owned
+by the pipeline/orchestrator. See [DRVEXO](../../models/drvexo_speech_8b.md)
+for runtime restrictions and validation scope.

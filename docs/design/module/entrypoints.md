@@ -217,3 +217,15 @@ stage lifecycle ownership in the parent composition root.
   import boundaries enforce it.
 - Obtain approval from a technical owner and an independent validation
   reviewer.
+
+## DRVEXO opt-in extensions
+
+For a `drvexo_speech_8b` chat config the composition root mounts explicit
+speech and General candidate-scoring routes after initializing serving state.
+Other model configurations do not expose these routes. Ordinary chat does
+not call a device classifier or replace model generation with fixed replies.
+The General endpoint accepts caller-defined state/candidates, returns
+non-executable scores, and skips engine work when explicitly disabled.
+Each recognition, synthesis or candidate-prefill operation owns a unique
+engine request ID; cancellation closes its generator and aborts only that ID.
+See [DRVEXO](../../models/drvexo_speech_8b.md) for schemas and limits.

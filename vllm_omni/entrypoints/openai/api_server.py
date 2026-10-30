@@ -444,6 +444,13 @@ async def omni_run_server_worker(
 
         await omni_init_app_state(engine_client, app.state, args)
 
+        chat = getattr(app.state, "openai_serving_chat", None)
+        config = getattr(getattr(chat, "model_config", None), "hf_config", None)
+        if getattr(config, "model_type", None) == "drvexo_speech_8b":
+            from .drvexo_routes import router as drvexo_router
+
+            app.include_router(drvexo_router)
+
         # The inherited routes assume a tokenization handler. Pure diffusion
         # has none; omit those capabilities instead of dereferencing None.
         if getattr(app.state, "serving_tokenization", None) is None:

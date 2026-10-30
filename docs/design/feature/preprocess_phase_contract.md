@@ -193,3 +193,13 @@ platform remains separate from the shared Python routing tests.
 - [Qwen2.5-Omni consumer fix, #5019](https://github.com/vllm-project/vllm-omni/pull/5019)
 - [Adding an Omni model](../../contributing/model/adding_omni_model.md)
 - [Test writing guide](../../contributing/ci/test_writing_guide.md)
+
+## Final-prefill output consumers
+
+A model setting `requires_request_computed_tokens` receives
+`request_computed_tokens` alongside `request_token_spans` in its output
+kwargs. Values are CPU integer offsets before this step, in the same current
+batch order as spans and intermediate buffers. DRVEXO uses the offset to
+score exactly the final prompt token across chunk boundaries and to avoid
+scoring decode tokens. This opt-in output metadata does not change the
+preprocess phase fields above or infer phase from a span's length.

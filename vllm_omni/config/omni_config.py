@@ -178,6 +178,7 @@ class _ModelEngineOverrides(TypedDict, total=False):
     linear_backend: str
     hf_overrides: Any
     limit_mm_per_prompt: dict[str, Any]
+    enable_mm_embeds: bool
     interleave_mm_strings: bool
     media_io_kwargs: dict[str, Any]
     final_output: bool
@@ -488,6 +489,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     linear_backend: str = "auto"
     hf_overrides: Any = None
     limit_mm_per_prompt: dict[str, Any] | None = None
+    enable_mm_embeds: bool = False
     # MiniCPM interleaved AV packing and media decode knobs (Daily-Omni).
     interleave_mm_strings: bool | None = None
     media_io_kwargs: dict[str, Any] | None = None
