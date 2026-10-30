@@ -561,7 +561,9 @@ class RayDiffusionExecutor(DiffusionExecutor):
             validate_new_request_data_identity(new_req)
 
         if len(new_reqs) > 1 and _uses_dlo_dp_concurrency(self.od_config):
-            attention_schedule_config = getattr(self.od_config, "diffusion_attention_schedule", None)
+            # Resolving the schedule here cannot raise: add_request() already resolved it against
+            # this service config and rejected an invalid one as that request's client error.
+            attention_schedule_config = self.od_config.diffusion_attention_schedule
             compatibility_keys = [
                 build_request_batch_sampling_params_key(item.req, attention_schedule_config) for item in new_reqs
             ]

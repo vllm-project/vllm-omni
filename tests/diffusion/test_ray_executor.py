@@ -480,6 +480,7 @@ def _make_request_executor(monkeypatch, prompts, component="text_encoder", allga
     executor._finalizer = Mock()
     executor.od_config = SimpleNamespace(
         parallel_config=SimpleNamespace(data_parallel_size=len(prompts)),
+        diffusion_attention_schedule=None,
         diffusion_offload_config={
             "mode": "layer",
             "components": [component],
