@@ -114,7 +114,9 @@ def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
     return metrics
 
 
-def _pooling_keys_not_in(pooling_output: Any, mm_output: Any) -> Any:
+def _pooling_keys_not_in(
+    pooling_output: torch.Tensor | dict[str, Any], mm_output: object
+) -> torch.Tensor | dict[str, Any] | None:
     """Drop pooling-payload entries already carried by ``mm_output``.
 
     The MR v2 AR runner's full-payload fallback publishes one per-request
