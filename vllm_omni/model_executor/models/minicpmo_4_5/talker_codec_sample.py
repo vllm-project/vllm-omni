@@ -45,6 +45,20 @@ _FUSED_PRELUDE_OK = True
 _FUSED_PRELUDE_WARMED = False
 _PRELUDE_BLOCK = 1024
 
+# Engine step 7d (top-k + top-p) runs as one Triton kernel on NPU when both
+# filters are active -- the stochastic tail right after the fused prelude.
+# Same two controls as the prelude: ``talker_codec_fused_tail: false`` in the
+# stage connector's ``extra`` block forces the eager chain (accuracy triage),
+# and ``_TAIL_FUSION_OK`` is a process-wide permanent latch fed by the first
+# failed compile/launch. The eager pair is launch-overhead-bound at this
+# vocab (per-op fixed cost dominates: 6562-wide and 25-wide eager ops time
+# the same), so the fusion removes launches, not arithmetic.
+_TAIL_FUSION_OK = True
+_TAIL_FUSION_WARMED = False
+_TAIL_BLOCK = 1024
+# The pairwise pass is single-block; wide candidate sets stay eager.
+_TAIL_MAX_CANDIDATES = 64
+
 try:  # Triton is NPU-only; other backends keep the eager prologue.
     import triton
     import triton.language as tl
@@ -83,6 +97,58 @@ try:  # Triton is NPU-only; other backends keep the eager prologue.
         x = tl.where(x < 0, x * alpha, x / alpha)
         x = x / temp
         tl.store(out_ptr + offs, x, mask=mask)
+
+    @triton.jit
+    def _topk_topp_mask_kernel(
+        logits_ptr,
+        vals_ptr,
+        idx_ptr,
+        out_ptr,
+        top_p,
+        K: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
+        KP: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
+        VOCAB: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
+        BLOCK: tl.constexpr,  # noqa: N803 - Triton constexpr naming convention
+    ):
+        """Single-block fused top-k + top-p mask over one B=1 logits row.
+
+        Semantics equal the eager chain it replaces (top-k ``masked_fill_``
+        then the ascending-cumsum top-p): candidate ``i`` is removed iff the
+        prob mass of strictly-smaller candidates plus its own prob stays
+        ``<= 1 - top_p`` -- the ascending ``cumsum <= 1 - top_p`` predicate
+        evaluated on the top-k-filtered distribution. The largest candidate
+        is never removed (total mass 1 > 1 - top_p for top_p < 1), so the
+        eager guard ``remove[..., -1:] = False`` holds by construction.
+        Ties among finite values cannot arise from continuous model logits;
+        ``-inf`` top-k padding candidates carry zero prob and sort before every
+        finite value, so both paths always remove them.
+        """
+        offs = tl.arange(0, KP)
+        cand = offs < K
+        v = tl.load(vals_ptr + offs, mask=cand, other=float("-inf"))
+        mx = tl.max(v, axis=0)
+        e = tl.where(cand, tl.exp(v - mx), 0.0)
+        q = e / tl.sum(e, axis=0)
+        # The ascending order must be decided on the raw logits, not on q:
+        # softmax is monotonic so v_j < v_i iff q_j < q_i, but tl.exp and the
+        # eager softmax exp can differ by ~1e-7 relative -- enough to flip the
+        # order of near-equal neighbours on near-flat rows, which shifts the
+        # ascending prefix by one candidate. The raw logits carry no
+        # computation and therefore no implementation drift.
+        vi = tl.reshape(v, (KP, 1))
+        vj = tl.reshape(v, (1, KP))
+        qj = tl.reshape(q, (1, KP))
+        smaller = tl.sum(tl.where(vj < vi, qj, 0.0), axis=1)
+        keep = cand & ((smaller + q) > (1.0 - top_p))
+        gids = tl.load(idx_ptr + offs, mask=cand, other=0)
+        for start in range(0, VOCAB, BLOCK):
+            o = start + tl.arange(0, BLOCK)
+            tl.store(
+                out_ptr + o,
+                tl.full((BLOCK,), float("-inf"), tl.float32),
+                mask=o < VOCAB,
+            )
+        tl.store(out_ptr + gids, v, mask=keep)
 
     _HAS_TRITON = True
 except Exception:  # pragma: no cover - triton missing/CPU
@@ -351,6 +417,65 @@ def warmup_fused_prelude(device: torch.device, enabled: bool = True) -> None:
     )
 
 
+def _topk_topp_fused(
+    logits: torch.Tensor,
+    top_k: int,
+    top_p: float,
+) -> torch.Tensor | None:
+    """Fused top-k + top-p mask on NPU; ``None`` falls back to the eager chain.
+
+    One ``torch.topk`` for the candidate set, one Triton kernel for both
+    masks. The returned row is what the eager top-k/top-p pair would produce:
+    kept candidates keep their original logit, everything else is ``-inf``.
+    The caller's softmax + ``torch.multinomial`` input is therefore unchanged
+    in shape, dtype and RNG stream.
+    """
+    global _TAIL_FUSION_OK
+    if not _TAIL_FUSION_OK or logits.device.type != "npu":
+        return None
+    keep = min(int(logits.shape[-1]), int(top_k))
+    if keep > _TAIL_MAX_CANDIDATES:
+        return None
+    vals, idx = torch.topk(logits, keep, dim=-1)
+    out = torch.empty_like(logits)
+    kp = 1 << (keep - 1).bit_length()
+    try:
+        _topk_topp_mask_kernel[(1,)](
+            logits,
+            vals,
+            idx,
+            out,
+            float(top_p),
+            K=keep,
+            KP=kp,
+            VOCAB=int(logits.shape[-1]),
+            BLOCK=_TAIL_BLOCK,
+            num_warps=8,
+        )
+    except Exception as exc:
+        # Same latch contract as the prelude: process-wide, permanent, and a
+        # failure inside an already captured graph replay never lands here.
+        _TAIL_FUSION_OK = False
+        logger.warning("fused talker codec tail disabled after a kernel failure: %s", exc)
+        return None
+    return out
+
+
+def warmup_fused_tail(device: torch.device, enabled: bool = True) -> None:
+    """Compile the fused tail kernel once, before any graph capture.
+
+    Same contract as :func:`warmup_fused_prelude`: running it here settles
+    ``_TAIL_FUSION_OK`` outside capture, so a compile failure downgrades the
+    process instead of poisoning a capture that just saw a failed launch.
+    Idempotent, and a no-op off NPU, without Triton, or when disabled.
+    """
+    global _TAIL_FUSION_WARMED
+    if not enabled or _TAIL_FUSION_WARMED or not _HAS_TRITON or device.type != "npu":
+        return
+    _TAIL_FUSION_WARMED = True
+    _topk_topp_fused(torch.zeros(1, VOCAB_SIZE, device=device), 25, 0.85)
+
+
 def prepare_codec_logits(
     raw_logits: torch.Tensor,
     state: TalkerCodecDeviceState,
@@ -367,6 +492,7 @@ def prepare_codec_logits(
     presence_penalty: float = 0.0,
     eos_window_masked: bool = False,
     fused_prelude: bool = True,
+    fused_tail: bool = True,
 ) -> torch.Tensor:
     """Prepare and filter logits without changing native NPU RNG semantics.
 
@@ -375,7 +501,9 @@ def prepare_codec_logits(
     ``min_tokens_stop_ids`` widens the censored stop set beyond the codec EOS;
     ``frequency_penalty``/``presence_penalty`` subtract the whole-stream counts.
     ``fused_prelude=False`` (stage connector ``extra`` key
-    ``talker_codec_fused_prelude``) forces the eager chain for accuracy triage.
+    ``talker_codec_fused_prelude``) forces the eager chain for accuracy triage;
+    ``fused_tail=False`` (``talker_codec_fused_tail``) does the same for the
+    top-k/top-p pair.
     Every one of them is a no-op at its default value.
     """
     stop_ids = _stop_id_tuple(eos_token_id, min_tokens_stop_ids)
@@ -414,6 +542,14 @@ def prepare_codec_logits(
         probabilities = torch.softmax(logits, dim=-1)
         min_p_threshold = probabilities.amax(dim=-1, keepdim=True) * min_p
         logits.masked_fill_(probabilities < min_p_threshold, float("-inf"))
+    # Engine step 7d: top-k then top-p over the filtered distribution. On NPU
+    # the pair runs as one Triton kernel when both filters are active (the
+    # deployment pins top_k=25/top_p=0.85) -- the eager pair is dominated by
+    # per-launch overhead at this vocab. Either path leaves the caller's
+    # softmax + multinomial input identical in shape, dtype and RNG stream.
+    tail = _topk_topp_fused(logits, top_k, top_p) if (fused_tail and top_k > 0 and 0.0 < float(top_p) < 1.0) else None
+    if tail is not None:
+        return tail
     # Engine step 7d: top-k first (topk_topp_sampler.py:392).
     if top_k > 0:
         keep = min(VOCAB_SIZE, int(top_k))

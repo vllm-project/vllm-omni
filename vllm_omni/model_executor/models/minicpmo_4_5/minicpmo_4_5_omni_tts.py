@@ -52,6 +52,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     make_device_state,
     prepare_codec_logits,
     warmup_fused_prelude,
+    warmup_fused_tail,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     VOCAB_SIZE as _CODEC_VOCAB_SIZE,
@@ -751,6 +752,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._codec_fused_prelude = _bool_flag(
             self._extra_config().get("talker_codec_fused_prelude", True),
             "talker_codec_fused_prelude",
+        )
+        # Same contract for the fused top-k/top-p tail of the stochastic
+        # codec-sampling chain; default true, runtime latch covers failures.
+        self._codec_fused_tail = _bool_flag(
+            self._extra_config().get("talker_codec_fused_tail", True),
+            "talker_codec_fused_tail",
         )
 
         # Multi-frame decode: K codec frames per Talker decode step. A value
@@ -2215,6 +2222,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # CANN/torch_npu upgrade a broken kernel may fault the device instead
         # of raising, which would defeat the switch.
         warmup_fused_prelude(hidden_state.device, enabled=self._codec_fused_prelude)
+        warmup_fused_tail(hidden_state.device, enabled=self._codec_fused_tail)
         return device_state, device_inputs, device_states
 
     def _sample_audio_code(
@@ -2256,6 +2264,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
             eos_window_masked=eos_window_masked,
             fused_prelude=self._codec_fused_prelude,
+            fused_tail=self._codec_fused_tail,
         )
         probabilities = torch.softmax(logits, dim=-1)
         sampled = torch.multinomial(
