@@ -82,4 +82,10 @@ def filter_active_lora_adapters(
     return tuple((request, scale) for request, scale in zip(requests, scales) if scale != 0.0)
 
 
-__all__ = ["LORA_SCALE_ROUND_DECIMALS", "build_lora_batch_key", "filter_active_lora_adapters", "round_lora_scale", "stable_lora_int_id"]
+__all__ = [
+    "LORA_SCALE_ROUND_DECIMALS",
+    "build_lora_batch_key",
+    "filter_active_lora_adapters",
+    "round_lora_scale",
+    "stable_lora_int_id",
+]

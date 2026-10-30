@@ -42,9 +42,7 @@ FASTH3_FPS = 24
 # A FastH3 deployment may expose H3 under any --served-model-name, so the payload
 # spec has to be named outright rather than recovered from that alias.
 FASTH3_SPEC_MODEL = "MiniMax-H3"
-_FASTH3_GUIDES_ERROR = (
-    "timeline_guides are not supported by FastH3 Preview; select Omni with a compatible backend."
-)
+_FASTH3_GUIDES_ERROR = "timeline_guides are not supported by FastH3 Preview; select Omni with a compatible backend."
 
 
 def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str]:
@@ -1140,8 +1138,12 @@ class VLLMOmniMiniMaxH3Params:
                 "continuation_overlap_frames": ("INT", {"default": 39, "min": 5, "max": 328, "step": 17}),
                 "latent_upscale": (
                     "FLOAT",
-                    {"default": 0.0, "min": 0.0, "step": 0.1,
-                     "tooltip": "0: disabled. 2: double width and height. Requires a server-loaded latent upscaler."},
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "step": 0.1,
+                        "tooltip": "0: disabled. 2: double width and height. Requires a server-loaded latent upscaler.",
+                    },
                 ),
             },
         }
