@@ -18,6 +18,7 @@ from vllm_omni.engine.output_processor import (
     OmniRequestState,
 )
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs.output_processor import _pooling_keys_not_in
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -124,6 +125,36 @@ def test_mrv2_payload_mirrored_on_both_channels_is_accumulated_once():
 
     torch.testing.assert_close(payload["latent"], hidden)
     torch.testing.assert_close(payload["latent_input_ids"], ids)
+
+
+def test_mrv2_mirror_is_dropped_by_value_and_rest_keeps_nested_layout():
+    # The channels are decoded separately, so the mirror is equal, not identical.
+    layer = torch.arange(6.0).reshape(3, 2)
+    pooling = {
+        "latent": torch.ones(3, 4),
+        "hidden_states": {"layers": {0: layer, 1: layer + 1}},
+        "codes": {"audio": torch.tensor([1, 2, 3])},
+    }
+    mm = {
+        "latent": torch.ones(3, 4),
+        "hidden_states": {"layers": {0: layer.clone()}},
+        "codes": {"audio": torch.tensor([7, 8, 9])},
+    }
+
+    rest = _pooling_keys_not_in(pooling, mm)
+
+    assert set(rest) == {"hidden_states", "codes"}
+    assert set(rest["hidden_states"]["layers"]) == {1}
+    torch.testing.assert_close(rest["hidden_states"]["layers"][1], layer + 1)
+    # Same key, different value: not a mirror, so it is kept.
+    torch.testing.assert_close(rest["codes"]["audio"], torch.tensor([1, 2, 3]))
+
+
+def test_mrv2_pooling_payload_without_mirror_is_passed_through():
+    pooling = {"hidden_states": {"layers": {0: torch.zeros(2, 2)}}}
+
+    assert _pooling_keys_not_in(pooling, {"latent": torch.ones(1)}) is pooling
+    assert _pooling_keys_not_in(pooling, {"hidden_states": {"layers": {0: torch.zeros(2, 2)}}}) is None
 
 
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
