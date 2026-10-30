@@ -514,6 +514,10 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         super().__init__(config)
         self.num_residual_blocks = len(config.resblock_kernel_sizes)
         self.num_upsample_layers = len(config.upsample_rates)
+        # min-level tensors for amplitude_to_db, keyed by (device, dtype,
+        # level): built once instead of a pageable H2D scalar per vocode
+        # (a blocking sync and a CUDA-graph capture blocker).
+        self._min_level_cache: dict[tuple[str, torch.dtype, float], torch.Tensor] = {}
 
         self.conv_pre = nn.Conv1d(config.mel_dim, config.upsample_initial_channel, 7, 1, padding=3)
 
@@ -566,13 +570,17 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
         )
 
     def amplitude_to_db(self, amplitude, min_db_level):
-        min_level = torch.exp(
-            torch.tensor(
-                min_db_level / 20.0 * np.log(10),
-                device=amplitude.device,
-                dtype=amplitude.dtype,
+        key = (str(amplitude.device), amplitude.dtype, float(min_db_level))
+        min_level = self._min_level_cache.get(key)
+        if min_level is None:
+            min_level = torch.exp(
+                torch.tensor(
+                    min_db_level / 20.0 * np.log(10),
+                    device=amplitude.device,
+                    dtype=amplitude.dtype,
+                )
             )
-        )
+            self._min_level_cache[key] = min_level
         return 20 * torch.log10(torch.clamp(amplitude, min=min_level))
 
     def process_mel_spectrogram(self, mel_spectrogram):
