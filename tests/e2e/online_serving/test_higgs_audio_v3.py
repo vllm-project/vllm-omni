@@ -227,11 +227,11 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "stream": False,
                 "response_format": "wav",
                 "timeout": 300.0,
-                # Normalize the generation cap across profiles (the V1
-                # high-throughput profile ships a lower Stage-0 max_tokens
-                # than the default). The byte floor stays generous-under
-                # dummy weights: audio-eos timing is weight-dependent, so
-                # only require ~20 s of synthesized audio to prove the long
+                # Normalize the generation cap below the Stage-0 max_tokens
+                # cap every profile ships (2048). The byte floor stays
+                # generous under dummy weights: audio-eos timing is
+                # weight-dependent, so only require ~20 s of synthesized
+                # audio to prove the long
                 # input completes rather than truncating.
                 "max_new_tokens": 1900,
                 "min_audio_bytes": 1_000_000,
