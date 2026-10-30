@@ -55,6 +55,7 @@ stages:
     top_k: 50
 - stage_id: 2
   load_format: drvexo_unified
+  dtype: float32
   engine_extras:
     model_subdir: codec
   devices: '0'
