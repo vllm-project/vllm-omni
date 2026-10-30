@@ -1,0 +1,52 @@
+# C1 correctness baseline. Launch with TRITON_F32_DEFAULT=ieee.
+# Both stages share GPU0; no graph pools or prefix cache.
+pipeline: soprano
+model_runner: v1
+async_chunk: false
+dtype: float32
+trust_remote_code: false
+enable_prefix_caching: false
+enable_chunked_prefill: false
+stages:
+  - stage_id: 0
+    devices: "0"
+    tensor_parallel_size: 1
+    max_num_seqs: 1
+    max_model_len: 768
+    max_num_batched_tokens: 768
+    gpu_memory_utilization: 0.20
+    enforce_eager: true
+    async_scheduling: false
+    compilation_config: {mode: 0, cudagraph_mode: NONE}
+    output_connectors: {to_stage_1: connector_of_shared_memory}
+    engine_extras:
+      kv_cache_memory_bytes: 67108864
+      attention_config: {backend: TRITON_ATTN}
+    default_sampling_params:
+      max_tokens: 512
+      temperature: 0.3
+      top_p: 0.95
+      top_k: 50
+      repetition_penalty: 1.2
+      seed: 44
+      detokenize: false
+  - stage_id: 1
+    devices: "0"
+    tensor_parallel_size: 1
+    max_num_seqs: 1
+    max_model_len: 768
+    max_num_batched_tokens: 768
+    gpu_memory_utilization: 0.20
+    enforce_eager: true
+    async_scheduling: false
+    compilation_config: {mode: 0, cudagraph_mode: NONE}
+    input_connectors: {from_stage_0: connector_of_shared_memory}
+    engine_extras:
+      dtype: float32
+      skip_tokenizer_init: true
+    default_sampling_params:
+      max_tokens: 1
+      detokenize: false
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector

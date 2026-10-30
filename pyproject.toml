@@ -34,6 +34,11 @@ classifiers = [
 
 [project.optional-dependencies]
 
+soprano = [
+    "inflect>=7.6.0,<8",
+    "Unidecode>=1.4.0,<2",
+]
+
 ming-tn = [
     "pynini",
     "inflect",
