@@ -30,7 +30,7 @@ from vllm_omni.diffusion.lora.utils import (
     _match_target_modules,
     from_layer_diffusion,
 )
-from vllm_omni.lora.utils import stable_lora_int_id
+from vllm_omni.lora.utils import round_lora_scale, stable_lora_int_id
 
 logger = init_logger(__name__)
 
@@ -150,6 +150,9 @@ class DiffusionLoRAManager:
         self._adapter_access_order: OrderedDict[int, float] = OrderedDict()
         # Pinned adapters are not evicted
         self._pinned_adapters: set[int] = set()
+        # Composed multi-adapter LRU: sorted ((adapter_id, rounded_scale), ...)
+        # key -> registered adapter id of the composed LoRAModel.
+        self._composed_adapters: OrderedDict[tuple[tuple[int, float], ...], int] = OrderedDict()
 
         # track replaced modules
         # key: full module name (component.module.path); value: LoRA layer
@@ -174,6 +177,7 @@ class DiffusionLoRAManager:
 
         try:
             if lora_path is not None:
+                logger.info("Loading LoRA during initialization from %s with scale %.2f", lora_path, lora_scale)
                 init_request = LoRARequest(
                     lora_name="static",
                     lora_int_id=stable_lora_int_id(lora_path),
@@ -200,6 +204,18 @@ class DiffusionLoRAManager:
         if self._fixed_adapter:
             request, scale = self._fixed_adapter_request, 1.0
         self.set_active_adapter(request, scale)
+
+    def set_request_adapters(
+        self,
+        requests: LoRARequest | list[LoRARequest | None] | tuple[LoRARequest | None, ...] | None,
+        scales: float | list[float] | tuple[float, ...] = 1.0,
+    ) -> None:
+        """Multi-adapter counterpart of set_request_adapter: a pipeline's fixed
+        student (if any) wins over any request-specified adapters."""
+        if self._fixed_adapter:
+            self.set_request_adapter(None)
+            return
+        self.set_active_adapters(requests, scales)
 
     @contextmanager
     def suspended(self) -> Iterator[None]:
@@ -260,6 +276,7 @@ class DiffusionLoRAManager:
             if isinstance(module, BaseLayerWithLoRA):
                 has_lora_wrappers = True
                 supported.add(name.split(".")[-1])
+                continue
 
         if has_lora_wrappers:
             supported.discard("base_layer")
@@ -410,25 +427,185 @@ class DiffusionLoRAManager:
 
         self._activate_adapter(adapter_id, lora_scale)
 
+    def set_active_adapters(
+        self,
+        lora_requests: LoRARequest | list[LoRARequest | None] | tuple[LoRARequest | None, ...] | None,
+        lora_scales: float | list[float] | tuple[float, ...] = 1.0,
+    ) -> None:
+        """Set the active LoRA adapter(s) for the pipeline.
+
+        A single request (or None) behaves exactly like set_active_adapter().
+        Multiple requests are composed into one rank-sum adapter whose deltas
+        equal sum(scale_i * B_i @ A_i @ x); see _compose_lora_models().
+        """
+        if lora_requests is None or isinstance(lora_requests, LoRARequest):
+            scale = lora_scales[0] if isinstance(lora_scales, (list, tuple)) else lora_scales
+            self.set_active_adapter(lora_requests, scale)
+            return
+
+        requests = list(lora_requests)
+        if isinstance(lora_scales, (list, tuple)):
+            scales = list(lora_scales)
+        else:
+            scales = [lora_scales] * len(requests)
+        if len(scales) != len(requests):
+            raise ValueError(f"Got {len(requests)} LoRA requests but {len(scales)} scales")
+
+        pairs = [
+            (req, scale) for req, scale in zip(requests, scales) if req is not None and not math.isclose(0.0, scale)
+        ]
+        if not pairs:
+            self.set_active_adapter(None)
+            return
+        if len(pairs) == 1:
+            self.set_active_adapter(pairs[0][0], pairs[0][1])
+            return
+
+        key = tuple(sorted((req.lora_int_id, DiffusionLoRAManager._get_rounded_scale(scale)) for req, scale in pairs))
+        composed_id = self._composed_adapters.get(key)
+        if composed_id is not None and composed_id in self._registered_adapters:
+            self._composed_adapters.move_to_end(key)
+            self._touch_adapter_info(composed_id)
+        else:
+            self._composed_adapters.pop(key, None)
+            composed_id = self._register_composed_adapter(key, pairs)
+
+        self._activate_adapter(composed_id, 1.0)
+
+    def _register_composed_adapter(
+        self,
+        key: tuple[tuple[int, float], ...],
+        pairs: list[tuple[LoRARequest, float]],
+    ) -> int:
+        """Load the source adapters, compose them, and register the result as
+        a regular adapter so the standard activation/cache paths apply.
+
+        Source adapters are used only until ``torch.cat`` in
+        ``_compose_lora_models``: cached ones are reused, missing ones are
+        loaded transiently without entering the LRU cache, so stacking works
+        with any ``max_cached_adapters`` value (including the default of 1).
+        """
+        specs: list[tuple[LoRAModel, float]] = []
+        for request, scale in pairs:
+            lora_model = self._registered_adapters.get(request.lora_int_id)
+            if lora_model is not None:
+                self._touch_adapter_info(request.lora_int_id)
+            else:
+                # Transient load for composition only; never registered, so it
+                # cannot evict (or be evicted from) the adapter cache.
+                lora_model, _ = self._load_adapter(request)
+            specs.append((lora_model, scale))
+
+        composed_key_repr = repr(key)
+        composed_id = stable_lora_int_id(composed_key_repr)
+        composed_model, peft_helper = self._compose_lora_models(composed_id, specs)
+
+        self._evict_for_new_adapter()
+        self._registered_adapters[composed_id] = composed_model
+        self._touch_adapter_info(composed_id)
+        self._replace_layers_with_lora(peft_helper)
+
+        self._composed_adapters[key] = composed_id
+        self._composed_adapters.move_to_end(key)
+        while len(self._composed_adapters) > self.max_cached_adapters:
+            _, evicted_id = self._composed_adapters.popitem(last=False)
+            if evicted_id != composed_id and evicted_id != self._active_adapter_id:
+                self.remove_adapter(evicted_id)
+
+        logger.info(
+            "Registered composed adapter: id=%d, sources=%s, cache_size=%d/%d",
+            composed_id,
+            [request.lora_int_id for request, _ in pairs],
+            len(self._registered_adapters),
+            self.max_cached_adapters,
+        )
+        return composed_id
+
+    def _compose_lora_models(
+        self,
+        composed_id: int,
+        specs: list[tuple[LoRAModel, float]],
+    ) -> tuple[LoRAModel, PEFTHelper]:
+        """Compose k adapters into one rank-sum adapter per covered module.
+
+        For each module covered by any source adapter, concatenate the A
+        matrices along the rank dim and the scale-weighted B matrices along
+        the output dim: sum(scale_i * B_i @ A_i @ x) == B_cat @ A_cat @ x.
+        Modules covered by only some adapters take just their contributions.
+        """
+        module_names: set[str] = set()
+        for lora_model, _ in specs:
+            module_names.update(lora_model.loras.keys())
+
+        max_composed_rank = 0
+        max_supported_rank = self._VALID_MAX_RANKS[-1]
+        composed_loras: dict[str, LoRALayerWeights] = {}
+        for module_name in sorted(module_names):
+            lora_a_parts: list[torch.Tensor] = []
+            lora_b_parts: list[torch.Tensor] = []
+            for lora_model, scale in specs:
+                weights = lora_model.loras.get(module_name)
+                if weights is None:
+                    continue
+                if isinstance(weights, PackedLoRALayerWeights):
+                    raise NotImplementedError(
+                        f"Cannot compose packed LoRA weights for module {module_name}; "
+                        "stacking adapters on packed layers is not supported."
+                    )
+                lora_a_parts.append(weights.lora_a)
+                lora_b_parts.append(weights.lora_b * scale)
+            if not lora_a_parts:
+                continue
+            composed_rank = sum(part.shape[0] for part in lora_a_parts)
+            if composed_rank > max_supported_rank:
+                raise ValueError(
+                    f"Combined LoRA rank for module {module_name} is {composed_rank}, "
+                    f"exceeding the maximum supported rank of {max_supported_rank}; "
+                    "reduce the number of stacked adapters or their ranks."
+                )
+            max_composed_rank = max(max_composed_rank, composed_rank)
+            # scaling=1.0: the per-adapter scale is already folded into B, so
+            # the composed adapter must not be scaled again at bind time.
+            composed_loras[module_name] = LoRALayerWeights(
+                module_name=module_name,
+                rank=composed_rank,
+                lora_alpha=composed_rank,
+                lora_a=torch.cat(lora_a_parts, dim=0),
+                lora_b=torch.cat(lora_b_parts, dim=1),
+                scaling=1.0,
+            )
+
+        if not composed_loras:
+            raise ValueError("Cannot compose LoRA adapters: none of the adapters cover any module.")
+
+        composed_model = LoRAModel(lora_model_id=composed_id, rank=max_composed_rank, loras=composed_loras)
+        peft_helper = PEFTHelper.from_dict(
+            {
+                "r": max_composed_rank,
+                "lora_alpha": max_composed_rank,
+                "target_modules": sorted({name.split(".")[-1] for name in composed_loras}),
+            }
+        )
+        return composed_model, peft_helper
+
     def _touch_adapter_info(self, adapter_id):
         """Update the current caching ordering info."""
         self._adapter_access_order[adapter_id] = time.time()
         self._adapter_access_order.move_to_end(adapter_id)
 
     def _update_adapter_scale(self, adapter_id: int, lora_scale: float):
-        """Update the adapter scale for a given adapter ID. To avoid potential
-        issues with using Floats as keys, for now, we round float values to
-        3 decimal points.
-        """
+        """Update the adapter scale for a given adapter ID."""
         scale = DiffusionLoRAManager._get_rounded_scale(lora_scale)
         self._adapter_scales[adapter_id] = scale
 
     @staticmethod
     def _get_rounded_scale(lora_scale: float):
         """Normalizes a lora scale for use as a key in the _adapter_scales
-        dict; for now we just round scales to 3 decimal places.
+        dict and in composed-adapter keys. Delegates to the canonical
+        ``round_lora_scale`` so manager identity always matches the scheduler
+        batch key and KV-cache namespace quantization.
         """
-        return round(lora_scale, 3)
+        return round_lora_scale(lora_scale)
 
     def _load_adapter(
         self,
@@ -1325,6 +1502,9 @@ class DiffusionLoRAManager:
         self._adapter_scales.pop(adapter_id, None)
         self._adapter_access_order.pop(adapter_id, None)
         self._pinned_adapters.discard(adapter_id)
+        stale_composed_keys = [key for key, cid in getattr(self, "_composed_adapters", {}).items() if cid == adapter_id]
+        for key in stale_composed_keys:
+            del self._composed_adapters[key]
         logger.debug(
             "Adapter %d removed, cache size: %d/%d",
             adapter_id,

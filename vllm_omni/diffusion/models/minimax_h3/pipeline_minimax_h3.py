@@ -2937,6 +2937,13 @@ class MiniMaxH3Pipeline(
         error = None
         if rank == 0:
             try:
+                # Stacked (multi-adapter) LoRA requests arrive as a list; the
+                # H3 turbo/native hooks only understand a single adapter.
+                if isinstance(sampling.lora_request, list):
+                    raise OmniClientError(
+                        "MiniMax-H3 turbo/native LoRA does not support stacked adapters; "
+                        "pass a single lora object per request"
+                    )
                 _, multi_modal_data = self._extract_prompt(raw_prompt)
                 if multi_modal_data.get(MINIMAX_H3_TIMELINE_GUIDES_KEY) is not None and not self.load_vae_encoder:
                     raise OmniClientError("MiniMax H3 timeline guides require a VAE encoder in the diffusion stage")

@@ -1180,6 +1180,16 @@ async def _parse_video_form(
             ),
         )
 
+    parsed_lora = _parse_form_json(lora)
+    if parsed_lora is not None and not (
+        isinstance(parsed_lora, dict)
+        or (isinstance(parsed_lora, list) and all(isinstance(item, dict) for item in parsed_lora))
+    ):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid JSON in form field: expected dict or list of dict, got {type(parsed_lora).__name__}.",
+        )
+
     if model == "auto":
         model = None
     request_data: dict[str, Any] = {
@@ -1214,7 +1224,7 @@ async def _parse_video_form(
         "frame_interpolation_exp": frame_interpolation_exp,
         "frame_interpolation_scale": frame_interpolation_scale,
         "frame_interpolation_model_path": frame_interpolation_model_path,
-        "lora": _parse_form_json(lora, expected_type=dict),
+        "lora": parsed_lora,
         "extra_params": _parse_form_json(extra_params, expected_type=dict),
         "return_stage_metrics": return_stage_metrics,
     }

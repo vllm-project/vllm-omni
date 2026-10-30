@@ -75,6 +75,48 @@ outputs = omni.generate(
 )
 ```
 
+#### PEFT backend: stacking multiple LoRAs in one request
+
+A single request can activate several LoRA adapters at once, each with its own
+scale. The adapters are composed into a single adapter whose per-layer rank is
+the sum of the individual ranks; the composed adapter is cached and activated
+like any other adapter, and requests with different LoRA combinations (or
+different scales) are scheduled into separate batches.
+
+Constraints:
+
+- The summed rank of the stacked adapters must not exceed **512** per layer.
+  Two or three typical LoRAs (rank 4-64) fit comfortably.
+- Adapters with a scale of approximately 0 are skipped.
+- Stacking adapters on packed (merged-projection) layers such as fused QKV is
+  not supported yet.
+- Pipelines with model-specific LoRA hooks (e.g. MiniMax-H3 turbo/native,
+  whose adapters pin a sampler contract) reject stacked requests with a
+  client error instead of stacking them.
+
+Offline: pass a list of `LoRARequest` objects together with a matching list of
+scales:
+
+```python
+outputs = omni.generate(
+    prompt="A piece of cheesecake",
+    lora_request=[lora_request_a, lora_request_b],
+    lora_scale=[0.8, 0.6],
+)
+```
+
+Online: the `lora` request field accepts an array of objects instead of a
+single object (a single object remains valid):
+
+```json
+"lora": [
+  {"name": "style", "local_path": "/path/to/style.safetensors", "scale": 0.8, "int_id": 1},
+  {"name": "character", "local_path": "/path/to/character.safetensors", "scale": 0.6, "int_id": 2}
+]
+```
+
+`int_id` is optional; when omitted it is derived from `local_path`.
+
 #### Distill backend: fuse distilled LoRA at init
 
 For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or more concrete `.safetensors` files. The weights are fused into the base model once at init; subsequent `generate()` calls do not need a `LoRARequest`.
