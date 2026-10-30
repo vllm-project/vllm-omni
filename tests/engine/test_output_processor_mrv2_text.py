@@ -18,7 +18,6 @@ from vllm_omni.engine.output_processor import (
     OmniRequestState,
 )
 from vllm_omni.outputs import OmniRequestOutput
-from vllm_omni.outputs.output_processor import _pooling_keys_not_in
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -127,34 +126,60 @@ def test_mrv2_payload_mirrored_on_both_channels_is_accumulated_once():
     torch.testing.assert_close(payload["latent_input_ids"], ids)
 
 
-def test_mrv2_mirror_is_dropped_by_value_and_rest_keeps_nested_layout():
+def _process_mrv2_mirror(pooling_output, multimodal_output):
+    processor, _ = _make_processor(OutputModality.LATENT, _Detokenizer())
+    output = _rehydrated_output(pooling_output=pooling_output)
+    output.multimodal_output = multimodal_output
+    return processor.process_outputs([output]).request_outputs[0].outputs[0].multimodal_output
+
+
+def test_mrv2_partially_mirrored_nested_payload_keeps_every_layer_once():
     # The channels are decoded separately, so the mirror is equal, not identical.
+    hidden = torch.arange(12.0).reshape(3, 4)
     layer = torch.arange(6.0).reshape(3, 2)
-    pooling = {
-        "latent": torch.ones(3, 4),
-        "hidden_states": {"layers": {0: layer, 1: layer + 1}},
-        "codes": {"audio": torch.tensor([1, 2, 3])},
-    }
-    mm = {
-        "latent": torch.ones(3, 4),
-        "hidden_states": {"layers": {0: layer.clone()}},
-        "codes": {"audio": torch.tensor([7, 8, 9])},
-    }
+    payload = _process_mrv2_mirror(
+        {"latent": hidden, "hidden_states": {"layers": {0: layer, 1: layer + 1}}},
+        {"latent": hidden.clone(), "hidden_states": {"layers": {0: layer.clone()}}},
+    )
 
-    rest = _pooling_keys_not_in(pooling, mm)
-
-    assert set(rest) == {"hidden_states", "codes"}
-    assert set(rest["hidden_states"]["layers"]) == {1}
-    torch.testing.assert_close(rest["hidden_states"]["layers"][1], layer + 1)
-    # Same key, different value: not a mirror, so it is kept.
-    torch.testing.assert_close(rest["codes"]["audio"], torch.tensor([1, 2, 3]))
+    torch.testing.assert_close(payload["latent"], hidden)
+    # _to_cpu stringifies nested dict keys on both channels.
+    layers = payload["hidden_states"]["layers"]
+    assert set(layers) == {"0", "1"}
+    torch.testing.assert_close(layers["0"], layer)
+    torch.testing.assert_close(layers["1"], layer + 1)
 
 
-def test_mrv2_pooling_payload_without_mirror_is_passed_through():
-    pooling = {"hidden_states": {"layers": {0: torch.zeros(2, 2)}}}
+def test_mrv2_mirror_with_nan_and_deep_nesting_is_accumulated_once():
+    hidden = torch.tensor([[1.0, float("nan")], [2.0, 3.0]])
+    speakers = [torch.tensor([1, 2]), torch.tensor([3])]
+    # Two levels down, so consolidate_metadata leaves the list as is.
+    payload = _process_mrv2_mirror(
+        {"latent": hidden, "extra": {"deep": {"t": hidden, "speakers": speakers}}},
+        {
+            "latent": hidden.clone(),
+            "extra": {"deep": {"t": hidden.clone(), "speakers": [t.clone() for t in speakers]}},
+        },
+    )
 
-    assert _pooling_keys_not_in(pooling, {"latent": torch.ones(1)}) is pooling
-    assert _pooling_keys_not_in(pooling, {"hidden_states": {"layers": {0: torch.zeros(2, 2)}}}) is None
+    torch.testing.assert_close(payload["latent"], hidden, equal_nan=True)
+    deep = payload["extra"]["deep"]
+    torch.testing.assert_close(deep["t"], hidden, equal_nan=True)
+    assert len(deep["speakers"]) == 2
+
+
+def test_mrv2_distinct_same_key_values_are_not_dropped():
+    first, second = torch.ones(1, 4), torch.zeros(1, 4)
+    payload = _process_mrv2_mirror(
+        {"latent": second, "codes": {"audio": torch.tensor([1, 2])}},
+        {"latent": first, "codes": {"audio": torch.tensor([7, 8]), "text": torch.tensor([5])}},
+    )
+
+    # A top-level tensor accumulates after the mm_output one, as before.
+    torch.testing.assert_close(payload["latent"], torch.cat([first, second]))
+    # Nested metadata keeps both siblings; the pooling value wins on conflict.
+    torch.testing.assert_close(payload["codes"]["audio"], torch.tensor([1, 2]))
+    torch.testing.assert_close(payload["codes"]["text"], torch.tensor([5]))
 
 
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
