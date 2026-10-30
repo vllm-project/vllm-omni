@@ -48,7 +48,7 @@ tts_server_params = [
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, online_client) -> None:
     """
@@ -73,7 +73,7 @@ def test_text_to_audio_001(omni_server, online_client) -> None:
 
 @pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A3"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_002(omni_server, online_client) -> None:
     """
