@@ -14,7 +14,7 @@ from starlette.routing import Route
 def remove_route_from_app(
     app: FastAPI,
     path: str,
-    methods: set[str],
+    methods: set[str] | frozenset[str],
 ) -> None:
     """Remove app routes matching a path and one of the given HTTP methods."""
     routes_to_remove = [
