@@ -34,6 +34,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.graph import build_denoise_graph_runner
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -239,6 +240,12 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         )
 
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
+        self._denoise_graph_runner = build_denoise_graph_runner(od_config, self._denoise_graph_forward, "ZImage DiT")
+
+    def _denoise_graph_forward(
+        self, latents: list[torch.Tensor], timestep: torch.Tensor, prompt_embeds: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        return self.transformer(latents, timestep, prompt_embeds)[0]
 
     def encode_prompt(
         self,
@@ -660,11 +667,19 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             if getattr(self, "_uses_cudagraph_trees", False):
                 # check Ming-Image
                 torch.compiler.cudagraph_mark_step_begin()
-            model_out_list = self.transformer(
-                latent_model_input_list,
-                timestep_model_input,
-                prompt_embeds_model_input,
-            )[0]
+            runner = getattr(self, "_denoise_graph_runner", None)
+            if runner is not None and not getattr(self, "_uses_cudagraph_trees", False):
+                model_out_list = runner(
+                    latents=latent_model_input_list,
+                    timestep=timestep_model_input,
+                    prompt_embeds=prompt_embeds_model_input,
+                )
+            else:
+                model_out_list = self.transformer(
+                    latent_model_input_list,
+                    timestep_model_input,
+                    prompt_embeds_model_input,
+                )[0]
 
             if apply_cfg:
                 # Perform CFG

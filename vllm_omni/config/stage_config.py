@@ -640,6 +640,7 @@ class StageDeployConfig:
     # today). Independent of compilation_config.cudagraph_mode;
     # enforce_eager=True also disables it.
     enable_cuda_graph_decode: bool | None = None
+    diffusion_use_graph: bool | None = None
     fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None
