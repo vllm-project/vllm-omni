@@ -18,6 +18,7 @@ from vllm_omni.engine.stage_engine_core_proc import (
     _bind_first_audio_sink,
     _extend_handshake_timeout,
 )
+from vllm_omni.inputs.mm_rng import MMRNGContext
 from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -94,6 +95,7 @@ def test_preprocess_add_request_preserves_omni_fields():
         request_id="internal",
         external_req_id="external",
         additional_information={"conditioning": "payload"},
+        mm_rng_context=MMRNGContext("test", 0, ("shape",)),
     )
     scheduler_request = SimpleNamespace()
 
@@ -108,6 +110,7 @@ def test_preprocess_add_request_preserves_omni_fields():
     assert current_wave == 3
     assert result.external_req_id == "external"
     assert result.additional_information == {"conditioning": "payload"}
+    assert result.mm_rng_context is request.mm_rng_context
 
 
 def test_first_audio_binding_preserves_talker_marker():

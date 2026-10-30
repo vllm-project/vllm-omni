@@ -1081,14 +1081,12 @@ async def omni_init_app_state(
     ):
         if vllm_config is not None:
             try:
-                from vllm.v1.engine.input_processor import InputProcessor
+                from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 
                 tokenizer = await engine_client.get_tokenizer()
                 if tokenizer is not None:
                     if not hasattr(engine_client, "input_processor") or engine_client.input_processor is None:
-                        engine_client.input_processor = InputProcessor(
-                            vllm_config=vllm_config,
-                        )
+                        engine_client.input_processor = build_stage0_input_processor(vllm_config)
                         logger.info("Initialized input_processor for AsyncOmni")
 
                     if not hasattr(engine_client, "model_config") or engine_client.model_config is None:

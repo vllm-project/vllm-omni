@@ -9,6 +9,7 @@ from typing import Any, Literal, TypeAlias
 import numpy as np
 import regex as re
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from PIL import Image
 from torch import nn
@@ -27,7 +28,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.inputs import MultiModalDataDict
+from vllm.inputs import MultiModalDataDict, MultiModalInput
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory as SharedFusedMoE
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
@@ -73,10 +74,12 @@ from vllm.multimodal.parse import (
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseProcessingInfo,
+    ProcessorInputs,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.multimodal.processing.context import TimingContext
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers import get_tokenizer
 from vllm.utils.tensor_schema import TensorSchema
@@ -85,6 +88,8 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.inputs.mm_rng import HUNYUAN_VAE_RNG_POLICY, MM_RNG_CONTEXT_KEY, MMRNGContext
+from vllm_omni.model_executor.mm_request_rng import MM_RNG_ITEM_KEY, RandomDrawSpec, RequestRNGProvider
 from vllm_omni.model_executor.models.hunyuan_image3._hunyuan_v1_vendored import (
     HunYuanMLP,
     HunYuanModel,
@@ -1031,6 +1036,19 @@ class HunyuanImage3DummyInputsBuilder(BaseDummyInputsBuilder[HunyuanImage3Proces
 class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3ProcessingInfo]):
     """Multimodal processor for HunyuanImage3 model."""
 
+    mm_rng_seed_field = "vae_generator_seed"
+
+    def apply(self, inputs: ProcessorInputs, timing_ctx: TimingContext) -> MultiModalInput:
+        result = super().apply(inputs, timing_ctx)
+        seed = inputs.hf_processor_mm_kwargs.get("vae_generator_seed")
+        if seed is not None:
+            result[MM_RNG_CONTEXT_KEY] = MMRNGContext(
+                policy=HUNYUAN_VAE_RNG_POLICY,
+                seed=int(seed),
+                retain_fields=("vae_generator_seed", "vae_token_grid_hw"),
+            )
+        return result
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -1068,13 +1086,13 @@ class HunyuanImage3MultiModalProcessor(OmniMultiModalProcessor[HunyuanImage3Proc
         if "vae_pixel_size" in hf_inputs:
             config["vae_pixel_size"] = MultiModalFieldConfig.batched("image")
         if "vae_token_grid_hw" in hf_inputs:
-            config["vae_token_grid_hw"] = MultiModalFieldConfig.batched("image")
+            config["vae_token_grid_hw"] = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
         if "base_size" in hf_inputs:
             config["base_size"] = MultiModalFieldConfig.batched("image")
         if "ratio_index" in hf_inputs:
             config["ratio_index"] = MultiModalFieldConfig.batched("image")
         if "vae_generator_seed" in hf_inputs:
-            config["vae_generator_seed"] = MultiModalFieldConfig.batched("image")
+            config["vae_generator_seed"] = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
         return config
 
     def _get_prompt_updates(
@@ -1444,6 +1462,42 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
     - Tensor Parallelism
     """
 
+    supports_mm_request_rng = True
+    _mm_rng_provider: RequestRNGProvider | None = None
+
+    def bind_mm_rng_provider(self, provider: RequestRNGProvider) -> None:
+        self._mm_rng_provider = provider
+
+    def get_mm_rng_specs(
+        self, features: list[MultiModalFeatureSpec], context: MMRNGContext
+    ) -> dict[int, RandomDrawSpec]:
+        if context.policy != HUNYUAN_VAE_RNG_POLICY:
+            raise ValueError(f"Unsupported Hunyuan VAE RNG policy: {context.policy}")
+        specs = {}
+        for index, feature in enumerate(features):
+            if feature.modality != "image":
+                continue
+            data = feature.data
+            if data is None or "vae_token_grid_hw" not in data or "vae_generator_seed" not in data:
+                raise ValueError("Seeded Hunyuan requests require VAE metadata for every reference image")
+            if int(data["vae_generator_seed"].data.item()) != context.seed:
+                raise ValueError("VAE image seed does not match the request RNG context")
+            token_h, token_w = data["vae_token_grid_hw"].data.tolist()
+            h = token_h * self.config.vae_downsample_factor[0] * self.config.patch_size
+            w = token_w * self.config.vae_downsample_factor[1] * self.config.patch_size
+            factor = self.vae.ffactor_spatial
+            if h % factor or w % factor:
+                raise ValueError("VAE reference image dimensions must align with the spatial downsample factor")
+            shape = (1, self.config.vae["latent_channels"], 1, h // factor, w // factor)
+            specs[index] = RandomDrawSpec(shape, self.vae.dtype, self.vae.device)
+        return specs
+
+    @staticmethod
+    def advance_mm_rng(generator: torch.Generator, spec: RandomDrawSpec) -> None:
+        # Match DiagonalGaussianDistribution.sample exactly, including dtype
+        # and shape-dependent CUDA RNG consumption. No VAE forward is needed.
+        randn_tensor(spec.shape, generator=generator, dtype=spec.dtype, device=spec.device)
+
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
     prefer_model_sampler = True
@@ -1799,7 +1853,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self,
         images: torch.Tensor,
         cfg_factor: int = 1,
-        generator: torch.Generator | None = None,
+        rng_item: tuple[int, int] | None = None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
         """
         Encode images through VAE encoder.
@@ -1819,7 +1873,15 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             images = images.to(dtype=self.vae.dtype)
 
         vae_encode_result = self.vae.encode(images)
-        latents = vae_encode_result.latent_dist.sample(generator)
+        posterior = vae_encode_result.latent_dist
+        if rng_item is None:
+            latents = posterior.sample()
+        else:
+            if self._mm_rng_provider is None:
+                raise ValueError("Seeded VAE sampling requires a Runner RNG provider")
+            spec = RandomDrawSpec(tuple(posterior.mean.shape), posterior.parameters.dtype, posterior.parameters.device)
+            with self._mm_rng_provider.sample(*rng_item, spec) as request_generator:
+                latents = posterior.sample(request_generator)
 
         # Apply shift and scaling factors if present
         if hasattr(config, "shift_factor") and config.shift_factor:
@@ -1941,6 +2003,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         """Get multimodal embeddings from input."""
+        rng_items = kwargs.pop(MM_RNG_ITEM_KEY, None)
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
             return []
@@ -1952,11 +2015,14 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vit_spatial_shapes = pixel_values["vit_spatial_shapes"]
         vae_pixel_values = pixel_values["vae_pixel_values"]
         vae_generator_seed = pixel_values.get("vae_generator_seed")
-        vae_generator = None
-        if vae_generator_seed is not None and vae_generator_seed.numel() > 0:
-            vae_generator = torch.Generator(device=vae_pixel_values[0].device).manual_seed(
-                int(vae_generator_seed.reshape(-1)[0].item())
-            )
+        if vae_generator_seed is not None:
+            if vae_generator_seed.numel() != len(vae_pixel_values):
+                raise ValueError("VAE seeds must align with the reference images")
+            if not isinstance(rng_items, torch.Tensor) or rng_items.shape != (len(vae_pixel_values), 2):
+                raise ValueError("Seeded VAE sampling requires aligned request RNG context from the Omni Runner")
+            rng_items = rng_items.tolist()
+        elif rng_items is not None:
+            raise ValueError("VAE RNG context requires an explicit processor seed")
 
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
@@ -1964,8 +2030,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # VAE encode + patch_embed per image — each cond image is at its own
         # `reso_group` bucket so shapes are ragged across the image-batch dim.
         vae_token_embeddings = []
-        for vae_image_i in vae_pixel_values:
-            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor, generator=vae_generator)
+        for i, vae_image_i in enumerate(vae_pixel_values):
+            rng_item = tuple(rng_items[i]) if rng_items is not None else None
+            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor, rng_item=rng_item)
             t_emb = self.time_embed(t_i[0])
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)

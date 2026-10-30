@@ -176,6 +176,7 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.additional_information = request.additional_information
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         scheduler_request.payload_sender_info = getattr(request, "payload_sender_info", None)
+        scheduler_request.mm_rng_context = getattr(request, "mm_rng_context", None)
         return scheduler_request, current_wave
 
     @staticmethod

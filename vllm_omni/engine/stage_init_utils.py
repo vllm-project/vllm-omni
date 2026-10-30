@@ -59,6 +59,7 @@ from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
+from vllm_omni.inputs.input_processor import OmniInputProcessor
 from vllm_omni.inputs.preprocess import build_omni_renderer, omni_renderer_cls
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
@@ -1679,7 +1680,7 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
     The renderer is the Omni subclass of the upstream renderer class that
     ``renderer_from_config`` would have picked (or of the token-only renderer
     when the stage skips tokenizer initialization), so upstream's
-    ``InputProcessor`` runs unmodified on top of it.
+    ``OmniInputProcessor`` preserves model-declared request context.
     """
 
     patch_generation_config_if_needed(stage_vllm_config.model_config)
@@ -1687,7 +1688,7 @@ def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
         renderer = _build_token_only_renderer(stage_vllm_config)
     else:
         renderer = build_omni_renderer(stage_vllm_config)
-    return InputProcessor(vllm_config=stage_vllm_config, renderer=renderer)
+    return OmniInputProcessor(vllm_config=stage_vllm_config, renderer=renderer)
 
 
 def device_init_lock_path(device_id: int, lock_dir: str = "/tmp") -> str:

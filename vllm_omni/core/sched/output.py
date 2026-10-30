@@ -8,6 +8,7 @@ from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, Schedul
 from vllm.v1.request import Request
 
 from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.inputs.mm_rng import MMRNGContext, retain_mm_rng_fields
 
 
 @dataclass
@@ -32,6 +33,7 @@ class OmniNewRequestData(NewRequestData):
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
     resumable: bool = False
+    mm_rng_context: MMRNGContext | None = None
 
     @classmethod
     def from_base(
@@ -41,12 +43,16 @@ class OmniNewRequestData(NewRequestData):
     ) -> "OmniNewRequestData":
         """Preserve upstream request data while attaching Omni payloads."""
         base_data = {field.name: getattr(data, field.name) for field in fields(NewRequestData)}
+        context = getattr(request, "mm_rng_context", None)
+        if context is not None and request is not None:
+            base_data["mm_features"] = retain_mm_rng_fields(data.mm_features, request.mm_features, context)
         return cls(
             **base_data,
             external_req_id=getattr(request, "external_req_id", None),
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            mm_rng_context=context,
         )
 
     @classmethod
@@ -82,6 +88,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            mm_rng_context=getattr(request, "mm_rng_context", None),
         )
 
 

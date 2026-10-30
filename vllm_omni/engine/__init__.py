@@ -15,6 +15,8 @@ from vllm.v1.engine import (
     EngineCoreRequest,
 )
 
+from vllm_omni.inputs.mm_rng import MMRNGContext
+
 
 class PromptEmbedsPayload(msgspec.Struct):
     """Serialized prompt embeddings payload for direct transfer.
@@ -83,6 +85,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
     payload_sender_info: dict[str, Any] | None = None
+    mm_rng_context: MMRNGContext | None = None
 
     @classmethod
     def from_request(
@@ -93,6 +96,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
         payload_sender_info: dict[str, Any] | None = None,
+        mm_rng_context: MMRNGContext | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -104,6 +108,8 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
         if payload_sender_info is None:
             payload_sender_info = getattr(request, "payload_sender_info", None)
+        if mm_rng_context is None:
+            mm_rng_context = getattr(request, "mm_rng_context", None)
 
         return cls(
             request_id=request.request_id,
@@ -131,6 +137,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             additional_information=additional_information,
             model_intermediate_buffer=model_intermediate_buffer,
             payload_sender_info=payload_sender_info,
+            mm_rng_context=mm_rng_context,
         )
 
 

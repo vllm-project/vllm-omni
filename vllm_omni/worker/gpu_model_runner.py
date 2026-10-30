@@ -15,6 +15,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
+from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem, PlaceholderRange
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument
@@ -37,7 +38,13 @@ from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.inputs.mm_rng import MMRNGContext
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
+from vllm_omni.model_executor.mm_request_rng import (
+    MM_RNG_ITEM_KEY,
+    RequestRNGProvider,
+    supports_mm_request_rng,
+)
 from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -115,6 +122,7 @@ def _build_prefill_token_mask(
 
 class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     intermediate_tensors: IntermediateTensors | None
+    _mm_rng_provider: RequestRNGProvider | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -135,6 +143,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._has_lmcache = False
 
     def shutdown(self) -> None:
+        if self._mm_rng_provider is not None:
+            self._mm_rng_provider.handles.clear()
+            self._mm_rng_provider.streams.clear()
+            self._mm_rng_contexts.clear()
         # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
         # earlier in its teardown; the shared helper is idempotent.
         self._shutdown_omni_prefix_cache()
@@ -208,6 +220,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         model = getattr(self, "model", None)
+        self._init_mm_request_rng()
         override_fn = None
         if bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)):
             candidate = getattr(model, "consume_sampled_token_ids_cpu_override", None)
@@ -223,6 +236,44 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
         self._warn_unexposed_stage_hooks(model)
+
+    def _init_mm_request_rng(self) -> None:
+        model = self.get_model()
+        self._mm_rng_contexts: dict[str, MMRNGContext] = {}
+        if supports_mm_request_rng(model):
+            self._mm_rng_provider = RequestRNGProvider(model.advance_mm_rng)
+            model.bind_mm_rng_provider(self._mm_rng_provider)
+
+    def _batch_mm_inputs_from_scheduler(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> tuple[list[str], list[tuple[str, MultiModalKwargsItem]], list[tuple[str, PlaceholderRange]]]:
+        hashes, items, refs = super()._batch_mm_inputs_from_scheduler(scheduler_output)
+        provider = self._mm_rng_provider
+        if provider is None:
+            return hashes, items, refs
+        model = self.get_model()
+        assert supports_mm_request_rng(model)
+        item_indices = {
+            (req_id, self.requests[req_id].mm_features[index].identifier): index
+            for req_id, indices in scheduler_output.scheduled_encoder_inputs.items()
+            for index in indices
+        }
+        for i, (identifier, (modality, item), (req_id, _)) in enumerate(zip(hashes, items, refs)):
+            context = self._mm_rng_contexts.get(req_id)
+            if context is None:
+                continue
+            mm_index = item_indices[req_id, identifier]
+            handle = provider.handles.get(req_id)
+            if handle is None:
+                features = self.requests[req_id].mm_features
+                handle = provider.register(req_id, context.seed, model.get_mm_rng_specs(features, context))
+            field = MultiModalFieldConfig.batched(modality, keep_on_cpu=True)
+            # Cache items are shared across requests. Only this invocation's
+            # shallow copy may contain a worker-local request handle.
+            item = MultiModalKwargsItem(item)
+            item[MM_RNG_ITEM_KEY] = field.build_elems(MM_RNG_ITEM_KEY, torch.tensor([[handle, mm_index]]))[0]
+            items[i] = modality, item
+        return hashes, items, refs
 
     # Read on the model this runner holds. A multi-stage wrapper that builds its
     # stage module as a child must re-export them, or the runner silently takes
@@ -590,6 +641,33 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if self._mm_rng_provider is not None:
+            for req_id in scheduler_output.finished_req_ids:
+                self._mm_rng_provider.discard(req_id)
+                self._mm_rng_contexts.pop(req_id, None)
+            for new_req in scheduler_output.scheduled_new_reqs:
+                context = getattr(new_req, "mm_rng_context", None)
+                previous = self._mm_rng_contexts.get(new_req.req_id)
+                if new_req.req_id in self.requests and new_req.req_id not in scheduler_output.finished_req_ids:
+                    if previous != context:
+                        raise ValueError("Multimodal RNG context changed within a request")
+                    if context is not None:
+                        old_features = self.requests[new_req.req_id].mm_features
+                        if [(f.modality, f.identifier) for f in old_features] != [
+                            (f.modality, f.identifier) for f in new_req.mm_features
+                        ]:
+                            raise ValueError("Multimodal RNG references changed within a request")
+                        if new_req.req_id in self._mm_rng_provider.handles:
+                            # Revalidate immutable plans only on request updates,
+                            # never once per scheduled image in the encoder loop.
+                            model = self.get_model()
+                            assert supports_mm_request_rng(model)
+                            self._mm_rng_provider.register(
+                                new_req.req_id, context.seed, model.get_mm_rng_specs(new_req.mm_features, context)
+                            )
+                if context is not None:
+                    self._mm_rng_contexts[new_req.req_id] = context
+
         # Remove finished requests from the cached states.
         # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
         # is only safe to call once init_omni_connectors() has finished
