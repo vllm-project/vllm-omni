@@ -6,12 +6,14 @@ from __future__ import annotations
 import asyncio
 import gc
 import queue
+import time
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -1726,4 +1728,129 @@ def test_omni_generate_dead_orchestrator_closes_engine(monkeypatch: pytest.Monke
         assert engine.aborted == [[engine.submitted[0]["request_id"]]]
         assert not app.request_states
     finally:
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage_metadata", [DIFFUSION_ONLY_META, THREE_STAGE_META])
+async def test_shutdown_waits_for_final_output(monkeypatch, stage_metadata):
+    submitted = asyncio.Event()
+    engine = FakeAsyncOmniEngine(stage_metadata=stage_metadata, on_add_request=lambda *_: submitted.set())
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni(model="dummy-model")
+
+    async def consume():
+        return [output async for output in app.generate("prompt", request_id="draining")]
+
+    request = asyncio.create_task(consume())
+    await asyncio.wait_for(submitted.wait(), timeout=2)
+    shutdown = asyncio.create_task(asyncio.to_thread(app.shutdown, timeout=5))
+    try:
+        await asyncio.sleep(0.05)
+        assert not shutdown.done()
+        assert not engine.shutdown_called
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await anext(app.generate("prompt", request_id="late"))
+        assert len(engine.submitted) == 1
+        engine.output_q.put(make_output_msg("draining", len(stage_metadata) - 1, payload="done", output_finished=True))
+        outputs = await asyncio.wait_for(request, timeout=2)
+        await asyncio.wait_for(shutdown, timeout=2)
+        assert outputs[-1].finished
+        assert engine.shutdown_called
+        app.shutdown(timeout=5)
+    finally:
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+        await shutdown
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", ["submit", "input", "abort_timeout"])
+async def test_shutdown_releases_pending_request(monkeypatch, pending):
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+    engine = FakeAsyncOmniEngine(on_add_request=lambda *_: started.set())
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni(model="dummy-model")
+
+    async def blocked_submit(**_kwargs):
+        started.set()
+        await blocked.wait()
+
+    async def blocked_abort(*_args, **_kwargs):
+        await blocked.wait()
+
+    async def input_stream():
+        started.set()
+        await blocked.wait()
+        yield StreamingInput(prompt="unused")
+
+    if pending == "submit":
+        monkeypatch.setattr(engine, "add_request_async", blocked_submit)
+    elif pending == "abort_timeout":
+        monkeypatch.setattr(engine, "abort_async", blocked_abort)
+        monkeypatch.setattr("vllm_omni.entrypoints.async_omni.ABORT_TIMEOUT_S", 0.02)
+
+    async def consume():
+        prompt = input_stream() if pending == "input" else "prompt"
+        return [output async for output in app.generate(prompt, request_id="pending")]
+
+    request = asyncio.create_task(consume())
+    await asyncio.wait_for(started.wait(), timeout=2)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown, timeout=0.01), timeout=2)
+        await asyncio.wait_for(request, timeout=2)
+        assert not app.request_states
+        assert not app._pending_submits
+        assert engine.shutdown_called
+    finally:
+        blocked.set()
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_rejects_request_waiting_for_resume(monkeypatch):
+    engine = FakeAsyncOmniEngine()
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni(model="dummy-model")
+    app._paused = True
+    request = asyncio.create_task(anext(app.generate("prompt", request_id="paused")))
+    await asyncio.sleep(0)
+    try:
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown, timeout=5), timeout=2)
+        with pytest.raises(OmniEngineDeadError, match="shutting down"):
+            await asyncio.wait_for(request, timeout=2)
+        assert not engine.submitted
+    finally:
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
+        app.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [0, 0.05])
+async def test_shutdown_aborts_unfinished_request(monkeypatch, timeout):
+    submitted = asyncio.Event()
+    engine = FakeAsyncOmniEngine(on_add_request=lambda *_: submitted.set())
+    _patch_engine(monkeypatch, engine)
+    app = AsyncOmni(model="dummy-model")
+
+    async def consume():
+        return [output async for output in app.generate("prompt", request_id="unfinished")]
+
+    request = asyncio.create_task(consume())
+    await asyncio.wait_for(submitted.wait(), timeout=2)
+    try:
+        started = time.monotonic()
+        await asyncio.wait_for(asyncio.to_thread(app.shutdown, timeout=timeout), timeout=2)
+        assert time.monotonic() - started >= timeout
+        await asyncio.wait_for(request, timeout=2)
+        assert engine.shutdown_called
+        assert not app.request_states
+    finally:
+        request.cancel()
+        await asyncio.gather(request, return_exceptions=True)
         app.shutdown()

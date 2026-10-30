@@ -611,6 +611,12 @@ class AsyncOmniBase(OmniBase):
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown the engine."""
         if self.final_output_task is not None:
-            self.final_output_task.cancel()
+            task = self.final_output_task
+            if not task.done():
+                loop = task.get_loop()
+                if loop.is_running():
+                    loop.call_soon_threadsafe(task.cancel)
+                elif not loop.is_closed():
+                    task.cancel()
             self.final_output_task = None
         OmniBase.shutdown(self)

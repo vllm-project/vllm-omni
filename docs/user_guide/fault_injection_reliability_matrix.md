@@ -45,6 +45,12 @@ More failure modes (for example, network jitter and network interruption) will b
 
 ## Fault Injection Scenario Matrix
 
+For `AsyncOmni` serving, `--shutdown-timeout N` allows active generations up to
+`N` seconds to finish after `SIGTERM` or `SIGINT`. New HTTP requests receive 503
+while draining. The server closes the engine when the last generation finishes,
+or aborts remaining generations when the timeout expires, then cleans up resources.
+The default, `--shutdown-timeout 0`, aborts without a drain period.
+
 | Scenario | Fault Type | System Behavior | Current Status |
 | ------ | ---------------------------- | ---------- | ---------- |
 | No load | Send `SIGKILL` to Worker | Worker process is killed immediately; main service detects child-process loss and turns unavailable; API enters stable 5xx | |

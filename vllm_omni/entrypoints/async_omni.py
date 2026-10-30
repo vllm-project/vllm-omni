@@ -34,6 +34,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import ErrorMessage
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, disable_watermarking
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -101,6 +102,12 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self.tts_max_instructions_length = tts_max_instructions_length
         self._pause_cond: asyncio.Condition = asyncio.Condition()
         self._paused: bool = False
+        self._shutting_down: bool = False
+        self._request_loop: asyncio.AbstractEventLoop | None
+        try:
+            self._request_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._request_loop = None
         # In-flight EngineCore submits (non-streaming add_request, or each
         # streaming ADD/update/final marker). sleep() waits for this to hit
         # zero so a pipelined request cannot race into EngineCore during
@@ -199,6 +206,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # only for internal tracking throughout the request's life.
         external_request_id = request_id
         request_id = self._get_unique_request_id(external_request_id)
+        self._request_loop = asyncio.get_running_loop()
 
         # Wait until generation is resumed if the engine is paused. Non-streaming
         # generate holds an admission slot until add_request completes so sleep()
@@ -212,7 +220,11 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         # side. Park here until the full wake instead of erroring (#8678).
         streaming_input = isinstance(prompt, AsyncGenerator)
         async with self._pause_cond:
-            await self._pause_cond.wait_for(lambda: not self._paused and not getattr(self, "_sleeping_tags", None))
+            await self._pause_cond.wait_for(
+                lambda: self.is_shutting_down or (not self._paused and not getattr(self, "_sleeping_tags", None))
+            )
+            if self.is_shutting_down:
+                raise OmniEngineDeadError("Engine is shutting down")
             if not streaming_input:
                 self._admitting = getattr(self, "_admitting", 0) + 1
         admitting = not streaming_input
@@ -405,6 +417,51 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             for key in [key for key in reservations if key[0] == request_id]:
                 reservations.pop(key, None)
             self._log_summary_and_cleanup(request_id)
+            if self.is_shutting_down:
+                async with self._pause_cond:
+                    self._pause_cond.notify_all()
+
+    @property
+    def is_shutting_down(self) -> bool:
+        return getattr(self, "_shutting_down", False)
+
+    async def _drain_requests(self, timeout: float) -> None:
+        async with self._pause_cond:
+            self._shutting_down = True
+            self._pause_cond.notify_all()
+            if timeout > 0 and self.request_states:
+                logger.info("Waiting up to %s seconds for %d requests to finish", timeout, len(self.request_states))
+                try:
+                    await asyncio.wait_for(self._pause_cond.wait_for(lambda: not self.request_states), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.info("Shutdown timeout reached; aborting %d requests", len(self.request_states))
+        if self.request_states:
+            await self._abort_internal_requests(list(self.request_states), timeout=ABORT_TIMEOUT_S)
+            # Abort RPCs can fail or time out; local consumers must still finish.
+            for request_id, state in list(self.request_states.items()):
+                if state.input_stream_task is not None:
+                    state.input_stream_task.cancel()
+                await self._enqueue_synthetic_abort(request_id)
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        """Drain accepted requests before closing the engine.
+
+        A positive timeout must be used from outside the serving event loop,
+        as in the vLLM HTTP launcher's executor-based shutdown call.
+        """
+        if getattr(self, "_shutdown_called", False):
+            return
+        loop = getattr(self, "_request_loop", None)
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if loop is not None and loop.is_running() and loop is not running_loop:
+            asyncio.run_coroutine_threadsafe(self._drain_requests(timeout or 0), loop).result()
+        elif timeout and self.request_states and loop is running_loop:
+            raise RuntimeError("Call shutdown with a positive timeout using await asyncio.to_thread(...)")
+        self._shutting_down = True
+        super().shutdown()
 
     async def _release_generate_admission(self) -> None:
         """Drop one in-flight generate admission slot held across add_request."""
