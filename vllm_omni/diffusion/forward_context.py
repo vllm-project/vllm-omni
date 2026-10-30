@@ -375,7 +375,7 @@ def begin_scheduled_denoise(total_steps: int) -> int | None:
 
 @contextmanager
 def clear_scheduled_denoise_step_on_exit(total_steps: int | None):
-    """Clear the step and total a scheduled denoise loop published, on any exit of the loop.
+    """Clear the step, timestep and total a scheduled denoise loop published, on any exit of the loop.
 
     ``total_steps`` is the result of ``begin_scheduled_denoise``. Work after the loop, such as VAE
     decode, runs outside the denoise schedule, and a forward that raises mid-loop leaves no step
@@ -388,6 +388,7 @@ def clear_scheduled_denoise_step_on_exit(total_steps: int | None):
     finally:
         if total_steps is not None and _forward_context is not None:
             set_forward_context_denoise_step_idx(None)
+            _forward_context.denoise_timestep = None
             _forward_context.total_denoise_steps = None
 
 

@@ -509,11 +509,11 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
 def test_diffuse_clears_the_scheduled_step_on_any_exit(fail) -> None:
     pipeline = _make_pipeline()
     latents = torch.zeros((1, 1, 1, 2, 2), dtype=torch.float32)
-    seen: list[tuple[int | None, int | None]] = []
+    seen: list[tuple[int | None, float | None, int | None]] = []
 
     def _fake_predict_noise_maybe_with_cfg(**kwargs):
         context = get_forward_context()
-        seen.append((context.denoise_step_idx, context.total_denoise_steps))
+        seen.append((context.denoise_step_idx, context.denoise_timestep, context.total_denoise_steps))
         if fail and context.denoise_step_idx == 1:
             raise RuntimeError("forward failed")
         return torch.zeros_like(latents)
@@ -537,10 +537,12 @@ def test_diffuse_clears_the_scheduled_step_on_any_exit(fail) -> None:
                 attention_kwargs={},
             )
         context = get_forward_context()
-        after = (context.denoise_step_idx, context.total_denoise_steps)
+        after = (context.denoise_step_idx, context.denoise_timestep, context.total_denoise_steps)
 
-    assert seen == ([(0, 3), (1, 3)] if fail else [(0, 3), (1, 3), (2, 3)])
-    assert after == (None, None)
+    # _StubScheduler normalizes by num_train_timesteps=1000.
+    published = [(0, pytest.approx(0.007), 3), (1, pytest.approx(0.003), 3), (2, pytest.approx(0.001), 3)]
+    assert seen == (published[:2] if fail else published)
+    assert after == (None, None, None)
 
 
 def test_cache_dit_expert_budgets_follow_each_request_schedule(monkeypatch) -> None:
