@@ -90,7 +90,7 @@ class _FakeModels:
 
 
 @pytest.fixture
-def handler_factory(monkeypatch):
+def multistage_handler(monkeypatch):
     speech_kwargs = {}
 
     class _FakeCtor:
@@ -102,9 +102,14 @@ def handler_factory(monkeypatch):
         def warmup(self):
             self.warmup_calls += 1
 
+        def _has_ming3_talker_stage(self):
+            return False
+
     class _FakeSpeech(_FakeCtor):
         def __init__(self, *args, **kwargs):
             speech_kwargs.update(kwargs)
+
+        _tts_model_type = None
 
         async def warmup(self):
             return None
@@ -132,11 +137,11 @@ def handler_factory(monkeypatch):
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
 
-    return speech_kwargs
+    return {"speech_kwargs": speech_kwargs}
 
 
 @pytest.fixture
-def diffusion_handler_factory(monkeypatch):
+def diffusion_handler(monkeypatch):
     speech_kwargs = {}
 
     def _for_diffusion_factory(label: str):
@@ -165,7 +170,7 @@ def diffusion_handler_factory(monkeypatch):
         classmethod(lambda cls, *a, **k: _marker("openpi")),
     )
 
-    return speech_kwargs
+    return {"speech_kwargs": speech_kwargs}
 
 
 def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
@@ -330,6 +335,8 @@ _CAN_BE_NONE = {
     "openai_serving_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "openai_serving_chat",
+    "openai_serving_chat_batch",
 }
 _DIFFUSION_APP_STATE_KEYS = {
     "engine_client",
@@ -1458,7 +1465,7 @@ def test_engine_dead_error_handler_registered_returns_json(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pure_diffusion_app_state_key_snapshot(diffusion_handler_factory) -> None:
+async def test_pure_diffusion_app_state_key_snapshot(diffusion_handler) -> None:
     """Lock pure-diffusion ``app.state`` keys after init, including live vs None.
 
     Fails if bootstrap drops keys route owners still read (e.g. video/speech/
@@ -1485,7 +1492,7 @@ async def test_pure_diffusion_app_state_key_snapshot(diffusion_handler_factory) 
 
 
 @pytest.mark.asyncio
-async def test_pure_diffusion_speech_forwards_media_access_args(diffusion_handler_factory, tmp_path) -> None:
+async def test_diffusion_speech_extra_args(diffusion_handler, tmp_path) -> None:
     stage = SimpleNamespace(stage_type="diffusion", engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage], supported_tasks=("speech",))
     base = tmp_path / "base.yaml"
@@ -1504,9 +1511,40 @@ async def test_pure_diffusion_speech_forwards_media_access_args(diffusion_handle
         ),
     )
 
-    assert diffusion_handler_factory["allowed_local_media_path"] == "/allowed/media"
-    assert diffusion_handler_factory["allowed_media_domains"] == ["media.example.com"]
-    config = diffusion_handler_factory["speech_cache_config"]
+    assert diffusion_handler["speech_kwargs"]["allowed_local_media_path"] == "/allowed/media"
+    assert diffusion_handler["speech_kwargs"]["allowed_media_domains"] == ["media.example.com"]
+    config = diffusion_handler["speech_kwargs"]["speech_cache_config"]
+    assert config.resolve_max_bytes == 1234
+    assert config.resolve_max_entries == 17
+    assert config.speaker_max_bytes == 0
+
+
+@pytest.mark.asyncio
+async def test_multistage_speech_extra_args(multistage_handler, tmp_path) -> None:
+    engine = _FakeEngineClient(
+        stage_configs=[object(), object()],
+        vllm_config=SimpleNamespace(
+            lora_config=None,
+            model_config=SimpleNamespace(),
+            parallel_config=SimpleNamespace(_api_process_rank=0),
+        ),
+        supported_tasks=("speech",),
+    )
+
+    base = tmp_path / "base.yaml"
+    base.write_text("speech_cache:\n  resolve_max_bytes: 1234\n  speaker_max_bytes: 0\n")
+    deploy = tmp_path / "deploy.yaml"
+    deploy.write_text("base_config: base.yaml\nspeech_cache:\n  resolve_max_entries: 17\n")
+    engine.config_path = str(deploy)
+
+    state = State()
+    await api_server.omni_init_app_state(
+        engine,
+        state,
+        _minimal_args(),
+    )
+
+    config = multistage_handler["speech_kwargs"]["speech_cache_config"]
     assert config.resolve_max_bytes == 1234
     assert config.resolve_max_entries == 17
     assert config.speaker_max_bytes == 0
@@ -1516,7 +1554,9 @@ async def test_pure_diffusion_speech_forwards_media_access_args(diffusion_handle
 @pytest.mark.parametrize("ming3", [False, True, "tts"])
 @pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
 @pytest.mark.parametrize("policy_server", [False, True])
-async def test_multistage_app_state_key_snapshot(handler_factory, tmp_path, supported_tasks, ming3, policy_server) -> None:
+async def test_multistage_app_state_key_snapshot(
+    multistage_handler, monkeypatch, mocker, supported_tasks, ming3, policy_server
+) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
@@ -1524,6 +1564,14 @@ async def test_multistage_app_state_key_snapshot(handler_factory, tmp_path, supp
     handler never wired” failure mode. A multi-stage robot policy (one that
     declares ``policy_server_config``) also gets the OpenPI server.
     """
+    if ming3 or ming3 == "tts":
+        extra_supported_task = ("speech",)
+        supported_tasks += extra_supported_task
+    mocked_value = ming3 is True
+    mocker.patch.object(api_server.OmniOpenAIServingChat, "_has_ming3_talker_stage", return_value=mocked_value)
+    if ming3 == "tts":
+        mocker.patch.object(api_server.OmniOpenAIServingSpeech, "_tts_model_type", new="ming3_audio_tts")
+
     engine = _FakeEngineClient(
         stage_configs=[object(), object()],
         vllm_config=SimpleNamespace(
@@ -1534,20 +1582,37 @@ async def test_multistage_app_state_key_snapshot(handler_factory, tmp_path, supp
         supported_tasks=supported_tasks,
     )
 
+    from unittest.mock import AsyncMock
+
+    register = AsyncMock()
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.ming3_voices.register_model_voice_presets", register)
+    if policy_server:
+        monkeypatch.setattr(
+            api_server.ServingRealtimeRobotOpenPI,
+            "create_policy_server",
+            classmethod(lambda cls, *a, **k: _marker("openpi")),
+        )
+
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
 
-    disabled = (
-        set()
-        if "generate" in supported_tasks
-        else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
-    )
+    if (ming3 is True and "generate" in supported_tasks) or ming3 == "tts":
+        register.assert_awaited_once()
+        assert register.call_args.args[0] is state.openai_serving_speech
+        assert register.call_args.args[1] == _minimal_args().model
+        if ming3 is True:
+            assert state.openai_serving_chat._ming3_speech_service is state.openai_serving_speech
+        else:
+            assert not hasattr(state.openai_serving_chat, "_ming3_speech_service")
+    else:
+        register.assert_not_awaited()
+
     robot = {"openai_serving_realtime_robot"} if policy_server else set()
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=(_MULTISTAGE_MUST_BE_WIRED | robot) - disabled,
-        must_be_none=(_MULTISTAGE_MUST_BE_NONE - robot) | disabled,
+        must_be_wired=(_MULTISTAGE_MUST_BE_WIRED | robot),
+        must_be_none=(_MULTISTAGE_MUST_BE_NONE - robot),
     )
     assert state.online_renderer.kwargs["log_error_stack"] is True
     assert state.online_renderer.warmup_calls == 1
@@ -1563,7 +1628,10 @@ async def test_multistage_app_state_key_snapshot(handler_factory, tmp_path, supp
 
 
 _GENERATE_MUST_BE_NONE = _DIFFUSION_MUST_BE_NONE.copy()
-_GENERATE_MUST_BE_NONE.update(_DIFFUSION_CAN_BE_NONE - {"openai_serving_realtime_robot", "rl_rollout_serving"})
+_GENERATE_MUST_BE_NONE.update(
+    _DIFFUSION_CAN_BE_NONE
+    - {"openai_serving_realtime_robot", "rl_rollout_serving", "openai_serving_chat", "openai_serving_chat_batch"}
+)
 _GENERATE_MUST_BE_WIRED = _DIFFUSION_MUST_BE_WIRED.copy()
 _GENERATE_MUST_BE_WIRED = _GENERATE_MUST_BE_WIRED - _GENERATE_MUST_BE_NONE
 
@@ -1595,9 +1663,7 @@ _VIDEO_TEST_MUST_BE_WIRED = _VIDEO_TEST_MUST_BE_WIRED - _VIDEO_TEST_NONE_KEYS
         (("x2v",), _VIDEO_TEST_MUST_BE_WIRED, _VIDEO_TEST_NONE_KEYS),
     ],
 )
-async def test_diffusion_supported_tasks_set_handlers(
-    diffusion_handler_factory, supported_tasks, wired_keys, none_keys
-):
+async def test_diffusion_supported_tasks_set_handlers(diffusion_handler, supported_tasks, wired_keys, none_keys):
     stage = SimpleNamespace(stage_type="diffusion", engine_args={})
     engine = _FakeEngineClient(stage_configs=[stage], supported_tasks=supported_tasks)
     state = State()
@@ -1618,7 +1684,9 @@ async def test_diffusion_supported_tasks_set_handlers(
 
 
 _GENERATE_MUST_BE_NONE = _MULTISTAGE_MUST_BE_NONE.copy()
-_GENERATE_MUST_BE_NONE.update(_MULTISTAGE_CAN_BE_NONE - {"openai_streaming_video"})
+_GENERATE_MUST_BE_NONE.update(
+    _MULTISTAGE_CAN_BE_NONE - {"openai_streaming_video", "openai_serving_chat", "openai_serving_chat_batch"}
+)
 _GENERATE_MUST_BE_WIRED = _MULTISTAGE_MUST_BE_WIRED.copy()
 _GENERATE_MUST_BE_WIRED = _GENERATE_MUST_BE_WIRED - _GENERATE_MUST_BE_NONE
 
@@ -1648,7 +1716,7 @@ _VIDEO_TEST_MUST_BE_WIRED = _VIDEO_TEST_MUST_BE_WIRED - _VIDEO_TEST_NONE_KEYS
         (("x2v",), _VIDEO_TEST_MUST_BE_WIRED, _VIDEO_TEST_NONE_KEYS),
     ],
 )
-async def test_supported_tasks_set_handlers(handler_factory, supported_tasks, wired_keys, none_keys):
+async def test_supported_tasks_set_handlers(multistage_handler, supported_tasks, wired_keys, none_keys):
     engine = _FakeEngineClient(
         stage_configs=[object(), object()],
         vllm_config=SimpleNamespace(

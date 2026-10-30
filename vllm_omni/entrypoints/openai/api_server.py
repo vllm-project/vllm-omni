@@ -1037,9 +1037,13 @@ async def omni_init_app_state(
             else None
         )
 
-        state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
-            diffusion_engine=engine_client,  # type: ignore
-            model_name=model_name,
+        state.openai_serving_chat_batch = (
+            OmniOpenAIServingChatBatch.for_diffusion(
+                diffusion_engine=engine_client,  # type: ignore
+                model_name=model_name,
+            )
+            if "generate" in supported_tasks
+            else None
         )
 
         # audio related
