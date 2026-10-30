@@ -31,6 +31,43 @@ reference media is still encoded locally.
 
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
+## NPU image-encoder GroupNorm and SiLU fusion (experimental)
+
+Set `VLLM_OMNI_H3_NPU_IMAGE_GN_SILU=1` before starting the worker to fuse
+GroupNorm followed by SiLU in the H3 video VAE's **image** input path, using
+`torch_npu.npu_group_norm_silu`. This is disabled by default and independent
+of temporal-convolution optimizations. Set the variable to `0` and restart
+to disable it. The decoder and video input path are unchanged.
+
+The fused path requires inference-only, contiguous FP32 NPU tensors with
+one frame, affine GroupNorm, no conditioning, and the concrete normalization
+types from the loaded H3 `EncoderFCN3D` package. The adapter follows that
+checkpoint's `SiLU(norm(x))` API, including temporal-isolated GroupNorm at T=1;
+it does not pin a source hash or support arbitrary same-named classes.
+Training, compilation, multi-frame or
+noncontiguous inputs, spatial-parallel normalization, normalization hooks,
+custom forwards, unknown remote code, and a missing fused API use the
+original implementation. A checkpoint configured to use its separate
+`FusedGroupNorm3D` wrapper also retains its original path. Fusion does not
+change HF32, transformer quantization, or offload settings, and stores no
+derived weights. It is not a guarantee of end-to-end acceleration.
+
+For component comparisons, run the checked-in benchmark in fresh processes
+with the same physical cards and reference image order. First unset the flag
+for the baseline, then set it to `1` for the candidate. Each arm uses one
+warmup and three measured requests, exporting all latents for exact comparison.
+Add `--profile` for a separate warmup and one rank0 L1 capture with shapes and
+stacks; profile timing is excluded from the reported mean. This benchmark
+keeps only the VAE encoder resident and does not measure DLO or E2E latency.
+
+```bash
+export VLLM_OMNI_H3_NPU_IMAGE_GN_SILU=1
+torchrun --nproc-per-node=8 benchmarks/diffusion/bench_h3_npu_image_encode.py \
+  --model "$MODEL/Ref2VA/video_vae" \
+  --images ref-1.png ref-2.png ref-3.png ref-4.png ref-5.png ref-6.png \
+  --height 480 --width 832 --warmup 1 --repeat 3 --output results/candidate
+```
+
 ## Prerequisites
 
 The checkpoint requires Hugging Face access approval. Authenticate once;
