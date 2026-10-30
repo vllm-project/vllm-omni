@@ -20,7 +20,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import generate_synthetic_video, generate_synthetic_audio, generate_synthetic_image
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.platforms import current_omni_platform
@@ -152,6 +152,38 @@ def test_video_to_audio(omni_runner, offline_client) -> None:
     video = generate_synthetic_video(224, 224, 300)["np_array"]
 
     request_config = {"prompts": get_prompt("video"), "videos": video, "modalities": ["audio"]}
+
+    # Test single completion
+    offline_client.send_omni_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_audio_to_text(omni_runner, offline_client) -> None:
+    """Test processing audio, generating text output"""
+    audio = generate_synthetic_audio(2, 1, 16000)["np_array"]
+    if len(audio.shape) == 2:
+        audio = audio.squeeze()
+
+    request_config = {"prompts": get_prompt("audio"), "audios": audio, "modalities": ["text"]}
+
+    # Test single completion
+    offline_client.send_omni_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_audio_to_audio(omni_runner, offline_client) -> None:
+    """Test audio processing, producing audio output"""
+    audio = generate_synthetic_audio(2, 1, 16000)["np_array"]
+    if len(audio.shape) == 2:
+        audio = audio.squeeze()
+
+    request_config = {"prompts": get_prompt("audio"), "audios": audio, "modalities": ["audio"]}
 
     # Test single completion
     offline_client.send_omni_request(request_config)
