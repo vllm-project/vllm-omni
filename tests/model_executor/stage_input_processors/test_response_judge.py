@@ -140,7 +140,18 @@ def test_example_deploy_judge_overrides_remain_valid(monkeypatch, name, fmt):
 
 @pytest.mark.parametrize(
     ("answer", "rejected"),
-    [("NO", True), (" no\n", True), ("YES", False), ("", False), ("NO.", False), ("maybe", False)],
+    [
+        ("NO", True),
+        (" no\n", True),
+        ("YES", False),
+        ("", False),
+        ("NO.", True),
+        ("No,", True),
+        ("NO。", True),
+        ("NO, actually YES", False),
+        ("NOBODY", False),
+        ("maybe", False),
+    ],
 )
 def test_chat_judge_rejects_only_a_clear_no(monkeypatch, answer, rejected):
     config = _model_config({"format": "chat_yes_no"}, _ChatTokenizer(), monkeypatch)
@@ -303,7 +314,7 @@ def test_a_cached_decision_belongs_to_its_judge_output(monkeypatch):
 def test_a_prompt_that_cannot_be_built_records_no_turn(monkeypatch):
     config = _model_config({"format": "laya", "state_template": "User: {missing}"}, _LayaTokenizer(), monkeypatch)
     owner = _owner()
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError, match="state_template"):
         rj.asr2judge([_asr("r-bad", "hi")], None, False, owner, target_model_config=config)
     assert rj._owned_turn("r-bad", owner) is None
     assert owner.bridge_states.get("response_judge", {}) == {}
@@ -462,3 +473,35 @@ def test_after_judge_forwards_through_the_engine_caller(monkeypatch, shape):
     [(name, text, extra)] = _call_like_the_engine(judged, [_judge_text("r1", "YES")], None, owner, model_config="MC")
     assert (name, text) == (shape, "今天天气怎么样")
     assert extra == {"plain": None, "underscore": owner, "varkw": "MC"}[shape]
+
+
+@pytest.mark.parametrize(("fmt", "key"), [("chat_yes_no", "user_template"), ("laya", "state_template")])
+@pytest.mark.parametrize("template", ["{missing}", "{}", "{", "{transcript.no_such_attribute}", '{"text": "example"}'])
+def test_bad_templates_fail_at_startup(monkeypatch, fmt, key, template):
+    with pytest.raises(ValueError, match=key):
+        _startup_model_config({"format": fmt, key: template}, monkeypatch)
+
+
+@pytest.mark.parametrize(("fmt", "key"), [("chat_yes_no", "user_template"), ("laya", "state_template")])
+def test_escaped_json_template_is_valid_at_startup(monkeypatch, fmt, key):
+    template = '{{"text": "{transcript}"}}'
+    config = _startup_model_config({"format": fmt, key: template}, monkeypatch)
+    assert rj.JudgeSpec.for_model_config(config).options[key].format(transcript="hi") == '{"text": "hi"}'
+
+
+def test_yaml_boolean_option_keys_explain_quoting_at_startup(monkeypatch):
+    import yaml
+
+    raw = yaml.safe_load("format: laya\noptions: {yes: reply, no: silence}\nreply_option: yes")
+    with pytest.raises(ValueError, match="quote.*yes/no"):
+        _startup_model_config(raw, monkeypatch)
+    quoted = yaml.safe_load('format: laya\noptions: {"yes": reply, "no": silence}\nreply_option: "yes"')
+    config = _startup_model_config(quoted, monkeypatch)
+    spec = rj.JudgeSpec.for_model_config(config)
+    assert rj._option_scores_reject(spec, _judge_pooled("r", [-2.0, 2.0]))
+
+
+@pytest.mark.parametrize("qtype", [0, 1, True, "unknown"])
+def test_invalid_laya_question_type_fails_at_startup(monkeypatch, qtype):
+    with pytest.raises(ValueError, match="question_type"):
+        _startup_model_config({"format": "laya", "question_type": qtype}, monkeypatch)

@@ -20,6 +20,7 @@ stages:
     # Pooling is one forward pass: sync scheduler, no prefix cache (encoder-only).
     async_scheduling: false
     enable_prefix_caching: false
+    enable_chunked_prefill: false
     max_model_len: 1024
     max_num_batched_tokens: 8192
     # Without a prefix cache every judge call is one prefill of the whole

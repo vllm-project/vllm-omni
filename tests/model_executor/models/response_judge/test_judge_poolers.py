@@ -131,3 +131,35 @@ def test_laya_question_types_that_disagree_fail_at_load():
     config = SimpleNamespace(laya_question_type="choice", response_judge={"question_type": "score"})
     with pytest.raises(ValueError, match="does not match"):
         laya_question_type(config)
+
+
+@pytest.mark.parametrize("qtype", [0, 1, True, "unknown"])
+def test_model_question_type_rejects_non_names(qtype):
+    with pytest.raises(ValueError, match="question_type"):
+        laya_question_type(SimpleNamespace(laya_question_type=qtype))
+
+
+@pytest.mark.parametrize(
+    ("budget", "chunked", "valid"),
+    [(63, True, False), (63, False, False), (64, True, False), (64, False, True), (128, False, True)],
+)
+def test_laya_checks_prefill_budget_before_constructing_encoder(monkeypatch, budget, chunked, valid):
+    import vllm_omni.model_executor.models.response_judge.laya as module
+
+    class EncoderReachedError(Exception):
+        pass
+
+    def encoder(**kwargs):
+        raise EncoderReachedError
+
+    monkeypatch.setattr(module, "ModernBertModel", encoder)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=64, hf_config=SimpleNamespace()),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=budget, enable_chunked_prefill=chunked),
+    )
+    if valid:
+        with pytest.raises(EncoderReachedError):
+            LayaDecisionModel(vllm_config=config)
+    else:
+        with pytest.raises(ValueError, match="enable_chunked_prefill" if chunked else "max_num_batched_tokens"):
+            LayaDecisionModel(vllm_config=config)

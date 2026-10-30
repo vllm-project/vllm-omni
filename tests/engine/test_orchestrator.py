@@ -4984,7 +4984,7 @@ async def test_shared_kv_ready_waits_for_ar_terminal_output(mocker, shared):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prewarmed", [True, False])
 async def test_empty_next_input_aborts_only_prewarmed_downstream(prewarmed: bool) -> None:
-    """A stage whose bridge yields no input ends the request with an empty output.
+    """A non-judged pipeline whose bridge yields no input ends the request with an empty output.
 
     Stages that async-chunk prewarm already submitted can never receive input
     now, so they are aborted; without a prewarm nothing is aborted (unchanged).
@@ -5003,7 +5003,7 @@ async def test_empty_next_input_aborts_only_prewarmed_downstream(prewarmed: bool
         stage_pools=pools,
     )
     req_state = OrchestratorRequestState(
-        request_id="req-judged",
+        request_id="req-empty-bridge",
         sampling_params_list=[_sampling_params() for _ in clients],
         final_stage_id=4,
     )
@@ -5011,17 +5011,17 @@ async def test_empty_next_input_aborts_only_prewarmed_downstream(prewarmed: bool
     for stage_id in submitted:
         # Bind the request where it actually ran (and where async-chunk prewarmed it).
         await pools[stage_id].submit_initial(
-            "req-judged", req_state, SimpleNamespace(request_id="req-judged", prompt_token_ids=[1])
+            "req-empty-bridge", req_state, SimpleNamespace(request_id="req-empty-bridge", prompt_token_ids=[1])
         )
         req_state.stage_submit_ts[stage_id] = float(stage_id)
-    orchestrator.request_states["req-judged"] = req_state
-    judge_output = SimpleNamespace(request_id="req-judged", finished=True, outputs=[])
+    orchestrator.request_states["req-empty-bridge"] = req_state
+    stage_output = SimpleNamespace(request_id="req-empty-bridge", finished=True, outputs=[])
 
-    await orchestrator._forward_to_next_stage("req-judged", 1, judge_output, req_state)
+    await orchestrator._forward_to_next_stage("req-empty-bridge", 1, stage_output, req_state)
 
     message = output_queue.get_nowait()
     assert message.finished and message.stage_id == 4
-    assert "req-judged" not in orchestrator.request_states
+    assert "req-empty-bridge" not in orchestrator.request_states
     aborted = [index for index, client in enumerate(clients) if client.abort_calls]
     assert aborted == ([0, 1, 4] if prewarmed else [])
     assert clients[2].add_request_calls == []

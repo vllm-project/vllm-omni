@@ -51,7 +51,7 @@ The judge is configured on its own stage in the deploy config, under
 
 | `format` | Model | Runner | Decision |
 | --- | --- | --- | --- |
-| `chat_yes_no` | Any chat model; `ResponseJudgeQwen3ForCausalLM` for Qwen3 | generate (`max_tokens: 1`) | Rejects only when the answer is exactly `reject_label` (default `NO`) |
+| `chat_yes_no` | Any chat model; `ResponseJudgeQwen3ForCausalLM` for Qwen3 | generate (`max_tokens: 1`) | Rejects `reject_label` (default `NO`), optionally followed by punctuation |
 | `laya` | LAYA decision models, `LayaDecisionModel` | pooling (`task: classify`) | Rejects when P(`reply_option`) < `threshold` |
 
 Options per format:
@@ -64,7 +64,21 @@ Options per format:
   to the model's `laya_question_type`; if both are set they must agree.
 
 `reply_option` may be a list; the probabilities of the listed options are
-added.
+added. Quote YAML option keys such as `"yes"` and `"no"`, and their
+`reply_option` values, so YAML does not convert them to booleans.
+LAYA `question_type` accepts only `choice`, `score` and `noul`; integer IDs
+are rejected. The prompt and model head use the same validated type.
+
+Both prompt templates are trial-rendered at startup with `{transcript}`.
+Escape literal braces as `{{` and `}}`; unknown placeholders and malformed
+format strings are rejected before the first turn. Chat answers such as
+`NO.`, `No,` and `NO。` reject the turn, while prose such as `NO, actually YES`
+remains ambiguous and lets the turn through.
+
+LAYA requires `enable_chunked_prefill: false` and
+`max_num_batched_tokens >= max_model_len` so each encoder
+prompt fits in one prefill step. An insufficient budget fails at model
+initialization, before constructing the encoder.
 
 LAYA score calibration: this adapter returns raw option logits and ignores
 the checkpoint's `temperature` buffer. The bridge computes

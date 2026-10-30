@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import functools
 import inspect
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from vllm.logger import init_logger
+
+from vllm_omni.model_executor.models.response_judge.config import laya_question_type
 
 logger = init_logger(__name__)
 
@@ -49,12 +52,29 @@ class JudgeSpec:
     def __post_init__(self) -> None:
         if self.format not in _FORMATS:
             raise ValueError(f"unknown response_judge format {self.format!r}; expected one of {sorted(_FORMATS)}")
+        template_key, default = (
+            ("state_template", "{transcript}")
+            if self.format == "laya"
+            else ("user_template", DEFAULT_CHAT_USER_TEMPLATE)
+        )
+        template = self.options.get(template_key, default)
+        try:
+            if not isinstance(template, str):
+                raise ValueError("template must be a string")
+            template.format(transcript="")
+        except (KeyError, IndexError, ValueError, AttributeError, TypeError) as exc:
+            raise ValueError(
+                f"response_judge.{template_key} must render with only {{transcript}}; "
+                "escape literal braces as {{ and }}"
+            ) from exc
         if self.format != "laya":
             return
         opts = dict(self.options)
         options = opts.get("options", {"yes": None, "no": None})
         if not isinstance(options, Mapping) or not options:
             raise ValueError("response_judge.options must be a non-empty mapping")
+        if any(not isinstance(key, str) for key in options):
+            raise ValueError("response_judge.options keys must be strings; quote YAML yes/no keys")
         reply = opts.get("reply_option", next(iter(options)))
         reply_keys = [str(k) for k in (reply if isinstance(reply, list) else [reply])]
         if not reply_keys or any(k not in options for k in reply_keys):
@@ -74,6 +94,8 @@ class JudgeSpec:
         raw = getattr(hf_config, RESPONSE_JUDGE_CONFIG_KEY, None)
         raw = dict(raw) if isinstance(raw, Mapping) else {}
         fmt = str(raw.pop("format", "chat_yes_no"))
+        if fmt == "laya":
+            raw["question_type"] = laya_question_type(hf_config)
         return cls(format=fmt, options=raw)
 
     @classmethod
@@ -190,7 +212,14 @@ def _chat_prompt(spec: JudgeSpec, transcript: str, model_config: Any) -> dict[st
 
 def _chat_rejects(spec: JudgeSpec, output: Any) -> bool:
     answer = _completion_text(output).strip().upper()
-    return bool(answer) and answer == str(spec.options.get("reject_label", "NO")).upper()
+    label = str(spec.options.get("reject_label", "NO")).strip().upper()
+    if answer == label:
+        return bool(answer)
+    # Only tolerate punctuation after the complete label; prose stays unreadable.
+    if not label or not answer.startswith(label):
+        return False
+    suffix = answer[len(label) :]
+    return bool(suffix) and all(unicodedata.category(char).startswith("P") for char in suffix)
 
 
 def _laya_prompt(spec: JudgeSpec, transcript: str, model_config: Any) -> dict[str, Any]:
@@ -203,7 +232,7 @@ def _laya_prompt(spec: JudgeSpec, transcript: str, model_config: Any) -> dict[st
     tok = cached_tokenizer_from_config(model_config)
     opts = spec.options
     # The model's head scores this question type too (laya_question_type).
-    qtype = str(opts.get("question_type", getattr(model_config.hf_config, "laya_question_type", "choice")))
+    qtype = laya_question_type(model_config.hf_config)
     max_len = int(opts.get("max_len", 1024))
     head_max_len = int(opts.get("head_max_len", 256))
     mask = tok.mask_token

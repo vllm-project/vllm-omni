@@ -29,8 +29,7 @@ from vllm.model_executor.models.modernbert import ModernBertModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sequence import IntermediateTensors
 
-# laya.common.QTYPES
-LAYA_QTYPES = {"choice": 0, "score": 1, "noul": 2}
+from .config import LAYA_QTYPES, laya_question_type
 
 
 class LayaDecisionPooler(Pooler):
@@ -77,19 +76,6 @@ class LayaDecisionPooler(Pooler):
         return outputs
 
 
-def laya_question_type(config: object) -> str | int:
-    """The question type the head scores, from ``laya_question_type`` or the
-    ``response_judge.question_type`` the prompt is built with; they must agree."""
-    model_qtype = getattr(config, "laya_question_type", None)
-    judge = getattr(config, "response_judge", None)
-    judge_qtype = judge.get("question_type") if isinstance(judge, dict) else None
-    if model_qtype is not None and judge_qtype is not None and str(model_qtype) != str(judge_qtype):
-        raise ValueError(
-            f"laya_question_type={model_qtype!r} does not match response_judge.question_type={judge_qtype!r}"
-        )
-    return model_qtype if model_qtype is not None else (judge_qtype or "choice")
-
-
 @attn_type("encoder_only")
 @default_pooling_type(seq_pooling_type="CLS")
 class LayaDecisionModel(nn.Module):
@@ -97,14 +83,21 @@ class LayaDecisionModel(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        if vllm_config.scheduler_config.enable_chunked_prefill:
+            raise ValueError("LAYA requires enable_chunked_prefill=False: encoder prompts cannot be split")
+        if vllm_config.scheduler_config.max_num_batched_tokens < vllm_config.model_config.max_model_len:
+            raise ValueError(
+                "LAYA requires max_num_batched_tokens >= max_model_len: "
+                "each encoder prompt must fit in a single prefill step"
+            )
         config = vllm_config.model_config.hf_config
-        self.encoder = ModernBertModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "encoder"))
         qtype = laya_question_type(config)
+        self.encoder = ModernBertModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "encoder"))
         self.pooler = LayaDecisionPooler(
             config.hidden_size,
             int(getattr(config, "laya_head_layers", 2)),
             int(config.mask_token_id),
-            LAYA_QTYPES[qtype] if isinstance(qtype, str) else int(qtype),
+            LAYA_QTYPES[qtype],
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
