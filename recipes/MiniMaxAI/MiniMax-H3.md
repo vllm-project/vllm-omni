@@ -31,6 +31,56 @@ reference media is still encoded locally.
 
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
+## NPU image-encoder temporal convolution (experimental)
+
+Set `VLLM_OMNI_H3_NPU_IMAGE_T1_CONV=1` before starting the worker to enable
+an opt-in optimization for the H3 video VAE's **image** input path. It is
+disabled by default. Causal convolutions with a single input frame use only
+the last temporal weight slice; the backend remains Conv3D and the current
+HF32 setting is preserved. This removes multiplication by padded zero frames.
+
+The optimization applies to inference-only FP32 NPU inputs with H3's
+`SpatialParallelConv3d` and temporal kernel size 1 or 3, or an unpadded
+`torch.nn.Conv3d` with temporal kernel size 1. The H3 class must be the exact
+convolution type imported by the loaded `EncoderFCN3D`, using causal constant
+temporal padding. This follows the published H3 checkpoint API rather than
+pinning its source hash; arbitrary same-named classes and subclasses are unsupported.
+Multi-frame video input, training, compilation, spatial-parallel convolution,
+and other convolution classes retain their original forward path.
+The decoder is unchanged. Set the variable to `0` and restart to disable it.
+This flag does not change the transformer's quantization or offload settings.
+
+Optionally set `VLLM_OMNI_H3_NPU_IMAGE_T1_WEIGHT_CACHE=1` together with the
+convolution flag to reuse the contiguous temporal weight slice. This separate
+optimization is also disabled by default. It caches within the current encoder
+residency interval, including across tiles and images, and releases derived
+weights before H3 offloads the encoder. DLO therefore rebuilds on the next
+residency interval; the cache does not keep encoder weights on the NPU.
+Parameter identity, version, storage, dtype, device, layout, and stream changes
+invalidate reuse. State-dict loads and normal device/dtype conversions clear
+the cache; unversioned inference parameters and unknown streams bypass it.
+Before edits through `.data` or external storage aliases, explicitly call
+`clear_npu_image_conv_cache(vae.model)` from
+`vllm_omni.diffusion.models.minimax_h3.ops.vae.npu_image_conv`.
+Such writes can bypass PyTorch's version counter. Set the cache flag to `0`
+and restart to retain temporal cropping without caching.
+
+For component comparisons, run the checked-in benchmark in fresh processes
+with the same physical cards and reference image order. First unset the flag
+for the baseline, then set it to `1` for the candidate. Each arm uses one
+warmup and three measured requests, exporting all latents for exact comparison.
+Add `--profile` for a separate warmup and one rank0 L1 capture with shapes and
+stacks; profile timing is excluded from the reported mean. This benchmark
+keeps only the VAE encoder resident and does not measure DLO or E2E latency.
+
+```bash
+export VLLM_OMNI_H3_NPU_IMAGE_T1_CONV=1
+torchrun --nproc-per-node=8 benchmarks/diffusion/bench_h3_npu_image_encode.py \
+  --model "$MODEL/Ref2VA/video_vae" \
+  --images ref-1.png ref-2.png ref-3.png ref-4.png ref-5.png ref-6.png \
+  --height 480 --width 832 --warmup 1 --repeat 3 --output results/candidate
+```
+
 ## Prerequisites
 
 The checkpoint requires Hugging Face access approval. Authenticate once;

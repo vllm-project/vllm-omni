@@ -35,6 +35,7 @@ from vllm_omni.platforms import current_omni_platform
 
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
+from .ops.vae.npu_image_conv import clear_npu_image_conv_cache, image_encode_context, install_npu_image_conv
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
 
@@ -389,6 +390,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         self.model = self.remote.model
+        install_npu_image_conv(self.model, device=device)
         self._stager = None
         self._encoder_stager = None
         self._decoder_stager = None
@@ -456,6 +458,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.remote.to(self._device_target)
 
     def _offload_part_to_cpu(self, part: str) -> None:
+        if part == "encoder" or self._stager is not None:
+            clear_npu_image_conv_cache(self.model)
         stager = self._part_stager(part)
         if stager is not None:
             stager.offload()
@@ -489,6 +493,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 stager.set_cache_retention(cache)
 
     def offload_to_cpu(self) -> None:
+        clear_npu_image_conv_cache(self.model)
         if self._encoder_stager is not None:
             self._encoder_stager.offload()
             self._decoder_stager.offload()
@@ -776,7 +781,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                with _minimax_h3_keyframe_encode_context(parameter.device):
+                with _minimax_h3_keyframe_encode_context(parameter.device), image_encode_context():
                     latent = self.model.encode_images(
                         image,
                         use_fp16_latent=True,
