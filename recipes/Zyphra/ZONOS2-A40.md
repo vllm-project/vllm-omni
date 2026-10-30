@@ -3,7 +3,7 @@
 ## Summary and model contract
 
 Zyphra `Zyphra/ZONOS2` is an 8B-A0.9B MoE TTS model. This native integration
-uses an AR talker followed by DAC. Maintainer:
+uses an AR talker followed by DAC. Integration contributor:
 [Xiaotangyuan-xty](https://github.com/Xiaotangyuan-xty).
 
 | Input/control | Contract |
@@ -47,12 +47,14 @@ is independent of unsupported async AR scheduling.
 | --- | --- |
 | OS/Python | Ubuntu 24.04 / Python 3.12.13 |
 | Driver | 580.95.05 |
-| Rebased runtime | vLLM 0.30.0, Torch 2.13.0+cu130, FlashInfer 0.6.18.post1 |
+| Current runtime | vLLM 0.32.0, Torch 2.13.0+cu130, Transformers 5.16.1, FlashInfer 0.7.0.post1 |
+| Router replay measurements (2026-10-03) | vLLM 0.30.0, Torch 2.13.0+cu130, FlashInfer 0.6.18.post1 |
 | Historical measurements | Native vLLM 0.29.0/Torch 2.13.0+cu130; official Torch 2.9.1+cu128 |
-| Rebase target | `527982d886db4da88f205a576cbc0333f9b8eac5` |
+| Main synchronization target (2026-10-30) | `cda4a1ef83b295ba332146a7709e6277725edc9f` |
 
-Historical timings below predate rebase. Post-rebase validation is a bounded
-regression run, not a replacement controlled performance matrix.
+Timings and quality scores below belong to the stated historical runtimes.
+The current runtime is checked separately for correctness and serving
+compatibility; these regressions do not establish a new performance gain.
 
 ## Checkpoint and dependencies
 
@@ -85,7 +87,7 @@ Check the selected physical GPU is idle. Both stages use logical device 0
 inside the single-card visibility mapping:
 
 ```bash
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=1
 vllm serve /owned/zonos2-safetensors --omni \
   --deploy-config vllm_omni/deploy/zonos2.yaml \
   --served-model-name zonos2 --host 127.0.0.1 --port 8091 --trust-remote-code
@@ -164,7 +166,8 @@ plus converted weights need approximately 35GB and additional result space.
 Buildkite requires an authorized trigger or the repository CI labels;
 local A40 runs do not establish a hosted H100/B200 pass.
 
-Router replay A/B on one A40 GPU1 used the same ten frozen inputs, two
+The 2026-10-03 router replay A/B on vLLM 0.30.0 and one A40 GPU1 used
+the same ten frozen inputs, two
 warmups and three measured rounds per variant (30 requests each).
 E2E P50: 15.584s eager / 13.731s replay; RTF P50: 3.710 / 3.324;
 first PCM P50: 1.027s / .933s. Sampled peak: 28817 / 29369MiB.

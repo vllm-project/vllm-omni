@@ -91,11 +91,13 @@ keys overlap state by runner request ID, suppresses replayed chunks, and
 clears buffers/tails on finish, cancellation or codec failure.
 
 CPU boundary/dependency tests live in `test_codec.py` and adapter tests in
-`test_zonos2_tts_adapter.py`. GPU2 component validation replays the previous
-P3 codes against frozen official DAC/OLA and speaker implementations.
-Runtime validation uses controlled talker logits and actual DAC weights.
-This verifies P4 components; it does not replace P5 end-to-end acceptance
-or P6 audio quality evaluation.
+`test_zonos2_tts_adapter.py`. Component qualification replays fixed codes
+against the frozen official DAC/OLA and speaker implementations. Real-weight
+offline, HTTP and concurrent acceptance tests live in `tests/e2e/zonos2/`.
+Their independent decoder instance follows the recorded chunk schedule to
+check request routing and complete delivery; it reuses the streaming decoder
+implementation and does not prove equality with one-shot DAC decoding.
+See the A40 recipe for runtime versions and historical quality measurements.
 
 The DAC dependency's TorchScript Snake activation can change numerically
 after its first profiling call. Exact reference comparisons warm both
