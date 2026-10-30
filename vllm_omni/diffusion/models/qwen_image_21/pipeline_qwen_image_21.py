@@ -1489,8 +1489,11 @@ class QwenImage21Pipeline(
 
         # A single Attention call has one scalar step selector. Requests at
         # different steps must not inherit the first request's precision policy.
+        # Skip selectors affect the unified quantization knob only; native
+        # precision and explicit backend quant specs do not vary with this step.
         split_by_step = (
-            bool(self.od_config.diffusion_kv_cache_skip_step_indices)
+            self.od_config.diffusion_kv_cache_dtype not in (None, "auto", "float")
+            and bool(self.od_config.diffusion_kv_cache_skip_step_indices)
             and len({state.step_index for state in states}) > 1
         )
         if self._needs_decode_seq_len_split(states) or split_by_step:

@@ -160,8 +160,11 @@ attention operators. It changes attention compute only; Linear weights and
 the persistent prefix KV cache keep their existing precision.
 
 The pipeline publishes zero-based denoising indices in both whole-request
-and step-wise execution. With step selectors configured, step-wise batches
-at different indices are evaluated separately and restored to request order.
+and step-wise execution. When `diffusion_kv_cache_dtype` enables quantization
+and step selectors are configured, step-wise batches at different indices are
+evaluated separately and restored to request order. Retaining a step selector
+with `diffusion_kv_cache_dtype` set to `None`, `auto`, or `float` does not split
+batches by step; existing prefix-length compatibility grouping still applies.
 Without the explicit step-0 exclusion, structural prefill still fails rather
 than silently changing precision. Padded decode batches carrying a mask are
 also unsupported by quantized NPU attention. Validate output quality against

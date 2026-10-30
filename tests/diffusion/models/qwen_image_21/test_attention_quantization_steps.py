@@ -186,6 +186,34 @@ def test_step_mode_separates_quantization_steps_without_reordering_rows(monkeypa
     assert seen == expected
 
 
+@pytest.mark.parametrize("dtype", [None, "auto", "float"])
+@pytest.mark.parametrize("different_prefix_lengths", [False, True])
+def test_native_decode_ignores_step_selector_but_preserves_prefix_groups(monkeypatch, dtype, different_prefix_lengths):
+    config = OmniDiffusionConfig(diffusion_kv_cache_dtype=dtype, diffusion_kv_cache_skip_steps="0")
+    pipe = _step_pipeline(config)
+    states = [_state("a", 1, 1.0), _state("b", 2, 2.0, rows=2), _state("c", 3, 3.0)]
+    for state in states:
+        rows = state.latents.shape[0]
+        prefix_length = 2 if different_prefix_lengths and state.request_id == "b" else 1
+        state.latents = state.latents.to(torch.bfloat16)
+        state.extra["prefill_prompt_seq_len"] = prefix_length
+        state.extra["kv_cache"] = [{"cond": {part: torch.zeros(rows, prefix_length, 4) for part in ("key", "value")}}]
+    forward_rows = []
+
+    def predict(*args, **kwargs):
+        hidden = args[2]["hidden_states"]
+        assert hidden.dtype == torch.bfloat16
+        forward_rows.append(hidden[:, 0, 0].tolist())
+        return hidden
+
+    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
+    with set_forward_context(omni_diffusion_config=config):
+        result = pipe.denoise_step(InputBatch.make_batch(states))
+        assert get_forward_context().denoise_step_idx is None
+    assert forward_rows == ([[1.0, 3.0], [2.0, 2.0]] if different_prefix_lengths else [[1.0, 2.0, 2.0, 3.0]])
+    torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 2.0, 3.0], dtype=torch.bfloat16))
+
+
 def test_step_mode_clears_context_after_failure(monkeypatch):
     config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0")
     pipe = _step_pipeline(config)
