@@ -1014,6 +1014,8 @@ def calculate_metrics(
             if duplex_metric_aggregation == "response" and isinstance(session_metrics, dict):
                 # Pool responses rather than giving short and long sessions equal weight.
                 # Goodput below remains request/session based.
+                # Duplex rows use None for missing timings; a measured zero is
+                # valid here, unlike the legacy audio_ttfp == 0.0 sentinel.
                 for row in getattr(outputs[i], "duplex_request_metrics", None) or []:
                     for field, samples, scale in (
                         ("ttft_ms", ttfts, 0.001),

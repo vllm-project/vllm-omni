@@ -712,10 +712,6 @@ def test_profiler_stage_durations_print_without_print_stage(capsys) -> None:
     assert "stage_0_gen_ms" not in metrics.stage_durations_mean
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
-
-
 def test_duplex_response_aggregation_pools_turns_and_excludes_missing_measurements():
     first, second = _make_output(100), _make_output(100)
     first.ttft, second.ttft = 0.2, 0.8
@@ -746,3 +742,37 @@ def test_duplex_response_aggregation_does_not_fall_back_to_session_means():
     metrics = _calculate_test_metrics([output], aggregation="response")
     assert metrics.num_ttft_samples == 0
     assert math.isnan(metrics.mean_ttft_ms)
+
+
+@pytest.mark.parametrize("aggregation", ["session", "response"])
+def test_duplex_zero_measurements_are_distinct_from_missing_timings(aggregation):
+    from vllm_omni.clients.duplex import EventCollector, summarize_session_request_metrics
+
+    collector = EventCollector()
+    collector.add({"type": "response.created", "response": {"id": "r"}}, received_at_s=10.0)
+    collector.add(
+        {"type": "response.output_audio_transcript.delta", "response_id": "r", "delta": "hello"},
+        received_at_s=10.0,
+    )
+    collector.add(
+        {"type": "response.output_audio.delta", "response_id": "r", "delta": "AAAA", "sample_rate_hz": 24_000},
+        received_at_s=10.0,
+    )
+    row = collector.timing_summary(after_s=10.0, response_id="r")["request_metrics"]
+    assert row["ttft_ms"] == row["ttfp_ms"] == 0.0
+    row["rtf"] = 0.0
+    measured, missing = _make_output(1), _make_output(1)
+    measured.ttft = measured.audio_ttfp = measured.audio_rtf = 0.0
+    measured.duplex_request_metrics = [row]
+    missing.duplex_request_metrics = [{"ttft_ms": None, "ttfp_ms": None, "rtf": None}]
+    for output in (measured, missing):
+        output.duplex_session_metrics = summarize_session_request_metrics(output.duplex_request_metrics, session_id="s")
+    metrics = _calculate_test_metrics([measured, missing], aggregation=aggregation)
+    assert (metrics.num_ttft_samples, metrics.num_audio_ttfp_samples, metrics.num_audio_rtf_samples) == (1, 1, 1)
+    assert metrics.mean_ttft_ms == metrics.mean_audio_ttfp_ms == metrics.mean_audio_rtf == 0.0
+    # Other backends still use audio_ttfp == 0.0 to mean no observed packet.
+    assert _calculate_test_metrics([_make_output(1)], aggregation=aggregation).num_audio_ttfp_samples == 0
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])

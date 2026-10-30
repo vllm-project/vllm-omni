@@ -287,7 +287,11 @@ def _read_hf(load_dataset: Callable[..., Any], dataset: str, want: str | None) -
         return load_dataset("parquet", data_files=dataset)
     kwargs = {}
     if not Path(dataset).exists() and "@" in dataset:
+        if Path(dataset).is_absolute() or dataset.startswith(("./", "../", "~")):
+            raise FileNotFoundError(f"Local dataset path does not exist: {dataset!r}")
         dataset, revision = dataset.rsplit("@", 1)
+        if not dataset:
+            raise ValueError("Dataset ID must not be empty before '@revision'")
         if not revision:
             raise ValueError("Dataset revision must not be empty")
         kwargs["revision"] = revision

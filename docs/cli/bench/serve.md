@@ -375,15 +375,15 @@ for Qwen3 and remains available for models that require a reference voice.
 
 The CUDA nightly configuration
 `tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json` uses two GPUs
-for Qwen3-Omni and no judge. It replays the same 16 fixed `PR_correction` samples
-at each concurrency of 1, 8, and 16, using dataset revision
+for Qwen3-Omni and no judge. It selects a fixed pool of 16 `PR_correction` samples
+and runs 4, 16, and 32 sessions at concurrency 1, 8, and 16 respectively, using dataset revision
 `de63329f76daa5e0c604363ef6a2c383dfba45f6`. The selected IDs are
 `0, 2, 3, 4, 5, 7, 8, 13, 27, 28, 32, 35, 38, 41, 53, 59`.
 These statements concern the current picture; tasks requiring continued visual
 monitoring, future-event reminders, or original-video audio are excluded.
 RTD is not part of this Qwen3-Omni performance workload.
 
-The `c1_c8_c16_response_v1` workload uses `--duplex-metric-aggregation response` and
+The `c1_c8_c16_response_v2` workload uses `--duplex-metric-aggregation response` and
 `--metric-percentiles 50,95` to pool individual responses for TTFT, audio TTFP
 and RTF. Missing measurements are excluded, never substituted with zero.
 Transport completion and finite measured distributions are required; answer
@@ -769,7 +769,13 @@ Both Qwen3-Omni duplex performance jobs use two GPUs and no answer judge.
 
 The pinned OmniInteract revision is
 `e195f75fe2666fcc5fe74f537ae49ca143a79969`. With shuffling disabled, the job
-selects `1q1a_math/0001` through `0016` for each concurrency of 1, 8, and 16.
+selects a fixed pool of `1q1a_math/0001` through `0016`. C1 uses the first four
+samples, C8 uses all 16 once, and C16 replays those same 16 samples twice for
+32 measured sessions. Both nightly jobs set `duplex_sample_pool_size: 16`;
+no new source samples are added for C16. Repeated output identities carry a
+`__repeat_1` suffix while the source media and annotations remain unchanged.
+The sample-pool option is limited to these two datasets without answer
+evaluation; ordinary dataset loading remains unchanged when it is omitted.
 Each clip contains two spoken questions about the current screen. Full `1q1a`
 clips mix in proactive tasks, and `1qna` requires continuous monitoring, so
 neither subset belongs to this VAD-triggered workload.
@@ -778,14 +784,20 @@ Clips remain unmodified: each lasts about five minutes, with two questions
 roughly two and a half minutes apart. This measures intermittent generation
 under concurrent realtime input, not continuously decoding requests.
 The nightly configurations explicitly skip the extra endpoint readiness replay
-(`ready_check_timeout_sec: 0`) and run one unmeasured warmup session
-(`num_warmups: 1`) per concurrency. Allow about five minutes of warmup per
-concurrency. Formal replay takes approximately 80, 10, and 5 minutes at
-concurrency 1, 8, and 16 respectively, so the complete sweep takes about
-110 minutes plus startup and response drain. Warmup does not enter metrics.
-Results and hardware baselines are
-separate for each concurrency; a concurrency of 16 is still only one wave of
-16 sessions, not a sustained saturation or long-duration memory test.
+(`ready_check_timeout_sec: 0`) and use the runner's default warmup count of
+`max(2, concurrency)`: 2, 8, and 16 unmeasured sessions. Warmup uses the same
+concurrency limit as the measured run, so C8/C16 each warm up a full concurrent
+wave. This exercises concurrent batching but does not guarantee that every
+shape-dependent kernel is compiled for all inputs.
+
+Formal replay takes approximately 20, 10, and 10 minutes at concurrency
+1, 8, and 16 respectively; warmup adds about 10, 5, and 5 minutes. The complete
+sweep therefore takes about 60 minutes plus startup and response drain, within
+the existing 180-minute job budget. Warmup does not enter metrics. Results and
+hardware baselines are separate for each concurrency. C16 covers two waves of
+sessions; it is not a sustained saturation or long-duration memory test.
+Execution failures, including OOM, continue to fail the nightly job. Local
+memory-limited runs do not replace validation on H100/B200.
 
 The primary percentile rows are P50/P95 TTFT, audio TTFP and RTF over individual
 responses (`--duplex-metric-aggregation response`). The default `session` mode
@@ -800,7 +812,7 @@ distributions, taking responses from successful sessions as the summary does.
 TTFT/TTFP still prefer server timings when available, otherwise client receipt
 relative to response creation; the aggregation option does not change clocks.
 
-The configuration is named `c1_c8_c16_response_v1` to distinguish its baseline from
+The configuration is named `c1_c8_c16_response_v2` to distinguish its baseline from
 older workloads. It has no answer-quality threshold or pre-filled hardware
 latency baseline. Use matching hardware and workload versions for comparisons.
 
