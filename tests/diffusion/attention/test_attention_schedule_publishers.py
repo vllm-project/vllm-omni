@@ -85,8 +85,8 @@ def test_clear_scheduled_denoise_step_on_exit_clears_only_a_scheduled_loop(sched
                 set_forward_context_denoise_total_steps(total_steps)
                 if fail:
                     raise RuntimeError("forward failed")
-        # An unscheduled loop keeps what it left, as before; the timestep is never cleared.
-        assert _progress(ctx) == ((None, 0.5, None) if scheduled else (2, 0.5, None))
+        # An unscheduled loop keeps what it left, as before, including the timestep.
+        assert _progress(ctx) == ((None, None, None) if scheduled else (2, 0.5, None))
 
 
 def test_clear_scheduled_denoise_step_on_exit_without_a_context_is_a_no_op():
