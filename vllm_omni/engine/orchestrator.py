@@ -1693,6 +1693,17 @@ class Orchestrator:
         )
         pool.evict_replica(replica_id)
         self._remove_stage_replica_waiting(stage_id, replica_id)
+        if self._dit_load_aware and self._dit_load_state is not None:
+            try:
+                self._dit_load_state.remove(stage_id, replica_id)
+                await self._push_dit_load_to_ar(self._dit_load_state)
+            except Exception:
+                logger.debug(
+                    "[Orchestrator] DitLoadState.remove failed during dead-replica eviction for stage-%s rep-%s",
+                    stage_id,
+                    replica_id,
+                    exc_info=True,
+                )
         stage_has_live = bool(pool.live_replica_ids())
         failed_ids: list[str] = []
         for req_id, req_state in list(self.request_states.items()):

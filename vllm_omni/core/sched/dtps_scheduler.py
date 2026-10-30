@@ -18,6 +18,7 @@ signal — no model-specific task-type strings.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, NamedTuple
 
@@ -75,13 +76,14 @@ class DTPSScheduler:
         return result
 
     def evict_request(self, request_id: str) -> None:
-        """Remove a finished request's cached classification."""
+        """Remove a finished request's cached classification and blind in-flight entry."""
         self._ar_only_cache.pop(request_id, None)
+        self._dit_inflight_ids.pop(request_id, None)
 
     def _compute_ar_only(self, req: Request) -> bool:
         info = getattr(req, "additional_information", None)
         if info is None:
-            return False
+            return True
         if isinstance(info, dict):
             pass
         else:
@@ -89,9 +91,9 @@ class DTPSScheduler:
                 info = deserialize_additional_information(info)
             except Exception:
                 logger.debug("[OmniDTPS] deserialize additional_information failed", exc_info=True)
-                return False
+                return True
             if not isinstance(info, dict):
-                return False
+                return True
         final_stage_id = info.get("omni_final_stage_id")
         force_kv = bool(info.get("omni_force_kv_transfer", False))
         return final_stage_id == self._stage_id and not force_kv
@@ -183,7 +185,15 @@ class DTPSScheduler:
         L1: ar_downstream within budget (num_prompt_tokens ASC)
         L2: remaining ar_only (FCFS)
         L3: ar_downstream beyond budget (num_prompt_tokens ASC)
+
+        Falls back to FCFS (no reorder) when the DiT load snapshot is
+        missing or stale (``fresh=False``), preventing downstream
+        admission when DiT visibility is unavailable.
         """
+        snap = self._dit_load_snapshot
+        if snap is None or not snap.get("fresh", False):
+            return
+
         inflight_running = 0
         if running is not None:
             inflight_running = sum(1 for r in running if not self._request_is_ar_only(r))
@@ -214,6 +224,7 @@ class DTPSScheduler:
                 downstream_reqs.append(req)
 
         downstream_reqs.sort(key=lambda r: getattr(r, "num_prompt_tokens", 0) or 0)
+        starving_reqs.sort(key=lambda r: getattr(r, "arrival_time", 0) or 0.0)
 
         if budget_raw is None:
             downstream_head = downstream_reqs
@@ -228,28 +239,30 @@ class DTPSScheduler:
         if [r.request_id for r in ordered] == [r.request_id for r in before_list]:
             return
 
-        def _fmt(reqs: list) -> str:
-            parts = []
-            for r in reqs:
-                w = (now - r.arrival_time) if r.arrival_time else 0.0
-                npt = getattr(r, "num_prompt_tokens", 0) or 0
-                tag = "AR+DiT" if not self._request_is_ar_only(r) else "AR"
-                parts.append(f"{r.request_id}({tag},{w:.1f}s,{npt}t)")
-            return "[" + ",".join(parts) + "]"
+        if logger.isEnabledFor(logging.DEBUG):
 
-        logger.debug(
-            "[OmniDTPS] reorder: before=%s | L0_starving=%s L1_budget=%s "
-            "L2_ar_only=%s L3_overflow=%s | budget=%s eff_min=%s | "
-            "after=%s",
-            _fmt(before_list),
-            _fmt(starving_reqs),
-            _fmt(downstream_head),
-            _fmt(ar_only_reqs),
-            _fmt(downstream_tail),
-            budget_raw,
-            self._last_phase_stats.get("effective_min"),
-            _fmt(ordered),
-        )
+            def _fmt(reqs: list) -> str:
+                parts = []
+                for r in reqs:
+                    w = (now - r.arrival_time) if r.arrival_time else 0.0
+                    npt = getattr(r, "num_prompt_tokens", 0) or 0
+                    tag = "AR+DiT" if not self._request_is_ar_only(r) else "AR"
+                    parts.append(f"{r.request_id}({tag},{w:.1f}s,{npt}t)")
+                return "[" + ",".join(parts) + "]"
+
+            logger.debug(
+                "[OmniDTPS] reorder: before=%s | L0_starving=%s L1_budget=%s "
+                "L2_ar_only=%s L3_overflow=%s | budget=%s eff_min=%s | "
+                "after=%s",
+                _fmt(before_list),
+                _fmt(starving_reqs),
+                _fmt(downstream_head),
+                _fmt(ar_only_reqs),
+                _fmt(downstream_tail),
+                budget_raw,
+                self._last_phase_stats.get("effective_min"),
+                _fmt(ordered),
+            )
 
         if hasattr(waiting, "clear") and hasattr(waiting, "extend"):
             waiting.clear()

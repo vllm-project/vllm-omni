@@ -205,6 +205,7 @@ class OmniEngineArgs(EngineArgs):
     omni_kv_config: dict | None = None
     dit_load_aware: bool | None = None
     dit_load_threshold: int | None = None
+    aging_s: float | None = None
     quantization_config: Any | None = None
     force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
@@ -437,6 +438,7 @@ class OmniEngineArgs(EngineArgs):
             omni_kv_config=self.omni_kv_config,
             dit_load_aware=self.dit_load_aware,
             dit_load_threshold=self.dit_load_threshold,
+            aging_s=self.aging_s,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
             sampling_extra_args_keys=tuple(self.sampling_extra_args_keys or ()),

@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DIT_LOAD_PUSH_TIMEOUT_S = 0.5
+
 
 class StageUnavailableError(RuntimeError):
     """Raised when dispatch cannot reach a live replica of a stage.
@@ -1241,6 +1243,9 @@ class StagePool:
         ZMQ UTILITY channel (``call_utility_async``) as other control-plane
         RPCs, so it inherits the channel's transport (``ipc://`` colocated
         or ``tcp://`` distributed) without extra socket management.
+
+        Each per-replica push is bounded by ``_DIT_LOAD_PUSH_TIMEOUT_S`` so
+        a stalled AR utility reply cannot block output routing.
         """
         payload = dict(snapshot)
         for replica_id in self.live_replica_ids():
@@ -1251,7 +1256,16 @@ class StagePool:
             if call_utility is None:
                 continue
             try:
-                await call_utility("omni_update_dit_load", payload)
+                await asyncio.wait_for(
+                    call_utility("omni_update_dit_load", payload),
+                    timeout=_DIT_LOAD_PUSH_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[StagePool] push_dit_load timed out for stage=%s replica=%s",
+                    self.stage_id,
+                    replica_id,
+                )
             except Exception:
                 logger.warning(
                     "[StagePool] push_dit_load failed for stage=%s replica=%s",

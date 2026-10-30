@@ -47,6 +47,7 @@ stages:
     tensor_parallel_size: 2
     dit_load_aware: false
     dit_load_threshold: 2
+    aging_s: 100.0
     hf_overrides:
       rope_parameters:
         mrope_section: [0, 32, 32]

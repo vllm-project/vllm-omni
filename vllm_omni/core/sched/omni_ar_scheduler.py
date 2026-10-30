@@ -211,10 +211,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return
         stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
         threshold = getattr(self.vllm_config.model_config, "dit_load_threshold", None)
+        aging_s = getattr(self.vllm_config.model_config, "aging_s", None)
         try:
+            kwargs: dict[str, Any] = {}
+            if threshold is not None:
+                kwargs["dit_load_threshold"] = threshold
+            if aging_s is not None:
+                kwargs["aging_s"] = aging_s
             self._dtps = DTPSScheduler(
                 stage_id=stage_id,
-                **({"dit_load_threshold": threshold} if threshold is not None else {}),
+                **kwargs,
             )
             logger.info(
                 "[OmniDTPS] AR stage %s: aging_threshold=%.1fs, dit_load_threshold=%d",

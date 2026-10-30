@@ -158,6 +158,9 @@ class _ModelEngineOverrides(TypedDict, total=False):
     has_sampling_extra_args: bool
     custom_voice_dir: str
     task_type: str
+    dit_load_aware: bool
+    dit_load_threshold: int
+    aging_s: float
     codec_frame_rate_hz: float
     enforce_eager: bool
     max_cudagraph_capture_size: int
