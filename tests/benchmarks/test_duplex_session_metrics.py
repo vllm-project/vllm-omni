@@ -100,9 +100,9 @@ def test_client_latency_is_absent_for_a_response_without_output():
 def test_response_latency_counts_every_response_once_across_sessions():
     # One session has three responses, the other one. A mean of session means
     # would weigh the lone response like the other three together.
-    rows: list[dict[str, object]] = [{"ttft_ms": 10.0, "client_ttft_ms": 100.0}] * 3
-    rows.append({"ttft_ms": 50.0, "client_ttft_ms": 500.0})
-    rows.append({"ttft_ms": None, "client_ttft_ms": float("nan"), "ttfp_ms": True})
+    rows: list[dict[str, object]] = [{"ttft_ms": 10.0, "client_ttft_ms": 100.0, "client_rtf": 0.5}] * 3
+    rows.append({"ttft_ms": 50.0, "client_ttft_ms": 500.0, "client_rtf": 0.7})
+    rows.append({"ttft_ms": None, "client_ttft_ms": float("nan"), "ttfp_ms": True, "client_rtf": True})
 
     metrics = duplex_response_latency_metrics(rows)
 
@@ -115,6 +115,10 @@ def test_response_latency_counts_every_response_once_across_sessions():
         "mean_duplex_client_ttft_ms": 200.0,
         "median_duplex_client_ttft_ms": 100.0,
         "p99_duplex_client_ttft_ms": 500.0,
+        "num_duplex_client_rtf_samples": 4,
+        "mean_duplex_client_rtf": 0.55,
+        "median_duplex_client_rtf": 0.5,
+        "p99_duplex_client_rtf": 0.7,
     }
     assert duplex_response_latency_metrics([]) == {}
 
@@ -129,6 +133,7 @@ def test_report_and_console_expose_the_flat_latency_keys(capsys):
         session_metrics=[bundle.session_metrics],
     )
     assert "mean_duplex_client_ttfp_ms" not in report
+    assert "mean_duplex_client_rtf" not in report
     assert report["mean_duplex_response_ttfp_ms"] == 150.0
     assert bundle.request_metrics[0]["response_created_to_first_audio_ms"] == 400.0
 
@@ -137,6 +142,7 @@ def test_report_and_console_expose_the_flat_latency_keys(capsys):
     assert "Duplex Per-Response Latency" in printed
     assert "Mean client TTFT (ms):" in printed and "300.00" in printed
     assert "Mean client append TTFP" not in printed
+    assert "Mean client append RTF" not in printed
     print_duplex_response_latency_metrics({})
     assert capsys.readouterr().out == ""
 

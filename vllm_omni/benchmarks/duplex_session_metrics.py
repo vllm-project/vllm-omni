@@ -42,11 +42,13 @@ _TEXT_DELTA_TYPES = frozenset(
 #: Per-response latencies exported as flat ``mean_/median_/p99_<name>`` keys,
 #: the shape perf baselines read (like ``mean_ttft_ms``). Every response
 #: counts once, however many responses its session had.
+#: ``(row field, flatten name, console label, summary digits, print unit)``.
 DUPLEX_RESPONSE_LATENCY_FIELDS = (
-    ("ttft_ms", "duplex_response_ttft_ms", "server TTFT"),
-    ("ttfp_ms", "duplex_response_ttfp_ms", "server TTFP"),
-    ("client_ttft_ms", "duplex_client_ttft_ms", "client TTFT"),
-    ("client_ttfp_ms", "duplex_client_ttfp_ms", "client append TTFP"),
+    ("ttft_ms", "duplex_response_ttft_ms", "server TTFT", 3, "ms"),
+    ("ttfp_ms", "duplex_response_ttfp_ms", "server TTFP", 3, "ms"),
+    ("client_ttft_ms", "duplex_client_ttft_ms", "client TTFT", 3, "ms"),
+    ("client_ttfp_ms", "duplex_client_ttfp_ms", "client append TTFP", 3, "ms"),
+    ("client_rtf", "duplex_client_rtf", "client append RTF", 6, ""),
 )
 _STREAM_MEASUREMENT_ORIGIN = {
     "ttft": "input stream start to first non-empty text delta",
@@ -298,8 +300,8 @@ def duplex_response_latency_metrics(request_metrics: Sequence[Mapping[str, objec
     from vllm_omni.clients.duplex import distribution_summary
 
     result: dict[str, float | int] = {}
-    for field, name, _ in DUPLEX_RESPONSE_LATENCY_FIELDS:
-        summary = distribution_summary(_finite_nonnegative(request_metrics, field))
+    for field, name, _label, digits, _unit in DUPLEX_RESPONSE_LATENCY_FIELDS:
+        summary = distribution_summary(_finite_nonnegative(request_metrics, field), digits=digits)
         if summary is None:
             continue
         result[f"num_{name}_samples"] = summary["count"]
@@ -314,11 +316,13 @@ def print_duplex_response_latency_metrics(metrics: Mapping[str, float | int]) ->
     if not metrics:
         return
     print("{s:{c}^{n}}".format(s=" Duplex Per-Response Latency ", n=50, c="="))
-    for _, name, label in DUPLEX_RESPONSE_LATENCY_FIELDS:
+    for _field, name, label, digits, unit in DUPLEX_RESPONSE_LATENCY_FIELDS:
         if f"mean_{name}" not in metrics:
             continue
         for stat, title in (("mean", "Mean"), ("median", "Median"), ("p99", "P99")):
-            print("{:<40} {:<10.2f}".format(f"{title} {label} (ms):", metrics[f"{stat}_{name}"]))
+            heading = f"{title} {label} ({unit}):" if unit else f"{title} {label}:"
+            printed_digits = 2 if unit == "ms" else digits
+            print(f"{{:<40}} {{:<10.{printed_digits}f}}".format(heading, metrics[f"{stat}_{name}"]))
     print("=" * 50)
 
 

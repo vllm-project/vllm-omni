@@ -615,6 +615,7 @@ length because input is paced in real time.
 | `duplex_response_ttft_ms` / `duplex_response_ttfp_ms` | server: request accepted by the engine | first text / audio output |
 | `duplex_client_ttft_ms` | client: `response.created` received | first non-empty text delta |
 | `duplex_client_ttfp_ms` | client: last `input_audio_buffer.append` send before this `response.created` (after the previous `response.created` or stream start), when that send was recorded | first audio delta |
+| `duplex_client_rtf` | same append-send start as `duplex_client_ttfp_ms` | last audio delta, divided by emitted audio duration |
 
 The server timer starts only after the model plugin prepared the prompt and the engine accepted it, so it leaves out
 prompt preparation; for Qwen3-Omni that is decoding the retained images, the chat template, and multimodal
