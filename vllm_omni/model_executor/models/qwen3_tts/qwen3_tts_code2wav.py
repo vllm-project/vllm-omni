@@ -7,6 +7,7 @@ import os
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -785,6 +786,13 @@ class Qwen3TTSCode2Wav(nn.Module):
         # files, and all load formats).  AutoWeightsLoader matches
         # "decoder.*" weights to self.decoder and skips encoder weights.
         model_loader = get_model_loader(self.vllm_config.load_config)
+        # Subfolder assets require the DefaultModelLoader iterator protocol.
+        # Registered subclasses (including unified checkpoints) keep their
+        # iterator; unrelated outer-model formats retain the native fallback.
+        if not isinstance(model_loader, DefaultModelLoader):
+            model_loader = DefaultModelLoader(
+                replace(self.vllm_config.load_config, load_format="auto", model_loader_extra_config={})
+            )
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=self.vllm_config.model_config.revision,

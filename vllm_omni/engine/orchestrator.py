@@ -2273,7 +2273,7 @@ class OrchestratorBase:
     def _upgrade_processed_stage_request(self, request: Any, raw_prompt: Any) -> Any:
         prompt_embeds = getattr(request, "prompt_embeds", None)
         additional_information = None
-        model_intermediate_buffer = None
+        model_intermediate_buffer = getattr(request, "model_intermediate_buffer", None)
 
         if isinstance(raw_prompt, dict):
             if prompt_embeds is None:
@@ -2281,7 +2281,7 @@ class OrchestratorBase:
                 if isinstance(raw_prompt_embeds, torch.Tensor):
                     prompt_embeds = raw_prompt_embeds
             raw_buffer = raw_prompt.get("model_intermediate_buffer")
-            if isinstance(raw_buffer, dict):
+            if model_intermediate_buffer is None and isinstance(raw_buffer, dict):
                 model_intermediate_buffer = raw_buffer
             raw_info = raw_prompt.get("additional_information")
             if isinstance(raw_info, dict):

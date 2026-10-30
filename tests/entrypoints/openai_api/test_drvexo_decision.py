@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from unittest.mock import AsyncMock
 
+import anyio
 import pytest
 import torch
 from pydantic import ValidationError
@@ -61,6 +62,7 @@ class _DecisionOutput:
 @dataclass
 class _ApplicationState:
     openai_serving_chat: object
+    drvexo_decision_limiter: object
 
 
 def body(**kwargs):
@@ -91,7 +93,9 @@ def request(engine):
     chat = _ServingChat(renderer=_Renderer(get_tokenizer=lambda: tokenizer), engine_client=engine)
     return _Request(
         is_disconnected=AsyncMock(return_value=False),
-        app=_Application(state=_ApplicationState(openai_serving_chat=chat)),
+        app=_Application(
+            state=_ApplicationState(openai_serving_chat=chat, drvexo_decision_limiter=anyio.CapacityLimiter(1))
+        ),
     )
 
 
@@ -142,3 +146,46 @@ async def test_cancel_aborts_only_its_owned_candidate():
         await task
     assert closed.is_set()
     engine.abort.assert_awaited_once_with(calls[0]["request_id"])
+
+
+@pytest.mark.asyncio
+async def test_busy_decision_rejected_without_engine_work():
+    from fastapi import HTTPException
+
+    generate = AsyncMock()
+    engine = _Engine(generate=generate, abort=AsyncMock(), default_sampling_params_list=[])
+    raw = request(engine)
+    limiter = raw.app.state.drvexo_decision_limiter
+    limiter.acquire_on_behalf_of_nowait("other-request")
+    with pytest.raises(HTTPException) as error:
+        await general_decision(body(), raw)
+    assert error.value.status_code == 429
+    generate.assert_not_called()
+    limiter.release_on_behalf_of("other-request")
+
+
+@pytest.mark.asyncio
+async def test_scoring_timeout_aborts_owned_candidate_and_releases_admission(mocker):
+    from fastapi import HTTPException
+
+    from vllm_omni.entrypoints.openai import drvexo_decision as module
+
+    closed, calls = [], []
+
+    async def generate(**kwargs):
+        calls.append(kwargs)
+        try:
+            await anyio.sleep_forever()
+            yield None
+        finally:
+            closed.append(True)
+
+    engine = _Engine(generate=generate, abort=AsyncMock(), default_sampling_params_list=[SamplingParams(max_tokens=1)])
+    raw = request(engine)
+    mocker.patch.object(module, "DECISION_TIMEOUT_SECONDS", 0.02)
+    with pytest.raises(HTTPException) as error:
+        await general_decision(body(), raw)
+    assert error.value.status_code == 504
+    assert closed == [True]
+    engine.abort.assert_awaited_once_with(calls[0]["request_id"])
+    assert raw.app.state.drvexo_decision_limiter.borrowed_tokens == 0

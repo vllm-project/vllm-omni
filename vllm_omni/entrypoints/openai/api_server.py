@@ -25,6 +25,7 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import anyio
 import torch
 import uvloop
 import vllm.envs as envs
@@ -449,6 +450,7 @@ async def omni_run_server_worker(
         if getattr(config, "model_type", None) == "drvexo_speech_8b":
             from .drvexo_routes import router as drvexo_router
 
+            app.state.drvexo_decision_limiter = anyio.CapacityLimiter(1)
             app.include_router(drvexo_router)
 
         # The inherited routes assume a tokenization handler. Pure diffusion

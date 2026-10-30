@@ -33,3 +33,24 @@ def test_processed_stage_request_preserves_runner_payload_with_routing_metadata(
     assert deserialize_additional_information(upgraded.additional_information) == {
         "global_request_id": ["runner-payload"]
     }
+
+
+def test_processed_payload_is_authoritative_over_raw_fallback():
+    from vllm_omni.engine import OmniEngineCoreRequest
+
+    request = OmniEngineCoreRequest(
+        request_id="processed",
+        prompt_token_ids=[1],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        model_intermediate_buffer={"text": ["processed"], "owner": "current"},
+    )
+    actual = object.__new__(Orchestrator)._upgrade_processed_stage_request(
+        request, {"model_intermediate_buffer": {"text": ["raw"], "stale": True}}
+    )
+    assert actual.model_intermediate_buffer == {"text": ["processed"], "owner": "current"}

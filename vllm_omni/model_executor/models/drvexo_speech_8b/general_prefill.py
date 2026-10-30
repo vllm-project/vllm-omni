@@ -57,7 +57,7 @@ class GeneralClassifier:
         ):
             raise ValueError(
                 "General-head native runtime requires eager BF16 compute, "
-                "single sequence, no prefix cache and2048 prefill budget"
+                "single sequence, no prefix cache and exactly 2048 prefill budget"
             )
 
     @torch.inference_mode()

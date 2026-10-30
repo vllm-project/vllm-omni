@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, patch
 
+import anyio
 import numpy as np
 import pytest
 from vllm import SamplingParams
@@ -58,6 +59,7 @@ class _TextOutput:
 @dataclass
 class _HFConfig:
     model_type: str
+    drvexo_text_intermediate: bool = False
 
 
 @dataclass
@@ -231,3 +233,65 @@ class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.asyncio
+async def test_transcription_disconnect_shields_inner_chat_abort():
+    from vllm_omni.entrypoints.openai.stream_lifecycle import owned_chat_stream
+
+    closed = []
+
+    async def response():
+        try:
+            yield 'data: {"choices": []}\n\n'
+        finally:
+            await anyio.sleep(0)
+            closed.append("response")
+
+    async def results():
+        yield None
+
+    engine = AsyncMock()
+    inner = owned_chat_stream(response(), results(), engine, "only-this-chat")
+
+    async def adapter():
+        try:
+            async for chunk in inner:
+                yield chunk
+        finally:
+            # Recursive response adapters may have cleanup checkpoints before
+            # reaching the owned generator's own shield.
+            await anyio.sleep(0)
+            await inner.aclose()
+
+    outer = module.attach_transcription(adapter(), {"text": "hello"})
+    await anext(outer)
+    with anyio.CancelScope() as scope:
+        scope.cancel()
+        await outer.aclose()
+    assert closed == ["response"]
+    engine.abort.assert_awaited_once_with("only-this-chat")
+
+
+@pytest.mark.asyncio
+async def test_internal_transcription_typeerror_is_not_a_client_error(mocker):
+    handler = object.__new__(OmniOpenAIServingChat)
+    handler.model_config = _ServingModelConfig(hf_config=_HFConfig("drvexo_speech_8b", True))
+    handler._check_model = AsyncMock(return_value=None)
+    mocker.patch.object(module, "current_audio_to_text", side_effect=TypeError("internal defect"))
+    req = ChatCompletionRequest(model="test", messages=[{"role": "user", "content": "hi"}])
+    with pytest.raises(TypeError, match="internal defect"):
+        await handler._create_chat_completion(req)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [ValueError, TypeError])
+async def test_recursive_serving_failure_keeps_server_error_identity(mocker, error):
+    handler = object.__new__(OmniOpenAIServingChat)
+    handler.model_config = _ServingModelConfig(hf_config=_HFConfig("drvexo_speech_8b", True))
+    handler._check_model = AsyncMock(return_value=None)
+    req = ChatCompletionRequest(model="test", messages=[{"role": "user", "content": "hi"}])
+    mocker.patch.object(module, "current_audio_to_text", return_value=(req, {"text": "hi"}))
+    handler._create_chat_completion = AsyncMock(side_effect=error("internal recursive error"))
+    with pytest.raises(error, match="internal recursive error"):
+        await OmniOpenAIServingChat._create_chat_completion(handler, req)

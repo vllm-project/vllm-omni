@@ -3,9 +3,12 @@
 
 """Opt-in packaged endpoints. Standard vLLM endpoints remain available."""
 
+import ipaddress
 import json
+from collections.abc import Mapping
 from typing import Literal
 
+import anyio
 import httpx
 import pybase64 as base64
 from fastapi import APIRouter, HTTPException, Request
@@ -30,18 +33,53 @@ class StreamChat(BaseModel):
     speech_language: Literal["Auto", "Chinese", "English"] = "Auto"
 
 
-def local_backend(scope):
-    # Use the actual listening socket, never Host/forwarded headers or user URL.
+def local_backend(scope: Mapping[str, object]) -> str:
+    """Use the actual HTTP listening socket, never Host/forwarded headers."""
     server = scope.get("server")
-    if not server or len(server) != 2 or not isinstance(server[1], int) or not 0 < server[1] <= 65535:
-        raise ValueError("Missing actual server port")
-    return f"http://127.0.0.1:{server[1]}"
+    if scope.get("scheme", "http") != "http":
+        raise HTTPException(503, "DRVEXO chat streaming requires a local HTTP listener; TLS is not supported")
+    if not isinstance(server, (tuple, list)) or len(server) != 2:
+        raise HTTPException(503, "DRVEXO chat streaming requires a TCP listener; Unix sockets are not supported")
+    host, port = server
+    if not isinstance(host, str) or not isinstance(port, int) or not 0 < port <= 65535:
+        raise HTTPException(503, "DRVEXO chat streaming has no valid listening socket")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise HTTPException(503, "DRVEXO chat streaming requires a numeric listening address") from exc
+    if address.is_unspecified:
+        address = ipaddress.ip_address("::1" if address.version == 6 else "127.0.0.1")
+    host = f"[{address}]" if address.version == 6 else str(address)
+    return f"http://{host}:{port}"
+
+
+def backend_headers(request: Request) -> dict[str, str]:
+    """Keep end-to-end auth/tracing headers when re-entering this server."""
+    excluded = {
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "forwarded",
+    }
+    excluded.update(part.strip().lower() for part in request.headers.get("connection", "").split(","))
+    return {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in excluded and not key.lower().startswith("x-forwarded-")
+    }
 
 
 def stream_payload(request):
     if not isinstance(request, dict) or not isinstance(request.get("messages"), list) or not request["messages"]:
         raise ValueError("Provide a normal chat request with nonempty messages")
-    if request.get("n", 1) != 1:
+    if request.get("n") not in (None, 1):
         raise ValueError("Sentence streaming requires one response choice")
     if request.get("tools") or request.get("functions"):
         raise ValueError("Tool-call speech streaming is not supported")
@@ -55,9 +93,9 @@ async def sentence_speech(body: SpeechText, raw_request: Request):
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.sampling_params import RequestOutputKind
 
-    serving = raw_request.app.state.openai_serving_chat
     if not body.text.strip():
         raise HTTPException(400, "Nonempty text required")
+    serving = raw_request.app.state.openai_serving_chat
     final = await collect_sentence(serving.engine_client, body.text, body.language, RequestOutputKind.FINAL_ONLY)
     req = ChatCompletionRequest(
         model=body.model or serving.models.model_name(None),
@@ -80,6 +118,9 @@ async def sentence_speech(body: SpeechText, raw_request: Request):
 
 
 async def sentence_speech_stream(body: SpeechText, raw_request: Request):
+    if not body.text.strip():
+        raise HTTPException(400, "Nonempty text required")
+
     async def generate():
         source = stream_sentence(raw_request.app.state.openai_serving_chat.engine_client, body.text, body.language)
         try:
@@ -88,7 +129,8 @@ async def sentence_speech_stream(body: SpeechText, raw_request: Request):
                 yield json.dumps({"type": "audio", "audio_data": base64.b64encode(wav).decode(), **chunk}) + "\n"
             yield json.dumps({"type": "done"}) + "\n"
         finally:
-            await source.aclose()
+            with anyio.CancelScope(shield=True):
+                await source.aclose()
 
     return StreamingResponse(
         generate(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
@@ -101,9 +143,8 @@ async def chat_stream(body: StreamChat, raw_request: Request):
         payload = stream_payload(body.request)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    # Preserve optional API authentication when calling the same local server.
-    authorization = raw_request.headers.get("authorization")
-    headers = {"Authorization": authorization} if authorization else {}
+    # This internal HTTP hop intentionally re-enters middleware/authentication.
+    headers = backend_headers(raw_request)
 
     async def generate():
         async with httpx.AsyncClient(
@@ -114,7 +155,8 @@ async def chat_stream(body: StreamChat, raw_request: Request):
                 async for line in source:
                     yield line
             finally:
-                await source.aclose()
+                with anyio.CancelScope(shield=True):
+                    await source.aclose()
 
     return StreamingResponse(
         generate(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
@@ -127,5 +169,5 @@ async def chat_stream(body: StreamChat, raw_request: Request):
 router = APIRouter()
 router.add_api_route("/v1/drvexo/decision", with_cancellation(general_decision), methods=["POST"])
 router.add_api_route("/v1/drvexo/speech", with_cancellation(sentence_speech), methods=["POST"])
-router.add_api_route("/v1/drvexo/speech/stream", sentence_speech_stream, methods=["POST"])
+router.add_api_route("/v1/drvexo/speech/stream", with_cancellation(sentence_speech_stream), methods=["POST"])
 router.add_api_route("/v1/drvexo/chat/stream", chat_stream, methods=["POST"])

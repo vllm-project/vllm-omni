@@ -228,4 +228,12 @@ The General endpoint accepts caller-defined state/candidates, returns
 non-executable scores, and skips engine work when explicitly disabled.
 Each recognition, synthesis or candidate-prefill operation owns a unique
 engine request ID; cancellation closes its generator and aborts only that ID.
+Response wrappers shield asynchronous close propagation on disconnect.
+Each API process admits one enabled General request at a time (429 when busy)
+and limits scoring to 120 seconds (504 after owned-request cleanup on timeout).
+This bounds decision admission, not shared-Thinker fairness or throughput.
+The chat/audio NDJSON wrapper re-enters the local HTTP stack using the actual
+IPv4/IPv6 listening socket and end-to-end auth/tracing headers, excluding
+transport/proxy-forwarding headers. Direct TLS and Unix socket listeners are
+explicitly unsupported for that wrapper (503); standard endpoints are unchanged.
 See [DRVEXO](../../models/drvexo_speech_8b.md) for schemas and limits.

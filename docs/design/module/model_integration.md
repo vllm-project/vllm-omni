@@ -84,7 +84,17 @@ for runtime restrictions and validation scope.
 
 When processing a raw prompt for a downstream entry or handoff stage, preserve
 `model_intermediate_buffer` on the upgraded `OmniEngineCoreRequest`, alongside
-serialized routing metadata. The runner merges decoded request metadata into
-this buffer rather than replacing its contents. A direct speech request carries
-its caller text and fixed-reply provenance in the buffer; dropping that state
-incorrectly sends it through the generated-token path.
+serialized routing metadata. A processed request's buffer is authoritative;
+the raw prompt is only a fallback, including for other pipelines using this
+shared path. On admission the runner combines that buffer with the same
+request's decoded routing metadata (routing keys win conflicts), then installs
+one snapshot. Omitted keys from an earlier admission are cleared, apart from
+the existing streaming `meta.num_processed_tokens` / `meta.resumable` lifecycle
+fields. Model-produced incremental updates still use the separate merge path.
+A direct speech request carries its caller text and fixed-reply provenance in
+the snapshot; dropping that state incorrectly selects the generated-token path.
+
+Qwen3-TTS subfolder reads keep a selected `DefaultModelLoader` subclass,
+including the unified-checkpoint loader. Other outer-model loader protocols
+fall back to a separate native `auto` loader for tokenizer assets, without
+mutating their outer load configuration or forwarding format-specific options.

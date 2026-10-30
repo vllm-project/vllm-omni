@@ -110,3 +110,105 @@ async def test_completed_stream_does_not_abort():
     engine = AsyncMock()
     assert [chunk async for chunk in owned_chat_stream(response(), results(), engine, "owned")] == ["done"]
     engine.abort.assert_not_awaited()
+
+
+@pytest.mark.parametrize("n", [None, 1])
+def test_stream_payload_accepts_optional_single_choice(n):
+    assert stream_payload({"messages": [{"role": "user", "content": "Hi"}], "n": n})["n"] in (None, 1)
+
+
+@pytest.mark.parametrize("path", ["/v1/drvexo/speech", "/v1/drvexo/speech/stream"])
+def test_whitespace_speech_rejected_before_model_access(path):
+    app = FastAPI()
+    app.include_router(router)
+    with TestClient(app) as client:
+        assert client.post(path, json={"text": "   "}).status_code == 400
+
+
+@pytest.mark.parametrize(
+    "server,scheme,expected",
+    [
+        (("127.0.0.1", 8000), "http", "http://127.0.0.1:8000"),
+        (("10.1.2.3", 8000), "http", "http://10.1.2.3:8000"),
+        (("0.0.0.0", 8000), "http", "http://127.0.0.1:8000"),
+        (("::", 8000), "http", "http://[::1]:8000"),
+        (("2001:db8::1", 8000), "http", "http://[2001:db8::1]:8000"),
+    ],
+)
+def test_backend_uses_actual_socket(server, scheme, expected):
+    from vllm_omni.entrypoints.openai.drvexo_routes import local_backend
+
+    assert local_backend({"server": server, "scheme": scheme}) == expected
+
+
+@pytest.mark.parametrize("server,scheme", [(None, "http"), (("127.0.0.1", 8000), "https")])
+def test_chat_stream_unsupported_transport_is_server_error(server, scheme):
+    from fastapi import HTTPException
+
+    from vllm_omni.entrypoints.openai.drvexo_routes import local_backend
+
+    with pytest.raises(HTTPException) as error:
+        local_backend({"server": server, "scheme": scheme})
+    assert error.value.status_code == 503
+
+
+def test_backend_hop_preserves_auth_and_trace_but_rebuilds_transport_headers():
+    from starlette.requests import Request
+
+    from vllm_omni.entrypoints.openai.drvexo_routes import backend_headers
+
+    headers = {
+        "host": "untrusted.example",
+        "content-length": "7",
+        "connection": "x-hop",
+        "x-hop": "drop",
+        "x-forwarded-host": "external.example",
+        "authorization": "Bearer key",
+        "x-custom-auth": "middleware-value",
+        "x-request-id": "trace-1",
+    }
+    request = Request({"type": "http", "headers": [(k.encode(), v.encode()) for k, v in headers.items()]})
+    assert backend_headers(request) == {
+        "authorization": "Bearer key",
+        "x-custom-auth": "middleware-value",
+        "x-request-id": "trace-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_sentence_stream_disconnect_closes_owned_engine_request(mocker):
+    from unittest.mock import Mock
+
+    import anyio
+    from starlette.requests import Request
+    from vllm import SamplingParams
+
+    from vllm_omni.entrypoints.openai.drvexo_routes import SpeechText, sentence_speech_stream
+
+    started, closed = anyio.Event(), []
+    calls = []
+
+    async def generate(**kwargs):
+        calls.append(kwargs)
+        started.set()
+        try:
+            await anyio.sleep_forever()
+            yield None
+        finally:
+            closed.append(True)
+
+    engine = Mock(
+        num_stages=3, default_sampling_params_list=[SamplingParams(max_tokens=1)], generate=generate, abort=AsyncMock()
+    )
+    app = FastAPI()
+    app.state.openai_serving_chat = Mock(engine_client=engine)
+    raw = Request({"type": "http", "app": app, "headers": []})
+    response = await sentence_speech_stream(SpeechText(text="Speak this sentence."), raw)
+
+    async def receive():
+        await started.wait()
+        return {"type": "http.disconnect"}
+
+    await response({"type": "http", "asgi": {"spec_version": "2.3"}}, receive, AsyncMock())
+    assert closed == [True]
+    engine.abort.assert_awaited_once_with(calls[0]["request_id"])

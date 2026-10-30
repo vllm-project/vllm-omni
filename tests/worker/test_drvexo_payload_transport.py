@@ -48,3 +48,36 @@ def test_decode_preserves_fixed_speech_payload_alongside_final_stage_metadata(la
     assert actual["language"] == [language]
     assert actual["omni_final_stage_id"] == 2
     assert runner.requests["speech"].additional_information_cpu == actual
+
+
+def test_request_transport_snapshot_drops_previous_payload_keys():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.requests = {"request": RequestState()}
+    runner.model_intermediate_buffer = {"request": {"old": True, "config": {"old": 1, "shared": 0}}}
+    batch = ScheduledBatch(
+        [
+            ScheduledRequest(
+                "request",
+                {"new": True, "config": {"shared": 2}},
+                serialize_additional_information({"omni_final_stage_id": 2}),
+            )
+        ]
+    )
+    runner._decode_and_store_request_payloads(batch)
+    assert runner.model_intermediate_buffer["request"] == {
+        "new": True,
+        "config": {"shared": 2},
+        "omni_final_stage_id": 2,
+    }
+    runner._decode_and_store_request_payloads(
+        ScheduledBatch(
+            [
+                ScheduledRequest(
+                    "request",
+                    {},
+                    serialize_additional_information({"only": "legacy"}),
+                )
+            ]
+        )
+    )
+    assert runner.model_intermediate_buffer["request"] == {"only": "legacy"}

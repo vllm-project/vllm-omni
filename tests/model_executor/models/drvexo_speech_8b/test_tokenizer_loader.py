@@ -11,7 +11,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 from vllm.config import LoadConfig
-from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.model_executor.models.drvexo_speech_8b.checkpoint import FORMAT, VIEW_FORMAT
@@ -48,7 +48,7 @@ class Stage(torch.nn.Module):
 
 
 @pytest.mark.parametrize("entry", ["talker", "codec", "first_frame"])
-@pytest.mark.parametrize("load_format", ["drvexo_unified", "safetensors"])
+@pytest.mark.parametrize("load_format", ["drvexo_unified", "safetensors", "dummy"])
 def test_speech_tokenizer_uses_selected_loader(tmp_path, mocker, entry, load_format):
     expected = torch.arange(4, dtype=torch.float32)
     folder = tmp_path / "speech_tokenizer"
@@ -72,7 +72,9 @@ def test_speech_tokenizer_uses_selected_loader(tmp_path, mocker, entry, load_for
     config = Config(LoadConfig(load_format=load_format))
     loader = get_model_loader(config.load_config)
     assert isinstance(loader, DRVEXOUnifiedModelLoader) == (load_format == "drvexo_unified")
-    iterator = mocker.spy(loader, "_get_weights_iterator")
+    iterator = mocker.spy(
+        loader if isinstance(loader, DefaultModelLoader) else DefaultModelLoader, "_get_weights_iterator"
+    )
     module = {"talker": qwen3_tts_talker, "codec": qwen3_tts_code2wav, "first_frame": first_frame_decoder}[entry]
     factory = mocker.patch.object(module, "get_model_loader", return_value=loader)
     calls = 0
@@ -100,6 +102,6 @@ def test_speech_tokenizer_uses_selected_loader(tmp_path, mocker, entry, load_for
         else:
             module.Qwen3TTSFirstFrameDecoder.load(stage, config)
     factory.assert_called_once_with(config.load_config)
-    source = iterator.call_args.args[0]
+    source = iterator.call_args.args[-1]
     assert source.model_or_path == str(tmp_path)
     assert source.subfolder == "speech_tokenizer"

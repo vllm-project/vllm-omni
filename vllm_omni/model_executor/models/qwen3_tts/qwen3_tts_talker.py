@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -1403,6 +1404,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # subfolder.  Skip decoder weights — the Talker only uses the
         # encoder for ref_audio encoding.
         model_loader = get_model_loader(self.vllm_config.load_config)
+        # Subfolder assets require the DefaultModelLoader iterator protocol.
+        # Registered subclasses (including unified checkpoints) keep their
+        # iterator; unrelated outer-model formats retain the native fallback.
+        if not isinstance(model_loader, DefaultModelLoader):
+            model_loader = DefaultModelLoader(
+                replace(self.vllm_config.load_config, load_format="auto", model_loader_extra_config={})
+            )
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=self.vllm_config.model_config.revision,

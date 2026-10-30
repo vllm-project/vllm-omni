@@ -648,20 +648,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             try:
                 validate_chat_request(request)
-                if getattr(hf_config, "drvexo_text_intermediate", False):
-                    from .drvexo_transcription import attach_transcription, current_audio_to_text
-
-                    error = await self._check_model(request)
-                    if error is not None:
-                        return error
-                    converted, transcription = await current_audio_to_text(self, request)
-                    if transcription is not None:
-                        response = await self._create_chat_completion(converted, raw_request)
-                        return attach_transcription(response, transcription)
-            except (ValueError, TypeError) as exc:
+            except ValueError as exc:
                 return self._create_error_response(str(exc), status_code=400)
-            except RuntimeError as exc:
-                return self._create_error_response(str(exc), status_code=503)
+            if getattr(hf_config, "drvexo_text_intermediate", False):
+                from .drvexo_transcription import attach_transcription, current_audio_to_text
+
+                error = await self._check_model(request)
+                if error is not None:
+                    return error
+                try:
+                    converted, transcription = await current_audio_to_text(self, request)
+                except ValueError as exc:
+                    return self._create_error_response(str(exc), status_code=400)
+                except RuntimeError as exc:
+                    return self._create_error_response(str(exc), status_code=503)
+                if transcription is not None:
+                    # Internal serving failures must keep their server-error
+                    # identity, rather than being recast as request validation.
+                    response = await self._create_chat_completion(converted, raw_request)
+                    return attach_transcription(response, transcription)
         stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
         serves_diffusion = self._diffusion_mode or any(
             get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs

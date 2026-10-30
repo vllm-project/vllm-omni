@@ -103,6 +103,36 @@ candidate. They are independent of the chat context budget. Setting
 `general_decision_head_enabled: false` skips the Thinker and head. Scores
 are not calibrated confidence; `executable` is always false.
 
+Enabled decisions score candidates sequentially, with one full shared-prefix
+prefill per candidate and no prefix caching. At the 151-candidate cap this can
+occupy the shared Thinker for substantially longer than a small decision;
+there is no production latency guarantee. Each API process permits only one
+enabled decision at a time and returns 429 with `Retry-After: 1` when busy.
+The scoring deadline is 120 seconds; expiry aborts the owned candidate and
+returns 504 after shielded cleanup. This does not reserve a separate chat lane;
+use separate deployments for latency-sensitive traffic. The native head's
+validated contract requires exactly 2048 batched prefill tokens, BF16 compute,
+eager execution, one sequence and no prefix caching; other budgets are rejected.
+
+At startup the General head verifies all `bound_artifacts`, including complete
+weight shards, before accepting their binding. This deliberately adds a full
+read of approximately 21.67 GB (BF16), 14.09 GB (FP8) or 10.96 GB (NVFP4) for
+the supplied bundles, in addition to weight loading. It is an integrity check,
+not a cached shortcut or a throughput measurement.
+
+`/v1/drvexo/chat/stream` connects to the actual HTTP listening IPv4/IPv6 socket.
+It forwards end-to-end authentication and tracing headers, excluding Host,
+hop-by-hop and proxy-forwarding headers, and re-enters the same middleware and
+logging stack. Direct TLS (`--ssl-keyfile`) and Unix socket (`--uds`) listeners
+are explicitly unsupported by this NDJSON wrapper and return 503; use a local
+HTTP listener for it. Standard chat/audio, sentence speech and decisions do
+not use this internal HTTP hop. Both speech routes reject whitespace-only text
+before starting synthesis. Sentence streaming accepts an omitted or null `n`
+as one response, and rejects multiple choices.
+
+The raw-audio frontend follows the vLLM 0.32 API documented by this checkout's
+CUDA installation guide; vLLM 0.28 compatibility is not claimed.
+
 Speech/chat streams propagate cancellation to their uniquely owned engine
 request. Disconnect-and-recovery checks are different from measuring GPU
 abort reclamation latency. A model-selected candidate never establishes that

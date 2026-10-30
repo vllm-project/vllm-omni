@@ -203,3 +203,11 @@ batch order as spans and intermediate buffers. DRVEXO uses the offset to
 score exactly the final prompt token across chunk boundaries and to avoid
 scoring decode tokens. This opt-in output metadata does not change the
 preprocess phase fields above or infer phase from a span's length.
+
+Scheduler offsets are installed by `_update_states` before input preparation;
+row reordering applies to the same persistent batch arrays. `_model_forward`
+reads these offsets before the current chunk is counted. CPU runner tests drive
+real cached scheduler updates through forward in both synchronous and async
+scheduling modes, including multiple prefill chunks and row reordering. They
+do not establish GPU async-scheduling or speculative-decoding acceptance;
+the DRVEXO deployment uses async scheduling off and no speculative decoder.

@@ -19,6 +19,7 @@ skips q/k, RoPE, masks and softmax (about two thirds of the kernels).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 import torch.nn as nn
@@ -50,6 +51,13 @@ class Qwen3TTSFirstFrameDecoder(nn.Module):
     def load(self, vllm_config: VllmConfig) -> set[str]:
         """Load decoder weights exactly as Code2Wav does; returns the loaded parameter names."""
         loader = get_model_loader(vllm_config.load_config)
+        # Subfolder assets require the DefaultModelLoader iterator protocol.
+        # Registered subclasses (including unified checkpoints) keep their
+        # iterator; unrelated outer-model formats retain the native fallback.
+        if not isinstance(loader, DefaultModelLoader):
+            loader = DefaultModelLoader(
+                replace(vllm_config.load_config, load_format="auto", model_loader_extra_config={})
+            )
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=vllm_config.model_config.revision,

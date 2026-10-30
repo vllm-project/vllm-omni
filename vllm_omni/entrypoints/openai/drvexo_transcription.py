@@ -214,6 +214,9 @@ def attach_transcription(response, metadata):
                         attached = True
                 yield chunk
         finally:
-            await response.aclose()
+            # A disconnect cancels the surrounding Starlette task group. Let
+            # every inner response adapter reach its owned engine cleanup.
+            with anyio.CancelScope(shield=True):
+                await response.aclose()
 
     return stream()

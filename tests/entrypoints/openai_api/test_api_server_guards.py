@@ -95,7 +95,8 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
+@pytest.mark.parametrize("model_type", ["dummy", "drvexo_speech_8b"])
+async def test_omni_run_server_worker_forwards_client_config(monkeypatch, model_type):
     captured: dict[str, object] = {}
 
     @asynccontextmanager
@@ -105,7 +106,13 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
     monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
-    monkeypatch.setattr(api_server, "omni_init_app_state", lambda *_args: asyncio.sleep(0))
+
+    async def fake_init_app_state(_engine, state, _args):
+        state.openai_serving_chat = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+        )
+
+    monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)
 
     async def fake_storage_start() -> None:
@@ -115,6 +122,10 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     async def fake_serve_http(app, **_kwargs):
         assert app.state.api_server_count == 2
+        if model_type == "drvexo_speech_8b":
+            assert app.state.drvexo_decision_limiter.total_tokens == 1
+        else:
+            assert not hasattr(app.state, "drvexo_decision_limiter")
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task

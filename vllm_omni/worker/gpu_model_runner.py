@@ -721,23 +721,14 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                         pass
             except Exception as e:
                 logger.error(f"Error decoding prompt embeds: {e}")
-            # Direct runner data-plane payloads populate
-            # model_intermediate_buffer without going through the deprecated
-            # additional_information request transport.
-            try:
-                model_buffer = getattr(new_req_data, "model_intermediate_buffer", None)
-                if isinstance(model_buffer, dict) and model_buffer:
-                    self._update_intermediate_buffer(req_id, model_buffer)
-            except Exception as e:
-                logger.error(f"Error updating model intermediate buffer: {e}")
-            # Decode additional_information payloads (dictionary)
-            try:
-                if getattr(new_req_data, "additional_information", None) is not None:
-                    info_dict = deserialize_additional_information(new_req_data.additional_information)
-                    if info_dict:
-                        self._update_intermediate_buffer(req_id, info_dict)
-            except Exception as e:
-                logger.error(f"Error decoding additional information: {e}")
+            # Both transports describe this admission's snapshot. Routing
+            # metadata overlays this request's payload, never a previous chunk.
+            model_buffer = getattr(new_req_data, "model_intermediate_buffer", None)
+            info_dict = deserialize_additional_information(new_req_data.additional_information)
+            payload = dict(model_buffer) if isinstance(model_buffer, dict) else {}
+            if info_dict:
+                payload.update(info_dict)
+            self._replace_intermediate_buffer(req_id, payload)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1393,8 +1384,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if pe_cpu is not None:
                 setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
             model_buffer = getattr(nr, "model_intermediate_buffer", None)
-            if isinstance(model_buffer, dict) and model_buffer:
-                self._update_intermediate_buffer(req_id, model_buffer)
+            payload = dict(model_buffer) if isinstance(model_buffer, dict) else {}
             info_payload = getattr(nr, "additional_information", None)
             if info_payload is not None:
                 logger.warning_once(
@@ -1402,7 +1392,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 )
             info_dict = deserialize_additional_information(info_payload)
             if info_dict:
-                self._update_intermediate_buffer(req_id, info_dict)
+                payload.update(info_dict)
+            self._replace_intermediate_buffer(req_id, payload)
 
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request model_intermediate_buffer in batch order."""
@@ -1484,6 +1475,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             try:
                 model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
                 if getattr(self.model, "requires_request_computed_tokens", False):
+                    # _update_states installs the scheduler's pre-step offsets;
+                    # _prepare_inputs may reorder rows, but does not add this
+                    # chunk's tokens before _model_forward consumes them.
                     model_kwargs_extra["request_computed_tokens"] = [
                         int(self.input_batch.num_computed_tokens_cpu[index])
                         for index in range(len(self.input_batch.req_ids))

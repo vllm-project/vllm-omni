@@ -92,7 +92,7 @@ async def stream_reply(client, backend, payload, audio_output, speech_language="
                                 await sentences.put(text)
                     finish = choice.get("finish_reason") or finish
         if finish is None:
-            raise RuntimeError("模型流意外中断，未提交本轮上下文")
+            raise RuntimeError("Model stream ended unexpectedly; this turn was not committed")
         if audio_output:
             for text in splitter.add("", final=True):
                 await sentences.put(text)

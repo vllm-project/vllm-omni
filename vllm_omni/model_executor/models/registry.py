@@ -545,13 +545,6 @@ _OMNI_MODELS = {
 
 
 _VLLM_OMNI_MODELS = {
-    "DRVEXOSpeech8BTalker": ("drvexo_speech_8b", "talker", "DRVEXOSpeech8BTalker"),
-    "DRVEXOSpeech8BCode2Wav": ("drvexo_speech_8b", "code2wav", "DRVEXOSpeech8BCode2Wav"),
-    "DRVEXOSpeech8BForConditionalGeneration": (
-        "drvexo_speech_8b",
-        "thinker",
-        "DRVEXOSpeech8BForConditionalGeneration",
-    ),
     **_VLLM_MODELS,
     **_OMNI_MODELS,
 }

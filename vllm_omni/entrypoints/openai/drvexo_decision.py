@@ -58,9 +58,29 @@ def tensors(value):
     return []
 
 
+DECISION_TIMEOUT_SECONDS = 120
+
+
 async def general_decision(body: GeneralRequest, raw_request: Request):
     if not body.general_decision_head_enabled:
         return {"enabled": False, "probabilities": None, "executable": False}
+    # Admission is per API process. Reject additional decision requests rather
+    # than queueing unbounded full-prefix work on the single-sequence Thinker.
+    limiter = raw_request.app.state.drvexo_decision_limiter
+    try:
+        limiter.acquire_nowait()
+    except anyio.WouldBlock as exc:
+        raise HTTPException(429, "A DRVEXO decision is already running", headers={"Retry-After": "1"}) from exc
+    try:
+        with anyio.fail_after(DECISION_TIMEOUT_SECONDS):
+            return await _score_candidates(body, raw_request)
+    except TimeoutError as exc:
+        raise HTTPException(504, "DRVEXO decision exceeded its scoring deadline") from exc
+    finally:
+        limiter.release()
+
+
+async def _score_candidates(body: GeneralRequest, raw_request: Request):
     try:
         row = input_row(body)
     except ValueError as error:
