@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY
 from vllm_omni.model_executor.models.zonos2.configuration_zonos2 import Zonos2Config
 from vllm_omni.model_executor.models.zonos2.zonos2_sampler import Zonos2RequestState, Zonos2SamplingParams
 from vllm_omni.model_executor.models.zonos2.zonos2_talker import (
@@ -47,7 +48,8 @@ def info(key, *, prompt_len=3, offset=0, history=None, count=0, max_tokens=20, s
         "zonos2_frames": frames,
         "_omni_num_computed_tokens": offset,
         "_omni_is_prefill": offset < prompt_len,
-        "_omni_output_token_ids": [0] * count,
+        OUTPUT_TOKEN_COUNT_KEY: count,
+        LAST_OUTPUT_TOKEN_KEY: 0 if count else None,
         "_omni_sampling_params": {
             "temperature": 0.0,
             "top_k": -1,
@@ -108,7 +110,7 @@ def test_batch_reordering_routes_current_codes_by_request_id(model):
     assert model.postprocess(torch.empty(0), _omni_req_id="b")["codes"]["audio"].tolist() == [[8] * 9]
 
 
-def test_terminal_frame_is_present_in_same_output_as_stop_token(model):
+def test_budget_terminal_frame_is_present_without_fabricating_eos(model):
     data = info("a", max_tokens=1)
     data["_zonos2_scheduled_span"] = 3
     model.preprocess(torch.zeros(3, dtype=torch.int64), None, **data)
@@ -117,7 +119,8 @@ def test_terminal_frame_is_present_in_same_output_as_stop_token(model):
     output = model.make_omni_output(torch.zeros(3, 2))
     assert output.multimodal_outputs["codes"]["audio"][0].numel() == 0
     sampled = model.sample(torch.zeros(1, 1026), None)
-    assert sampled.sampled_token_ids.tolist() == [[1]]
+    assert sampled.sampled_token_ids.tolist() == [[0]]
+    assert output.multimodal_outputs["meta"]["is_final"][0]
     assert output.multimodal_outputs["codes"]["audio"][0].tolist() == [[7] * 9]
     assert len(model.postprocess(torch.empty(0), _omni_req_id="a")["zonos2"]["history"]) == 1
 
@@ -172,7 +175,7 @@ def test_unseeded_preemption_reuses_persisted_base_seed(model):
 def test_preprocess_error_cleans_previous_request_state(model):
     data = info("a")
     model.preprocess(torch.zeros(3, dtype=torch.int64), None, **data)
-    data["_omni_output_token_ids"] = [0] * 5
+    data[OUTPUT_TOKEN_COUNT_KEY] = 5
     with pytest.raises(ValueError, match="lifecycle"):
         model.preprocess(torch.zeros(3, dtype=torch.int64), None, **data)
     assert "a" not in model._request_states
@@ -184,17 +187,20 @@ def test_lifecycle_vocabulary_covers_stop_sentinel_and_text_padding():
     assert 1 < config.vocab_size and config.text_vocab < config.vocab_size
 
 
-def test_terminal_replay_does_not_append_duplicate_frame_or_consume_rng(model):
-    history = torch.zeros((2, 9), dtype=torch.int32)
-    data = info("a", history=history, count=2, max_tokens=2)
-    data["_omni_output_token_ids"] = [0, 1]
-    _, _, updates = model.preprocess(torch.zeros(5, dtype=torch.int64), None, **data)
+@pytest.mark.parametrize("natural_eos", [False, True])
+def test_terminal_replay_does_not_append_duplicate_frame_or_consume_rng(model, natural_eos):
+    history = torch.zeros((10, 9), dtype=torch.int32)
+    if natural_eos:
+        history[0, 0] = 1024
+    data = info("a", history=history, count=10, max_tokens=10)
+    data[LAST_OUTPUT_TOKEN_KEY] = int(natural_eos)
+    _, _, updates = model.preprocess(torch.zeros(13, dtype=torch.int64), None, **data)
     data.update(updates)
     model._sampling_plan = [("a", True, data)]
     model._last_fused_logits = logits_for_codes([7])
-    output = model.make_omni_output(torch.zeros(5, 2))
-    assert model.sample(torch.zeros(1, 1026), None).sampled_token_ids.tolist() == [[1]]
-    assert len(model._request_states["a"].history) == 2
+    output = model.make_omni_output(torch.zeros(13, 2))
+    assert model.sample(torch.zeros(1, 1026), None).sampled_token_ids.tolist() == [[int(natural_eos)]]
+    assert len(model._request_states["a"].history) == 10
     assert output.multimodal_outputs["codes"]["audio"][0].numel() == 0
 
 

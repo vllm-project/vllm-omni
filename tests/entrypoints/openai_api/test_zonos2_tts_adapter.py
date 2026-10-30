@@ -105,6 +105,44 @@ def test_reference_audio_adapter_reuses_resolver_and_encoder():
     assert len(called) == 1
 
 
+def test_concurrent_first_reference_requests_share_one_lazy_encoder(monkeypatch):
+    import torch
+
+    adapter = _adapter()
+    adapter._get_processor().normalizer.normalize = lambda text, language: text
+    encoders = []
+
+    class Encoder:
+        def __init__(self):
+            encoders.append(self)
+
+        def encode(self, wav, sr):
+            return torch.ones(2048)
+
+    monkeypatch.setattr("vllm_omni.model_executor.models.zonos2.zonos2_speaker.Zonos2SpeakerEncoder", Encoder)
+
+    async def run():
+        ready = asyncio.Event()
+        resolved = 0
+
+        async def resolve(value):
+            nonlocal resolved
+            resolved += 1
+            if resolved == 2:
+                ready.set()
+            await ready.wait()
+            return [0.0] * 24000, 24000, "reference-key"
+
+        adapter.ctx.server._resolve_ref_audio = resolve
+        request = OpenAICreateSpeechRequest(input="Test", ref_audio="data:audio/wav;base64,AAAA")
+        return await asyncio.gather(adapter.build(request, [], False), adapter.build(request, [], False))
+
+    prepared = asyncio.run(run())
+    assert len(encoders) == 1
+    assert len(prepared) == 2
+    assert adapter._speaker is encoders[0]
+
+
 def test_audio_decode_backend_error_is_actionable():
     adapter = _adapter()
 
@@ -287,7 +325,7 @@ def test_quality_negative_ranges_and_outside_clamping(value, bucket):
     assert adapter._conditioning(request)["quality_buckets"][0] == bucket
 
 
-@pytest.mark.parametrize("finish,tokens", [("length", 10), ("stop", 1024)])
+@pytest.mark.parametrize("finish,tokens", [("length", 10), ("length", 1024), ("stop", 1025)])
 def test_codec_budget_does_not_silently_return_truncated_speech(finish, tokens):
     from vllm_omni.entrypoints.openai.tts_adapters.base import TTSGenerationError
 
@@ -295,5 +333,6 @@ def test_codec_budget_does_not_silently_return_truncated_speech(finish, tokens):
         _adapter().validate_generation({"zonos2_token_budget": 1024}, stage0_finish_reason=finish, output_tokens=tokens)
 
 
-def test_natural_eos_below_budget_is_valid():
-    _adapter().validate_generation({"zonos2_token_budget": 1024}, stage0_finish_reason="stop", output_tokens=300)
+@pytest.mark.parametrize("tokens", [300, 1024])
+def test_natural_eos_at_or_below_budget_is_valid(tokens):
+    _adapter().validate_generation({"zonos2_token_budget": 1024}, stage0_finish_reason="stop", output_tokens=tokens)

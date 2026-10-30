@@ -64,9 +64,12 @@ def install_trace() -> None:
                     )
         result = sample(self, logits, metadata)
         for index, (key, eligible, info) in enumerate(self._sampling_plan):
-            if not eligible or int(result.sampled_token_ids[index, 0]) != 1:
+            if not eligible:
                 continue
             state = self._request_states[key]
+            natural_eos = int(result.sampled_token_ids[index, 0]) == 1
+            if not natural_eos and len(state.history) < state.params.max_tokens:
+                continue
             torch.save(state.history.detach().cpu(), directory / f"{key}.pt")
             write(
                 {
@@ -77,7 +80,7 @@ def install_trace() -> None:
                     "frames": len(state.history),
                     "eos_frame": int(state.eos_frame),
                     "countdown": int(state.countdown),
-                    "reached_cap": len(state.history) >= state.params.max_tokens,
+                    "reached_cap": not natural_eos and len(state.history) >= state.params.max_tokens,
                 }
             )
         return result

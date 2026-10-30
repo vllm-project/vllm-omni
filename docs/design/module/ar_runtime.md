@@ -68,8 +68,8 @@ adapter, not injected through unrelated scheduler state.
 ## Model-owned sampling metadata
 
 A model declaring `requires_request_sampling_params` receives the active
-request ID, committed output-token IDs and resolved sampling parameters in
-its preprocessing metadata. Other models retain the existing metadata path.
+request ID, committed output-token count, last lifecycle token and resolved
+sampling parameters in its preprocessing metadata. Other models retain the existing metadata path.
 Multi-codebook history needed for reconstruction remains request-owned
 multimodal state; lifecycle continue/stop tokens cannot replace that history.
 Partial prefill must not advance sampling state. Finished and cancelled

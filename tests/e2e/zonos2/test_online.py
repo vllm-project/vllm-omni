@@ -73,6 +73,34 @@ def test_real_http_nonstreaming_and_streaming(tmp_path):
             reports.append(report)
             (directory / f"{mode}.bin").write_bytes(content)
             print("REAL_HTTP_PASS", mode, report, flush=True)
+            if mode == "wav":
+                # Same input and seed, with EOS exactly on the last allowed
+                # frame: completion must remain valid and audio must match.
+                exact = client.post("/v1/audio/speech", json={**body, "max_new_tokens": life["frames"]})
+                assert exact.status_code == 200, exact.text
+                exact_audio, exact_sr = decode_wav(exact.content)
+                assert exact_sr == sr and np.array_equal(exact_audio, audio)
+                report["natural_eos_at_budget"] = life["frames"]
+
+                # One frame less leaves the EOS delay countdown unfinished.
+                # Already streamed PCM must terminate with an error, not done.
+                truncated = client.post(
+                    "/v1/audio/speech",
+                    json={
+                        **body,
+                        "max_new_tokens": life["frames"] - 1,
+                        "response_format": "pcm",
+                        "stream": True,
+                        "stream_format": "sse",
+                    },
+                )
+                assert truncated.status_code == 200, truncated.text
+                events = [json.loads(line[6:]) for line in truncated.text.splitlines() if line.startswith("data: ")]
+                assert any(event["type"] == "speech.audio.delta" for event in events)
+                assert events[-1]["type"] == "speech.audio.error"
+                assert "incomplete" in events[-1]["error"]["message"]
+                assert events[-1]["error"]["partial_audio"] and events[-1]["error"]["action"] == "discard"
+                assert not any(event["type"] == "speech.audio.done" for event in events)
         # Ensure invalid conditioning receives a client error without generation.
         invalid = client.post(
             "/v1/audio/speech", json={"model": "zonos2-e2e", "input": "Test", "extra_params": {"emotion_cfg_scale": 2}}

@@ -116,12 +116,35 @@ def test_simultaneous_eoa_uses_highest_index_and_never_restarts_countdown():
 def test_max_tokens_wins_over_pending_countdown_and_ignore_eos_works():
     state = Zonos2RequestState.rebuild("a", params(max_tokens=2), torch.empty((0, 9), dtype=torch.int32))
     assert state.append(torch.full((9,), 1024, dtype=torch.int32)) == 0
-    assert state.append(torch.zeros(9, dtype=torch.int32)) == 1
+    assert state.append(torch.zeros(9, dtype=torch.int32)) == 0
+    assert state.stopped
     ignored = Zonos2RequestState.rebuild(
         "b", params(max_tokens=2, ignore_eos=True), torch.empty((0, 9), dtype=torch.int32)
     )
     assert ignored.append(torch.full((9,), 1024, dtype=torch.int32)) == 0
     assert ignored.eos_frame == -1 and ignored.countdown == -1
+
+
+@pytest.mark.parametrize("eoa_step", [None, 0, 9])
+def test_scheduler_distinguishes_natural_eos_at_budget_from_truncation(eoa_step):
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.sched.utils import check_stop
+    from vllm.v1.request import Request, RequestStatus
+
+    budget = 10
+    state = Zonos2RequestState.rebuild("r", params(max_tokens=budget), torch.empty((0, 9), dtype=torch.int32))
+    request = Request("r", [0], SamplingParams(max_tokens=budget, stop_token_ids=[1]), None)
+    for step in range(budget):
+        frame = torch.zeros(9, dtype=torch.int32)
+        if step == eoa_step:
+            frame[0] = 1024
+        token = int(state.append(frame))
+        request.append_output_token_ids(token)
+        finished = check_stop(request, max_model_len=100)
+        assert finished == (step == budget - 1)
+    natural = eoa_step == 0
+    assert state.stopped
+    assert request.status == (RequestStatus.FINISHED_STOPPED if natural else RequestStatus.FINISHED_LENGTH_CAPPED)
 
 
 def test_reconstruction_restores_eos_repetition_and_next_rng_from_full_history():

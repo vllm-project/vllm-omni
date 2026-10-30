@@ -181,8 +181,12 @@ class Zonos2RequestState:
             self.countdown = torch.where(first, 10, self.countdown)
             self.countdown = torch.where(self.countdown > 0, self.countdown - 1, self.countdown)
         self.history = torch.cat((self.history, codes.reshape(1, 9)), dim=0)
-        self.stopped = ((self.eos_frame >= 0) & (self.countdown == 0)) | (len(self.history) >= self.params.max_tokens)
-        return torch.where(self.stopped, STOP_TOKEN, CONTINUE_TOKEN).to(torch.int64)
+        natural_eos = (self.eos_frame >= 0) & (self.countdown == 0)
+        self.stopped = natural_eos | (len(self.history) >= self.params.max_tokens)
+        # Only codec EOS emits a stop token. Let vLLM report budget exhaustion
+        # as length, including an unfinished delay-pattern countdown. vLLM
+        # checks EOS before length, so natural completion at the cap stays stop.
+        return torch.where(natural_eos, STOP_TOKEN, CONTINUE_TOKEN).to(torch.int64)
 
     def payload(self) -> dict[str, Any]:
         return {

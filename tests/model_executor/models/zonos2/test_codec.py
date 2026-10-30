@@ -136,6 +136,17 @@ def test_stage_async_terminal_frame_once_and_buffer_cleanup():
     assert "r" not in manager.code_prompt_token_ids
 
 
+@pytest.mark.parametrize("final", [False, True])
+def test_async_handoff_accepts_empty_eos_boundary(final):
+    manager = SimpleNamespace(code_prompt_token_ids=defaultdict(list), put_req_chunk=defaultdict(int))
+    request = SimpleNamespace(external_req_id="r", is_finished=lambda: False)
+    _, raw = delayed(16)
+    mm = {"codes": {"audio": raw}, "meta": {"eos_frame": torch.empty(0, dtype=torch.long)}}
+    payload = talker2dac_async_chunk(manager, mm, request, is_finished=final, new_token_ids=(0,) * len(raw))
+    assert payload.meta.num_processed_tokens == (len(raw) if final else 16)
+    assert torch.equal(payload.codes.audio, raw.T)
+
+
 def test_sync_handoff_keeps_raw_frames_without_arbitrary_edge_trim():
     _, raw = delayed(17)
     source = SimpleNamespace(

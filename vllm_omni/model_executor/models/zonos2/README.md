@@ -11,6 +11,12 @@ transport is separate from vLLM asynchronous scheduling. For a synchronous
 whole-request handoff, set `async_chunk: false` and connector
 `codec_streaming: false` in a deployment copy.
 
+The talker requires BF16 (`dtype: bfloat16` / `--dtype bfloat16`); FP16 and
+FP32 talker runs are rejected by the strict checkpoint dtype check. DAC stays
+FP32. After checkpoint validation, expert gate/up weights are repacked once
+into their existing parameter ownership; a second canonical GPU copy is not
+retained. CPU reference execution reads the same layout after packing.
+
 ## Optional dependencies and offline assets
 
 Install the model-specific packages into the vLLM-Omni environment:
@@ -89,6 +95,16 @@ is the output frame target and `meta.last_chunk` marks the codec terminal.
 These fields survive the framework's runtime metadata rewrite. The decoder
 keys overlap state by runner request ID, suppresses replayed chunks, and
 clears buffers/tails on finish, cancellation or codec failure.
+
+Snapshots replace the receiver's runtime information and let the decoder
+validate the cumulative prefix. They are materialized only on a codec chunk
+or terminal flush. This protocol retains cumulative copying; delta transport
+would require a coordinated change to the producer and decoder.
+
+Only natural codec EOS emits the lifecycle stop token. Budget exhaustion
+leaves a continue token for vLLM's length check, including an unfinished EOS
+delay countdown. Natural EOS exactly on the last allowed frame is accepted;
+a length-capped request still reports incomplete speech.
 
 CPU boundary/dependency tests live in `test_codec.py` and adapter tests in
 `test_zonos2_tts_adapter.py`. Component qualification replays fixed codes

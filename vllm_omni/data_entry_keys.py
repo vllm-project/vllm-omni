@@ -23,6 +23,10 @@ import torch
 FIRST_AUDIO_KEY = "_omni_first_audio"
 FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 
+# Constant-size snapshots of scheduler-owned lifecycle progress for model samplers.
+OUTPUT_TOKEN_COUNT_KEY = "_omni_output_token_count"
+LAST_OUTPUT_TOKEN_KEY = "_omni_last_output_token"
+
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 # Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry

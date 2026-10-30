@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.zonos2.zonos2_talker import (
     Zonos2RMSNorm,
     Zonos2RotaryEmbedding,
     Zonos2SpeakerLDAProjection,
+    Zonos2TalkerForConditionalGeneration,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -50,27 +51,52 @@ def _moe(topk):
     return module
 
 
-def test_expert_packing_keeps_canonical_parameters_and_nonpersistent_cache():
+def test_expert_packing_owns_one_storage_and_is_idempotent():
     moe = _moe(1)
     with torch.no_grad():
         for row, value in enumerate((11.0, 22.0, 33.0, 44.0)):
             moe.experts.w13[:, row].fill_(value)
-    canonical = moe.experts.w13.detach().clone()
     names = set(dict(moe.named_parameters()))
     moe.prepare_expert_weights()
-    packed = moe._packed_w13
+    packed = moe.experts.w13
     assert packed.is_contiguous()
-    assert torch.equal(moe.experts.w13, canonical)
     assert torch.equal(packed[:, 0], torch.full_like(packed[:, 0], 11))
     assert torch.equal(packed[:, 1], torch.full_like(packed[:, 1], 33))
     assert torch.equal(packed[:, 3072], torch.full_like(packed[:, 3072], 22))
     assert torch.equal(packed[:, 3073], torch.full_like(packed[:, 3073], 44))
     assert set(dict(moe.named_parameters())) == names
     assert "_packed_w13" not in moe.state_dict()
-    with torch.no_grad():
-        moe.experts.w13[:, 0].fill_(55)
     moe.prepare_expert_weights()
-    assert torch.equal(moe._packed_w13[:, 0], torch.full_like(packed[:, 0], 55))
+    assert moe.experts.w13.data_ptr() == packed.data_ptr()
+    assert torch.equal(moe.experts.w13[:, 0], torch.full_like(packed[:, 0], 11))
+
+
+def test_prepared_expert_weights_do_not_retain_a_second_storage():
+    moe = _moe(2)
+    inputs = torch.ones((2, 2))
+    expected, _ = moe(inputs, None)
+    moe.prepare_expert_weights()
+    packed = getattr(moe, "_packed_w13", None)
+    assert packed is None or packed.data_ptr() == moe.experts.w13.data_ptr()
+    actual, _ = moe(inputs, None)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_checkpoint_reload_restores_interleaved_order_before_repacking():
+    moe = _moe(2)
+    model = Zonos2TalkerForConditionalGeneration.__new__(Zonos2TalkerForConditionalGeneration)
+    nn.Module.__init__(model)
+    layer = nn.Module()
+    layer.feed_forward = moe
+    model.layers = nn.ModuleList([layer])
+    checkpoint = {name: value.detach().clone() for name, value in model.named_parameters()}
+    inputs = torch.ones((2, 2))
+    expected, _ = moe(inputs, None)
+    for _ in range(2):
+        assert model.load_weights(checkpoint.items()) == set(checkpoint)
+        actual, _ = moe(inputs, None)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert moe._expert_weights_packed
 
 
 @pytest.mark.parametrize("topk", [1, 2])

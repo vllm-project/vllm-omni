@@ -274,7 +274,7 @@ class Zonos2Adapter(ARTTSAdapter):
         budget = tts_params.get(TOKEN_BUDGET)
         if not isinstance(budget, int) or budget <= 0:
             return
-        if stage0_finish_reason == "length" or output_tokens >= budget:
+        if stage0_finish_reason == "length" or output_tokens > budget:
             raise TTSGenerationError(
                 f"ZONOS2 reached its codec-frame budget ({output_tokens}/{budget}); "
                 "the generated speech may be incomplete. Increase the budget or use a shorter input.",
@@ -307,6 +307,8 @@ class Zonos2Adapter(ARTTSAdapter):
                     "Cannot decode ZONOS2 reference audio; check the audio input and installed audio backend/ffmpeg"
                 ) from exc
             if self._speaker is None:
+                # No await between the check and lightweight construction on
+                # the serving loop. encode() serializes lazy loading internally.
                 self._speaker = Zonos2SpeakerEncoder()
             kwargs["speaker_embedding"] = await make_async(self._speaker.encode, executor=executor)(wav, sr)
             tts_params["ref_audio_cache_key"] = key

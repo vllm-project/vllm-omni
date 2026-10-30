@@ -13,8 +13,8 @@ Numerical backbone scope:
   * Attention runs on vLLM's PagedAttention (KV cache) with interleaved RoPE;
     QK RMSNorm / per-head temperature / headwise sigmoid gate are structurally
     present and get numerically validated in M2a.
-  * The sonic EDA router preserves canonical checkpoint parameters while
-    expert computation uses vLLM's fused MoE kernels.
+  * The sonic EDA router preserves checkpoint math; expert weights are
+    repacked once after loading for vLLM's fused MoE kernels.
   * Sampling is request-local with independent controls and reproducible
     replay from the complete nine-codebook history; lifecycle tokens carry
     continue/stop only, while multimodal output carries the codec frames.
@@ -31,6 +31,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -38,6 +39,7 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.utils import make_layers
 from vllm.v1.outputs import SamplerOutput
 
+from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.zonos2.configuration_zonos2 import Zonos2Config
 from vllm_omni.model_executor.models.zonos2.zonos2_keys import (
@@ -60,6 +62,8 @@ from vllm_omni.model_executor.models.zonos2.zonos2_sampler import (
     Zonos2SamplingParams,
     sample_frame,
 )
+
+logger = init_logger(__name__)
 
 
 class _WeightModule(nn.Module):
@@ -363,13 +367,18 @@ class Zonos2MoE(nn.Module):
         self.experts.w13 = nn.Parameter(torch.zeros(self.n_experts, 2 * 3072, config.dim))
         self.experts.w2 = nn.Parameter(torch.zeros(self.n_experts, config.dim, 3072))
         self.router = Zonos2SonicRouter(config, has_prev_state=layer_id > config.moe_start_from_layer)
-        # Keep canonical interleaved checkpoint parameters for L0 attestation.
-        # vLLM's fused kernel consumes contiguous gate/up halves instead.
-        self.register_buffer("_packed_w13", None, persistent=False)
+        # Checkpoint loading uses interleaved rows; after L0, the same parameter
+        # owns contiguous gate/up halves for both GPU and CPU computation.
+        self._expert_weights_packed = False
         self._experts_kernel: Zonos2TritonExperts | None = None
 
+    @torch.no_grad()
     def prepare_expert_weights(self) -> None:
-        self._packed_w13 = torch.cat([self.experts.w13[:, 0::2], self.experts.w13[:, 1::2]], dim=1).contiguous()
+        if self._expert_weights_packed:
+            return
+        self.experts.w13.data = torch.cat([self.experts.w13[:, 0::2], self.experts.w13[:, 1::2]], dim=1)
+        self._expert_weights_packed = True
+        self._experts_kernel = None
 
     def forward(self, x: torch.Tensor, prev_router_state: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
         expert_prob, state = self.router(x, prev_router_state)
@@ -380,13 +389,12 @@ class Zonos2MoE(nn.Module):
         weights = expert_prob.gather(-1, topk_idx)  # [T, k]
 
         if x.device.type != "cpu":
-            if self._packed_w13 is None:
-                self.prepare_expert_weights()
+            self.prepare_expert_weights()
             if self._experts_kernel is None:
-                self._experts_kernel = Zonos2TritonExperts.create(x, self._packed_w13, self.topk)
+                self._experts_kernel = Zonos2TritonExperts.create(x, self.experts.w13, self.topk)
             out = self._experts_kernel.forward(
                 x.contiguous(),
-                self._packed_w13,
+                self.experts.w13,
                 self.experts.w2,
                 weights.float().contiguous(),
                 topk_idx.int().contiguous(),
@@ -400,8 +408,9 @@ class Zonos2MoE(nn.Module):
             mask = (topk_idx == e).any(dim=-1)
             xe = x[mask]
             w13 = self.experts.w13[e]
-            gate = F.linear(xe, w13[0::2])
-            up = F.linear(xe, w13[1::2])
+            gate_weight, up_weight = w13.chunk(2) if self._expert_weights_packed else (w13[0::2], w13[1::2])
+            gate = F.linear(xe, gate_weight)
+            up = F.linear(xe, up_weight)
             activated = (F.silu(gate.float()) * up.float()).to(x.dtype)
             ye = F.linear(activated.float(), self.experts.w2[e].float())
             w = (weights[mask] * (topk_idx[mask] == e).float()).sum(dim=-1, keepdim=True)
@@ -598,9 +607,8 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
         if not isinstance(history, torch.Tensor):
             raise TypeError("ZONOS2 reconstruction needs full tensor code history")
         history = history.to(device=input_ids.device)
-        lifecycle_history = info.get("_omni_output_token_ids", ())
-        committed = len(lifecycle_history)
-        terminal = bool(committed and lifecycle_history[-1] == STOP_TOKEN) or committed >= params.max_tokens
+        committed = int(info[OUTPUT_TOKEN_COUNT_KEY])
+        terminal = info.get(LAST_OUTPUT_TOKEN_KEY) == STOP_TOKEN or committed >= params.max_tokens
         if committed > len(history):
             raise ValueError("Cannot reconstruct nine-codebook history from lifecycle token ids alone")
         history = history[:committed]
@@ -803,7 +811,9 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
                     continue  # partial replay/prefill must not emit or consume RNG
                 state = self._request_states[key]
                 if info.get(TERMINAL):
-                    lifecycle[index, 0] = STOP_TOKEN
+                    lifecycle[index, 0] = torch.where(
+                        (state.eos_frame >= 0) & (state.countdown == 0), STOP_TOKEN, CONTINUE_TOKEN
+                    )
                     if self._step_payload is not None:
                         self._step_payload["meta"]["eos_frame"][index] = state.eos_frame.reshape(1)
                         self._step_payload["meta"]["is_final"][index] = state.stopped.reshape(1)
@@ -880,6 +890,11 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
         loaded model must never reach the forward pass.
         """
         params = dict(self.named_parameters())
+        for layer in self.layers:
+            if isinstance(layer.feed_forward, Zonos2MoE):
+                # A reload writes checkpoint order into the existing storage.
+                layer.feed_forward._expert_weights_packed = False
+                layer.feed_forward._experts_kernel = None
         loaded: set[str] = set()
         skipped: list[str] = []
         duplicates: list[str] = []
@@ -913,5 +928,5 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
         for layer in self.layers:
             if isinstance(layer.feed_forward, Zonos2MoE):
                 layer.feed_forward.prepare_expert_weights()
-        print(f"[Zonos2] load_weights L0 OK: consumed={len(loaded)} tensors, no residue", flush=True)
+        logger.info("ZONOS2 L0 complete: consumed %d tensors, no residue", len(loaded))
         return loaded

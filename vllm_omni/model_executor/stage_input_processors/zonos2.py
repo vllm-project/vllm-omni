@@ -27,13 +27,15 @@ def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
     return shear(audio_codes_qt.T, up=True)[: max(0, audio_codes_qt.shape[1] - 8)].T.contiguous()
 
 
-def _target(frames: torch.Tensor, meta: dict, final: bool) -> int:
+def _eos_frame(meta: dict) -> int | None:
     eos = meta.get("eos_frame")
     if isinstance(eos, torch.Tensor):
         eos = int(eos.reshape(-1)[-1]) if eos.numel() else -1
-    if eos is None:
-        eos = eos_boundary(frames)
-    target = len(frames) if final else max(0, len(frames) - 8)
+    return int(eos) if eos is not None else None
+
+
+def _target(frame_count: int, eos: int | None, final: bool) -> int:
+    target = frame_count if final else max(0, frame_count - 8)
     return min(target, max(0, int(eos))) if eos is not None and int(eos) >= 0 else target
 
 
@@ -47,12 +49,15 @@ def talker2dac(source_outputs: list[Any], prompt: Any = None, _requires_multimod
         mm = source.outputs[0].multimodal_output or {}
         audio = mm.get("codes", {}).get("audio")
         frames = _frames(audio) if isinstance(audio, torch.Tensor) else torch.empty((0, 9), dtype=torch.long)
+        eos = _eos_frame(mm.get("meta", {}))
+        if eos is None:
+            eos = eos_boundary(frames)
         inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0],
                 additional_information={
                     "codes": {"audio": frames.T.contiguous()},
-                    TARGET_FRAMES: _target(frames, mm.get("meta", {}), True),
+                    TARGET_FRAMES: _target(len(frames), eos, True),
                     "meta": {"finished": True, "chunk_seq": 0},
                 },
             )
@@ -79,19 +84,20 @@ def talker2dac_async_chunk(
         if len(frames) != len(new_token_ids):
             raise ValueError("ZONOS2 step frame/token count mismatch")
         buffer.extend(frames.unbind(0))
-    meta = mm.get("meta", {})
-    boundary = meta.get("eos_frame")
-    if boundary is not None:
-        boundary = int(boundary.reshape(-1)[-1]) if isinstance(boundary, torch.Tensor) else int(boundary)
-        target = len(buffer) if final else max(0, len(buffer) - 8)
-        if boundary >= 0:
-            target = min(target, boundary)
-        if not final and (target < 16 or target % 16 != 0):
-            return None
-    frames = torch.stack(buffer) if buffer else torch.empty((0, 9), dtype=torch.long)
-    target = _target(frames, meta, final)
+    eos = _eos_frame(mm.get("meta", {}))
+    frames = None
+    if eos is None:
+        # Legacy producers omit EOS metadata; their raw frames remain the oracle.
+        frames = torch.stack(buffer) if buffer else torch.empty((0, 9), dtype=torch.long)
+        eos = eos_boundary(frames)
+    target = _target(len(buffer), eos, final)
     if not final and (target < 16 or target % 16 != 0):
         return None
+    if frames is None:
+        frames = torch.stack(buffer) if buffer else torch.empty((0, 9), dtype=torch.long)
+    # The receiver replaces runtime information and DACStreamDecoder validates
+    # cumulative prefixes. Send an owned full snapshot on emission/flush only;
+    # changing to deltas requires a matching decoder/transport contract change.
     payload = OmniPayloadStruct(
         codes=CodesStruct(audio=frames.T.contiguous()),
         meta=MetaStruct(
