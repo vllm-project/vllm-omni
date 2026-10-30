@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Resolve the MiniCPM-o three-stage duplex MRv2 deployment contract."""
+"""Resolve the MiniCPM-o default V1 and opt-in V2 duplex deployment contracts."""
 
 import pytest
 
@@ -26,7 +26,7 @@ def _resolve_cuda_stages(monkeypatch, filename):
 
 
 @pytest.mark.parametrize("filename,use_v2", [("minicpmo_4_5.yaml", False), (_DEPLOY, True)])
-def test_duplex_mrv2_cuda_profile(monkeypatch, filename, use_v2) -> None:
+def test_duplex_cuda_runner_selection(monkeypatch, filename, use_v2) -> None:
     config, stages = _resolve_cuda_stages(monkeypatch, filename)
     assert config.session_mode == "duplex"
     # All three stages follow the default or explicit opt-in runner.
@@ -44,7 +44,7 @@ def test_duplex_mrv2_cuda_profile(monkeypatch, filename, use_v2) -> None:
 
 @pytest.mark.parametrize("filename", ["minicpmo_4_5.yaml", _DEPLOY])
 @pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
-def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform, filename) -> None:
+def test_duplex_profiles_keep_non_cuda_on_v1(monkeypatch, platform, filename) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(filename)), platform=platform)
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
