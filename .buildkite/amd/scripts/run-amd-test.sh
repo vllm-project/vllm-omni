@@ -48,6 +48,19 @@ mkdir -p "${TMPDIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}" \
     "${VLLM_CACHE_ROOT}" "${XDG_CACHE_HOME}" "${HF_HOME}" \
     "${HF_DATASETS_CACHE}"
 
+# s3tokenizer (the CosyVoice3 speech tokenizer) downloads a ~925 MiB ONNX
+# checkpoint from modelscope.cn into "${XDG_CACHE_HOME}/s3tokenizer". The
+# job-local XDG cache above is discarded with the pod, so every CosyVoice3
+# job would pay that download during engine startup and, on a slow mirror,
+# exceed --stage-init-timeout. Keep the s3tokenizer cache on the persistent
+# Hugging Face volume instead so it is fetched once per node.
+S3TOKENIZER_CACHE_DIR="${HF_HOME}/s3tokenizer"
+mkdir -p "${S3TOKENIZER_CACHE_DIR}"
+if [[ -e "${XDG_CACHE_HOME}/s3tokenizer" && ! -L "${XDG_CACHE_HOME}/s3tokenizer" ]]; then
+    rm -rf "${XDG_CACHE_HOME}/s3tokenizer"
+fi
+ln -sfn "${S3TOKENIZER_CACHE_DIR}" "${XDG_CACHE_HOME}/s3tokenizer"
+
 if [[ "${VLLM_CI_REQUIRE_PERSISTENT_HF_CACHE:-0}" == "1" ]]; then
     if ! command -v findmnt >/dev/null 2>&1; then
         echo "Error: findmnt is required to verify the Hugging Face cache mount." >&2

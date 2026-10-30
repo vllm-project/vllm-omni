@@ -26,6 +26,7 @@ AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scrip
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
+S3TOKENIZER_PREFETCH = "python3 .buildkite/amd/scripts/prefetch_s3tokenizer.py"
 CUDA_MERGE_PIPELINE = Path(".buildkite/cuda/test-merge.yml")
 CUDA_READY_PIPELINE = Path(".buildkite/cuda/test-ready.yml")
 AR_PAGED_ATTENTION_LABEL = "ROCm · AR Diffusion Paged Attention GPU Test"
@@ -1087,12 +1088,25 @@ def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
     assert AITER_MHA_CACHE_PREPARE not in blocking["commands"]
 
 
+def _assert_prefetches_s3tokenizer_before_pytest(step: dict) -> None:
+    """CosyVoice3 jobs must download the s3tokenizer checkpoint before serving.
+
+    The ~925 MiB download otherwise runs inside the engine's stage-init
+    deadline and times the server out whenever the modelscope mirror is slow.
+    """
+    commands = step["commands"]
+    assert S3TOKENIZER_PREFETCH in commands
+    first_pytest = next(index for index, command in enumerate(commands) if "pytest" in split(command))
+    assert commands.index(S3TOKENIZER_PREFETCH) < first_pytest
+
+
 def test_cosyvoice_ready_smoke_uses_sdpa() -> None:
     step = _find_step("CosyVoice3-TTS E2E Smoke (SDPA)", AMD_READY_PIPELINE)
 
     assert step["grade"] == "Blocking"
     assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
     assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in step["commands"]
+    _assert_prefetches_s3tokenizer_before_pytest(step)
 
     pytest_command = next(command for command in step["commands"] if "pytest" in command)
     assert "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py::test_voice_clone_zh_002" in pytest_command
@@ -1105,10 +1119,22 @@ def test_cosyvoice_full_default_backend_suite_runs_nightly() -> None:
     assert step["timeout_in_minutes"] == 90
     assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
     assert all("DIFFUSION_ATTENTION_BACKEND" not in command for command in step["commands"])
+    _assert_prefetches_s3tokenizer_before_pytest(step)
 
     pytest_command = next(command for command in step["commands"] if "pytest" in command)
     assert "tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py" in pytest_command
     assert "::" not in pytest_command
+
+
+def test_amd_runner_keeps_s3tokenizer_cache_on_persistent_volume() -> None:
+    runner = AMD_RUNNER.read_text(encoding="utf-8")
+
+    # The job-local XDG cache is discarded with the pod; s3tokenizer must
+    # resolve its default cache dir to the persistent Hugging Face volume.
+    assert 'S3TOKENIZER_CACHE_DIR="${HF_HOME}/s3tokenizer"' in runner
+    assert 'ln -sfn "${S3TOKENIZER_CACHE_DIR}" "${XDG_CACHE_HOME}/s3tokenizer"' in runner
+    assert runner.index('XDG_CACHE_HOME="${native_cache_root}/xdg"') < runner.index("S3TOKENIZER_CACHE_DIR=")
+    assert runner.index("S3TOKENIZER_CACHE_DIR=") < runner.index("Commands:")
 
 
 def test_amd_template_preserves_step_retry_policy() -> None:
@@ -1328,6 +1354,7 @@ def test_cosyvoice_offline_zero_shot_runs_nightly_on_rocm() -> None:
         assert argv[argv.index("-m") + 1] == markers
         assert argv[argv.index("--run-level") + 1] == "full_model"
     assert "--junitxml=/tmp/cosyvoice3-offline-pytest.xml" in split(run_command)
+    _assert_prefetches_s3tokenizer_before_pytest(step)
 
     commands = "\n".join(step["commands"])
     assert "DIFFUSION_ATTENTION_BACKEND" not in commands
