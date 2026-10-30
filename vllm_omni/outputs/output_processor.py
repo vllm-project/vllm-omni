@@ -114,20 +114,46 @@ def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
     return metrics
 
 
+def _is_mirror(value: object, mm_value: object) -> bool:
+    """Whether a pooling entry repeats the ``mm_output`` entry under its key.
+
+    Compared by value: the two channels are decoded separately on the way
+    from the engine core, so a mirrored tensor is never the same object here.
+    """
+    if isinstance(value, torch.Tensor) or isinstance(mm_value, torch.Tensor):
+        return (
+            isinstance(value, torch.Tensor)
+            and isinstance(mm_value, torch.Tensor)
+            and value.dtype == mm_value.dtype
+            and value.shape == mm_value.shape
+            and value.device == mm_value.device
+            and torch.equal(value, mm_value)
+        )
+    try:
+        return bool(value == mm_value)
+    except (RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _pooling_keys_not_in(
     pooling_output: torch.Tensor | dict[str, Any], mm_output: object
 ) -> torch.Tensor | dict[str, Any] | None:
-    """Drop pooling-payload entries already carried by ``mm_output``.
+    """Drop pooling-payload entries that mirror ``mm_output``.
 
     The MR v2 AR runner's full-payload fallback publishes one per-request
     payload on both channels; accumulating both concatenates every tensor
-    with itself. V1 never sets both, so this only trims the V2 mirror.
+    with itself. Only entries equal to the ``mm_output`` entry under the same
+    key are dropped, and the rest keeps the nested layout of the input, so V1
+    (which never sets both) and distinct same-key values are unchanged.
     """
     if not isinstance(pooling_output, dict) or not isinstance(mm_output, dict):
         return pooling_output
-    present = flatten_payload(mm_output).keys()
-    rest = {k: v for k, v in flatten_payload(pooling_output).items() if k not in present}
-    return rest or None
+    flat_mm = flatten_payload(mm_output)
+    flat = flatten_payload(pooling_output)
+    rest = {k: v for k, v in flat.items() if k not in flat_mm or not _is_mirror(v, flat_mm[k])}
+    if len(rest) == len(flat):
+        return pooling_output
+    return unflatten_payload(rest) if rest else None
 
 
 class OmniRequestState(RequestState):
