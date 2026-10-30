@@ -141,21 +141,30 @@ class KokoroForConditionalGeneration(nn.Module):
         # One [1, 2 * style_dim] style vector per chunk length, so a pack needs
         # a row for every length up to MAX_PHONEMES.
         row_shape = (1, 2 * self.config.style_dim)
+        # Cast to the network's dtype; a no-op for the fp32 checkpoint.
+        dtype = next(self.network.parameters()).dtype
         self._voicepacks = {}
         for voice in list_voices(voices_dir):
-            pack = torch.load(os.path.join(voices_dir, f"{voice}.pt"), map_location="cpu", weights_only=True)
+            path = os.path.join(voices_dir, f"{voice}.pt")
+            try:
+                pack = torch.load(path, map_location="cpu", weights_only=True)
+            except Exception as exc:
+                # A truncated download, or a pickle weights_only rejects: name the file.
+                raise ValueError(f"Kokoro voice pack {voice!r} at {path} could not be loaded: {exc}") from exc
             valid = (
                 isinstance(pack, torch.Tensor)
+                and pack.is_floating_point()
                 and pack.ndim == 3
                 and pack.shape[0] >= MAX_PHONEMES
                 and tuple(pack.shape[1:]) == row_shape
             )
             if not valid:
-                found = tuple(pack.shape) if isinstance(pack, torch.Tensor) else type(pack).__name__
+                found = f"{pack.dtype} {tuple(pack.shape)}" if isinstance(pack, torch.Tensor) else type(pack).__name__
                 raise ValueError(
-                    f"Kokoro voice pack {voice!r} is {found}; expected shape ({MAX_PHONEMES}+, 1, {row_shape[1]})"
+                    f"Kokoro voice pack {voice!r} is {found}; expected a floating-point tensor of shape "
+                    f"({MAX_PHONEMES}+, 1, {row_shape[1]})"
                 )
-            self._voicepacks[voice] = pack.to(self._device)
+            self._voicepacks[voice] = pack.to(device=self._device, dtype=dtype)
         if not self._voicepacks:
             raise ValueError(f"Kokoro checkpoint has no voices/*.pt packs in {voices_dir}")
         return {f"network.{n}" for n, _ in self.network.named_parameters()}

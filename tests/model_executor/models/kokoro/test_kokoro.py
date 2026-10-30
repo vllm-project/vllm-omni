@@ -279,14 +279,34 @@ def test_load_weights_preloads_every_voice_and_rejects_other_names(network: Koko
 
 @pytest.mark.parametrize(
     "bad_pack",
-    [torch.randn(10, 1, 256), torch.randn(MAX_PHONEMES, 1, 128), torch.randn(MAX_PHONEMES, 256), {"pack": 1}],
-    ids=["too-few-rows", "wrong-style-dim", "wrong-rank", "not-a-tensor"],
+    [
+        torch.randn(10, 1, 256),
+        torch.randn(MAX_PHONEMES, 1, 128),
+        torch.randn(MAX_PHONEMES, 256),
+        {"pack": 1},
+        torch.zeros(MAX_PHONEMES, 1, 256, dtype=torch.int64),
+    ],
+    ids=["too-few-rows", "wrong-style-dim", "wrong-rank", "not-a-tensor", "not-floating-point"],
 )
 def test_load_weights_rejects_malformed_voice_pack(network: KokoroNetwork, tmp_path: Path, bad_pack) -> None:
     model = _bare_model(_config(), _checkpoint_dir(tmp_path))
     torch.save(bad_pack, tmp_path / "voices" / "af_bad.pt")
     with pytest.raises(ValueError, match="voice pack 'af_bad'"):
         model.load_weights(iter(_reference_layout_checkpoint(network).items()))
+
+
+def test_load_weights_names_an_unreadable_voice_pack(network: KokoroNetwork, tmp_path: Path) -> None:
+    model = _bare_model(_config(), _checkpoint_dir(tmp_path))
+    (tmp_path / "voices" / "af_bad.pt").write_bytes(b"truncated download")
+    with pytest.raises(ValueError, match=r"voice pack 'af_bad' at .*af_bad\.pt could not be loaded"):
+        model.load_weights(iter(_reference_layout_checkpoint(network).items()))
+
+
+def test_load_weights_casts_voice_packs_to_the_network_dtype(network: KokoroNetwork, tmp_path: Path) -> None:
+    model = _bare_model(_config(), _checkpoint_dir(tmp_path, voices=()))
+    torch.save(torch.randn(MAX_PHONEMES, 1, 256, dtype=torch.float64), tmp_path / "voices" / "af_heart.pt")
+    model.load_weights(iter(_reference_layout_checkpoint(network).items()))
+    assert model._voicepacks["af_heart"].dtype == next(model.network.parameters()).dtype
 
 
 def test_load_weights_rejects_checkpoint_without_voices(network: KokoroNetwork, tmp_path: Path) -> None:
