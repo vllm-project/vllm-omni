@@ -28,6 +28,7 @@ def _start_image() -> Image.Image:
 
 @pytest.mark.slow
 @pytest.mark.diffusion
+@pytest.mark.full_model
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
 @pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
 def test_image_to_video_camera_001(omni_runner_handler: OmniRunnerHandler):
