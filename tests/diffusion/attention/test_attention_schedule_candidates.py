@@ -18,6 +18,7 @@ import torch.nn as nn
 
 import vllm_omni.diffusion.attention.layer as layer_mod
 from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
 from vllm_omni.diffusion.attention.capabilities import AttentionComputation
 from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -205,6 +206,38 @@ def test_candidate_with_the_baseline_identity_reuses_the_baseline_impl(attention
     assert layer._schedule_candidates["auto"].impl is not layer.attention
     # Its own calibration is stamped onto its own impl, so it never shares the baseline's.
     assert layer._schedule_candidates["calibrated"].impl is not layer.attention
+
+
+def test_reused_baseline_impl_keeps_its_kwargs_and_fallback_calibration_after_stamping(attention_env):
+    """Preparing and stamping candidates leaves the shared baseline impl as the baseline configured it.
+
+    ``skip_calibration={}`` canonicalizes like ``None`` and stamping treats both as "no curve of its
+    own", so that profile reuses the baseline impl too. Stamping writes the fallback curve onto the
+    shared impl once; a candidate with its own curve is stamped on its own impl.
+    """
+    schedule = AttentionScheduleConfig(
+        profiles={
+            "same": AttentionConfig(default=AttentionSpec(backend="SDPA")),
+            "empty": AttentionConfig(default=AttentionSpec(backend="SDPA", skip_calibration={})),
+            "calibrated": AttentionConfig(default=AttentionSpec(backend="SDPA", skip_calibration={"a": 2.0, "b": 3.0})),
+        },
+        default=[{"start": 0, "end": None, "profile": "same"}],
+    )
+    layer = attention_env.build(
+        _make_config(baseline=AttentionConfig(default=AttentionSpec(backend="SDPA")), schedule=schedule)
+    )
+    baseline = layer.attention
+    kwargs_before = dict(baseline.kwargs)
+
+    assert layer._schedule_candidates["same"].impl is baseline
+    assert layer._schedule_candidates["empty"].impl is baseline
+
+    stamped = apply_to_pipeline(nn.ModuleDict({"attn": layer}), {"a": 0.5, "b": 1.0})
+
+    assert stamped == 2  # the shared baseline impl once, the calibrated candidate once
+    assert baseline.kwargs == kwargs_before
+    assert baseline.calibration == (0.5, 1.0)
+    assert layer._schedule_candidates["calibrated"].impl.calibration == (2.0, 3.0)
 
 
 def test_candidates_are_built_with_the_baseline_impl_arguments(attention_env):
