@@ -20,6 +20,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -30,6 +31,7 @@ from vllm_omni.diffusion.forward_context import (
     begin_scheduled_denoise,
     clear_scheduled_denoise_step_on_exit,
 )
+from vllm_omni.diffusion.graph import build_denoise_graph_runner
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -661,6 +663,17 @@ class Wan22Pipeline(
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
+        self._denoise_graph_runner = self._build_denoise_graph_runner(od_config)
+
+    def _build_denoise_graph_runner(self, od_config: OmniDiffusionConfig) -> GraphedForward | None:
+        return build_denoise_graph_runner(
+            od_config,
+            self._denoise_graph_forward,
+            "Wan DiT",
+            refusal=None
+            if type(self) is Wan22Pipeline
+            else f"{type(self).__name__} is not validated with denoise graphs",
         )
 
     def _create_transformer(self, config: dict, component: str = "transformer") -> WanTransformer3DModel:
@@ -1594,8 +1607,15 @@ class Wan22Pipeline(
         """
         if current_model is None:
             current_model = self.transformer
+        if getattr(self, "_denoise_graph_runner", None) is not None:
+            # By name: the graph keys on primitive values, and each expert gets its own graph.
+            component = "transformer_2" if current_model is self.transformer_2 else "transformer"
+            return self._denoise_graph_runner(component=component, **kwargs)
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
+
+    def _denoise_graph_forward(self, component: str, **kwargs: Any) -> torch.Tensor:
+        return getattr(self, component)(**kwargs)[0]
 
     def encode_prompt(
         self,
