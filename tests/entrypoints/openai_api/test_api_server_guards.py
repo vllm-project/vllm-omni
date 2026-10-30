@@ -79,6 +79,21 @@ class _FakeVllmConfig:
     parallel_config: _FakeParallelConfig
 
 
+@dataclass
+class _FakeHFConfig:
+    model_type: str
+
+
+@dataclass
+class _FakeChatModelConfig:
+    hf_config: _FakeHFConfig
+
+
+@dataclass
+class _FakeServingChat:
+    model_config: _FakeChatModelConfig
+
+
 def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
     args = _minimal_args(_omni_stage_client_configs=[{"stage_addresses": {}}])
     death_signal = mocker.patch.object(api_server, "set_death_signal")
@@ -108,9 +123,7 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, model_
     monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
 
     async def fake_init_app_state(_engine, state, _args):
-        state.openai_serving_chat = SimpleNamespace(
-            model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
-        )
+        state.openai_serving_chat = _FakeServingChat(_FakeChatModelConfig(_FakeHFConfig(model_type)))
 
     monkeypatch.setattr(api_server, "omni_init_app_state", fake_init_app_state)
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)

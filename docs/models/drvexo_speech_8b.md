@@ -152,6 +152,19 @@ checks ran at `67072af55a6af930de24d2d7c8cd06f0e1504f87`. Later Codec changes
 affect only quantized reference validation; explicit BF16 load dtype equals the previous resolved default.
 Servers, suites and the final managed launcher retained actual zero exits.
 
+The review follow-up passed 713 CPU tests and 24 subtests (one skipped).
+A matching runtime-code BF16 run at `bd6c164d02d161100b7dc613e02031cc59272352`
+passed 22/22 serving checks: the existing 20 above plus audio-input text-stream
+disconnect and subsequent-chat recovery. The NDJSON chat case explicitly used
+`n: null`; all five unauthenticated route probes returned 401. The server,
+suite, managed main, `systemd-run` and outer launcher retained actual zero
+exits, with an empty original cgroup and no experiment GPU residue. This run
+used the complete BF16 deploy YAML, synchronous eager execution and the same
+local component bundles. FP8/NVFP4 were not rerun after this review follow-up;
+their earlier evidence remains separate. The two-chunk runner regression also
+exercises cached scheduler offsets and batch reordering in both async-flag
+modes on CPU; async GPU scheduling and speculative decoding remain unvalidated.
+
 The environment used Torch 2.13.0+cu130, Transformers 5.16.1, FlashInfer
 0.7.0.post1, Humming-kernels 0.1.17 and CUTLASS DSL 4.8.0. Installed Omni dev
 metadata still produces a version warning; identify code by its source commit.

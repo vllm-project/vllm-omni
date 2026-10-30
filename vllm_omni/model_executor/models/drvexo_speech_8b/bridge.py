@@ -55,6 +55,7 @@ def condition_spans(bridge, hidden, memories, spans):
     """Condition each packed request only on its own language memory."""
     if len(memories) != len(spans):
         raise ValueError("Bridge request count does not match token spans")
+    # Span replacement must not mutate the parent's original packed hidden states.
     output = hidden.clone()
     previous_end = 0
     for memory, (start, end) in zip(memories, spans):
