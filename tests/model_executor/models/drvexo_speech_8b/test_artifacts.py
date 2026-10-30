@@ -9,8 +9,8 @@ import shutil
 import tempfile
 import unittest
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -24,6 +24,40 @@ from vllm_omni.model_executor.models.drvexo_speech_8b.artifacts import resolve_a
 from vllm_omni.model_executor.models.drvexo_speech_8b.processing import DRVEXOProcessingInfo
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class _ThinkerConfig:
+    audio_feature_dim: int
+    hidden_size: int
+    connector_checkpoint: str
+    audio_encoder_path: str
+    audio_encoder_config: dict
+
+
+@dataclass
+class _VllmConfig:
+    model_config: object
+
+
+@dataclass
+class _TalkerConfig:
+    drvexo_output_conditioning: str
+    drvexo_source_tokenizer: str
+    drvexo_connector_checkpoint: str
+    drvexo_speaker_embedding: str
+    drvexo_bridge_layers: list
+
+
+@dataclass
+class _TalkerShape:
+    hidden_size: int
+
+
+@dataclass
+class _ModelConfig:
+    model: str
+    hf_config: object
 
 
 @contextmanager
@@ -93,14 +127,14 @@ class ArtifactRelocationTest(unittest.TestCase):
             self.assertFalse(original.exists())
             unrelated = parent / "unrelated-cwd"
             unrelated.mkdir()
-            config = SimpleNamespace(
+            config = _ThinkerConfig(
                 audio_feature_dim=4,
                 hidden_size=8,
                 connector_checkpoint="assets/connectors.json",
                 audio_encoder_path="audio_encoder",
                 audio_encoder_config={},
             )
-            vllm_config = SimpleNamespace(model_config=SimpleNamespace(model=str(moved), hf_config=config))
+            vllm_config = _VllmConfig(model_config=_ModelConfig(model=str(moved), hf_config=config))
 
             def base_init(instance, **kwargs):
                 nn.Module.__init__(instance)
@@ -119,23 +153,23 @@ class ArtifactRelocationTest(unittest.TestCase):
                 self.assertEqual(loaded, {k for k in state if k.startswith("input_projector.")})
                 for name, value in model.input_projector.state_dict().items():
                     torch.testing.assert_close(value, state["input_projector." + name], rtol=0, atol=0)
-                info = DRVEXOProcessingInfo(SimpleNamespace(model_config=vllm_config.model_config))
+                info = DRVEXOProcessingInfo(_VllmConfig(model_config=vllm_config.model_config))
                 self.assertEqual(info.feature_extractor.feature_size, 128)
 
-            tts_config = SimpleNamespace(
+            tts_config = _TalkerConfig(
                 drvexo_output_conditioning="generated_tokens",
                 drvexo_source_tokenizer="..",
                 drvexo_connector_checkpoint="../assets/connectors.json",
                 drvexo_speaker_embedding="../assets/speaker.json",
                 drvexo_bridge_layers=[],
             )
-            tts_vllm = SimpleNamespace(model_config=SimpleNamespace(model=str(moved / "talker"), hf_config=tts_config))
+            tts_vllm = _VllmConfig(model_config=_ModelConfig(model=str(moved / "talker"), hf_config=tts_config))
 
             def tts_base_init(instance, **kwargs):
                 nn.Module.__init__(instance)
                 instance.model = nn.Module()
                 instance.model.layers = nn.ModuleList()
-                instance.talker_config = SimpleNamespace(hidden_size=4)
+                instance.talker_config = _TalkerShape(hidden_size=4)
                 instance.gpu_resident_buffer_keys = set()
 
             with (

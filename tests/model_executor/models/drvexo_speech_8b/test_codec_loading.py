@@ -6,8 +6,8 @@
 import hashlib
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -17,6 +17,27 @@ from vllm_omni.model_executor.models.drvexo_speech_8b import code2wav
 from vllm_omni.model_executor.models.drvexo_speech_8b.artifacts import resolve_codec_quantization
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class _VllmConfig:
+    model_config: object
+
+
+@dataclass
+class _ModelConfig:
+    model: str
+    hf_config: object
+
+
+@dataclass
+class _ModelConfig2:
+    hf_config: object
+
+
+@dataclass
+class _CodecConfig:
+    drvexo_codec_compute_dtype: str
 
 
 class CodecLoadingTests(unittest.TestCase):
@@ -35,10 +56,8 @@ class CodecLoadingTests(unittest.TestCase):
             events.append(("load", instance.decoder.weight.dtype))
             return {"decoder.weight", "decoder.bias"}
 
-        config = SimpleNamespace(
-            model_config=SimpleNamespace(
-                model="unused", hf_config=SimpleNamespace(drvexo_codec_compute_dtype="bfloat16")
-            )
+        config = _VllmConfig(
+            model_config=_ModelConfig(model="unused", hf_config=_CodecConfig(drvexo_codec_compute_dtype="bfloat16"))
         )
         with (
             patch.object(code2wav.Qwen3TTSCode2Wav, "__init__", initialize),
@@ -51,9 +70,7 @@ class CodecLoadingTests(unittest.TestCase):
                 model.load_weights(iter(()))
 
     def test_invalid_dtype_fails_before_parent_constructor(self):
-        config = SimpleNamespace(
-            model_config=SimpleNamespace(hf_config=SimpleNamespace(drvexo_codec_compute_dtype="fp4"))
-        )
+        config = _VllmConfig(model_config=_ModelConfig2(hf_config=_CodecConfig(drvexo_codec_compute_dtype="fp4")))
         with patch.object(code2wav.Qwen3TTSCode2Wav, "__init__") as parent:
             with self.assertRaises(ValueError):
                 code2wav.DRVEXOSpeech8BCode2Wav(vllm_config=config)

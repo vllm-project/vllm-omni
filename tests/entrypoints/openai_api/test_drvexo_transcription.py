@@ -7,7 +7,8 @@ import asyncio
 import copy
 import json
 import unittest
-from types import SimpleNamespace
+from collections.abc import Callable
+from dataclasses import dataclass
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
@@ -24,10 +25,52 @@ AUDIO = {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@dataclass
+class _Renderer:
+    get_tokenizer: Callable
+
+
+@dataclass
+class _Engine:
+    default_sampling_params_list: list
+    output_modalities: list
+    abort: AsyncMock
+    calls: list
+    generate: Callable | None = None
+
+
+@dataclass
+class _ServingModelConfig:
+    hf_config: object
+
+
+@dataclass
+class _MediaConnector:
+    fetch_audio_async: Callable
+
+
+@dataclass
+class _TextOutput:
+    error: object
+    outputs: list
+
+
+@dataclass
+class _HFConfig:
+    model_type: str
+
+
+@dataclass
+class _Completion:
+    text: str
+    finish_reason: str
+    token_ids: list[int]
+
+
 class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.fetch = AsyncMock(return_value=(np.ones(16), 16000))
-        patcher = patch.object(module, "MediaConnector", return_value=SimpleNamespace(fetch_audio_async=self.fetch))
+        patcher = patch.object(module, "MediaConnector", return_value=_MediaConnector(fetch_audio_async=self.fetch))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -42,11 +85,11 @@ class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
         handler = object.__new__(OmniOpenAIServingChat)
         handler.chat_template = None
         handler.chat_template_content_format = "auto"
-        handler.renderer = SimpleNamespace(get_tokenizer=lambda: object())
+        handler.renderer = _Renderer(get_tokenizer=lambda: object())
         handler._preprocess_chat = AsyncMock(
             return_value=([], [{"prompt_token_ids": [1, 2], "multi_modal_data": {"audio": [(np.ones(16), 16000)]}}])
         )
-        engine = SimpleNamespace(
+        engine = _Engine(
             default_sampling_params_list=[SamplingParams(max_tokens=2)],
             output_modalities=["text"],
             abort=AsyncMock(),
@@ -55,9 +98,7 @@ class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
 
         async def generate(**kw):
             engine.calls.append(kw)
-            yield SimpleNamespace(
-                error=None, outputs=[SimpleNamespace(text="你好。", finish_reason="stop", token_ids=[3, 4])]
-            )
+            yield _TextOutput(error=None, outputs=[_Completion(text="你好。", finish_reason="stop", token_ids=[3, 4])])
 
         engine.generate = generate
         handler.engine_client = engine
@@ -112,9 +153,7 @@ class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
             handler, engine, req = self.make()
 
             async def generate(**kw):
-                yield SimpleNamespace(
-                    error=error, outputs=[SimpleNamespace(text=text, finish_reason=reason, token_ids=[])]
-                )
+                yield _TextOutput(error=error, outputs=[_Completion(text=text, finish_reason=reason, token_ids=[])])
 
             engine.generate = generate
             with self.assertRaises(exception):
@@ -146,7 +185,7 @@ class TranscriptionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_chat_rejects_legacy_interception_before_generation(self):
         handler, engine, req = self.make(decision_head_enabled=True, modalities=["text"])
-        handler.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="drvexo_speech_8b"))
+        handler.model_config = _ServingModelConfig(hf_config=_HFConfig(model_type="drvexo_speech_8b"))
         response = await handler._create_chat_completion(req)
         self.assertEqual(response.error.code, 400)
         self.assertEqual(len(engine.calls), 0)

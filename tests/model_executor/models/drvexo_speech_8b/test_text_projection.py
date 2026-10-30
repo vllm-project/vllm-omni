@@ -6,8 +6,8 @@
 import hashlib
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +19,38 @@ from vllm_omni.model_executor.models.drvexo_speech_8b import talker, text_projec
 from vllm_omni.model_executor.models.drvexo_speech_8b.artifacts import resolve_text_projection_quantization
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class _TalkerConfig:
+    drvexo_output_conditioning: str
+    drvexo_text_projection_quantization: object
+    drvexo_connector_checkpoint: str
+    drvexo_speaker_embedding: str
+    drvexo_bridge_layers: list
+
+
+@dataclass
+class _VllmConfig:
+    model_config: object
+
+
+@dataclass
+class _TalkerConfig2:
+    text_hidden_size: int
+    hidden_size: int
+    hidden_act: str
+
+
+@dataclass
+class _PromptBuilder:
+    _text_projection: object
+
+
+@dataclass
+class _ModelConfig:
+    model: str
+    hf_config: object
 
 
 class TextProjectionTests(unittest.TestCase):
@@ -75,20 +107,20 @@ class TextProjectionTests(unittest.TestCase):
                 list(text_projection.without_source_projection(iter(rows), self.source))
 
     def test_constructor_replaces_prompt_builder_reference(self):
-        config = SimpleNamespace(
+        config = _TalkerConfig(
             drvexo_output_conditioning="generated_tokens",
             drvexo_text_projection_quantization=self.spec,
             drvexo_connector_checkpoint="connectors.pt",
             drvexo_speaker_embedding="speaker.pt",
             drvexo_bridge_layers=[],
         )
-        vc = SimpleNamespace(model_config=SimpleNamespace(model=str(self.root), hf_config=config))
+        vc = _VllmConfig(model_config=_ModelConfig(model=str(self.root), hf_config=config))
 
         def base_init(instance, **kwargs):
             nn.Module.__init__(instance)
-            instance.talker_config = SimpleNamespace(text_hidden_size=4, hidden_size=4, hidden_act="silu")
+            instance.talker_config = _TalkerConfig2(text_hidden_size=4, hidden_size=4, hidden_act="silu")
             instance.text_projection = nn.Identity()
-            instance._prompt_builder = SimpleNamespace(_text_projection=instance.text_projection)
+            instance._prompt_builder = _PromptBuilder(_text_projection=instance.text_projection)
             instance.gpu_resident_buffer_keys = set()
 
         replacement = nn.Linear(4, 4)

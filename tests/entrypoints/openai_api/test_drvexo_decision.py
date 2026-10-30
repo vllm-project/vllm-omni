@@ -4,7 +4,8 @@
 """Explicit decisions validate input, bypass disabled calls and own cancellation."""
 
 import asyncio
-from types import SimpleNamespace
+from collections.abc import Callable
+from dataclasses import dataclass
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,6 +16,51 @@ from vllm import SamplingParams
 from vllm_omni.entrypoints.openai.drvexo_decision import GeneralRequest, general_decision, input_row
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class _Tokenizer:
+    encode: Callable
+
+
+@dataclass
+class _ServingChat:
+    renderer: object
+    engine_client: object
+
+
+@dataclass
+class _Request:
+    is_disconnected: AsyncMock
+    app: object
+
+
+@dataclass
+class _Engine:
+    generate: Callable
+    abort: AsyncMock
+    default_sampling_params_list: list
+
+
+@dataclass
+class _Renderer:
+    get_tokenizer: Callable
+
+
+@dataclass
+class _Application:
+    state: object
+
+
+@dataclass
+class _DecisionOutput:
+    error: object
+    multimodal_output: dict
+
+
+@dataclass
+class _ApplicationState:
+    openai_serving_chat: object
 
 
 def body(**kwargs):
@@ -41,11 +87,11 @@ def test_duplicate_ids_and_nonboolean_flag_rejected():
 
 
 def request(engine):
-    tokenizer = SimpleNamespace(encode=lambda text, **kw: list(text.encode()))
-    chat = SimpleNamespace(renderer=SimpleNamespace(get_tokenizer=lambda: tokenizer), engine_client=engine)
-    return SimpleNamespace(
+    tokenizer = _Tokenizer(encode=lambda text, **kw: list(text.encode()))
+    chat = _ServingChat(renderer=_Renderer(get_tokenizer=lambda: tokenizer), engine_client=engine)
+    return _Request(
         is_disconnected=AsyncMock(return_value=False),
-        app=SimpleNamespace(state=SimpleNamespace(openai_serving_chat=chat)),
+        app=_Application(state=_ApplicationState(openai_serving_chat=chat)),
     )
 
 
@@ -55,7 +101,7 @@ async def test_scores_are_request_local_and_non_executable():
 
     async def generate(**kwargs):
         calls.append(kwargs)
-        yield SimpleNamespace(
+        yield _DecisionOutput(
             error=None,
             multimodal_output={
                 "drvexo_general_scores": [torch.tensor([float(len(calls))])],
@@ -63,9 +109,7 @@ async def test_scores_are_request_local_and_non_executable():
             },
         )
 
-    engine = SimpleNamespace(
-        generate=generate, abort=AsyncMock(), default_sampling_params_list=[SamplingParams(max_tokens=10)]
-    )
+    engine = _Engine(generate=generate, abort=AsyncMock(), default_sampling_params_list=[SamplingParams(max_tokens=10)])
     result = await general_decision(body(), request(engine))
     assert result["selected_id"] == "b"
     assert result["scores"] == {"a": 1.0, "b": 2.0}
@@ -90,9 +134,7 @@ async def test_cancel_aborts_only_its_owned_candidate():
         finally:
             closed.set()
 
-    engine = SimpleNamespace(
-        generate=generate, abort=AsyncMock(), default_sampling_params_list=[SamplingParams(max_tokens=10)]
-    )
+    engine = _Engine(generate=generate, abort=AsyncMock(), default_sampling_params_list=[SamplingParams(max_tokens=10)])
     task = asyncio.create_task(general_decision(body(), request(engine)))
     await entered.wait()
     task.cancel()

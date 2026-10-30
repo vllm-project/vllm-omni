@@ -4,9 +4,11 @@
 """Guard explicit graph configuration and leave default predictor behavior alone."""
 
 import unittest
-from types import SimpleNamespace
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import pytest
+import torch
 
 from vllm_omni.model_executor.models.common.qwen3_code_predictor import CodePredictorWrapperConfig
 from vllm_omni.model_executor.models.drvexo_speech_8b.code_predictor import configure_body_cuda_graphs
@@ -14,13 +16,27 @@ from vllm_omni.model_executor.models.drvexo_speech_8b.code_predictor import conf
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@dataclass
+class _Predictor:
+    _compiled_model_fwd: object
+    _device_graphs: dict
+    _prefix_graphs_enabled: bool
+    _wrapper_config: CodePredictorWrapperConfig
+    parameters: Callable
+
+
+@dataclass
+class _Parameter:
+    device: torch.device
+
+
 def model(device="cuda"):
-    return SimpleNamespace(
+    return _Predictor(
         _compiled_model_fwd=None,
         _device_graphs={},
         _prefix_graphs_enabled=False,
         _wrapper_config=CodePredictorWrapperConfig(use_projection=True, sampling_mode="per_call"),
-        parameters=lambda: iter([SimpleNamespace(device=SimpleNamespace(type=device))]),
+        parameters=lambda: iter([_Parameter(device=torch.device(device))]),
     )
 
 

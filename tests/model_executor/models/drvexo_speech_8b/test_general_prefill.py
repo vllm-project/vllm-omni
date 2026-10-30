@@ -3,7 +3,8 @@
 
 """Chunked prefill must score only its request's final prompt token."""
 
-from types import SimpleNamespace
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -14,6 +15,16 @@ from vllm_omni.model_executor.models.drvexo_speech_8b.general_prefill import Gen
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@dataclass
+class _ScoringHead:
+    score: Callable
+
+
+@dataclass
+class _Tokenizer:
+    encode: Callable
+
+
 def test_chunk_offsets_own_scoring_and_do_not_repeat_on_decode():
     seen = []
 
@@ -21,7 +32,7 @@ def test_chunk_offsets_own_scoring_and_do_not_repeat_on_decode():
         seen.append((hidden.item(), task))
         return hidden.clone()
 
-    runtime = GeneralPrefill(SimpleNamespace(score=score))
+    runtime = GeneralPrefill(_ScoringHead(score=score))
     state = {"drvexo_general_decision": {"prompt_length": 5, "task": "choice"}}
     first = runtime.process(torch.tensor([[1.0], [2.0], [3.0]]), [state], [(0, 3)], [0])
     assert first["drvexo_general_status"][0].item() == 0
@@ -35,7 +46,7 @@ def test_chunk_offsets_own_scoring_and_do_not_repeat_on_decode():
 
 
 def test_branch_budgets_keep_closing_chat_boundary():
-    branch = BranchTokenizer(SimpleNamespace(encode=lambda text, **kw: list(text.encode())), 1536, 384)
+    branch = BranchTokenizer(_Tokenizer(encode=lambda text, **kw: list(text.encode())), 1536, 384)
     row = {"system_prompt": "", "instruction": "i" * 4000, "state_json": "s" * 4000}
     assert len(branch.prefix(row)) == 1536
     suffix = branch.candidate("a" * 5000)
