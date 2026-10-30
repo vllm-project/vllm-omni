@@ -139,7 +139,7 @@ def test_omitted_guidance_scale_matches_explicit_default(stepwise):
     assert not probe.sampling_params.guidance_scale_provided
     assert probe.sampling_params.guidance_scale == 1.0
     torch.testing.assert_close(
-        execute(model, stepwise, cfg=None), execute(pipeline(), stepwise, cfg=4.0), atol=0, rtol=0
+        execute(model, stepwise, cfg=None), execute(pipeline(), stepwise, cfg=3.0), atol=0, rtol=0
     )
     assert not torch.equal(execute(model, stepwise, cfg=None), execute(pipeline(), stepwise, cfg=1.0))
 

@@ -72,7 +72,8 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 _DEFAULT_RESOLUTION = 1024
 _DEFAULT_NUM_INFERENCE_STEPS = 50
-_DEFAULT_GUIDANCE_SCALE = 4.0
+# Model-card default for MOSS-Image (recipes/models/OpenMOSS-Team/MOSS-Image-Base.yaml); 1.0 would disable CFG.
+_DEFAULT_GUIDANCE_SCALE = 3.0
 _MAX_SEQUENCE_LENGTH = 4096
 
 
