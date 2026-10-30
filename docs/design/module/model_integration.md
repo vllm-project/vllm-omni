@@ -79,3 +79,12 @@ reuses upstream Qwen3 execution and adds an audio encoder/input projector
 and explicit final-prefill candidate scoring. Stage transitions remain owned
 by the pipeline/orchestrator. See [DRVEXO](../../models/drvexo_speech_8b.md)
 for runtime restrictions and validation scope.
+
+### Runner payloads at downstream entry stages
+
+When processing a raw prompt for a downstream entry or handoff stage, preserve
+`model_intermediate_buffer` on the upgraded `OmniEngineCoreRequest`, alongside
+serialized routing metadata. The runner merges decoded request metadata into
+this buffer rather than replacing its contents. A direct speech request carries
+its caller text and fixed-reply provenance in the buffer; dropping that state
+incorrectly sends it through the generated-token path.

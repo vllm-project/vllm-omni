@@ -735,12 +735,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 if getattr(new_req_data, "additional_information", None) is not None:
                     info_dict = deserialize_additional_information(new_req_data.additional_information)
                     if info_dict:
-                        self.model_intermediate_buffer[req_id] = info_dict
-                        setattr(
-                            self.requests[req_id],
-                            "additional_information_cpu",
-                            info_dict,
-                        )
+                        self._update_intermediate_buffer(req_id, info_dict)
             except Exception as e:
                 logger.error(f"Error decoding additional information: {e}")
 
@@ -1407,8 +1402,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 )
             info_dict = deserialize_additional_information(info_payload)
             if info_dict:
-                self.model_intermediate_buffer[req_id] = info_dict
-                setattr(self.requests[req_id], "additional_information_cpu", info_dict)
+                self._update_intermediate_buffer(req_id, info_dict)
 
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request model_intermediate_buffer in batch order."""
