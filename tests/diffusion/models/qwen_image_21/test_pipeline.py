@@ -243,7 +243,7 @@ def test_assemble_kv_cache_decode_rejects_mismatched_prefill_prompt_seq_len():
     assert take_ownership is False
 
 
-def test_split_decode_groups_by_prefill_prompt_seq_len():
+def test_group_by_prefix_lengths():
     """Routine serving: separate prefills → joint decode must split, not fail."""
     short = _state(_decode_cache(1, 1.0))
     short.request_id = "short"
@@ -257,14 +257,41 @@ def test_split_decode_groups_by_prefill_prompt_seq_len():
 
     states = [short, long, short2]
     assert QwenImage21Pipeline._needs_decode_seq_len_split(states) is True
-    groups = QwenImage21Pipeline._split_decode_groups(states)
+    groups = QwenImage21Pipeline._group_by_prefix_lengths(states)
     assert [[s.request_id for s in g] for g in groups] == [["short", "short2"], ["long"]]
 
     same = [_state(_decode_cache(1, 1.0)), _state(_decode_cache(1, 2.0))]
     for s in same:
         s.extra["prefill_prompt_seq_len"] = 4
     assert QwenImage21Pipeline._needs_decode_seq_len_split(same) is False
-    assert QwenImage21Pipeline._split_decode_groups(same) == [same]
+    assert QwenImage21Pipeline._group_by_prefix_lengths(same) == [same]
+
+
+@pytest.mark.parametrize("include_step", [False, True])
+def test_prefix_groups_preserve_both_cfg_lengths_and_request_order(include_step):
+    states = []
+    for request_id, prefix, negative_prefix, step in [
+        ("a", 4, 6, 1),
+        ("b", 4, 6, 2),
+        ("c", 8, 6, 1),
+        ("d", 4, 8, 1),
+        ("e", 4, 6, 1),
+    ]:
+        state = _state(_decode_cache(1, 1.0))
+        state.request_id = request_id
+        state.step_index = step
+        state.extra["prefill_prompt_seq_len"] = prefix
+        state.extra["prefill_negative_prompt_seq_len"] = negative_prefix
+        states.append(state)
+
+    group_requests = (
+        QwenImage21Pipeline._group_by_prefix_lengths_and_step
+        if include_step
+        else QwenImage21Pipeline._group_by_prefix_lengths
+    )
+    expected = [["a", "e"], ["b"], ["c"], ["d"]] if include_step else [["a", "b", "e"], ["c"], ["d"]]
+    assert [[state.request_id for state in group] for group in group_requests(states)] == expected
+    assert group_requests([]) == []
 
 
 def test_scatter_kv_cache_splits_rows_back_per_request():
