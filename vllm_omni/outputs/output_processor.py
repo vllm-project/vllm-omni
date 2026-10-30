@@ -153,9 +153,10 @@ def _merge_mirrored_payload(
     payload on both channels; accumulating both concatenates every tensor
     with itself. Returns ``(merged, extra)``: ``merged`` holds every entry of
     both channels once (non-tensor entries are metadata and the pooling one
-    wins, as it did when accumulated second), and ``extra`` only the top-level
-    pooling tensors that differ from the ``mm_output`` tensor under the same
-    key, which still accumulate after it. V1 never sets both channels.
+    wins, as it did when accumulated second), and ``extra`` the top-level
+    pooling entries that would not have merged into the ``mm_output`` one
+    under the same key: a differing tensor, or a tensor/non-tensor pair.
+    These still accumulate after it. V1 never sets both channels.
     """
     if not isinstance(pooling_output, dict) or not isinstance(mm_output, dict):
         return mm_output, pooling_output
@@ -163,12 +164,19 @@ def _merge_mirrored_payload(
     extra: dict[str, Any] = {}
     for k, v in pooling_output.items():
         existing = merged.get(k)
-        if isinstance(existing, dict) and isinstance(v, dict):
+        if k not in merged:
+            merged[k] = v
+        elif isinstance(existing, dict) and isinstance(v, dict):
             merged[k] = _merge_nested(existing, v)
         elif isinstance(existing, torch.Tensor) and isinstance(v, torch.Tensor):
             if not _is_mirror(v, existing):
                 extra[k] = v
+        elif isinstance(existing, torch.Tensor) or isinstance(v, torch.Tensor):
+            # A tensor and a non-tensor land in separate partitions of the
+            # accumulated payload, so both are kept, as when accumulated apart.
+            extra[k] = v
         else:
+            # Non-tensor metadata: the later accumulation replaces it.
             merged[k] = v
     return merged, extra or None
 
