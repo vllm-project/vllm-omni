@@ -101,11 +101,6 @@ class DRVEXODummyInputsBuilder(BaseDummyInputsBuilder[DRVEXOProcessingInfo]):
 
 
 class DRVEXOMultiModalProcessor(BaseMultiModalProcessor[DRVEXOProcessingInfo]):
-    def _call_hf_processor(self, prompt, mm_data, mm_kwargs, tok_kwargs):
-        # vLLM 0.28 combines text/media here; 0.29 calls get_hf_processor
-        # for media separately. Both paths use the same frontend.
-        return self.info.get_hf_processor()(text=prompt, audios=mm_data.get("audios", []))
-
     def _hf_processor_applies_updates(self, *args, **kwargs):
         return False
 
