@@ -715,6 +715,7 @@ def test_encoder_conditioning_keeps_control_separate_from_latent_edit(monkeypatc
         quality="lossless",
         seed=7,
         num_outputs_per_prompt=1,
+        attention_schedule=None,
     )
     pixels = torch.ones(1, 3, num_frames, 32, 32)
     rows = torch.ones(planner.video_latent_t(num_frames) * 4, 196)
