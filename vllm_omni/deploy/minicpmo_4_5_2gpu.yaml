@@ -92,6 +92,11 @@ stages:
       detokenize: true
 
 platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        # Match the default CUDA Thinker backend for full reference audio.
+        attention_backend: TRITON_ATTN
   npu:
     stages:
       - stage_id: 0

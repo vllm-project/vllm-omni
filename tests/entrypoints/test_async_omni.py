@@ -9,6 +9,7 @@ import anyio
 import pytest
 from vllm.engine.protocol import StreamingInput
 from vllm.lora.request import LoRARequest
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.kv_hints import KvHintsEnvelope
 
@@ -63,6 +64,15 @@ async def fake_process_results(request_id, metrics, final_stage_id_for_e2e, req_
         request_output=SimpleNamespace(outputs=[]),
         finished=True,
     )
+
+
+async def _wait_until(predicate, *, max_ticks: int = 100) -> None:
+    """Yield to the loop until ``predicate()`` holds (bounded, no wall clock)."""
+    for _ in range(max_ticks):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition not reached")
 
 
 def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) -> AsyncOmni:
@@ -170,6 +180,36 @@ def test_generate_forwards_kv_hints_on_initial_stage_submission(streaming):
             pass
         assert len(submissions) == 1
         assert submissions[0]["kv_hints"] is hints
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_generate_watermarking_opt_out_disables_every_stage():
+    """Ensure opting out disables watermarking on all stages without mutating the default params."""
+
+    async def run():
+        submitted_params_lists: list[list[SamplingParams | OmniDiffusionSamplingParams | PoolingParams]] = []
+
+        async def add_request_async(*, sampling_params_list, **kwargs):
+            submitted_params_lists.append(sampling_params_list)
+
+        omni = get_async_omni_instance(fake_add_request=add_request_async)
+        defaults = [SamplingParams(), OmniDiffusionSamplingParams(), PoolingParams()]
+        omni.engine.num_stages = len(defaults)
+        omni.default_sampling_params_list = defaults
+        # For now, watermark is passed as a kwarg. In the future, this will be collapsed and the
+        # sampling param building will be centralized to better align with vLLM.
+        async for _ in omni.generate(
+            prompt={"prompt": "test"}, request_id="watermark-req", sampling_params_list=defaults, watermarking=False
+        ):
+            pass
+
+        llm_params, diffusion_params, pooling_params = submitted_params_lists[0]
+        assert not llm_params.watermarking
+        assert not diffusion_params.watermarking
+        assert pooling_params is defaults[2]
+        assert (defaults[0].watermarking, defaults[1].watermarking) == (None, None)
 
     asyncio.run(run())
 
@@ -489,7 +529,9 @@ def test_generate_accepts_request_after_repeated_cancellations():
 
         for idx in range(3):
             task = asyncio.create_task(collect_outputs(f"cancel-{idx}"))
-            await asyncio.sleep(0)
+            # The submit runs as its own tracked task; cancel once it has
+            # reached the engine so this exercises cancel-after-submit.
+            await _wait_until(lambda: len(submitted_request_ids) == idx + 2)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -625,7 +667,7 @@ def test_generate_cancellation_converges_after_engine_shutdown_starts(mocker):
                 pass
 
         task = asyncio.create_task(collect_outputs())
-        await asyncio.sleep(0)
+        await _wait_until(lambda: len(submitted_request_ids) == 1)
         task.cancel()
 
         with pytest.raises(asyncio.CancelledError):

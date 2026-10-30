@@ -57,6 +57,16 @@ steps:
             -m 'core_model and npu and 310P'
             --run-level 'core_model'
 
+      - label: "Platforms Test - 310P"
+        key: ready-platforms-test-310p
+        mirror_hardwares: 310p_npu_1
+        commands:
+          - >-
+            pytest -s -v
+            tests/platforms/npu/test_310p_real_device.py
+            -m 'core_model and npu and 310P and omni'
+            --run-level 'core_model'
+
   - group: ":card_index_dividers: E2E Test"
     key: ready-e2e-group
     depends_on: upload-ready-pipeline
@@ -95,6 +105,18 @@ steps:
         commands:
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m 'core_model and npu and A3 and omni' --run-level 'core_model'
         timeout_in_minutes: 60
+
+      - label: ":sound: TTS · Drama 3 Test (A3)"
+        key: ready-tts-drama-3-npu
+        source_file_dependencies: tts_drama_3_function
+        mirror_hardwares: a3_npu_2
+        timeout_in_minutes: 60
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+        commands:
+          # Keep the smoke selection, but load real weights: core_model's dummy
+          # loader casts FP16 random values to FP8 on device, unsupported on A3.
+          - pytest -s -v tests/e2e/online_serving/test_drama_3.py -m 'core_model and npu and A3' --run-level 'advanced_model'
 
       - label: ":sound: TTS · Qwen3-TTS CustomVoice Test"
         mirror_hardwares: a3_npu_2
@@ -156,3 +178,17 @@ steps:
                 pytest -s -v tests/e2e/online_serving/test_hunyuan_image.py -m 'core_model and diffusion and npu' --run-level 'core_model'
                 "
         timeout_in_minutes: 60
+
+      - label: "Diffusion · MiniMax-H3 DLO DP2 T2VA Test"
+        key: ready-diffusion-minimax-h3
+        source_file_dependencies: diffusion_minimax_h3_function
+        timeout_in_minutes: 90
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_HUB_OFFLINE: "1"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - |
+            [ -d "$${VLLM_TEST_MINIMAX_H3_MODEL:-}/FL2VA" ] && export VLLM_TEST_MINIMAX_H3_MODEL="$$VLLM_TEST_MINIMAX_H3_MODEL/FL2VA" || true
+            pytest -s -v tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py -m "core_model and npu and A3 and diffusion and cards_2" --run-level core_model

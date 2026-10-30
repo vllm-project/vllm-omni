@@ -21,7 +21,7 @@ steps:
           - omni_minicpmo_4_5_function
         timeout_in_minutes: 120
         commands:
-          - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and B200 and omni and cards_1" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py --ignore=tests/e2e/online_serving/test_minicpmo_4_5_window.py
+          - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and B200 and omni and cards_1" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py --ignore=tests/e2e/online_serving/test_minicpmo_4_5_window.py --ignore=tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py
 
       - label: ":full_moon: Omni · Function Test with H100 · 2-GPU"
         source_file_dependencies:
@@ -34,7 +34,10 @@ steps:
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_function
         timeout_in_minutes: 120
+        artifact_paths:
+          - tests/e2e/online_serving/results/minicpmo_duplex_recognition/**/*
         commands:
+          - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py -m "full_model and cuda and H100 and B200 and omni and cards_1" --run-level "full_model"
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py -m "full_model and cuda and H100 and B200 and omni and cards_1" --run-level "full_model"
           - pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_window.py -m "full_model and cuda and H100 and B200 and omni and cards_1" --run-level "full_model"
 
@@ -48,8 +51,6 @@ steps:
       - label: ":full_moon: Omni · Doc Test with H100 · 2-GPU"
         source_file_dependencies: omni_qwen3_omni_doc
         timeout_in_minutes: 90
-        artifact_paths:
-          - audio_*.wav
         commands:
           - pytest -s -v tests/examples/ -m "full_model and omni and H100 and B200 and cards_2" --run-level "full_model"
 
@@ -85,7 +86,6 @@ steps:
         artifact_paths:
           - tests/dfx/perf/results/*.json
           - tests/e2e/accuracy/omni_duplex_eval/results/*.json
-          - tests/dfx/perf/results/omni_duplex_eval_minicpmo_4_5/**/*
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omni_duplex_eval/results
@@ -117,7 +117,6 @@ steps:
         timeout_in_minutes: 180
         artifact_paths:
           - tests/dfx/perf/results/*.json
-          - tests/dfx/perf/results/omniinteract_qwen3_omni/**/*
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json -m "full_model and H100 and B200 and cuda and omni and cards_3" --run-level full_model
@@ -128,7 +127,6 @@ steps:
         timeout_in_minutes: 180
         artifact_paths:
           - tests/dfx/perf/results/*.json
-          - tests/dfx/perf/results/omni_duplex_eval_qwen3_omni/**/*
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json -m "full_model and H100 and B200 and cuda and omni and cards_3" --run-level full_model
@@ -142,16 +140,6 @@ steps:
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json -m "H100 and B200 and cards_1"
-
-      - label: ":full_moon: Omni · Qwen3-Omni · Seed-TTS Realtime Perf Test"
-        source_file_dependencies: omni_qwen3_omni_seed_tts_perf
-        key: nightly-omni-performance-qwen3-seed-tts
-        timeout_in_minutes: 180
-        artifact_paths:
-          - tests/dfx/perf/results/*.json
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json -m "H100 and B200 and cards_2"
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_perf

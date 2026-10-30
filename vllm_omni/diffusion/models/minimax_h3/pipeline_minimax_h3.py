@@ -117,6 +117,7 @@ from .condition_noise import (
     minimax_h3_imgvid_cond_noise_rows,
 )
 from .continuation import diffuse_continuation, plan_continuation_windows, resolve_continuation
+from .controlnet import MINIMAX_H3_CONTROL_MEDIA_KEY, build_control_rows, load_control_pixels, parse_control
 from .denoise_loop import (
     MiniMaxH3DenoiseBranch,
     minimax_h3_denoise_loop,
@@ -142,11 +143,11 @@ from .latent_upscaler import (
     resolve_minimax_h3_latent_upscaler,
 )
 from .lora import TurboSpec, load_minimax_h3_turbo_lora
-from .minimax_h3_transformer import (
+from .minimax_h3_blocks import (
     MiniMaxH3Attention,
-    MiniMaxH3DiTModel,
     _attention_isolates_packed_requests,
 )
+from .minimax_h3_transformer import MiniMaxH3DiTModel
 from .npu.lora import (
     MINIMAX_H3_NATIVE_INFERENCE_STEPS,
     load_minimax_h3_native_lora,
@@ -298,6 +299,8 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "visual_condition_shapes",
     "audio_condition_lengths",
     "keyframe_frame_indices",
+    "control_rows",
+    "control_context_scale",
     "guide_blocks",
     "pad_seq_len",
     "locked_audio_rows",
@@ -951,6 +954,29 @@ class MiniMaxH3Pipeline(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
+        control_path = getattr(od_config, "controlnet_model_path", None)
+        if control_path:
+            if not Path(control_path).is_file() or Path(control_path).suffix != ".safetensors":
+                raise ValueError("--controlnet-model-path must be a local original .safetensors file")
+            if not modular and self.partition != "fl2va":
+                raise ValueError("H3 control requires the FL2VA checkpoint partition")
+            unsupported = (
+                not self.load_vae_encoder
+                or int(self.parallel_config.ulysses_degree) != 1
+                or int(self.parallel_config.ring_degree) != 1
+                or int(self.parallel_config.allgather_degree) != 1
+                or getattr(self.parallel_config, "use_hsdp", False)
+                or getattr(od_config, "step_execution", False)
+                or getattr(od_config, "quantization_config", None)
+                or resolve_offload(od_config).strategy is not OffloadStrategy.NONE
+                or getattr(od_config, "host_weight_runtime_mode", "disabled") != "disabled"
+                or getattr(od_config, "cache_backend", "none") not in (None, "none")
+            )
+            if unsupported:
+                raise ValueError(
+                    "H3 control requires request mode, local VAE encoding, dense weights, "
+                    "and no cache/offload/SP/HSDP; TP is supported"
+                )
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
@@ -967,6 +993,8 @@ class MiniMaxH3Pipeline(
             )
             if str(od_config.task_type or "auto").lower() == "auto":
                 self.partition = self._fasth3_checkpoint.partition
+            if control_path and self.partition != "fl2va":
+                raise ValueError("H3 control requires the FL2VA checkpoint partition")
             self._fasth3_checkpoint.check_serving_contract(partition=self.partition, od_config=od_config)
             release = self._fasth3_checkpoint.release_metadata()
             if isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec):
@@ -1028,6 +1056,17 @@ class MiniMaxH3Pipeline(
                 fall_back_to_pt=False,
             )
         ]
+        if control_path:
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=str(Path(control_path).parent),
+                    subfolder=None,
+                    revision=None,
+                    prefix="controlnet.",
+                    fall_back_to_pt=False,
+                    allow_patterns_overrides=[Path(control_path).name],
+                )
+            )
         self._dit_modules = ["transformer"]
         if ref2va_model_path is not None:
             self.weights_sources.append(
@@ -1272,7 +1311,7 @@ class MiniMaxH3Pipeline(
         def source_prefix(item: tuple[str, torch.Tensor]) -> str:
             name, _ = item
             prefix = name.partition(".")[0] + "."
-            if prefix in {"transformer.", "transformers_ref.", "text_encoder."}:
+            if prefix in {"transformer.", "transformers_ref.", "text_encoder.", "controlnet."}:
                 return prefix
             raise ValueError(f"unexpected MiniMax-H3 weight {name!r}")
 
@@ -1283,7 +1322,9 @@ class MiniMaxH3Pipeline(
             if prefix in loaded_prefixes:
                 raise ValueError(f"MiniMax-H3 weight source {prefix!r} is not contiguous")
             loaded_prefixes.add(prefix)
-            component = getattr(self, prefix.removesuffix("."))
+            component = (
+                self.transformer.controlnet if prefix == "controlnet." else getattr(self, prefix.removesuffix("."))
+            )
             if component is None:
                 raise ValueError(f"MiniMax-H3 component {prefix.removesuffix('.')!r} is disabled in this deployment")
             stream = ((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
@@ -1298,10 +1339,11 @@ class MiniMaxH3Pipeline(
             loaded = component.load_weights(stream)
             if prefix == "transformer.":
                 transformer_loaded = set(loaded)
-            if prefix != "text_encoder.":
+            if prefix not in {"text_encoder.", "controlnet."}:
                 component.post_load_weights()
                 self._finish_adaln_sidecar(component)
-            loaded_with_prefix.update(prefix + name for name in loaded)
+            loaded_prefix = "transformer.controlnet." if prefix == "controlnet." else prefix
+            loaded_with_prefix.update(loaded_prefix + name for name in loaded)
         # Both VAEs load eagerly in ``__init__`` rather than through
         # ``weights_sources``. The text encoder uses the shared component
         # loader so online quantization and offload processing follow the same
@@ -1899,6 +1941,8 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        control_rows: torch.Tensor | None = None,
+        control_context_scale: float = 1.0,
         guide_blocks: list[dict[str, Any]] | None = None,
         pad_seq_len: int | None = None,
         locked_audio_rows: torch.Tensor | None = None,
@@ -2023,6 +2067,12 @@ class MiniMaxH3Pipeline(
             token_tags=tags,
             device=self.device,
         )
+
+        if control_rows is not None:
+            branch.static_kwargs.update(
+                control_rows=control_rows,
+                control_context_scale=control_context_scale,
+            )
 
         visual_anchor = visual_condition
         if visual_anchor is not None:
@@ -2194,6 +2244,8 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        control_rows: torch.Tensor | None = None,
+        control_context_scale: float = 1.0,
         guide_blocks: list[dict[str, Any]] | None = None,
         pad_seq_len: int | None = None,
         locked_audio_rows: torch.Tensor | None = None,
@@ -2235,6 +2287,8 @@ class MiniMaxH3Pipeline(
             visual_condition_shapes=visual_condition_shapes,
             audio_condition_lengths=audio_condition_lengths,
             keyframe_frame_indices=keyframe_frame_indices,
+            control_rows=control_rows,
+            control_context_scale=control_context_scale,
             guide_blocks=guide_blocks,
             pad_seq_len=pad_seq_len,
             locked_audio_rows=locked_audio_rows,
@@ -2992,7 +3046,9 @@ class MiniMaxH3Pipeline(
             )
         else:
             conditioning = self._extract_encoder_conditioning(raw_prompt)
-        context.update(self._prepare_encoder_conditioning_inputs(conditioning, sampling))
+        prompt_media = raw_prompt.get("multi_modal_data") if isinstance(raw_prompt, Mapping) else None
+        control_media = prompt_media.get(MINIMAX_H3_CONTROL_MEDIA_KEY) if isinstance(prompt_media, Mapping) else None
+        context.update(self._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=control_media))
         if (
             context.get("latent_refine") is not None
             and context.get("latent_upscale") is not None
@@ -3027,8 +3083,18 @@ class MiniMaxH3Pipeline(
         self,
         conditioning: MiniMaxH3EncoderConditioning,
         sampling: Any,
+        control_media: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         extra = sampling.extra_args or {}
+        try:
+            control = parse_control(extra, control_media)
+        except ValueError as exc:
+            raise OmniClientError(str(exc)) from exc
+        if control is not None:
+            if not getattr(self.od_config, "controlnet_model_path", None):
+                raise OmniClientError("Control request requires --controlnet-model-path")
+            if sampling.quality == "high" or extra.get(MINIMAX_H3_GENERIC_CACHE_KEY):
+                raise OmniClientError("H3 control does not support Cache-DiT quality profiles")
         continuation = resolve_continuation(
             extra, task=conditioning.task, step_execution=bool(getattr(self.od_config, "step_execution", False))
         )
@@ -3053,6 +3119,12 @@ class MiniMaxH3Pipeline(
             turbo_spec=turbo_spec,
             has_native_lora=has_native_lora,
         )
+        if control is not None and task != "t2va":
+            raise OmniClientError("H3 control supports t2va only; reference/keyframe conditioning is unsupported")
+        if control is not None and continuation is not None:
+            raise OmniClientError(
+                "MiniMax H3 control does not support long-video continuation; use long_video_mode=full"
+            )
         if turbo_spec is not None:
             self._validate_turbo_sampling(sampling, turbo_spec)
         if has_native_lora:
@@ -3147,6 +3219,46 @@ class MiniMaxH3Pipeline(
         except ValueError as exc:
             raise OmniClientError(str(exc)) from exc
 
+        control_rows = None
+        control_scale = control["control_context_scale"] if control is not None else 1.0
+        if control is not None and control_scale != 0:
+            if any(block["kind"] in ("image", "video", "video_audio") for block in conditioning.guide_blocks):
+                raise OmniClientError(
+                    "H3 control does not support visual timeline guides; control rows cover only the target canvas"
+                )
+            try:
+                media = {
+                    role: load_control_pixels(
+                        control[role],
+                        height=conditioning.height,
+                        width=conditioning.width,
+                        num_frames=conditioning.num_frames,
+                        mask=role == "mask_path",
+                    )
+                    if control.get(role)
+                    else None
+                    for role in ("control_path", "source_path", "mask_path")
+                }
+                with self._component_on_device(self.video_vae.encoder_component):
+                    control_rows = build_control_rows(
+                        media["control_path"],
+                        media["source_path"],
+                        media["mask_path"],
+                        height=conditioning.height,
+                        width=conditioning.width,
+                        num_frames=conditioning.num_frames,
+                        latent_shape=(
+                            conditioning.latent_t,
+                            conditioning.height // 16,
+                            conditioning.width // 16,
+                        ),
+                        encode=self.video_vae.encode_control_latents,
+                        device=self.device,
+                    )
+                self._release_stage_cache()
+            except (ValueError, OSError) as exc:
+                raise OmniClientError(f"Invalid H3 control media: {exc}") from exc
+
         self._prepare_adaln_adapter(sampling)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         sampler = normalize_h3_sampler(extra.get("sampler"))
@@ -3187,6 +3299,15 @@ class MiniMaxH3Pipeline(
         )
         latent_refine = self._resolve_latent_refine(extra)
         if latent_refine is not None:
+            if (
+                control_rows is not None
+                and upscale_target is not None
+                and (upscale_target.height, upscale_target.width) != (conditioning.height, conditioning.width)
+            ):
+                raise OmniClientError(
+                    "H3 control conditioning uses the first-pass canvas; latent_refine cannot change its resolution. "
+                    "Disable latent_refine or keep the base canvas."
+                )
             if continuation is not None:
                 raise OmniClientError("MiniMax H3 latent_refine does not support latent-tail continuation")
             if conditioning.video_edit_clean_rows is not None or conditioning.audio_edit_clean_rows is not None:
@@ -3227,6 +3348,8 @@ class MiniMaxH3Pipeline(
         return {
             "continuation": continuation,
             "task": task,
+            "control_rows": control_rows,
+            "control_context_scale": control_scale,
             "latent_upscale": upscale_target,
             "latent_refine": latent_refine,
             "keyframe_images": [],
