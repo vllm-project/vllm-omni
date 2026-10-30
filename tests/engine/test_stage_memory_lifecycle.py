@@ -324,7 +324,7 @@ async def test_shutdown_removes_memory_snapshots(lifecycle, monkeypatch, shutdow
 
         monkeypatch.setattr(env.clients[0], "shutdown", fail_shutdown)
 
-    env.orchestrator._shutdown_stages()
+    await env.orchestrator._shutdown_stages()
     assert env.values(0) == (None, None)
     assert env.values(1) == (None, None)
     # A recreated logger reuses these families in the same process. An
@@ -337,7 +337,7 @@ async def test_shutdown_removes_memory_snapshots(lifecycle, monkeypatch, shutdow
     )
     assert env.values(0) == (None, None)
     assert env.values(1) == (None, None)
-    env.orchestrator._shutdown_stages()
+    await env.orchestrator._shutdown_stages()
     await env.orchestrator.publish_stage_post_warmup_memory()
     assert [client.calls for client in env.clients] == [1, 1]
     assert env.values(0) == (None, None)
@@ -351,8 +351,37 @@ async def test_shutdown_discards_pending_memory_reply(lifecycle):
     task = asyncio.create_task(env.orchestrator._publish_replica_post_warmup_memory(0, 0, client))
     try:
         await asyncio.wait_for(client.started.wait(), timeout=2)
-        env.orchestrator._shutdown_stages()
+        await env.orchestrator._shutdown_stages()
     finally:
         client.release.set()
         await task
     assert env.values(0) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_stage_shutdown_starts_all_replicas_before_waiting(lifecycle, monkeypatch):
+    import threading
+
+    env = lifecycle
+    entered = [threading.Event() for _ in env.clients]
+    release = threading.Event()
+    completed = []
+
+    def shutdown(index):
+        entered[index].set()
+        assert release.wait(timeout=5)
+        completed.append(index)
+
+    for index, client in enumerate(env.clients):
+        monkeypatch.setattr(client, "shutdown", lambda index=index: shutdown(index))
+    task = asyncio.create_task(env.orchestrator._shutdown_stages())
+    try:
+        for event in entered:
+            assert await asyncio.to_thread(event.wait, 2)
+        assert not task.done()
+    finally:
+        release.set()
+        await task
+    assert sorted(completed) == list(range(len(env.clients)))
+    await env.orchestrator._shutdown_stages()
+    assert len(completed) == len(env.clients)

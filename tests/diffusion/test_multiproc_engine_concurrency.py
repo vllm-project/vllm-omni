@@ -1314,42 +1314,34 @@ class TestStageDiffusionClientErrorPropagation:
         client = self._make_client()
         client.check_health()
 
-    def test_local_shutdown_uses_existing_signal_path(self):
+    @pytest.mark.parametrize("backend", ["mp", "ray"])
+    def test_shutdown_waits_for_clean_subprocess_exit(self, backend):
         client = self._make_client()
         client._zmq_ctx = MagicMock()
-        client._proc_manager.distributed_executor_backend = "mp"
-        client._proc_manager.wait_for_shutdown = MagicMock()
-        client._proc_manager.shutdown = MagicMock()
-        client.shutdown()
-        client._proc_manager.wait_for_shutdown.assert_not_called()
-        client._proc_manager.shutdown.assert_called_once_with(timeout=10)
-
-    def test_shutdown_waits_for_clean_subprocess_exit(self):
-        client = self._make_client()
-        client._zmq_ctx = MagicMock()
-        client._proc_manager.distributed_executor_backend = "ray"
+        client._proc_manager.distributed_executor_backend = backend
         client._proc_manager.wait_for_shutdown = MagicMock(return_value=True)
         client._proc_manager.shutdown = MagicMock()
 
         client.shutdown()
 
         client._request_socket.send.assert_called_once()
-        client._proc_manager.wait_for_shutdown.assert_called_once_with(timeout=10)
+        client._proc_manager.wait_for_shutdown.assert_called_once_with(timeout=20.0)
         client._proc_manager.shutdown.assert_not_called()
         client._request_socket.close.assert_called_once_with(linger=0)
         client._response_socket.close.assert_called_once_with(linger=0)
         client._zmq_ctx.term.assert_called_once_with()
 
-    def test_shutdown_uses_signals_only_after_clean_exit_timeout(self):
+    @pytest.mark.parametrize("backend", ["mp", "ray"])
+    def test_shutdown_uses_signals_only_after_clean_exit_timeout(self, backend):
         client = self._make_client()
         client._zmq_ctx = MagicMock()
-        client._proc_manager.distributed_executor_backend = "ray"
+        client._proc_manager.distributed_executor_backend = backend
         client._proc_manager.wait_for_shutdown = MagicMock(return_value=False)
         client._proc_manager.shutdown = MagicMock()
 
         client.shutdown()
 
-        client._proc_manager.wait_for_shutdown.assert_called_once_with(timeout=10)
+        client._proc_manager.wait_for_shutdown.assert_called_once_with(timeout=20.0)
         client._proc_manager.shutdown.assert_called_once_with(timeout=10)
 
     def test_get_output_raises_engine_dead_when_dead(self):

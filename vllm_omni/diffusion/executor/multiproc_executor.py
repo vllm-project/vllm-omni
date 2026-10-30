@@ -15,6 +15,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from multiprocessing import shared_memory
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
 
@@ -110,6 +111,7 @@ class _ExecutorShutdownCleaner:
     broadcast_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
+    result_handles: list[Handle] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __call__(self) -> None:
@@ -166,6 +168,41 @@ class _ExecutorShutdownCleaner:
                     [(proc.name, proc.pid) for proc in alive],
                 )
 
+        if not self.processes:
+            self._cleanup_result_shm()
+
+    def _cleanup_result_shm(self) -> None:
+        # Workers own their result rings and normally unlink them on exit.
+        # SIGKILL/native crashes skip that destructor. Only reclaim exported
+        # buffers after every worker is confirmed dead; never scan /dev/shm.
+        pending = []
+        for handle in self.result_handles:
+            failed = False
+            for buffer_handle in (handle.buffer_handle, handle.tensor_arena_handle):
+                if buffer_handle is None:
+                    continue
+                name = buffer_handle[3]
+                try:
+                    shm = shared_memory.SharedMemory(name=name, create=False)
+                except FileNotFoundError:
+                    continue  # The worker already released its buffer.
+                except OSError:
+                    logger.exception("Failed to attach worker result shared memory %s for cleanup", name)
+                    failed = True
+                    continue
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    logger.exception("Failed to unlink worker result shared memory %s", name)
+                    failed = True
+                finally:
+                    shm.close()
+            if failed:
+                pending.append(handle)
+        self.result_handles = pending
+
 
 class MultiprocDiffusionExecutor(DiffusionExecutor):
     uses_multiproc: bool = True
@@ -197,6 +234,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             broadcast_mq=self._broadcast_mq,
             num_workers=num_workers,
             processes=self._processes,
+            result_handles=[handle for handle in result_handles if handle is not None],
         )
         self._shutdown_cleaner: _ExecutorShutdownCleaner | None = shutdown_cleaner
         self._finalizer = weakref.finalize(self, shutdown_cleaner)
@@ -1243,5 +1281,5 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 self._completed_outputs.clear()
                 self._dropped_output_ids.clear()
             self._processes = (cleaner.processes or []) if cleaner is not None else []
-            if not self._processes:
+            if not self._processes and (cleaner is None or not cleaner.result_handles):
                 self._shutdown_cleaner = None

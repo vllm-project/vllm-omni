@@ -61,6 +61,7 @@ from vllm_omni.config.stage_config import (
     resolve_stage_model_runner,
     update_deploy_config_async_chunk_enabled,
     validate_native_mrv2_session,
+    validate_stage_parallel_layout,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
@@ -642,6 +643,7 @@ class OmniStageRuntimeConfig:
     devices: str | None = None
     num_replicas: int = Field(default=1, ge=1)
     env: dict[str, Any] | None = None
+    parallel_decode_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     num_gpus: int = Field(default=1, ge=1)
     log_level: str = "info"
     log_stats: bool = False
@@ -1741,6 +1743,18 @@ class BaseVllmOmniStageConfig:
         return list(self.stage_pipeline_config.input_sources)
 
     @property
+    def fanout_targets(self) -> list[int]:
+        return list(self.stage_pipeline_config.fanout_targets)
+
+    @property
+    def input_payload_selector(self) -> str | None:
+        return self.stage_pipeline_config.input_payload_selector
+
+    @property
+    def result_aggregator(self) -> str | None:
+        return self.stage_pipeline_config.result_aggregator
+
+    @property
     def final_output(self) -> bool:
         return self.stage_pipeline_config.final_output
 
@@ -2229,6 +2243,8 @@ def _build_runtime_config(
         kwargs["env"] = _copy_value(stage_deploy.env)
     kwargs["cuda_mps"] = deploy.cuda_mps
     kwargs["num_gpus"] = parallel_config.world_size
+    if deploy.stage_parallel.mode == "parallel":
+        kwargs["parallel_decode_timeout_s"] = deploy.stage_parallel.decode_timeout_s
     return OmniStageRuntimeConfig(**kwargs)
 
 
@@ -2349,6 +2365,7 @@ class VllmOmniConfig:
                 setattr(deploy, name, _copy_value(cli_overrides[name]))
 
         deploy = _apply_platform_overrides(deploy)
+        validate_stage_parallel_layout(deploy)
 
         cli_async_chunk = cli_overrides.get("async_chunk")
         if cli_async_chunk is not None:

@@ -257,7 +257,7 @@ first, then `start_step`; do not compensate by lowering `sparsity` alone.
 These pairings were validated at 1344x768 / 50 steps only; re-evaluate for
 other resolutions or step counts.
 
-## HTTP API examples
+## Standard HTTP requests
 
 The request contract is identical to the GPU recipe; see
 [MiniMax-H3.md § HTTP API examples](MiniMax-H3.md#http-api-examples). Use the
@@ -286,7 +286,6 @@ exact power-of-two input pre-scaling (`laser_input_scale=256`) so the
 kernel's fp16 workspace cannot overflow on outlier activations. Measured on
 the FastH3 four-step Dense configuration below, T2VA 15 s at 1344x768, this
 kernel reduced end-to-end latency from ~73 s to ~57 s (about 22%).
-
 
 ## FastH3 four-step on A3
 
@@ -459,8 +458,8 @@ These describe the validated shapes rather than a general throughput guarantee.
 > through the offload backend's per-tensor transform hook, but is left as future
 > work pending upstream design discussion.
 
-
 ## HTTP API examples
+
 Switch tasks via `extra_params.task` (`t2va` / `fl2va` / `ref2va`); FL2VA and
 Ref2VA additionally pass `input_references` (first-frame image, reference
 video/audio). The full parameter table lives in the GPU recipe.
@@ -546,6 +545,141 @@ recommended lossy configuration. Memory figures are per device.
 
 These numbers describe the validated shapes rather than a general throughput
 guarantee.
+
+## Opt-in parallel video/audio decoder stages
+
+The default H3 pipeline and the existing three-stage deployment keep their
+serial decoding behavior. To try concurrent full-output decoding, select the
+four-stage deployment explicitly:
+
+```bash
+export MODEL=/data1/weights/minimax-h3
+export VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS=15
+vllm serve "$MODEL" \
+  --omni --trust-remote-code --task-type fl2va \
+  --deploy-config vllm_omni/deploy/minimax_h3_disaggregated_parallel_decode_3plus1.yaml
+```
+
+The command gives Encoder workers 15 seconds to exit before signal escalation.
+NPU runtime finalization can continue after Python model and connector cleanup;
+the upstream five-second worker grace was insufficient in functional testing.
+This uses vLLM's existing environment setting and does not change its default.
+Keep the setting in the launching environment for both serial and parallel
+comparisons. The stage process manager includes worker grace and engine teardown
+in its default close budget; an explicitly supplied timeout retains its meaning.
+
+This configuration keeps one API and routes Encoder → DiT → two independent
+decoder stages. Stage 2 loads only Video VAE; stage 3 loads only Audio VAE.
+Both receive their respective latents before the orchestrator waits for their
+results. The video communication group excludes the audio stage. The response
+is published only after both modalities succeed, using the existing video,
+audio, FPS and sample-rate output contract and CPU MP4 muxer.
+
+The example retains the base deployment's two-device Encoder and four-device
+DiT. These earlier stages reuse the decoder devices sequentially. They are
+not changed by the decoder split. Edit their placement separately if the
+existing deployment has a different frontend layout, and include all resident
+weights, activations and communication buffers in the memory budget.
+
+The deployment YAML contains the opt-in and device validation settings:
+
+```yaml
+stage_parallel:
+  mode: parallel
+  total_devices: 4
+  video_devices: [0, 1, 2]
+  audio_devices: [3]
+  allow_device_overlap: false
+  require_full_device_partition: true
+  decode_timeout_s: 120
+```
+
+Keep each list consistent with its stage's `devices`. Video
+`parallel_config.ulysses_degree` and `vae_patch_parallel_size` must equal the
+video group size, with `vae_parallel_mode: tile`. The audio group uses
+`vae_patch_parallel_size: 1`. Device IDs are relative to the process-visible
+device pool. Overlapping decoder groups require `allow_device_overlap: true`;
+process isolation alone does not guarantee device computation overlaps.
+
+### Decoder DLO switch
+
+Each decoder stage uses the existing `enable_distributed_layerwise_offload`
+boolean. The supplied split-decoder YAMLs enable it on stages 2 and 3; the
+serial decoder example enables it on stage 2. Set it to `false` on those
+stages to keep their native VAE weights resident instead. Stage 1's DiT
+setting is independent: changing only that setting does not offload decoder
+workers. For a completely resident deployment, also disable stage 1's DLO
+and budget for all stages' weights on shared devices.
+
+```yaml
+# Under each decoder entry in stages:
+enable_distributed_layerwise_offload: true  # false: keep VAE weights resident
+```
+
+The independent `pin_cpu_memory` setting controls host weight pinning (default
+`true`). Set it to `false` explicitly when host locked-memory allocation is
+unavailable; DLO still stages weights between CPU and device, using pageable
+host memory. This changes transfer characteristics and must be recorded in
+performance comparisons. Allocation failures are not silently retried.
+
+With DLO enabled, decoders load native weights on CPU, use the existing
+component stagers to load weights for decode, and release device weights on
+completion or failure. The generic offload backend preserves this on-demand
+placement rather than moving VAEs back to the device during initialization.
+The Video VAE and Audio VAE are staged as components; decoder blocks are not
+weight-sharded or streamed layer by layer. DiT block DLO remains unchanged.
+With the switch disabled, no component staging or DLO allocator cache is
+installed. Both states preserve tile geometry, decoder dtype and output format.
+The compact `diffusion_offload_config` API selects only `dit`/`text_encoder`;
+it does not select VAEs and must not be passed to decoder-only workers as a
+substitute for this compatibility switch.
+
+Examples for `1plus1`, `2plus1`, `2plus2`, `3plus1`, `4plus4` and `7plus1` are
+provided alongside the base parallel YAML. Their names describe decoder
+placement only. Native audio decoding executes on the audio group's output
+leader: extra audio ranks reserve devices and do not accelerate one sample.
+Prefer X+1. Arbitrary video group sizes still require checkpoint, tiling and
+collective validation on the target hardware; accepting a layout is not a
+performance or compatibility guarantee. Tile geometry and numerical algorithms
+are unchanged by this feature.
+
+All video ranks participate in the native tiled decode and its collectives.
+Only the output rank crops and quantizes the full video into the transfer
+layout; other ranks discard their decoded frames after the codec returns.
+
+This initial path accepts one complete request at a time; overlapping requests
+receive HTTP 429. It does not implement cross-request pipelining. Latents use
+CPU serialization through `SharedMemoryConnector`, with separate keys for each
+request and modality. Provision `/dev/shm` and account for CPU copies; this is
+a same-host transport rather than device-to-device zero-copy.
+
+Failures, cancellation and decode timeouts abort the whole request. Pending
+submissions are joined and shared-memory resources are released. Before
+accepting another request, the workers must acknowledge idle tasks and device
+synchronization. If this cannot be established, admission fails with HTTP 503
+until the service is restarted. `decode_timeout_s` covers dispatch and decode;
+recovery may require a further bounded wait.
+
+The multiprocess DiT executor has a separate execution budget:
+`VLLM_OMNI_DLO_DP_WAVE_TIMEOUT` defaults to 600 seconds and also bounds
+ordinary request-mode execution. Increasing `decode_timeout_s` does not
+extend that budget. For long requests, set an explicit budget before starting
+the service, for example `VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=3000`, and size it for
+the measured workload. A timeout still fails the worker group; extending the
+budget does not recover a failed group or establish a performance gain.
+
+Use full-output decoding (`preencode_mp4: false`). Incremental/preencoded MP4
+continues to use the serial implementation. To roll back, restart with the
+original deployment YAML or omit `--deploy-config` for the standard pipeline.
+Setting `stage_parallel.mode: serial` (the default) in a parallel YAML selects
+the existing combined decoder and removes the audio-only stage; it retains
+the other device settings in that file, so restore the original YAML for an
+exact placement rollback.
+
+Benchmark against the original serial deployment on the same server and
+inputs. Report decode and complete request latency separately, including
+transport and MP4 encoding. A smaller video group or device contention can
+outweigh audio overlap; this feature does not promise an RTF or speedup.
 
 ## Experimental reference-KV offload
 

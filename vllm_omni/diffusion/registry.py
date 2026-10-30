@@ -156,6 +156,16 @@ _DIFFUSION_MODELS = {
         "pipeline_minimax_h3_decoder",
         "MiniMaxH3DecoderPipeline",
     ),
+    "MiniMaxH3VideoDecoderPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3_decoder",
+        "MiniMaxH3VideoDecoderPipeline",
+    ),
+    "MiniMaxH3AudioDecoderPipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3_decoder",
+        "MiniMaxH3AudioDecoderPipeline",
+    ),
     "AuKPipeline": (
         "auk",
         "pipeline_auk",
@@ -737,6 +747,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3ModularPipeline": "get_minimax_h3_post_process_func",
     "MiniMaxH3DecoderPipeline": "get_minimax_h3_post_process_func",
+    "MiniMaxH3VideoDecoderPipeline": "get_minimax_h3_video_decoder_post_process_func",
+    "MiniMaxH3AudioDecoderPipeline": "get_minimax_h3_audio_decoder_post_process_func",
     "AuKPipeline": "get_auk_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",

@@ -5,6 +5,7 @@ import os
 from multiprocessing.process import BaseProcess
 
 import pytest
+from vllm import envs as vllm_envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.utils import numa_utils
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
@@ -47,7 +48,7 @@ def spawn_boundary(mocker, monkeypatch):
     return observed
 
 
-def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, tp_size=1):
+def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, tp_size=1, detach_finalizer=True):
     # No model is constructed: the manager consumes only these config fields.
     config = VllmConfig.__new__(VllmConfig)
     config.parallel_config = ParallelConfig(
@@ -72,7 +73,9 @@ def start_manager(executor_class, *, stage_id, cpus, numa_bind=True, dp_size=1, 
         omni_stage_id=stage_id,
     )
     # Fake processes need no finalizer; all patches are fixture-scoped.
-    manager._finalizer.detach()
+    if detach_finalizer:
+        manager._finalizer.detach()
+    return manager
 
 
 @pytest.mark.parametrize("executor_class", [UniProcExecutor, CustomUniProcExecutor])
@@ -108,3 +111,26 @@ def test_in_process_binding_restores_the_parent_environment(spawn_boundary, monk
     assert spawn_boundary[0]["binding"] == "--physcpubind=2 --membind=0"
     assert os.environ[numa_utils._NUMACTL_ARGS_ENV] == "--cpunodebind=1"
     assert os.environ[numa_utils._NUMACTL_PYTHON_EXECUTABLE_ENV] == "/parent/python"
+
+
+def test_default_shutdown_outlives_request_drain_and_worker_teardown(spawn_boundary, mocker, monkeypatch):
+    monkeypatch.setattr(vllm_envs, "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", 7)
+    manager = start_manager(MultiprocExecutor, stage_id=0, cpus=["2", "4"], tp_size=2, detach_finalizer=False)
+    stop_processes = mocker.patch("vllm.v1.engine.utils.shutdown")
+
+    manager.shutdown()
+
+    # Request drain (5), worker grace (7), worker SIGTERM grace (4), then
+    # EngineCore queue/process teardown (5). Parent and child cannot race.
+    stop_processes.assert_called_once_with(manager.processes, timeout=21.0)
+    assert manager.manager_stopped.is_set()
+
+
+@pytest.mark.parametrize("timeout", [0.0, 1.0, 60.0])
+def test_explicit_shutdown_deadline_is_not_extended(spawn_boundary, mocker, timeout):
+    manager = start_manager(UniProcExecutor, stage_id=0, cpus=["2"], detach_finalizer=False)
+    stop_processes = mocker.patch("vllm.v1.engine.utils.shutdown")
+
+    manager.shutdown(timeout=timeout)
+
+    stop_processes.assert_called_once_with(manager.processes, timeout=timeout)

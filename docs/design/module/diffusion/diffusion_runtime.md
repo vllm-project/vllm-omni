@@ -425,7 +425,11 @@ streams with an error, closes scheduler state, and shuts down the executor.
   workers that miss the grace period. Shutdown marks unfinished RPC and
   async-output futures as failed, then clears them. Completed async outputs
   cached for later `wait_output_ready()` calls are dropped with the executor
-  object.
+  object. Workers normally unlink their own result queue buffers. The executor
+  retains the exported ring and tensor-arena handles so it can also unlink
+  those buffers after a worker crashes or is killed. This fallback runs only
+  after all workers have exited; buffers and process references are retained
+  for a later shutdown retry if cleanup is incomplete.
 - **`ray`**: the executor gives actors up to five seconds to shut down, then
   kills them and removes placement groups it owns. Actor death is monitored
   even while idle; actor errors and RPC timeouts fail the group and notify the

@@ -1660,6 +1660,24 @@ class StagePool:
                 e,
             )
 
+    async def shutdown_replica_async(self, replica_id: int) -> None:
+        """Close a replica while other stages and its event loop can progress."""
+        if replica_id >= len(self.clients):
+            return
+        client = self.clients[replica_id]
+        if client is None:
+            return
+        shutdown_async = getattr(client, "shutdown_async", None)
+        if shutdown_async is None:
+            # vLLM clients marshal async socket/task cleanup onto their loop.
+            await asyncio.to_thread(self.shutdown_replica, replica_id)
+            return
+        try:
+            await shutdown_async()
+            logger.info("[StagePool] Stage %d replica %d shut down", self.stage_id, replica_id)
+        except Exception as e:
+            logger.warning("[StagePool] Failed to shutdown stage %d replica %d: %s", self.stage_id, replica_id, e)
+
     def evict_replica(self, replica_id: int) -> None:
         """Shut down a replica and remove it from the live set.
 

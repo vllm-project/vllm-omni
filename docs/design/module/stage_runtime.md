@@ -72,6 +72,17 @@ and is not presented as current behavior.
 
 ## Ownership boundary
 
+The opt-in H3 modality stages carry `fanout_targets`,
+`input_payload_selector` and `result_aggregator` as routing metadata; clients
+do not choose successors. Both decoder stages run in subprocesses, with
+independent device groups. Deployment validates group sizes and explicit
+overlap after platform/CLI overrides. Existing deployments default to serial.
+
+For these stages, `drain_requests` is queued with ordinary diffusion RPCs. It
+waits for the named request tasks and synchronizes worker devices before
+acknowledging cancellation recovery. Queue ordering, streaming-control RPCs
+and ordinary serial requests keep their existing dispatch behavior.
+
 This document owns local and distributed stage placement, startup and
 readiness, one pool per logical stage, replica identity and membership,
 selection and affinity, stage-client/process lifecycle, liveness, draining,
@@ -152,3 +163,24 @@ before the upstream engine constructor creates its scheduler and cache
 managers. The default hook is a no-op. The NPU implementation installs its
 Mamba allocator signature compatibility here, so Ascend imports and patches
 remain in the NPU platform and are not applied to other platforms.
+
+## Stage process shutdown signals
+
+`StageEngineCoreProc` preserves shutdown signals received during construction.
+Once initialized, it marks the inherited engine shutdown state as requested and
+wakes its input loop. The busy loop owns draining or aborting requests before
+the process calls executor shutdown; a signal handler must not raise
+`SystemExit` in the middle of a queue operation or worker RPC.
+
+Without an explicit process deadline, the stage manager allows request draining,
+the configured vLLM worker shutdown grace, the executor's four-second SIGTERM
+grace, and five seconds for EngineCore queue/process teardown. This prevents the
+parent's deadline from expiring during the child's own grace period. An explicit
+caller timeout remains unchanged. The same budget applies to finalizer cleanup.
+
+Diffusion clients first request normal subprocess shutdown and allow up to
+20 seconds for worker cleanup and process teardown. This applies to both MP
+and Ray executors. Only a failed request or an expired grace period falls back
+to signal-based shutdown; sending a signal immediately after the request can
+interrupt the subprocess's own cleanup. Async clients join in a thread while
+keeping socket operations on the owning event loop.

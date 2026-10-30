@@ -1,0 +1,84 @@
+# Experimental decoder partition example. Encoder/DiT match the base configuration.
+# Audio uses the group leader; additional audio ranks do not accelerate decoding.
+# Validate the native checkpoint/HCCL for this layout before deployment.
+pipeline: minimax_h3_disaggregated_parallel_decode
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+stages:
+- stage_id: 0
+  devices: 0,1
+  tensor_parallel_size: 2
+  gpu_memory_utilization: 0.3
+  max_model_len: 6144
+  max_num_seqs: 1
+  enforce_eager: true
+  hf_overrides:
+    minimax_h3_encoder_components:
+      text_encoder:
+        parallel_mode: tp
+      video_vae:
+        parallel_mode: patch
+      audio_vae:
+        parallel_mode: leader
+  default_sampling_params:
+    detokenize: false
+    max_tokens: 1
+    temperature: 0.0
+- stage_id: 1
+  devices: 0,1,2,3
+  max_num_seqs: 1
+  enforce_eager: true
+  enable_distributed_layerwise_offload: true
+  model_loaded:
+    text_encoder: false
+    vae_encoder: false
+    vae_decoder: false
+  parallel_config:
+    tensor_parallel_size: 1
+    ulysses_degree: 4
+    vae_patch_parallel_size: 1
+  default_sampling_params:
+    num_inference_steps: 50
+    seed: 42
+- stage_id: 2
+  enable_distributed_layerwise_offload: true
+  devices: 0,1,2,3,4,5,6
+  max_num_seqs: 1
+  enforce_eager: true
+  parallel_config:
+    tensor_parallel_size: 1
+    ulysses_degree: 7
+    vae_patch_parallel_size: 7
+    vae_parallel_mode: tile
+  default_sampling_params:
+    seed: 42
+  vae_use_tiling: true
+- stage_id: 3
+  enable_distributed_layerwise_offload: true
+  devices: '7'
+  max_num_seqs: 1
+  enforce_eager: true
+  parallel_config:
+    tensor_parallel_size: 1
+    ulysses_degree: 1
+    vae_patch_parallel_size: 1
+    vae_parallel_mode: tile
+  default_sampling_params:
+    seed: 42
+stage_parallel:
+  mode: parallel
+  total_devices: 8
+  video_devices:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  audio_devices:
+  - 7
+  allow_device_overlap: false
+  require_full_device_partition: true
+  decode_timeout_s: 120

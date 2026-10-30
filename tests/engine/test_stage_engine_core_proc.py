@@ -163,3 +163,50 @@ def test_platform_compat_runs_before_engine_construction(monkeypatch):
     with pytest.raises(ConstructionStoppedError):
         StageEngineCoreProc()
     assert calls == ["platform", "engine"]
+
+
+@pytest.mark.parametrize("during_init", [False, True])
+@pytest.mark.parametrize("signum", [15, 2])
+def test_shutdown_signal_is_handled_by_busy_loop(monkeypatch, mocker, during_init, signum):
+    import signal
+
+    from vllm.v1.engine.core import EngineShutdownState
+
+    from vllm_omni.engine import stage_engine_core_proc as module
+
+    run = StageEngineCoreProc.run_stage_core
+    handlers: dict[int, Any] = {}
+    callback = mocker.Mock()
+    engine = mocker.Mock(shutdown_state=EngineShutdownState.RUNNING)
+
+    def busy_loop():
+        if not during_init:
+            handlers[signum](signum, None)
+            callback.trigger.assert_called_once()
+        assert engine.shutdown_state == EngineShutdownState.REQUESTED
+        raise SystemExit(0)
+
+    def construct(*args, **kwargs):
+        if during_init:
+            handlers[signum](signum, None)
+        return engine
+
+    engine.run_busy_loop.side_effect = busy_loop
+    monkeypatch.setattr(module, "StageEngineCoreProc", construct)
+    monkeypatch.setattr(module.signal, "signal", lambda sig, handler: handlers.update({sig: handler}))
+    for name in (
+        "set_death_signal",
+        "set_process_title",
+        "decorate_logs",
+        "maybe_register_config_serialize_by_value",
+        "maybe_apply_cfg_scheduler_patches",
+    ):
+        monkeypatch.setattr(module, name, mocker.Mock())
+    monkeypatch.setattr(module, "SignalCallback", lambda wakeup: callback)
+    with pytest.raises(SystemExit) as exc:
+        run(vllm_config=mocker.Mock(spec=module.VllmConfig, logging_config=None))
+    assert exc.value.code == 0
+    engine.shutdown.assert_called_once()
+    callback.stop.assert_called_once()
+    assert handlers[signal.SIGTERM] == signal.SIG_DFL
+    assert handlers[signal.SIGINT] == signal.SIG_DFL

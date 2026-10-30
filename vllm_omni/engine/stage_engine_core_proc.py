@@ -45,9 +45,6 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
-_SIGNAL_EXIT_BASE = 128
-
-
 def _install_phase_locks(kwargs: dict[str, Any], local_dp_rank: int) -> None:
     """Wrap ``kwargs["executor_class"]`` with the SH/EX phase-lock guard.
 
@@ -75,11 +72,6 @@ def _install_phase_locks(kwargs: dict[str, Any], local_dp_rank: int) -> None:
         "[StageEngineCoreProc] parallel_stage_init: SH/EX phase locks on devices %s",
         locker.device_ids,
     )
-
-
-def _signal_exit_code(signum: int) -> int:
-    """Return the conventional process exit code for signal-driven exits."""
-    return _SIGNAL_EXIT_BASE + signum
 
 
 def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: Any) -> bool:
@@ -233,6 +225,20 @@ class StageEngineCoreProc(EngineCoreProc):
 
         engine_core: StageEngineCoreProc | None = None
         coord_client = None
+        shutdown_requested = False
+
+        def signal_handler(signum: int, frame: Any) -> None:
+            nonlocal shutdown_requested
+            shutdown_requested = True
+            if engine_core is not None:
+                engine_core.shutdown_state = EngineShutdownState.REQUESTED
+            if signal_callback is not None:
+                signal_callback.trigger()
+
+        # Match vLLM's shutdown loop: do not interrupt a queue operation or
+        # executor RPC with SystemExit, and preserve signals received in init.
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
         try:
             # NOTE: previous revisions hardcoded data_parallel_size=1 here
             # (TODO referencing issue #984). The hardcoding has been removed
@@ -314,14 +320,9 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
 
             signal_callback = SignalCallback(wakeup_engine)
-
-            def signal_handler(signum: int, frame: Any) -> None:
+            if shutdown_requested:
                 engine_core.shutdown_state = EngineShutdownState.REQUESTED
                 signal_callback.trigger()
-                raise SystemExit(_signal_exit_code(signum))
-
-            signal.signal(signal.SIGTERM, signal_handler)
-            signal.signal(signal.SIGINT, signal_handler)
 
             engine_core.run_busy_loop()
 

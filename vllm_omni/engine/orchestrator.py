@@ -278,6 +278,12 @@ class OrchestratorRequestState:
     upstream_first_audio: bool = False
     pending_upstream_first_audio: tuple[int, OmniEngineCoreOutput] | None = None
     pending_first_audio_outputs: list[tuple[int, int, Any]] = field(default_factory=list)
+    # Fan-out terminal outputs are held until every modality branch succeeds.
+    parallel_outputs: dict[int, Any] = field(default_factory=dict)
+    parallel_output_metrics: dict[int, Any] = field(default_factory=dict)
+    parallel_timeout_task: asyncio.Task | None = None
+    parallel_submit_tasks: list[asyncio.Task] = field(default_factory=list)
+    parallel_cleanup_started: bool = False
 
 
 @dataclass
@@ -556,7 +562,7 @@ class OrchestratorBase:
                 self._membership.shutdown()
 
             self._orch_monitor.flush()
-            self._shutdown_stages()
+            await self._shutdown_stages()
 
             loop = asyncio.get_running_loop()
             pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task() and not t.done()]
@@ -1901,9 +1907,35 @@ class OrchestratorBase:
                 if cid not in batch:
                     batch.add(cid)
                     cleanup_ids.append(cid)
+        recovery_clients = []
+        for rid in cleanup_ids:
+            state = self.request_states.get(rid)
+            if state is None:
+                continue
+            state.parallel_cleanup_started = True
+            deadline = getattr(state, "parallel_timeout_task", None)
+            if deadline is not None and deadline is not asyncio.current_task():
+                deadline.cancel()
+            submissions = getattr(state, "parallel_submit_tasks", ())
+            pending_submissions = [task for task in submissions if not task.done()]
+            for task in pending_submissions:
+                task.cancel()
+            if pending_submissions:
+                await asyncio.gather(*pending_submissions, return_exceptions=True)
+            if abort and self._parallel_decode_enabled():
+                # A branch may already be bound while add_request_async is
+                # still waiting to send. Cancellation can prevent its submit
+                # timestamp from being recorded, so inspect all bindings.
+                for sid in range(len(self.stage_pools)):
+                    if sid not in state.finished_stage_ids:
+                        client = self.stage_pools[sid].get_bound_client(rid)
+                        if client is not None and client not in recovery_clients:
+                            recovery_clients.append(client)
         abort_outputs: list[OutputMessage] = []
         if abort:
             abort_outputs = await self._abort_request_ids(cleanup_ids)
+            if recovery_clients:
+                await self._drain_parallel_decode(recovery_clients, cleanup_ids)
         self._release_request_bindings(cleanup_ids)
         self._release_stage_transfer_resources(cleanup_ids)
         for request_id in cleanup_ids:
@@ -2120,9 +2152,21 @@ class OrchestratorBase:
     ) -> None:
         """Route a processed output: send to frontend and/or forward."""
         req_id = output.request_id
+        # Cooperative abort may deliver a late terminal while cleanup drains
+        # the workers. It must never become a successful frontend response.
+        if getattr(req_state, "parallel_cleanup_started", False):
+            return
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
+        # A modality terminal in an explicitly fan-out topology is an
+        # intermediate result.  Keep it private until the sibling modality is
+        # complete, then emit one legacy-compatible H3 output.
+        if getattr(getattr(self.stage_pools[stage_id], "stage_client", None), "result_aggregator", None):
+            # Parallel full-output decoding never publishes a partial modality.
+            if finished:
+                await self._route_parallel_terminal_output(stage_id, output, req_state, stage_metrics, replica_id)
+            return
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
@@ -2242,6 +2286,85 @@ class OrchestratorBase:
 
         if request_finished and not req_state.session_owned:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+
+    async def _route_parallel_terminal_output(
+        self,
+        stage_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        stage_metrics: Any,
+        replica_id: int,
+    ) -> None:
+        if getattr(output, "error", None):
+            await self._fail_request_client_error(
+                output.request_id,
+                stage_id,
+                str(output.error),
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                error_type="ParallelDecodeError",
+            )
+            return
+        if stage_id in req_state.parallel_outputs:
+            await self._fail_request_client_error(output.request_id, stage_id, "duplicate parallel terminal output")
+            return
+        req_state.parallel_outputs[stage_id] = output
+        req_state.parallel_output_metrics[stage_id] = stage_metrics
+        req_state.finished_stage_ids.add(stage_id)
+        req_state.finished_final_output_stage_ids.add(stage_id)
+        expected = {
+            sid
+            for sid, pool in enumerate(self.stage_pools)
+            if getattr(pool.stage_client, "result_aggregator", None) == "minimax_h3_av"
+        }
+        if not expected.issubset(req_state.parallel_outputs):
+            return
+        outputs = [req_state.parallel_outputs[sid] for sid in sorted(expected)]
+        video = next((item for item in outputs if getattr(item, "final_output_type", None) == "video"), None)
+        audio = next((item for item in outputs if getattr(item, "final_output_type", None) == "audio"), None)
+        if video is None or audio is None:
+            # This aggregator is intentionally strict: a partial modality
+            # response would violate the existing H3 API contract.
+            await self.output_async_queue.put(
+                ErrorMessage(request_id=output.request_id, stage_id=stage_id, error="parallel H3 output is incomplete")
+            )
+            await self._cleanup_request_ids([output.request_id], abort=True)
+            return
+        video_mm = dict(getattr(video, "multimodal_output", None) or {})
+        audio_mm = dict(getattr(audio, "multimodal_output", None) or {})
+        for key in ("audio", "audio_sample_rate"):
+            if key in audio_mm:
+                video_mm[key] = audio_mm[key]
+        if "metadata" in audio_mm:
+            metadata = dict(video_mm.get("metadata") or {})
+            metadata["audio"] = (audio_mm["metadata"] or {}).get("audio", {})
+            video_mm["metadata"] = metadata
+        # OmniRequestOutput deliberately keeps the multimodal payload private;
+        # updating that payload preserves all existing client formatting.
+        audio_payload = audio_mm.get("audio")
+        if audio_payload is None or not hasattr(audio_payload, "__len__") or len(video.images) != len(audio_payload):
+            await self._fail_request_client_error(output.request_id, stage_id, "parallel output count mismatch")
+            return
+        video._multimodal_output = video_mm
+        video.stage_durations = {
+            **(getattr(video, "stage_durations", None) or {}),
+            **(getattr(audio, "stage_durations", None) or {}),
+        }
+        video.peak_memory_mb = max(video.peak_memory_mb, audio.peak_memory_mb)
+        video_sid = next(sid for sid in expected if req_state.parallel_outputs[sid] is video)
+        video_replica = self.stage_pools[video_sid].get_bound_replica_id(output.request_id)
+        video.finished = True
+        await self.output_async_queue.put(
+            OutputMessage(
+                request_id=output.request_id,
+                stage_id=video_sid,
+                replica_id=video_replica,
+                engine_outputs=video,
+                metrics=req_state.parallel_output_metrics.get(video_sid),
+                finished=True,
+                stage_submit_ts=req_state.stage_submit_ts.get(video_sid),
+            )
+        )
+        await self._cleanup_request_ids([output.request_id, *self._cfg_tracker.cleanup_parent(output.request_id)])
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
@@ -2739,6 +2862,17 @@ class OrchestratorBase:
         is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
+        fanout_targets = tuple(getattr(self.stage_pools[src_stage_id].stage_client, "fanout_targets", ()) or ())
+        if fanout_targets:
+            await self._forward_to_fanout_stages(
+                req_id,
+                src_stage_id,
+                output,
+                req_state,
+                fanout_targets,
+                src_replica_id=src_replica_id,
+            )
+            return
         next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
         pinned_replica_id = self._session_route(next_logical, req_state)
@@ -3146,6 +3280,142 @@ class OrchestratorBase:
             tx_ms=_tx_ms,
         )
 
+    def _parallel_decode_enabled(self) -> bool:
+        return any(
+            getattr(getattr(pool, "stage_client", None), "result_aggregator", None) == "minimax_h3_av"
+            for pool in self.stage_pools
+        )
+
+    async def _watch_parallel_decode_deadline(
+        self, req_id: str, req_state: OrchestratorRequestState, timeout: float
+    ) -> None:
+        await asyncio.sleep(timeout)
+        if self.request_states.get(req_id) is req_state and not req_state.parallel_cleanup_started:
+            await self._fail_request_client_error(
+                req_id,
+                1,
+                f"parallel H3 decode exceeded {timeout:g}s",
+                status_code=HTTPStatus.GATEWAY_TIMEOUT.value,
+                error_type="ParallelDecodeTimeout",
+            )
+
+    async def _drain_parallel_decode(self, clients: list[Any], request_ids: list[str]) -> None:
+        async def drain(client):
+            wait_idle = getattr(client, "wait_for_requests_idle_async", None)
+            if wait_idle is None:
+                raise RuntimeError(f"stage {client.stage_id} cannot confirm cancellation completion")
+            timeout = getattr(client, "parallel_decode_timeout_s", 120.0)
+            await asyncio.wait_for(wait_idle(request_ids, timeout), timeout=timeout)
+
+        results = await asyncio.gather(*(drain(client) for client in clients), return_exceptions=True)
+        failures = [str(result) or type(result).__name__ for result in results if isinstance(result, BaseException)]
+        if failures:
+            # Fail closed: abort acknowledgements alone do not prove idle NPU
+            # streams. A service restart is required if draining cannot finish.
+            self._parallel_decode_recovery_error = "; ".join(failures)
+            logger.error(
+                "[Orchestrator] parallel decode recovery requires restart: %s", self._parallel_decode_recovery_error
+            )
+
+    async def _forward_to_fanout_stages(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        target_stage_ids: tuple[int, ...],
+        *,
+        src_replica_id: int | None = None,
+    ) -> None:
+        """Submit all explicit fan-out branches without serializing them."""
+        # Validate every branch before submitting any work. A bad sibling must
+        # not cause a partially dispatched request or race request cleanup.
+        branches = []
+        try:
+            for target_stage_id in target_stage_ids:
+                if not 0 <= target_stage_id < len(self.stage_pools):
+                    raise ValueError(f"fan-out target stage {target_stage_id} does not exist")
+                pool = self.stage_pools[target_stage_id]
+                if not pool.live_replica_ids():
+                    await self._fail_request_dead_stage(req_id, target_stage_id)
+                    return
+                client = pool.stage_client
+                processor = getattr(client, "custom_process_input_func", None)
+                if processor is None:
+                    raise ValueError(f"fan-out stage {target_stage_id} has no input processor")
+                prompt = processor([output], req_state.prompt, False)
+                if isinstance(prompt, list):
+                    if len(prompt) != 1:
+                        raise ValueError(f"fan-out stage {target_stage_id} requires one prompt")
+                    prompt = prompt[0]
+                if prompt is None:
+                    raise ValueError(f"stage {src_stage_id} produced no input for stage {target_stage_id}")
+                params = req_state.sampling_params_list[target_stage_id]
+                kwargs = self._diffusion_submit_kwargs(req_id, src_stage_id, client, req_state, output)
+                sender = self._build_payload_sender_info(src_stage_id, request_id=req_id)
+                if sender is not None:
+                    kwargs["payload_sender_info"] = sender
+                branches.append((target_stage_id, pool, prompt, params, kwargs))
+        except Exception as exc:
+            await self._fail_request_client_error(
+                req_id,
+                src_stage_id,
+                str(exc),
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                error_type="FanoutInputError",
+            )
+            return
+
+        async def _submit_branch(stage_id, pool, prompt, params, kwargs):
+            replica_id = await pool.submit_initial(
+                req_id,
+                req_state,
+                prompt,
+                submit_kwargs=kwargs,
+                params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+            )
+            self._on_stage_submitted(stage_id, req_id, replica_id, req_state)
+            req_state.stage_submit_ts[stage_id] = _time.time()
+            self._emit_tx_edge(
+                from_stage=src_stage_id,
+                from_replica=src_replica_id if src_replica_id is not None else 0,
+                to_stage=stage_id,
+                to_pool=pool,
+                request_id=req_id,
+                tx_ms=0.0,
+            )
+
+        if self._parallel_decode_enabled():
+            timeout = min(
+                getattr(pool.stage_client, "parallel_decode_timeout_s", 120.0) for _, pool, _, _, _ in branches
+            )
+            req_state.parallel_timeout_task = asyncio.create_task(
+                self._watch_parallel_decode_deadline(req_id, req_state, timeout)
+            )
+        tasks = [asyncio.create_task(_submit_branch(*branch)) for branch in branches]
+        req_state.parallel_submit_tasks = tasks
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException as exc:
+            # gather does not cancel siblings when a submit fails. Join them
+            # before aborting, so no late submit can resurrect a cleaned request.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if isinstance(exc, asyncio.CancelledError):
+                if getattr(req_state, "parallel_cleanup_started", False):
+                    return
+                await self._cleanup_request_ids([req_id], abort=True)
+                raise
+            logger.exception("[Orchestrator] fan-out submission failed req=%s", req_id)
+            await self._fail_request_client_error(
+                req_id,
+                src_stage_id,
+                str(exc),
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                error_type="FanoutSubmissionError",
+            )
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -3474,7 +3744,7 @@ class OrchestratorBase:
 
     # ---- Shutdown / lifecycle ----
 
-    def _shutdown_stages(self) -> None:
+    async def _shutdown_stages(self) -> None:
         """Shutdown all stage pools."""
         if self._stages_shutdown:
             return
@@ -3485,9 +3755,15 @@ class OrchestratorBase:
                 self._stat_logger.remove_stage_post_warmup_memory(engine_idx=engine_idx)
         total = sum(pool.live_num_replicas for pool in self.stage_pools)
         logger.info("[Orchestrator] Shutting down all %d client(s)", total)
-        for pool in self.stage_pools:
-            for replica_id in pool.live_replica_ids():
-                pool.shutdown_replica(replica_id)
+        # Stage processes own independent resources. Start all teardown before
+        # waiting, so each stage's grace period fits within the outer join.
+        await asyncio.gather(
+            *(
+                pool.shutdown_replica_async(replica_id)
+                for pool in self.stage_pools
+                for replica_id in pool.live_replica_ids()
+            )
+        )
 
 
 class Orchestrator(OrchestratorBase):
@@ -3565,6 +3841,28 @@ class Orchestrator(OrchestratorBase):
             raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
         final_stage_id = msg.final_stage_id
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
+
+        if self._parallel_decode_enabled():
+            recovery_error = getattr(self, "_parallel_decode_recovery_error", None)
+            if self.request_states or recovery_error:
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        request_id=request_id,
+                        stage_id=0,
+                        error=(
+                            f"parallel H3 workers require restart: {recovery_error}"
+                            if recovery_error
+                            else "parallel H3 accepts one complete request at a time"
+                        ),
+                        status_code=(
+                            HTTPStatus.SERVICE_UNAVAILABLE.value
+                            if recovery_error
+                            else HTTPStatus.TOO_MANY_REQUESTS.value
+                        ),
+                        error_type="ParallelDecodeUnavailable" if recovery_error else "ParallelDecodeBusy",
+                    )
+                )
+                return
 
         if not self.stage_pools[stage_id].live_replica_ids():
             # The entry stage lost all replicas between the HTTP-layer errored check and

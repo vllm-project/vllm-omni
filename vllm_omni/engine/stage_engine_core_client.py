@@ -147,6 +147,9 @@ class StageEngineCoreClientBase(StageClientBase):
             self.is_comprehension = metadata.is_comprehension
             self.requires_multimodal_data = metadata.requires_multimodal_data
             self.engine_input_source = metadata.engine_input_source
+            self.fanout_targets = list(getattr(metadata, "fanout_targets", ()))
+            self.input_payload_selector = getattr(metadata, "input_payload_selector", None)
+            self.result_aggregator = getattr(metadata, "result_aggregator", None)
             self.final_output = metadata.final_output
             self.final_output_type = metadata.final_output_type
             self.default_sampling_params = metadata.default_sampling_params

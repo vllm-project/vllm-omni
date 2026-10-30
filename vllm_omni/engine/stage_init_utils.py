@@ -22,7 +22,7 @@ import time
 import warnings
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -57,7 +57,6 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
 )
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
-from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import build_omni_renderer, omni_renderer_cls
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
@@ -574,6 +573,11 @@ class StageMetadata:
     custom_process_input_func: Callable | None
     model_stage: str | None
     runtime_cfg: Any
+    # Optional request-level fan-out metadata.  These fields come after the
+    # legacy required fields so existing positional construction remains valid.
+    fanout_targets: list[int] = field(default_factory=list)
+    input_payload_selector: str | None = None
+    result_aggregator: str | None = None
     prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
@@ -679,6 +683,9 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             is_comprehension=False,
             requires_multimodal_data=False,
             engine_input_source=engine_input_source,
+            fanout_targets=list(_get_attr_or_item(stage_config, "fanout_targets", [])),
+            input_payload_selector=_get_attr_or_item(stage_config, "input_payload_selector"),
+            result_aggregator=_get_attr_or_item(stage_config, "result_aggregator"),
             final_output=final_output,
             final_output_type=final_output_type,
             default_sampling_params=default_params,
@@ -700,6 +707,9 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         is_comprehension=is_comprehension,
         requires_multimodal_data=requires_multimodal_data,
         engine_input_source=engine_input_source,
+        fanout_targets=list(_get_attr_or_item(stage_config, "fanout_targets", [])),
+        input_payload_selector=_get_attr_or_item(stage_config, "input_payload_selector"),
+        result_aggregator=_get_attr_or_item(stage_config, "result_aggregator"),
         final_output=final_output,
         final_output_type=final_output_type,
         default_sampling_params=default_params,
@@ -747,6 +757,9 @@ def extract_stage_metadata_from_omni_stage_config(
             is_comprehension=False,
             requires_multimodal_data=False,
             engine_input_source=stage_config.input_sources,
+            fanout_targets=list(getattr(stage_config, "fanout_targets", ())),
+            input_payload_selector=getattr(stage_config, "input_payload_selector", None),
+            result_aggregator=getattr(stage_config, "result_aggregator", None),
             final_output=stage_config.final_output,
             final_output_type=stage_config.final_output_type,
             default_sampling_params=sampling_params,
@@ -764,6 +777,9 @@ def extract_stage_metadata_from_omni_stage_config(
         is_comprehension=stage_config.is_comprehension,
         requires_multimodal_data=stage_config.requires_multimodal_data,
         engine_input_source=stage_config.input_sources,
+        fanout_targets=list(getattr(stage_config, "fanout_targets", ())),
+        input_payload_selector=getattr(stage_config, "input_payload_selector", None),
+        result_aggregator=getattr(stage_config, "result_aggregator", None),
         final_output=stage_config.final_output,
         final_output_type=stage_config.final_output_type,
         default_sampling_params=sampling_params,
@@ -1122,7 +1138,7 @@ def _project_omni_stage_engine_args(
         "default_sampling_params",
         "has_sampling_extra_args",
     }
-    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus", "cuda_mps"}
+    runtime_excluded_fields = {"devices", "num_replicas", "env", "num_gpus", "cuda_mps", "parallel_decode_timeout_s"}
     if is_diffusion:
         # Diffusion owns these fields. Model defaults must not overwrite the
         # explicit diffusion selection copied above. Retain explicit model
@@ -1561,6 +1577,8 @@ def build_vllm_config(
             if isinstance(stage_config, BaseVllmOmniStageConfig)
             else build_engine_args_dict(stage_config, model, stage_connector_spec=stage_connector_spec)
         )
+
+    from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
     if api_process_count != 1 or api_process_rank != 0:
@@ -2092,6 +2110,15 @@ def build_diffusion_config(
             f"but {len(physical_devices)} device(s) are available: {physical_devices}"
         )
 
+    if od_config.model_class_name in {"MiniMaxH3VideoDecoderPipeline", "MiniMaxH3AudioDecoderPipeline"}:
+        if len(physical_devices) != num_devices_per_stage:
+            raise ValueError(
+                f"Stage {metadata.stage_id} decoder world_size={num_devices_per_stage} "
+                f"does not match assigned devices {physical_devices}"
+            )
+        expected_patch = num_devices_per_stage if od_config.model_class_name == "MiniMaxH3VideoDecoderPipeline" else 1
+        if od_config.parallel_config.vae_patch_parallel_size != expected_patch:
+            raise ValueError(f"Stage {metadata.stage_id} requires vae_patch_parallel_size={expected_patch}")
     od_config.num_gpus = num_devices_per_stage
     if metadata.cfg_kv_collect_func is not None:
         od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func

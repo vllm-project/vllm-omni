@@ -83,3 +83,54 @@ MINIMAX_H3_DECODE_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+
+# Explicit opt-in topology.  The legacy decode pipeline above remains the
+# default so existing deployments keep the linear Encoder -> DiT -> Decoder
+# behavior.
+MINIMAX_H3_PARALLEL_DECODE_PIPELINE = PipelineConfig(
+    model_type="minimax_h3_disaggregated_parallel_decode",
+    default_deploy_config_name="minimax_h3_disaggregated_parallel_decode.yaml",
+    stage_cli_aliases={"text_encoder_tp_size": (0, "tensor_parallel_size")},
+    model_arch="MiniMaxH3Encoder",
+    stages=(
+        replace(
+            MINIMAX_H3_PIPELINE.stages[0],
+            prompt_transform_func=f"{_PROCESSOR}.prepare_encoder_prompt_with_decoder",
+        ),
+        replace(
+            MINIMAX_H3_PIPELINE.stages[1],
+            final_output=False,
+            final_output_type=None,
+            fanout_targets=(2, 3),
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="video_vae",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(1,),
+            final_output=True,
+            final_output_type="video",
+            model_arch="MiniMaxH3VideoDecoderPipeline",
+            custom_process_input_func=f"{_PROCESSOR}.diffusion2video_decoder",
+            input_payload_selector="video",
+            result_aggregator="minimax_h3_av",
+            model_path_resolver=f"{_DECODER_PIPELINE}.resolve_minimax_h3_decoder_model_path",
+            inline_diffusion=False,
+        ),
+        StagePipelineConfig(
+            stage_id=3,
+            model_stage="audio_vae",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(1,),
+            final_output=True,
+            final_output_type="audio",
+            model_arch="MiniMaxH3AudioDecoderPipeline",
+            custom_process_input_func=f"{_PROCESSOR}.diffusion2audio_decoder",
+            input_payload_selector="audio",
+            result_aggregator="minimax_h3_av",
+            model_path_resolver=f"{_DECODER_PIPELINE}.resolve_minimax_h3_decoder_model_path",
+            inline_diffusion=False,
+        ),
+    ),
+)

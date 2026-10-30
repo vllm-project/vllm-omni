@@ -43,6 +43,9 @@ class StageClient(Protocol):
     requires_multimodal_data: bool
     custom_process_input_func: Any | None
     engine_input_source: Sequence[int]
+    fanout_targets: Sequence[int]
+    input_payload_selector: str | None
+    result_aggregator: str | None
     is_comprehension: bool
 
     def check_health(self) -> None: ...

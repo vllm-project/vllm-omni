@@ -455,6 +455,16 @@ class StageDiffusionProc:
         ) -> None:
             """Process a single diffusion request and send the response."""
             try:
+                # The opt-in H3 fan-out sends control over ZMQ and latents
+                # through a single-consumer SharedMemoryConnector key.
+                if isinstance(prompt, dict) and "_minimax_h3_stage_latent_shm" in prompt:
+                    from vllm_omni.diffusion.stage_latent_transport import unpack_stage_latents
+
+                    if self._od_config.model_class_name is None:
+                        raise ValueError("Stage latent transport requires an explicit decoder model class")
+                    prompt = unpack_stage_latents(
+                        prompt, request_id, self._od_config.stage_id, self._od_config.model_class_name
+                    )
                 if not self._od_config.streaming_output:
 
                     async def _send_request_started(output: OmniRequestOutput) -> None:
@@ -469,6 +479,16 @@ class StageDiffusionProc:
                         kv_transfer_params=kv_transfer_params,
                         payload_sender_info=payload_sender_info,
                     )
+                    transfer_metrics = (
+                        prompt.get("additional_information", {})
+                        .get("minimax_h3_decode", {})
+                        .get("stage_latent_transfer", {})
+                        if isinstance(prompt, dict)
+                        else {}
+                    )
+                    for key in ("latent_shm_get_ms", "latent_shm_bytes"):
+                        if key in transfer_metrics:
+                            result.metrics[key] = transfer_metrics[key]
                     await response_socket.send(encoder.encode({"type": "result", "output": result}))
                 else:
                     async for result in self._process_streaming_request(
@@ -525,12 +545,23 @@ class StageDiffusionProc:
         async def _dispatch_rpc(msg: dict[str, Any]) -> None:
             rpc_id = msg["rpc_id"]
             try:
-                result = await self._handle_collective_rpc(
-                    msg["method"],
-                    msg.get("timeout"),
-                    tuple(msg.get("args", ())),
-                    msg.get("kwargs", {}),
-                )
+                if msg["method"] == "drain_requests":
+                    # Abort is cooperative: acknowledge only after request
+                    # tasks finish and their device work has synchronized.
+                    request_ids = msg.get("args", [[]])[0]
+                    pending = [tasks[rid] for rid in request_ids if rid in tasks]
+                    if pending:
+                        await asyncio.gather(*(asyncio.shield(task) for task in pending))
+                    result = await self._handle_collective_rpc(
+                        "synchronize_device", msg.get("timeout"), (), {"timeout": msg.get("timeout")}
+                    )
+                else:
+                    result = await self._handle_collective_rpc(
+                        msg["method"],
+                        msg.get("timeout"),
+                        tuple(msg.get("args", ())),
+                        msg.get("kwargs", {}),
+                    )
                 await response_socket.send(
                     encoder.encode(
                         {

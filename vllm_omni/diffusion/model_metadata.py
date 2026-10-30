@@ -104,6 +104,8 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
         attention_mask_free=True,
     ),
+    "MiniMaxH3VideoDecoderPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "MiniMaxH3AudioDecoderPipeline": DiffusionModelMetadata(final_output_type="audio"),
     # The modular alias is served by MiniMaxH3Pipeline and has the same
     # Ref2VA request contract and packed-sequence layout. Every field must stay
     # in sync with it: the repository root ``model_index.json`` declares this

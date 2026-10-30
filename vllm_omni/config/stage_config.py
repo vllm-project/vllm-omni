@@ -405,6 +405,11 @@ class StagePipelineConfig:
     # next stage over the connector. Only diffusion producers need this; AR
     # stages already send through ``send_full_payload_outputs``.
     stage_output_payload_keys: tuple[str, ...] = ()
+    # Optional request-level fan-out. Empty by default preserves the existing
+    # linear ``stage_id + 1`` routing semantics for every other pipeline.
+    fanout_targets: tuple[int, ...] = ()
+    input_payload_selector: str | None = None
+    result_aggregator: str | None = None
     # Set on an async-chunk receiving stage. The orchestrator calls it with the
     # original prompt when it submits this stage's prewarm placeholder; it
     # returns a flat ``{name: Tensor | scalar}`` dict (or ``None``) sent under
@@ -525,6 +530,13 @@ class PipelineConfig:
                     errors.append(f"Stage {stage.stage_id} references non-existent input source {src}")
                 if src == stage.stage_id:
                     errors.append(f"Stage {stage.stage_id} references itself")
+            for target in stage.fanout_targets:
+                if target not in stage_id_set:
+                    errors.append(f"Stage {stage.stage_id} references non-existent fan-out target {target}")
+                if target == stage.stage_id:
+                    errors.append(f"Stage {stage.stage_id} fans out to itself")
+            if len(stage.fanout_targets) != len(set(stage.fanout_targets)):
+                errors.append(f"Stage {stage.stage_id} has duplicate fan-out targets")
         if not any(not s.input_sources for s in self.stages):
             errors.append("No entry point (stage with empty input_sources)")
         # Request completion and client-visible output are both driven by stages
@@ -842,6 +854,42 @@ class DuplexSessionRuntimeConfig:
 
 
 @dataclass
+class StageParallelConfig:
+    """Explicit opt-in for the H3 video/audio terminal stages."""
+
+    mode: Literal["serial", "parallel"] = "serial"
+    total_devices: int | None = None
+    video_devices: list[int] = field(default_factory=list)
+    audio_devices: list[int] = field(default_factory=list)
+    allow_device_overlap: bool = False
+    require_full_device_partition: bool = False
+    decode_timeout_s: float = 120.0
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("serial", "parallel"):
+            raise ValueError("stage_parallel.mode must be serial or parallel")
+        if self.total_devices is not None and (type(self.total_devices) is not int or self.total_devices < 1):
+            raise ValueError("stage_parallel.total_devices must be a positive integer")
+
+        if (
+            isinstance(self.decode_timeout_s, bool)
+            or not isinstance(self.decode_timeout_s, (float, int))
+            or not math.isfinite(self.decode_timeout_s)
+            or self.decode_timeout_s <= 0
+        ):
+            raise ValueError("stage_parallel.decode_timeout_s must be finite and positive")
+        for name in ("allow_device_overlap", "require_full_device_partition"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"stage_parallel.{name} must be a boolean")
+        for name in ("video_devices", "audio_devices"):
+            values = getattr(self, name)
+            if not isinstance(values, list) or any(type(i) is not int or i < 0 for i in values):
+                raise ValueError(f"stage_parallel.{name} must be a list of non-negative integers")
+            if len(values) != len(set(values)):
+                raise ValueError(f"stage_parallel.{name} contains duplicate devices")
+
+
+@dataclass
 class DeployConfig:
     """Loaded from deploy/<model>.yaml — the only config file users edit.
 
@@ -869,6 +917,7 @@ class DeployConfig:
     platforms: dict[str, Any] | None = None
     # Overrides the auto-detected pipeline registry key for structural variants.
     pipeline: str | None = None
+    stage_parallel: StageParallelConfig = field(default_factory=StageParallelConfig)
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool | None = None
@@ -1110,6 +1159,15 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     if not isinstance(speech_cache, dict):
         raise ValueError("speech_cache must be a mapping")
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
+    stage_parallel = StageParallelConfig(**(raw_dict.get("stage_parallel") or {}))
+    pipeline_name = raw_dict.get("pipeline")
+    if pipeline_name == "minimax_h3_disaggregated_parallel_decode" and stage_parallel.mode == "serial":
+        pipeline_name = "minimax_h3_disaggregated_decode"
+        stages = [stage for stage in stages if stage.stage_id != 3]
+    elif stage_parallel.mode == "parallel":
+        if pipeline_name not in (None, "minimax_h3_disaggregated_parallel_decode"):
+            raise ValueError("stage_parallel.mode=parallel requires the H3 parallel decode pipeline")
+        pipeline_name = "minimax_h3_disaggregated_parallel_decode"
 
     model_runner = raw_dict.get("model_runner", "v1")
     if model_runner not in ("v1", "v2"):
@@ -1130,7 +1188,8 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "edges": raw_dict.get("edges", None),
         "stages": stages,
         "platforms": raw_dict.get("platforms", None),
-        "pipeline": raw_dict.get("pipeline", None),
+        "pipeline": pipeline_name,
+        "stage_parallel": stage_parallel,
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.
@@ -1143,6 +1202,87 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
                 value = int(value or 0)
             kwargs[name] = value
     return DeployConfig(**kwargs)
+
+
+def _parse_device_ids(value: str | None) -> list[int] | None:
+    if value is None:
+        return None
+    try:
+        ids = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError(f"stage devices must be a comma-separated list of integers, got {value!r}") from exc
+    if not ids or any(item < 0 for item in ids) or len(ids) != len(set(ids)):
+        raise ValueError(f"stage devices must contain unique non-negative IDs, got {value!r}")
+    return ids
+
+
+def validate_stage_parallel_layout(deploy: DeployConfig) -> None:
+    """Validate only concurrent decoder groups, after platform overrides.
+
+    Encoder and DiT intentionally reuse the same devices at earlier stages.
+    """
+    config = deploy.stage_parallel
+    if config.mode != "parallel":
+        return
+    by_id = {stage.stage_id: stage for stage in deploy.stages}
+    groups = []
+    for stage_id, declared in ((2, config.video_devices), (3, config.audio_devices)):
+        stage = by_id.get(stage_id)
+        if stage is None:
+            raise ValueError(f"parallel decode requires stage {stage_id}")
+        ids = _parse_device_ids(stage.devices)
+        if not ids:
+            raise ValueError(f"parallel decode stage {stage_id} requires explicit devices")
+        if declared and ids != declared:
+            raise ValueError(f"stage {stage_id} devices disagree with stage_parallel device list")
+        if config.total_devices is not None and max(ids) >= config.total_devices:
+            raise ValueError(f"stage {stage_id} device outside stage_parallel.total_devices")
+        from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+        parallel_args = dict(stage.engine_extras.get("parallel_config") or {})
+        overrides = {
+            name: getattr(stage, name, None)
+            for name in (
+                "tensor_parallel_size",
+                "ulysses_degree",
+                "ring_degree",
+                "allgather_degree",
+                "sequence_parallel_size",
+                "vae_patch_parallel_size",
+                "vae_parallel_mode",
+                "use_hsdp",
+                "hsdp_shard_size",
+                "hsdp_replicate_size",
+            )
+        }
+        resolved = {"parallel_config": parallel_args}
+        _apply_diffusion_parallel_runtime_overrides(resolved, overrides)
+        parallel = DiffusionParallelConfig(**resolved["parallel_config"])
+        if parallel.world_size != len(ids):
+            raise ValueError(
+                f"stage {stage_id} parallel world_size={parallel.world_size} "
+                f"does not match {len(ids)} configured devices"
+            )
+        expected_patch = len(ids) if stage_id == 2 else 1
+        if parallel.vae_patch_parallel_size != expected_patch:
+            raise ValueError(f"stage {stage_id} requires vae_patch_parallel_size={expected_patch}")
+        if parallel.vae_parallel_mode != "tile":
+            raise ValueError(
+                f"stage {stage_id}: H3 decoder uses vae_parallel_mode=tile; audio executes on the group leader"
+            )
+        groups.append(set(ids))
+    overlap = groups[0] & groups[1]
+    if overlap and not config.allow_device_overlap:
+        raise ValueError(f"parallel decoder devices overlap: {sorted(overlap)}")
+    if config.require_full_device_partition:
+        if config.total_devices is None or groups[0] | groups[1] != set(range(config.total_devices)):
+            raise ValueError("decoder devices must cover the complete declared device pool")
+    logger.info(
+        "H3 decode mode=parallel video=%s audio=%s shared=%s",
+        by_id[2].devices,
+        by_id[3].devices,
+        config.allow_device_overlap,
+    )
 
 
 class PlatformOverrides(NamedTuple):
@@ -1535,6 +1675,7 @@ def merge_pipeline_deploy(
 ) -> list[StageConfig]:
     """Merge pipeline + deploy + platform overrides → list[StageConfig]."""
     deploy = _apply_platform_overrides(deploy)
+    validate_stage_parallel_layout(deploy)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
     # NOTE: The CLI override is applied to the Deployconfig for async chunk prior
@@ -1570,6 +1711,8 @@ def merge_pipeline_deploy(
                 runtime["env"] = ds.env
         if deploy.cuda_mps:
             runtime["cuda_mps"] = True
+        if deploy.stage_parallel.mode == "parallel":
+            runtime["parallel_decode_timeout_s"] = deploy.stage_parallel.decode_timeout_s
         runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(
@@ -1580,6 +1723,9 @@ def merge_pipeline_deploy(
                 session_mode=deploy.session_mode,
                 stage_type=stage_type,
                 input_sources=list(ps.input_sources),
+                fanout_targets=list(ps.fanout_targets),
+                input_payload_selector=ps.input_payload_selector,
+                result_aggregator=ps.result_aggregator,
                 custom_process_input_func=input_proc,
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
@@ -1609,6 +1755,9 @@ class StageConfig:
     session_mode: str = "turn"
     stage_type: StageType = StageType.LLM
     input_sources: list[int] = field(default_factory=list)
+    fanout_targets: list[int] = field(default_factory=list)
+    input_payload_selector: str | None = None
+    result_aggregator: str | None = None
     custom_process_input_func: str | None = None
     final_output: bool = False
     final_output_type: str | None = None
@@ -1705,6 +1854,9 @@ class StageConfig:
             "engine_args": create_config(engine_args),
             "runtime": create_config(runtime),
             "engine_input_source": self.input_sources,  # Legacy field name
+            "fanout_targets": self.fanout_targets,
+            "input_payload_selector": self.input_payload_selector,
+            "result_aggregator": self.result_aggregator,
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
             "is_comprehension": self.is_comprehension,

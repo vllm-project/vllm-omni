@@ -341,6 +341,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        pin_memory: bool = True,
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
@@ -393,7 +394,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self._encoder_stager = None
         self._decoder_stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
-            self._build_residency_stagers(device)
+            self._build_residency_stagers(device, pin_memory=pin_memory)
         self.encoder_component = _VideoVAEPartProxy(self, "encoder")
         self.decoder_component = _VideoVAEPartProxy(self, "decoder")
         self.use_tiling = True
@@ -406,7 +407,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if self._tile_gather_reuse_enabled():
             self._install_persistent_tile_gather()
 
-    def _build_residency_stagers(self, device: torch.device) -> None:
+    def _build_residency_stagers(self, device: torch.device, *, pin_memory: bool = True) -> None:
         """Stage the encode and decode halves of the remote separately.
 
         The encode path touches only ``encoder`` + ``quant_conv`` and the
@@ -423,18 +424,18 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self._encoder_stager = PinnedModuleStager(
                 [self.model.encoder, self.model.quant_conv],
                 device,
-                pin_memory=True,
+                pin_memory=pin_memory,
             )
             self._decoder_stager = PinnedModuleStager(
                 [self.model.post_quant_conv, self.model.decoder],
                 device,
-                pin_memory=True,
+                pin_memory=pin_memory,
             )
             return
         self._stager = PinnedModuleStager(
             self.remote,
             device,
-            pin_memory=True,
+            pin_memory=pin_memory,
         )
 
     def _part_stager(self, part: str) -> PinnedModuleStager | None:
@@ -1161,6 +1162,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        pin_memory: bool = True,
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
@@ -1188,7 +1190,7 @@ class MiniMaxH3AudioVAE(nn.Module):
             self._stager = PinnedModuleStager(
                 self.remote,
                 device,
-                pin_memory=True,
+                pin_memory=pin_memory,
             )
         self.model = self.remote.model
         self.sample_rate = int(self.config_dict["sample_rate"])

@@ -135,6 +135,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._has_lmcache = False
 
     def shutdown(self) -> None:
+        # AR runners own background payload senders and any unread SHM keys.
+        # Stop them before upstream drops the model and its tensor storage.
+        if getattr(self, "_omni_connector_initialized", False):
+            shutdown_connectors = getattr(self, "shutdown_omni_connectors", None)
+            if shutdown_connectors is not None:
+                shutdown_connectors()
         # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
         # earlier in its teardown; the shared helper is idempotent.
         self._shutdown_omni_prefix_cache()
