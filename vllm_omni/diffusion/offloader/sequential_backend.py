@@ -3,6 +3,7 @@
 
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 from torch import nn
@@ -332,6 +333,28 @@ def sequential_offload_component(module: nn.Module) -> Iterator[None]:
             hook._to_cpu(module)
 
 
+def install_stage_entry_hooks(module: nn.Module, device: torch.device) -> list[Any]:
+    """Activate a hooked stage whenever any of its direct children runs.
+
+    VAE stages usually run through ``decode``/``encode`` or call submodules
+    such as ``vae.decoder`` directly, so the ``forward`` hook alone would leave
+    them on the host. The first child call on a non-resident stage performs its
+    swap (evicting the selected DiTs); the DiT hooks evict it again.
+    """
+    hook = _get_sequential_offload_hook(module)
+    first_param = next(module.parameters(), None)
+    if first_param is None:
+        return []
+
+    def activate(_child: nn.Module, args: tuple) -> None:
+        current = first_param.device
+        # ``device`` may omit the index ("cuda"); parameters always carry one.
+        if current.type != device.type or (device.index is not None and current.index != device.index):
+            hook.pre_forward(module)
+
+    return [child.register_forward_pre_hook(activate) for child in module.children()]
+
+
 class ModelLevelOffloadBackend(OffloadBackend):
     """Model-level (sequential) offloading backend.
 
@@ -341,6 +364,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
     def __init__(self, config: OffloadConfig, device: torch.device):
         super().__init__(config, device)
         self._offload_modules: list[nn.Module] = []  # Track modules with hooks
+        self._entry_handles: list[Any] = []  # Child pre-hooks activating selected VAEs
         self._custom_pipeline: SupportsModelCpuOffload | None = None
 
     def enable(self, pipeline: nn.Module) -> None:
@@ -386,21 +410,27 @@ class ModelLevelOffloadBackend(OffloadBackend):
         residents = [component.module for component in resolved.residents]
         selected_dits = [component.module for component in resolved.dits if component.selected]
         selected_encoders = [component.module for component in resolved.encoders if component.selected]
+        # Selected VAEs join the swap as execution stages next to the encoders.
+        selected_vaes = [component.module for component in resolved.vaes if component.selected]
+        stages = [*encoders, *selected_vaes]
 
         all_modules = [*dits, *encoders, *vaes, *residents]
         initial_devices = _capture_tensor_devices(all_modules)
+        entry_handles: list[Any] = []
         try:
             for encoder in encoders:
                 encoder.to(self.device)
+            selected_vae_ids = {id(vae) for vae in selected_vaes}
             for vae in vaes:
-                vae.to(self.device, non_blocking=True)
+                if id(vae) not in selected_vae_ids:
+                    vae.to(self.device, non_blocking=True)
             for resident in residents:
                 resident.to(self.device)
 
             if not dits:
                 logger.warning("No DiT/transformer modules found, skipping model-level offloading")
                 return
-            if not encoders:
+            if not stages:
                 for dit in dits:
                     dit.to(self.device)
                 logger.warning("No encoder modules found, skipping model-level offloading")
@@ -408,12 +438,12 @@ class ModelLevelOffloadBackend(OffloadBackend):
 
             apply_sequential_offload(
                 dit_modules=dits,
-                encoder_modules=encoders,
+                encoder_modules=stages,
                 device=self.device,
                 pin_memory=self.config.pin_cpu_memory,
                 use_hsdp=self.config.use_hsdp,
                 offload_dit_modules=selected_dits,
-                offload_encoder_modules=selected_encoders,
+                offload_encoder_modules=[*selected_encoders, *selected_vaes],
                 # Fixed DiT staging keeps decode-graph weight pointers valid;
                 # only models that capture weight pointers (Qwen-Image-2.1's
                 # CUDA-graph decode) pay for it — every other model keeps
@@ -423,9 +453,15 @@ class ModelLevelOffloadBackend(OffloadBackend):
                     self.device.type == "cuda" and any(getattr(dit, "enable_cuda_graph_decode", False) for dit in dits)
                 ),
             )
+            for vae in selected_vaes:
+                entry_handles.extend(install_stage_entry_hooks(vae, self.device))
+                # A selected VAE waits on the host until its first stage call.
+                _get_sequential_offload_hook(vae)._to_cpu(vae)
         except BaseException:
+            for handle in entry_handles:
+                handle.remove()
             try:
-                remove_sequential_offload([*dits, *encoders])
+                remove_sequential_offload([*dits, *stages])
             except BaseException:
                 logger.exception("Failed to remove every model-level hook during rollback")
             try:
@@ -435,14 +471,17 @@ class ModelLevelOffloadBackend(OffloadBackend):
             raise
 
         # Track modules for cleanup
-        self._offload_modules = [*dits, *encoders]
+        self._offload_modules = [*dits, *stages]
+        self._entry_handles = entry_handles
 
         self.enabled = True
 
         logger.info(
             "Model-level offloading enabled: %s <-> %s (mutual exclusion)%s",
             ", ".join(component.path for component in resolved.dits),
-            ", ".join(component.path for component in resolved.encoders),
+            ", ".join(
+                component.path for component in (*resolved.encoders, *resolved.vaes) if component.module in stages
+            ),
             (
                 f"; resident on GPU: {', '.join(component.path for component in resolved.residents)}"
                 if resolved.residents
@@ -461,6 +500,9 @@ class ModelLevelOffloadBackend(OffloadBackend):
             logger.info("Model-level offloading disabled")
             return
 
+        for handle in self._entry_handles:
+            handle.remove()
+        self._entry_handles = []
         remove_sequential_offload(self._offload_modules)
 
         self._offload_modules.clear()

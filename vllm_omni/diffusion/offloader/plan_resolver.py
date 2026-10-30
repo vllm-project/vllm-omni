@@ -27,7 +27,7 @@ from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
 from .block_discovery import get_blocks_from_dit
 from .component_utils import get_encoder_block_groups, validate_on_demand_component
-from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT, OffloadStrategy
+from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT, VAE_COMPONENT, OffloadStrategy
 from .module_collector import ModuleDiscovery
 from .offload_plan import OffloadPlan, get_offload_plan
 
@@ -328,6 +328,8 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
             config.offloads_encoder(path, declaration) for path in modules.encoder_names
         ):
             raise ValueError("No text encoder modules found for selected text_encoder offload")
+        if config.offloads(VAE_COMPONENT) and not modules.vaes:
+            raise ValueError("No VAE modules found for selected vae offload")
 
     if config.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE and config.dlo_resident_layers:
         resident_paths = frozenset() if declaration is None else declaration.resident_dit_paths
@@ -395,15 +397,16 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
             )
         )
 
+    vae_selected = explicit and config.offloads(VAE_COMPONENT)
     for path, module in zip(modules.vae_names, modules.vaes):
-        # VAEs are not part of the public selector. A model plan may still own
-        # their residency, which the compatibility topology preserves.
+        # Only module mode can select VAEs; they swap as whole modules. A model
+        # plan may still own their residency in the compatibility topology.
         legacy_staged = (
             layerwise and not explicit and declaration is not None and path in declaration.on_demand_component_paths
         )
         if legacy_staged:
             validate_on_demand_component(module, path)
-        vaes.append(ResolvedComponent(path=path, module=module, selected=False, on_demand=legacy_staged))
+        vaes.append(ResolvedComponent(path=path, module=module, selected=vae_selected, on_demand=legacy_staged))
 
     for path, module in zip(modules.resident_names, modules.resident_modules):
         residents.append(ResolvedComponent(path=path, module=module, selected=False))
