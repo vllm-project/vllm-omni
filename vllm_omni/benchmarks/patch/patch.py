@@ -128,6 +128,7 @@ _IMAGE_STAGE_METRICS_BACKENDS = frozenset(
     }
 )
 _PRINT_STAGE = False
+_DUPLEX_METRIC_AGGREGATION = "session"
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -162,6 +163,14 @@ def should_request_stage_metrics(args: Any) -> bool:
     extra_body = getattr(args, "extra_body", None) or {}
     modalities = extra_body.get("modalities") if isinstance(extra_body, dict) else None
     return backend == "openai-chat-omni" and "image" in (modalities or [])
+
+
+def set_duplex_metric_aggregation(aggregation: str) -> None:
+    """Select the observation unit for duplex latency distributions."""
+    if aggregation not in {"session", "response"}:
+        raise ValueError(f"Unknown duplex metric aggregation: {aggregation}")
+    global _DUPLEX_METRIC_AGGREGATION
+    _DUPLEX_METRIC_AGGREGATION = aggregation
 
 
 def set_print_stage(enabled: bool) -> None:
@@ -4064,6 +4073,7 @@ async def benchmark(
             request_rate=request_rate,
             benchmark_duration=benchmark_duration,
             print_stage=_PRINT_STAGE,
+            duplex_metric_aggregation=_DUPLEX_METRIC_AGGREGATION,
         )
     else:
         metrics = calculate_metrics_for_embeddings(
@@ -4308,6 +4318,9 @@ async def benchmark(
         for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}", None) or []:
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
+
+    if any(isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs):
+        result["duplex_metric_aggregation"] = _DUPLEX_METRIC_AGGREGATION
 
     if task_type == TaskType.GENERATION:
         for metric in result_percentile_metrics:

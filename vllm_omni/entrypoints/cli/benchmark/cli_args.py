@@ -231,6 +231,12 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for vLLM-Omni multi-stage benchmarks."""
     group = parser.add_argument_group("vLLM-Omni Multi-stage Benchmark Options")
     group.add_argument(
+        "--duplex-metric-aggregation",
+        choices=("session", "response"),
+        default="session",
+        help="Aggregate duplex TTFT, audio TTFP and RTF over session means (default) or individual responses.",
+    )
+    group.add_argument(
         "--print-stage",
         action="store_true",
         default=False,

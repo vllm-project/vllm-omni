@@ -1233,3 +1233,19 @@ def test_variable_stage_workload_does_not_require_stage_metrics(extra_body):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
     assert_result({"completed": 2}, {"extra_body": extra_body}, 2)
+
+
+def test_response_performance_requires_measurements_not_accuracy():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    params = {"dataset_name": "omni-duplex-eval", "duplex_performance_only": True}
+    result = {"completed": 16, "duplex_metric_aggregation": "response"}
+    for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+        result[f"num_{metric}_samples"] = 16
+        suffix = "" if metric == "audio_rtf" else "_ms"
+        for percentile in (50, 95):
+            result[f"p{percentile}_{metric}{suffix}"] = 1.0
+    assert_result(result, params, 16)
+    result["num_audio_ttfp_samples"] = 0
+    with pytest.raises(AssertionError, match="No measured audio_ttfp"):
+        assert_result(result, params, 16)

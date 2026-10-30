@@ -285,9 +285,15 @@ def _read_hf(load_dataset: Callable[..., Any], dataset: str, want: str | None) -
         # passes ``None``) and implied physical split support that does not
         # exist, so it was removed.
         return load_dataset("parquet", data_files=dataset)
+    kwargs = {}
+    if not Path(dataset).exists() and "@" in dataset:
+        dataset, revision = dataset.rsplit("@", 1)
+        if not revision:
+            raise ValueError("Dataset revision must not be empty")
+        kwargs["revision"] = revision
     if want:
-        return load_dataset(dataset, split=want)
-    return load_dataset(dataset)
+        kwargs["split"] = want
+    return load_dataset(dataset, **kwargs)
 
 
 def _rows_from_hf(dataset: str, *, split: str | None) -> list[dict[str, Any]]:

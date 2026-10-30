@@ -547,6 +547,16 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
+    if params.get("duplex_performance_only"):
+        assert result.get("duplex_metric_aggregation") == "response", "Wrong duplex measurement unit"
+        for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+            assert result.get(f"num_{metric}_samples", 0) > 0, f"No measured {metric} samples"
+            suffix = "" if metric == "audio_rtf" else "_ms"
+            for percentile in (50, 95):
+                assert _is_finite_number(result.get(f"p{percentile}_{metric}{suffix}")), (
+                    f"Missing or invalid P{percentile} {metric}"
+                )
+        return
     if params.get("dataset_name") == "omni-duplex-eval":
         _assert_duplex_eval_result(result, params, num_prompt)
     if params.get("dataset_name") == "omniinteract":
@@ -673,6 +683,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "judge_server_params",
         "duplex_eval_accuracy_config",
         "duplex_eval_score_floor_hardware",
+        "duplex_performance_only",
         "name",
         "enable_negative_prompt",
         "random_request_config",
