@@ -252,7 +252,9 @@ def _validate_sigma(value: float, name: str) -> float:
     # Compare without float(): an int too large for a float would raise OverflowError, not a client error.
     if not 0 <= value <= 1:  # also rejects NaN and infinities
         raise ValueError(f"attention_sigma_schedule {name} must be in [0, 1], got {value!r}")
-    # Store other reals, such as numpy scalars, as float, so windows compare and serialize like parsed JSON.
+    # Store other reals, such as numpy scalars, as float so windows serialize like parsed JSON. Only float64
+    # or exactly representable values compare equal to the JSON window: float(np.float32(0.1)) is
+    # 0.10000000149011612, not 0.1, so such a window lands in a different (still correct) batch key.
     return value if type(value) in (int, float) else float(value)
 
 
