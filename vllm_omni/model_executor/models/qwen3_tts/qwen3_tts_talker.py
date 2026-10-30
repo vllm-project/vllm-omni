@@ -18,6 +18,7 @@ from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
@@ -1401,7 +1402,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Load speech tokenizer encoder weights from speech_tokenizer/
         # subfolder.  Skip decoder weights — the Talker only uses the
         # encoder for ref_audio encoding.
-        model_loader = DefaultModelLoader(self.vllm_config.load_config)
+        model_loader = get_model_loader(self.vllm_config.load_config)
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=self.vllm_config.model_config.revision,

@@ -14,7 +14,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader import DefaultModelLoader
+from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
@@ -784,7 +784,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         # via vLLM's weight loader (handles sharded safetensors, index
         # files, and all load formats).  AutoWeightsLoader matches
         # "decoder.*" weights to self.decoder and skips encoder weights.
-        model_loader = DefaultModelLoader(self.vllm_config.load_config)
+        model_loader = get_model_loader(self.vllm_config.load_config)
         source = DefaultModelLoader.Source(
             model_or_path=self.model_path,
             revision=self.vllm_config.model_config.revision,

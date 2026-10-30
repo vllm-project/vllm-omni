@@ -71,7 +71,10 @@ in the shared model implementation.
 DRVEXO registers a `drvexo_unified` local-only loader through the existing
 plugin and declares its Thinker/Talker/Codec topology in the pipeline
 registry. Stage-local JSON views resolve namespaced tensors in one root
-safetensors index; they do not materialize another checkpoint. The Thinker
+safetensors index; they do not materialize another checkpoint. Qwen3-TTS
+subfolder reads select the configured loader as well, so Talker, Codec and
+the optional first-frame decoder preserve the complete checkpoint format.
+The Thinker
 reuses upstream Qwen3 execution and adds an audio encoder/input projector
 and explicit final-prefill candidate scoring. Stage transitions remain owned
 by the pipeline/orchestrator. See [DRVEXO](../../models/drvexo_speech_8b.md)
