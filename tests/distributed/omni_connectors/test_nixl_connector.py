@@ -548,6 +548,61 @@ def reliable_claim_queries(producer, nixl_connector_cls, monkeypatch):
     monkeypatch.setattr(nixl_connector_cls, "_query_metadata_at", query)
 
 
+def test_stream_writes_are_fenced_once_per_accelerator_device(nixl_connector_cls, monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors import nixl_connector
+
+    synchronized = []
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_stream",
+        lambda device: types.SimpleNamespace(synchronize=lambda: synchronized.append(device)),
+    )
+    tensors = [types.SimpleNamespace(device=torch.device(name)) for name in ("cuda:0", "cuda:0", "cuda:1", "cpu")]
+
+    nixl_connector._wait_for_stream_writes(tensors)
+
+    assert sorted(map(str, synchronized)) == ["cuda:0", "cuda:1"]
+
+
+def test_put_fences_payload_writes_before_registration(producer, monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors import nixl_connector
+
+    events = []
+    monkeypatch.setattr(nixl_connector, "_wait_for_stream_writes", lambda tensors: events.append("fence"))
+    register = producer._agent.register_memory
+
+    def register_memory(descs, backends=None):
+        events.append("register")
+        register(descs, backends=backends)
+
+    monkeypatch.setattr(producer._agent, "register_memory", register_memory)
+
+    assert producer.put("0", "1", "fenced-put", torch.arange(4, dtype=torch.float32))[0]
+    assert events == ["fence", "register"]
+
+
+def test_get_fences_receive_memory_before_read(producer, consumer, ownership_copying_agent, monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors import nixl_connector
+
+    monkeypatch.setattr(consumer, "_metadata_query_timeout_ms", consumer._handshake_timeout_ms)
+    payload = torch.arange(6, dtype=torch.float32)
+    _, _, metadata = producer.put("0", "1", "fenced-get", payload)
+    events = []
+    monkeypatch.setattr(nixl_connector, "_wait_for_stream_writes", lambda tensors: events.append("fence"))
+    transfer = consumer._agent.transfer
+
+    def read(pairs):
+        events.append("read")
+        transfer(pairs)
+
+    monkeypatch.setattr(consumer._agent, "transfer", read)
+
+    actual, _ = consumer.get("0", "1", "fenced-get", metadata)
+
+    torch.testing.assert_close(actual, payload, rtol=0, atol=0)
+    assert events == ["fence", "read"]
+
+
 def test_put_publishes_its_handshake_endpoint(producer):
     ok, size, metadata = producer.put("0", "1", "req-0", torch.arange(8, dtype=torch.float32))
 

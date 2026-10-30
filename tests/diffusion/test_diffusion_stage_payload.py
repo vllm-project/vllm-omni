@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -627,9 +628,13 @@ def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
         kv_calls.append(state_request.request_id)
 
     runner.kv_transfer_manager.receive_multi_kv_cache_distributed = receive_kv
-    scheduled = SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(request_id=request.request_id, req=request, diffusion_kv_metadata=None)],
-        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    scheduled = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
     )
     states, new_ids = runner._update_states(scheduled)
     assert new_ids == [request.request_id]
@@ -637,8 +642,14 @@ def test_step_mode_receives_payload_before_kv_and_reuses_cached_state():
     assert len(connector.calls) == 1
     assert kv_calls == [request.request_id]
 
-    scheduled.scheduled_new_reqs = []
-    scheduled.scheduled_cached_reqs.request_ids = [request.request_id]
+    scheduled = DiffusionSchedulerOutput(
+        step_id=1,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(request_ids=[request.request_id]),
+        finished_req_ids=set(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
     cached_states, new_ids = runner._update_states(scheduled)
     assert cached_states == states
     assert new_ids == []

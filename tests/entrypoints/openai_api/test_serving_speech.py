@@ -12,6 +12,7 @@ import os
 import struct
 import wave
 from collections import OrderedDict
+from contextlib import asynccontextmanager, closing
 from dataclasses import FrozenInstanceError, replace
 from http import HTTPStatus
 from inspect import Signature, signature
@@ -32,6 +33,7 @@ from vllm.entrypoints.serve import create_error_response
 from vllm.entrypoints.serve.engine.protocol import ErrorInfo, ErrorResponse
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.outputs import CompletionOutput
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -44,6 +46,8 @@ from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.errors import InvalidPresetVoiceReferenceError, InvalidVoiceReferenceError
 from vllm_omni.entrypoints.openai.protocol.audio import (
+    AudioChunkMetadata,
+    AudioResponse,
     BatchSpeechRequest,
     CreateAudio,
     OpenAICreateAudioGenerateRequest,
@@ -55,6 +59,8 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 )
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
+    _audio_duration_seconds,
+    _audio_format_headers,
     _create_wav_header,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
@@ -72,10 +78,12 @@ from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator
+from vllm_omni.model_executor.models.cosyvoice3.pipeline import COSYVOICE3_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
 )
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
 from vllm_omni.model_executor.models.ming_tts.constants import (
     KEY_SPEAKER_EMBEDDING,
     KEY_SPEAKER_SAMPLE_RATES,
@@ -92,6 +100,27 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [None, "test-model", "alias", "missing-model"])
+async def test_diffusion_speech_checks_all_served_model_names(mocker, monkeypatch, tmp_path, model):
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    server = OmniOpenAIServingSpeech.for_diffusion(
+        diffusion_engine=mocker.MagicMock(),
+        model_name="test-model",
+        served_model_names=["test-model", "alias"],
+    )
+    generation = mocker.patch.object(server, "_create_diffusion_speech", new_callable=mocker.AsyncMock)
+    response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", model=model))
+    if model == "missing-model":
+        assert response.status_code == 404
+        assert json.loads(response.body)["error"]["type"] == "NotFoundError"
+        generation.assert_not_awaited()
+    else:
+        assert response is generation.return_value
+        generation.assert_awaited_once()
+
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +429,199 @@ def client(test_app):
     return TestClient(test_app)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enable_scale_out", [False, True], ids=["default", "scale-out"])
+async def test_server_worker_applies_speech_only_endpoint_restrictions(mocker: MockerFixture, enable_scale_out):
+    class FakeCompletionHandler:
+        def __init__(self):
+            self.create_completion = mocker.AsyncMock(return_value={"id": "cmpl", "choices": []})
+
+    class FakeChatHandler:
+        def __init__(self):
+            self.create_chat_completion = mocker.AsyncMock(return_value={"id": "chatcmpl", "choices": []})
+
+    class FakeChatBatchHandler:
+        def __init__(self):
+            batch_response = mocker.Mock()
+            batch_response.model_dump.return_value = {"id": "chatcmpl-batch", "choices": []}
+            self.create_batch_chat_completion = mocker.AsyncMock(return_value=batch_response)
+
+    class FakeSpeechHandler:
+        def __init__(self):
+            self.create_speech = mocker.AsyncMock(return_value=JSONResponse({"ok": True}))
+            batch_response = mocker.Mock()
+            batch_response.model_dump.return_value = {"items": []}
+            self.create_speech_batch = mocker.AsyncMock(return_value=batch_response)
+            self.shutdown = mocker.Mock()
+
+    class FakeEngine:
+        endpoint_restrictions = COSYVOICE3_PIPELINE.endpoint_restrictions
+        stage_configs: list[object] = []
+
+        def __init__(self):
+            self.generate = mocker.AsyncMock()
+
+        async def get_supported_tasks(self):
+            return ("generate",)
+
+    engine = FakeEngine()
+    completion_handler = FakeCompletionHandler()
+    chat_handler = FakeChatHandler()
+    chat_batch_handler = FakeChatBatchHandler()
+    speech_handler = FakeSpeechHandler()
+    unexpected_dispatch_error = ErrorResponse(
+        error=ErrorInfo(message="Generation handler must not be reached", type="BadRequestError", code=400)
+    )
+    sibling_handlers = {
+        "openai_serving_responses": SimpleNamespace(
+            create_responses=mocker.AsyncMock(return_value=unexpected_dispatch_error)
+        ),
+        "anthropic_serving_messages": SimpleNamespace(
+            create_messages=mocker.AsyncMock(return_value=unexpected_dispatch_error)
+        ),
+        "serving_tokens": SimpleNamespace(serve_tokens=mocker.AsyncMock(return_value=unexpected_dispatch_error)),
+    }
+    captured_app = None
+    serve_started = asyncio.Event()
+    http_shutdown = asyncio.Event()
+
+    @asynccontextmanager
+    async def fake_build_async_omni(*args, **kwargs):
+        del args, kwargs
+        yield engine
+
+    async def fake_init_app_state(engine_client, state, args):
+        del args
+        state.engine_client = engine_client
+        state.openai_serving_chat = chat_handler
+        state.openai_serving_chat_batch = chat_batch_handler
+        state.openai_serving_completion = completion_handler
+        state.openai_serving_speech = speech_handler
+        for name, handler in sibling_handlers.items():
+            setattr(state, name, handler)
+
+    async def fake_serve_http(asgi_app, **kwargs):
+        nonlocal captured_app
+        del kwargs
+        captured_app = asgi_app._inner
+        serve_started.set()
+
+        async def wait_for_shutdown():
+            await http_shutdown.wait()
+
+        return asyncio.create_task(wait_for_shutdown())
+
+    mocker.patch.object(api_server_module, "build_async_omni", fake_build_async_omni)
+    mocker.patch.object(api_server_module, "omni_init_app_state", fake_init_app_state)
+    mocker.patch.object(api_server_module, "serve_http", fake_serve_http)
+    mocker.patch.object(api_server_module.STORAGE_MANAGER, "start", new=mocker.AsyncMock())
+    mocker.patch.object(api_server_module.openai_app_state, "_get_vllm_config", new=mocker.AsyncMock(return_value=None))
+    mocker.patch.object(api_server_module, "get_uvicorn_log_config", return_value=None)
+    args = api_server_module.make_arg_parser(FlexibleArgumentParser()).parse_args([])
+    args.enable_scale_out = enable_scale_out
+    # Real upstream registration is essential: an empty FastAPI stub cannot
+    # expose sibling generation routes that bypass completion/chat admission.
+    upstream_app = api_server_module.build_openai_app(args, ("generate",))
+    upstream_post_paths = {
+        route.path for route in upstream_app.routes if hasattr(route, "methods") and "POST" in (route.methods or ())
+    }
+    assert {"/v1/responses", "/v1/messages", "/invocations"} <= upstream_post_paths
+    # Token-route registration varies across upstream versions; the requests
+    # below must be rejected whether the route was originally registered or not.
+    sock = mocker.Mock()
+    worker_task = asyncio.create_task(api_server_module.omni_run_server_worker("127.0.0.1:0", sock, args))
+    await asyncio.wait_for(serve_started.wait(), timeout=2)
+
+    try:
+        assert captured_app is not None
+        # The worker has already initialized app state. Do not run a second
+        # ASGI lifespan here: upstream shutdown deletes state before the
+        # worker's own shutdown can inspect and close the speech handler.
+        with closing(TestClient(captured_app)) as client:
+            completion_response = client.post(
+                "/v1/completions",
+                json={"model": "cosyvoice3", "prompt": "hello"},
+            )
+            chat_response = client.post(
+                "/v1/chat/completions",
+                json={"model": "cosyvoice3", "messages": [{"role": "user", "content": "hello"}]},
+            )
+            chat_batch_response = client.post(
+                "/v1/chat/completions/batch",
+                json={
+                    "model": "cosyvoice3",
+                    "messages": [
+                        [{"role": "user", "content": "hello"}],
+                        [{"role": "user", "content": "another request"}],
+                    ],
+                },
+            )
+            sibling_payloads = {
+                "/v1/responses": {"model": "cosyvoice3", "input": "hello"},
+                "/v1/messages": {
+                    "model": "cosyvoice3",
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+                "/invocations": {"model": "cosyvoice3", "prompt": "hello", "max_tokens": 1},
+                "/inference/v1/generate": {
+                    "model": "cosyvoice3",
+                    "token_ids": [151645],
+                    "sampling_params": {"max_tokens": 1},
+                },
+            }
+            for path, payload in sibling_payloads.items():
+                response = client.post(path, json=payload)
+                assert response.status_code == 400, path
+                body = response.json()
+                assert body["error"]["type"] == "BadRequestError", path
+                assert body["error"]["code"] == 400, path
+                assert "CosyVoice3 does not support" in body["error"]["message"], path
+            speech_response = client.post(
+                "/v1/audio/speech",
+                json={"model": "cosyvoice3", "input": "hello", "voice": "alloy"},
+            )
+            speech_batch_response = client.post(
+                "/v1/audio/speech/batch",
+                json={"model": "cosyvoice3", "items": [{"input": "hello"}], "voice": "alloy"},
+            )
+    finally:
+        http_shutdown.set()
+        await asyncio.wait_for(worker_task, timeout=2)
+
+    assert completion_response.status_code == 400
+    completion_body = completion_response.json()
+    assert completion_body["error"]["type"] == "BadRequestError"
+    assert completion_body["error"]["code"] == 400
+    assert "Completions API" in completion_body["error"]["message"]
+
+    assert chat_response.status_code == 400
+    chat_body = chat_response.json()
+    assert chat_body["error"]["type"] == "BadRequestError"
+    assert chat_body["error"]["code"] == 400
+    assert "Chat Completions API" in chat_body["error"]["message"]
+
+    assert chat_batch_response.status_code == 400
+    chat_batch_body = chat_batch_response.json()
+    assert chat_batch_body["error"]["type"] == "BadRequestError"
+    assert chat_batch_body["error"]["code"] == 400
+    assert "Batch Chat Completions API" in chat_batch_body["error"]["message"]
+
+    assert speech_response.status_code == 200
+    assert speech_batch_response.status_code == 200
+    completion_handler.create_completion.assert_not_awaited()
+    chat_handler.create_chat_completion.assert_not_awaited()
+    chat_batch_handler.create_batch_chat_completion.assert_not_awaited()
+    sibling_handlers["openai_serving_responses"].create_responses.assert_not_awaited()
+    sibling_handlers["anthropic_serving_messages"].create_messages.assert_not_awaited()
+    sibling_handlers["serving_tokens"].serve_tokens.assert_not_awaited()
+    speech_handler.create_speech.assert_awaited_once()
+    speech_handler.create_speech_batch.assert_awaited_once()
+    speech_handler.shutdown.assert_called_once()
+    engine.generate.assert_not_awaited()
+    sock.close.assert_called_once()
+
+
 class TestSpeechAPI:
     @pytest.fixture(autouse=True)
     def _mock_upload_io(self, mocker: MockerFixture):
@@ -431,6 +653,13 @@ class TestSpeechAPI:
         assert response.headers["content-type"] == "audio/wav"
         assert len(response.content) > 0
 
+    def test_create_speech_forwards_watermarking_opt_out(self, client):
+        payload = {"input": "Hello world", "model": "tts-model", "voice": "alloy", "watermarking": False}
+        response = client.post("/v1/audio/speech", json=payload)
+        assert response.status_code == 200
+        generate = client.app.state.openai_serving_speech.engine_client.generate
+        assert generate.call_args.kwargs["watermarking"] is False
+
     def test_create_speech_includes_token_usage_and_detail_headers(self, client):
         payload = {
             "input": "Hello world",
@@ -445,6 +674,62 @@ class TestSpeechAPI:
         assert response.headers["x-vllm-omni-total-tokens"] == "7"
         assert response.headers["x-vllm-omni-input-text-tokens"] == "2"
         assert response.headers["x-vllm-omni-input-audio-tokens"] == "0"
+
+    def test_create_speech_includes_audio_duration_header(self, client):
+        payload = {
+            "input": "Hello world",
+            "model": "tts-model",
+            "voice": "alloy",
+            "response_format": "wav",
+        }
+        response = client.post("/v1/audio/speech", json=payload)
+        assert response.status_code == 200
+        # create_mock_audio_output_for_test emits 24000 samples at 24 kHz.
+        assert response.headers["x-audio-duration-seconds"] == "1.000"
+        exposed = {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
+        assert "x-audio-duration-seconds" in exposed
+
+    def test_audio_format_headers_expose_duration_alongside_format(self):
+        headers = _audio_format_headers({"sample_rate": 24000, "channels": 1}, 1.5)
+        assert headers["X-Audio-Duration-Seconds"] == "1.500"
+        exposed = {h.strip() for h in headers["Access-Control-Expose-Headers"].split(",")}
+        assert exposed == {"X-Audio-Sample-Rate", "X-Audio-Channels", "X-Audio-Duration-Seconds"}
+
+    def test_audio_format_headers_omit_absent_duration(self):
+        headers = _audio_format_headers({"sample_rate": 24000, "channels": 1})
+        assert "X-Audio-Duration-Seconds" not in headers
+        assert headers["Access-Control-Expose-Headers"] == "X-Audio-Sample-Rate, X-Audio-Channels"
+
+    def test_audio_format_headers_report_zero_duration(self):
+        headers = _audio_format_headers({"sample_rate": 24000, "channels": 1}, 0.0)
+        assert headers["X-Audio-Duration-Seconds"] == "0.000"
+
+    def test_audio_duration_seconds_uses_encoder_frame_count(self):
+        response = AudioResponse(
+            audio_data=b"",
+            media_type="audio/wav",
+            audio_metadata=AudioChunkMetadata(format="wav", sample_rate_hz=24000, frame_count=36000, channels=1),
+        )
+        assert _audio_duration_seconds(response) == pytest.approx(1.5)
+
+    def test_audio_duration_seconds_follows_speed_and_resampling(self, mocker: MockerFixture):
+        # 1 s at 24 kHz, sped up 2x and resampled to 16 kHz, is 0.5 s of audio.
+        # This is why the duration comes from the encoder metadata rather than
+        # from the pre-encode waveform.
+        mocker.patch("soundfile.write")
+        audio_obj = CreateAudio(
+            audio_tensor=np.random.rand(24000).astype(np.float32),
+            sample_rate=24000,
+            output_sample_rate=16000,
+            response_format="wav",
+            speed=2.0,
+            base64_encode=False,
+        )
+        response = AudioMixin().create_audio(audio_obj)
+        assert _audio_duration_seconds(response) == pytest.approx(0.5, abs=1e-3)
+
+    def test_audio_duration_seconds_without_metadata_is_unknown(self):
+        assert _audio_duration_seconds(AudioResponse(audio_data=b"", media_type="audio/wav")) is None
 
     def test_build_speech_usage_headers_uses_usage_and_detail_field_names(self):
         usage = SpeechTokenUsage(
@@ -602,6 +887,7 @@ class TestSpeechAPI:
         assert response.json()["voices"] == ["alice", "bob", "carol", "default"]
         assert response.json()["uploaded_voices"] == [
             {
+                "id": "carol",
                 "name": "Carol",
                 "consent": "",
                 "created_at": 1,
@@ -955,13 +1241,70 @@ class TestSpeechAPI:
         assert b"Invalid voice" in response.body
 
     @pytest.mark.asyncio
-    async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
-        """Test diffusion parameters reach StepScheduler as standard fields."""
+    async def test_diffusion_speech_reports_audio_format_and_duration_na(self, mocker: MockerFixture):
+        """Diffusion servers report the same audio headers as the AR path."""
+        mock_engine = mocker.MagicMock()
+        mock_engine.default_sampling_params_list = [OmniDiffusionSamplingParams(extra_args={})]
+
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+
+        response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", response_format="pcm"))
+
+        assert response.status_code == 200
+        # create_mock_audio_output_for_test emits 24000 samples at 24 kHz.
+        assert response.headers["x-audio-sample-rate"] == "24000"
+        assert response.headers["x-audio-channels"] == "1"
+        assert response.headers["x-audio-duration-seconds"] == "1.000"
+        exposed = {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
+        assert exposed == {"x-audio-sample-rate", "x-audio-channels", "x-audio-duration-seconds"}
+
+    async def test_create_diffusion_speech_forwards_watermarking_opt_out(self, mocker: MockerFixture):
+        """Ensure that diffusion speech forward watermark opt out correctly."""
+        mock_engine = mocker.MagicMock()
+        mock_engine.default_sampling_params_list = [OmniDiffusionSamplingParams()]
+
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        await server.create_speech(OpenAICreateSpeechRequest(input="Hello", watermarking=False))
+        assert mock_engine.generate.call_args.kwargs["watermarking"] is False
+
+    @pytest.mark.parametrize(
+        ("request_seed", "extra_seed", "expected_seed"),
+        [
+            (None, None, 99),
+            (None, 17, 17),
+            (42, 17, 42),
+            (None, -1, -1),
+            (None, -(2**63), -(2**63)),
+            (-1, 17, -1),
+            (-(2**63), 17, -(2**63)),
+        ],
+    )
+    @pytest.mark.parametrize("default_legacy_seed", [None, 3])
+    async def test_create_diffusion_speech_extra_params(
+        self,
+        mocker: MockerFixture,
+        request_seed,
+        extra_seed,
+        expected_seed,
+        default_legacy_seed,
+    ):
+        """Test diffusion speech extra_params and seed propagation."""
         # Mock the engine client
         mock_engine = mocker.MagicMock()
 
         # Mock default sampling params
-        mock_sampling_param = OmniDiffusionSamplingParams(extra_args={"existing_arg": "value"})
+        default_extra = {"existing_arg": "value"}
+        if default_legacy_seed is not None:
+            default_extra["seed"] = default_legacy_seed
+        mock_sampling_param = OmniDiffusionSamplingParams(seed=99, extra_args=default_extra.copy())
         mock_engine.default_sampling_params_list = [mock_sampling_param]
 
         # Mock generate to yield a valid OmniRequestOutput
@@ -977,14 +1320,18 @@ class TestSpeechAPI:
             server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
         )
 
+        extra_params = {
+            "new_arg": 123,
+            "existing_arg": "new_value",
+            "num_inference_steps": 12,
+            "guidance_scale": 7.0,
+        }
+        if extra_seed is not None:
+            extra_params["seed"] = extra_seed
         req = OpenAICreateSpeechRequest(
             input="Hello",
-            extra_params={
-                "new_arg": 123,
-                "existing_arg": "new_value",
-                "num_inference_steps": 12,
-                "guidance_scale": 7.0,
-            },
+            seed=request_seed,
+            extra_params=extra_params,
         )
 
         response = await server.create_speech(req)
@@ -1002,12 +1349,20 @@ class TestSpeechAPI:
 
         # Verify it was deepcopied and updated
         assert passed_params is not mock_engine.default_sampling_params_list
-        assert passed_params[0].extra_args == {
+        assert passed_params[0].seed == expected_seed
+        expected_extra = {
             "existing_arg": "new_value",
             "new_arg": 123,
             "num_inference_steps": 12,
             "guidance_scale": 7.0,
         }
+        if default_legacy_seed is not None:
+            expected_extra["seed"] = (
+                expected_seed if request_seed is not None or extra_seed is not None else default_legacy_seed
+            )
+        assert passed_params[0].extra_args == expected_extra
+        assert mock_sampling_param.seed == 99
+        assert mock_sampling_param.extra_args == default_extra
         assert passed_params[0].num_inference_steps == 12
         assert passed_params[0].guidance_scale == 7.0
 
@@ -1076,13 +1431,30 @@ class TestSpeechAPI:
         ("extra_params", "expected_message"),
         [
             ({"num_inference_steps": "invalid"}, "num_inference_steps must be an integer"),
+            ({"num_inference_steps": 0}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": -1}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": 0.5}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": 12.5}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": True}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": False}, "num_inference_steps must be a positive integer"),
+            ({"num_inference_steps": float("nan")}, "num_inference_steps must be an integer"),
+            ({"num_inference_steps": float("inf")}, "num_inference_steps must be an integer"),
+            ({"num_inference_steps": float("-inf")}, "num_inference_steps must be an integer"),
             ({"guidance_scale": "invalid"}, "guidance_scale must be a number"),
+            ({"guidance_scale": float("nan")}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": float("inf")}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": float("-inf")}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": "NaN"}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": "Infinity"}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": True}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": False}, "guidance_scale must be a finite number"),
+            ({"guidance_scale": 10**400}, "guidance_scale must be a number"),
         ],
     )
     async def test_create_diffusion_speech_rejects_invalid_scheduler_params(
         self,
         mocker: MockerFixture,
-        extra_params: dict[str, str],
+        extra_params: dict[str, object],
         expected_message: str,
     ) -> None:
         mock_engine = mocker.MagicMock()
@@ -1094,6 +1466,46 @@ class TestSpeechAPI:
         assert response.status_code == 400
         assert expected_message in response.body.decode()
         mock_engine.generate.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("extra_params", "expected_steps", "expected_guidance"),
+        [
+            ({}, 32, 2.0),
+            ({"num_inference_steps": 1, "guidance_scale": 0.0}, 1, 0.0),
+            ({"num_inference_steps": "12", "guidance_scale": "7.0"}, 12, 7.0),
+            ({"num_inference_steps": 12.0, "guidance_scale": -1.0}, 12, -1.0),
+        ],
+    )
+    async def test_create_diffusion_speech_accepts_valid_scheduler_params(
+        self,
+        mocker: MockerFixture,
+        extra_params: dict[str, object],
+        expected_steps: int,
+        expected_guidance: float,
+    ) -> None:
+        defaults = OmniDiffusionSamplingParams(num_inference_steps=32, guidance_scale=2.0)
+        mock_engine = mocker.MagicMock()
+        mock_engine.default_sampling_params_list = [defaults]
+
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        mocker.patch.object(
+            server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
+        )
+
+        response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", extra_params=extra_params))
+
+        assert response.status_code == 200
+        mock_engine.generate.assert_called_once()
+        sampling = mock_engine.generate.call_args.kwargs["sampling_params_list"][0]
+        assert sampling.num_inference_steps == expected_steps
+        assert sampling.guidance_scale == expected_guidance
+        assert defaults.num_inference_steps == 32
+        assert defaults.guidance_scale == 2.0
 
 
 class TestTTSMethods:
@@ -4132,6 +4544,15 @@ class TestMergeBatchItem:
         merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
         assert merged.response_format == "mp3"
 
+    def test_watermarking_merge(self):
+        """Per-item watermarking should override the batch default only when set."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", watermarking=True), SpeechBatchItem(input="bye")],
+            watermarking=False,
+        )
+        merged = [OmniOpenAIServingSpeech._merge_batch_item(batch, item) for item in batch.items]
+        assert [request.watermarking for request in merged] == [True, False]
+
     def test_stream_always_false(self):
         """Merged requests should always have stream=False."""
         batch = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
@@ -5464,8 +5885,8 @@ class TestMingTTSServing:
         assert sampling_params.max_tokens == 8
 
 
-@pytest.fixture
-def ming_flash_omni_tts_server(mocker: MockerFixture):
+@pytest.fixture(params=["ming_tts", "ming3_tts"], ids=["ming2", "ming3"])
+def ming_flash_omni_tts_server(request: pytest.FixtureRequest, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.tts_adapters.base.load_supported_speakers",
         return_value=set(),
@@ -5487,7 +5908,7 @@ def ming_flash_omni_tts_server(mocker: MockerFixture):
     mock_engine_client.generate = mocker.MagicMock(return_value="generator")
     mock_engine_client.stage_configs = [
         SimpleNamespace(
-            engine_args=SimpleNamespace(model_stage="ming_tts"),
+            engine_args=SimpleNamespace(model_stage=request.param),
             tts_args={},
         )
     ]
@@ -5509,11 +5930,23 @@ class TestMingFlashOmniTTSServing:
         assert error is not None
         assert "ref_text" in error
 
-    def test_validate_ming_flash_omni_tts_rejects_ref_audio(self, ming_flash_omni_tts_server):
+    def test_validate_ming_ref_audio_support(self, ming_flash_omni_tts_server, mocker: MockerFixture):
         request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
         error = ming_flash_omni_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_audio" in error
+        if ming_flash_omni_tts_server._tts_model_type == "ming_flash_omni_tts":
+            assert error is not None
+            assert "not yet supported" in error
+        else:
+            assert error is None
+            ming_flash_omni_tts_server._resolve_ref_audio_array = mocker.AsyncMock(
+                return_value=([0.1, -0.1], 16000, "cache-key")
+            )
+            asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
+            prompt = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+            reference = unpack_reference_audio(prompt["additional_information"])[0]
+            assert reference["sample_rate"] == 16000
+            torch.testing.assert_close(reference["samples"], torch.tensor([0.1, -0.1]))
+            assert prompt["additional_information"]["speaker_conditioning"] == "prompt"
 
     def test_ming_flash_omni_tts_adapter_builds_prompt(self, ming_flash_omni_tts_server):
         request = OpenAICreateSpeechRequest(input="Hello", voice="test")
@@ -5522,7 +5955,15 @@ class TestMingFlashOmniTTSServing:
         prompt = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["prompt"]
         assert prompt["prompt_token_ids"] == [0]
         assert prompt["additional_information"]["text"] == "Hello"
-        assert prompt["additional_information"]["voice_name"] == "test"
+        info = prompt["additional_information"]
+        if ming_flash_omni_tts_server._tts_model_type == "ming_flash_omni_tts":
+            assert info["voice_name"] == "test"
+            assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] is None
+            assert "speaker_conditioning" not in info
+        else:
+            assert info["voice_name"] is None
+            assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "test"
+            assert info["speaker_conditioning"] == "mute"
 
 
 class TestTTSAsyncOffloading:
@@ -6158,6 +6599,31 @@ class TestTTSAsyncOffloading:
         assert payload["usage"]["output_tokens"] == 191
         assert payload["usage"]["input_tokens"] == 2
         assert payload["usage"]["total_tokens"] == 193
+
+    @pytest.mark.asyncio
+    async def test_qwen3_tts_base_sse_done_reports_emitted_audio_duration(
+        self, qwen3_tts_server, qwen3_stage_output, mocker: MockerFixture
+    ):
+        async def generator():
+            yield qwen3_stage_output("req-base-sse-duration", "stop")
+
+        mocker.patch.object(qwen3_tts_server, "_count_usage_text_tokens", return_value=2)
+        events = [
+            event
+            async for event in qwen3_tts_server._generate_audio_sse_events(
+                generator(),
+                "req-base-sse-duration",
+                request=OpenAICreateSpeechRequest(input="Hello", task_type="Base"),
+                tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]},
+            )
+        ]
+
+        assert any("event: speech.audio.delta" in event for event in events)
+        assert not any("event: speech.audio.error" in event for event in events)
+        done_event = next(event for event in events if "event: speech.audio.done" in event)
+        payload = json.loads(next(line for line in done_event.splitlines() if line.startswith("data: "))[6:])
+        # create_mock_audio_output_for_test emits 24000 samples at 24 kHz.
+        assert payload["duration"] == 1.0
 
     @pytest.mark.asyncio
     async def test_sse_error_before_audio_is_not_marked_partial(self, qwen3_tts_server):

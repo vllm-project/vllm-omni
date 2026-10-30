@@ -150,33 +150,22 @@ class StatelessFirstGraphs:
         self._decode = decode
         if not batch_sizes:
             return
-        self.compiled = torch.compile(
-            decode,
-            dynamic=False,
-            fullgraph=True,
-            options={"triton.cudagraphs": False, "epilogue_fusion": False, "emulate_precision_casts": True},
-        )
         device = next(codec.parameters()).device
         stream = torch.cuda.Stream(device=device)
         # Buckets replay serially and copy their outputs before the next replay.
         # Share a first-frame-only pool, separate from Talker/MTP allocations.
         pool = torch.cuda.graph_pool_handle()
         stream.wait_stream(torch.cuda.current_stream(device))
-        # Each configured bucket needs a compiled specialization. Scope the
-        # cache bound to capture instead of changing the process-wide default.
-        with (
-            torch._dynamo.config.patch(recompile_limit=max(torch._dynamo.config.recompile_limit, len(batch_sizes))),
-            torch.cuda.stream(stream),
-        ):
+        with torch.cuda.stream(stream):
             for batch in reversed(self.batch_sizes):
                 codes = torch.zeros(num_quantizers, batch, 1, dtype=torch.long, device=device)
                 lengths = torch.ones(batch, dtype=torch.long, device=device)
                 for _ in range(max(1, warmups)):
-                    self.compiled(codes, lengths)
+                    decode(codes, lengths)
                 stream.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream, pool=pool):
-                    pcm = self.compiled(codes, lengths)
+                    pcm = decode(codes, lengths)
                 self.entries[batch] = graph, codes, pcm
         torch.cuda.current_stream(device).wait_stream(stream)
         stream.synchronize()

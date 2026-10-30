@@ -12,6 +12,8 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+from .triton_launch import cuda_pdl_launch_kwargs
+
 _gdc_launch = tl.extra.cuda.gdc_launch_dependents
 _gdc_wait = tl.extra.cuda.gdc_wait
 libdevice = tl.extra.cuda.libdevice
@@ -525,8 +527,8 @@ def sample_attend(
         group,
         attend,
         USE_PDL=_USE_PDL,
-        launch_pdl=_USE_PDL,
         num_warps=num_warps,
+        **cuda_pdl_launch_kwargs(_USE_PDL),
     )
     return (out, residual) if attend else None
 
@@ -682,3 +684,61 @@ def mtp_epilogue(
         num_warps=4,
     )
     return out_embeds, out_codes
+
+
+@triton.jit
+def _add_layer_norm(
+    x_ptr,
+    u_ptr,
+    w_ptr,
+    b_ptr,
+    res_ptr,
+    out_ptr,
+    N: tl.constexpr,
+    eps,
+    BN: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    """Residual add rounded to the residual dtype, then LayerNorm (FP32 statistics)."""
+    if USE_PDL:
+        _gdc_wait()
+        _gdc_launch()
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BN)
+    m = cols < N
+    x = tl.load(x_ptr + row * N + cols, m, 0.0).to(tl.float32)
+    r = (x + tl.load(u_ptr + row * N + cols, m, 0.0).to(tl.float32)).to(res_ptr.dtype.element_ty)
+    tl.store(res_ptr + row * N + cols, r, m)
+    x = r.to(tl.float32)
+    mean = tl.sum(x, 0) / N
+    xc = tl.where(m, x - mean, 0.0)
+    y = xc * tl.rsqrt(tl.sum(xc * xc, 0) / N + eps) * tl.load(w_ptr + cols, m, 0.0).to(tl.float32)
+    y = y + tl.load(b_ptr + cols, m, 0.0).to(tl.float32)
+    tl.store(out_ptr + row * N + cols, y.to(out_ptr.dtype.element_ty), m)
+
+
+def add_layer_norm(
+    x: torch.Tensor, update: torch.Tensor, norm: torch.nn.LayerNorm
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(r, norm(r))`` with ``r = x + update``, in one launch (the Local tail's residual adds)."""
+    N = x.shape[-1]
+    assert x.is_contiguous() and update.is_contiguous() and update.shape == x.shape
+    assert norm.weight is not None and norm.bias is not None and norm.weight.shape == (N,)
+    res = torch.empty_like(x)
+    out = torch.empty_like(x)
+    if x.numel():
+        _add_layer_norm[(x.numel() // N,)](
+            x,
+            update,
+            norm.weight,
+            norm.bias,
+            res,
+            out,
+            N,
+            float(norm.eps),
+            triton.next_power_of_2(N),
+            USE_PDL=_USE_PDL,
+            num_warps=4 if N <= 2048 else 8,
+            **cuda_pdl_launch_kwargs(_USE_PDL),
+        )
+    return res, out

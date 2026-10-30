@@ -312,6 +312,25 @@ def test_resolve_native_vaes_uses_pinned_revision_and_only_vae_patterns(tmp_path
     assert not (model_root / "conversion.json").exists()
 
 
+def test_public_v2_without_provenance_uses_the_native_vae_compatibility_pin(tmp_path, monkeypatch):
+    """Public V2 revision 3da2ddfe has no provenance.json."""
+    (tmp_path / "fastvideo_inference.json").write_text(json.dumps(_fastvideo_metadata()))
+    calls = {}
+
+    def download(**kwargs):
+        calls.update(kwargs)
+        return "/base/snapshot"
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint.download_weights_from_hf_specific", download
+    )
+    result = FastH3CheckpointSpec.from_metadata(_fastvideo_metadata()).resolve_native_vaes(tmp_path)
+    assert str(result) == "/base/snapshot/FL2VA"
+    assert calls["revision"] == "9bfb6693f2cf6de171db46d1aa586f67d773a1da"
+    assert calls["model_name_or_path"] == FASTH3_BASE_MODEL
+    assert calls["allow_patterns"] == ["FL2VA/video_vae/**", "FL2VA/audio_vae/**"]
+
+
 @pytest.mark.parametrize(
     "base_model",
     [
@@ -399,6 +418,35 @@ def test_native_local_model_root_keeps_partition_layout(tmp_path):
 
     assert is_minimax_h3_modular(str(root)) is False
     assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
+
+
+def test_native_local_model_root_with_modular_index_keeps_partition_layout(tmp_path):
+    # The official MiniMaxAI/MiniMax-H3 repository ships modular_model_index.json at its root.
+    root = tmp_path / "MiniMax-H3"
+    (root / "FL2VA" / "text_encoder").mkdir(parents=True)
+    (root / "FL2VA" / "text_encoder" / "config.json").write_text("{}", encoding="utf-8")
+    (root / "FL2VA" / "model_index.json").write_text("{}", encoding="utf-8")
+    (root / "Ref2VA").mkdir()
+    (root / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
+        encoding="utf-8",
+    )
+
+    assert is_minimax_h3_modular(str(root)) is False
+    assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
+    assert resolve_minimax_h3_diffusion_model_path(str(root), None, "fl2va") == str(root / "FL2VA")
+
+
+def test_empty_partition_dirs_do_not_override_modular_marker(tmp_path):
+    root = tmp_path / "FastH3"
+    (root / "FL2VA").mkdir(parents=True)
+    (root / "Ref2VA").mkdir()
+    (root / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
+        encoding="utf-8",
+    )
+
+    assert is_minimax_h3_modular(str(root)) is True
 
 
 def test_diffusion_resolver_returns_local_modular_root_without_partition_files(tmp_path):
@@ -527,6 +575,7 @@ def _load_fixture(
         rope_inv_freq_len=2,
     )
     model._diffusers_weights = diffusers_weights
+    model._serialized_weight_map = {}
     model._rope_theta = 10000.0
     qkv_calls: list[tuple[str | None, torch.Tensor]] = []
     fc1_calls: list[tuple[int, torch.Tensor]] = []
@@ -591,6 +640,36 @@ def test_diffusers_load_weights_uses_shape_aware_qkv_and_mlp_slices():
     )
 
 
+def test_diffusers_fp8_scales_follow_qkv_and_gate_up_weights():
+    model, _, _ = _load_fixture(diffusers_weights=True)
+    qkv = model.blocks[0].attn.qkv_proj
+    fc1 = model.blocks[0].mlp.fc1
+    qkv.weight_scale = nn.Parameter(torch.zeros(12), requires_grad=False)
+    fc1.weight_scale = nn.Parameter(torch.zeros(6), requires_grad=False)
+
+    def load_qkv(param, value, shard):
+        assert value.shape == (4,)
+        offset = {"q": 0, "k": 4, "v": 8}[shard]
+        param.data[offset : offset + 4].copy_(value)
+
+    def load_fc1(param, value, shard):
+        assert value.shape == (3,)
+        param.data[shard * 3 : (shard + 1) * 3].copy_(value)
+
+    qkv.weight_scale.weight_loader = load_qkv
+    fc1.weight_scale.weight_loader = load_fc1
+    scales = torch.arange(1, 13, dtype=torch.float32).reshape(12, 1)
+    model.load_weights(
+        [
+            (f"transformer_blocks.0.attn.to_{part}.weight_scale", value)
+            for part, value in zip(("q", "k", "v"), scales.chunk(3), strict=True)
+        ]
+        + [("transformer_blocks.0.ff.net.0.proj.weight_scale", scales[:6])]
+    )
+    torch.testing.assert_close(qkv.weight_scale, scales.flatten())
+    torch.testing.assert_close(fc1.weight_scale, torch.tensor([4.0, 5.0, 6.0, 1.0, 2.0, 3.0]))
+
+
 def test_native_load_weights_keeps_grouped_qkv_and_gate_first_layouts():
     model, qkv_calls, fc1_calls = _load_fixture(diffusers_weights=False)
     grouped_qkv = torch.arange(36, dtype=torch.float32).reshape(12, 3)
@@ -619,6 +698,73 @@ def test_native_load_weights_keeps_grouped_qkv_and_gate_first_layouts():
     torch.testing.assert_close(model.blocks[0].attn.qkv_proj.weight, expected_qkv)
     torch.testing.assert_close(model.blocks[0].mlp.fc1.weight, fc1)
     assert torch.equal(model.rope.inv_freq, torch.zeros(2))
+
+
+def test_native_load_weights_reorders_grouped_qkv_scales():
+    model, _, _ = _load_fixture(diffusers_weights=False)
+    qkv = model.blocks[0].attn.qkv_proj
+    qkv.weight_scale = nn.Parameter(torch.zeros(12, 2), requires_grad=False)
+
+    def scale_loader(param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str | None = None) -> None:
+        assert shard_id is None
+        param.data.copy_(loaded_weight)
+
+    qkv.weight_scale.weight_loader = scale_loader
+    grouped_scale = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+    loaded = model.load_weights([("blocks.0.attn.qkv_proj.weight_scale", grouped_scale)])
+
+    expected = torch.cat(
+        (
+            grouped_scale[:2],
+            grouped_scale[6:8],
+            grouped_scale[2:4],
+            grouped_scale[8:10],
+            grouped_scale[4:6],
+            grouped_scale[10:],
+        )
+    )
+    assert loaded == {"blocks.0.attn.qkv_proj.weight_scale"}
+    torch.testing.assert_close(qkv.weight_scale, expected)
+
+
+def test_native_load_weights_passes_through_per_tensor_qkv_scale():
+    model, _, _ = _load_fixture(diffusers_weights=False)
+    qkv = model.blocks[0].attn.qkv_proj
+    qkv.weight_scale = nn.Parameter(torch.zeros(1), requires_grad=False)
+    calls = []
+
+    def scale_loader(param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str | None = None) -> None:
+        assert shard_id is None
+        calls.append(loaded_weight.clone())
+        param.data.copy_(loaded_weight.reshape_as(param))
+
+    qkv.weight_scale.weight_loader = scale_loader
+    scale = torch.tensor(0.5)
+    loaded = model.load_weights([("blocks.0.attn.qkv_proj.weight_scale", scale)])
+
+    assert loaded == {"blocks.0.attn.qkv_proj.weight_scale"}
+    assert len(calls) == 1
+    torch.testing.assert_close(qkv.weight_scale, torch.tensor([0.5]))
+
+
+def test_native_load_weights_passes_through_per_tensor_fc1_scale():
+    model, _, _ = _load_fixture(diffusers_weights=False)
+    fc1 = model.blocks[0].mlp.fc1
+    fc1.weight_scale = nn.Parameter(torch.zeros(1), requires_grad=False)
+    calls = []
+
+    def scale_loader(param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int | None = None) -> None:
+        assert shard_id is None
+        calls.append(loaded_weight.clone())
+        param.data.copy_(loaded_weight.reshape_as(param))
+
+    fc1.weight_scale.weight_loader = scale_loader
+    scale = torch.tensor(0.25)
+    loaded = model.load_weights([("blocks.0.mlp.fc1.weight_scale", scale)])
+
+    assert loaded == {"blocks.0.mlp.fc1.weight_scale"}
+    assert len(calls) == 1
+    torch.testing.assert_close(fc1.weight_scale, torch.tensor([0.25]))
 
 
 def test_diffusers_load_weights_rejects_unknown_name():

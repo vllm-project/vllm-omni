@@ -3,7 +3,7 @@
 """Benchmark MAGI-2 multi-head MoE route construction.
 
 Measures the two route-construction stages of
-``vllm_omni.diffusion.models.magi2.mh_moe`` in isolation:
+``vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe`` in isolation:
 
 * ``compute_topk_probs_and_indices`` -- sigmoid, selection bias, top-k,
   probability gather and L1 normalization;
@@ -35,10 +35,8 @@ from vllm_omni.diffusion.models.magi2.fused_moe_kernels import (
     global_sort_routes,
     triton_mh_moe_forward,
 )
-from vllm_omni.diffusion.models.magi2.mh_moe import (
-    _reference_topk_probs_and_indices,
-    compute_topk_probs_and_indices,
-)
+from vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe import compute_topk_probs_and_indices
+from vllm_omni.diffusion.models.magi2.layers.native.mh_moe import _reference_topk_probs_and_indices
 
 MiB = 1024**2
 

@@ -10,7 +10,7 @@ from tests.helpers.mark import hardware_test
 pytestmark = pytest.mark.core_model
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("step_dtype", [torch.float32, torch.bfloat16])
 def test_settled_frames_match_torch(step_dtype):
     from vllm_omni.worker_v2.model_states.eager_mtp_kernels import settled_frames
@@ -28,7 +28,7 @@ def test_settled_frames_match_torch(step_dtype):
     torch.testing.assert_close(embeds, expected, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("n,size,frames", [(3, 8, 1), (8, 8, 1), (2, 4, 25)])
 def test_codec_graph_inputs_match_the_copies(n, size, frames):
     from vllm.triton_utils import triton
@@ -59,7 +59,7 @@ def test_codec_graph_inputs_match_the_copies(n, size, frames):
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("n,size", [(3, 8), (8, 8)])
 def test_eager_post_fills_codec_graph_inputs_and_scratch(n, size):
     from vllm_omni.worker_v2.model_states.eager_mtp_kernels import eager_post
@@ -109,7 +109,7 @@ def test_eager_post_fills_codec_graph_inputs_and_scratch(n, size):
     assert valid.all() and valid_out.all()
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_history_scatter_preserves_independent_storage_and_offsets():
     import numpy as np
 
@@ -132,13 +132,13 @@ def test_history_scatter_preserves_independent_storage_and_offsets():
         torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_codec_direct_inputs_wait_for_slow_side_stream():
     from types import SimpleNamespace
 
     from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.streaming_decoder import StreamingDecodeGraphs
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, FrameBatch
+    from vllm_omni.worker_v2.model_states.mtp_model_state import FrameBatch, MTPState
 
     device = torch.device("cuda", 0)
     hidden, n = 128, 2
@@ -163,10 +163,13 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
         prime_stream_decoder=lambda _primes: None,
     )
     owner = SimpleNamespace(model=model, intermediate_buffer=SimpleNamespace(buffers=[{}, {}]))
+    owner._embed_dim = 0
+    owner.device = torch.device("cpu")
+    owner.model.has_talker_mtp = False
+    state = MTPState(owner)
     for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step"):
         shape = (n,) if name == "_mtp_input_ids" else (n, hidden)
-        setattr(owner, name, torch.zeros(shape, device=device, dtype=torch.long if len(shape) == 1 else torch.float32))
-    state = EagerMTPState(owner)
+        setattr(state, name, torch.zeros(shape, device=device, dtype=torch.long if len(shape) == 1 else torch.float32))
     state.embeds = torch.zeros(n, hidden, device=device)
     weight = torch.randn(32, hidden, device=device)
     state._embedding_weight = lambda: weight
@@ -176,11 +179,11 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
     for value in range(10, 14):
         codes = torch.full((n, 2), value, device=device, dtype=torch.long)
         frames = torch.full((n, hidden), value, device=device)
-        owner._mtp_forward = lambda *args, _codes=codes, _frames=frames, **kwargs: (_frames, _codes)
+        state._mtp_forward = lambda *args, _codes=codes, _frames=frames, **kwargs: (_frames, _codes)
         with torch.cuda.stream(state._decode_stream):
             torch.cuda._sleep(5_000_000)
         out = torch.zeros(n, 4, device=device)
-        state._run_eager_mtp_fused(
+        state._run_mtp_fused(
             batch,
             frames,
             torch.ones(n, 1, device=device, dtype=torch.long),
@@ -197,21 +200,24 @@ def test_codec_direct_inputs_wait_for_slow_side_stream():
         torch.testing.assert_close(out.cpu(), torch.full((n, 4), float(value)))
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_batched_history_recording_preserves_ragged_reordered_requests():
     from types import SimpleNamespace
 
     import numpy as np
 
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+    from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 
     n, hidden = 32, 128
     owner = SimpleNamespace(
         model=SimpleNamespace(stream_decoder=object()),
         vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=16)),
     )
-    state = EagerMTPState(owner)
+    owner._embed_dim = 0
+    owner.device = torch.device("cpu")
+    owner.model.has_talker_mtp = False
+    state = MTPState(owner)
     counts = np.ones(n, dtype=np.int64)
     counts[:2] = [3, 0]
     starts = np.concatenate(([0], counts.cumsum()))

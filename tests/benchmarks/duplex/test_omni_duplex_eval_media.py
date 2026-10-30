@@ -16,12 +16,63 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_media import (
     _ffmpeg_q_to_pil_quality,
     _video_thread_type,
     extract_jpeg,
+    iter_av_units,
+    iter_jpegs,
     materialize_media,
+    mix_pcm16,
     read_audio_pcm16,
+    read_soundtrack_pcm16,
     video_duration,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("unit_ms", [32, 1000])
+def test_av_units_keep_all_frames_in_their_capture_interval(unit_ms):
+    unit_samples = 16 * unit_ms
+    pcm = np.arange(2 * unit_samples + 5, dtype=np.int16).tobytes()
+    frames = [(index * unit_ms / 2000, str(index).encode()) for index in range(5)]
+    units = list(iter_av_units(pcm, iter(frames), unit_ms=unit_ms))
+    assert [frame for _, frame in units] == [[b"0", b"1"], [b"2", b"3"], b"4"]
+    assert [len(audio) for audio, _ in units] == [unit_samples * 2, unit_samples * 2, 10]
+    assert b"".join(audio for audio, _ in units) == pcm
+
+
+def test_av_units_put_boundary_frame_in_the_following_unit():
+    units = list(iter_av_units(bytes(2 * 32000), iter([(1.0, b"boundary")])))
+    assert [frame for _, frame in units] == [None, b"boundary"]
+
+
+@pytest.mark.parametrize("samples", [0, 5, 16000, 20005])
+def test_av_units_preserve_audio_without_video(samples):
+    pcm = b"\x01\x00" * samples
+    units = list(iter_av_units(pcm, iter(())))
+    assert b"".join(audio for audio, _ in units) == pcm
+    assert all(frame is None for _, frame in units)
+
+
+@pytest.mark.parametrize(
+    "timestamps",
+    [
+        [-0.1],
+        [float("nan")],
+        [float("inf")],
+        [0.5, 0.25],
+        [1.25],  # A frame at the end is outside the final partial interval.
+        [1.3],
+        [0.0, 0.1, 0.2],  # The native wire accepts at most two frames per append.
+    ],
+)
+def test_av_units_reject_frames_that_cannot_be_delivered(timestamps):
+    with pytest.raises(ValueError):
+        list(iter_av_units(bytes(40000), iter((timestamp, b"frame") for timestamp in timestamps)))
+
+
+@pytest.mark.parametrize("pcm,unit_ms", [(b"x", 1000), (b"\0\0", 0), (b"\0\0", -1)])
+def test_av_units_reject_invalid_pcm_or_unit_size(pcm, unit_ms):
+    with pytest.raises(ValueError):
+        list(iter_av_units(pcm, iter(()), unit_ms=unit_ms))
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +136,14 @@ def _make_synthetic_ogg(duration: float = 1.0, sample_rate: int = 16000) -> byte
         for pkt in stream.encode():
             container.mux(pkt)
     return buf.getvalue()
+
+
+def test_iter_jpegs_fractional_fps_excludes_clip_endpoint(tmp_path):
+    path = tmp_path / "fractional.mp4"
+    path.write_bytes(_make_synthetic_mp4(duration=4.0))
+    frames = list(iter_jpegs(path, fps=1.5, duration=4.0))
+    assert [timestamp for timestamp, _ in frames] == pytest.approx([0, 2 / 3, 4 / 3, 2, 8 / 3, 10 / 3])
+    assert all(jpeg.startswith(b"\xff\xd8") for _, jpeg in frames)
 
 
 class TestVideoThreadType:
@@ -277,6 +336,143 @@ class TestReadAudioPcm16:
         broken.write_bytes(b"\x00\x00\x00\x00")
         with pytest.raises((OSError, ValueError)):
             read_audio_pcm16(broken)
+
+
+def _jpeg_mean(payload: bytes) -> float:
+    from PIL import Image
+
+    return float(np.array(Image.open(io.BytesIO(payload))).mean())
+
+
+def _make_timeline_mp4(*, video_start_s: float, audio_start_s: float, burst: int = 1600) -> bytes:
+    """Return an MP4 whose PCM audio burst starts at ``audio_start_s`` on the video timeline."""
+    from fractions import Fraction
+
+    buf = io.BytesIO()
+    with av.open(buf, mode="w", format="mp4") as container:
+        video = container.add_stream("mpeg4", rate=10)
+        video.width = 32
+        video.height = 32
+        video.pix_fmt = "yuv420p"
+        video.time_base = Fraction(1, 10)
+        audio = container.add_stream("pcm_s16le", rate=16000, layout="mono")
+        audio.time_base = Fraction(1, 16000)
+        video_pts = int(round(video_start_s * 10))
+        for index in range(10):
+            # Distinct brightness per frame so a timestamp can be checked against the audio marker.
+            color = 40 + index * 20
+            frame = av.VideoFrame.from_ndarray(np.full((32, 32, 3), color, dtype=np.uint8), format="rgb24")
+            frame.pts = video_pts + index
+            for packet in video.encode(frame):
+                container.mux(packet)
+        chunk = np.full(burst, 1000, dtype=np.int16)
+        audio_frame = av.AudioFrame.from_ndarray(chunk[np.newaxis, :], format="s16", layout="mono")
+        audio_frame.sample_rate = 16000
+        audio_frame.pts = int(round(audio_start_s * 16000))
+        audio_frame.time_base = Fraction(1, 16000)
+        for packet in audio.encode(audio_frame):
+            container.mux(packet)
+        for stream in (video, audio):
+            for packet in stream.encode():
+                container.mux(packet)
+    return buf.getvalue()
+
+
+def _make_synthetic_mp4_with_audio(duration: float = 1.0, fps: int = 10, sample_rate: int = 16000) -> bytes:
+    """Return an MP4 byte blob carrying a video stream and a 440 Hz AAC track."""
+    buf = io.BytesIO()
+    with av.open(buf, mode="w", format="mp4") as container:
+        video = container.add_stream("mpeg4", rate=fps)
+        video.width = 64
+        video.height = 64
+        video.pix_fmt = "yuv420p"
+        audio = container.add_stream("aac", rate=sample_rate, layout="mono")
+        for i in range(int(duration * fps)):
+            frame = av.VideoFrame.from_ndarray(np.full((64, 64, 3), i * 16 % 256, dtype=np.uint8), format="rgb24")
+            for pkt in video.encode(frame):
+                container.mux(pkt)
+        n = int(sample_rate * duration)
+        samples = (np.sin(2 * np.pi * 440 * np.arange(n) / sample_rate) * 0.3).astype(np.float32)
+        frame_size = audio.codec_context.frame_size or 1024
+        for start in range(0, n, frame_size):
+            chunk = samples[start : start + frame_size]
+            frame = av.AudioFrame.from_ndarray(chunk[np.newaxis, :], format="fltp", layout="mono")
+            frame.sample_rate = sample_rate
+            frame.pts = start
+            for pkt in audio.encode(frame):
+                container.mux(pkt)
+        for stream in (video, audio):
+            for pkt in stream.encode():
+                container.mux(pkt)
+    return buf.getvalue()
+
+
+class TestReadSoundtrackPcm16:
+    @staticmethod
+    def test_decodes_clip_audio_track(tmp_path: Path) -> None:
+        path = tmp_path / "clip.mp4"
+        path.write_bytes(_make_synthetic_mp4_with_audio(duration=1.0))
+        pcm = np.frombuffer(read_soundtrack_pcm16(path), dtype=np.int16)
+        assert abs(len(pcm) - 16000) <= 2048
+        assert np.abs(pcm).max() > 1000
+
+    @staticmethod
+    def test_clip_without_audio_is_empty(tmp_path: Path) -> None:
+        path = tmp_path / "silent.mp4"
+        path.write_bytes(_make_synthetic_mp4(duration=0.5))
+        assert read_soundtrack_pcm16(path) == b""
+
+    @staticmethod
+    def test_raises_for_broken_file(tmp_path: Path) -> None:
+        broken = tmp_path / "broken.mp4"
+        broken.write_bytes(b"\x00\x00\x00\x00")
+        with pytest.raises((OSError, ValueError)):
+            read_soundtrack_pcm16(broken)
+
+    @staticmethod
+    def test_audio_that_starts_after_the_video_is_left_padded(tmp_path: Path) -> None:
+        path = tmp_path / "late.mp4"
+        path.write_bytes(_make_timeline_mp4(video_start_s=0.0, audio_start_s=0.5))
+        pcm = np.frombuffer(read_soundtrack_pcm16(path), dtype=np.int16)
+        assert pcm[:8000].tolist() == [0] * 8000
+        assert pcm[8000:].tolist() == [1000] * 1600
+
+    @staticmethod
+    def test_shared_start_offset_stays_on_the_video_timeline(tmp_path: Path) -> None:
+        path = tmp_path / "shifted.mp4"
+        path.write_bytes(_make_timeline_mp4(video_start_s=0.5, audio_start_s=0.5))
+        pcm = np.frombuffer(read_soundtrack_pcm16(path), dtype=np.int16)
+        assert pcm.tolist() == [1000] * 1600
+        # Session t=0 is the video start (PTS 0.5s, first frame). Session t=0.5s
+        # is half a second later (PTS 1.0s), the same instant the audio timeline uses.
+        assert _jpeg_mean(extract_jpeg(path, timestamp=0.0)) < 50
+        assert _jpeg_mean(extract_jpeg(path, timestamp=0.5)) > 120
+
+    @staticmethod
+    def test_audio_offset_is_relative_to_the_video_start(tmp_path: Path) -> None:
+        path = tmp_path / "relative.mp4"
+        path.write_bytes(_make_timeline_mp4(video_start_s=0.5, audio_start_s=1.0))
+        pcm = np.frombuffer(read_soundtrack_pcm16(path), dtype=np.int16)
+        assert pcm[:8000].tolist() == [0] * 8000
+        assert pcm[8000:].tolist() == [1000] * 1600
+
+
+class TestMixPcm16:
+    @staticmethod
+    def _pcm(*values: int) -> bytes:
+        return np.array(values, dtype=np.int16).tobytes()
+
+    def test_sums_and_pads_to_longest(self) -> None:
+        mixed = mix_pcm16(self._pcm(100, -200, 300), self._pcm(1, 2))
+        assert np.frombuffer(mixed, dtype=np.int16).tolist() == [101, -198, 300]
+
+    def test_clips_to_int16(self) -> None:
+        mixed = mix_pcm16(self._pcm(30000, -30000), self._pcm(10000, -10000))
+        assert np.frombuffer(mixed, dtype=np.int16).tolist() == [32767, -32768]
+
+    def test_empty_tracks_are_ignored(self) -> None:
+        assert mix_pcm16(self._pcm(5, 6), b"") == self._pcm(5, 6)
+        assert mix_pcm16(b"", b"") == b""
 
 
 # ---------------------------------------------------------------------------
