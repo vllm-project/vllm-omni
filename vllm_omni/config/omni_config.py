@@ -84,6 +84,7 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "model_tag",
         "omni",
         "output_modalities",
+        "shutdown_timeout",
         "stage_id",
         "subparser",
         "tokenizer",

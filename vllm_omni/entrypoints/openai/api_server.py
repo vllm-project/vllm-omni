@@ -502,6 +502,8 @@ async def omni_run_server_worker(
                 shutdown_timeout=getattr(args, "shutdown_timeout", 0),
             )
         else:
+            # The launcher reads this server-wide timeout from the stage-backed config.
+            vllm_config.shutdown_timeout = getattr(args, "shutdown_timeout", 0)
             logger.info(
                 "Starting vLLM API server %d on %s",
                 vllm_config.parallel_config._api_process_rank,
