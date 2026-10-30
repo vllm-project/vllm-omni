@@ -115,6 +115,39 @@ def test_sentence_chunks_group_sentences() -> None:
     assert "".join(c.replace(" ", "") for c in chunks) == text.replace(" ", "")
 
 
+def _frontend_with_g2p(lang_code: str, per_char: int) -> KokoroTextFrontend:
+    """A frontend whose G2P emits ``per_char`` phonemes per non-space character."""
+
+    def g2p(text: str) -> tuple[str, None]:
+        return "".join(ch if ch.isspace() else ch * per_char for ch in text), None
+
+    frontend = KokoroTextFrontend()
+    frontend._g2p[lang_code] = g2p
+    return frontend
+
+
+def test_long_non_english_sentence_is_split_not_truncated() -> None:
+    """One run-on sentence past the budget is split at clause marks; no speech is lost."""
+    sentence = ", ".join(["el gato duerme en la casa grande"] * 30)  # 1018 chars, no . ! ?
+    chunks = _frontend_with_g2p("e", 1).phoneme_chunks(sentence, "e")
+    assert len(chunks) > 1
+    assert all(0 < len(c) <= MAX_PHONEMES for c in chunks)
+    assert "".join(chunks).replace(" ", "") == sentence.replace(" ", "")
+
+
+def test_full_width_sentence_ends_split_cjk_text() -> None:
+    text = "今天天气很好我们去公园散步吧。" * 30  # 450 chars, 1350 phonemes
+    chunks = _frontend_with_g2p("z", 3).phoneme_chunks(text, "z")
+    assert all(0 < len(c) <= MAX_PHONEMES for c in chunks)
+    assert all(c.endswith("。" * 3) for c in chunks)
+    assert "".join(chunks) == "".join(ch * 3 for ch in text)
+
+
+def test_non_english_chunk_that_fits_is_phonemized_whole() -> None:
+    text = "Hola, ¿qué tal? Muy bien."
+    assert _frontend_with_g2p("e", 1).phoneme_chunks(text, "e") == [text]
+
+
 @pytest.mark.parametrize(
     ("voice", "language", "expected"),
     [

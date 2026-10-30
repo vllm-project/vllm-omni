@@ -3,9 +3,11 @@
 """Kokoro text frontend: grapheme-to-phoneme conversion, chunking and voices.
 
 Ported from ``KPipeline`` in the reference ``kokoro`` package (v0.9.4) so that
-text reaches the network as the same phoneme chunks. G2P comes from ``misaki``
-(the optional ``vllm-omni[kokoro]`` extra); Japanese and Mandarin need its
-``ja`` / ``zh`` extras on top.
+text reaches the network as the same phoneme chunks. The one deliberate
+difference: where ``KPipeline`` truncates a non-English chunk past the phoneme
+budget, dropping its tail, this frontend splits the chunk instead. G2P comes
+from ``misaki`` (the optional ``vllm-omni[kokoro]`` extra); Japanese and
+Mandarin need its ``ja`` / ``zh`` extras on top.
 """
 
 from __future__ import annotations
@@ -175,6 +177,35 @@ def _sentence_chunks(text: str, chunk_size: int = 400) -> list[str]:
     return chunks
 
 
+# Break points for re-splitting an overflowing non-English chunk, strongest
+# first: sentence ends (ASCII and full-width), clause marks, then whitespace.
+_BREAKS = (r"[.!?。！？…]+", r"[,;:，、；：]+", r"\s+")
+
+
+def _split_in_two(text: str) -> tuple[str, str]:
+    """Split ``text`` at its strongest break, taking the one nearest the middle."""
+    middle = len(text) // 2
+    for pattern in _BREAKS:
+        cuts = [m.end() for m in re.finditer(pattern, text) if 0 < m.end() < len(text)]
+        if cuts:
+            cut = min(cuts, key=lambda c: abs(c - middle))
+            return text[:cut], text[cut:]
+    return text[:middle], text[middle:]
+
+
+def _phonemize_within_budget(g2p: Any, text: str) -> list[str]:
+    """Phonemize a non-English chunk, re-splitting it while it overflows a pass.
+
+    A chunk that fits is phonemized whole, as ``KPipeline`` does; one that
+    does not is split and each part phonemized, instead of truncated.
+    """
+    ps, _ = g2p(text)
+    if not ps or len(ps) <= MAX_PHONEMES or len(text) < 2:
+        return [ps] if ps else []
+    head, tail = _split_in_two(text)
+    return [*_phonemize_within_budget(g2p, head.strip()), *_phonemize_within_budget(g2p, tail.strip())]
+
+
 class KokoroTextFrontend:
     """Per-language G2P instances, built lazily and reused across requests."""
 
@@ -236,8 +267,7 @@ class KokoroTextFrontend:
                 pieces = []
                 for chunk in _sentence_chunks(paragraph):
                     if chunk.strip():
-                        ps, _ = g2p(chunk)
-                        pieces.append(ps)
+                        pieces.extend(_phonemize_within_budget(g2p, chunk))
             for ps in pieces:
                 if not ps:
                     continue
