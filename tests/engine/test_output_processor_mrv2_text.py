@@ -182,6 +182,20 @@ def test_mrv2_distinct_same_key_values_are_not_dropped():
     torch.testing.assert_close(payload["codes"]["text"], torch.tensor([5]))
 
 
+def test_mrv2_differing_top_level_metadata_matches_separate_accumulation():
+    # Same result as accumulating the two channels one after the other: the
+    # pooling value replaces differing metadata, and a tensor and a non-tensor
+    # under one key keep both partitions, where the snapshot shows the metadata.
+    hidden = torch.ones(1, 4)
+    payload = _process_mrv2_mirror(
+        {"latent": hidden, "spk": ["b", "c"], "a": torch.tensor([9]), "b": ["y"]},
+        {"latent": hidden.clone(), "spk": ["a"], "a": ["x"], "b": torch.tensor([4])},
+    )
+
+    torch.testing.assert_close(payload["latent"], hidden)
+    assert payload.metadata == {"spk": ["b", "c"], "a": ["x"], "b": ["y"]}
+
+
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
     processor, state = _make_processor(OutputModality.TEXT, _Detokenizer())
     request = EngineCoreRequest(
