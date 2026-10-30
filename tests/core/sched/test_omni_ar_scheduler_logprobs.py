@@ -258,10 +258,15 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     np.testing.assert_array_equal(token_rows[:, 0], [7])
 
 
-def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
+@pytest.mark.parametrize(
+    "failure,num_logprobs",
+    [("logprobs", 1), ("logits", 1), ("logits", None), ("model", None), ("model_and_logits", None)],
+)
+def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure, num_logprobs) -> None:
     """A bad runner response must not bring down unrelated batch requests."""
     bad = _Request("bad")
     good = _Request("good")
+    bad.sampling_params.num_logprobs = good.sampling_params.num_logprobs = num_logprobs
     scheduler = _make_scheduler_stub([bad, good])
     update_calls: list[str] = []
 
@@ -278,6 +283,10 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=[[7], [8]],
+        invalid_logits_req_ids={"bad"} if failure in ("logits", "model_and_logits") else set(),
+        request_errors={"bad": "Non-finite Ming3 flow-head output in decode step."}
+        if failure in ("model", "model_and_logits")
+        else None,
         logprobs=_logprobs(
             [[9, 1], [8, 2]],
             [[-0.9, -1.0], [-0.8, -1.0]],
@@ -285,6 +294,8 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
         ),
         prompt_logprobs_dict={},
         pooler_output=None,
+        multimodal_outputs=[{"audio": "bad"}, {"audio": "good"}],
+        inter_stage_outputs=[{"hidden": "bad"}, {"hidden": "good"}],
         num_nans_in_logits=None,
         kv_connector_output=None,
         cudagraph_stats=None,
@@ -297,12 +308,23 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
 
     assert update_calls == ["good"]
     assert bad.status is RequestStatus.FINISHED_ERROR
-    assert bad.stop_reason is not None and "misaligned" in bad.stop_reason
+    assert bad.stop_reason is not None
+    expected_reason = (
+        "Non-finite Ming3"
+        if failure.startswith("model")
+        else ("no finite logits" if failure == "logits" else "misaligned")
+    )
+    assert expected_reason in bad.stop_reason
     assert "bad" not in scheduler.requests
     assert output_by_id["bad"].finish_reason is FinishReason.ERROR
     assert output_by_id["bad"].new_token_ids == []
+    assert output_by_id["bad"].multimodal_output is None
+    assert bad.output_token_ids == []
+    assert good.output_token_ids == [8]
     assert output_by_id["good"].new_token_ids == [8]
-    np.testing.assert_array_equal(output_by_id["good"].new_logprobs.logprob_token_ids[:, 0], [8])
+    assert output_by_id["good"].multimodal_output == {"audio": "good"}
+    if num_logprobs is not None:
+        np.testing.assert_array_equal(output_by_id["good"].new_logprobs.logprob_token_ids[:, 0], [8])
 
 
 @pytest.mark.parametrize("scored", [False, True])

@@ -640,12 +640,8 @@ class RainFusionAttentionImpl(AttentionImpl):
             precision = "bf16"
         else:
             precision = requested
-            if requested not in ("fp8", "mxfp4", "mix"):
-                reason = f"sparse {requested} is not supported"
-            elif not _mindiesd_supports_precision():
+            if not _mindiesd_supports_precision():
                 reason = "MindIE-SD sparse_attention must explicitly support precision"
-            elif plan.video_spans is not None:
-                reason = "quantized multi-video RainFusion is not supported"
             elif requested in ("fp8", "mxfp4") and query.shape[0] != 1:
                 reason = "quantized Wan BSA requires batch size 1"
             elif requested in ("fp8", "mxfp4") and (query.shape[-1] < 64 or query.shape[-1] & (query.shape[-1] - 1)):
@@ -668,6 +664,9 @@ class RainFusionAttentionImpl(AttentionImpl):
         # Ulysses has already gathered the full sequence onto this rank and split
         # the heads, so read the head count off the tensor rather than num_heads.
         common_kwargs: dict[str, object] = {
+            # rf_v2 ignores precision on non-A5 devices. Route all quantized
+            # layouts through rf_v3 and let MindIE validate their block geometry.
+            "sparse_type": "rf_v3" if precision != "bf16" else "rf_v2",
             "scale": self.softmax_scale,
             "head_num": query.shape[-2],
             "input_layout": _INPUT_LAYOUT,
@@ -681,16 +680,12 @@ class RainFusionAttentionImpl(AttentionImpl):
                 q,
                 k,
                 v,
-                sparse_type="rf_v2",
                 video_spans=plan.video_spans,
                 **common_kwargs,
             )
         else:
             assert plan.prefix_len is not None and plan.latent_shape is not None
             common_kwargs.update(
-                # rf_v2 ignores precision on non-A5 devices. Select the explicit
-                # quantized high-level path so mask/rearrangement remain in MindIE.
-                sparse_type="rf_v3" if precision != "bf16" else "rf_v2",
                 txt_len=plan.prefix_len,
                 latent_shape_q=plan.latent_shape,
                 latent_shape_k=plan.latent_shape,

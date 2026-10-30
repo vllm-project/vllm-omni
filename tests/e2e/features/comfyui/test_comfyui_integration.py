@@ -33,6 +33,7 @@ from comfyui_vllm_omni.nodes import (
     VLLMOmniGenerateMusic,
     VLLMOmniGenerateVideo,
     VLLMOmniLatentMaskEditing,
+    VLLMOmniMiniMaxH3Guide,
     VLLMOmniTTS,
     VLLMOmniUnderstanding,
     VLLMOmniVideoReferences,
@@ -93,8 +94,10 @@ class SamplingKind(str, Enum):
     VIDEO_FL2VA = "video_fl2va"
     VIDEO_FASTH3 = "video_fasth3"
     VIDEO_REF2VA_IMAGE_AUDIO = "video_ref2va_image_audio"
+    VIDEO_REF2VA_LOCK_SOURCE = "video_ref2va_lock_source"
     VIDEO_REF2VA_MULTI_VIDEO = "video_ref2va_multi_video"
     VIDEO_REF2VA_MIXED = "video_ref2va_mixed"
+    VIDEO_TIMELINE_GUIDES = "video_timeline_guides"
 
 
 # Pre-defined arguments to be used in function calls during the tests
@@ -492,7 +495,7 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
             _assert_model_param_values(received, {"task": "t2va", "aspect_ratio": "1:1"})
             assert "flow_shift" not in received.extra_args
             assert "audio_flow_shift" not in received.extra_args
-        elif sampling_case.kind is SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO:
+        elif sampling_case.kind in (SamplingKind.VIDEO_REF2VA_IMAGE_AUDIO, SamplingKind.VIDEO_REF2VA_LOCK_SOURCE):
             assert len(received_sampling_params_list) == 1
             assert isinstance(prompt, dict)
             multi_modal_data = prompt.get("multi_modal_data")
@@ -515,6 +518,10 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                     "flow_shift": 12.0,
                     "task": "ref2va",
                     "audio_flow_shift": 3.0,
+                    # The music-video workflow drives each shot with its slice of the track.
+                    "audio_mode": (
+                        "lock_source" if sampling_case.kind is SamplingKind.VIDEO_REF2VA_LOCK_SOURCE else None
+                    ),
                 },
             )
         elif sampling_case.kind in (SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, SamplingKind.VIDEO_REF2VA_MIXED):
@@ -558,6 +565,35 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                     "audio_flow_shift": 3.0,
                 },
             )
+        elif sampling_case.kind is SamplingKind.VIDEO_TIMELINE_GUIDES:
+            assert len(received_sampling_params_list) == 1
+            received = received_sampling_params_list[0]
+            _assert_sampling_param_values(
+                received,
+                {"width": VIDEO_WIDTH, "height": VIDEO_HEIGHT, "num_frames": 124, "fps": 24, "quality": "lossless"},
+            )
+            # Guides do not reroute the request: a first frame stays FL2VA.
+            _assert_model_param_values(received, {"task": "fl2va", "frame_indices": [0]})
+            assert isinstance(prompt, dict)
+            multi_modal_data = prompt["multi_modal_data"]
+            # The keyframe stays the ordinary input image; guides never join it.
+            assert multi_modal_data["image"].getpixel((0, 0)) == (0, 0, 0)
+            guides = multi_modal_data["timeline_guides"]
+            assert [guide["frame_index"] for guide in guides] == [72, 36, -22, -1]
+            assert [sorted(set(guide) - {"frame_index"}) for guide in guides] == [
+                ["image"],
+                ["audio", "image"],
+                ["audio", "video"],
+                ["audio"],
+            ]
+            assert [guides[i]["image"].getpixel((0, 0)) for i in (0, 1)] == [(51, 51, 51), (204, 204, 204)]
+            # Clips and audio are request-scoped files that exist while the job runs.
+            assert Path(guides[2]["video"]).read_bytes() == b"guide-clip"
+            for guide, sample_rate in ((guides[1], 16000), (guides[2], 24000), (guides[3], 48000)):
+                assert guide["audio"].endswith(".flac")
+                with av.open(guide["audio"]) as container:
+                    stream = container.streams.audio[0]
+                    assert (stream.codec_context.name, stream.sample_rate) == ("flac", sample_rate)
         else:
             raise AssertionError(f"Unknown sampling case: {sampling_case.kind}")
 
@@ -1289,6 +1325,17 @@ async def test_fast_h3_deployment_node(api_server: str, sampling_case: SamplingC
                 stage_configs=[H3_STAGE_CONFIG],
                 outputs=[_build_diffusion_video_output()],
             ),
+            SamplingCase(kind=SamplingKind.VIDEO_REF2VA_LOCK_SOURCE, sampling_params=None),
+            "image_audio_lock_source",
+            id="ref2va-image-audio-lock-source",
+        ),
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[H3_STAGE_CONFIG],
+                outputs=[_build_diffusion_video_output()],
+            ),
             SamplingCase(kind=SamplingKind.VIDEO_REF2VA_MULTI_VIDEO, sampling_params=None),
             "multi_video",
             id="ref2va-multi-video",
@@ -1316,7 +1363,8 @@ async def test_video_generation_node_minimax_h3_ref2va(
     node = VLLMOmniGenerateVideo()
     refs_node = VLLMOmniVideoReferences()
 
-    if ref_mode == "image_audio":
+    model_params = H3_MODEL_PARAMS
+    if ref_mode in ("image_audio", "image_audio_lock_source"):
         (references,) = refs_node.get_references(
             image_1=torch.zeros((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32),
             audio_1={"waveform": torch.zeros((1, 1, 24000), dtype=torch.float32), "sample_rate": 24000},
@@ -1325,6 +1373,8 @@ async def test_video_generation_node_minimax_h3_ref2va(
             "A white cat with black mustache and eyebrow markings sits on a beige couch, "
             "lip-syncing precisely to the complete reference audio."
         )
+        if ref_mode == "image_audio_lock_source":
+            model_params = MiniMaxH3ModelSpecificParams({**H3_MODEL_PARAMS, "audio_mode": "lock_source"})
     elif ref_mode == "multi_video":
         (references,) = refs_node.get_references(
             video_1=VideoInput(b"subject-video"),  # type: ignore[reportAbstractUsage]
@@ -1357,7 +1407,7 @@ async def test_video_generation_node_minimax_h3_ref2va(
         fps=VIDEO_FPS,
         duration=VIDEO_DURATION,
         references=references,
-        model_params=H3_MODEL_PARAMS,
+        model_params=model_params,
     )
 
     assert isinstance(result, tuple)
@@ -1495,6 +1545,69 @@ async def test_video_generation_node_minimax_h3_latent_mask_editing(api_server: 
         duration=VIDEO_DURATION,
         model_params=H3_MODEL_PARAMS,
         latent_edit=latent_edit,
+    )
+
+    assert isinstance(result, tuple)
+    assert len(result) == 1
+    assert isinstance(result[0], VideoInput)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case",
+    [
+        pytest.param(
+            ServerCase(
+                served_model="MiniMaxAI/MiniMax-H3",
+                stage_list=["diffusion"],
+                stage_configs=[H3_STAGE_CONFIG],
+                outputs=[_build_diffusion_video_output()],
+            ),
+            id="minimax-h3",
+        ),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "sampling_case",
+    [pytest.param(SamplingCase(kind=SamplingKind.VIDEO_TIMELINE_GUIDES, sampling_params=None), id="timeline-guides")],
+    indirect=True,
+)
+async def test_video_generation_node_minimax_h3_timeline_guides(api_server: str, sampling_case: SamplingCase):
+    """Chained Add Guide nodes reach the model in chain order through the real /v1/videos parser."""
+
+    def audio(sample_rate: int) -> AudioInput:
+        t = torch.arange(sample_rate // 10) / sample_rate
+        return {"waveform": (0.5 * torch.sin(2 * torch.pi * 440 * t)).repeat(1, 2, 1), "sample_rate": sample_rate}
+
+    guide = VLLMOmniMiniMaxH3Guide()
+    (chain,) = guide.add_guide(frame_index=72, image=torch.full((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), 0.2))
+    (chain,) = guide.add_guide(
+        frame_index=36,
+        image=torch.full((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), 0.8),
+        audio=audio(16000),
+        timeline_guides=chain,
+    )
+    (chain,) = guide.add_guide(
+        frame_index=-22,
+        video=VideoInput(b"guide-clip"),  # type: ignore[reportAbstractUsage]
+        audio=audio(24000),
+        timeline_guides=chain,
+    )
+    (chain,) = guide.add_guide(frame_index=-1, audio=audio(48000), timeline_guides=chain)
+
+    result = await VLLMOmniGenerateVideo().generate(
+        url=api_server,
+        model="MiniMaxAI/MiniMax-H3",
+        prompt="Follow the timeline guides.",
+        negative_prompt="",
+        width=VIDEO_WIDTH,
+        height=VIDEO_HEIGHT,
+        fps=24,
+        duration=5.167,
+        first_frame=torch.zeros((1, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=torch.float32),
+        model_params=H3_MODEL_PARAMS,
+        timeline_guides=chain,
     )
 
     assert isinstance(result, tuple)

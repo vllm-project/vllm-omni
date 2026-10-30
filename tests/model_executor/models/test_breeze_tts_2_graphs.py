@@ -32,9 +32,13 @@ def _disable_graph_capture(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize(("is_rocm", "expected"), [(True, False), (False, True)])
-def test_depth_layer_compile_options(monkeypatch, is_rocm: bool, expected: bool) -> None:
+@pytest.mark.parametrize(
+    ("is_rocm", "is_xpu", "expected"),
+    [(True, False, False), (False, True, False), (False, False, True)],
+)
+def test_depth_layer_compile_options(monkeypatch, is_rocm: bool, is_xpu: bool, expected: bool) -> None:
     monkeypatch.setattr(current_platform, "is_rocm", lambda: is_rocm)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: is_xpu)
 
     assert _depth_layer_compile_options() == {
         "epilogue_fusion": False,
@@ -54,7 +58,7 @@ def full_precision_matmul():
         torch.set_float32_matmul_precision(original_precision)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 @pytest.mark.parametrize("capture", [True, False], ids=["graph", "eager"])
 def test_text_graph_masks_padding_and_local_attention_across_replays(
@@ -131,7 +135,7 @@ def _make_depth_decoder(vocab_size: int = 35) -> BreezeDepthDecoder:
     return depth
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_depth_graph_survives_interleaved_batches_and_workspace_allocations(full_precision_matmul, monkeypatch) -> None:
     torch.manual_seed(42)
@@ -254,7 +258,7 @@ def test_depth_graph_survives_interleaved_batches_and_workspace_allocations(full
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_matmul, monkeypatch) -> None:
     def reject_eager_noise(*args, **kwargs):
@@ -410,7 +414,7 @@ def test_depth_graph_buckets_bound_shapes_and_preserve_requests(full_precision_m
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "xpu": "B60", "rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_batched_decode_embedding_matches_scalar_bfloat16() -> None:
     # Use the checkpoint's RVQ table dimensions without loading its backbone.

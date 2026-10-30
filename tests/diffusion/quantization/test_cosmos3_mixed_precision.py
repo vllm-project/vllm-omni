@@ -822,6 +822,33 @@ def test_install_discovers_generation_and_opt_in_reasoner(monkeypatch) -> None:
     assert all(isinstance(layer.quant_method, Cosmos3MixedPrecisionLinearMethod) for layer in generation)
 
 
+def test_install_skips_reasoner_on_non_first_pipeline_stage(monkeypatch) -> None:
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    class _FakeLinear(torch.nn.Module):
+        def __init__(self, prefix: str) -> None:
+            super().__init__()
+            self.prefix = prefix
+            self.input_size_per_partition = 4
+            self.output_size_per_partition = 2
+            self.quant_method = SimpleNamespace(name="fp8")
+
+    monkeypatch.setattr(runtime_impl, "LinearBase", _FakeLinear)
+    strategy = Fp8W8A8W8A16Strategy()
+    monkeypatch.setattr(strategy, "accepts", lambda method: getattr(method, "name", None) == "fp8")
+    monkeypatch.setattr(runtime_impl, "_STRATEGIES", (strategy,))
+    runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner="a16"))
+    # Non-first PP stage: the UND reasoner is a placeholder and gen_layers is
+    # padded with PPMissingLayer for the layers owned by earlier stages.
+    owned = _FakeLinear("gen_layers.1.mlp.up_proj")
+    transformer = SimpleNamespace(
+        language_model=PPMissingLayer(),
+        gen_layers=torch.nn.ModuleList([PPMissingLayer(), torch.nn.Sequential(owned)]),
+    )
+    runtime.install(transformer)
+    assert isinstance(owned.quant_method, Cosmos3MixedPrecisionLinearMethod)
+
+
 def test_pipeline_helpers_forward_and_reset_schedule() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import (
         Cosmos3OmniDiffusersPipeline,

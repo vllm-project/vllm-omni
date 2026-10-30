@@ -770,6 +770,32 @@ def test_duplex_eval_result_rejects_incomplete_artifacts_or_judging(field, value
         assert_result(result, {"dataset_name": "omni-duplex-eval", "duplex_eval_evaluate": True}, 1)
 
 
+@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
+def test_duplex_eval_score_floor_hardware_controls_enforcement(monkeypatch, hardware, enforce_score_floors):
+    from tests.dfx.perf.scripts import run_benchmark
+    from tests.e2e.accuracy.omni_duplex_eval import validation
+
+    observed = []
+    monkeypatch.setattr(validation, "load_accuracy_config", lambda *args: {"baseline": {}})
+    monkeypatch.setattr(
+        validation,
+        "assert_accuracy_result",
+        lambda *args, **kwargs: observed.append(kwargs["enforce_score_floors"]),
+    )
+    result = _duplex_eval_result()
+    result["Hardware"] = hardware
+    run_benchmark.assert_result(
+        result,
+        {
+            "dataset_name": "omni-duplex-eval",
+            "duplex_eval_accuracy_config": "config.json",
+            "duplex_eval_score_floor_hardware": ["H100", "B200", "A3"],
+        },
+        1,
+    )
+    assert observed == [enforce_score_floors]
+
+
 @pytest.mark.parametrize("field", ["client_ttft_ms", "client_ttfp_ms"])
 @pytest.mark.parametrize("metric", [{}, {"count": 0, "mean": 0.0}, {"count": 1, "mean": float("nan")}])
 def test_duplex_eval_result_rejects_missing_measurements(field, metric):
@@ -812,7 +838,8 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
         assert args[args.index(f"--{prefix.replace('_', '-')}-judge-base-url") + 1] == judge_url
 
 
-def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch):
+@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
+def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, hardware, enforce_score_floors):
     from dataclasses import dataclass
     from pathlib import Path
 
@@ -829,6 +856,7 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch):
     assert set(params["duplex_eval_ids"]) == ids
     assert config["judge_server_params"]["model"] == params["duplex_eval_judge_model"]
     assert params["duplex_eval_evaluate"]
+    assert params["duplex_eval_score_floor_hardware"] == ["H100", "B200", "A3"]
 
     @dataclass
     class ServerEndpoint:
@@ -839,7 +867,7 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch):
 
     calls = []
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
-    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: hardware)
 
     def benchmark(**kwargs):
         calls.append(kwargs)
@@ -856,6 +884,7 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch):
     assert args.duplex_eval_ids == params["duplex_eval_ids"]
     assert args.num_prompts == 66
     assert args.max_concurrency == 8
+    assert args.save_detailed
     assert args.duplex_eval_split == "all"
     assert args.disable_shuffle
     assert call["num_warmups"] == 0
@@ -864,7 +893,8 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch):
     assert args.duplex_eval_evaluate
     assert args.duplex_eval_judge_base_url == "http://localhost:8001"
     assert "--duplex-eval-accuracy-config" not in call["args"]
-    assert call["accuracy_baseline"] == accuracy["baseline"]
+    assert "--duplex-eval-score-floor-hardware" not in call["args"]
+    assert call["accuracy_baseline"] == (accuracy["baseline"] if enforce_score_floors else {})
 
 
 @pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])

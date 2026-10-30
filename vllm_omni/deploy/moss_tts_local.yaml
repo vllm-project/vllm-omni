@@ -72,7 +72,6 @@ platforms:
         max_num_batched_tokens: 512
         max_num_seqs: 128
         hf_overrides:
-          mrv2_gpu_slot_state: true
           mrv2_batch_prefill: true
           mrv2_direct_tokens: true
           mrv2_eager_mtp: true
