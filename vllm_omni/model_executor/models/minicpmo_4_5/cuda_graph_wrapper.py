@@ -341,6 +341,43 @@ class HiFTGraphWrapper:
 
         return self._replay_key(key, speech_feat, cache_source)
 
+    def replay_from_parts(self, old_mel, chunk_mel, cache_source):
+        """Replay an existing exact-batch graph without materializing concatenated mel.
+
+        Return ``None`` when the regular replay policy must handle the inputs.
+        No capture, padding, or partial input writes happen on a miss.
+        """
+        _check_graph_failure(self)
+        batch_size = int(chunk_mel.shape[0])
+        old_frames = int(old_mel.shape[2])
+        key = (batch_size, old_frames + int(chunk_mel.shape[2]), int(cache_source.shape[2]))
+        if key not in self.graph or key[1] == 0:
+            return None
+        if key not in getattr(self, "_exact_keys", ()) and (
+            key[1:] not in self._legit_shapes or batch_size not in self.capture_batch_sizes
+        ):
+            return None
+        if _graph_api(self.device).is_current_stream_capturing():
+            return None
+        static_mel = self.static_speech_inputs[key]
+        static_source = self.static_cache_source_inputs[key]
+        if (
+            old_mel.shape[:2] != chunk_mel.shape[:2]
+            or chunk_mel.shape[:2] != static_mel.shape[:2]
+            or cache_source.shape != static_source.shape
+            or any(t.device != static_mel.device or t.dtype != static_mel.dtype for t in (old_mel, chunk_mel))
+            or cache_source.device != static_source.device
+            or cache_source.dtype != static_source.dtype
+        ):
+            return None
+        if old_frames:
+            static_mel[..., :old_frames].copy_(old_mel)
+        if chunk_mel.shape[2]:
+            static_mel[..., old_frames:].copy_(chunk_mel)
+        if cache_source.shape[2]:
+            static_source.copy_(cache_source)
+        return self._replay_outputs(key, batch_size)
+
     def _replay_key(self, key, speech_feat, cache_source):
         """Replay the captured graph ``key`` on a batch of at most ``key[0]`` rows."""
         batch_size = speech_feat.shape[0]
@@ -353,7 +390,9 @@ class HiFTGraphWrapper:
             static_cache_sources[batch_size:].zero_()
         static_speech_inputs[:batch_size].copy_(speech_feat)
         static_cache_sources[:batch_size].copy_(cache_source)
+        return self._replay_outputs(key, batch_size)
 
+    def _replay_outputs(self, key, batch_size):
         self.graph[key].replay()
         static_magnitude_output = self.static_magnitude_outputs[key]
         static_phase_output = self.static_phase_outputs[key]

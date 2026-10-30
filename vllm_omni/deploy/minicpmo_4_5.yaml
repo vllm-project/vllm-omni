@@ -36,9 +36,15 @@ connectors:
       # codec_left_context_frames. (#5869)
       enable_hift_graph: true
       # Capture batch-1 continuation/tail shapes without padding: with the
-      # 8-frame mel cache these codec widths cover 16-64 mel frames.
-      hift_graph_continuation_frames: [4, 28]
-      hift_graph_exact_batch_sizes: [1]
+      # 8-frame mel cache these codec widths cover 14-74 mel frames. The lower
+      # end (3) is a short tail chunk and the upper end (29-33) is a tail chunk
+      # merged with a small backlog; both used to miss every bucket and run
+      # eager HiFT (32 of 798 decode calls in the 2026-10-30 c8 round).
+      hift_graph_continuation_frames: [3, 33]
+      # Batch 2 was the last eager residue: every batch-2 continuation shape
+      # missed both the buckets (only 1/2/4/8 x 50/58 are captured) and the
+      # batch-1 exact graphs (2026-10-30: 5 of 798 decode calls).
+      hift_graph_exact_batch_sizes: [1, 2]
       enable_cfm_graph: true
       # Fused CFM DiT body: CUDA via TF32, NPU via packed QKV + ACLNN
       # AddLayerNorm + im2col-GEMM convolutions and a single cache transpose.
