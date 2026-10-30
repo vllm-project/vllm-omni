@@ -928,13 +928,13 @@ def test_scheduled_step_batch_at_one_progress_is_packed():
     torch.testing.assert_close(serial_velocity, packed_velocity)
 
 
-def test_inherited_and_explicit_equal_schedules_resolve_to_one_hashable_value_and_pack():
-    """The runner stores each request's schedule resolved against the service config.
+def test_inherited_and_explicit_equal_schedules_resolve_to_one_hashable_value():
+    """An omitted schedule and the same ranges sent explicitly resolve to equal, hashable tuples.
 
-    An omitted schedule and the same ranges sent explicitly resolve to equal tuples of frozen
-    ranges, so the pipeline gate sees one schedule and packs them. The scheduler keeps these two
-    requests in different batches (the key also records whether the request sent a schedule), so
-    this exercises the pipeline gate directly.
+    So the pipeline gate packs them: ``test_scheduled_step_batch_at_one_progress_is_packed`` drives
+    the gate with two equal resolved schedules. The runner storing the resolved value is pinned by
+    ``test_cached_step_reuses_the_schedule_resolved_at_admission``. The scheduler keeps these two
+    requests in different batches (the key also records whether the request sent a schedule).
     """
     service = AttentionScheduleConfig(
         profiles={"sparse": AttentionConfig()}, default=[{"start": 0, "end": None, "profile": "sparse"}]
@@ -944,15 +944,9 @@ def test_inherited_and_explicit_equal_schedules_resolve_to_one_hashable_value_an
         OmniDiffusionSamplingParams(attention_schedule=[{"start": 0, "end": None, "profile": "sparse"}]), service
     )
     assert inherited == explicit == _sparse_schedule()
-    assert type(inherited) is tuple and hash(inherited) == hash(explicit)
-
-    model = _ProgressRecordingModel()
-    states = _same_progress_states(model, [inherited, explicit])
-    with set_forward_context(), bind_attention_schedule(inherited):
-        _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
-
-    sigmas = states[0].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
-    assert model.progress == [(1, float(sigmas[1]), 4, "sparse", 2)]
+    assert type(inherited) is tuple and type(explicit) is tuple
+    assert hash(inherited) == hash(explicit)
+    assert len({inherited, explicit}) == 1
 
 
 @pytest.mark.parametrize(
