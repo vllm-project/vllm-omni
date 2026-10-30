@@ -70,6 +70,7 @@ def test_nz_defaults_skip_unsupported_devices(supported):
     model = QwenImage21Transformer2DModel.__new__(QwenImage21Transformer2DModel)
     nn.Module.__init__(model)
     model._nz_weights_supported = supported
+    model.mlp_backend = "native"
     model._enforce_eager = False
     model._nz_runs_eager = False
     model.enable_cuda_graph_decode = False

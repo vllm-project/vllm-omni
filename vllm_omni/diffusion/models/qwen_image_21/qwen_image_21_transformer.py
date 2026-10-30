@@ -37,7 +37,9 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
+from vllm_omni.diffusion.layers.fused_swiglu import FusedSwiGLU
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
+from vllm_omni.diffusion.models.qwen_image_21.mlp_fusion import select_mlp_backend
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
@@ -303,6 +305,7 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
         mlp_hidden_size: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        mlp_backend: str = "native",
     ):
         super().__init__()
         self.proj = ColumnParallelLinear(
@@ -333,8 +336,65 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
             prefix=f"{prefix}.out",
         )
         self._npu_inplace_mlp = quant_config is None
+        self.mlp_backend = mlp_backend if quant_config is None else "native"
+        self.fused_swiglu = FusedSwiGLU() if self.mlp_backend == "eagle" else None
+        self.register_buffer("_gate_up_weight", None, persistent=False)
+        self._packed_module_ids: tuple[int, int, int] | None = None
+
+    def prepare_fused_weights(self) -> bool:
+        """Pack after loading; retain checkpoint keys without persistent weight copies."""
+        if self.mlp_backend != "eagle":
+            return False
+        gate, up, down = self.gate_layer.weight, self.proj.weight, self.out.weight
+        if (
+            gate.device.type == "meta"
+            or gate.dtype != torch.bfloat16
+            or up.dtype != gate.dtype
+            or down.dtype != gate.dtype
+            or gate.device != up.device
+            or gate.device != down.device
+            or gate.shape != up.shape
+        ):
+            return False
+        # Weight loading may run in inference mode. Keep storage writable for
+        # later checkpoint reloads outside that mode, too.
+        with torch.inference_mode(False), torch.no_grad():
+            packed = torch.cat((gate.detach(), up.detach()), dim=0).contiguous()
+            gate.data, up.data = packed.chunk(2, dim=0)
+        self._gate_up_weight = packed
+        self._packed_module_ids = (id(self.gate_layer), id(self.proj), id(self.out))
+        return True
+
+    def _can_use_packed_weights(self, hidden_states: torch.Tensor) -> bool:
+        packed = self._gate_up_weight
+        if (
+            self.mlp_backend != "eagle"
+            or packed is None
+            or self.training
+            or torch.is_grad_enabled()
+            or torch.compiler.is_compiling()
+            or self._packed_module_ids != (id(self.gate_layer), id(self.proj), id(self.out))
+        ):
+            return False
+        gate, up, down = self.gate_layer.weight, self.proj.weight, self.out.weight
+        return (
+            hidden_states.dtype == packed.dtype == gate.dtype == up.dtype == down.dtype == torch.bfloat16
+            and hidden_states.device == packed.device == gate.device == up.device == down.device
+            and hidden_states.is_contiguous()
+            and gate.is_contiguous()
+            and up.is_contiguous()
+            and down.is_contiguous()
+            and not any(
+                module._forward_hooks or module._forward_pre_hooks for module in (self.gate_layer, self.proj, self.out)
+            )
+            and gate.data_ptr() == packed.data_ptr()
+            and up.data_ptr() == packed.data_ptr() + gate.numel() * gate.element_size()
+        )
 
     def forward(self, hidden_states: torch.Tensor, *, _pointwise_validated: bool = False) -> torch.Tensor:
+        if self.fused_swiglu is not None and self._can_use_packed_weights(hidden_states):
+            # TP1 only: the complete FFN bypasses the RowParallelLinear module.
+            return self.fused_swiglu(hidden_states, self._gate_up_weight, self.out.weight)
         if (
             self._npu_inplace_mlp
             and hidden_states.device.type == "npu"
@@ -689,6 +749,7 @@ class QwenImage21TransformerBlock(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         prefix_kv_cache_dtype: str | None = None,
+        mlp_backend: str = "native",
     ):
         super().__init__()
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -707,6 +768,7 @@ class QwenImage21TransformerBlock(nn.Module):
             mlp_hidden_size=dim * mlp_ratio,
             quant_config=quant_config,
             prefix=f"{prefix}.img_mlp",
+            mlp_backend=mlp_backend,
         )
 
     def _modulate(
@@ -953,6 +1015,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         self.causal_block = causal_block
         self.quant_config = _enable_pattern_ignored_layers(quant_config)
         quant_config = self.quant_config
+        self.mlp_backend = select_mlp_backend(od_config, unquantized=quant_config is None)
         self._pointwise_contract_allowed = (
             quant_config is None
             and getattr(od_config, "lora_config", None) is None
@@ -1007,6 +1070,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                     quant_config=quant_config,
                     prefix=f"{prefix}.transformer_blocks.{i}",
                     prefix_kv_cache_dtype=self.prefix_kv_cache_dtype,
+                    mlp_backend=self.mlp_backend,
                 )
                 for i in range(num_layers)
             ]
@@ -1586,11 +1650,20 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         unloaded = sorted(set(params_dict) - set(loaded_params))
         if unloaded:
             logger.warning("Model parameters not loaded from checkpoint: %s", unloaded)
+        eagle_projections: set[int] = set()
+        if self.mlp_backend == "eagle":
+            for block in self.transformer_blocks:
+                mlp = block.img_mlp
+                if mlp.prepare_fused_weights():
+                    # Eagle consumes ND weights. Preserve its three projections;
+                    # automatic NZ conversion remains available for other linears.
+                    eagle_projections.update(id(module) for module in (mlp.gate_layer, mlp.proj, mlp.out))
         if self._nz_weights_supported and self._automatic_nz_eligible():
             weights = [
                 module.weight
                 for module in self.modules()
                 if isinstance(module, (ColumnParallelLinear, RowParallelLinear, ReplicatedLinear))
+                and id(module) not in eagle_projections
                 and module.weight is not None
                 and module.weight.device.type == "npu"
                 and module.weight.dtype == torch.bfloat16
