@@ -678,3 +678,54 @@ execution strategy and needs paired audio validation for the target workload.
 Compare actual graph coverage, startup cost, memory, latency and audio quality
 on the deployed model before changing these settings; synthetic tests alone do
 not establish a service-level improvement.
+
+### NPU Talker decode graph mode
+
+The Talker emits one codec frame per step, so a step is a few thousand small
+device kernels wrapped in per-step scheduler, sampling and IPC work. vLLM-Omni
+wraps `talker_mtp` in a device-graph wrapper only when the stage's
+`cudagraph_mode` reports full graphs (`_init_talker_mtp` in
+`worker/gpu_model_runner.py`), so under `PIECEWISE` that wrapper is never
+built and the per-step host work stays on the critical path. A `torch_npu`
+profile of a concurrency-1 decode measured **20.8 ms of host gap inside every
+45.3 ms step (46%)** across 2646 kernels; device-side time was 24.5 ms.
+
+`FULL_DECODE_ONLY` on stage 0 builds the wrapper. Measured on one Ascend
+910B1 with `Qwen3-TTS-12Hz-1.7B-CustomVoice`, BF16, a fixed 32-request
+English workload, warmup `max(2, concurrency)`, four runs per configuration:
+
+| Stage-0 `cudagraph_mode` | c1 throughput | c32 throughput | c32 TTFA p50 |
+| --- | ---: | ---: | ---: |
+| `PIECEWISE` | 23.5 ± 0.3 frames/s | 232.3 ± 3.6 frames/s | 923 ms |
+| `FULL_DECODE_ONLY` | 29.6 ± 0.1 frames/s | 247.3 ± 0.4 frames/s | 853 ms |
+
+All 256 timed requests succeeded and every server exited 0.
+
+**This changes the sampled codec tokens.** Graph replay and the eager path do
+not produce bit-identical logits, so the autoregressive draw diverges and the
+emitted audio differs; per-request audio length moves in both directions
+(measured: 10 of 32 requests changed length, 6 shorter and 4 longer). Output
+is deterministic for a fixed configuration — four `PIECEWISE` runs and four
+`FULL_DECODE_ONLY` runs were each byte-identical within their configuration.
+
+Independent Whisper-large-v3 FP32 scoring of the same 32 English utterances
+(353 reference words) across four configurations:
+
+| Stage-0 mode | Code2Wav NPU options | WER | Failing utterances |
+| --- | --- | ---: | --- |
+| `PIECEWISE` | shipped defaults | 1.70% (6 errors) | 10, 19, 22 |
+| `PIECEWISE` | incremental codec + frame graph + predictor KV | 1.70% (6 errors) | 10, 19, 22 |
+| `FULL_DECODE_ONLY` | shipped defaults | 2.55% (9 errors) | 4, 10, 19, 22 |
+| `FULL_DECODE_ONLY` | incremental codec + frame graph + predictor KV | 1.70% (6 errors) | 10, 19, 22 |
+
+Three of the four configurations fail on the same three utterances. The fourth
+adds one garbled ending on utterance 4, and that configuration is *not* the one
+with the most changed numerics — the other full-graph configuration matches the
+baseline exactly. So the extra failure tracks which draw a given numerical path
+lands on rather than the graph mode, and that utterance sits close enough to a
+decision boundary that any perturbation can flip it.
+
+This is **not** a demonstrated quality regression, and it is **not** a
+demonstrated equivalence: 32 utterances in one language, with no speaker
+similarity scoring, cannot certify either. Run the quality gate for the target
+workload before relying on this mode.
