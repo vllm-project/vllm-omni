@@ -28,6 +28,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
+from vllm.v1.engine.exceptions import EngineGenerateError
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -384,6 +385,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 req_start_ts,
                 wall_start_ts,
             ):
+                if self.is_shutting_down and any(completion.finish_reason == "abort" for completion in output.outputs):
+                    raise EngineGenerateError("Request aborted during shutdown.")
                 yield output
                 metadata = (getattr(output, "multimodal_output", None) or {}).get("metadata", {})
                 stream = metadata.get("stream", {}) if isinstance(metadata, dict) else {}

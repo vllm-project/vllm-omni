@@ -16,6 +16,7 @@ import pytest
 from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.outputs import CompletionOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
@@ -84,7 +85,16 @@ def make_output_msg(
         final_output_type=final_output_type,
         images=images or [],
         stage_durations={},
-        outputs=[SimpleNamespace(text=payload, index=0)],
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text=payload,
+                token_ids=[],
+                cumulative_logprob=None,
+                logprobs=None,
+                finish_reason="stop" if output_finished else None,
+            )
+        ],
     )
     return OutputMessage(
         request_id=request_id,
@@ -1800,7 +1810,8 @@ async def test_shutdown_releases_pending_request(monkeypatch, pending):
     await asyncio.wait_for(started.wait(), timeout=2)
     try:
         await asyncio.wait_for(asyncio.to_thread(app.shutdown, timeout=0.01), timeout=2)
-        await asyncio.wait_for(request, timeout=2)
+        with pytest.raises(EngineGenerateError, match="aborted during shutdown"):
+            await asyncio.wait_for(request, timeout=2)
         assert not app.request_states
         assert not app._pending_submits
         assert engine.shutdown_called
@@ -1832,9 +1843,10 @@ async def test_shutdown_rejects_request_waiting_for_resume(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("timeout", [0, 0.05])
-async def test_shutdown_aborts_unfinished_request(monkeypatch, timeout):
+@pytest.mark.parametrize("stage_metadata", [DIFFUSION_ONLY_META, THREE_STAGE_META])
+async def test_shutdown_aborts_unfinished_request(monkeypatch, timeout, stage_metadata):
     submitted = asyncio.Event()
-    engine = FakeAsyncOmniEngine(on_add_request=lambda *_: submitted.set())
+    engine = FakeAsyncOmniEngine(stage_metadata=stage_metadata, on_add_request=lambda *_: submitted.set())
     _patch_engine(monkeypatch, engine)
     app = AsyncOmni(model="dummy-model")
 
@@ -1847,7 +1859,8 @@ async def test_shutdown_aborts_unfinished_request(monkeypatch, timeout):
         started = time.monotonic()
         await asyncio.wait_for(asyncio.to_thread(app.shutdown, timeout=timeout), timeout=2)
         assert time.monotonic() - started >= timeout
-        await asyncio.wait_for(request, timeout=2)
+        with pytest.raises(EngineGenerateError, match="aborted during shutdown"):
+            await asyncio.wait_for(request, timeout=2)
         assert engine.shutdown_called
         assert not app.request_states
     finally:
