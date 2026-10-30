@@ -3707,6 +3707,25 @@ _DISTRIBUTED_BUFFER_READY_NODES = (
 )
 _DISTRIBUTED_BUFFER_JUNIT_MESSAGE = "Expected exactly two executed distributed buffer GPU smokes"
 _DEVICE_REDUCTION_JUNIT_MESSAGE = "Expected exactly 17 executed device-reduction GPU tests"
+_ROCM_V1_DUPLEX_READY_LABEL = "ROCm · MiniCPM-o 4.5 V1 Fallback Duplex Coverage"
+_ROCM_V1_DUPLEX_READY_MARKER = "advanced_model and omni and rocm and MI325 and cards_1"
+_ROCM_V1_DUPLEX_FILE = "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py"
+_ROCM_V1_DUPLEX_CONFIG_NODE = (
+    "tests/config/test_minicpmo_4_5_duplex_mrv2_deploy.py::test_duplex_mrv2_profile_keeps_non_cuda_on_v1[rocm]"
+)
+_ROCM_V1_DUPLEX_NODES = (
+    f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_overlapping_turns[1-mrv2-real-weights]",
+    f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_overlapping_turns[2-mrv2-real-weights]",
+    f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_overlapping_turns[4-mrv2-real-weights]",
+    (f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_new_session_during_long_response[mrv2-real-weights]"),
+    (f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_server_answers_image_chat_from_the_image[mrv2-real-weights]"),
+)
+_ROCM_V1_DUPLEX_JUNIT_MESSAGE = "Expected exactly five executed MiniCPM-o ROCm V1 fallback duplex tests"
+
+
+def _quoted_ready_nodes(command: str) -> tuple[str, ...]:
+    body = command.split(")", 1)[0]
+    return tuple(re.findall(r'"(tests/[^"]+)"', body))
 
 
 def _minijinja_bin() -> str | None:
@@ -4064,3 +4083,102 @@ def test_minicpmo_ready_grades_render_blocking() -> None:
         assert rendered["depends_on"] == "amd-build"
         assert rendered["soft_fail"] is False
         assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
+
+
+def test_minicpmo_rocm_v1_duplex_ready_pins_five_one_card_nodes() -> None:
+    """READY qualifies five real-weight duplex cases on the resolved V1 runner.
+
+    ``--run-level advanced_model`` keeps real weights. The config test invokes
+    the production platform resolver and proves that the shared CUDA-MRv2
+    profile deliberately selects V1 for ROCm before the GPU cases run.
+    """
+    step = _find_step(_ROCM_V1_DUPLEX_READY_LABEL, AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    node_lists = command.split("nodes=(")[1:]
+    quoted = tuple(_quoted_ready_nodes(part) for part in node_lists)
+    source = Path(_ROCM_V1_DUPLEX_FILE).read_text(encoding="utf-8")
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["depends_on"] == "amd-build"
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 45
+    assert step["artifact_paths"] == ["artifacts/rocm-minicpmo-45-v1-fallback-duplex/**/*"]
+    assert "VLLM_ROCM_USE_AITER" not in step.get("env", {})
+    assert "timeout --signal=TERM --kill-after=1m 35m" in command
+    assert "timeout 45m" not in command
+    assert command.count(_ROCM_V1_DUPLEX_READY_MARKER) == 2
+    assert _marker_expressions(step) == ["$$marker", _ROCM_V1_DUPLEX_READY_MARKER]
+    assert command.count("--run-level advanced_model") == 2
+    assert command.count("--run-level core_model") == 1
+    assert _ROCM_V1_DUPLEX_CONFIG_NODE in command
+    assert quoted == (_ROCM_V1_DUPLEX_NODES, _ROCM_V1_DUPLEX_NODES)
+    assert len(_ROCM_V1_DUPLEX_NODES) == 5
+    assert _ROCM_V1_DUPLEX_JUNIT_MESSAGE in command
+    assert "--junitxml=" in command
+    assert "pytest.log" not in command
+    assert "pytest-summary.txt" not in command
+    assert "PIPESTATUS" not in command
+    assert "tee " not in command
+    assert "VLLM_ROCM_USE_AITER" not in command
+    assert "ROCm V1 fallback" in source
+    assert source.count('res={"cuda": "H100", "rocm": "MI325"}, num_cards=1') == 3
+    assert 'res={"cuda": "H100"}, num_cards=' not in source
+    for function_name in (
+        "def test_mrv2_duplex_overlapping_turns(",
+        "def test_mrv2_duplex_new_session_during_long_response(",
+        "def test_mrv2_duplex_server_answers_image_chat_from_the_image(",
+    ):
+        head, _, _ = source.partition(function_name)
+        assert '"rocm": "MI325"' in head[-300:]
+    ready_text = AMD_READY_PIPELINE.read_text(encoding="utf-8")
+    assert ready_text.count(f'label: "{_ROCM_V1_DUPLEX_READY_LABEL}"') == 1
+    for pipeline_path in (AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert _ROCM_V1_DUPLEX_FILE not in text
+
+
+def test_minicpmo_rocm_v1_duplex_ready_renders_nonblocking() -> None:
+    """NonBlocking renders soft_fail true on queue amd_mi300_1."""
+    rendered = _rendered_ready_step(_ROCM_V1_DUPLEX_READY_LABEL)
+    assert rendered["agents"]["queue"] == "amd_mi300_1"
+    assert rendered["depends_on"] == "amd-build"
+    assert rendered["soft_fail"] is True
+    assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
+    assert rendered["timeout_in_minutes"] == 45
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 5, 0, None, 0),
+        (0, 5, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 5, 0, None, 1),
+        (0, 5, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_minicpmo_rocm_v1_duplex_ready_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    """The V1 fallback job fails closed unless exactly five cases execute."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label=_ROCM_V1_DUPLEX_READY_LABEL,
+        command_fragment='pytest -s -v "$${nodes[@]}"',
+        expected_message=_ROCM_V1_DUPLEX_JUNIT_MESSAGE,
+        artifact_env="ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR",
+        job_id_prefix="minicpmo-rocm-v1-duplex-ready-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
