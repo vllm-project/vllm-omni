@@ -186,14 +186,23 @@ def test_mrv2_differing_top_level_metadata_matches_separate_accumulation():
     # Same result as accumulating the two channels one after the other: the
     # pooling value replaces differing metadata, and a tensor and a non-tensor
     # under one key keep both partitions, where the snapshot shows the metadata.
+    processor, state = _make_processor(OutputModality.LATENT, _Detokenizer())
     hidden = torch.ones(1, 4)
-    payload = _process_mrv2_mirror(
-        {"latent": hidden, "spk": ["b", "c"], "a": torch.tensor([9]), "b": ["y"]},
-        {"latent": hidden.clone(), "spk": ["a"], "a": ["x"], "b": torch.tensor([4])},
+    output = _rehydrated_output(
+        pooling_output={"latent": hidden, "spk": ["b", "c"], "a": torch.tensor([9]), "b": ["y"]}
     )
+    output.multimodal_output = {"latent": hidden.clone(), "spk": ["a"], "a": ["x"], "b": torch.tensor([4])}
+
+    payload = processor.process_outputs([output]).request_outputs[0].outputs[0].multimodal_output
 
     torch.testing.assert_close(payload["latent"], hidden)
     assert payload.metadata == {"spk": ["b", "c"], "a": ["x"], "b": ["y"]}
+    # The tensor side of each mismatched key is accumulated once, not dropped.
+    accumulated = state.mm_accumulated
+    assert set(accumulated.tensors) == {"latent", "a", "b"}
+    torch.testing.assert_close(accumulated.tensors["latent"], hidden)
+    torch.testing.assert_close(accumulated.tensors["a"], torch.tensor([9]))
+    torch.testing.assert_close(accumulated.tensors["b"], torch.tensor([4]))
 
 
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
