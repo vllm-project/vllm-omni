@@ -394,7 +394,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     @staticmethod
     def _build_pooler_output_from_cpu(
-        hidden_cpu: torch.Tensor,
+        hidden_cpu: torch.Tensor | None,
         mm_cpu: dict[str, Any],
         query_start_loc_np: np.ndarray,
         num_scheduled_tokens: np.ndarray,
@@ -409,7 +409,9 @@ class OmniARModelRunner(OmniGPUModelRunner):
         for i in range(num_reqs):
             start = int(query_start_loc_np[i])
             end = start + int(num_scheduled_tokens[i])
-            payload: dict[str, Any] = {"hidden": hidden_cpu[start:end].clone()}
+            payload: dict[str, Any] = {}
+            if hidden_cpu is not None:
+                payload["hidden"] = hidden_cpu[start:end].clone()
             for k, v in mm_cpu.items():
                 payload[k] = _slice_pooler_value(
                     v,
@@ -756,11 +758,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._has_fault: torch.Tensor | None = None
 
         # Snapshot input_batch metadata needed for pooler_output slicing
-        self._need_pooler = (
-            streaming_audio is not None
-            or text_hidden is not None
-            or ((self._async_chunk or finalize_multimodal is not None) and bool(multimodal_outputs))
-        )
+        self._need_pooler = streaming_audio is not None or text_hidden is not None or bool(multimodal_outputs)
         self._query_start_loc_np: np.ndarray | None = None
         self._num_scheduled_tokens: np.ndarray | None = None
         self._num_reqs: int = 0
@@ -894,13 +892,14 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                             pin_memory=pin_memory,
                         ),
                     )
-            elif self._need_pooler and text_hidden is not None:
-                self._hidden_cpu = _async_copy_tensor(
-                    text_hidden,
-                    copy_stream=copy_stream,
-                    pin_memory=pin_memory,
-                )
-                total_tokens = text_hidden.shape[0]
+            elif self._need_pooler:
+                if text_hidden is not None:
+                    self._hidden_cpu = _async_copy_tensor(
+                        text_hidden,
+                        copy_stream=copy_stream,
+                        pin_memory=pin_memory,
+                    )
+                total_tokens = self._total_tokens
                 self._mm_cpu = _async_copy_mm(
                     multimodal_outputs,
                     total_tokens,
@@ -987,7 +986,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.multimodal_outputs = (
                 [copy_payload(p) if p else {} for p in pooler_client] if pooler_client else None
             )
-        elif self._need_pooler and self._hidden_cpu is not None:
+        elif self._need_pooler:
             pooler_output = OmniARModelRunner._build_pooler_output_from_cpu(
                 self._hidden_cpu,
                 self._mm_cpu,

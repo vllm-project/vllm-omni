@@ -9,6 +9,7 @@ steps:
           - >-
             pytest -s -v
             tests/platforms/npu/test_minicpmo_code2wav_npugraph.py
+            tests/platforms/npu/test_minicpmo_cross_reference_npugraph.py
             tests/platforms/npu/test_contiguous_kv_cache.py
             tests/platforms/npu/test_npu_device_copy.py
             -m 'core_model and npu and A3 and omni'

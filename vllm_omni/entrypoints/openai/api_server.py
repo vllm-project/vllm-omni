@@ -210,6 +210,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _run_video_generation_job,
     _status_code_for_video_failure,
     _unpack_video_generation_result,
+    validate_latent_continuation_source,
     video_response_from_request,
 )
 from vllm_omni.entrypoints.openai.video.segmentation.helpers import (
@@ -2971,7 +2972,9 @@ async def create_video(
     task: asyncio.Task[None] | None = None
     ref = None
     try:
+        continue_from = await validate_latent_continuation_source(handler, request)
         ref = video_response_from_request(effective_model_name, request)
+        ref.remixed_from_video_id = continue_from
         await VIDEO_STORE.upsert(ref.id, ref)
         task = asyncio.create_task(
             _run_video_generation_job(
@@ -3043,6 +3046,7 @@ async def create_video_sync(
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
+        await validate_latent_continuation_source(handler, request)
         video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
             await asyncio.wait_for(
                 handler.generate_video_bytes(

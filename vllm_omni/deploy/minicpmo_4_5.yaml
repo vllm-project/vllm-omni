@@ -43,6 +43,15 @@ connectors:
       # Fused CFM DiT body: CUDA via TF32, NPU via packed QKV + ACLNN
       # AddLayerNorm + im2col-GEMM convolutions and a single cache transpose.
       cfm_fused_body: true
+      # Enabled in this profile for NPU; set false to disable.
+      # Has no effect on non-NPU backends. Different references share CFM
+      # decode when prepared
+      # prompt/cache/token shapes, dtypes, devices and final flags match.
+      # Requires a FP32 fused Whole-Euler arena, FP32 attention caches and
+      # code2wav_min_batch_size: 1. References still initialize separately.
+      # Does not enable mixed-history or slot-pool batching; singleton and
+      # unsupported configurations retain their existing dispatch.
+      cfm_npu_cross_reference_batching: true
       # Small exact encoder batches share one startup arena; larger batches
       # replay in groups, preserving cache lengths without batch padding.
       enable_code2wav_encoder_graph: true

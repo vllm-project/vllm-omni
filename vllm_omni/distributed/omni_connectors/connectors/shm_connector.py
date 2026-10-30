@@ -26,11 +26,6 @@ def _wakeup_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
 
 
-def _wakeup_directory() -> str:
-    # Stage engine processes of one deployment share their launching parent.
-    return f"/dev/shm/omni_shm_wake_{os.getuid()}_{os.getppid()}"
-
-
 class SharedMemoryConnector(OmniConnectorBase):
     """Key-addressed local shared-memory connector.
 
@@ -47,6 +42,40 @@ class SharedMemoryConnector(OmniConnectorBase):
     deployment layout, or ``VLLM_OMNI_SHM_WAKEUP=0``) keeps the timed poll.
     """
 
+    shm_directory = "/dev/shm"
+
+    def _shm_name(self, key: str) -> str:
+        """Map a logical key to an OS segment name."""
+        return key
+
+    def _shm_exists(self, key: str) -> bool:
+        """Return True while a published payload remains unread.
+
+        Override when segments are not files under ``shm_directory``.
+        """
+        return os.path.exists(f"{self.shm_directory}/{self._shm_name(key)}")
+
+    def _wakeup_directory(self) -> str:
+        # Stage engine processes of one deployment share their launching parent.
+        return f"{self.shm_directory}/omni_shm_wake_{os.getuid()}_{os.getppid()}"
+
+    def _lock_file(self, name: str) -> str:
+        return f"{self.shm_directory}/shm_{name}_lockfile.lock"
+
+    def _write_bytes(self, payload: bytes, name: str) -> dict[str, Any]:
+        """Publish payload bytes while the caller holds the segment lock."""
+        return shm_write_bytes(payload, name=name)
+
+    def _read_bytes(self, metadata: dict[str, Any]) -> bytes:
+        """Read logical payload bytes and unlink under the segment lock."""
+        return shm_read_bytes(metadata)
+
+    def _unlink_segment(self, name: str) -> None:
+        """Unlink a segment by its OS name; raise FileNotFoundError if absent."""
+        seg = shm_pkg.SharedMemory(name=name)
+        seg.close()
+        seg.unlink()
+
     def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
         if time.monotonic() >= deadline:
             return None
@@ -57,9 +86,9 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.stage_id = config.get("stage_id", -1)
         scope = config.get("extra", {}).get("wakeup_scope")
         self._wake_directory = (
-            f"/dev/shm/omni_shm_wake_{os.getuid()}_{hashlib.sha256(str(scope).encode()).hexdigest()[:24]}"
+            f"{self.shm_directory}/omni_shm_wake_{os.getuid()}_{hashlib.sha256(str(scope).encode()).hexdigest()[:24]}"
             if scope is not None
-            else _wakeup_directory()
+            else self._wakeup_directory()
         )
         self._pending_keys: OrderedDict[str, None] = OrderedDict()
         self._pending_keys_lock = threading.Lock()
@@ -206,10 +235,11 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
-            lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
+            name = self._shm_name(put_key)
+            lock_file = self._lock_file(name)
             with open(lock_file, "wb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
-                meta = shm_write_bytes(payload, name=put_key)
+                meta = self._write_bytes(payload, name)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
 
             # meta contains {'name': ..., 'size': ...}
@@ -232,7 +262,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                data_bytes = shm_read_bytes(shm_handle)
+                data_bytes = self._read_bytes(shm_handle)
                 consumed = True
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
@@ -253,8 +283,9 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
         # Take the publication lock before opening a possibly unsized segment.
-        lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
-        result = self._get_data_with_lock(lock_file, {"name": get_key})
+        name = self._shm_name(get_key)
+        lock_file = self._lock_file(name)
+        result = self._get_data_with_lock(lock_file, {"name": name})
         if result is not None:
             with self._pending_keys_lock:
                 self._pending_keys.pop(get_key, None)
@@ -273,7 +304,7 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             if isinstance(metadata, dict) and "shm" in metadata:
                 shm_handle = metadata["shm"]
-                lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+                lock_file = self._lock_file(shm_handle["name"])
                 result = self._get_data_with_lock(lock_file, shm_handle)
                 if result is not None:
                     with self._pending_keys_lock:
@@ -298,16 +329,14 @@ class SharedMemoryConnector(OmniConnectorBase):
         with self._pending_keys_lock:
             self._pending_keys.pop(key, None)
             try:
-                seg = shm_pkg.SharedMemory(name=key)
-                seg.close()
-                seg.unlink()
+                self._unlink_segment(self._shm_name(key))
                 logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
                 unlinked = True
             except FileNotFoundError:
                 pass
             except Exception as e:
                 logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
-            lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+            lock_file = self._lock_file(self._shm_name(key))
             if os.path.exists(lock_file):
                 try:
                     os.remove(lock_file)
@@ -339,7 +368,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         with self._pending_keys_lock:
             for _ in range(min(max_keys, len(self._pending_keys))):
                 key, _ = self._pending_keys.popitem(last=False)
-                if os.path.exists(f"/dev/shm/{key}"):
+                if self._shm_exists(key):
                     self._pending_keys[key] = None
 
     def health(self) -> dict[str, Any]:

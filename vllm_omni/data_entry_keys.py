@@ -260,6 +260,9 @@ class MetaStruct(_StructBase):
     # derives one segment's n_k as the increase between consecutive segment
     # boundaries; the value itself is not segment-local.
     request_text_tokens: int | None = None
+    # Duplex session stats (RFC #8325): [epoch, seq] of the chunk the sending
+    # request worked on, stamped by the chunk transfer adapter.
+    duplex_perf_chunk: list[int] | None = None
 
 
 class OmniPayloadStruct(_StructBase):
