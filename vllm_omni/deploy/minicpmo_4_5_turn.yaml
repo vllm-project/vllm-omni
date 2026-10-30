@@ -4,11 +4,9 @@ session_mode: turn
 
 stages:
   - stage_id: 0
-    # Thinker prefix cache for turn serving on CUDA. The NPU platform block in
-    # the base and the blocks below keep it off on other platforms; the MRv2
-    # turn profile turns it back off. An overlay that sets this key to false
-    # turns it off (see qwen3_omni_moe.yaml).
-    enable_prefix_caching: true
+    # The default CUDA MRv2 Thinker does not merge cached prefix rows.
+    # Non-CUDA platforms also retain their existing cache-disabled behavior.
+    enable_prefix_caching: false
 
 platforms:
   rocm:

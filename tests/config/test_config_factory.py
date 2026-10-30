@@ -2072,7 +2072,7 @@ stages:
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
-            ("minicpmo_4_5_turn.yaml", "cuda", True),
+            ("minicpmo_4_5_turn.yaml", "cuda", False),
             *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5_turn_mrv2.yaml", "cuda", False),
             ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", False),
@@ -3246,6 +3246,7 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts_mrv2.yaml", "qwen3_tts"),
             ("moss_tts_local.yaml", "moss_tts_local"),
+            ("minicpmo_4_5.yaml", "minicpmo_4_5"),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])

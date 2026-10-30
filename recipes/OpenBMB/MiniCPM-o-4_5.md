@@ -70,6 +70,19 @@ Code2Wav consumes them through a shared-memory async connector.
 | 3-GPU | GPU 0 | GPU 1 | GPU 2 | 3x GPU |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
 
+### Default model runner
+
+The default deployment uses Model Runner V2 for all three stages on CUDA.
+NPU, XPU, ROCm and MUSA retain Model Runner V1. The Thinker hands its complete
+payload to Talker (`async_chunk: false` on CUDA stage 0); Talker and Code2Wav
+continue streaming chunks. The explicit `minicpmo_4_5_duplex_mrv2.yaml` profile
+remains available.
+
+The ordinary turn profile also inherits CUDA MRv2 and keeps Thinker prefix
+caching disabled, matching the existing MRv2 turn profile. To compare against
+MRv1, use a deploy overlay with `platforms.cuda.model_runner: v1` while keeping
+other settings unchanged.
+
 ### Single-device concurrency
 
 The default `minicpmo_4_5.yaml` profile allows 32 concurrent sequences per

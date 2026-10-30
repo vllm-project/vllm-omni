@@ -18,15 +18,16 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _DEPLOY = "minicpmo_4_5_duplex_mrv2.yaml"
 
 
-def _resolve_cuda_stages(monkeypatch):
+def _resolve_cuda_stages(monkeypatch, filename):
     # Resolve CUDA overrides even when this test runs on a non-CUDA host.
     monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
-    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform="cuda")
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(filename)), platform="cuda")
     return config, merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
 
 
-def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
-    config, stages = _resolve_cuda_stages(monkeypatch)
+@pytest.mark.parametrize("filename", ["minicpmo_4_5.yaml", _DEPLOY])
+def test_duplex_mrv2_cuda_profile(monkeypatch, filename) -> None:
+    config, stages = _resolve_cuda_stages(monkeypatch, filename)
     assert config.session_mode == "duplex"
     # All three stages use MRv2; there is no hidden Talker fallback.
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [True, True, True]
@@ -41,9 +42,10 @@ def test_duplex_mrv2_cuda_profile(monkeypatch) -> None:
     assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 8 * 1024**3
 
 
+@pytest.mark.parametrize("filename", ["minicpmo_4_5.yaml", _DEPLOY])
 @pytest.mark.parametrize("platform", ["npu", "xpu", "rocm", "musa"])
-def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform) -> None:
+def test_duplex_mrv2_profile_keeps_non_cuda_on_v1(monkeypatch, platform, filename) -> None:
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
-    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(_DEPLOY)), platform=platform)
+    config = _apply_platform_overrides(load_deploy_config(get_deploy_config_path(filename)), platform=platform)
     stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [False, False, False]
