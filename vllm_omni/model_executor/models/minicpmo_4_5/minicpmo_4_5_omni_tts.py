@@ -78,16 +78,18 @@ _CODEC_TOP_K = 25
 _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 
-# Host-side codec boundary sampling (per-frame sync-chain optimization,
-# plan B): with VLLM_OMNI_HOST_CODEC_SAMPLE=1 the K-step frame loop's
-# per-request sampling chain -- ~40 eager micro-kernels plus one
-# packed.cpu() sync per frame -- collapses to a head_code Linear on
-# device plus a single 26KB logits D2H, with every downstream filter /
-# penalty / draw / transition on host scalars. Opt-in via env because
-# the host RNG stream is not bit-identical to the NPU multinomial
-# sequence; greedy (temperature==0) stays bit-identical. See
+# Host-side codec boundary sampling (per-frame sync-chain optimization):
+# the K-step frame loop's per-request sampling chain -- ~40 eager
+# micro-kernels plus one packed.cpu() sync per frame -- collapses to a
+# head_code Linear on device plus a single 26KB logits D2H, with every
+# downstream filter / penalty / draw / transition on host scalars.
+# Enabled by default; set VLLM_OMNI_HOST_CODEC_SAMPLE=0 to restore the
+# device sampler. The host RNG stream is not bit-identical to the NPU
+# multinomial sequence, so generated audio differs from the device
+# sampler, but quality is unchanged (seed-tts WER identical item by
+# item); greedy (temperature==0) stays bit-identical. See
 # _sample_audio_code_host.
-_HOST_CODEC_SAMPLE = os.environ.get("VLLM_OMNI_HOST_CODEC_SAMPLE", "0") == "1"
+_HOST_CODEC_SAMPLE = os.environ.get("VLLM_OMNI_HOST_CODEC_SAMPLE", "1") == "1"
 # Optimization C gate: one-row-deep pipeline of boundary heads on the host
 # sampling path. Default on when host sampling is on; set
 # VLLM_OMNI_HOST_SAMPLE_PIPELINE=0 to settle each row eagerly (A/B arms).
