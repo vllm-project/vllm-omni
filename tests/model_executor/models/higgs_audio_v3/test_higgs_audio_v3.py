@@ -108,6 +108,27 @@ class TestHiggsAudioV3Config:
         assert v2.audio_mrv2_static_inputs is False
         assert v2.audio_async_payload is True
 
+    def test_mrv2_explicit_flags_warn_when_ignored_under_v1(self, caplog):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config(audio_mrv2_static_inputs=True, audio_mrv2_fused_state=True)
+        with caplog.at_level("WARNING", logger="vllm_omni.transformers_utils.configs.higgs_audio_v3"):
+            v1 = config.resolve_mrv2_defaults(use_v2_model_runner=False)
+        assert v1.audio_mrv2_static_inputs is False
+        assert v1.audio_mrv2_fused_state is False
+        assert any(
+            "audio_mrv2_static_inputs" in message and "audio_mrv2_fused_state" in message for message in caplog.messages
+        )
+
+        # The same explicit values are honored, not warned about, under v2.
+        caplog.clear()
+        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
+        assert v2.audio_mrv2_static_inputs is True
+        assert v2.audio_mrv2_fused_state is True
+        assert not caplog.records
+
     def test_custom_audio_encoder_config(self):
         from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
