@@ -18,7 +18,10 @@ from typing import Any, cast
 
 import janus
 from vllm import envs as vllm_envs
+from vllm.config import ModelConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader import get_model_cls
+from vllm.model_executor.models import supports_transcription
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
@@ -453,11 +456,22 @@ class OmniEngineBase:
             )
             for client in self.stage_clients
         ]
-        supported_tasks: set[str] = set()
-        if any(getattr(stage_config, "is_comprehension", False) for stage_config in self.stage_configs):
-            supported_tasks.add("generate")
+        supported_tasks: list[str] = []
+        is_transcription_only = False
+        stage0_vllm_cfg = self.stage_vllm_configs[0] if self.stage_vllm_configs else None
+        stage0_model_cfg = getattr(stage0_vllm_cfg, "model_config", None)
+        if isinstance(stage0_model_cfg, ModelConfig):
+            stage0_model_cls = get_model_cls(stage0_model_cfg)
+            if supports_transcription(stage0_model_cls):
+                supported_tasks.append("transcription")
+                is_transcription_only = bool(getattr(stage0_model_cls, "supports_transcription_only", False))
+
+        if not is_transcription_only and any(
+            getattr(stage_config, "is_comprehension", False) for stage_config in self.stage_configs
+        ):
+            supported_tasks.append("generate")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
-            supported_tasks.add("speech")
+            supported_tasks.append("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
     def _bootstrap_orchestrator(

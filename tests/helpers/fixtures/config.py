@@ -10,6 +10,7 @@ import os
 import pytest
 import torch
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.platforms import current_platform
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -24,6 +25,8 @@ def default_env():
         os.environ["VLLM_TARGET_DEVICE"] = "cuda"
     elif hasattr(torch, "npu") and torch.npu.is_available():
         os.environ["VLLM_TARGET_DEVICE"] = "npu"
+    elif not current_platform.is_unspecified() and current_platform.device_type:
+        os.environ["VLLM_TARGET_DEVICE"] = current_platform.device_type
     else:
         os.environ["VLLM_TARGET_DEVICE"] = "cpu"
     yield
@@ -48,6 +51,8 @@ def default_vllm_config():
         device = "cuda"
     elif hasattr(torch, "npu") and torch.npu.is_available():
         device = "npu"
+    elif not current_platform.is_unspecified() and current_platform.device_type:
+        device = current_platform.device_type
     else:
         device = "cpu"
     device_config = DeviceConfig(device=device)

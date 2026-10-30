@@ -54,6 +54,21 @@ def scope_stage_replica_mm_uuids(
     if not isinstance(prompt, dict):
         return prompt
 
+    if "encoder_prompt" in prompt:
+        enc_prompt = prompt.get("encoder_prompt")
+        scoped_enc = scope_stage_replica_mm_uuids(
+            enc_prompt,
+            stage_id=stage_id,
+            replica_id=replica_id,
+            model_id=model_id,
+            mm_hasher_algorithm=mm_hasher_algorithm,
+        )
+        if scoped_enc is enc_prompt:
+            return prompt
+        scoped_prompt = dict(prompt)
+        scoped_prompt["encoder_prompt"] = scoped_enc
+        return scoped_prompt
+
     mm_data = prompt.get("multi_modal_data")
     if not isinstance(mm_data, dict) or not mm_data:
         return prompt
