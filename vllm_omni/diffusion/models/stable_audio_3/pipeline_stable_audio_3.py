@@ -319,6 +319,14 @@ class StableAudio3Pipeline(
         duration: float = (audio_end_s - audio_start_s) if audio_end_s is not None else 30.0
         sampler_type: str = extra.get("sampler_type", "dpmpp-3m-sde")
 
+        # Written as `not x >= ...` so NaN is rejected too; +inf is caught by the max check.
+        if not audio_start_s >= 0:
+            raise ValueError(f"audio_start_in_s must be a non-negative number of seconds, got {audio_start_s}")
+        # At least one output sample, otherwise latent_sample_size below is zero or negative.
+        if not duration * self.sample_rate >= 1:
+            raise ValueError(
+                f"audio_end_in_s must be after audio_start_in_s, got start={audio_start_s}s end={audio_end_s}s",
+            )
         if duration > self.max_audio_seconds:
             raise ValueError(
                 f"Requested duration {duration:.1f}s exceeds SA3 Medium max of {self.max_audio_seconds:.0f}s",
