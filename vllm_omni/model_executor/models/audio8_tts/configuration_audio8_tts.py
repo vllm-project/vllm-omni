@@ -184,7 +184,7 @@ class Audio8TTSFastARConfig(PretrainedConfig):
 
     def __init__(
         self,
-        codebook_size: int = ARKTTS_SEMANTIC_CODEBOOK_SIZE,
+        codebook_size: int | None = None,
         num_codebooks: int = 10,
         fast_dim: int = 896,
         fast_n_head: int = 14,
@@ -215,11 +215,20 @@ class Audio8TTSFastARConfig(PretrainedConfig):
 
         # ``to_dict()`` serializes ``vocab_size``, so a round-tripped sub-config
         # would otherwise pass it twice.
-        # ``to_dict()`` serializes ``vocab_size``; it is the only record of a
-        # non-default codebook size, so use it as the fallback.
-        codebook_size = int(kwargs.pop("vocab_size", codebook_size))
-        self.codebook_size = codebook_size
-        super().__init__(vocab_size=codebook_size, **kwargs)
+        # ``to_dict()`` serializes ``vocab_size``; it is the fallback for a config
+        # that does not carry ``codebook_size``. An explicitly passed value wins,
+        # and a disagreement is an error rather than a silent override.
+        serialized_vocab = kwargs.pop("vocab_size", None)
+        if codebook_size is None:
+            codebook_size = ARKTTS_SEMANTIC_CODEBOOK_SIZE if serialized_vocab is None else int(serialized_vocab)
+        elif serialized_vocab is not None and int(serialized_vocab) != int(codebook_size):
+            raise ValueError(
+                f"Audio8TTSFastARConfig: codebook_size={codebook_size} disagrees with the "
+                f"serialized vocab_size={serialized_vocab}; fix the config instead of letting "
+                "one value silently win."
+            )
+        self.codebook_size = int(codebook_size)
+        super().__init__(vocab_size=int(codebook_size), **kwargs)
 
 
 class Audio8TTSConfig(PretrainedConfig):
