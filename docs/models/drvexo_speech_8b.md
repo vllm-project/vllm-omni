@@ -31,22 +31,28 @@ checkpoint compatibility and is not the validated generated-text speech path.
 ## Development launch
 
 Install the dependencies for the checked-out vLLM-Omni revision, then install
-this checkout as described in the installation guide. Current upstream targets
-vLLM 0.32.0. The original exported runtime was tested on vLLM 0.29.0; those
-results do **not** validate the current upstream adapter. Check the PR's
-matching-head validation report before relying on this development command:
+this checkout as described in the installation guide. The adapter was also
+checked on vLLM 0.32.0 / DGX Spark GB10; see the validation scope below.
+The original exported runtime uses vLLM 0.29.0 and different extension paths.
 
 ```bash
-vllm serve /absolute/path/to/complete-checkpoint --omni \
+export VLLM_API_KEY="set-a-local-api-key"
+export VLLM_ALLOW_INSECURE_SERIALIZATION=1
+python -m vllm_omni.entrypoints.cli.main serve /absolute/path/to/complete-checkpoint --omni \
   --deploy-config vllm_omni/deploy/drvexo_speech_8b.yaml \
   --served-model-name drvexo --host 127.0.0.1 --port 8000 \
-  --stage-init-timeout 1800 --init-timeout 2400
+  --stage-init-timeout 1800 --init-timeout 1900
 ```
 
 The opt-in deployment uses a single device, eager execution, one sequence,
 no prefix caching and a 2048-token prefill batch. The General head requires
 these settings. Chat has a 32768-token context budget; deployment settings
 are not a claim of portability to every GPU, environment or context workload.
+
+The tested local multiprocess stage path uses the serialization opt-in above;
+checkpoint weights use safetensors. Quantized Codec loads BF16 state and promotes
+it to FP32 for exact calibration-reference validation before packed replacement
+and the manifest-selected surrounding compute conversion.
 
 Do not reuse version-bound numerical caches from a different runtime. BF16,
 FP8 and NVFP4 names describe supported stored/quantized components, not every
@@ -56,8 +62,10 @@ have precision exceptions. See the checkpoint's component manifests.
 
 ## Requests
 
-Standard `/v1/chat/completions` requests support text and audio inputs. Supply
-complete committed history, tool associations and authoritative product facts.
+Standard `/v1/chat/completions` requests support text and audio inputs.
+For text plus WAV output, use `"modalities": ["text", "audio"]` and
+`"audio": {"format": "wav"}`. The response combines text and audio in one choice.
+Supply complete committed history, tool associations and authoritative product facts.
 The adapter does not insert identity answers or use decision scores to
 intercept ordinary chat. Audio recognition of the current input returns
 `input_transcription` metadata; committed text history is preserved.
@@ -65,6 +73,7 @@ intercept ordinary chat. Audio recognition of the current input returns
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $VLLM_API_KEY" \
   -d '{"model":"drvexo","messages":[{"role":"user","content":"Hello"}],"modalities":["text"],"max_tokens":64}'
 ```
 
@@ -83,6 +92,7 @@ use the versioned paths below with this upstream adapter:
 ```bash
 curl http://127.0.0.1:8000/v1/drvexo/decision \
   -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $VLLM_API_KEY" \
   -d '{"task":"choice","instruction":"Match the color in the state.","state":{"color":"blue"},"candidates":[{"id":"a","text":"blue"},{"id":"b","text":"red"}]}'
 ```
 
@@ -103,9 +113,24 @@ a call, transaction or device action succeeded.
 CPU tests cover actual tiny safetensors loading/relocation, path containment,
 component completeness, input projection, quantization adapters, General
 candidate validation, chunked-prefill ownership, disabled-head bypass,
-cancellation and audio-history conversion. GPU execution and numerical output
-must be validated against the exact PR commit and runtime. Earlier bundle
-usability checks and benchmark scores are not matching-head evidence here.
+cancellation and audio-history conversion. The related local run passed 225
+tests and 24 subtests. On GB10 with vLLM 0.32.0, each complete precision passed
+17 existing usability checks plus 3 standard generated-token chat/audio checks;
+5 unauthenticated route checks per precision returned 401. BF16's 17 ran at
+`85722197e39eb08ae9952dc78d811303e22a5e06`; its additional 3 and all FP8/NVFP4
+checks ran at `67072af55a6af930de24d2d7c8cd06f0e1504f87`. Later Codec changes
+affect only quantized reference validation; explicit BF16 load dtype equals the previous resolved default.
+Servers, suites and the final managed launcher retained actual zero exits.
+
+The environment used Torch 2.13.0+cu130, Transformers 5.16.1, FlashInfer
+0.7.0.post1, Humming-kernels 0.1.17 and CUTLASS DSL 4.8.0. Installed Omni dev
+metadata still produces a version warning; identify code by its source commit.
+The environment includes system site-packages. First-use native kernel builds
+can take several minutes. These checks establish functional local usability,
+not fresh accuracy, cross-runtime numerical parity or throughput improvement.
+Successful local shutdown logs also retain Python resource_tracker warnings
+for three shared-memory objects. Zero exits and an empty cgroup/GPU do not
+independently establish complete IPC-object lifecycle correctness.
 
 This integration does not implement SIP/PSTN/WebRTC, full-duplex telephony,
 production concurrency guarantees, human listening tests or speaker-similarity
