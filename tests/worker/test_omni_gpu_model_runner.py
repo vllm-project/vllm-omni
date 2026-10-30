@@ -1661,6 +1661,7 @@ def test_multimodal_embeddings_receive_opt_in_host_request_boundaries(supports_b
 
 class BatchFilledRowsModel:
     has_preprocess = True
+    preprocess_batch_requires_stable_decode = False
 
     def __init__(self, filled, *, fills_rows=True):
         self.filled = set(filled)
@@ -2226,3 +2227,23 @@ def test_take_restored_mm_removes_only_the_requested_ids():
 def test_take_restored_mm_is_empty_without_lmcache():
     runner = object.__new__(LMCacheHiddenStateMixin)
     assert runner._take_restored_mm(["r1"]) == {}
+
+
+@pytest.mark.parametrize("changed", ["new", "resumed", "stable"])
+def test_decode_only_batch_hook_keeps_admission_and_resume_on_generic_path(monkeypatch, changed):
+    runner, scheduled, _, _ = _make_phase_runner(
+        monkeypatch, [("live-a", 5, 5, 1), ("live-b", 6, 6, 1)], batched_decode=False
+    )
+    _without_mtp_buffers(runner)
+    model = BatchFilledRowsModel({"live-a", "live-b"})
+    model.preprocess_batch_requires_stable_decode = True
+    runner.model = model
+    scheduled.scheduled_new_reqs = [SimpleNamespace(req_id="live-a")] if changed == "new" else []
+    scheduled.scheduled_cached_reqs = SimpleNamespace(resumed_req_ids={"live-a"} if changed == "resumed" else set())
+    runner._preprocess(scheduled, scheduled.total_num_scheduled_tokens)
+    if changed == "stable":
+        assert not model.calls
+        assert "inputs_embeds" in model.batch_kwargs
+    else:
+        assert model.calls == ["live-a", "live-b"]
+        assert "inputs_embeds" not in model.batch_kwargs

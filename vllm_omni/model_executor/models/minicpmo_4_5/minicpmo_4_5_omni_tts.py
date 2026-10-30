@@ -2425,8 +2425,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = torch.empty((0, 1), dtype=torch.long, device="cpu")
-        codec_deltas = [empty_delta for _ in infos]
-        terminal_flags = [torch.tensor(False, dtype=torch.bool) for _ in infos]
+        codec_deltas: list[Any] | torch.Tensor = [empty_delta for _ in infos]
+        terminal_flags: list[Any] | torch.Tensor = [None] * len(infos)
         force_eos_rows = [False] * len(infos)
         mask_eos_rows = [False] * len(infos)
         empty_history = torch.empty(0, dtype=torch.long, device="cpu")
@@ -2435,7 +2435,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         codec_eos_id = int(self._codec_eos_id)
         gpu_rows = []
         gpu_groups = []
-        frame_valid = [torch.empty(0, dtype=torch.bool, device="cpu") for _ in infos]
+        batch_codec_output = False
+        frame_valid: list[Any] | torch.Tensor = [None] * len(infos)
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             if emit_duplex_metadata:
@@ -2559,13 +2560,21 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 silent_frames=_TURN_END_SILENT_FRAMES,
                 quiet_stop_frames=_TURN_END_QUIET_STOP_FRAMES,
             )
+            batch_codec_output = (
+                len(gpu_rows) == len(infos)
+                and all(code is not None for _, _, code in gpu_rows)
+                and len(spans) == len(infos)
+                and all(end - start == 1 for start, end in spans)
+            )
             history_rows = histories.unbind()
-            valid_rows = valid.split(1)
-            done_rows = done.unbind()
-            masked_rows = masked.unbind()
-            id_rows = ids.reshape(-1, 1).split(1)
+            valid_rows = () if batch_codec_output else valid.split(1)
+            done_rows = () if batch_codec_output else done.unbind()
+            masked_rows = () if batch_codec_output else masked.unbind()
+            id_rows = () if batch_codec_output else ids.reshape(-1, 1).split(1)
             for row, (index, state, code) in enumerate(gpu_rows):
                 state["recent_codes"] = history_rows[row]
+                if batch_codec_output:
+                    continue
                 if code is not None:
                     codec_deltas[index] = id_rows[row]
                     frame_valid[index] = valid_rows[row]
@@ -2588,6 +2597,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
                 force_eos_rows = device_flags(force_eos_rows, done)
                 mask_eos_rows = device_flags(mask_eos_rows, masked)
+
+        if gpu_rows and batch_codec_output:
+            # Preserve batches through the owned async snapshot; only split
+            # after D2H. No views into a reusable device buffer escape without
+            # the runner's normal snapshot clone.
+            codec_deltas = ids.reshape(-1, 1, 1)
+            frame_valid = valid.reshape(-1, 1)
+            terminal_flags = done
+
+        # Device decode fills these rows directly. Allocate CPU placeholders
+        # only for fallback rows, after the device results have been assigned.
+        if not batch_codec_output:
+            for index in range(len(infos)):
+                if terminal_flags[index] is None:
+                    terminal_flags[index] = torch.tensor(False, dtype=torch.bool)
+                if frame_valid[index] is None:
+                    frame_valid[index] = torch.empty(0, dtype=torch.bool, device="cpu")
 
         # Empty-speech rows, finished duplex chunks, and offline requests that
         # fill the remaining Talker context must sample codec EOS so the
@@ -2617,6 +2643,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "meta": meta_outputs,
             },
         )
+
+    @staticmethod
+    def finalize_multimodal_outputs_from_cpu_snapshot(outputs):
+        if not isinstance(outputs, dict):
+            return outputs
+        codes = outputs.get("codes", {})
+        audio = codes.get("audio") if isinstance(codes, dict) else None
+        if isinstance(audio, torch.Tensor) and audio.ndim == 3:
+            # Restore the existing per-request shape and scalar flag contract
+            # at the output boundary, after the batch copy has completed.
+            outputs = dict(outputs)
+            outputs["codes"] = {**codes, "audio": list(audio.unbind(0))}
+            meta = dict(outputs["meta"])
+            for key in ("codec_frame_valid", "finished"):
+                meta[key] = list(meta[key].unbind(0))
+            outputs["meta"] = meta
+        return outputs
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         if not isinstance(hidden_states, torch.Tensor):

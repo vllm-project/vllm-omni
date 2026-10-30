@@ -271,3 +271,25 @@ changing backend versions; floating-point waveform identity is not promised.
 `platforms.cuda.cuda_mps`. Profiles that inherit it, including
 `minicpmo_4_5_turn.yaml`, inherit both. Set either key to `false` in an
 overlay to disable that part.
+
+## V1 Talker decode bookkeeping
+
+The V1 Talker uses the existing batch-preprocess row-fill hook for batches
+containing only one-token decode requests with initialized audio state. It
+checks the current request order, token offsets and prompt boundaries on every
+step; it does not cache metadata by batch size. New admissions, preemption
+resumes, mixed prefill/decode and K-step execution keep the generic path.
+The hook preserves condition metadata and updates only the live decode fields
+and the empty codec delta; the Talker still owns the sampled-id snapshot.
+
+For a full device-decode batch, codec ids, validity and completion flags stay
+batched until the runner's owned output snapshot has been copied. The output
+finalizer then restores per-request tensors and scalar completion flags.
+Mixed batches retain row-wise output. CPU placeholders are allocated only for
+rows without a device result. Snapshot ownership remains necessary even when
+all rows share one tensor: producer buffers may be overwritten on the next
+step.
+
+These shortcuts target V1. The default CUDA MRv2 Talker already skips identity
+decode preprocessing and emits device batches, so a V1 improvement alone does
+not establish a speedup for the default MRv2 deployment.
