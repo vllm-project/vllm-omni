@@ -108,6 +108,9 @@ en-GB, es, fr) at speeds 0.9, 1.0 and 1.2.
   | Long input, 3 chunks → 79.5 s audio | 1.7 s non-streaming; streaming first audio 0.82 s |
   | 16 concurrent requests, 140 s audio total | 4.4 s wall (32x realtime), p50 latency 2.8 s |
 
+- Startup downloads all 54 `voices/*.pt` packs next to the weights and loads
+  them on the GPU. On a host without network access, pre-fetch the repository
+  (`hf download hexgrad/Kokoro-82M`) and set `HF_HUB_OFFLINE=1`.
 - Key flags: `enforce_eager: true`; `gpu_memory_utilization` is a startup
   headroom check, not a KV budget.
 - Known limitations: each engine step synthesizes its requests one after
