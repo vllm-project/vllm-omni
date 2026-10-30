@@ -4055,3 +4055,39 @@ def test_save_async_boundary_holds_generation_without_request_counter(build_adap
 
     assert len(adapter._pending_save_reqs) == queued_before + 1
     assert adapter._pending_save_reqs[-1]["request"] is follow_up
+
+
+@pytest.mark.parametrize(("source", "target"), [(0, 2), (2, 1)])
+def test_configured_edge_transfers_ordered_chunks_through_real_shm(build_adapter, source, target):
+    """Exercise actual SHM put/get with scheduler threads stepped by the test."""
+    from vllm_omni.config.stage_routing import StageRouting
+    from vllm_omni.engine.stage_init_utils import get_stage_connector_spec
+
+    route = StageRouting.from_transitions(3, ((0, 2), (2, 1)))
+    sender, _ = build_adapter(stage_id=source)
+    receiver, _ = build_adapter(stage_id=target)
+    sender.config.stage_connector_config = get_stage_connector_spec(None, source, True, route)
+    receiver.config.stage_connector_config = get_stage_connector_spec(None, target, True, route)
+    send_connector = SharedMemoryConnector({"stage_id": source})
+    recv_connector = SharedMemoryConnector({"stage_id": target})
+    sender.connector = send_connector
+    receiver.connector = recv_connector
+    external_id = f"configured-route-{uuid.uuid4().hex}"
+    send_request = _req("sender", RequestStatus.RUNNING, external_req_id=external_id)
+    recv_request = _req("receiver", RequestStatus.WAITING, external_req_id=external_id)
+    try:
+        for index in range(3):
+            sender.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.tensor([index], dtype=torch.long))
+            )
+            sender.save_async(None, send_request)
+            sender._send_single_request(sender._pending_save_reqs.popleft())
+            entry = _dequeue_load_entry(receiver, recv_request)
+            assert receiver._poll_single_request(entry)
+            assert receiver.get_req_chunk["receiver"] == index + 1
+            payload = receiver._pending_ar_prompt_updates["receiver"][1]
+            assert payload["codes"]["audio"].tolist() == [index]
+        assert sender.put_req_chunk[external_id] == 3
+    finally:
+        send_connector.close()
+        recv_connector.close()

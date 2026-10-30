@@ -21,7 +21,7 @@ from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_p
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..connectors.shm_connector import SharedMemoryConnector
 from ..factory import OmniConnectorFactory
-from ..utils.config import ConnectorSpec, stage_receives_chunks
+from ..utils.config import ConnectorSpec, get_stage_connector_peer, stage_receives_chunks
 from ..utils.initialization import resolve_connector_spec
 from ..utils.kv_utils import get_local_tp_rank, get_omni_replica_id
 from ..utils.logging import get_connector_logger
@@ -564,7 +564,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def _poll_single_request(self, entry: _LoadEntry):
         request = entry.request
         stage_id = self.connector.stage_id
-        target_stage_id = stage_id - 1
+        target_stage_id = get_stage_connector_peer(self.config, stage_id, "from_stage")
+        if target_stage_id is None:
+            return True
         req_id = request.request_id
         with self._receiver_state_lock:
             if self._registered_load_entries.get(req_id) is not entry:
@@ -919,7 +921,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
         stage_id = self.connector.stage_id
-        next_stage_id = stage_id + 1
+        next_stage_id = get_stage_connector_peer(self.config, stage_id, "to_stage")
+        if next_stage_id is None:
+            return
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"

@@ -23,6 +23,7 @@ from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime i
     logger,
     should_accumulate_full_payload_output,
 )
+from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_peer
 from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
 
@@ -766,6 +767,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             return list(outputs.keys())
         sent_ids: list[str] = []
         next_stage_id = self._next_stage_id
+        if next_stage_id is None:
+            return []
         for req_id, value in outputs.items():
             if isinstance(value, tuple) and len(value) == 2:
                 raw_output, request = value
@@ -1127,7 +1130,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 )
                 return False
 
-        target_stage_id = self._stage_id - 1
+        target_stage_id = get_stage_connector_peer(self._get_model_config(), self._stage_id, "from_stage")
+        if target_stage_id is None:
+            return False
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         request = self._pending_load_reqs.get(req_id)
@@ -1559,6 +1564,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """Enqueue an already-built payload under its per-request chunk key."""
         raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
         request_id = self._resolve_external_req_id(request, raw_req_id)
+        if self._next_stage_id is None:
+            return True, None
         if raw_req_id and raw_req_id != request_id:
             self._request_ids_mapping.setdefault(raw_req_id, request_id)
         chunk_id = self._put_req_chunk[request_id]

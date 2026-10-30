@@ -14,6 +14,7 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
@@ -100,7 +101,7 @@ class FakeInputProcessor:
 
 
 class FakePrewarmPool:
-    """Single-replica pool double that binds requests only on submission."""
+    """Single-replica pool double that binds before advertising its sender."""
 
     stage_type = "llm"
 
@@ -114,6 +115,10 @@ class FakePrewarmPool:
             )
         )
         self.submitted: list[Any] = []
+
+    async def pick(self, request_id, *, request_state):
+        self._bound_request_ids.add(request_id)
+        return 0
 
     async def submit_initial(self, request_id, _req_state, request, prompt_text=None):
         self.submitted.append(request)
@@ -221,6 +226,7 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
     if payload_sender_info is not None:
         stage1.stage_client.get_payload_sender_info = MagicMock(return_value=payload_sender_info)
     orchestrator.stage_pools = [stage0, stage1, stage2]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._on_stage_submitted = MagicMock()
     max_frames = [256]
@@ -234,6 +240,7 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
         final_stage_id=2,
     )
+    orchestrator.request_states = {req_state.request_id: req_state}
 
     prewarmed = await orchestrator._prewarm_async_chunk_stages(
         "req-prewarm",
@@ -249,7 +256,7 @@ async def test_async_prewarm_skips_outgoing_only_stage(payload_sender_info) -> N
 
     assert prewarmed is True
     assert stage1.submitted == []
-    assert stage1.get_bound_client("req-prewarm") is None
+    assert stage1.get_bound_client("req-prewarm") is stage1.stage_client
     assert len(stage2.submitted) == 1
     assert stage2.get_bound_client("req-prewarm") is stage2.stage_client
     assert stage2.submitted[0].payload_sender_info == payload_sender_info
@@ -281,6 +288,7 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
     stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)
     stage2 = FakePrewarmPool("receiver")
     orchestrator.stage_pools = [stage0, stage1, stage2]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._emit_tx_edge = lambda **_kwargs: None
     orchestrator._on_stage_submitted = MagicMock()
     req_state = OrchestratorRequestState(
@@ -289,6 +297,7 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
         sampling_params_list=[SamplingParams(max_tokens=1) for _ in range(3)],
         final_stage_id=2,
     )
+    orchestrator.request_states = {req_state.request_id: req_state}
 
     prewarmed = await orchestrator._prewarm_async_chunk_stages(
         "req-prewarm-custom",
@@ -315,6 +324,7 @@ async def test_async_route_forwards_to_outgoing_only_stage() -> None:
     stage0 = SimpleNamespace(final_output=False)
     stage1 = FakePrewarmPool("sender")
     orchestrator.stage_pools = [stage0, stage1]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator._forward_to_next_stage = AsyncMock()
     req_state = OrchestratorRequestState(
         request_id="req-route",
@@ -340,6 +350,7 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
         cleanup_parent=lambda _request_id: [],
     )
     orchestrator.stage_pools = [SimpleNamespace(final_output=True)]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.output_async_queue = asyncio.Queue()
     orchestrator._cleanup_request_ids = AsyncMock()
 
@@ -358,7 +369,7 @@ async def test_streaming_segment_does_not_complete_final_output_stage() -> None:
 
     await orchestrator._route_output(0, 0, output, req_state, None)
 
-    assert req_state.finished_final_output_stage_ids == set()
+    assert req_state.finished_stage_ids == set()
     orchestrator._cleanup_request_ids.assert_not_awaited()
     routed = orchestrator.output_async_queue.get_nowait()
     assert routed.finished is False

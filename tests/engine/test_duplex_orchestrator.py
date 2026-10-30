@@ -678,7 +678,7 @@ async def test_streaming_segment_stop_keeps_response_open_until_real_terminal(mo
         assert request_state.streaming.segment(1).finished is True
         assert request_id in orchestrator.request_states
         assert 1 not in request_state.finished_stage_ids
-        assert 1 not in request_state.finished_final_output_stage_ids
+        assert not request_state.final_outputs_finished
 
         await _route_raw_codec_output(
             orchestrator,
@@ -708,7 +708,7 @@ async def test_streaming_segment_stop_keeps_response_open_until_real_terminal(mo
         assert done[0].status == "completed"
         assert session.active_response_id is None
         assert 1 in request_state.finished_stage_ids
-        assert 1 in request_state.finished_final_output_stage_ids
+        assert request_state.final_outputs_finished
     finally:
         await orchestrator.session_manager.shutdown()
 
@@ -744,7 +744,7 @@ async def test_non_streaming_terminal_completes_the_response_once(mocker) -> Non
         assert session.active_response_id is None
         assert request_state.streaming.segment(1).finished is False
         assert 1 in request_state.finished_stage_ids
-        assert 1 in request_state.finished_final_output_stage_ids
+        assert request_state.final_outputs_finished
     finally:
         await orchestrator.session_manager.shutdown()
 
@@ -1214,7 +1214,8 @@ async def test_payload_sender_info_binds_from_explicit_session_state(monkeypatch
         assert pool.get_bound_replica_id(request_id) is None
         with monkeypatch.context() as patch:
             patch.delattr(orchestrator, "request_states")
-            assert orchestrator._build_payload_sender_info(0, request_id=request_id) == {"replica": 0}
+            assert orchestrator._build_payload_sender_info(0) == {"replica": 0}
+            assert orchestrator._build_payload_sender_info(0, request_id=request_id) is None
             assert pool.get_bound_replica_id(request_id) is None
             sender_info = orchestrator._build_payload_sender_info(0, request_id=request_id, req_state=state)
         assert sender_info == {"replica": 1}
