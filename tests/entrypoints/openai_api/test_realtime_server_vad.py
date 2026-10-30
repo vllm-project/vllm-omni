@@ -148,7 +148,9 @@ def _make_connection(
     *,
     semantic_vad_backend_provider: SmartTurnBackendProvider | None = None,
 ) -> _ResponseRecordingConnection:
-    engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=100))
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100), engine=SimpleNamespace(tracer_provider=None)
+    )
     chat_handler = SimpleNamespace(renderer=SimpleNamespace(get_tokenizer=lambda: object()))
     connection = _ResponseRecordingConnection(
         websocket=websocket,
