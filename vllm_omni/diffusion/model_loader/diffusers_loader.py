@@ -221,6 +221,35 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         self._last_load_request: dict[str, object] | None = None
         self._force_canonical_load = False
 
+    def _is_h3_eager_vae_only_quantization(self, load_format: str) -> bool:
+        """Whether online INT8 is owned entirely by H3's eager VAE loader.
+
+        Only this narrow configuration can keep CPU initialization even though
+        a quantization config is present. Other components still use the shared
+        loader's existing device-side quantization lifecycle.
+        """
+        if load_format != "default" or getattr(self.od_config, "model_class_name", None) not in {
+            "MiniMaxH3Pipeline",
+            "MiniMaxH3ModularPipeline",
+            "MiniMaxH3DecoderPipeline",
+        }:
+            return False
+
+        from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+        from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+        config = self.quant_config
+        if not isinstance(config, ComponentQuantizationConfig) or config.default_config is not None:
+            return False
+        components = config.component_configs
+        vae_config = components.get("video_vae")
+        return (
+            isinstance(vae_config, DiffusionInt8Config)
+            and not vae_config.is_checkpoint_int8_serialized
+            and vae_config.activation_scheme == "dynamic"
+            and all(value is None for name, value in components.items() if name != "video_vae")
+        )
+
     def take_host_weight_plan(self) -> HostWeightPlan | None:
         """Transfer the loader-produced plan to the offload backend."""
         plan = self.host_weight_plan
@@ -744,7 +773,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # For online quantization, load on device so quantization can run on accelerator,
         # then move back to CPU afterward.
         offload_after_quant = False
-        if load_device == "cpu" and self.quant_config is not None and device is not None:
+        if (
+            load_device == "cpu"
+            and self.quant_config is not None
+            and device is not None
+            and not self._is_h3_eager_vae_only_quantization(load_format)
+        ):
             quant_cfg = self.quant_config
             is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
                 quant_cfg, "is_checkpoint_quantized", False

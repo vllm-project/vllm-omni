@@ -174,6 +174,7 @@ from .time_request import (
     minimax_h3_time_shift_sigmas,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _load_component_config, _VideoVAEPartProxy
+from .vae_int8 import resolve_h3_video_vae_quant_config
 from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
@@ -915,6 +916,9 @@ class MiniMaxH3Pipeline(
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
+        video_vae_quant_config = resolve_h3_video_vae_quant_config(od_config.quantization_config)
+        if video_vae_quant_config is not None and not self.load_vae_decoder:
+            raise ValueError("MiniMax H3 video_vae quantization requires a loaded VAE decoder")
         if not self.load_vae_decoder and self.load_vae_encoder:
             raise ValueError(
                 "MiniMax H3 external decoding requires vae_encoder=false and external encoder conditioning"
@@ -1244,18 +1248,20 @@ class MiniMaxH3Pipeline(
         self.video_vae = None
         self.audio_vae = None
         if self.load_vae_decoder:
+            decoder_source = (od_config.additional_config or {}).get(
+                "video_vae_decoder",
+                str(model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors")
+                if (model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors").is_file()
+                else None,
+            )
             self.video_vae = MiniMaxH3VideoVAE(
                 os.path.join(vae_model_path, "video_vae"),
                 device=self.device,
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
-                decoder_source=(od_config.additional_config or {}).get(
-                    "video_vae_decoder",
-                    str(model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors")
-                    if (model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors").is_file()
-                    else None,
-                ),
+                decoder_source=decoder_source,
+                quant_config=video_vae_quant_config,
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),

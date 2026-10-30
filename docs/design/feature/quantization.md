@@ -119,6 +119,15 @@ both positive matches and fall-through behavior.
 
 ## Online and pre-quantized checkpoints
 
+MiniMax H3's native Video VAE has an explicit, exact `video_vae` component
+opt-in for online dynamic INT8 on Ascend. Its eager adapter converts decoder
+Transformer linears after floating checkpoint loading and before residency
+snapshots. Encoder, convolution, audio VAE, and fallback/global configurations
+do not select this adapter. A VAE-only configuration retains CPU initialization
+and converts one linear at a time on the NPU; configurations that also quantize
+other components retain the shared loader's device-side lifecycle. See the
+[INT8 guide](../../user_guide/quantization/int8.md) for restrictions and usage.
+
 The same method name can represent two different loading paths:
 
 - **Online**: the source checkpoint contains BF16/FP16 weights; the method

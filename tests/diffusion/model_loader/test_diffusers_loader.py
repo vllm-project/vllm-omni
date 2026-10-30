@@ -207,6 +207,84 @@ def test_serialized_torchao_component_uses_pytorch_iterator(mocker):
     assert torch.equal(weights[0][1], torch.ones(1))
 
 
+@pytest.mark.parametrize(
+    "model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline", "MiniMaxH3DecoderPipeline"]
+)
+def test_h3_vae_only_quantization_keeps_cpu_initialization(monkeypatch, model_class_name):
+    from vllm_omni.quantization import int8_config
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    loader = _make_loader_with_weights([])
+    loader.od_config.model_class_name = model_class_name
+    loader.quant_config = ComponentQuantizationConfig(
+        {"video_vae": DiffusionInt8Config(), "transformer": None, "text_encoder": None, "audio_vae": None}
+    )
+    captured: list[tuple[torch.device, bool]] = []
+
+    class ConstructionInterceptError(Exception):
+        pass
+
+    def capture_initialization(_load_format, target_device, *_args, **_kwargs):
+        captured.append((target_device, int8_config._LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.get()))
+        raise ConstructionInterceptError
+
+    monkeypatch.setattr(loader, "_init_from_load_format", capture_initialization)
+
+    # Meta stands in for an accelerator without requiring physical hardware.
+    # Stop at construction so this tests the real load_model device decision.
+    with pytest.raises(ConstructionInterceptError):
+        loader.load_model(load_device="cpu", device=torch.device("meta"))
+
+    assert captured == [(torch.device("cpu"), False)]
+    assert loader.quant_config.component_configs["video_vae"] is not None
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["global", "mixed_dit", "mixed_encoder", "mixed_audio", "unknown", "default", "offline", "other_model", "adapter"],
+)
+def test_h3_vae_only_exception_preserves_other_device_loading(monkeypatch, case):
+    from vllm_omni.quantization import int8_config
+    from vllm_omni.quantization.int8_config import DiffusionInt8Config
+
+    loader = _make_loader_with_weights([])
+    loader.od_config.model_class_name = "MiniMaxH3Pipeline"
+    components = {"video_vae": DiffusionInt8Config()}
+    default = None
+    load_format = "default"
+    if case == "global":
+        loader.quant_config = DiffusionInt8Config()
+    else:
+        if case.startswith("mixed_"):
+            component = {"mixed_dit": "transformer", "mixed_encoder": "text_encoder", "mixed_audio": "audio_vae"}[case]
+            components[component] = DiffusionInt8Config()
+        elif case == "unknown":
+            components["custom_component"] = DiffusionInt8Config()
+        elif case == "default":
+            default = DiffusionInt8Config()
+        elif case == "offline":
+            components["video_vae"] = DiffusionInt8Config(is_checkpoint_int8_serialized=True)
+        elif case == "other_model":
+            loader.od_config.model_class_name = "HeliosPipeline"
+        elif case == "adapter":
+            load_format = "diffusers"
+        loader.quant_config = ComponentQuantizationConfig(components, default_config=default)
+    captured: list[tuple[torch.device, bool]] = []
+
+    class ConstructionInterceptError(Exception):
+        pass
+
+    def capture_initialization(_load_format, target_device, *_args, **_kwargs):
+        captured.append((target_device, int8_config._LOAD_UNQUANTIZABLE_FALLBACK_ON_CPU.get()))
+        raise ConstructionInterceptError
+
+    monkeypatch.setattr(loader, "_init_from_load_format", capture_initialization)
+    with pytest.raises(ConstructionInterceptError):
+        loader.load_model(load_device="cpu", load_format=load_format, device=torch.device("meta"))
+
+    assert captured == [(torch.device("meta"), True)]
+
+
 def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
     tmp_path: Path,
     monkeypatch,

@@ -12,6 +12,7 @@ from torch import nn
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader.config import offload_streams_blocks
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
@@ -25,6 +26,7 @@ from .pipeline_minimax_h3 import (
     get_minimax_h3_post_process_func,
 )
 from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vae_int8 import resolve_h3_video_vae_quant_config
 
 
 def resolve_minimax_h3_decoder_model_path(
@@ -75,14 +77,23 @@ class MiniMaxH3DecoderPipeline(
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         self.device = get_local_device()
+        video_vae_quant_config = resolve_h3_video_vae_quant_config(od_config.quantization_config)
+        legacy_manual_components = getattr(od_config, "diffusion_offload_config", None) is None and (
+            offload_streams_blocks(od_config)
+        )
+        video_load_device = (
+            torch.device("cpu") if video_vae_quant_config is not None and legacy_manual_components else self.device
+        )
         model_path = Path(
             resolve_minimax_h3_decoder_model_path(str(od_config.model), od_config.revision, od_config.task_type)
         )
         self.video_vae = MiniMaxH3VideoVAE(
             str(model_path / "video_vae"),
             device=self.device,
+            load_device=video_load_device,
             decode_only=True,
             trust_remote_code=od_config.trust_remote_code,
+            quant_config=video_vae_quant_config,
         )
         self.audio_vae = MiniMaxH3AudioVAE(
             str(model_path / "audio_vae"),

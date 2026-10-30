@@ -10,7 +10,7 @@ import os
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -37,6 +37,9 @@ from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -345,6 +348,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decode_only: bool = False,
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -352,6 +356,20 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
+        if quant_config is not None:
+            from .vae_int8 import (
+                install_h3_video_vae_int8,
+                validate_h3_video_vae_quant_config,
+            )
+
+            # Validate before loading native weights or resolving the alternative
+            # NVFP4 decoder, including its CUDA-only capability check.
+            validate_h3_video_vae_quant_config(
+                quant_config,
+                device=device,
+                encode_only=self.encode_only,
+                decoder_source=decoder_source,
+            )
         from .vae_nvfp4 import (
             install_nvfp4_video_decoder,
             released_decoder_pixels,
@@ -375,14 +393,29 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # weights may be materialized in FP16 because reference decode casts
         # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
-        weight_device = torch.device("cpu") if decoder_path is not None else initial_device
+        # Convert one decoder Linear at a time on the NPU rather than staging
+        # the entire floating-point VAE there before online INT8 conversion.
+        weight_device = torch.device("cpu") if decoder_path is not None or quant_config is not None else initial_device
         self.remote.eval().to(device=weight_device, dtype=torch.float32)
         if decoder_path is not None:
             install_nvfp4_video_decoder(self.remote.model, decoder_path)
             self.decode_dtype = torch.bfloat16
             self.remote.to(device=initial_device)
         decoder = getattr(self.remote.model, "decoder", None)
-        if decoder is not None and decoder_path is None:
+        if quant_config is not None:
+            self._int8_report = install_h3_video_vae_int8(
+                decoder,
+                quant_config,
+                quant_device=device,
+                storage_device=initial_device,
+                compute_dtype=self.decode_dtype,
+            )
+            # Preserve registered INT8 weights and FP32 scales/biases. All
+            # replacements must precede the residency stagers' snapshots.
+            self.remote.to(device=initial_device)
+            if not self.decode_only and next(self.remote.parameters()).dtype != torch.float32:
+                raise ValueError("MiniMax H3 INT8 video VAE requires an FP32 encoder/boundary first parameter")
+        if decoder is not None and decoder_path is None and quant_config is None:
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
