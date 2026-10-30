@@ -63,6 +63,7 @@ def test_prefetch_retries_transient_failures(prefetch_io, mocker, caplog, succee
         include_root_metadata=False,
     )
 
+    # Pin _PREFETCH_MAX_ATTEMPTS=3 and _PREFETCH_BACKOFF_BASE_S=1.0 so policy drift is visible.
     assert (
         download.call_args_list
         == [
@@ -223,6 +224,7 @@ def test_from_pretrained_local_failures_are_not_retried(mocker, tmp_path, source
 @pytest.mark.parametrize("error_type", [OSError, RuntimeError, ValueError])
 @pytest.mark.parametrize("max_attempts", [1, 3])
 def test_from_pretrained_exhaustion_raises_last_error(mocker, error_type, max_attempts):
+    # Cover one attempt and _PREFETCH_MAX_ATTEMPTS=3; backoffs pin _PREFETCH_BACKOFF_BASE_S=1.0.
     errors = [error_type(f"load failure {attempt}") for attempt in range(max_attempts)]
     factory = mocker.Mock(side_effect=errors)
     prefetch = mocker.patch.object(hub_prefetch, "prefetch_subfolders")
