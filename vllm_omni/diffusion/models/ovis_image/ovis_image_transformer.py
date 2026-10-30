@@ -37,6 +37,7 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_joint_qkv_norm_rope,
     fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
     pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -129,11 +130,14 @@ class OvisImageAttention(nn.Module):
 
         # Fused RMSNorm (+ text/image cat) + RoPE in one launch when the
         # forward supplied the packed table and the CUDA kernel accepts the
-        # geometry; otherwise the original eager chain. The fused op reproduces
-        # the CUDA RMSNorm reduction, so both paths produce the same bits.
+        # geometry; otherwise the original eager chain. With vllm_c RMSNorm,
+        # outputs are bit-identical in eager; torch.compile can introduce
+        # last-bit differences in the unfused RoPE arithmetic.
         qk_norm_rope_table = kwargs.get(QK_NORM_ROPE_TABLE_KEY)
-        use_fused_qk_norm_rope = qk_norm_rope_table is not None and _fused_cuda_supported(
-            query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
+        use_fused_qk_norm_rope = (
+            qk_norm_rope_table is not None
+            and self.head_dim == qk_norm_rope_table.shape[-1] == 128
+            and _fused_cuda_supported(query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
         )
         if not use_fused_qk_norm_rope:
             query = self.norm_q(query)
@@ -435,6 +439,7 @@ class OvisImageTransformer2DModel(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.attention_head_dim = attention_head_dim
         self.pos_embed = OvisImagePosEmbed(theta=10000, axes_dim=axes_dims_rope)
 
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
@@ -531,15 +536,17 @@ class OvisImageTransformer2DModel(nn.Module):
         # RoPE of every block (double: joint text/image op; single: joint
         # sequence), in the activation dtype like the eager chain's cos/sin.
         joint_attention_kwargs = None
-        qk_norm_rope_table = pack_qk_norm_rope_table(
-            image_rotary_emb[0],
-            image_rotary_emb[1],
-            hidden_states.shape[0],
-            dtype=hidden_states.dtype,
-            cuda_rms_norm=True,
-        )
-        if qk_norm_rope_table is not None:
-            joint_attention_kwargs = {QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
+        if hidden_states.shape[0] * ids.shape[0] >= fused_qk_norm_rope_min_tokens(0):
+            qk_norm_rope_table = pack_qk_norm_rope_table(
+                image_rotary_emb[0],
+                image_rotary_emb[1],
+                hidden_states.shape[0],
+                dtype=hidden_states.dtype,
+                head_dim=self.attention_head_dim,
+                cuda_rms_norm=True,
+            )
+            if qk_norm_rope_table is not None:
+                joint_attention_kwargs = {QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
