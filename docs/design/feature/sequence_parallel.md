@@ -105,7 +105,9 @@ In strict Ulysses mode, `pre_attention` reshards Q, K and V with **three separat
 
 Fusing trades communication launches for a transient `(B, S/P, 3, H, D)` stacking allocation. This is a net win for image models but not for long-sequence video models, where the extra memory/copy cost cancels the savings. Enable it per-model only after validating both output parity and a real speedup.
 
-Currently opted in: **FLUX.2**, **Qwen-Image**, **Qwen-Image-Edit** (see `vllm_omni/diffusion/models/flux2/flux2_transformer.py` and `.../qwen_image/qwen_image_transformer.py`). Equivalence of the fused vs. separate paths is covered by `test_fused_qkv_all_to_all_matches_three_4d_exchanges_cpu` (CPU, exact) and `test_combined_qkv_equivalence_parity` (GPU, fp16/bf16) in `tests/diffusion/distributed/test_comm.py`.
+Currently opted in: **FLUX.2** (single-stream blocks only — `Flux2ParallelSelfAttention`; the double-stream `Flux2Attention` keeps three collectives), **Qwen-Image** and **Qwen-Image-Edit** (all attention layers, via the shared `QwenImageCrossAttention`). See `vllm_omni/diffusion/models/flux2/flux2_transformer.py` and `.../qwen_image/qwen_image_transformer.py`.
+
+Equivalence of the fused vs. separate paths is covered by `test_fused_qkv_all_to_all_matches_three_4d_exchanges_cpu` (CPU, exact) and `test_combined_qkv_equivalence_parity` (GPU, fp16/bf16) in `tests/diffusion/distributed/test_comm.py`.
 
 ---
 

@@ -251,11 +251,11 @@ During Ulysses-SP, each attention layer normally issues **three** all-to-all col
 
 **Coverage:** this is an opt-in optimization that individual models enable. It is currently enabled for:
 
-| Model           | Enabled |
-| --------------- | ------- |
-| FLUX.2          | ✅      |
-| Qwen-Image      | ✅      |
-| Qwen-Image-Edit | ✅      |
+| Model           | Enabled | Scope                                                                          |
+| --------------- | ------- | ------------------------------------------------------------------------------ |
+| FLUX.2          | ✅      | Single-stream blocks only. Double-stream blocks still issue three collectives. |
+| Qwen-Image      | ✅      | All attention layers.                                                          |
+| Qwen-Image-Edit | ✅      | All attention layers.                                                          |
 
 It only takes effect in **strict** Ulysses mode when Q/K/V shapes match (i.e. no GQA/MQA). It is on by default for the models above; set `enable_combine_qkv_a2a=False` in `DiffusionParallelConfig` to disable it globally. If a model opts in but the preconditions are not met, it falls back to three separate collectives and logs a one-time warning.
 
