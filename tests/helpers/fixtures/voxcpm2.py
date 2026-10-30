@@ -26,6 +26,7 @@ def omni_server(request, run_level, tmp_path_factory):
         with open(deploy_path) as stream:
             config = yaml.safe_load(stream)
         config["model_runner"] = "v1"
+        config["platforms"].pop("cuda", None)
         runtime = config["stages"][0]["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
         runtime.update(
             enable_incremental_vae=False,
