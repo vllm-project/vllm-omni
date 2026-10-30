@@ -165,6 +165,8 @@ _EXPECTED_ROUTER_ROUTES = {
     ("GET", "/v1/models"),
     ("POST", "/v1/images/generations"),
     ("POST", "/v1/images/edits"),
+    ("POST", "/v1/images/segmentations"),
+    ("POST", "/v1/videos/segmentations"),
     ("POST", "/v1/videos"),
     ("POST", "/v1/videos/sync"),
     ("GET", "/v1/videos"),

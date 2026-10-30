@@ -361,12 +361,31 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
+        # Both params use id "default". Pytest 9 suffixes them in source order:
+        # default0 is the one-card CUDA/ROCm param, default1 is the NPU param.
         - |
-          timeout 40m bash -c "
-            export VLLM_TEST_CLEAN_GPU_MEMORY=1
-            export VLLM_IMAGE_FETCH_TIMEOUT=60
-            pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model' --run-level 'core_model'
-          "
+          timeout 40m bash <<'WAN22_READY'
+          set -euo pipefail
+          export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          export VLLM_IMAGE_FETCH_TIMEOUT=60
+          nodes=(
+            "tests/e2e/online_serving/test_wan22_t2v.py::test_text_to_video_001[default0]"
+          )
+          printf '%s\n' "$${nodes[@]}" | sort > /tmp/wan22-ready-expected.txt
+          pytest -q tests/e2e/online_serving/test_wan22_t2v.py \
+            -m "core_model and diffusion and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --collect-only \
+            | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+            | sort > /tmp/wan22-ready-collected.txt
+          if ! diff -u /tmp/wan22-ready-expected.txt /tmp/wan22-ready-collected.txt; then
+            echo "Wan2.2 READY collection drifted from test_text_to_video_001[default0]" >&2
+            exit 1
+          fi
+          pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py \
+            -m "core_model and diffusion and rocm and MI325 and cards_1" \
+            --run-level "core_model"
+          WAN22_READY
 
 ## ISSUE depends on `diffusers` package: https://github.com/huggingface/diffusers/issues/13274
 # - label: "Audio Generation Model Test"
@@ -434,10 +453,102 @@ steps:
   grade: Blocking
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    # hardware_test unions L4 and MI325 at one card, so the node id has no
+    # platform suffix. The H100 CUDA ready leaf and tests/worker stay out.
     - |
-      timeout 15m bash -c '
-              pytest -s -v tests/engine/test_async_omni_engine_abort.py
-      '
+      timeout 15m bash <<'ENGINE_ABORT_READY'
+      set -euo pipefail
+      nodes=(
+        "tests/engine/test_async_omni_engine_abort.py::test_abort"
+      )
+      printf '%s\n' "$${nodes[@]}" | sort > /tmp/engine-abort-ready-expected.txt
+      pytest -q tests/engine/test_async_omni_engine_abort.py \
+        -m "core_model and omni and rocm and MI325 and cards_1" \
+        --run-level "core_model" \
+        --collect-only \
+        | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+        | sort > /tmp/engine-abort-ready-collected.txt
+      if ! diff -u /tmp/engine-abort-ready-expected.txt /tmp/engine-abort-ready-collected.txt; then
+        echo "Engine abort READY collection drifted from test_abort" >&2
+        exit 1
+      fi
+      pytest -s -v tests/engine/test_async_omni_engine_abort.py \
+        -m "core_model and omni and rocm and MI325 and cards_1" \
+        --run-level "core_model"
+      ENGINE_ABORT_READY
+
+- label: "ROCm · One-Card Worker GPU Test"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: NonBlocking
+  # Not part of R2-01. The step is 30 minutes; the command leaves five minutes
+  # for the runner preflight, matching the R2-02 budget split.
+  timeout_in_minutes: 30
+  artifact_paths:
+    - "artifacts/rocm-worker-one-card/**/*"
+  commands:
+    - |
+      timeout --signal=TERM --kill-after=1m 25m bash <<'WORKER_READY'
+      set -euo pipefail
+      export WORKER_READY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-worker-one-card"
+      mkdir -p "$$WORKER_READY_ARTIFACT_DIR"
+      nodes=(
+            "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[1]"
+            "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[3]"
+            "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets0]"
+            "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets1]"
+            "tests/worker/test_batched_omni_output.py::test_mixed_stop_flags_do_not_synchronize_cuda"
+            "tests/worker/test_gpu_generation_async_output.py::test_async_generation_owns_output_and_request_mapping[tensor]"
+            "tests/worker/test_gpu_generation_async_output.py::test_async_generation_owns_output_and_request_mapping[list]"
+            "tests/worker/test_gpu_generation_async_output.py::test_async_generation_owns_output_and_request_mapping[mapping]"
+            "tests/worker/test_gpu_generation_async_output.py::test_async_generation_preserves_none_rows"
+            "tests/worker/test_gpu_generation_async_output.py::test_full_payload_accumulation_keeps_synchronous_host_copy[False]"
+            "tests/worker/test_gpu_generation_async_output.py::test_full_payload_accumulation_keeps_synchronous_host_copy[True]"
+            "tests/worker/test_gpu_generation_async_output.py::test_owned_generation_output_skips_device_snapshot_and_retains_sources[tensor]"
+            "tests/worker/test_gpu_generation_async_output.py::test_owned_generation_output_skips_device_snapshot_and_retains_sources[list]"
+            "tests/worker/test_gpu_generation_async_output.py::test_owned_generation_output_skips_device_snapshot_and_retains_sources[mapping]"
+            "tests/worker/test_gpu_generation_async_output.py::test_owned_generation_output_preserves_none_rows"
+            "tests/worker/test_gpu_generation_async_output.py::test_outer_graph_execution_keeps_snapshot_even_for_owned_model"
+            "tests/worker/test_gpu_generation_async_output.py::test_discarded_output_records_copy_stream[False]"
+            "tests/worker/test_gpu_generation_async_output.py::test_discarded_output_records_copy_stream[True]"
+            "tests/worker/test_gpu_generation_async_output.py::test_dense_waveforms_share_one_host_allocation[False-False]"
+            "tests/worker/test_gpu_generation_async_output.py::test_dense_waveforms_share_one_host_allocation[False-True]"
+            "tests/worker/test_gpu_generation_async_output.py::test_dense_waveforms_share_one_host_allocation[True-False]"
+            "tests/worker/test_gpu_generation_async_output.py::test_dense_waveforms_share_one_host_allocation[True-True]"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_settled_frames_match_torch[step_dtype0]"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_settled_frames_match_torch[step_dtype1]"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_codec_graph_inputs_match_the_copies[3-8-1]"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_codec_graph_inputs_match_the_copies[8-8-1]"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_codec_graph_inputs_match_the_copies[2-4-25]"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_eager_post_fills_codec_graph_inputs_and_scratch[3-8]"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_eager_post_fills_codec_graph_inputs_and_scratch[8-8]"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_history_scatter_preserves_independent_storage_and_offsets"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_codec_direct_inputs_wait_for_slow_side_stream"
+            "tests/worker_v2/test_eager_frame_kernels.py::test_batched_history_recording_preserves_ragged_reordered_requests"
+      )
+      printf '%s\n' "$${nodes[@]}" | sort > /tmp/worker-ready-expected.txt
+      pytest -q \
+        tests/worker/test_batched_omni_output.py \
+        tests/worker/test_gpu_generation_async_output.py \
+        tests/worker_v2/test_eager_frame_kernels.py \
+        -m "core_model and rocm and MI325 and cards_1" \
+        --run-level "core_model" \
+        --collect-only \
+        | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+        | sort > /tmp/worker-ready-collected.txt
+      if ! diff -u /tmp/worker-ready-expected.txt /tmp/worker-ready-collected.txt; then
+        echo "One-card worker READY collection drifted from the 32 MI325 nodes" >&2
+        exit 1
+      fi
+      pytest -s -v \
+        tests/worker/test_batched_omni_output.py \
+        tests/worker/test_gpu_generation_async_output.py \
+        tests/worker_v2/test_eager_frame_kernels.py \
+        -m "core_model and rocm and MI325 and cards_1" \
+        --run-level "core_model" \
+        --junitxml="$$WORKER_READY_ARTIFACT_DIR/pytest.xml"
+      WORKER_READY
 
 - label: "ROCm · Entrypoints GPU Coverage (R2-02)"
   agent_pool: mi300_1
@@ -590,6 +701,178 @@ steps:
       fi
       (exit "$$status")
 
+- group: ":full_moon: MiniCPM-o 4.5 READY"
+  steps:
+    - label: "ROCm · MiniCPM-o 4.5 Offline Coverage"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 30
+      artifact_paths:
+        - artifacts/rocm-minicpmo-45-offline/**/*
+      commands:
+        - export ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-45-offline"
+        - mkdir -p "$$ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_text_to_text[omni_runner0]"
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_mix_to_audio[omni_runner0]"
+          )
+          marker="core_model and omni and rocm and MI325 and cards_1"
+          pytest --collect-only -q "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "$$marker" --run-level core_model \
+            > "$$ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR/collection.txt"
+          count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+            "$$ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != "$${#nodes[@]}" ]]; then
+            echo "Expected exactly $${#nodes[@]} MiniCPM-o offline nodes, found $$count." >&2
+            cat "$$ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR/collection.txt" >&2
+            exit 1
+          fi
+          for node in "$${nodes[@]}"; do
+            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR/collection.txt"; then
+              echo "MiniCPM-o offline node was not collected: $$node" >&2
+              exit 1
+            fi
+          done
+        - |
+          nodes=(
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_text_to_text[omni_runner0]"
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_mix_to_audio[omni_runner0]"
+          )
+          status=0
+          timeout --signal=TERM --kill-after=1m 20m \
+            pytest -s -v "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "core_model and omni and rocm and MI325 and cards_1" --run-level core_model \
+            --junitxml="$$ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 2 and skipped == 0; print(f"Expected exactly two executed MiniCPM-o offline tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
+    - label: "ROCm · MiniCPM-o 4.5 Online Coverage"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 30
+      artifact_paths:
+        - artifacts/rocm-minicpmo-45-online/**/*
+      commands:
+        - export ROCM_MINICPMO_ONLINE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-45-online"
+        - mkdir -p "$$ROCM_MINICPMO_ONLINE_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[async_chunk]"
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[turn_async_chunk]"
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_mix_to_text_audio_001[async_chunk]"
+          )
+          marker="core_model and omni and rocm and MI325 and cards_1"
+          pytest --collect-only -q "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "$$marker" --run-level core_model \
+            > "$$ROCM_MINICPMO_ONLINE_ARTIFACT_DIR/collection.txt"
+          count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+            "$$ROCM_MINICPMO_ONLINE_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != "$${#nodes[@]}" ]]; then
+            echo "Expected exactly $${#nodes[@]} MiniCPM-o online nodes, found $$count." >&2
+            cat "$$ROCM_MINICPMO_ONLINE_ARTIFACT_DIR/collection.txt" >&2
+            exit 1
+          fi
+          for node in "$${nodes[@]}"; do
+            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_ONLINE_ARTIFACT_DIR/collection.txt"; then
+              echo "MiniCPM-o online node was not collected: $$node" >&2
+              exit 1
+            fi
+          done
+        - |
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[async_chunk]"
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[turn_async_chunk]"
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_mix_to_text_audio_001[async_chunk]"
+          )
+          status=0
+          timeout --signal=TERM --kill-after=1m 20m \
+            pytest -s -v "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "core_model and omni and rocm and MI325 and cards_1" --run-level core_model \
+            --junitxml="$$ROCM_MINICPMO_ONLINE_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 3 and skipped == 0; print(f"Expected exactly three executed MiniCPM-o online tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_ONLINE_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
+    - label: "ROCm · MiniCPM-o 4.5 Duplex Coverage"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 45
+      artifact_paths:
+        - artifacts/rocm-minicpmo-45-duplex/**/*
+      commands:
+        - export ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-45-duplex"
+        - mkdir -p "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR"
+        - |
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_websocket_protocol_smoke[three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_duplex_client_live.py::test_duplex_client_live_session[three-stage-single-gpu]"
+          )
+          marker="core_model and omni and rocm and MI325 and cards_1"
+          pytest --collect-only -q "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "$$marker" --run-level core_model \
+            > "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt"
+          count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+            "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt")
+          if [[ "$$count" != "$${#nodes[@]}" ]]; then
+            echo "Expected exactly $${#nodes[@]} MiniCPM-o duplex nodes, found $$count." >&2
+            cat "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt" >&2
+            exit 1
+          fi
+          for node in "$${nodes[@]}"; do
+            if ! grep -Fq "$$node" "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt"; then
+              echo "MiniCPM-o duplex node was not collected: $$node" >&2
+              exit 1
+            fi
+          done
+        - |
+          nodes=(
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::test_duplex_websocket_protocol_smoke[three-stage-single-gpu]"
+            "tests/e2e/online_serving/test_duplex_client_live.py::test_duplex_client_live_session[three-stage-single-gpu]"
+          )
+          status=0
+          timeout --signal=TERM --kill-after=1m 35m \
+            pytest -s -v "$${nodes[@]}" \
+            --shard-id=0 --num-shards=1 \
+            -m "core_model and omni and rocm and MI325 and cards_1" --run-level core_model \
+            --junitxml="$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 2 and skipped == 0; print(f"Expected exactly two executed MiniCPM-o duplex tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
 - group: ":card_index_dividers: E2E Test"
   steps:
     - label: "Qwen3-TTS E2E Test"
@@ -601,7 +884,31 @@ steps:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-        - timeout 30m pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m "core_model" --run-level "core_model"
+        # Card counts match, so hardware_test does not add a platform id suffix.
+        - |
+          timeout 30m bash <<'QWEN3_TTS_READY'
+          set -euo pipefail
+          nodes=(
+            "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_cached_predictor_streaming_audio[omni_server0]"
+            "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_default_cuda_graph_startup[async_chunk]"
+            "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_text_to_audio_001[async_chunk]"
+            "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_text_to_audio_002[async_chunk]"
+          )
+          printf '%s\n' "$${nodes[@]}" | sort > /tmp/qwen3-tts-ready-expected.txt
+          pytest -q tests/e2e/online_serving/test_qwen3_tts_customvoice.py \
+            -m "core_model and tts and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --collect-only \
+            | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+            | sort > /tmp/qwen3-tts-ready-collected.txt
+          if ! diff -u /tmp/qwen3-tts-ready-expected.txt /tmp/qwen3-tts-ready-collected.txt; then
+            echo "Qwen3-TTS READY collection drifted from the selected CustomVoice core nodes" >&2
+            exit 1
+          fi
+          pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py \
+            -m "core_model and tts and rocm and MI325 and cards_1" \
+            --run-level "core_model"
+          QWEN3_TTS_READY
 
     # Keep a fast model/server integration check in the blocking lane. The
     # full default-backend suite remains in the nightly pipeline because a
@@ -620,6 +927,42 @@ steps:
       commands:
         - export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
         - pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py::test_voice_clone_zh_002 -m "slow" --run-level "core_model"
+
+    # One-card text-to-audio only. Voice-clone cases stay out until they have
+    # an MI325 run. The command budget stays 30 minutes inside a 40-minute step.
+    - label: "Drama 3 E2E Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 40
+      artifact_paths:
+        - "artifacts/rocm-drama3-ready/**/*"
+      commands:
+        - |
+          timeout 30m bash <<'DRAMA3_READY'
+          set -euo pipefail
+          export DRAMA3_READY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-drama3-ready"
+          mkdir -p "$$DRAMA3_READY_ARTIFACT_DIR"
+          nodes=(
+            "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
+          )
+          printf '%s\n' "$${nodes[@]}" | sort > /tmp/drama3-ready-expected.txt
+          pytest -q tests/e2e/online_serving/test_drama_3.py \
+            -m "core_model and tts and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --collect-only \
+            | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+            | sort > /tmp/drama3-ready-collected.txt
+          if ! diff -u /tmp/drama3-ready-expected.txt /tmp/drama3-ready-collected.txt; then
+            echo "Drama 3 READY collection drifted from test_text_to_audio_001[drama_3-rocm]" >&2
+            exit 1
+          fi
+          pytest -s -v tests/e2e/online_serving/test_drama_3.py \
+            -m "core_model and tts and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --junitxml="$$DRAMA3_READY_ARTIFACT_DIR/pytest.xml"
+          DRAMA3_READY
 
 # TODO: Bagel test on ROCm is very unstable. @tjtanaa
 # Need to debug before reneable numerical changes across large PRs

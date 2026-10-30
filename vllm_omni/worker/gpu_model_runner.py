@@ -138,6 +138,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
         # earlier in its teardown; the shared helper is idempotent.
         self._shutdown_omni_prefix_cache()
+        # The encoder graph manager holds its graphs, their pool and the stage
+        # model; upstream drops it on ROCm only.
+        encoder_cudagraph_manager = getattr(self, "encoder_cudagraph_manager", None)
+        if encoder_cudagraph_manager is not None:
+            encoder_cudagraph_manager.clear()
+            self.encoder_cudagraph_manager = None
         super().shutdown()
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:

@@ -1569,30 +1569,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         "presence_penalty",
     }
 
-    def _apply_request_overrides(
-        self,
-        default_params: SamplingParams,
-        request: ChatCompletionRequest,
-    ) -> SamplingParams:
-        """Clone default params and override with user-provided request values.
-
-        Starts with YAML defaults and only overrides fields that the user
-        explicitly provided (non-None values) in the request.
-
-        max_tokens uses the deploy YAML default unless explicitly overridden.
-
-        Args:
-            default_params: Default SamplingParams from the resolved pipeline and deploy configuration.
-            request: The chat completion request containing user-provided values.
-
-        Returns:
-            New SamplingParams with YAML defaults overridden by request values.
-        """
-        params = default_params.clone()
-        for field_name, value in self._request_sampling_overrides(request).items():
-            setattr(params, field_name, value)
-        return params
-
     def _request_sampling_overrides(self, request: ChatCompletionRequest) -> dict[str, Any]:
         """Select explicit request values without introducing protocol defaults."""
         overrides: dict[str, Any] = {}
@@ -2957,7 +2933,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # the fields of FunctionDefinition are a superset of the
                 # tool call outputs and can be used for parsing
                 assert content is not None
-                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(content)
+                tool_calls: list[FunctionDefinition] = TypeAdapter(list[FunctionDefinition]).validate_json(content)
                 tool_call_ids = []
                 for tool_call in tool_calls:
                     tool_call_ids.append(

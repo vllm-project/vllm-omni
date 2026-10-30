@@ -1769,42 +1769,6 @@ def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
         assert "Qwen-Image 2.1 Accuracy" not in text
 
 
-def test_qwen3_omni_seed_tts_realtime_perf_is_one_nonblocking_nightly_job() -> None:
-    step = _find_step("Qwen3-Omni Seed-TTS Realtime Perf", AMD_NIGHTLY_PIPELINE)
-    assert step["grade"] == "NonBlocking"
-    assert step["agent_pool"] == "mi300_2"
-    assert step["depends_on"] == "amd-build"
-    assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["timeout_in_minutes"] == 180
-    assert step["env"]["BENCHMARK_DIR"] == (
-        "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-seed-tts-perf/benchmark-results"
-    )
-    assert step["artifact_paths"] == ["artifacts/rocm-qwen3-omni-seed-tts-perf/**/*"]
-    commands = "\n".join(step["commands"])
-    assert "full_model and omni and rocm and MI325 and cards_2" in commands
-    assert "--run-level full_model" in commands
-    assert "--collect-only" in commands
-    assert "tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json" in commands
-    assert "hf_hub_download" in commands
-    assert "SILERO_VAD_REVISION" in commands
-    assert "SileroVADBackendProvider().get()" in commands
-    assert "test_qwen3_omni_seed_tts_realtime-explicit" in commands
-    assert "test_qwen3_omni_seed_tts_realtime-vad" in commands
-    assert "Expected exactly $${#nodes[@]} Qwen3-Omni Seed-TTS realtime nodes" in commands
-    assert "timeout --signal=TERM --kill-after=2m 165m" in commands
-    assert "Expected exactly 2 Qwen3-Omni Seed-TTS result JSON files" in commands
-    assert "Expected exactly one Qwen3-Omni Seed-TTS $$name result JSON" in commands
-    config = json.loads(Path("tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json").read_text(encoding="utf-8"))
-    assert config[0]["mark"][0]["hardware_marks"]["res"]["rocm"] == "MI325"
-    benchmark_params = config[0]["benchmark_params"]
-    assert len(benchmark_params) == 2
-    assert {params["name"] for params in benchmark_params} == {"explicit", "vad"}
-    assert all("baseline" not in params for params in benchmark_params)
-    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
-        text = pipeline_path.read_text(encoding="utf-8")
-        assert "Qwen3-Omni Seed-TTS Realtime Perf" not in text
-
-
 def test_minicpmo_4_5_perf_is_one_nonblocking_nightly_job() -> None:
     step = _find_step("MiniCPM-o 4.5 Perf", AMD_NIGHTLY_PIPELINE)
     assert step["grade"] == "NonBlocking"
@@ -2407,6 +2371,83 @@ def test_qwen_image_expansion_executes_junit_guard_before_exit(
     )
 
 
+_QWEN25_OMNI_MERGE_NODES = (
+    "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]",
+    "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_audio_in_video_boundaries[False-omni_server0]",
+    "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_audio_in_video_boundaries[True-omni_server0]",
+    "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_text_to_text_001[omni_server0]",
+    "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_speaker_001[Chelsie-omni_server0]",
+    "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_speaker_001[ETHAN-omni_server0]",
+    "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py::test_mix_to_audio[omni_runner0-rocm]",
+    "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py::test_text_to_text[omni_runner0-rocm]",
+)
+
+
+def test_qwen25_omni_merge_selects_eight_marked_nodes() -> None:
+    """MERGE runs exactly the eight marked two-card ROCm cases."""
+    step = _find_step("Omni Model Test Qwen2-5-Omni", AMD_MERGE_PIPELINE)
+    command = "\n".join(step["commands"])
+
+    assert step["agent_pool"] == "mi300_2"
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 180
+    assert step["artifact_paths"] == ["artifacts/rocm-qwen25-omni-merge/**/*"]
+    assert command.count("slow and rocm and MI325 and cards_2") == 2
+    assert "tests/e2e/*/" not in command
+    assert "timeout --signal=TERM --kill-after=2m 165m" in command
+    assert "--shard-id=0 --num-shards=1" in command
+    assert "PIPESTATUS[0]" in command
+    assert "collection.log" in command
+    assert "pytest.xml" in command
+    assert "pytest.log" in command
+    assert "pytest-summary.txt" in command
+    assert "Expected exactly eight executed Qwen2.5-Omni MERGE tests" in command
+    for node in _QWEN25_OMNI_MERGE_NODES:
+        assert node in command
+    assert command.count("test_qwen2_5_omni_expansion.py::") == len(_QWEN25_OMNI_MERGE_NODES)
+
+    source = Path("tests/e2e/online_serving/test_qwen2_5_omni_expansion.py").read_text(encoding="utf-8")
+    text_test_marks = source.split("def test_text_to_text_001", maxsplit=1)[0].rsplit("@pytest.mark.slow", maxsplit=1)[
+        1
+    ]
+    assert '@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)' in text_test_marks
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 8, 0, None, 0),
+        (0, 8, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 8, 0, None, 1),
+        (0, 8, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_qwen25_omni_merge_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_MERGE_PIPELINE,
+        step_label="Omni Model Test Qwen2-5-Omni",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly eight executed Qwen2.5-Omni MERGE tests",
+        artifact_env="ROCM_QWEN25_OMNI_MERGE_ARTIFACT_DIR",
+        job_id_prefix="qwen25-omni-merge-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
 def test_wan22_function_has_separate_nonblocking_card_jobs() -> None:
     one = _find_step("Wan2.2 Function 1 GPU", AMD_NIGHTLY_PIPELINE)
     two = _find_step("Wan2.2 Function 2 GPU", AMD_NIGHTLY_PIPELINE)
@@ -2839,3 +2880,406 @@ def test_entrypoints_full_nightly_executes_junit_guard_before_exit(
         timeout_status=timeout_status,
         expected_status=expected_status,
     )
+
+
+_MINICPMO_READY_MARKER = "core_model and omni and rocm and MI325 and cards_1"
+_MINICPMO_READY_JOBS = (
+    (
+        "ROCm · MiniCPM-o 4.5 Offline Coverage",
+        30,
+        "20m",
+        "artifacts/rocm-minicpmo-45-offline",
+        (
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_text_to_text[omni_runner0]",
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_mix_to_audio[omni_runner0]",
+        ),
+        "exactly two executed MiniCPM-o offline tests",
+    ),
+    (
+        "ROCm · MiniCPM-o 4.5 Online Coverage",
+        30,
+        "20m",
+        "artifacts/rocm-minicpmo-45-online",
+        (
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[async_chunk]",
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[turn_async_chunk]",
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_mix_to_text_audio_001[async_chunk]",
+        ),
+        "exactly three executed MiniCPM-o online tests",
+    ),
+    (
+        "ROCm · MiniCPM-o 4.5 Duplex Coverage",
+        45,
+        "35m",
+        "artifacts/rocm-minicpmo-45-duplex",
+        (
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::"
+            "test_duplex_websocket_protocol_smoke[three-stage-single-gpu]",
+            "tests/e2e/online_serving/test_duplex_client_live.py::"
+            "test_duplex_client_live_session[three-stage-single-gpu]",
+        ),
+        "exactly two executed MiniCPM-o duplex tests",
+    ),
+)
+
+
+def test_minicpmo_ready_jobs_select_marked_core_model_nodes() -> None:
+    """READY owns the CUDA core_model cases, selected by an explicit ROCm mark."""
+    for label, timeout, command_timeout, artifact, nodes, junit_message in _MINICPMO_READY_JOBS:
+        step = _find_step(label, AMD_READY_PIPELINE)
+        command = "\n".join(step["commands"])
+
+        assert step["agent_pool"] == "mi300_1"
+        assert step["grade"] == "NonBlocking"
+        assert step["timeout_in_minutes"] == timeout
+        assert step["artifact_paths"] == [f"{artifact}/**/*"]
+        assert f"--kill-after=1m {command_timeout}" in command
+        assert _MINICPMO_READY_MARKER in command
+        assert "--run-level core_model" in command
+        assert command.count("--shard-id=0 --num-shards=1") == 2
+        assert "test_minicpmo_4_5_duplex_mrv2.py" not in command
+        assert "test_minicpmo_4_5_ready.json" not in command
+        assert "test_minicpmo_4_5_duplex_expansion.py" not in command
+        assert junit_message in command
+        assert "--junitxml=" in command
+        assert "pytest.log" not in command
+        assert "pytest-summary.txt" not in command
+        assert "PIPESTATUS" not in command
+        assert "tee " not in command
+        for node in nodes:
+            assert command.count(node) == 2
+
+
+def test_minicpmo_ready_core_model_cases_declare_mi325() -> None:
+    """The selected cases carry MI325 so a one-card CUDA mark is not the selector."""
+    cases = {
+        "tests/e2e/offline_inference/test_minicpmo_4_5.py": (
+            "def test_text_to_text(",
+            "def test_mix_to_audio(",
+        ),
+        "tests/e2e/online_serving/test_minicpmo_4_5.py": (
+            "def test_text_to_text_001(",
+            "def test_mix_to_text_audio_001(",
+        ),
+        "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py": ("def test_duplex_websocket_protocol_smoke(",),
+        "tests/e2e/online_serving/test_duplex_client_live.py": ("def test_duplex_client_live_session(",),
+    }
+    for path, functions in cases.items():
+        source = Path(path).read_text(encoding="utf-8")
+        for function_name in functions:
+            head, _, _ = source.partition(function_name)
+            assert '"rocm": "MI325"' in head[-300:]
+
+
+@pytest.mark.parametrize(
+    (
+        "step_label",
+        "expected_tests",
+        "expected_message",
+        "artifact_env",
+        "job_id_prefix",
+    ),
+    [
+        (
+            "ROCm · MiniCPM-o 4.5 Offline Coverage",
+            2,
+            "Expected exactly two executed MiniCPM-o offline tests",
+            "ROCM_MINICPMO_OFFLINE_ARTIFACT_DIR",
+            "minicpmo-ready-offline-guard",
+        ),
+        (
+            "ROCm · MiniCPM-o 4.5 Online Coverage",
+            3,
+            "Expected exactly three executed MiniCPM-o online tests",
+            "ROCM_MINICPMO_ONLINE_ARTIFACT_DIR",
+            "minicpmo-ready-online-guard",
+        ),
+        (
+            "ROCm · MiniCPM-o 4.5 Duplex Coverage",
+            2,
+            "Expected exactly two executed MiniCPM-o duplex tests",
+            "ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR",
+            "minicpmo-ready-duplex-guard",
+        ),
+    ],
+    ids=("offline", "online", "duplex"),
+)
+@pytest.mark.parametrize(
+    (
+        "pytest_status",
+        "tests_override",
+        "skipped",
+        "timeout_status",
+        "expected_status",
+    ),
+    [
+        (0, None, 0, None, 0),
+        (0, None, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, None, 0, None, 1),
+        (0, None, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_minicpmo_ready_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    step_label: str,
+    expected_tests: int,
+    expected_message: str,
+    artifact_env: str,
+    job_id_prefix: str,
+    pytest_status: int,
+    tests_override: int | None,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    """MiniCPM READY jobs fail closed on the JUnit count before the step exits."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label=step_label,
+        command_fragment='pytest -s -v "$${nodes[@]}"',
+        expected_message=expected_message,
+        artifact_env=artifact_env,
+        job_id_prefix=job_id_prefix,
+        pytest_status=pytest_status,
+        tests=expected_tests if tests_override is None else tests_override,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+_WAN22_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
+_WAN22_READY_NODE = "tests/e2e/online_serving/test_wan22_t2v.py::test_text_to_video_001[default0]"
+
+
+def test_wan22_ready_fail_closes_on_the_one_card_rocm_node() -> None:
+    """READY keeps the blocking 40-minute Wan2.2 job and rejects the NPU param.
+
+    Both params use id ``default``. Pytest 9 names them ``default0`` (CUDA/ROCm,
+    one card) and ``default1`` (NPU, two cards) in source order.
+    """
+    step = _find_step("Diffusion · Wan22 Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert "timeout_in_minutes" not in step
+    assert "timeout 40m" in command
+    assert _marker_expressions(step) == [_WAN22_READY_MARKER, _WAN22_READY_MARKER]
+    assert command.count('--run-level "core_model"') == 2
+    assert "advanced_model" not in command
+    assert command.count(_WAN22_READY_NODE) == 1
+    assert "test_text_to_video_001[default1]" not in command
+    assert "default1" not in command
+    assert "diff -u /tmp/wan22-ready-expected.txt /tmp/wan22-ready-collected.txt" in command
+
+    merge_online = _find_step("Diffusion · Wan22 Online Test", AMD_MERGE_PIPELINE)
+    merge_markers = _marker_expressions(merge_online)
+    assert merge_markers
+    assert all("advanced_model" in marker and "core_model" not in marker for marker in merge_markers)
+    assert "tests/e2e/online_serving/test_wan22_t2v.py" in "\n".join(merge_online["commands"])
+
+
+_ENGINE_ABORT_READY_MARKER = "core_model and omni and rocm and MI325 and cards_1"
+_ENGINE_ABORT_READY_NODE = "tests/engine/test_async_omni_engine_abort.py::test_abort"
+
+
+def test_engine_abort_ready_pins_the_mi325_node() -> None:
+    """READY fail-closes on the existing one-card ROCm abort case."""
+    step = _find_step("Engine Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+
+    assert step["grade"] == "Blocking"
+    assert "timeout 15m" in command
+    assert _marker_expressions(step) == [
+        _ENGINE_ABORT_READY_MARKER,
+        _ENGINE_ABORT_READY_MARKER,
+    ]
+    assert command.count(_ENGINE_ABORT_READY_NODE) == 1
+    assert "diff -u /tmp/engine-abort-ready-expected.txt" in command
+
+
+_QWEN3_TTS_READY_MARKER = "core_model and tts and rocm and MI325 and cards_1"
+_QWEN3_TTS_READY_NODES = (
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_cached_predictor_streaming_audio[omni_server0]",
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_default_cuda_graph_startup[async_chunk]",
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_text_to_audio_001[async_chunk]",
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_text_to_audio_002[async_chunk]",
+)
+_QWEN3_TTS_CUSTOMVOICE = Path("tests/e2e/online_serving/test_qwen3_tts_customvoice.py")
+
+
+def test_qwen3_tts_ready_pins_selected_customvoice_core_nodes() -> None:
+    """READY fail-closes on the existing one-card CustomVoice core cases."""
+    step = _find_step("Qwen3-TTS E2E Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    source = _QWEN3_TTS_CUSTOMVOICE.read_text(encoding="utf-8")
+
+    assert step["grade"] == "Blocking"
+    assert "timeout 30m" in command
+    assert _marker_expressions(step) == [_QWEN3_TTS_READY_MARKER, _QWEN3_TTS_READY_MARKER]
+    for node in _QWEN3_TTS_READY_NODES:
+        assert command.count(node) == 1
+    assert "diff -u /tmp/qwen3-tts-ready-expected.txt" in command
+    assert source.count('"rocm": "MI325"') == 4
+
+
+_WORKER_ONE_CARD_MARKER = "core_model and rocm and MI325 and cards_1"
+_WORKER_ONE_CARD_FILES = (
+    "tests/worker/test_batched_omni_output.py",
+    "tests/worker/test_gpu_generation_async_output.py",
+    "tests/worker_v2/test_eager_frame_kernels.py",
+)
+_WORKER_ONE_CARD_EXCLUDED = (
+    "tests/worker_v2/test_capture_query_bound_gpu.py",
+    "tests/worker_v2/test_decode_query_bound_gpu.py",
+    "tests/worker/test_gpu_ar_model_runner_cuda.py",
+)
+_WORKER_ONE_CARD_NODES = (
+    "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[1]",
+    "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[3]",
+    "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets0]",
+    "tests/worker/test_batched_omni_output.py::test_mtp_preserves_rows_and_snapshot_without_cuda_sync[offsets1]",
+    "tests/worker/test_batched_omni_output.py::test_mixed_stop_flags_do_not_synchronize_cuda",
+    "tests/worker/test_gpu_generation_async_output.py::test_async_generation_owns_output_and_request_mapping[tensor]",
+    "tests/worker/test_gpu_generation_async_output.py::test_async_generation_owns_output_and_request_mapping[list]",
+    "tests/worker/test_gpu_generation_async_output.py::test_async_generation_owns_output_and_request_mapping[mapping]",
+    "tests/worker/test_gpu_generation_async_output.py::test_async_generation_preserves_none_rows",
+    "tests/worker/test_gpu_generation_async_output.py::"
+    "test_full_payload_accumulation_keeps_synchronous_host_copy[False]",
+    "tests/worker/test_gpu_generation_async_output.py::"
+    "test_full_payload_accumulation_keeps_synchronous_host_copy[True]",
+    "tests/worker/test_gpu_generation_async_output.py::"
+    "test_owned_generation_output_skips_device_snapshot_and_retains_sources[tensor]",
+    "tests/worker/test_gpu_generation_async_output.py::"
+    "test_owned_generation_output_skips_device_snapshot_and_retains_sources[list]",
+    "tests/worker/test_gpu_generation_async_output.py::"
+    "test_owned_generation_output_skips_device_snapshot_and_retains_sources[mapping]",
+    "tests/worker/test_gpu_generation_async_output.py::test_owned_generation_output_preserves_none_rows",
+    "tests/worker/test_gpu_generation_async_output.py::test_outer_graph_execution_keeps_snapshot_even_for_owned_model",
+    "tests/worker/test_gpu_generation_async_output.py::test_discarded_output_records_copy_stream[False]",
+    "tests/worker/test_gpu_generation_async_output.py::test_discarded_output_records_copy_stream[True]",
+    "tests/worker/test_gpu_generation_async_output.py::test_dense_waveforms_share_one_host_allocation[False-False]",
+    "tests/worker/test_gpu_generation_async_output.py::test_dense_waveforms_share_one_host_allocation[False-True]",
+    "tests/worker/test_gpu_generation_async_output.py::test_dense_waveforms_share_one_host_allocation[True-False]",
+    "tests/worker/test_gpu_generation_async_output.py::test_dense_waveforms_share_one_host_allocation[True-True]",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_settled_frames_match_torch[step_dtype0]",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_settled_frames_match_torch[step_dtype1]",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_codec_graph_inputs_match_the_copies[3-8-1]",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_codec_graph_inputs_match_the_copies[8-8-1]",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_codec_graph_inputs_match_the_copies[2-4-25]",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_eager_post_fills_codec_graph_inputs_and_scratch[3-8]",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_eager_post_fills_codec_graph_inputs_and_scratch[8-8]",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_history_scatter_preserves_independent_storage_and_offsets",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_codec_direct_inputs_wait_for_slow_side_stream",
+    "tests/worker_v2/test_eager_frame_kernels.py::test_batched_history_recording_preserves_ragged_reordered_requests",
+)
+
+
+def test_worker_one_card_ready_stays_outside_r2_01() -> None:
+    """READY adds one NonBlocking MI300 job for the collected one-card nodes.
+
+    Local collection of the three files with the MI325 marker returned these
+    32 ids. R2-01 still collects 1416 model-executor nodes and does not run them.
+    """
+    step = _find_step("ROCm · One-Card Worker GPU Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    body = command.split("nodes=(", 1)[1].split(")", 1)[0]
+    quoted = tuple(re.findall(r'"(tests/[^"]+)"', body))
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 30
+    assert step["artifact_paths"] == ["artifacts/rocm-worker-one-card/**/*"]
+    assert "timeout --signal=TERM --kill-after=1m 25m" in command
+    assert "timeout 30m" not in command
+    assert _marker_expressions(step) == [
+        _WORKER_ONE_CARD_MARKER,
+        _WORKER_ONE_CARD_MARKER,
+    ]
+    assert command.count('--run-level "core_model"') == 2
+    assert quoted == _WORKER_ONE_CARD_NODES
+    assert len(_WORKER_ONE_CARD_NODES) == 32
+    for path in _WORKER_ONE_CARD_FILES:
+        assert sum(node.startswith(path + "::") for node in quoted) >= 1
+        assert command.count(f"\n  {path} \\\n") == 2
+    for path in _WORKER_ONE_CARD_EXCLUDED:
+        assert path not in command
+        assert "MI325" not in Path(path).read_text(encoding="utf-8")
+    assert "diff -u /tmp/worker-ready-expected.txt" in command
+    assert "--junitxml=" in command
+    assert "pytest.log" not in command
+    assert "pytest-summary.txt" not in command
+    assert "PIPESTATUS" not in command
+    assert "tee " not in command
+
+    for path in _WORKER_ONE_CARD_FILES[:2]:
+        source = Path(path).read_text(encoding="utf-8")
+        assert source.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 1
+    eager = Path(_WORKER_ONE_CARD_FILES[2]).read_text(encoding="utf-8")
+    assert eager.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 6
+
+    r2_01 = _find_step(
+        "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
+        AMD_READY_PIPELINE,
+    )
+    r2_01_command = "\n".join(r2_01["commands"])
+    assert "assert-pytest-collection.sh 1416" in r2_01_command
+    assert "tests/model_executor/" in r2_01_command
+    for path in _WORKER_ONE_CARD_FILES:
+        assert path not in r2_01_command
+
+
+_DRAMA3_READY_MARKER = "core_model and tts and rocm and MI325 and cards_1"
+_DRAMA3_READY_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
+_DRAMA3_EXCLUDED = (
+    "test_voice_clone_streaming_002",
+    "test_voice_clone_concurrent_003",
+    "test_voice_clone_requires_ref_text_004",
+)
+
+
+def _hardware_decorator(source: str, function_name: str) -> str:
+    head = source.split(f"def {function_name}", 1)[0]
+    return head.rsplit("@hardware_test", 1)[1]
+
+
+def test_drama3_ready_adds_one_nonblocking_text_to_audio_node() -> None:
+    """READY adds one NonBlocking MI300 job for the one-card ROCm smoke.
+
+    CUDA uses one card and NPU uses two, so ``hardware_test`` keeps a separate
+    ROCm item. The server param id is ``drama_3`` and the platform id is ``rocm``.
+    """
+    step = _find_step("Drama 3 E2E Test", AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    source = Path("tests/e2e/online_serving/test_drama_3.py").read_text(encoding="utf-8")
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == ["artifacts/rocm-drama3-ready/**/*"]
+    assert "timeout 30m" in command
+    assert "timeout 40m" not in command
+    assert _marker_expressions(step) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
+    assert command.count('--run-level "core_model"') == 2
+    assert "full_model" not in command
+    assert command.count(_DRAMA3_READY_NODE) == 1
+    for name in _DRAMA3_EXCLUDED:
+        assert name not in command
+    assert "diff -u /tmp/drama3-ready-expected.txt" in command
+    assert "--junitxml=" in command
+    assert "pytest.log" not in command
+    assert "pytest-summary.txt" not in command
+    assert "PIPESTATUS" not in command
+    assert "tee " not in command
+    assert '"rocm": "MI325"' in _hardware_decorator(source, "test_text_to_audio_001")
+    assert '"rocm": 1' in _hardware_decorator(source, "test_text_to_audio_001")
+    for name in _DRAMA3_EXCLUDED:
+        assert "rocm" not in _hardware_decorator(source, name)
+    assert source.count('"rocm": "MI325"') == 1
