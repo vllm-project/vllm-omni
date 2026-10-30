@@ -387,7 +387,14 @@ class _DuplexProcessWorker:
                     try:
                         await self.engine.submit_command_async(session_id, command)
                     except Exception as exc:
-                        await self.send_event(session_id, error_event(getattr(exc, "code", "engine_error"), str(exc)))
+                        await self.send_event(
+                            session_id,
+                            error_event(
+                                getattr(exc, "code", "engine_error"),
+                                str(exc),
+                                event_id=getattr(command, "event_id", None),
+                            ),
+                        )
                 elif operation in _CONTROLS or operation == "check_health":
                     self.tasks.start_soon(self.control, request_id, operation, args, kwargs)
                 else:

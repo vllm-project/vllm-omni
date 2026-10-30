@@ -16,7 +16,7 @@ import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
-from vllm_omni.engine.duplex.commands import AppendAudio, AppendText, ClearOutputAudio
+from vllm_omni.engine.duplex.commands import AppendAudio, AppendText, ClearOutputAudio, UpdateSession
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import AudioDelta, OutputAudioCleared, SessionClosed, SessionCreated
@@ -88,7 +88,9 @@ class FakeEngine:
             os._exit(17)
         elif isinstance(command, AppendText) and command.text == "bad_output":
             self.output.put_nowait("unexpected engine output")
-        elif isinstance(command, AppendText) and command.text == "reject":
+        elif (isinstance(command, AppendText) and command.text == "reject") or (
+            isinstance(command, UpdateSession) and command.patch.get("instructions") == "reject"
+        ):
             raise DuplexSessionError("queue full", code="engine_backpressure", retryable=True)
 
     async def close_session_async(self, session_id, *, reason, **kwargs):
