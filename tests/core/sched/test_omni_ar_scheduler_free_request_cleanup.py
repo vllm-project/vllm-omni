@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Regression tests for vllm-project/vllm-omni#5349 (P1): normal completion
 goes through _free_request(), not finish_requests() (the external
 abort/cancel entry point). Without a cleanup_receiver() call there,
@@ -74,6 +77,23 @@ def test_free_request_is_safe_without_a_chunk_transfer_adapter():
     sched._free_request(request)  # must not raise
 
     sched._free_input_coordinator_request.assert_called_once_with("req-1")
+
+
+@pytest.mark.parametrize("notify_client", [False, True])
+def test_aborted_held_tokens_are_dropped_only_without_terminal_notification(notify_client):
+    from collections import defaultdict
+
+    sched = _make_scheduler()
+    sched._held_token_ids = {"req-1": [11]}
+    sched.finished_req_ids_dict = defaultdict(set) if notify_client else None
+    request = _make_finished_request()
+    request.status = RequestStatus.FINISHED_ABORTED
+    request.client_index = 0
+
+    sched._free_request(request)
+
+    # Notified clients retain tokens until the terminal output flush.
+    assert sched._held_token_ids == ({"req-1": [11]} if notify_client else {})
 
 
 def test_native_mooncake_finish_uses_confirmed_token_boundary() -> None:

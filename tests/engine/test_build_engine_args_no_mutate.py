@@ -8,6 +8,10 @@ import copy
 from types import SimpleNamespace
 
 import pytest
+from vllm.config import FaultToleranceConfig
+
+from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -143,3 +147,48 @@ class TestBuildEngineArgsDictNoMutate:
         assert stage_cfg.engine_args == original, (
             "inject_omni_kv_connector_config on the returned dict mutated stage_config.engine_args"
         )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("timeout", [120, 30])
+def test_typed_engine_args_preserve_ft_intent_and_config_types(tmp_path, enabled, timeout):
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    source = OmniEngineArgs(
+        model=str(tmp_path),
+        enable_fault_tolerance=enabled,
+        fault_tolerance_config=FaultToleranceConfig(engine_recovery_timeout_sec=timeout),
+    )
+    stage = _make_stage_config()
+    stage.engine_args = source
+    projected = build_engine_args_dict(stage, model=str(tmp_path))
+
+    assert isinstance(projected["fault_tolerance_config"], FaultToleranceConfig)
+    assert projected["fault_tolerance_config"] is not source.fault_tolerance_config
+    assert type(projected["compilation_config"]) is type(source.compilation_config)
+    rebuilt = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, projected))
+    assert rebuilt.enable_fault_tolerance is enabled
+    assert rebuilt.fault_tolerance_config.engine_recovery_timeout_sec == timeout
+
+    rebuilt.fault_tolerance_config.engine_recovery_timeout_sec = 60
+    assert source.fault_tolerance_config.engine_recovery_timeout_sec == timeout
+
+
+@pytest.mark.parametrize("timeout", [120, 30])
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_raw_ft_config_keeps_native_opt_in(tmp_path, timeout, enabled):
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    raw = {"engine_recovery_timeout_sec": timeout}
+    inputs = {"fault_tolerance_config": raw}
+    if enabled is not None:
+        inputs["enable_fault_tolerance"] = enabled
+    source = copy.deepcopy(inputs)
+    stage = _make_stage_config(inputs)
+    projected = build_engine_args_dict(stage, model=str(tmp_path))
+    native = OmniEngineArgs(model=str(tmp_path), **inputs)
+    rebuilt = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, projected))
+
+    assert rebuilt.enable_fault_tolerance is native.enable_fault_tolerance is True
+    assert rebuilt.fault_tolerance_config.engine_recovery_timeout_sec == timeout
+    assert inputs == source

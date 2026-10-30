@@ -71,14 +71,13 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    check_interleaved_audio_video,
     merge_interleaved_embeddings,
 )
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLProcessingInfo,
 )
 from vllm.model_executor.models.qwen2_audio import Qwen2AudioProcessingInfo
-from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM
+from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeForCausalLM
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeModel as _Qwen3MoeLLMModel
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer as _Qwen3Omni_VisionTransformer,
@@ -117,8 +116,10 @@ from vllm.multimodal.processing.processor import (
 from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
+from vllm.utils.torch_utils import async_tensor_h2d
 
 from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerMultiModalDataParser,
@@ -126,9 +127,14 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     _get_request_video_use_audio_in_video,
     _get_video_second_per_grid_t,
 )
+from vllm_omni.model_executor.models.qwen3_omni.hf_numerics import (
+    HFNumericsDecoderLayer,
+    HFNumericsRMSNorm,
+)
 from vllm_omni.model_executor.models.qwen3_omni.quantization import (
     Qwen3OmniNestedSupportsQuant,
 )
+from vllm_omni.model_executor.models.qwen3_omni.vision_encoder_cudagraph import Qwen3OmniVisionEncoderCudaGraphMixin
 from vllm_omni.quantization.component_config import (
     PRE_QUANTIZED_METHODS,
     ComponentQuantizationConfig,
@@ -142,6 +148,14 @@ except (ImportError, ModuleNotFoundError):
 logger = init_logger(__name__)
 
 PP_CAPTURE_PREFIX = "capture_"
+# Capture index of the word embeddings, i.e. the input to decoder layer 0.
+_EMBEDDING_LAYER_INDEX = 0
+
+
+def _get_capture_key(layer_idx: int) -> str:
+    """Return the IntermediateTensors key that carries a layer capture across PP ranks."""
+    return f"{PP_CAPTURE_PREFIX}{layer_idx}"
+
 
 _THINKER_ARCHITECTURE = "Qwen3OmniMoeThinkerForConditionalGeneration"
 
@@ -167,67 +181,62 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         super().__init__(*args, **kwargs)
         self.tp_size = get_tensor_model_parallel_world_size()
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        grid_thw,
-    ) -> torch.Tensor:
-        hidden_states = x.to(device=self.device, dtype=self.dtype)
-        hidden_states = self.patch_embed(hidden_states)
-
+    def prepare_encoder_metadata(self, grid_thw) -> dict[str, torch.Tensor]:
+        """Prepare positions and attention metadata outside CUDA graph capture."""
+        if not isinstance(grid_thw, torch.Tensor):
+            grid_thw = torch.as_tensor(grid_thw, dtype=torch.int32)
+        metadata = {}
         if self.apply_vit_abs_pos_embed:
-            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-            hidden_states = hidden_states + pos_embeds
+            metadata["pos_embeds"] = self.fast_pos_embed_interpolate(grid_thw)
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw)
 
-        if isinstance(grid_thw, torch.Tensor):
-            grid_thw_tensor = grid_thw.to(self.device)
-        else:
-            grid_thw_tensor = torch.as_tensor(grid_thw, dtype=torch.int32, device=self.device)
+        rotary_pos_emb_cos = rotary_pos_emb_cos.to(self.device)
+        rotary_pos_emb_sin = rotary_pos_emb_sin.to(self.device)
 
-        try:
-            cu_seqlens = torch.repeat_interleave(
-                grid_thw_tensor[:, 1] * grid_thw_tensor[:, 2],
-                grid_thw_tensor[:, 0],
-            ).cumsum(
-                dim=0,
-                dtype=grid_thw_tensor.dtype if torch.jit.is_tracing() else torch.int32,
-            )
-            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        except RuntimeError:
-            logger.warning(
-                "torch.repeat_interleave not executable, switching to vectorized searchsorted implementation."
-            )
-            repeat_counts = grid_thw_tensor[:, 0]
-            values = grid_thw_tensor[:, 1] * grid_thw_tensor[:, 2]
-            repeat_cumsum = repeat_counts.cumsum(0)
-            total_items = repeat_cumsum[-1].item()
-            indices = torch.searchsorted(
-                repeat_cumsum,
-                torch.arange(total_items, device=grid_thw_tensor.device),
-                right=True,
-            )
-            cu_seqlens = values[indices].cumsum(
-                dim=0,
-                dtype=grid_thw_tensor.dtype if torch.jit.is_tracing() else torch.int32,
-            )
-            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-        hidden_states = hidden_states.unsqueeze(1)
-        rotary_pos_emb_cos = rotary_pos_emb_cos.to(hidden_states.device)
-        rotary_pos_emb_sin = rotary_pos_emb_sin.to(hidden_states.device)
-        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
-
-        grid_thw_np = grid_thw_tensor.cpu().numpy().astype(np.int32)
+        # Sequence boundaries come from the host grid, so neither the eager
+        # path nor a replay reads a device value back.
+        grid_thw_np = grid_thw.cpu().numpy().astype(np.int32)
         cu_seqlens_np = np.repeat(grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]).cumsum(
             axis=0, dtype=np.int32
         )
         cu_seqlens_np = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens_np])
+        cu_seqlens_host = torch.from_numpy(cu_seqlens_np)
+        if self.device.type == "cpu":
+            cu_seqlens = cu_seqlens_host
+        else:
+            cu_seqlens = async_tensor_h2d(cu_seqlens_host, device=self.device)
+        # Attention reads this scalar on the host. Replay keeps the capture
+        # budget's bound instead.
+        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens_host)
         sequence_lengths = MMEncoderAttention.maybe_compute_seq_lens(
             self.attn_backend,
             cu_seqlens_np,
             self.device,
         )
+
+        metadata.update(
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        if sequence_lengths is not None:
+            metadata["sequence_lengths"] = sequence_lengths
+        return metadata
+
+    def forward(
+        self, x: torch.Tensor, grid_thw, *, encoder_metadata: dict[str, torch.Tensor] | None = None
+    ) -> torch.Tensor:
+        if encoder_metadata is None:
+            encoder_metadata = self.prepare_encoder_metadata(grid_thw)
+        return self.forward_with_encoder_metadata(x, encoder_metadata)
+
+    def forward_with_encoder_metadata(self, x: torch.Tensor, metadata: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Run patch embedding, vision blocks and all DeepStack mergers."""
+        hidden_states = self.patch_embed(x.to(device=self.device, dtype=self.dtype))
+        if self.apply_vit_abs_pos_embed:
+            hidden_states = hidden_states + metadata["pos_embeds"]
+        hidden_states = hidden_states.unsqueeze(1)
 
         hidden_states_list = []
         deepstack_visual_indexes = self.deepstack_visual_indexes
@@ -235,11 +244,11 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         for layer_num, blk in enumerate(self.blocks):
             hidden_states = blk(
                 hidden_states,
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb_cos=rotary_pos_emb_cos,
-                rotary_pos_emb_sin=rotary_pos_emb_sin,
-                max_seqlen=max_seqlen,
-                sequence_lengths=sequence_lengths,
+                cu_seqlens=metadata["cu_seqlens"],
+                rotary_pos_emb_cos=metadata["rotary_pos_emb_cos"],
+                rotary_pos_emb_sin=metadata["rotary_pos_emb_sin"],
+                max_seqlen=metadata["max_seqlen"],
+                sequence_lengths=metadata.get("sequence_lengths"),
             )
 
             if deepstack_visual_indexes is not None and layer_num in deepstack_visual_indexes:
@@ -434,33 +443,73 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
             dtype=torch.get_default_dtype(),
         )
 
+    def prepare_encoder_metadata(self, feature_lens: Sequence[int]) -> dict[str, object]:
+        """Chunk and attention layout for ``forward_with_encoder_metadata``.
+
+        Everything is derived from host-side mel lengths, so the forward pass
+        never reads a device value back.
+        """
+        chunk_size = self.n_window * 2
+        chunk_lengths: list[int] = []
+        aftercnn_lens: list[int] = []
+        for length in feature_lens:
+            length = int(length)
+            num_chunks = -(-length // chunk_size)
+            chunk_lengths += [chunk_size] * (num_chunks - 1) + [length - chunk_size * (num_chunks - 1)]
+            aftercnn_lens.append(int(_get_feat_extract_output_lengths(length)))
+        chunk_lens_after_cnn = self._get_cnn_output_lengths(np.asarray(chunk_lengths, dtype=np.int64))
+        max_len_after_cnn = int(chunk_lens_after_cnn.max())
+
+        # Row-major positions of the valid frames in the padded [chunk, time]
+        # grid, the order boolean-mask indexing would produce.
+        offsets = np.arange(len(chunk_lengths), dtype=np.int64) * max_len_after_cnn
+        valid_index = np.concatenate(
+            [offset + np.arange(n, dtype=np.int64) for offset, n in zip(offsets, chunk_lens_after_cnn)]
+        )
+
+        window_aftercnn = max_len_after_cnn * (self.n_window_infer // chunk_size)
+        cu_chunk_lens = [0]
+        for cnn_len in aftercnn_lens:
+            cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
+            if cnn_len % window_aftercnn:
+                cu_chunk_lens.append(cnn_len % window_aftercnn)
+        cu_seqlens_host = torch.tensor(cu_chunk_lens, dtype=torch.int32).cumsum(-1, dtype=torch.int32)
+
+        valid_index_host = torch.from_numpy(valid_index)
+        device = self.conv2d1.weight.device
+        if device.type != "cpu":
+            valid_index_host = async_tensor_h2d(valid_index_host, device=device)
+            cu_seqlens = async_tensor_h2d(cu_seqlens_host, device=device)
+        else:
+            cu_seqlens = cu_seqlens_host
+        return {
+            "chunk_lengths": chunk_lengths,
+            "valid_index": valid_index_host,
+            "cu_seqlens": cu_seqlens,
+            # Attention reads this scalar on the host.
+            "max_seqlen": self.compute_attn_mask_seqlen(cu_seqlens_host),
+            "aftercnn_lens": aftercnn_lens,
+        }
+
     def forward(
         self,
         input_features: torch.Tensor,
         feature_lens: torch.Tensor,
-        aftercnn_lens: torch.Tensor,
+        aftercnn_lens: torch.Tensor | None = None,
     ):
-        import torch.nn.functional as F
+        return self.forward_with_encoder_metadata(input_features, self.prepare_encoder_metadata(feature_lens.tolist()))
 
-        chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
+    def forward_with_encoder_metadata(self, input_features: torch.Tensor, metadata: dict[str, object]) -> torch.Tensor:
+        return self.forward_chunks(self.pad_chunks(input_features, metadata["chunk_lengths"]), metadata)
 
-        chunk_lengths = torch.tensor(
-            [self.n_window * 2] * chunk_num.sum(),
-            dtype=torch.long,
-            device=feature_lens.device,
-        )
-        tail_chunk_index = F.pad(chunk_num, (1, 0), value=-1).cumsum(0)[1:]
-        chunk_lengths[tail_chunk_index] = feature_lens % (self.n_window * 2)
-        chunk_lengths[chunk_lengths == 0] = self.n_window * 2
+    @staticmethod
+    def pad_chunks(input_features: torch.Tensor, chunk_lengths: list[int]) -> torch.Tensor:
+        """Split ``[mel, frames]`` features into zero-padded ``[chunk, mel, frames]`` chunks."""
+        chunk_list = input_features.T.split(chunk_lengths, dim=0)
+        return nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
 
-        chunk_list = input_features.T.split(chunk_lengths.tolist(), dim=0)
-        padded_feature = nn.utils.rnn.pad_sequence(chunk_list, batch_first=True).transpose(1, 2)
-
-        feature_lens_after_cnn = self._get_cnn_output_lengths(chunk_lengths)
-        max_len_after_cnn = feature_lens_after_cnn.max().item()
-        indices = torch.arange(max_len_after_cnn, device=padded_feature.device)
-        padded_mask_after_cnn = indices.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(1)
-
+    def forward_chunks(self, padded_feature: torch.Tensor, metadata: dict[str, object]) -> torch.Tensor:
+        """Encode padded chunks; reads ``valid_index``, ``cu_seqlens`` and ``max_seqlen``."""
         padded_feature = padded_feature.unsqueeze(1)
 
         if padded_feature.size(0) <= self.conv_chunksize:
@@ -486,19 +535,9 @@ class Qwen3OmniMoeAudioEncoder(_Qwen3OmniMoeAudioEncoder):
         )
         padded_embed = padded_embed + positional_embedding
 
-        hidden_states = padded_embed[padded_mask_after_cnn]
-
-        cu_chunk_lens = [0]
-        window_aftercnn = padded_mask_after_cnn.shape[-1] * (self.n_window_infer // (self.n_window * 2))
-        for cnn_len in aftercnn_lens.tolist():
-            num_full_chunks = cnn_len // window_aftercnn
-            remainder = cnn_len % window_aftercnn
-            cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
-            if remainder:
-                cu_chunk_lens.append(remainder)
-        cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=torch.int32)
-
-        max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        hidden_states = padded_embed.flatten(0, 1).index_select(0, metadata["valid_index"])
+        cu_seqlens = metadata["cu_seqlens"]
+        max_seqlen = metadata["max_seqlen"]
 
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
@@ -550,6 +589,18 @@ ISO639_1_SUPPORTED_LANGS = {
     }
 )
 class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        hf_numerics = bool(vllm_config.additional_config.get("hf_numerics", False))
+        super().__init__(
+            vllm_config=vllm_config,
+            prefix=prefix,
+            decoder_layer_type=HFNumericsDecoderLayer if hf_numerics else Qwen3MoeDecoderLayer,
+        )
+        self.hf_numerics = hf_numerics
+        if hf_numerics:
+            config = vllm_config.model_config.hf_text_config
+            self.norm = HFNumericsRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -579,7 +630,7 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
                     hs = captured_hidden_states.setdefault("hidden_states", {})
                     layers = hs.setdefault("layers", {})
                     # Receive buffers are reused on the next step; retain an independent snapshot.
-                    layers[layer_idx] = intermediate_tensors[f"{PP_CAPTURE_PREFIX}{layer_idx}"].clone()
+                    layers[layer_idx] = intermediate_tensors[_get_capture_key(layer_idx)].clone()
 
         for layer_idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             layer_idx = layer_idx + self.start_layer
@@ -600,18 +651,29 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
             )
 
             if deepstack_input_embeds is not None and layer_idx in range(0, len(deepstack_input_embeds)):
-                hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
+                if self.hf_numerics:
+                    # The next norm then takes the merged stream with no residual, as in HF.
+                    hidden_states = torch.ops.vllm_omni.hf_add_deepstack(
+                        hidden_states, residual, deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
+                    )
+                    residual = None
+                else:
+                    hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{layer_idx}"]
 
         if not get_pp_group().is_last_rank:
-            tensors = {"hidden_states": hidden_states, "residual": residual}
-            if captured_hidden_states:
-                tensors.update(
-                    {
-                        f"{PP_CAPTURE_PREFIX}{index}": value
-                        for index, value in captured_hidden_states["hidden_states"]["layers"].items()
-                    }
-                )
-            return IntermediateTensors(tensors)
+            captured = (
+                {
+                    _get_capture_key(index): value
+                    for index, value in captured_hidden_states["hidden_states"]["layers"].items()
+                }
+                if captured_hidden_states
+                else {}
+            )
+            # A local tensors.update(...) survives Dynamo transformation with
+            # `update` in co_names, and vLLM's cudagraph-in-compiler guard
+            # rejects any `update` as a possible buffer mutation (#8818). Build
+            # the dict in one expression instead; the contents are identical.
+            return IntermediateTensors({"hidden_states": hidden_states, "residual": residual, **captured})
         hidden_states, _ = self.norm(hidden_states, residual)
         if captured_hidden_states is not None:
             return hidden_states, captured_hidden_states
@@ -1001,20 +1063,13 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
         audio_input: Qwen2_5OmniAudioFeatureInputs,
     ) -> tuple[torch.Tensor, ...]:
         input_features = audio_input["input_features"]
-        # vLLM 0.29 marks audio_feature_lengths keep_on_cpu, and the audio tower
-        # derives device placement from feature_lens, so move it explicitly.
-        # Mirrors upstream Qwen3OmniMoeThinker._process_audio_input.
-        audio_feature_lengths = audio_input["audio_feature_lengths"].to(input_features.device, non_blocking=True)
-
-        audio_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths)
-
-        audio_outputs = self.audio_tower(
-            input_features.to(self.audio_tower.dtype),
-            feature_lens=audio_feature_lengths,
-            aftercnn_lens=audio_output_lengths,
+        # audio_feature_lengths is kept on the CPU, so the chunk layout is
+        # built without reading anything back from the device.
+        metadata = self.audio_tower.prepare_encoder_metadata(audio_input["audio_feature_lengths"].tolist())
+        audio_features = self.audio_tower.forward_with_encoder_metadata(
+            input_features.to(self.audio_tower.dtype), metadata
         )
-        audio_features = audio_outputs if isinstance(audio_outputs, torch.Tensor) else audio_outputs.last_hidden_state
-        return audio_features.split(audio_output_lengths.tolist())
+        return audio_features.split(metadata["aftercnn_lens"])
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -1024,6 +1079,7 @@ class Qwen3OmniMoeConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMix
 )
 class Qwen3OmniMoeThinkerForConditionalGeneration(
     nn.Module,
+    Qwen3OmniVisionEncoderCudaGraphMixin,
     SupportsMultiModal,
     SupportsPP,
     SupportsLoRA,
@@ -1143,14 +1199,24 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
             # register buffer for deepstack
             if self.use_deepstack:
+                # Create the buffers on the target device explicitly. They are
+                # built inside the `_mark_tower_model` block, which runs under
+                # vLLM's meta-device `no_init_weights` context when the image and
+                # video limits are both 0 (audio-only serving), so a bare
+                # torch.zeros(...) would stay on meta and the first profile_run
+                # fails with "Tensor on device meta is not on the expected device".
                 self.deepstack_input_embeds = [
                     torch.zeros(
                         vllm_config.scheduler_config.max_num_batched_tokens,
                         thinker_config.text_config.hidden_size,
+                        device=vllm_config.device_config.device,
                     )
                     for _ in range(self.deepstack_num_level)
                 ]
                 self.deepstack_input_embeds_num_tokens = 0
+
+        self._enable_image_encoder_cudagraph()
+        self._enable_audio_encoder_cudagraph(vllm_config)
 
         with self._mark_language_model(vllm_config):
             lm_vllm_config = vllm_config.with_hf_config(
@@ -1400,6 +1466,19 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         else:
             deepstack_input_embeds = None
 
+        # HACK: Snapshot the embedding capture here, before calling the compiled language model.
+        # This is needed for TP > 1, because vLLM's compile integration currently removes the
+        # clone on the graph input since it's read only, and enables kernels which write the
+        # residual in place, thereby causing the audio output to become corrupted.
+        embedding_capture = None
+        if (
+            return_hidden_states
+            and inputs_embeds is not None
+            and _EMBEDDING_LAYER_INDEX in (capture_layer_indices or ())
+        ):
+            embedding_capture = inputs_embeds.clone()
+            capture_layer_indices = [index for index in capture_layer_indices if index != _EMBEDDING_LAYER_INDEX]
+
         model_output = self.language_model.model(
             input_ids,
             positions,
@@ -1414,8 +1493,15 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if inputs_embeds is not None and get_pp_group().is_first_rank:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
 
+        if embedding_capture is not None:
+            # If we externally captured the embeddings for correct compile behavior, we need to rewrite the correct
+            # value back to the corresponding location to ensure read-only clone removal doesn't corrupt values
+            if isinstance(model_output, IntermediateTensors):
+                model_output[_get_capture_key(_EMBEDDING_LAYER_INDEX)] = embedding_capture
+            else:
+                model_output[-1]["hidden_states"]["layers"][_EMBEDDING_LAYER_INDEX] = embedding_capture
+
         if isinstance(model_output, IntermediateTensors):
-            # Non-last PP rank: forward the intermediate tensors as-is.
             return model_output
         hidden_states, captured_hidden_states = model_output
         if capture_layer_indices is None and not return_hidden_states:

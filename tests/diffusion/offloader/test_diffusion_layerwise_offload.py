@@ -13,7 +13,6 @@ import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.monitor import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -55,6 +54,7 @@ IMAGE_VIDEO_MODELS_PARAMS: dict[str, dict[str, Any]] = {
 }
 
 _OFFLOAD_STATE_PROBE = "vllm_omni_layerwise_offload_test"
+_OFFLOAD_MEMORY_PROBE = "vllm_omni_layerwise_offload_memory_test"
 # A second CI build can reverse the same exact-head measurement without a
 # source edit; the default keeps the existing baseline-first workload.
 _MEASUREMENT_ORDER_ENV = "VLLM_OMNI_OFFLOAD_TEST_ORDER"
@@ -65,7 +65,7 @@ _MEASUREMENT_ORDERS: dict[str, tuple[bool, bool]] = {
 
 
 class OffloadStateProbe:
-    """Test-only worker extension exposing the configured offloader state."""
+    """Test-only worker extension exposing offloader and allocator state."""
 
     model_runner: Any
 
@@ -86,6 +86,21 @@ class OffloadStateProbe:
             "block_count": sum(group_sizes),
         }
 
+    def reset_peak_memory_for_test(self) -> dict[str, str]:
+        """Start a process-local inference peak after model initialization."""
+        current_omni_platform.synchronize()
+        torch.accelerator.reset_peak_memory_stats()
+        return {"probe": _OFFLOAD_MEMORY_PROBE, "operation": "reset"}
+
+    def get_peak_memory_for_test(self) -> dict[str, str | float]:
+        """Return this worker's allocator peak without counting other jobs."""
+        current_omni_platform.synchronize()
+        return {
+            "probe": _OFFLOAD_MEMORY_PROBE,
+            "operation": "snapshot",
+            "peak_allocated_mb": torch.accelerator.max_memory_allocated() / (1024**2),
+        }
+
 
 def check_audio_determinism(audio1: np.ndarray, audio2: np.ndarray, atol: float = 1e-2) -> bool:
     if not np.allclose(audio1, audio2, atol=atol):
@@ -94,13 +109,6 @@ def check_audio_determinism(audio1: np.ndarray, audio2: np.ndarray, atol: float 
         print(f"Mean difference: {diff.mean()}")
         raise AssertionError(f"Audio outputs differ beyond tolerance atol={atol}")
     return True
-
-
-def _device_used_mb(device_index: int) -> float:
-    current_omni_platform.synchronize()
-    with current_omni_platform.device(device_index):
-        free_bytes, total_bytes = current_omni_platform.mem_get_info()
-    return (total_bytes - free_bytes) / (1024**2)
 
 
 def _extract_audio(output: Any) -> np.ndarray | None:
@@ -117,15 +125,27 @@ def _extract_audio(output: Any) -> np.ndarray | None:
     return np.asarray(audio)
 
 
-def _collect_offload_states(value: Any) -> list[dict[str, Any]]:
+def _collect_probe_results(value: Any, probe: str) -> list[dict[str, Any]]:
     if isinstance(value, dict):
-        return [value] if value.get("probe") == _OFFLOAD_STATE_PROBE else []
+        return [value] if value.get("probe") == probe else []
     if isinstance(value, (list, tuple)):
-        states: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         for item in value:
-            states.extend(_collect_offload_states(item))
-        return states
+            results.extend(_collect_probe_results(item, probe))
+        return results
     return []
+
+
+def _collect_offload_states(value: Any) -> list[dict[str, Any]]:
+    return _collect_probe_results(value, _OFFLOAD_STATE_PROBE)
+
+
+def _collect_memory_results(value: Any, operation: str) -> list[dict[str, Any]]:
+    return [
+        result
+        for result in _collect_probe_results(value, _OFFLOAD_MEMORY_PROBE)
+        if result.get("operation") == operation
+    ]
 
 
 def _measurement_order() -> tuple[bool, bool]:
@@ -144,8 +164,6 @@ def run_inference(
     num_inference_steps: int = 3,
 ) -> dict[str, Any]:
     current_omni_platform.empty_cache()
-    device_index = current_omni_platform.current_device()
-    initial_used_mb = _device_used_mb(device_index)
 
     if model_name in AUDIO_MODEL:
         params = AUDIO_MODEL_PARAMS
@@ -166,52 +184,45 @@ def run_inference(
         if not offload_states:
             raise AssertionError("The offload-state worker probe returned no diffusion worker results")
 
-        # Measure steady-state inference memory, not model construction. Enabling
-        # layerwise offload first loads the model and then replaces each block's
-        # device storage with CPU-backed weights.  Monitoring that transition
-        # captures both the original model and temporary staging allocations,
-        # which is not representative of layerwise-offloaded inference.
-        monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
-        current_omni_platform.reset_peak_memory_stats()
-        monitor.start()
+        # Reset and read allocator peaks in the diffusion worker process. A
+        # device-wide mem_get_info() sample includes unrelated sibling jobs on
+        # the same GPU and produced negative "savings" in shared ROCm CI.
+        reset_results = _collect_memory_results(
+            runner.omni.engine.collective_rpc(method="reset_peak_memory_for_test", timeout=60),
+            "reset",
+        )
+        if not reset_results:
+            raise AssertionError("The worker peak-memory probe returned no reset acknowledgements")
 
-        try:
-            # Refer to tests/e2e/offline_inference/test_wan22.py
-            # Use minimal settings for testing
-            output = runner.omni.generate(
-                "A cat sitting on a table",
-                OmniDiffusionSamplingParams(
-                    generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
-                    guidance_scale=1.0,
-                    num_inference_steps=num_inference_steps,
-                    **params["sampler_params"],
-                ),
-            )
-        finally:
-            monitor.stop()
+        # Refer to tests/e2e/offline_inference/test_wan22.py.
+        # Use minimal settings for testing.
+        output = runner.omni.generate(
+            "A cat sitting on a table",
+            OmniDiffusionSamplingParams(
+                generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
+                guidance_scale=1.0,
+                num_inference_steps=num_inference_steps,
+                **params["sampler_params"],
+            ),
+        )
+        memory_results = _collect_memory_results(
+            runner.omni.engine.collective_rpc(method="get_peak_memory_for_test", timeout=60),
+            "snapshot",
+        )
+        if not memory_results:
+            raise AssertionError("The worker peak-memory probe returned no snapshots")
 
         audio = _extract_audio(output)
         del output
-
-    # DeviceMemoryMonitor reports absolute device usage. Subtract this run's
-    # starting usage. Each mode runs in its own spawned process below, so model
-    # objects and process-local allocator/compiler/backend workspace state cannot
-    # carry into the other measurement. Shared filesystem caches can persist;
-    # _MEASUREMENT_ORDER_ENV enables a reversed-order validation run for that.
-    peak_used_mb = monitor.peak_used_mb
-    incremental_peak_mb = max(0.0, peak_used_mb - initial_used_mb)
 
     del runner
     gc.collect()
     cleanup_dist_env_and_memory()
     current_omni_platform.empty_cache()
-    post_cleanup_used_mb = _device_used_mb(device_index)
 
     return {
-        "initial_used_mb": initial_used_mb,
-        "peak_used_mb": peak_used_mb,
-        "incremental_peak_mb": incremental_peak_mb,
-        "post_cleanup_used_mb": post_cleanup_used_mb,
+        "peak_allocated_mb": max(float(result["peak_allocated_mb"]) for result in memory_results),
+        "memory_results": memory_results,
         "audio": audio,
         "offload_states": offload_states,
     }
@@ -259,12 +270,8 @@ def _assert_audio_outputs(
 
 
 def _print_measurement(label: str, measurement: dict[str, Any]) -> None:
-    print(
-        f"{label}: initial={measurement['initial_used_mb']:.1f} MB, "
-        f"peak={measurement['peak_used_mb']:.1f} MB, "
-        f"incremental_peak={measurement['incremental_peak_mb']:.1f} MB, "
-        f"post_cleanup={measurement['post_cleanup_used_mb']:.1f} MB"
-    )
+    print(f"{label}: worker_peak_allocated={measurement['peak_allocated_mb']:.1f} MB")
+    print(f"{label} worker memory: {measurement['memory_results']}")
     print(f"{label} offload state: {measurement['offload_states']}")
 
 
@@ -296,6 +303,33 @@ def test_measurement_order_rejects_unknown_value(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match=_MEASUREMENT_ORDER_ENV):
         _measurement_order()
+
+
+@pytest.mark.diffusion
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_collect_memory_results_filters_nested_worker_responses() -> None:
+    value = [
+        None,
+        [
+            {"probe": _OFFLOAD_MEMORY_PROBE, "operation": "reset"},
+            {
+                "probe": _OFFLOAD_MEMORY_PROBE,
+                "operation": "snapshot",
+                "peak_allocated_mb": 123.0,
+            },
+        ],
+        {"probe": _OFFLOAD_STATE_PROBE, "operation": "snapshot"},
+    ]
+
+    assert _collect_memory_results(value, "reset") == [{"probe": _OFFLOAD_MEMORY_PROBE, "operation": "reset"}]
+    assert _collect_memory_results(value, "snapshot") == [
+        {
+            "probe": _OFFLOAD_MEMORY_PROBE,
+            "operation": "snapshot",
+            "peak_allocated_mb": 123.0,
+        }
+    ]
 
 
 @pytest.mark.diffusion
@@ -366,8 +400,8 @@ def test_layerwise_offload_diffusion_model(model_name: str):
 
     # Verify that layerwise offloading significantly reduces memory usage
     # Passes only if the actual savings meets the expected savings
-    no_offload_peak_memory = no_offload["incremental_peak_mb"]
-    layerwise_offload_peak_memory = layerwise_offload["incremental_peak_mb"]
+    no_offload_peak_memory = no_offload["peak_allocated_mb"]
+    layerwise_offload_peak_memory = layerwise_offload["peak_allocated_mb"]
     actual_saved_memory = no_offload_peak_memory - layerwise_offload_peak_memory
     assert layerwise_offload_peak_memory + expected_saved_memory <= no_offload_peak_memory, (
         f"Layerwise offload peak memory {layerwise_offload_peak_memory} MB "

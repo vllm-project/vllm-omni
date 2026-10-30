@@ -32,7 +32,7 @@ class OmniCFGARScheduler(OmniARScheduler):
             raise ValueError("Atomic CFG reservations require one full-attention KV group")
         self._capacity = self.kv_cache_manager.block_pool.num_gpu_blocks - 1 - self.kv_cache_manager.watermark_blocks
         pair_pages = 2 * -(-self.max_model_len // self.block_size)
-        if self._capacity < pair_pages or self.max_num_running_reqs < 2:
+        if self._capacity < pair_pages or min(self.max_num_running_reqs, self.max_num_active_reqs) < 2:
             raise ValueError("Atomic CFG requires KV capacity and max_num_seqs for two maximum-length branches")
         if self.max_num_scheduled_tokens < 2 * self.max_model_len:
             raise ValueError("Atomic CFG requires max_num_batched_tokens >= 2 * max_model_len")
@@ -81,7 +81,7 @@ class OmniCFGARScheduler(OmniARScheduler):
         admitted = create_request_queue(self.policy)
         pending = {request.request_id: request for request in original_waiting}
         pages = self._capacity - sum(self._reserved_pages(request) for request in self.running)
-        slots = self.max_num_running_reqs - len(self.running)
+        slots = self.max_num_active_reqs - len(self.running)
         tokens = self.max_num_scheduled_tokens - len(self.running)
         chosen: set[str] = set()
         for request in original_waiting:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Pinned CPU block mirror (mirrors vLLM BlockPool)."""
+"""Pageable CPU block mirror (mirrors vLLM BlockPool)."""
 
 import logging
 
@@ -26,6 +26,10 @@ class PrefixBlockPool:
     fixed tensor sized to the same ``num_blocks`` as the upstream KV
     pool. Rows *are* those kv slots: when vLLM recycles a block, the
     next pool write overwrites that row. Slot reuse is the eviction.
+
+    Only staging buffers need pinning; the mirror receives CPU copies.
+    Leave storage uninitialized to avoid clearing the whole pool on first save;
+    the manager zeroes rows that were absent when a read was planned.
     """
 
     def __init__(self, config: PrefixCacheConfig):
@@ -33,19 +37,12 @@ class PrefixBlockPool:
         self._caches: dict[TensorName, torch.Tensor] = {}
 
     def _alloc(self, dtype: torch.dtype, feat: int) -> torch.Tensor:
-        return torch.zeros(
-            (self._config.num_blocks, self._config.block_size, feat),
-            dtype=dtype,
-            device="cpu",
-            # Pinning lets device→host overlap compute; unsupported on
-            # CPU-only builds where that overlap is off anyway.
-            pin_memory=torch.cuda.is_available(),
-        )
+        return torch.empty((self._config.num_blocks, self._config.block_size, feat), dtype=dtype, device="cpu")
 
     def alloc_key(self, key: str, dtype: torch.dtype, feat: int) -> torch.Tensor | None:
         """Allocate storage for a new ``key`` without publishing it (None if
-        already open). Pinned allocation is slow; run this unlocked and
-        hand the tensor to ``install_key`` under the manager's state lock."""
+        already open). Run this unlocked and hand the tensor to
+        ``install_key`` under the manager's state lock."""
         if key in self._caches:
             return None
         return self._alloc(dtype, feat)

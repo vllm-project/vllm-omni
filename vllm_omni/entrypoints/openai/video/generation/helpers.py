@@ -24,6 +24,7 @@ See ``video/generation/README.md`` (utils vs helpers, no overlap).
 import asyncio
 import io
 import json
+import math
 import os
 import tempfile
 import time
@@ -32,13 +33,15 @@ from contextlib import suppress
 from http import HTTPStatus
 from numbers import Integral
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, NoReturn, cast
 
 from fastapi import File, Form, HTTPException, Request, UploadFile
 from PIL import Image
+from pydantic import TypeAdapter, ValidationError
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve import create_error_response
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
@@ -47,6 +50,7 @@ from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
     SizeStr,
+    TimelineGuide,
     VideoAction,
     VideoError,
     VideoGenerationRequest,
@@ -59,6 +63,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceAudio,
     ReferenceImage,
     ReferenceVideo,
+    TimelineGuideInput,
     _stage_diffusion_model_class_name,
 )
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
@@ -70,6 +75,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     _validate_image_pixel_limit,
     decode_audio_url,
     decode_input_reference,
+    validate_control_media_file,
 )
 from vllm_omni.errors import OmniClientError
 
@@ -84,7 +90,7 @@ MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES = 15 * 1024 * 1024
 
 MINIMAX_H3_MAX_REFERENCE_COUNT = 12
 
-MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
+MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp"})
 
 MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 
@@ -94,10 +100,17 @@ CONTROL_REFERENCE_IMAGE_SUFFIXES = frozenset({".bmp", ".gif", ".jpg", ".jpeg", "
 CONTROL_REFERENCE_VIDEO_SUFFIXES = frozenset({".mkv", ".mov", ".mp4", ".webm"})
 CONTROL_REFERENCE_MAX_BYTES = 512 * 1024 * 1024
 
+TIMELINE_GUIDE_MAX_ENTRIES = 8
+TIMELINE_GUIDE_MAX_FILES = 16
+TIMELINE_GUIDE_AUDIO_SUFFIXES = frozenset({".wav", ".mp3", ".flac"})
+_TIMELINE_GUIDES_ADAPTER = TypeAdapter(list[TimelineGuide])
+
 LATENT_EDIT_SOURCE_MAX_BYTES = 512 * 1024 * 1024
 LATENT_EDIT_MASK_FILE_MAX_BYTES = 8 * 1024 * 1024
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
+# Scheduling slack on top of the engine abort budget when DELETE waits for a cancelled job.
+VIDEO_DELETE_TIMEOUT_S = 2.0
 
 
 def _resolve_video_runtime_context(raw_request: Request) -> tuple[str | None, list[Any] | None]:
@@ -354,7 +367,7 @@ async def _cleanup_video(video_id: str):
 def _cleanup_video_references(
     reference_video: ReferenceVideo | None,
     reference_audio: ReferenceAudio | None,
-    control_path: str | None = None,
+    request: VideoGenerationRequest,
     latent_edit_input: LatentEditInput | None = None,
 ) -> None:
     if reference_video is not None:
@@ -366,12 +379,22 @@ def _cleanup_video_references(
         for path in cleanup_paths:
             if os.path.exists(path):
                 os.unlink(path)
-    if control_path is not None and os.path.exists(control_path):
-        os.unlink(control_path)
+    for path in request._control_reference_paths:
+        if os.path.exists(path):
+            os.unlink(path)
     if latent_edit_input is not None:
         for path in latent_edit_input.cleanup_paths:
             if os.path.exists(path):
                 os.unlink(path)
+
+
+def _cleanup_timeline_guides(request: VideoGenerationRequest) -> None:
+    guide_input = request._timeline_guide_input
+    if guide_input is None:
+        return
+    for path in guide_input.cleanup_paths:
+        with suppress(OSError):
+            os.unlink(path)
 
 
 def _unpack_video_generation_result(
@@ -400,14 +423,14 @@ async def _run_video_generation_job(
     reference_image: ReferenceImage | None = None,
     reference_video: ReferenceVideo | None = None,
     reference_audio: ReferenceAudio | None = None,
-    control_path: str | None = None,
     app_state: Any | None = None,
     latent_edit_input: LatentEditInput | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
+        _cleanup_timeline_guides(request)
         return
 
     started_at = time.perf_counter()
@@ -484,7 +507,8 @@ async def _run_video_generation_job(
         await VIDEO_STORE.pop(video_id)
         raise
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
+        _cleanup_timeline_guides(request)
 
 
 async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
@@ -552,6 +576,7 @@ async def _persist_uploaded_control_reference(
     upload: UploadFile,
     *,
     max_bytes: int = CONTROL_REFERENCE_MAX_BYTES,
+    field_name: str = "control_reference",
 ) -> str:
     """Stream one model control upload to request-scoped local storage."""
     kind = _uploaded_media_kind(upload)
@@ -560,13 +585,13 @@ async def _persist_uploaded_control_reference(
     if kind == "audio" or (suffix and suffix not in supported_suffixes):
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail="control_reference must be an image or video file.",
+            detail=f"{field_name} must be an image or video file.",
         )
     if not suffix:
         suffix = ".png" if kind == "image" else ".mp4"
     return await _persist_uploaded_reference(
         upload,
-        field_name="control_reference",
+        field_name=field_name,
         suffix=suffix,
         max_bytes=max_bytes,
     )
@@ -680,17 +705,76 @@ def _validate_control_upload(
     return normalized_type
 
 
+def _validate_h3_control_uploads(
+    handler: OmniOpenAIServingVideo,
+    request: VideoGenerationRequest,
+    control_reference: UploadFile | None,
+    control_type: str | None,
+    source_reference: UploadFile | None,
+    mask_reference: UploadFile | None,
+    *,
+    has_references: bool,
+) -> str | None:
+    """Validate H3's uploaded conditioning without opening server-local paths."""
+    modes = {"canny", "depth", "hed", "mlsd", "pose", "inpaint"}
+    extras = request.extra_params or {}
+    active = {mode for mode in modes if mode in extras}
+    supplied = any(item is not None for item in (control_reference, source_reference, mask_reference, control_type))
+    if not supplied and not active:
+        return None
+
+    def reject(message: str) -> NoReturn:
+        raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=message)
+
+    if not handler.controlnet_configured:
+        reject("MiniMax H3 control requires starting the server with --controlnet-model-path.")
+    selected = control_type.strip().lower() if control_type else None
+    if selected is None or selected not in modes:
+        reject("MiniMax H3 conditioning requires control_type: canny, depth, hed, mlsd, pose, or inpaint.")
+    if active - {selected}:
+        reject("Provide parameters for only the selected control_type.")
+    if source_reference is not None and mask_reference is None:
+        reject("source_reference requires mask_reference.")
+    if selected != "inpaint" and control_reference is None:
+        reject("control_type requires a control_reference upload.")
+    if selected == "inpaint" and mask_reference is None:
+        reject("control_type=inpaint requires mask_reference.")
+    if has_references:
+        reject(
+            "MiniMax H3 control cannot be combined with input/image/video/audio references, "
+            "keyframes, or latent-mask editing."
+        )
+    config = extras.get(selected, {})
+    if not isinstance(config, Mapping):
+        reject(f"extra_params.{selected} must be an object.")
+    if any(key in config for key in ("control", "control_path", "source", "source_path", "mask", "mask_path")):
+        reject("Use control_reference/source_reference/mask_reference uploads, not server-local paths or tensors.")
+    unknown = set(config) - {"control_context_scale"}
+    if unknown:
+        reject(f"Unknown extra_params.{selected} fields: {', '.join(sorted(unknown))}.")
+    strength = config.get("control_context_scale", 1.0)
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+        reject("control_context_scale must be a finite, non-negative number.")
+    try:
+        strength = float(strength)
+    except OverflowError:
+        reject("control_context_scale must be a finite, non-negative number.")
+    if not math.isfinite(strength) or strength < 0:
+        reject("control_context_scale must be a finite, non-negative number.")
+    for role, upload in (("control_reference", control_reference), ("source_reference", source_reference)):
+        if upload is not None and _uploaded_media_kind(upload) != "video":
+            reject(f"{role} must be a video file.")
+    return selected
+
+
 def _attach_control_upload(
     request: VideoGenerationRequest,
     control_type: str,
-    control_path: str | None = None,
 ) -> None:
-    """Declare an uploaded control and attach its persisted path when available."""
+    """Declare the uploaded control type before selecting the reference decode policy."""
     extra_params = dict(request.extra_params or {})
     existing = extra_params.get(control_type)
     control_params = dict(existing) if isinstance(existing, Mapping) else {}
-    if control_path is not None:
-        control_params["control_path"] = control_path
     extra_params[control_type] = control_params
     request.extra_params = extra_params
 
@@ -708,6 +792,8 @@ def _uploaded_media_kind(upload: UploadFile) -> str:
     if content_type.startswith("audio/"):
         return "audio"
     suffix = Path(upload.filename or "").suffix.lower()
+    # HEIC/HEIF are classified as images so they take the image validation path;
+    # the decoder allowlist below does not accept those formats.
     if suffix in {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"}:
         return "image"
     if suffix in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}:
@@ -760,7 +846,7 @@ def _validate_minimax_h3_image_payload(
 ) -> None:
     """Validate a H3 image before converting it to a format-less PIL image."""
     try:
-        with Image.open(io.BytesIO(payload)) as image:
+        with open_image(io.BytesIO(payload)) as image:
             image_format = str(image.format or "").lower()
             if image_format in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
                 _validate_image_pixel_limit(image)
@@ -774,15 +860,15 @@ def _validate_minimax_h3_image_payload(
     except (OSError, ValueError) as exc:
         if allow_non_image:
             return
-        raise HTTPException(400, detail=f"Invalid uploaded image reference: {filename}") from exc
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST.value,
+            detail=(f"Invalid uploaded image reference: {filename}. Expected a JPG, JPEG, PNG, or WEBP image."),
+        ) from exc
 
     if image_format not in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail=(
-                "MiniMax H3 reference images must use JPG, JPEG, PNG, WEBP, HEIC, or HEIF; "
-                f"got {image_format or 'unknown'}."
-            ),
+            detail=(f"MiniMax H3 reference images must use JPG, JPEG, PNG, or WEBP; got {image_format or 'unknown'}."),
         )
 
 
@@ -849,12 +935,140 @@ async def _persist_uploaded_media_references(
     return images, videos, audios
 
 
+def _parse_timeline_guides(
+    handler: OmniOpenAIServingVideo,
+    timeline_guides: str | None,
+    guide_files: list[UploadFile],
+) -> tuple[list[TimelineGuide], dict[int, str]] | None:
+    """Validate the guide manifest and map each upload index to one modality."""
+    if not timeline_guides and not guide_files:
+        return None
+    if not handler.supports_timeline_guides:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Timeline guides are not supported by this model.",
+        )
+    if not timeline_guides:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="guide_files requires a timeline_guides manifest.",
+        )
+    try:
+        guides = _TIMELINE_GUIDES_ADAPTER.validate_json(timeline_guides)
+    except ValidationError as exc:
+        error = exc.errors()[0]
+        location = ".".join(str(item) for item in error["loc"])
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Invalid timeline_guides{f' at {location}' if location else ''}: {error['msg']}",
+        ) from exc
+    if not guides:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="timeline_guides must not be empty.")
+    if len(guides) > TIMELINE_GUIDE_MAX_ENTRIES:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"timeline_guides accepts at most {TIMELINE_GUIDE_MAX_ENTRIES} entries.",
+        )
+    if len(guide_files) > TIMELINE_GUIDE_MAX_FILES:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"guide_files accepts at most {TIMELINE_GUIDE_MAX_FILES} uploads.",
+        )
+    kinds: dict[int, str] = {}
+    for guide in guides:
+        for kind in ("image", "video", "audio"):
+            source = getattr(guide, kind)
+            if source is None:
+                continue
+            index = source.upload_index
+            if index >= len(guide_files):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=(
+                        f"timeline_guides references guide_files[{index}], but only {len(guide_files)} were uploaded."
+                    ),
+                )
+            if kinds.setdefault(index, kind) != kind:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=f"guide_files[{index}] cannot be used as both {kinds[index]} and {kind}.",
+                )
+    if len(kinds) != len(guide_files):
+        unused = sorted(set(range(len(guide_files))) - set(kinds))
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"guide_files{unused} are not referenced by timeline_guides.",
+        )
+    return guides, kinds
+
+
+async def _persist_timeline_guides(
+    guides: list[TimelineGuide],
+    kinds: dict[int, str],
+    guide_files: list[UploadFile],
+) -> TimelineGuideInput:
+    """Decode guide images in memory and persist clips and audio as files."""
+    sources: dict[int, Any] = {}
+    paths: list[str] = []
+    try:
+        for index, kind in sorted(kinds.items()):
+            upload = guide_files[index]
+            field_name = f"guide_files[{index}]"
+            suffix = Path(upload.filename or "").suffix.lower()
+            if kind == "image":
+                payload = await _read_upload_limited(upload, max_bytes=MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES)
+                _validate_minimax_h3_image_payload(payload, filename=upload.filename)
+                try:
+                    sources[index] = _decode_image_bytes(payload, source=f"uploaded {field_name}")
+                except InvalidInputReferenceError as exc:
+                    raise HTTPException(HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+                continue
+            if kind == "video":
+                allowed, max_bytes, expected = (
+                    MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES,
+                    MINIMAX_H3_MAX_REFERENCE_VIDEO_BYTES,
+                    "an MP4 or MOV file",
+                )
+            else:
+                allowed, max_bytes, expected = (
+                    TIMELINE_GUIDE_AUDIO_SUFFIXES,
+                    MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES,
+                    "a WAV, MP3, or FLAC file",
+                )
+            if suffix not in allowed:
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=f"{field_name} used as a {kind} guide must be {expected}.",
+                )
+            path = await _persist_uploaded_reference(
+                upload, field_name="guide_file", suffix=suffix, max_bytes=max_bytes
+            )
+            paths.append(path)
+            sources[index] = path
+    except (asyncio.CancelledError, Exception):
+        for path in paths:
+            with suppress(OSError):
+                os.unlink(path)
+        raise
+    resolved = []
+    for guide in guides:
+        entry: dict[str, Any] = {"frame_index": guide.frame_index}
+        for kind in ("image", "video", "audio"):
+            source = getattr(guide, kind)
+            if source is not None:
+                entry[kind] = sources[source.upload_index]
+        resolved.append(entry)
+    return TimelineGuideInput(guides=resolved, cleanup_paths=tuple(paths))
+
+
 async def _parse_video_form(
     raw_request: Request,
     prompt: str = Form(...),
     input_reference: UploadFile | None = File(default=None),
     input_references: list[UploadFile] | None = File(default=None),
     control_reference: UploadFile | None = File(default=None),
+    source_reference: UploadFile | None = File(default=None),
+    mask_reference: UploadFile | None = File(default=None),
     control_type: str | None = Form(default=None),
     image_reference: str | None = Form(default=None),
     video_reference: str | None = Form(default=None),
@@ -893,6 +1107,8 @@ async def _parse_video_form(
     source_audio: UploadFile | None = File(default=None),
     video_noise_mask: UploadFile | None = File(default=None),
     audio_noise_mask: UploadFile | None = File(default=None),
+    timeline_guides: str | None = Form(default=None),
+    guide_files: list[UploadFile] | None = File(default=None),
 ) -> tuple[
     VideoGenerationRequest,
     "OmniOpenAIServingVideo",
@@ -900,7 +1116,6 @@ async def _parse_video_form(
     ReferenceImage | None,
     ReferenceVideo | None,
     ReferenceAudio | None,
-    str | None,
     LatentEditInput | None,
 ]:
     """FastAPI dependency that parses video form data, validates inputs,
@@ -938,6 +1153,8 @@ async def _parse_video_form(
             ),
         )
 
+    if model == "auto":
+        model = None
     request_data: dict[str, Any] = {
         "prompt": prompt,
         "model": model,
@@ -1005,6 +1222,8 @@ async def _parse_video_form(
             detail=f"Video generation setup failed: {str(e)}",
         )
 
+    parsed_timeline_guides = _parse_timeline_guides(handler, timeline_guides, guide_files or [])
+
     has_latent_edit = _validate_latent_edit_inputs(
         handler,
         source_video=source_video,
@@ -1013,7 +1232,31 @@ async def _parse_video_form(
         audio_noise_mask=parsed_audio_noise_mask,
     )
 
-    normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
+    h3_control = handler.is_minimax_h3
+    if h3_control:
+        normalized_control_type = _validate_h3_control_uploads(
+            handler,
+            request,
+            control_reference,
+            control_type,
+            source_reference,
+            mask_reference,
+            has_references=bool(input_references)
+            or any(
+                item is not None
+                for item in (
+                    input_reference,
+                    parsed_image_reference,
+                    parsed_video_reference,
+                    parsed_audio_reference,
+                )
+            )
+            or has_latent_edit,
+        )
+    else:
+        if source_reference is not None or mask_reference is not None:
+            raise HTTPException(400, detail="source_reference/mask_reference are not supported by this model.")
+        normalized_control_type = _validate_control_upload(handler, request, control_reference, control_type)
     if normalized_control_type is not None:
         # Make the selected transfer mode visible while choosing the model's
         # reference-video decode policy. The upload itself stays unpersisted
@@ -1124,7 +1367,7 @@ async def _parse_video_form(
             for audio_reference in _reference_list(request.audio_reference):
                 audio_paths.append(await decode_audio_url(audio_reference.audio_url))
         except InvalidInputReferenceError as exc:
-            _cleanup_video_references(reference_video, reference_audio)
+            _cleanup_video_references(reference_video, reference_audio, request)
             cleanup_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)
             for path in audio_paths:
                 if path not in cleanup_paths and os.path.exists(path):
@@ -1142,16 +1385,36 @@ async def _parse_video_form(
             cleanup_paths=cleanup_paths,
         )
 
-    control_path: str | None = None
-    if control_reference is not None and normalized_control_type is not None:
+    control_paths = request._control_reference_paths
+    if normalized_control_type is not None:
         try:
-            control_path = await _persist_uploaded_control_reference(
-                control_reference,
-                max_bytes=CONTROL_REFERENCE_MAX_BYTES,
-            )
-            _attach_control_upload(request, normalized_control_type, control_path)
+            for role, upload in (
+                ("control", control_reference),
+                ("source", source_reference),
+                ("mask", mask_reference),
+            ):
+                if upload is None:
+                    continue
+                path = await _persist_uploaded_control_reference(
+                    upload,
+                    max_bytes=CONTROL_REFERENCE_MAX_BYTES,
+                    field_name=f"{role}_reference",
+                )
+                control_paths.append(path)
+                if h3_control:
+                    # Decode validation is shared media logic; request ownership
+                    # remains here and covers partial persistence failures too.
+                    await asyncio.to_thread(validate_control_media_file, path, allow_image=role == "mask")
+                if h3_control:
+                    request._minimax_h3_control_media[f"{role}_path"] = path
+                else:
+                    assert request.extra_params is not None
+                    request.extra_params[normalized_control_type][f"{role}_path"] = path
+        except InvalidInputReferenceError as exc:
+            _cleanup_video_references(reference_video, reference_audio, request)
+            raise HTTPException(400, detail=str(exc)) from exc
         except (asyncio.CancelledError, HTTPException, OSError, TypeError, ValueError):
-            _cleanup_video_references(reference_video, reference_audio, control_path)
+            _cleanup_video_references(reference_video, reference_audio, request)
             raise
 
     latent_edit_input: LatentEditInput | None = None
@@ -1183,7 +1446,15 @@ async def _parse_video_form(
             for path in source_paths:
                 with suppress(OSError):
                     os.unlink(path)
-            _cleanup_video_references(reference_video, reference_audio, control_path)
+            _cleanup_video_references(reference_video, reference_audio, request)
+            raise
+
+    if parsed_timeline_guides is not None:
+        guides, kinds = parsed_timeline_guides
+        try:
+            request._timeline_guide_input = await _persist_timeline_guides(guides, kinds, guide_files or [])
+        except (asyncio.CancelledError, Exception):
+            _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
             raise
 
     return (
@@ -1193,6 +1464,5 @@ async def _parse_video_form(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     )

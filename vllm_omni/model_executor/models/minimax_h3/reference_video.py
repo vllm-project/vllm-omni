@@ -97,7 +97,13 @@ def _probe_video(path: str) -> dict[str, Any]:
         "sample_aspect_ratio:format=format_name,size,duration"
     )
     command = ["ffprobe", "-v", "error", "-show_entries", show_entries, "-of", "json", path]
-    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+    )
     probe = json.loads(result.stdout)
     streams = probe.get("streams") or []
     video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
@@ -111,6 +117,7 @@ def _probe_video(path: str) -> dict[str, Any]:
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
         )
         probe = json.loads(result.stdout)
         streams = probe.get("streams") or []
@@ -222,6 +229,7 @@ def _probe_audio(path: str) -> dict[str, Any]:
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
     )
     probe = json.loads(result.stdout)
     streams = [stream for stream in probe.get("streams", []) if stream.get("codec_type") == "audio"]
@@ -345,41 +353,40 @@ def _transcode_reference_video(
         # requested target; longer inputs are deterministically trimmed by the
         # same -frames:v limit without enabling this padding filter.
         filters.append("tpad=stop_mode=clone:stop=-1")
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-ss",
-            f"{float(start_time_seconds):.6f}",
-            "-i",
-            source,
-            "-map",
-            "0:v:0",
-            "-an",
-            "-vf",
-            ",".join(filters),
-            *duration_args,
-            *frame_count_args,
-            "-metadata:s:v:0",
-            "rotate=0",
-            # Keep the transformed RGB pixels lossless. The same prepared
-            # stream is decoded by Qwen3VL and the video VAE; a yuv420p
-            # intermediate would make the two consumers see different
-            # pixels from the model-card reference recipe.
-            "-c:v",
-            "libx264rgb",
-            "-crf",
-            "0",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "rgb24",
-            output,
-        ],
-        check=True,
-    )
+    command = [
+        "ffmpeg",
+        "-nostdin",
+        "-y",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{float(start_time_seconds):.6f}",
+        "-i",
+        source,
+        "-map",
+        "0:v:0",
+        "-an",
+        "-vf",
+        ",".join(filters),
+        *duration_args,
+        *frame_count_args,
+        "-metadata:s:v:0",
+        "rotate=0",
+        # Keep the transformed RGB pixels lossless. The same prepared
+        # stream is decoded by Qwen3VL and the video VAE; a yuv420p
+        # intermediate would make the two consumers see different
+        # pixels from the model-card reference recipe.
+        "-c:v",
+        "libx264rgb",
+        "-crf",
+        "0",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "rgb24",
+        output,
+    ]
+    subprocess.run(command, check=True, stdin=subprocess.DEVNULL)
     return output
 
 
@@ -540,6 +547,7 @@ def _decode_video_frames_ffmpeg(
     output_frame_count = frame_count if indices is None else len(indices)
     command = [
         "ffmpeg",
+        "-nostdin",
         "-loglevel",
         "error",
         "-threads",
@@ -570,6 +578,7 @@ def _decode_video_frames_ffmpeg(
         command,
         check=True,
         capture_output=True,
+        stdin=subprocess.DEVNULL,
     )
     frame_size = width * height * 3
     expected_size = output_frame_count * frame_size
@@ -673,6 +682,7 @@ def load_audio_file(path: str) -> tuple[torch.Tensor, int]:
             subprocess.run(
                 [
                     "ffmpeg",
+                    "-nostdin",
                     "-y",
                     "-loglevel",
                     "error",
@@ -684,8 +694,12 @@ def load_audio_file(path: str) -> tuple[torch.Tensor, int]:
                     wav,
                 ],
                 check=True,
+                stdin=subprocess.DEVNULL,
             )
             return _soundfile_to_waveform(wav)
+
+
+_AUDIO_EXTRACTION_TIMEOUT_SECONDS = 120
 
 
 def load_video_audio(
@@ -700,6 +714,7 @@ def load_video_audio(
         output = str(Path(tmpdir) / "audio.wav")
         command = [
             "ffmpeg",
+            "-nostdin",
             "-y",
             "-loglevel",
             "error",
@@ -718,7 +733,12 @@ def load_video_audio(
         if duration_seconds is not None:
             command.extend(["-t", f"{float(duration_seconds):.6f}"])
         command.append(output)
-        subprocess.run(command, check=True)
+        subprocess.run(
+            command,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            timeout=_AUDIO_EXTRACTION_TIMEOUT_SECONDS,
+        )
         return load_audio_file(output)
 
 

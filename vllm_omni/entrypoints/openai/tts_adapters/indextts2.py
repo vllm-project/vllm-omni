@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """IndexTTS2 serving adapter."""
 
 from __future__ import annotations
@@ -23,8 +24,6 @@ from vllm_omni.model_executor.models.indextts2.configuration_indextts2 import (
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 
-_TTS_MAX_NEW_TOKENS_MIN = 1
-_TTS_MAX_NEW_TOKENS_MAX = 4096
 _INDEXTTS2_EMOTION_KEYS = ("emo_audio", "emo_vector", "emo_alpha", "emo_text", "use_emo_text", "use_random")
 
 
@@ -154,11 +153,9 @@ class IndexTTS2Adapter(ARTTSAdapter):
             fmt_err = server._validate_ref_audio_format(request.ref_audio)
             if fmt_err:
                 return fmt_err
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
-                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
-            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
-                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+        err = self._validate_max_new_tokens(request)
+        if err:
+            return err
         if request.extra_params is not None:
             if not isinstance(request.extra_params, dict):
                 return "extra_params must be a JSON object/dict."

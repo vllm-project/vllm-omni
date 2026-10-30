@@ -147,6 +147,7 @@ _PIPELINE_STAGES = [
     "dac_decoder",
     "diffusion",
     "dit",
+    "fish_omni",
     "fish_speech_slow_ar",
     "fused_thinker_talker",
     "gepard",
@@ -161,6 +162,7 @@ _PIPELINE_STAGES = [
     "llm",
     "minimax_music3_ar",
     "ming_tts",
+    "ming3_tts",
     "moss_tts",
     "moss_tts_codec",
     "moss_tts_local",
@@ -183,6 +185,7 @@ _PIPELINE_STAGES = [
     "token2wav",
     "tts",
     "encoder",
+    "yue2",
 ]
 
 _STAGES = [*_PIPELINE_STAGES, None, "vae", "not_a_real_stage"]
@@ -285,14 +288,21 @@ def test_pipeline_stage_list_is_complete():
 
 
 def test_entry_stage_archs_are_explicit():
-    """Only Ming dense and AuK identify their entry stage by architecture.
+    """Ming dense, AuK, and Ming3 identify entry stages by architecture.
 
-    Both use a generic ``model_stage`` (``llm`` and ``encoder``) that other
+    They use generic ``model_stage`` values (``llm`` and ``encoder``) that other
     pipelines share. Widening this set would change which stage
     ``_find_tts_stage`` selects in mixed deployments — notably VoxCPM2, which
     declares ``model_archs`` but is found by its ``latent_generator`` stage key.
     """
-    assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration", "AuKForConditionalGeneration"})
+    assert tts_entry_stage_archs() == frozenset(
+        {
+            "MingTTSForConditionalGeneration",
+            "AuKForConditionalGeneration",
+            "Ming3TTSForConditionalGeneration",
+            "LingV3TTSForConditionalGeneration",
+        }
+    )
 
 
 def test_minimax_h3_encoder_is_not_a_tts_stage():

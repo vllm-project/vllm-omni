@@ -7,10 +7,14 @@ from typing import Any
 
 import pytest
 from vllm.config import SchedulerConfig, VllmConfig
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
+from vllm.v1.request import Request
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.core.sched import omni_scheduler_mixin
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 
@@ -18,7 +22,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _Scheduler(OmniSchedulerMixin):
-    pass
+    _is_blocked_waiting_status = staticmethod(Scheduler._is_blocked_waiting_status)
 
 
 def test_async_chunk_adapter_initializes_for_stage_zero_sender_and_stage_one_receiver(monkeypatch):
@@ -111,16 +115,24 @@ def test_native_data_plane_uses_the_selected_input_protocol(async_chunk, stage_i
     assert scheduler._native_data_plane
     if async_chunk or (stage_id > 0 and required):
         assert scheduler.input_coordinator._async_chunk is async_chunk
+        assert scheduler.input_coordinator.receives_chunks is (async_chunk and stage_id > 0)
     else:
         assert scheduler.input_coordinator is None
     assert scheduler._async_chunk_transport_enabled() is async_chunk
     assert scheduler.chunk_transfer_adapter is None
+    # Stage zero can own an async coordinator for bookkeeping without
+    # receiving connector chunks. Full-payload inputs are not atomic chunks.
+    assert OmniGenerationScheduler._requires_atomic_chunk(scheduler) is (async_chunk and stage_id > 0)
 
 
 def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
     calls: list[tuple[Any, ...]] = []
     scheduler = _Scheduler()
-    scheduler.waiting = ["waiting"]
+    waiting = Request("waiting", [1], SamplingParams(max_tokens=1), pooling_params=None)
+    holding = Request("holding", [1, 2], SamplingParams(max_tokens=1), pooling_params=None)
+    holding.num_computed_tokens = 1
+    scheduler.waiting = [waiting]
+    scheduler.kv_holding_waiting = [holding]
     scheduler.running = ["running"]
     scheduler.requests = {"request": object()}
     scheduler._consume_pending_connector_output = lambda mode: calls.append(("consume", mode))
@@ -137,16 +149,16 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
     scheduler.chunk_transfer_adapter = SimpleNamespace(
         receives_chunks=True,
         process_pending_chunks=lambda waiting, running, scheduler_requests: calls.append(
-            ("process", waiting, running, scheduler_requests)
+            ("process", list(waiting), running, scheduler_requests)
         ),
         restore_queues=lambda waiting, running, scheduler_requests: calls.append(
-            ("restore-chunks", waiting, running, scheduler_requests)
+            ("restore-chunks", list(waiting), running, scheduler_requests)
         ),
         collect_timed_out_request_ids=_collect_timed_out,
         collect_failed_send_request_ids=_collect_failed_sends,
     )
     scheduler.input_coordinator = SimpleNamespace(
-        restore_queues=lambda waiting, running: calls.append(("restore-full", waiting, running))
+        restore_queues=lambda waiting, running: calls.append(("restore-full", list(waiting), running))
     )
 
     scheduler._process_pending_omni_inputs("ar")
@@ -155,13 +167,13 @@ def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
     assert calls == [
         ("consume", "ar"),
         ("timeouts",),
-        ("process", scheduler.waiting, scheduler.running, scheduler.requests),
+        ("process", [holding, waiting], scheduler.running, scheduler.requests),
         # The chunk deadline runs after chunks are applied, so a chunk that
         # arrived this cycle resets the clock before it is measured (R1.1).
         ("chunk-timeouts", omni_scheduler_mixin.DEFAULT_INPUT_WAIT_TIMEOUT_S),
         ("failed-sends",),
-        ("restore-chunks", scheduler.waiting, scheduler.running, scheduler.requests),
-        ("restore-full", scheduler.waiting, scheduler.running),
+        ("restore-chunks", [holding, waiting], scheduler.running, scheduler.requests),
+        ("restore-full", [holding, waiting], scheduler.running),
     ]
 
 
@@ -229,4 +241,8 @@ def test_native_downstream_sender_stage_does_not_wait_for_chunks(role, coordinat
 
     assert scheduler._native_data_plane
     assert (scheduler.input_coordinator is not None) is coordinated
+    if coordinated:
+        assert scheduler.input_coordinator.receives_chunks
     assert scheduler._async_chunk_transport_enabled() is coordinated
+    assert scheduler.chunk_transfer_adapter is None
+    assert OmniGenerationScheduler._requires_atomic_chunk(scheduler) is coordinated

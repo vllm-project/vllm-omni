@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """HunyuanImage3 pipeline topology."""
 
 from vllm_omni.config.stage_config import (
@@ -29,7 +29,7 @@ HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=True,
             final_output_type="text",
-            owns_tokenizer=False,
+            owns_tokenizer=True,
             requires_multimodal_data=True,
             model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
             engine_output_type="latent",

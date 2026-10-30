@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Extended INC/AutoRound config for multi-stage omni models."""
 
 from __future__ import annotations
 
+import logging
 from os.path import commonprefix
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
-from torch.nn import Module
-from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.inc import INCConfig
+from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.model_executor.parameter import ModelWeightParameter
-from vllm.model_executor.utils import replace_parameter
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -21,6 +20,7 @@ if TYPE_CHECKING:
     )
 
 _REGEX_SPECIAL_CHARS = frozenset(r"*+?^$()[]{}|\\")
+logger = logging.getLogger(__name__)
 
 
 def _stage_prefix(prefix_map: dict[str, str | None]) -> str:
@@ -49,85 +49,111 @@ def _map_with_stage_prefix(
     return result
 
 
+def _normalize_block_names(value: str | list[str] | None) -> list[str] | None:
+    if isinstance(value, str):
+        return [name.strip() for name in value.split(",") if name.strip()]
+    return value
+
+
+def _remap_name(name: str, prefix_map: dict[str, str]) -> str:
+    """Replace the first matching checkpoint prefix in *name*."""
+    for source in sorted(prefix_map, key=len, reverse=True):
+        if name.startswith(source):
+            return prefix_map[source] + name[len(source) :]
+    return name
+
+
+def _is_regex_key(key: str) -> bool:
+    return any(char in _REGEX_SPECIAL_CHARS for char in key)
+
+
+def _remap_regex_key(key: str, prefix_map: dict[str, str]) -> str:
+    """Remap a checkpoint prefix in a regex key in either dot style."""
+    for source in sorted(prefix_map, key=len, reverse=True):
+        target = prefix_map[source] or ""
+        for source_form, target_form in (
+            (source, target),
+            (re.escape(source), re.escape(target)),
+        ):
+            if source_form != target_form and source_form in key:
+                return key.replace(source_form, target_form, 1)
+    return key
+
+
+def _remap_extra_config_key(key: str, prefix_map: dict[str, str]) -> str:
+    """Remap an ``extra_config`` key, preserving regex patterns."""
+    if _is_regex_key(key):
+        new_key = _remap_regex_key(key, prefix_map)
+        if new_key == key:
+            logger.debug("extra_config regex key did not match any prefix: %s", key)
+        return new_key
+    return _remap_name(key, prefix_map)
+
+
 class OmniINCConfig(INCConfig):
-    """INCConfig extended with multi-stage prefix remapping and MXFP8 support.
+    """INC config with stage-prefix mapping and AutoRound MXFP8/NVFP4 dispatch."""
 
-    AutoRound MXFP8 checkpoints declare quant_method="auto-round" with data_type="mx_fp".
-    This config detects that case and dispatches to IncMxfp8OfflineLinearMethod instead
-    of the standard INT quantization path.
+    block_name_to_quantize: list[str] | None
+    extra_config: dict[str, Any] | None
 
-    Architecture:
-      - AutoRound INT4/INT8 → standard INCConfig path (xpu_w4a16_quant_layer, etc.)
-      - AutoRound MXFP8 (data_type="mx_fp") → IncMxfp8OfflineLinearMethod
-      - Native MXFP8 (quant_method="mxfp8") → DiffusionMXFP8Config → NPUMxfp8LinearMethod (NPU only)
-    """
-
-    # Extend supported data types and formats to include MXFP8
-    SUPPORTED_DTYPES = {"int", "mx_fp"}
+    SUPPORTED_DTYPES = {"int", "mx_fp", "nv_fp"}
     SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq", "auto_round:llm_compressor"}
 
     # ------------------------------------------------------------------
-    # Core integration: called by vLLM's configure_quant_config()
+    # Quantization method selection and checkpoint name mapping
     # ------------------------------------------------------------------
 
     def get_quant_method(self, layer, prefix: str):
-        """Get quantization method, handling AutoRound MXFP8 as a special case."""
-        # Check if this is an AutoRound MXFP8 checkpoint (data_type="mx_fp")
-        if hasattr(self, "data_type") and self.data_type == "mx_fp" and self.weight_bits == 8:
-            from vllm.model_executor.layers.linear import LinearBase
+        """Get quantization methods for AutoRound checkpoints."""
+        if self.data_type == "nv_fp":
+            from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+                CompressedTensorsW4A4Fp4,
+            )
 
+            layer_config = self.config_parser.resolve(layer, prefix)
             if isinstance(layer, LinearBase):
-                return IncMxfp8OfflineLinearMethod()
+                if not layer_config.quantized:
+                    return UnquantizedLinearMethod()
+                scheme = CompressedTensorsW4A4Fp4()
+                layer.scheme = scheme
+                return CompressedTensorsLinearMethod(self)
             return None
 
-        # Otherwise, use parent INCConfig logic
-        return super().get_quant_method(layer, prefix)
+        # AutoRound MXFP8/MXFP4: vLLM's method, wrapped for diffusion's 3-D activations.
+        method = super().get_quant_method(layer, prefix)
+        if self.is_mxfp and isinstance(method, INCLinearMethod):
+            return _MXFlattenedLinearMethod(method.scheme)
+        return method
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         """Remap HF checkpoint names to vLLM runtime prefixes."""
         prefix_map = getattr(hf_to_vllm_mapper, "orig_to_new_prefix", None) or {}
         stage = _stage_prefix(prefix_map) if prefix_map else ""
 
-        # -- Normalize CSV string -----------------------------------------
-        if isinstance(self.block_name_to_quantize, str):
-            self.block_name_to_quantize = [b.strip() for b in self.block_name_to_quantize.split(",") if b.strip()]
-
         # -- block_name_to_quantize ----------------------------------------
-        if self.block_name_to_quantize is not None:
+        block_names = _normalize_block_names(self.block_name_to_quantize)
+        if block_names is not None:
             if prefix_map and stage:
-                self.block_name_to_quantize = _map_with_stage_prefix(
-                    self.block_name_to_quantize,
-                    prefix_map,
-                    stage,
-                )
+                block_names = _map_with_stage_prefix(block_names, prefix_map, stage)
             else:
-                self.block_name_to_quantize = hf_to_vllm_mapper.apply_list(self.block_name_to_quantize)
+                block_names = hf_to_vllm_mapper.apply_list(block_names)
+        self.block_name_to_quantize = block_names
 
         # -- extra_config --------------------------------------------------
-        if self.extra_config is not None and prefix_map:
+        extra_config = self.extra_config
+        if extra_config is not None and prefix_map:
             new_extra: dict[str, Any] = {}
             sorted_keys = sorted(prefix_map, key=len, reverse=True)
 
-            # Build escaped-dot map for regex pattern keys
-            escaped_map: dict[str, str] = {}
-            for orig, new in prefix_map.items():
-                escaped_map[orig.replace(".", r"\.")] = (new or "").replace(".", r"\.")
-            escaped_sorted = sorted(escaped_map, key=len, reverse=True)
-
-            for key, val in self.extra_config.items():
-                is_regex = any(c in _REGEX_SPECIAL_CHARS for c in key)
+            for key, val in extra_config.items():
+                is_regex = _is_regex_key(key)
                 if is_regex:
-                    # Regex keys: escaped-dot substring replacement.
-                    # re.search matches anywhere so no stage prefix needed.
-                    new_key = key
-                    for esc_orig in escaped_sorted:
-                        if esc_orig in new_key:
-                            new_key = new_key.replace(
-                                esc_orig,
-                                escaped_map[esc_orig],
-                                1,
-                            )
-                            break
+                    # re.search matches anywhere, so no stage prefix is needed.
+                    new_key = _remap_extra_config_key(key, prefix_map)
                 else:
                     # Plain keys: prefix replacement + stage prefix.
                     new_key = key
@@ -138,8 +164,33 @@ class OmniINCConfig(INCConfig):
                             break
                 new_extra[new_key] = val
             self.extra_config = new_extra
-        elif self.extra_config is not None:
-            self.extra_config = hf_to_vllm_mapper.apply_dict(self.extra_config)
+        elif extra_config is not None:
+            self.extra_config = hf_to_vllm_mapper.apply_dict(extra_config)
+
+    def apply_prefix_map(self, prefix_map: dict[str, str]) -> None:
+        """Replace checkpoint prefixes with runtime prefixes in-place.
+
+        ``block_name_to_quantize`` and ``extra_config`` both carry checkpoint
+        module names, so models that rename submodules between checkpoint and
+        runtime must remap both. Otherwise a per-layer ``extra_config``
+        exception (for example a BF16 ``down_proj``) stops matching at
+        runtime and the layer is built quantized even though its checkpoint
+        stores an unquantized weight.
+
+        Unlike :meth:`apply_vllm_mapper`, keys in *prefix_map* are replaced
+        verbatim; no container/stage prefix is inferred. Entries without a
+        matching prefix are left unchanged.
+        """
+        if not prefix_map:
+            return
+        block_names = _normalize_block_names(self.block_name_to_quantize)
+        if block_names is not None:
+            block_names = [_remap_name(name, prefix_map) for name in block_names]
+        self.block_name_to_quantize = block_names
+
+        extra_config = self.extra_config
+        if extra_config is not None:
+            self.extra_config = {_remap_extra_config_key(key, prefix_map): value for key, value in extra_config.items()}
 
     # ------------------------------------------------------------------
     # Upgrading a vanilla INCConfig created by vLLM
@@ -154,6 +205,9 @@ class OmniINCConfig(INCConfig):
         """
         omni = object.__new__(cls)
         omni.__dict__.update(inc.__dict__)
+        # The copied parser still references the original INCConfig. Rebuild it
+        # so layer resolution reads the upgraded config after prefix remapping.
+        omni.config_parser = type(inc.config_parser)(omni)
         return omni
 
     @classmethod
@@ -173,93 +227,34 @@ class OmniINCConfig(INCConfig):
 
 
 # ---------------------------------------------------------------------------
-# IncMxfp8OfflineLinearMethod - used by AutoRound MXFP8 checkpoints
+# AutoRound MXFP8/MXFP4 checkpoints - vLLM's INC MX schemes, 3-D activations
 # ---------------------------------------------------------------------------
 
 
-class IncMxfp8OfflineLinearMethod(LinearMethodBase):
-    """Offline MXFP8 linear method for AutoRound MXFP8 checkpoints.
+class _MXFlattenedLinearMethod(INCLinearMethod):
+    """vLLM's INC MX linear method with diffusion activations flattened to 2-D.
 
-    For pre-quantized AutoRound MXFP8 checkpoints (data_type="mx_fp") where weights
-    are stored as BF16 (losslessly representing FP8 E4M3 values) with uint8 MX block scales.
-    Delegates to the platform-appropriate kernel (XPUMxFp8LinearKernel, etc.).
-
-    Used by OmniINCConfig when data_type="mx_fp".
+    The MX GEMMs behind the INC MXFP4/MXFP8 schemes (``fp4_gemm`` / ``fp8_gemm``
+    on XPU) only accept 2-D activations, while diffusion transformers run
+    (B, S, K) hidden states. Weight creation, layout and the GEMM stay vLLM's;
+    only the reshape is added.
     """
 
-    def __init__(self) -> None:
-        from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
-        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-            MXFP8_BLOCK_SIZE,
-            MXFP8_SCALE_DTYPE,
-        )
-
-        self.kernel = init_mxfp8_linear_kernel()
-        self.block_size = MXFP8_BLOCK_SIZE
-        self.scale_dtype = MXFP8_SCALE_DTYPE
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        if input_size_per_partition % self.block_size != 0:
-            raise ValueError(
-                f"MXFP8 requires input_size_per_partition "
-                f"({input_size_per_partition}) to be divisible by "
-                f"{self.block_size}."
-            )
-
-        output_size_per_partition = sum(output_partition_sizes)
-        weight_loader = extra_weight_attrs.get("weight_loader")
-
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-
-        # Allocate as params_dtype (BF16) to match checkpoint dtype.
-        # Will be cast to FP8 in process_weights_after_loading.
-        layer.register_parameter(
-            "weight",
-            ModelWeightParameter(
-                data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=params_dtype),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            ),
-        )
-
-        num_groups = input_size_per_partition // self.block_size
-        layer.register_parameter(
-            "weight_scale",
-            ModelWeightParameter(
-                data=torch.empty(output_size_per_partition, num_groups, dtype=self.scale_dtype),
-                input_dim=1,
-                output_dim=0,
-                weight_loader=weight_loader,
-            ),
-        )
-
-    def process_weights_after_loading(self, layer: Module) -> None:
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
+        if not hasattr(layer, "weight_packed") and hasattr(layer, "weight"):
+            from vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_linear import (
+                INCMxfp4LinearMethod,
+            )
 
-        # Cast BF16 weight to FP8.
-        # Checkpoint stores weights as BF16 (losslessly representing FP8 E4M3 values).
-        w = layer.weight.data
-        if w.dtype != torch.float8_e4m3fn:
-            # Cast to FP8 E4M3. AutoRound stores FP8 values as BF16, so this is lossless.
-            w = w.to(torch.float8_e4m3fn).contiguous()
-            replace_parameter(layer, "weight", w)
-
-        # Delegate layout transforms (transpose, scale reinterpret) to the platform kernel.
-        self.kernel.process_weights_after_loading(layer)
+            if isinstance(self.scheme, INCMxfp4LinearMethod):
+                # INCMxfp4LinearMethod destructively replaces weight_packed with
+                # weight. A second finalize (generic post-load plus an explicit
+                # repack) would otherwise raise AttributeError.
+                layer._already_called_process_weights_after_loading = True
+                return
+        super().process_weights_after_loading(layer)
         layer._already_called_process_weights_after_loading = True
 
     def apply(
@@ -268,10 +263,8 @@ class IncMxfp8OfflineLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if x.dim() <= 2:
+            return super().apply(layer, x, bias)
         ori_shape = x.shape
-        if x.dim() > 2:
-            x = x.reshape(-1, ori_shape[-1])
-        output = self.kernel.apply_weights(layer, x, bias)
-        if len(ori_shape) > 2:
-            output = output.reshape(*ori_shape[:-1], -1)
-        return output
+        output = super().apply(layer, x.reshape(-1, ori_shape[-1]), bias)
+        return output.reshape(*ori_shape[:-1], -1)

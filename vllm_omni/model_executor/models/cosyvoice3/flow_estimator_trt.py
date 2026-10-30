@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import queue
 import uuid
+from contextlib import contextmanager
 
 import torch
 from vllm.logger import init_logger
@@ -121,6 +122,89 @@ def _convert_onnx_to_trt(onnx_path: str, plan_path: str, strongly_typed: bool) -
     logger.info("Wrote flow-estimator TensorRT engine to %s", plan_path)
 
 
+_TRT_INPUT_NAMES = ("x", "mask", "mu", "t", "spks", "cond")
+# Within one Euler solve only x and t change between estimator calls.
+_TRT_DYNAMIC_INPUT_INDICES = (0, 3)
+
+
+class _TrtEstimatorSession:
+    """A fixed-shape TensorRT estimator binding reused across Euler steps."""
+
+    def __init__(self, context, stream, engine, io_dtype: torch.dtype, inputs: tuple[torch.Tensor, ...]):
+        if len(inputs) != len(_TRT_INPUT_NAMES):
+            raise ValueError(f"expected {len(_TRT_INPUT_NAMES)} estimator inputs, got {len(inputs)}")
+
+        self.context = context
+        self.stream = stream
+        self.io_dtype = io_dtype
+        self._shapes = tuple(tuple(tensor.shape) for tensor in inputs)
+        self._input_buffers = tuple(self._make_input_buffer(tensor) for tensor in inputs)
+        self._initialized = False
+        self._engine_output = torch.empty_like(
+            inputs[0],
+            dtype=io_dtype,
+            memory_format=torch.contiguous_format,
+        )
+        if self._engine_output.dtype == inputs[0].dtype:
+            self._output = self._engine_output
+        else:
+            self._output = torch.empty_like(
+                inputs[0],
+                memory_format=torch.contiguous_format,
+            )
+
+        for name, buffer in zip(_TRT_INPUT_NAMES, self._input_buffers):
+            context.set_input_shape(name, tuple(buffer.shape))
+
+        bound_tensors = (*self._input_buffers, self._engine_output)
+        for index, tensor in enumerate(bound_tensors):
+            context.set_tensor_address(engine.get_tensor_name(index), tensor.data_ptr())
+
+    def _make_input_buffer(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dtype == self.io_dtype and tensor.is_contiguous():
+            return tensor
+        return torch.empty_like(
+            tensor,
+            dtype=self.io_dtype,
+            memory_format=torch.contiguous_format,
+        )
+
+    def run(self, *inputs: torch.Tensor) -> torch.Tensor:
+        if len(inputs) != len(self._input_buffers):
+            raise ValueError(f"expected {len(self._input_buffers)} estimator inputs, got {len(inputs)}")
+        for tensor, shape in zip(inputs, self._shapes):
+            if tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"TensorRT estimator input shape changed within a session: {tuple(tensor.shape)} != {shape}"
+                )
+
+        caller_stream = torch.cuda.current_stream(inputs[0].device)
+        self.stream.wait_stream(caller_stream)
+        with torch.cuda.stream(self.stream):
+            input_indices = range(len(inputs)) if not self._initialized else _TRT_DYNAMIC_INPUT_INDICES
+            for index in input_indices:
+                tensor = inputs[index]
+                buffer = self._input_buffers[index]
+                if tensor.data_ptr() != buffer.data_ptr():
+                    buffer.copy_(tensor)
+
+            assert self.context.execute_async_v3(self.stream.cuda_stream) is True
+            self._initialized = True
+
+            for tensor in (*self._input_buffers, self._engine_output):
+                if tensor.is_cuda:
+                    tensor.record_stream(self.stream)
+
+        caller_stream.wait_stream(self.stream)
+        if self._output is not self._engine_output:
+            if self._engine_output.is_cuda:
+                self._engine_output.record_stream(caller_stream)
+            self._output.copy_(self._engine_output)
+        if self._output.is_cuda:
+            self._output.record_stream(caller_stream)
+        return self._output
+
+
 class TrtContextWrapper:
     """Pool of TensorRT execution contexts for the flow estimator.
 
@@ -147,6 +231,21 @@ class TrtContextWrapper:
 
     def release_estimator(self, context, stream):
         self._pool.put([context, stream])
+
+    @contextmanager
+    def estimation_session(self, *inputs: torch.Tensor):
+        """Hold one pooled TRT context and fixed I/O binding for one flow solve."""
+        [context, stream], engine = self.acquire_estimator()
+        try:
+            yield _TrtEstimatorSession(
+                context=context,
+                stream=stream,
+                engine=engine,
+                io_dtype=self.io_dtype,
+                inputs=inputs,
+            )
+        finally:
+            self.release_estimator(context, stream)
 
 
 def build_flow_estimator_trt(onnx_path: str, device: str | torch.device) -> TrtContextWrapper:

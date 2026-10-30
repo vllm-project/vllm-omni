@@ -81,13 +81,24 @@ def conditioning_cache_salt(
     This replaces the uploaded data URI in the hash without changing the request.
     """
     h = hashlib.sha256()
+    ref_audio: str | list[str] | tuple[str, int] | None = request.ref_audio
+    if (
+        isinstance(ref_audio, str)
+        and len(ref_audio) > 256
+        and tts_params is not None
+        and tts_params.get("ref_audio_cache_key") is not None
+    ):
+        # The resolve key below is already a content-aware digest of this
+        # locator. Hashing a repr of a large inline data URI again dominates
+        # the per-request serving cost without adding information.
+        ref_audio = ("ref_audio_cache_key", len(ref_audio))
     for part in (
         request.input,
         request.task_type,
         request.language,
         request.voice,
         request.ref_text,
-        registered_voice if registered_voice is not None else request.ref_audio,
+        registered_voice if registered_voice is not None else ref_audio,
         request.instructions,
         request.x_vector_only_mode,
         request.speaker_embedding,
@@ -109,7 +120,23 @@ def conditioning_cache_salt(
         value = tts_params.get(key) if tts_params is not None else None
         if value is not None:
             h.update(repr(value).encode("utf-8"))
+    # Pre-computed reference codes: their digest (folded only when present,
+    # so other requests keep their salts).
+    codes_key = tts_params.get("ref_codes_cache_key") if tts_params is not None else None
+    if codes_key is not None:
+        h.update(b"\x00ref_codes\x00" + str(codes_key).encode("utf-8"))
     return h.hexdigest()[:32]
+
+
+def validate_tts_request(adapter: "TTSModelAdapter", request: "OpenAICreateSpeechRequest") -> str | None:
+    """``adapter.validate`` after the checks every adapter shares: ``ref_audio_codes``
+    only where supported, rather than silently dropped."""
+    if getattr(request, "ref_audio_codes", None) is not None and not getattr(
+        adapter, "supports_reference_codes", False
+    ):
+        name = getattr(adapter, "name", None) or "this model"
+        return f"'ref_audio_codes' (pre-computed reference codes) is not supported by {name}"
+    return adapter.validate(request)
 
 
 def apply_max_new_tokens(
@@ -161,9 +188,6 @@ class PreparedRequest:
     tts_params: dict[str, Any] = field(default_factory=dict)
     model_type: str = "generic"
     output_policy: OutputPolicy = field(default_factory=OutputPolicy)
-    #: Cross-cutting per-request state the orchestrator still owns (e.g. the
-    #: Qwen3-TTS ref-audio warmup artifact key tracked after ``generate()``).
-    warmup_artifact_key: str | None = None
 
 
 @dataclass
@@ -182,6 +206,25 @@ class SpeechServingContext:
     server: Any
     engine_client: Any | None = None
     diffusion_engine: Any | None = None
+
+
+@dataclass(frozen=True)
+class TextCommitmentCapabilities:
+    """Adapter contract for raw-text commitment through the WebSocket path.
+
+    These describe supported behavior, not a promise that the current server
+    deployment enables optional features such as the forced aligner. A future
+    stateful adapter must use a handler that implements its lifecycle contract.
+    """
+
+    #: Versioned key resolved by the streaming text frontend factory registry.
+    profile: str
+    languages: frozenset[str]
+    independent_segments: bool
+    preserves_cross_segment_context: bool
+    streaming_audio: bool
+    word_timestamps: bool
+    retry_failed_segments: bool
 
 
 @dataclass(frozen=True)
@@ -224,6 +267,12 @@ class TTSModelAdapter(ABC):
     validates_generation: ClassVar[bool] = False
     #: Whether the model consumes ``request.speed`` in its native parameters.
     native_speed_control: ClassVar[bool] = False
+    #: None disables commitment. Opt-in adapters describe their complete
+    #: commitment contract so the handler can validate every requested feature.
+    text_commitment: ClassVar[TextCommitmentCapabilities | None] = None
+    #: Whether ``request.ref_audio_codes`` (pre-computed reference codes) is
+    #: accepted; other adapters get a 4xx instead of silently dropping it.
+    supports_reference_codes: ClassVar[bool] = False
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
@@ -272,6 +321,15 @@ class TTSModelAdapter(ABC):
         """
         return None
 
+    def _validate_max_new_tokens(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        """Range-check ``request.max_new_tokens`` against the adapter bounds."""
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < self.max_new_tokens_min:
+                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
+            if request.max_new_tokens > self.max_new_tokens_max:
+                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
+        return None
+
     @abstractmethod
     async def build(
         self,
@@ -318,6 +376,18 @@ class TTSModelAdapter(ABC):
         :attr:`validates_generation` so streaming entrypoints retain the
         terminal metrics needed by the validation without charging that cost
         to unrelated TTS models.
+        """
+
+    def validate_stream_audio(self, *, has_audio: bool) -> None:
+        """Validate audio availability before recording streaming success."""
+
+    def collect_response_metadata(self, audio_output: Mapping[str, Any], collect: dict) -> None:
+        """Fold engine-side metadata from the mm payload into ``collect``.
+
+        Non-streaming only. The orchestrator surfaces select ``collect``
+        entries as response headers (precedent: ``word_timestamps`` ->
+        ``X-Word-Timestamps``, ``audio_truncated`` -> ``X-Audio-Truncated``);
+        adapters opt in by setting the keys it knows. Default: no-op.
         """
 
     async def warmup(self) -> None:

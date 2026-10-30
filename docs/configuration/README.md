@@ -2,7 +2,7 @@
 
 This section lists the most common options for running vLLM-Omni.
 
-For options within a vLLM Engine, please refer to the [vLLM 0.30 configuration guide](https://docs.vllm.ai/en/v0.30.0/configuration/index.html).
+For options within a vLLM Engine, please refer to the [vLLM 0.32 configuration guide](https://docs.vllm.ai/en/v0.32.0/configuration/index.html).
 
 Each model defines fixed topology in a registered `PipelineConfig` and runtime
 overrides in a deploy YAML.
@@ -21,3 +21,4 @@ For an introduction, see [Pipeline and deploy configurations](./stage_configs.md
 ## Optimization Features
 
 - **[Diffusion Features Overview](../user_guide/diffusion_features.md)** - Complete overview of all diffusion model features and supported models
+- **[Weight Transfer for RL Training](../user_guide/weight_transfer.md)** - Dynamic model weight updates for RLHF and RL-based training workflows

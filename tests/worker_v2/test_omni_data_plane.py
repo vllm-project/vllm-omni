@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 import torch
+from vllm import SamplingParams
 
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
@@ -104,6 +105,7 @@ def test_full_payload_waits_for_terminal_and_last_deferred_frame(plane):
 
     [(snapshot, payload)] = plane.record.batches[0]
     assert snapshot.is_finished()
+    assert snapshot.aborted is False
     assert snapshot.output_token_ids == [21, 2150]
     torch.testing.assert_close(payload["codes.audio"], torch.cat([first, last]))
     torch.testing.assert_close(payload["codes.ref"], ref)
@@ -121,9 +123,64 @@ def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     assert plane.abort_requests({"internal"}) == 1
     [(snapshot, payload)] = plane.record.batches[0]
     assert snapshot.is_finished() and payload is None
+    assert snapshot.aborted is True
     assert _complete(plane, [{"codes.audio": torch.tensor([[3, 4]])}]) == 0
     assert len(plane.record.batches) == 1
     assert not plane._pending_full_payload_send
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.parametrize("stop", ["token", "length"])
+def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk, stop):
+    plane._async_chunk = async_chunk
+    plane._full_payload_replace_keys_cached = frozenset()
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(stop_token_ids=[2150], max_tokens=2 if stop == "length" else 10)
+    plane.register_request(request)
+    first, last, stale = (torch.tensor([[value]]) for value in (1, 2, 99))
+    plane.reserve_outputs(["internal"])
+    _complete(plane, [{"codes.audio": first}], token=21)
+    plane.reserve_outputs(["internal"])
+    _complete(plane, [{"codes.audio": last}], token=2150 if stop == "token" else 22)
+    plane.reserve_outputs(["internal"])
+    assert plane.request_terminal({"internal"}) == 0
+    _complete(plane, [{"codes.audio": stale}], token=23)
+
+    payloads = [
+        payload["codes"]["audio"] if async_chunk else payload["codes.audio"]
+        for batch in plane.record.batches
+        for _, payload in batch
+        if payload
+    ]
+    torch.testing.assert_close(torch.cat(payloads), torch.cat([first, last]))
+    terminal, _ = plane.record.batches[-1][0]
+    assert terminal.is_finished()
+    assert terminal.output_token_count == 2
+    assert plane.record.cleaned == ["internal"]
+    assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_native_output_honors_ignore_eos_and_min_tokens(plane, ignore_eos):
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(ignore_eos=ignore_eos, min_tokens=2, max_tokens=10)
+    request.sampling_params.update_from_generation_config({}, eos_token_id=99)
+    plane.register_request(request)
+    for token in (99, 99, 21):
+        _complete(plane, [{"codes.audio": torch.tensor([[token]])}], token=token)
+    state = plane._native_requests["internal"]
+    assert state.output_token_ids == ([99, 99, 21] if ignore_eos else [99, 99])
+    assert len(plane.record.batches) == (3 if ignore_eos else 2)
+
+
+def test_resumable_output_keeps_scheduler_owned_segment_boundary(plane):
+    plane.register_request(_new_request())
+    for token in (21, 2150, 22):
+        _complete(plane, [{"codes.audio": torch.tensor([[token]])}], token=token)
+    assert plane._native_requests["internal"].output_token_ids == [21, 2150, 22]
+    assert len(plane.record.batches) == 3
 
 
 def test_full_payload_qwen_builder_receives_complete_codec(raw_plane, monkeypatch):
@@ -253,6 +310,26 @@ def test_emit_cohort_one_batch_and_trims_non_resumable_history(plane):
     )
     request, _ = plane.record.batches[1][0]
     assert request.output_token_count == 1025 and request.all_token_ids == []
+
+
+def test_async_text_producer_opts_into_full_token_history(plane):
+    from vllm_omni.model_executor.stage_input_processors.ming3_audio import thinker2talker_async_chunk
+
+    plane._custom_process_func = thinker2talker_async_chunk
+    request = _new_request()
+    request.resumable = False
+    plane.register_request(request)
+    plane._put_req_chunk["external"] = 1
+
+    plane.emit_chunks(
+        req_ids=["internal"],
+        inter_stage_outputs=None,
+        sampled_token_ids=[[21]],
+        terminal_req_ids=set(),
+    )
+    [(snapshot, payload)] = plane.record.batches[0]
+    assert payload is None
+    assert snapshot.all_token_ids == [10, 11, 21]
 
 
 def test_terminal_reserved_abort_and_cleanup_lifecycle(plane):
@@ -620,3 +697,59 @@ def test_payload_builders_see_stage_model_config(monkeypatch):
 
     assert plane._get_model_config() is model_config
     assert _get_accept_hidden_layer_index(plane) == 24
+
+
+@pytest.mark.parametrize("factory", ["from_base", "from_request"])
+def test_native_request_preserves_streaming_flag_and_reference_audio(plane, factory):
+    from vllm.v1.core.sched.output import NewRequestData
+
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import tts2code2wav_async_chunk
+
+    base = NewRequestData(
+        req_id="internal",
+        prompt_token_ids=[0, 0],
+        mm_features=[],
+        sampling_params=SamplingParams(stop_token_ids=[6561]),
+        pooling_params=None,
+        block_ids=([],),
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+    owner = SimpleNamespace(
+        **vars(base),
+        request_id="internal",
+        external_req_id="voice",
+        resumable=True,
+        model_intermediate_buffer={"codes": {"ref": [0.1, -0.1]}, "meta": {"ref_audio_sr": 16000}},
+    )
+    data = (
+        OmniNewRequestData.from_base(base, owner)
+        if factory == "from_base"
+        else OmniNewRequestData.from_request(owner, ([],), prefill_token_ids=[0, 0])
+    )
+    plane.register_request(data)
+    state = plane._native_requests["internal"]
+    assert state.resumable is True
+    state.accept_tokens([6561])
+    snapshot = state.snapshot(include_token_history=True, sampled_token_ids=[6561])
+    payload = tts2code2wav_async_chunk(
+        SimpleNamespace(),
+        {"codes": {"audio": torch.arange(7)}, "meta": {"native_duplex": True, "turn_end": True}},
+        snapshot,
+    )
+    assert payload is not None and payload.meta.last_chunk is True
+    assert payload.meta.ref_audio_sr == 16000
+    torch.testing.assert_close(payload.codes.ref, torch.tensor([0.1, -0.1]))
+
+
+def test_native_snapshot_distinguishes_fresh_samples_from_ledger_tail(plane):
+    plane.register_request(_new_request())
+    _complete(plane, [{"codes.audio": torch.tensor([[1]])}], token=2150)
+    first = plane.record.batches[-1][0][0]
+    assert first.sampled_token_ids == [2150]
+    plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=[{"meta.turn_end": True}], sampled_token_ids=[[]])
+    next_snapshot = plane.record.batches[-1][0][0]
+    assert next_snapshot.last_output_token_id == 2150
+    assert next_snapshot.sampled_token_ids == []
+    assert first.sampled_token_ids == [2150]
