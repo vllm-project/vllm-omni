@@ -88,6 +88,10 @@ _CODEC_REPETITION_PENALTY = 1.05
 # sequence; greedy (temperature==0) stays bit-identical. See
 # _sample_audio_code_host.
 _HOST_CODEC_SAMPLE = os.environ.get("VLLM_OMNI_HOST_CODEC_SAMPLE", "0") == "1"
+# Optimization C gate: one-row-deep pipeline of boundary heads on the host
+# sampling path. Default on when host sampling is on; set
+# VLLM_OMNI_HOST_SAMPLE_PIPELINE=0 to settle each row eagerly (A/B arms).
+_HOST_SAMPLE_PIPELINE = os.environ.get("VLLM_OMNI_HOST_SAMPLE_PIPELINE", "1") == "1"
 _CODEC_MIN_TOKENS = 50
 _CODEC_MAX_TOKENS = 2048
 # The Talker's two-wide stop head emits continue/stop control rows under
@@ -1704,6 +1708,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         row_continue, row_stop, flag_false, flag_true, empty_delta = self._step_constants(hidden)
+        # Optimization C: one-row-deep pipeline of boundary heads. The
+        # head Linear for the NEXT row is submitted before THIS row's
+        # D2H + numpy sampling, so this row's .cpu() wait disappears
+        # (the pre-submitted head finished while the previous row's
+        # numpy chain ran) and this row's numpy chain overlaps the next
+        # head on the device. A pre-submitted row that turns out to be
+        # skipped (continue / non-host branch) is dropped stale: one
+        # wasted ~0.2 ms device call, never a wrong binding.
+        pending_lg: torch.Tensor | None = None
+        pending_lg_row = -1
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             if emit_duplex_metadata:
@@ -1812,6 +1826,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # Plan B: host-side sampling replaces the device eager
                 # chain for both greedy and random; the three scalars come
                 # back without the per-frame packed.cpu() round trip.
+                # Optimization C: consume the pre-submitted head for this
+                # row when the binding matches, then pre-submit the next
+                # row's head so it overlaps this row's D2H + numpy chain.
+                if _HOST_SAMPLE_PIPELINE and pending_lg is not None and pending_lg_row == index:
+                    lg_dev: torch.Tensor | None = pending_lg
+                else:
+                    lg_dev = None
+                pending_lg = None
                 host_id, device_finished, device_emit = self._sample_audio_code_host(
                     hidden[end - 1 : end],
                     codes,
@@ -1821,7 +1843,22 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     min_tokens,
                     max_tokens,
                     eos_window_masked,
+                    lg_dev=lg_dev,
                 )
+                # Submit the NEXT row's head AFTER this row's D2H. Order
+                # matters: .cpu() is a synchronising D2H that waits for
+                # everything already queued on the stream, so submitting
+                # before it makes this row wait for the next row's head
+                # too (measured: +0.7~+1.4% RTF on all three tiers).
+                # Submitting after it overlaps that head with the next
+                # row's host-side entry work.
+                nxt = index + 1
+                if _HOST_SAMPLE_PIPELINE and nxt < len(infos):
+                    s2, e2 = spans[nxt]
+                    e2 = min(int(e2), int(hidden.shape[0]))
+                    if e2 > s2:
+                        pending_lg = self.head_code[0](hidden[e2 - 1 : e2]).float().reshape(-1).detach()
+                        pending_lg_row = nxt
             elif _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
                 greedy_result = self._sample_audio_code_greedy(
                     hidden[end - 1 : end],
@@ -2314,6 +2351,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         min_tokens: int,
         max_tokens: int,
         eos_window_masked: bool = False,
+        lg_dev: torch.Tensor | None = None,
     ) -> tuple[int, bool, bool]:
         """Host-side codec boundary sampling (VLLM_OMNI_HOST_CODEC_SAMPLE=1).
 
@@ -2323,6 +2361,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         the multinomial draw and the eos/stop/limit transition all run on
         host scalars, replacing the per-frame eager micro-kernel chain (and
         its packed.cpu() sync) that the device samplers drive.
+
+        Optimization C: ``lg_dev`` carries a head result the caller
+        pre-submitted one row ahead. The D2H below then returns without
+        waiting (the head finished while the previous row's numpy chain
+        ran) and this row's numpy chain overlaps the next row's head on
+        the device. When it is None the head is submitted here, exactly
+        as before the pipeline existed.
 
         The draw uses a per-request python random.Random seeded from the
         same codec_seed the device path derives its NPU generator from: the
@@ -2426,8 +2471,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Device: project + one D2H of the raw logits row. The sampling
         # chain below runs on numpy host scalars: the equivalent chain of
         # small CPU torch ops costs ~0.9ms/frame in dispatch alone, which
-        # lands directly on the c1 serial critical path.
-        lg = self.head_code[0](hidden_state).float().reshape(-1).detach().cpu().numpy()
+        # lands directly on the c1 serial critical path. With Optimization
+        # C the projection arrived pre-submitted (lg_dev), so this D2H
+        # returns immediately and the numpy chain overlaps the next head.
+        lg = (
+            lg_dev
+            if lg_dev is not None
+            else self.head_code[0](hidden_state).float().reshape(-1).detach()
+        ).cpu().numpy()
         # Engine step 3-4: stop censoring before any penalty.
         if eos_window_masked or hstate["step"] < int(min_tokens):
             lg[list(stop_ids)] = -np.inf
