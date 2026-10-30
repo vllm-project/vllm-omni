@@ -277,6 +277,15 @@ class _StepContext:
     # Leading rows of this step's slice that were already delivered.
     trims: dict[ReqId, int] = field(default_factory=dict)
 
+    # Session-stream position, snapshotted at publish (see
+    # _append_session_rows): rows this request had already saved before
+    # this step (within-turn count), plus the session offset the request
+    # started with (its STARTED hit_end). Their sum is the session
+    # position this step's rows belong at — the value decode steps
+    # cannot get from `hits`, which only STARTED requests carry.
+    positions: dict[ReqId, int] = field(default_factory=dict)
+    session_offsets: dict[ReqId, int] = field(default_factory=dict)
+
     # Key split frozen at save: recompute at materialize races ensure_key.
     cached_keys: set[TensorName] = field(default_factory=set)
     # Leftover mm copied to CPU at save (this-step deferred rows + mm
@@ -449,6 +458,17 @@ class OmniPrefixCacheManager:
         self._hit_prefetch: dict[ReqId, dict[TensorName, Future]] = {}
         self._trims: dict[ReqId, int] = {}
 
+        # Session-stream position bookkeeping (copied into _StepContext at
+        # save; see _append_session_rows). Per request: rows saved so far
+        # in this request's current turn, and the session offset the turn
+        # started with (its STARTED hit_end). Both are popped when the
+        # request finishes or aborts, and the row count resets at STARTED.
+        # Publishes run on the engine thread in step order, so the
+        # snapshotted positions are true sequence positions regardless of
+        # which thread later consumes the step.
+        self._req_row_pos: dict[ReqId, int] = {}
+        self._req_session_offset: dict[ReqId, int] = {}
+
         # Planned-but-unread slot refs. A write reusing their slots copies the
         # old rows into ``_SlotRef.preserved`` before overwriting (COW). Guarded
         # by ``_state_lock``; each ref is dropped when its fetch completes.
@@ -528,6 +548,8 @@ class OmniPrefixCacheManager:
                     continue
                 req_id = event.req_id
                 tids, dtask = self._request_tasks.finish(req_id)
+                self._req_row_pos.pop(req_id, None)
+                self._req_session_offset.pop(req_id, None)
                 # A resumable session request's termination is the
                 # session-end signal: its private rows are dropped with
                 # it. Anything else only loses its binding; segments
@@ -554,6 +576,13 @@ class OmniPrefixCacheManager:
                 # The adapter alone classifies starts versus continuation or
                 # resume. Do not re-infer that lifecycle from write-task state.
                 num_computed = int(event.hit_end)
+                # Turn-start session offset, and a reset row count: a started
+                # request has saved nothing in this turn yet. Recorded for
+                # every start (session-bound or not); _append_session_rows
+                # adds the offset to the within-turn position to get the
+                # session position of each later step's rows.
+                self._req_session_offset[req_id] = num_computed
+                self._req_row_pos[req_id] = 0
                 if num_computed > 0:
                     self._register_hit_span(req_id, num_computed, event.block_ids, read_start=0)
             # Re-entries whose first position differs from what was already
@@ -837,16 +866,39 @@ class OmniPrefixCacheManager:
     def release_device_bytes(self, nbytes: int) -> None:
         self._controller.release_bytes(nbytes)
 
-    @_locked
     def discard_step(self, step_id: int) -> None:
         """Consume the step context when nothing will materialize it.
 
         Any thread; same exactly-once contract as materialize (unknown or
-        duplicate id raises). Only the read-side snapshot is dropped —
+        duplicate id raises). Session rows for session-bound requests
+        are still appended: a discarded step's rows are the session's
+        computed rows just as a materialized step's are — decode steps
+        (including coalesced decode flushes) reach the session store
+        only through this path. Only the read-side snapshot is dropped —
         the cache write proceeds unchanged.
+
+        The lock is held only to take the context; the staging read and
+        the append run unlocked, mirroring materialize (the engine thread
+        must not wait on a device→host copy while holding the lock).
         """
-        ctx = self._take_step_ctx(step_id)
-        self._release_step_staging(ctx)
+        with self._state_lock:
+            ctx = self._take_step_ctx(step_id)
+        try:
+            session_for_req: dict[str, str] = {}
+            for req_id in ctx.spans:
+                session_id = self._session_store.session_of(req_id)
+                if session_id is not None:
+                    session_for_req[req_id] = session_id
+            if session_for_req:
+                current: dict[str, torch.Tensor] = {}
+                if ctx.d2h_snapshot is not None:
+                    # Whole-step device→host was launched at save; usually
+                    # already complete by the time the output path consumes
+                    # the step (a coalesced flush pays one wait per block).
+                    current = ctx.d2h_snapshot.copy_to_cpu()
+                self._append_session_rows(ctx, list(ctx.spans), session_for_req, current)
+        finally:
+            self._release_step_staging(ctx)
 
     @_locked
     def step_rewrite_req_ids(self, step_id: int) -> frozenset[ReqId]:
@@ -1040,11 +1092,20 @@ class OmniPrefixCacheManager:
             self._invalidate_overwritten_prefetches()
             self._prefetch_hit_spans()
         self._next_step_id = step_id + 1
+        # Snapshot session-stream positions: rows this request saved
+        # before this step, then advance by this step's rows. Publishes
+        # run in step order, so these are true sequence positions.
+        positions = {}
+        for r in req_order:
+            positions[r] = self._req_row_pos.get(r, 0)
+            self._req_row_pos[r] = positions[r] + num_sched[r]
         self._step_ctxs[step_id] = _StepContext(
             spans={r: (query_start[r], query_start[r] + num_sched[r]) for r in req_order},
             num_tokens_unpadded=num_tokens_unpadded,
             hits=dict(self._hit_spans),
             hit_prefetch=dict(self._hit_prefetch),
+            positions=positions,
+            session_offsets={r: self._req_session_offset.get(r, 0) for r in req_order},
             trims=dict(self._trims),
             cached_keys=without_hidden(self._pool.keys()) & mm_keys,
             mm_cpu_snapshot=step_outputs.leftover,
@@ -1536,15 +1597,23 @@ class OmniPrefixCacheManager:
         """Extend session streams with this step's new rows.
 
         Continuation rule, checked atomically (``append_if_length``):
-        append only when the turn's hit length equals the stored length.
-        A gap — a slot-pool hit longer than the session stream, or a
-        post-invalidation nonzero hit — means the stored stream no longer
-        describes this prompt; appending would misalign rows, so the
-        stream stalls until a full-prefix turn rebuilds it. Immediate pool
-        keys only: deferred mm is not on CPU at materialize time, and
-        leftover mm is not a pool key. Steps consumed by discard_step
-        never reach here, so coalesced decode flushes leave the same
-        kind of gap (documented limitation).
+        append only when this step's session position equals the stored
+        length. The position is the turn-start offset (the request's
+        STARTED hit_end) plus rows this request saved earlier in the
+        turn, both snapshotted into the step context at publish. For a
+        start step this reduces to the pool-hit length; for decode steps
+        — which carry no hit in the context — it is the only correct
+        position, so decode rows (including coalesced decode flushes,
+        which arrive via discard_step) now extend the stream instead of
+        leaving a gap. A gap — a saved step this stream never saw, or a
+        post-invalidation nonzero offset — means the stored stream no
+        longer describes this prompt; appending would misalign rows, so
+        the stream stalls until a full-prefix turn rebuilds it. Immediate
+        pool keys only: deferred mm is not on CPU at materialize time,
+        and leftover mm is not a pool key. A misaligned tail, if one
+        ever forms, is never served: serving requires the store to cover
+        the pool-hit prefix, and a pool hit truncates at the first
+        missing block.
         """
         for req_id in req_ids:
             session_id = session_for_req.get(req_id)
@@ -1553,14 +1622,13 @@ class OmniPrefixCacheManager:
             start, end = ctx.spans[req_id]
             if start == end:
                 continue
-            hit = ctx.hits.get(req_id)
-            hit_upto = hit[0] if hit else 0
+            expected = ctx.session_offsets.get(req_id, 0) + ctx.positions.get(req_id, 0)
             for key, cur in current.items():
                 # Atomic continuation check: a concurrent invalidate
                 # between a length read and the append would land these
                 # rows at the head of a fresh stream, where a later turn
                 # could serve them as its prefix.
-                self._session_store.append_if_length(session_id, key, hit_upto, cur[start:end])
+                self._session_store.append_if_length(session_id, key, expected, cur[start:end])
 
     def _merge_uncached_mm(
         self,

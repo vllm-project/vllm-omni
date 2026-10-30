@@ -528,8 +528,14 @@ history or ends.
   worker-visible session-end signal: a resumable binding's termination
   drops the session's rows. An ephemeral request's termination only
   unbinds; the session continues and its rows stay servable.
-- Retention: materialize appends a turn's new rows only on exact
-  continuation (turn hit length equals stored length). The slot pool is
+- Retention: each consumed step appends its new rows only on exact
+  continuation (the step's session position equals the stored length).
+  The position is the turn-start offset (the request's STARTED hit_end)
+  plus rows the request saved earlier in the turn, both snapshotted into
+  the step context at publish — so decode steps, which carry no pool
+  hit, append at their true sequence position too. Discarded steps
+  (including coalesced decode flushes) append through `discard_step`;
+  materialized steps through `materialize`. The slot pool is
   untouched, so existing cross-request sharing is unchanged.
 - Coarse invalidation: `invalidate_session` drops a session's segments
   wholesale on any history mutation (edit, truncation, interruption).
@@ -544,8 +550,6 @@ history or ends.
 - Limits: `PrefixCacheConfig.session_store_max_bytes` (default 2 GiB)
   caps host bytes; over-budget appends are refused and fall back to the
   slot pool. Deferred mm is not stored (not on CPU at materialize time).
-  Steps consumed by `discard_step` (coalesced decode flushes) leave the
-  same kind of gap as a post-invalidation nonzero hit.
 
 Explicitly out of phase 1: fine-grained invalidation (phase 2, builds on
 the snapshot/ledger work), and any change to vLLM block eviction —

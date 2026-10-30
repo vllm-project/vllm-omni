@@ -2228,6 +2228,79 @@ def test_session_store_serves_hit_after_slot_reuse():
         mgr.shutdown()
 
 
+def run_decode_step(mgr, view, req_id, blocks, start_pos, sched, *, offset=0):
+    """One continuation step for an already-started request: no STARTED
+    event (the runner's decode path), consumed via discard_step."""
+    view.order = [req_id]
+    view.req_blocks[req_id] = blocks
+    view.computed[req_id] = start_pos
+    slots = view.slots_for(req_id, start_pos, start_pos + sched)
+    view.step_slot_mapping = slots
+    hidden = (slots.to(DTYPE) + offset).unsqueeze(1).expand(sched, HIDDEN).clone()
+    sched_out = FakeSchedOut(new_reqs=[], finished=[], num_scheduled={req_id: sched})
+    adapter = getattr(mgr, "_test_adapter", None)
+    if adapter is None:
+        adapter = mgr._test_adapter = PrefixCacheSchedulerAdapter()
+    step = adapter.translate_step(sched_out)
+    mgr.new_step_starts(step)
+    layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
+    n = int(slots.numel())
+    return mgr.save_outputs(hidden, {}, num_tokens_unpadded=n, num_tokens_padded=n, write_layout=layout)
+
+
+def test_session_decode_discard_appends_and_next_turn_hits():
+    mgr, view = make_manager()
+    try:
+        # Turn 1 prefill: 8 rows, materialized (existing path).
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        # Turn 1 decode: 4 rows at positions [8, 12), no STARTED event,
+        # consumed via discard_step (the runner's decode path). Before the
+        # decode-capture fix this left the stream stuck at 8 and the next
+        # turn missed; now the stream extends to 12 in order.
+        s2 = run_decode_step(mgr, view, "a", [0, 1, 2], 8, 4)
+        mgr.discard_step(s2)
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            expected_rows(view.slots_for("a", 0, 12)),
+        )
+        # Another request reuses the same blocks with different values;
+        # turn 1's request finishes (unbind only, rows survive).
+        s3 = run_session_step(mgr, view, "b", [0, 1, 2], 0, 12, offset=1000, finished=["a"])
+        mgr.materialize(s3, ["b"])
+        assert mgr._session_store.session_of("a") is None
+        assert "a" not in mgr._req_row_pos and "a" not in mgr._req_session_offset
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        # Same session, new turn, prefix hit on the reused blocks.
+        s4 = run_session_step(mgr, view, "a2", [0, 1, 2, 3], 12, 4, hit=12, session="S", finished=["b"])
+        assert float(mgr._pool.rows(HIDDEN_KEY, torch.tensor([0]))[0, 0]) == 1000.0
+        outs = mgr.materialize(s4, ["a2"])
+        merged = outs.hidden_states["a2"]
+        # Prefix comes from the session store (original values), not the
+        # slot pool (1000+ values); tail is this turn's own rows; and the
+        # turn's rows appended at the continuation (12 -> 16).
+        assert torch.equal(merged[:12], expected_rows(view.slots_for("a", 0, 12)))
+        assert torch.equal(merged[12:], expected_rows(view.slots_for("a2", 12, 16)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 16
+    finally:
+        mgr.shutdown()
+
+
+def test_session_discard_without_binding_is_noop():
+    mgr, view = make_manager()
+    try:
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8)
+        mgr.discard_step(s1)
+        assert mgr._session_store.session_ids() == []
+        # Staging slot freed: a later save consumes cleanly.
+        s2 = run_session_step(mgr, view, "b", [0, 1], 0, 8)
+        mgr.materialize(s2, ["b"])
+    finally:
+        mgr.shutdown()
+
+
 def test_session_coarse_invalidation_is_negative():
     mgr, view = make_manager()
     try:
