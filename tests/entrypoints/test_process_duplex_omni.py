@@ -165,6 +165,38 @@ async def test_serving_context_selects_process_and_closes_it(monkeypatch):
     assert not omni.sessions
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_id", [None, "rejected-update"])
+async def test_rejected_update_does_not_block_audio_append(process_omni, event_id):
+    """A child-side rejection must settle the handler's pending session update."""
+    from tests.entrypoints.duplex.test_duplex_serving import FakeWebSocket
+    from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
+
+    handler = OmniDuplexSessionHandler(duplex_omni=process_omni)
+    websocket = FakeWebSocket(query={"model": "fake"})
+    task = asyncio.create_task(handler.handle_realtime_session(websocket))
+    try:
+        await websocket.wait_for("session.created", timeout_s=5)
+        update = {"type": "session.update", "session": {"instructions": "reject"}}
+        if event_id is not None:
+            update["event_id"] = event_id
+        websocket.feed(update)
+        error = (await websocket.wait_for("error", timeout_s=5))["error"]
+        assert error["code"] == "engine_backpressure"
+        if event_id is None:
+            assert error.get("event_id")  # Serving assigns an ID when the client omits it.
+        else:
+            assert error.get("event_id") == event_id
+        websocket.feed({"type": "input_audio_buffer.append", "audio": "AAAA"})
+        audio = await websocket.wait_for("response.output_audio.delta", timeout_s=5)
+        assert audio["delta"] == "AAAA"
+        assert not task.done()
+    finally:
+        websocket.disconnect()
+        await asyncio.wait_for(task, 5)
+        await process_omni.aclose()
+
+
 def test_websocket_audio_uses_spawned_runtime(monkeypatch):
     from contextlib import asynccontextmanager
 
