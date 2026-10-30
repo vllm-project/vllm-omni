@@ -26,14 +26,8 @@ def omni_server(request, run_level, tmp_path_factory):
         with open(deploy_path) as stream:
             config = yaml.safe_load(stream)
         config["model_runner"] = "v1"
-        config["platforms"].pop("cuda", None)
-        runtime = config["stages"][0]["engine_extras"]["hf_overrides"]["voxcpm2_runtime_config"]
-        runtime.update(
-            enable_incremental_vae=False,
-            vae_decode_every=3,
-            audio_emit_every=1,
-            enable_batched_vae_decode=True,
-        )
+        # The CUDA override selects V2; removing it restores the base V1 audio settings.
+        config.get("platforms", {}).pop("cuda", None)
         path = tmp_path_factory.mktemp("voxcpm2-v1") / "deploy.yaml"
         path.write_text(yaml.safe_dump(config))
         deploy_path = str(path)

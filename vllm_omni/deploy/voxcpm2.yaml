@@ -41,6 +41,8 @@ stages:
 
           audio_emit_every: 1
           vae_decode_every: 3
+          enable_incremental_vae: false
+          enable_exact_patch_batch: false
           enable_batched_cfm: true
           enable_batched_vae_decode: true
           coalesce_audio_d2h: true
