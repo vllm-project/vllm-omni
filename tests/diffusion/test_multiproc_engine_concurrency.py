@@ -303,6 +303,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -416,6 +417,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -433,6 +435,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -461,6 +464,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -478,6 +482,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
@@ -498,6 +503,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -518,6 +524,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -546,6 +553,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -589,6 +597,7 @@ class TestRequestModeDispatch:
         executor, req_q, res_q = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=True,
@@ -626,6 +635,7 @@ class TestRequestModeDispatch:
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
+            diffusion_attention_schedule=None,
             parallel_config=SimpleNamespace(data_parallel_size=2),
             diffusion_offload_config={
                 "mode": "layer",
