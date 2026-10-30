@@ -52,7 +52,8 @@
         "metric-percentiles": "50,95",
         "duplex_performance_only": true,
         "ready_check_timeout_sec": 0,
-        "duplex_sample_pool_size": 16
+        "duplex_sample_pool_size": 16,
+        "num_warmups": 1
       }
     ]
   }
