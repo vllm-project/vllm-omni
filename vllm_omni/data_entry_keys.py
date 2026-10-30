@@ -120,6 +120,9 @@ class OmniPayloadMeta(TypedDict, total=False):
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    # embed.prefill also holds the accept-layer hidden state at multimodal
+    # placeholder rows, so no hidden_states.output is sent (Qwen3-Omni chunk 0).
+    prefill_holds_accept_hidden: bool
     omni_final_stage_id: int
     # Per-request audio seed. Stages that draw their own noise (flow-matching
     # / diffusion decoders) need the producing stage's seed to stay
@@ -243,6 +246,7 @@ class MetaStruct(_StructBase):
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
     talker_prefill_offset: int | None = None
+    prefill_holds_accept_hidden: bool | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
@@ -256,6 +260,9 @@ class MetaStruct(_StructBase):
     # derives one segment's n_k as the increase between consecutive segment
     # boundaries; the value itself is not segment-local.
     request_text_tokens: int | None = None
+    # Duplex session stats (RFC #8325): [epoch, seq] of the chunk the sending
+    # request worked on, stamped by the chunk transfer adapter.
+    duplex_perf_chunk: list[int] | None = None
 
 
 class OmniPayloadStruct(_StructBase):

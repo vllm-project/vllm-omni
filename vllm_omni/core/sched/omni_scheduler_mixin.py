@@ -31,6 +31,7 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.duplex_stage_work import DuplexStageWorkRecorder
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_full_payload_input_coordinator,
@@ -761,7 +762,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             if request_id in self.requests
         ]
         pending_prewarms.clear()
-        return OmniSchedulerOutput(
+        scheduler_output = OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
@@ -769,6 +770,28 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             input_terminal_req_ids=input_terminal_req_ids or set(),
             pending_request_prewarms=request_prewarms,
         )
+        OmniSchedulerMixin._duplex_stage_work_recorder(self).step_begin(scheduler_output, getattr(self, "requests", {}))
+        return scheduler_output
+
+    def _duplex_stage_work_recorder(self) -> DuplexStageWorkRecorder:
+        # Lazy: __new__-constructed test schedulers skip __init__.
+        recorder = getattr(self, "_duplex_stage_work", None)
+        if recorder is None:
+            recorder = DuplexStageWorkRecorder()
+            self._duplex_stage_work = recorder
+        return recorder
+
+    def _attach_duplex_stage_work(
+        self,
+        scheduler_output: SchedulerOutput,
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> None:
+        """Close this step's duplex work spans and attach them to its outputs (RFC #8325)."""
+        OmniSchedulerMixin._duplex_stage_work_recorder(self).step_end(scheduler_output, engine_core_outputs)
+
+    def _duplex_step_chunk(self, scheduler_output: SchedulerOutput, req_id: str) -> tuple[int, int] | None:
+        """The duplex chunk ``req_id`` worked on in this step (RFC #8325), or None."""
+        return OmniSchedulerMixin._duplex_stage_work_recorder(self).step_chunk(scheduler_output, req_id)
 
     def _rewrap_scheduled_new_reqs(self, scheduler_output: SchedulerOutput) -> None:
         """Attach Omni payloads without reconstructing existing Omni entries."""

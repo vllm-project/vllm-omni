@@ -532,6 +532,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._default_prompt_normalized: tuple[str, str] | None = None
         self._onset_merge = read_bool_flag(extra, "cfm_onset_merge", False)
         self._cross_turn_buckets = read_bool_flag(extra, "cfm_cross_turn_buckets", False)
+        self._npu_cross_reference_batching = read_bool_flag(extra, "cfm_npu_cross_reference_batching", False)
+        if self._npu_cross_reference_batching and self._min_batch_size != 1:
+            logger.warning(
+                "cfm_npu_cross_reference_batching requires code2wav_min_batch_size=1, but got %d; "
+                "NPU cross-reference batching will remain inactive and existing dispatch will be used",
+                self._min_batch_size,
+            )
         self._row_offset_merge = self._cfm_graph_config["row_offset_merge"]
         self._precapture_empty_cache = read_bool_flag(extra, "cfm_precapture_empty_cache", False)
 
@@ -882,11 +889,18 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     @staticmethod
     def _bucket_key(
-        item: _WorkItem, *, cross_turn: bool = False, row_offsets: bool = False, cross_reference: bool = False
+        item: _WorkItem,
+        *,
+        cross_turn: bool = False,
+        row_offsets: bool = False,
+        cross_reference: bool = False,
+        npu_same_shape: bool = False,
     ) -> tuple[Any, ...]:
         cache_signature: Any
         if item.previous is None:
             cache_signature = ("uninitialized",)
+        elif npu_same_shape:
+            cache_signature = state_shape_signature(item.previous.token2wav)
         elif row_offsets and _slot_resident(item):
             # A slot-pool row keeps its cache lengths per row (``cfm_row_offset_merge``).
             cache_signature = ("row_offsets", row_offset_signature(item.previous.token2wav))
@@ -896,10 +910,76 @@ class MiniCPMO45Code2Wav(nn.Module):
             cache_signature = row_offset_signature(item.previous.token2wav)
         else:
             cache_signature = state_shape_signature(item.previous.token2wav)
-        prompt = (None, None) if cross_reference else (item.prompt_cache_id, item.prompt_wav)
+        if npu_same_shape:
+            # Fresh references are prepared independently before a second,
+            # authoritative shape grouping. Do not infer their cache lengths
+            # from reference identity or from normalized audio duration.
+            cache_signature = (
+                "npu_same_shape",
+                cache_signature,
+                tuple(item.tokens.shape),
+                str(item.tokens.dtype),
+                str(item.tokens.device),
+                item.last_chunk,
+            )
+        prompt = (None, None) if cross_reference or npu_same_shape else (item.prompt_cache_id, item.prompt_wav)
         if cross_turn:
             return (*prompt, cache_signature)
         return (*prompt, cache_signature, item.cache_epoch)
+
+    def _npu_cross_reference_active(self) -> bool:
+        """Admit only the already-supported FP32 fused Whole-Euler arena."""
+        if not getattr(self, "_npu_cross_reference_batching", False) or self.backend is None:
+            return False
+        if getattr(self, "_min_batch_size", 1) != 1:
+            # Post-setup shape splitting can create singleton groups. Preserve
+            # the existing strict minimum-bucket contract for such profiles.
+            return False
+        if not self.backend._whole_euler_ragged_active():
+            return False
+        wrapper = self.backend._whole_euler_graph_wrapper
+        return (
+            wrapper.device.type == "npu"
+            and getattr(wrapper, "dtype", None) == torch.float32
+            and getattr(wrapper, "att_slots", 0) == 0
+            and getattr(self.backend, "_ragged_fused_body", False)
+            and getattr(self.backend, "_estimator_att_cache_dtype", None) == torch.float32
+        )
+
+    @staticmethod
+    def _npu_same_shape_groups(
+        items: list[_WorkItem],
+        states: list[BatchedToken2WavState],
+        features: PromptFeatures | list[PromptFeatures],
+        *,
+        cross_turn: bool,
+    ) -> list[list[int]]:
+        """Partition prepared rows without reading tensor values or mixing histories."""
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for row, (item, state) in enumerate(zip(items, states, strict=True)):
+            feature = features[row] if isinstance(features, list) else features
+            # Full shapes include prompt/history lengths. Full device strings
+            # additionally prevent combining rows from different NPU indices.
+            caches = tuple(
+                (kind, name, tuple(value.shape), str(value.dtype), str(value.device))
+                for kind, cache in (("flow", state.flow_cache), ("hift", state.hift_cache))
+                for name, value in sorted(cache.items())
+            )
+            conditioning = tuple(
+                (tuple(value.shape), str(value.dtype), str(value.device))
+                for value in (feature.speech_tokens, feature.speaker_embedding, feature.mels)
+            )
+            signature = (
+                caches,
+                conditioning,
+                tuple(item.tokens.shape),
+                str(item.tokens.dtype),
+                str(item.tokens.device),
+                item.last_chunk,
+                None if cross_turn else item.cache_epoch,
+            )
+            groups.setdefault(signature, []).append(row)
+        return list(groups.values())
 
     def _prepare_decode_batch(
         self, items: list[_WorkItem]
@@ -975,6 +1055,15 @@ class MiniCPMO45Code2Wav(nn.Module):
         """Decode ``items`` together: ragged when asked to, or when their token counts or last-chunk flags differ."""
         tokens = [item.tokens for item in items]
         last_chunks = [item.last_chunk for item in items]
+        if len(items) > 1 and self._npu_cross_reference_active():
+            groups = self._npu_same_shape_groups(
+                items, states, features, cross_turn=getattr(self, "_cross_turn_buckets", False)
+            )
+            if len(groups) != 1:
+                raise _batch_error("npu_cross_reference_shape_mismatch")
+            # Keep uniform padding and fallback policy; conditions and caches
+            # remain per request. Mixed-history NPU guards are unchanged.
+            return self.backend.decode_batch(torch.stack(tokens, dim=0), features, states, last_chunk=last_chunks[0])
         if (
             ragged
             or (isinstance(features, list) and self.backend._whole_euler_ragged_active())
@@ -1185,10 +1274,17 @@ class MiniCPMO45Code2Wav(nn.Module):
             and self.backend._whole_euler_ragged_active()
             and self.backend._whole_euler_graph_wrapper.device.type == "cuda"
         )
+        # A single ready request cannot share CFM work. Keep its
+        # original keys and dispatch without inspecting NPU capability.
+        npu_same_shape = len(compute_items) > 1 and self._npu_cross_reference_active()
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
         for item in compute_items:
             key = self._bucket_key(
-                item, cross_turn=cross_turn, row_offsets=row_offsets, cross_reference=cross_reference
+                item,
+                cross_turn=cross_turn,
+                row_offsets=row_offsets,
+                cross_reference=cross_reference,
+                npu_same_shape=npu_same_shape,
             )
             buckets.setdefault(key, []).append(item)
         undersized = [
@@ -1312,7 +1408,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
                 row_groups: list[list[int]] | None = None
                 offset_mix = False
-                if isinstance(features, list):
+                if npu_same_shape and batch_size > 1:
+                    row_groups = self._npu_same_shape_groups(bucket, states, features, cross_turn=cross_turn)
+                elif isinstance(features, list):
                     # Each reference has its own cache lengths and conditioning.
                     # The ragged path handles them in one solve.
                     pass
@@ -1332,8 +1430,16 @@ class MiniCPMO45Code2Wav(nn.Module):
                     audios, next_states = [None] * batch_size, [None] * batch_size
                     for rows in row_groups:
                         group_states = [states[row] for row in rows]
+                        group_features = features
+                        if isinstance(features, list):
+                            selected = [features[row] for row in rows]
+                            group_features = (
+                                selected[0] if len({feature.cache_key for feature in selected}) == 1 else selected
+                            )
                         mixed = row_offsets and len({state_shape_signature(state) for state in group_states}) > 1
-                        decoded = self._decode_rows([bucket[row] for row in rows], group_states, features, ragged=mixed)
+                        decoded = self._decode_rows(
+                            [bucket[row] for row in rows], group_states, group_features, ragged=mixed
+                        )
                         for row, audio, next_state in zip(rows, *decoded, strict=True):
                             audios[row], next_states[row] = audio, next_state
             except Exception as exc:

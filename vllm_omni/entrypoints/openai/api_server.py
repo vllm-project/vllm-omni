@@ -210,6 +210,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _run_video_generation_job,
     _status_code_for_video_failure,
     _unpack_video_generation_result,
+    validate_latent_continuation_source,
     video_response_from_request,
 )
 from vllm_omni.entrypoints.openai.video.segmentation.helpers import (
@@ -2946,7 +2947,6 @@ async def create_video(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
@@ -2962,18 +2962,19 @@ async def create_video(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     ) = ctx
 
     def _cleanup_request_resources() -> None:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
 
     task: asyncio.Task[None] | None = None
     ref = None
     try:
+        continue_from = await validate_latent_continuation_source(handler, request)
         ref = video_response_from_request(effective_model_name, request)
+        ref.remixed_from_video_id = continue_from
         await VIDEO_STORE.upsert(ref.id, ref)
         task = asyncio.create_task(
             _run_video_generation_job(
@@ -2983,7 +2984,6 @@ async def create_video(
                 reference_image,
                 reference_video,
                 reference_audio,
-                control_path,
                 app_state=raw_request.app.state,
                 latent_edit_input=latent_edit_input,
             )
@@ -3021,7 +3021,6 @@ async def create_video_sync(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
@@ -3041,13 +3040,13 @@ async def create_video_sync(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
+        await validate_latent_continuation_source(handler, request)
         video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
             await asyncio.wait_for(
                 handler.generate_video_bytes(
@@ -3080,7 +3079,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
     inference_time_s = time.perf_counter() - started_at
 

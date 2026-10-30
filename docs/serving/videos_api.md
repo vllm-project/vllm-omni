@@ -71,7 +71,9 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | `timeline_guides` | string | null | MiniMax H3 JSON manifest of ordered timeline guides; see [MiniMax H3 Timeline Guides](#minimax-h3-timeline-guides) |
 | `guide_files` | repeated file | null | Guide uploads addressed by zero-based `upload_index` in `timeline_guides` |
 | `control_reference` | file | null | Optional uploaded image/video control, up to 512 MiB, for models that declare control-upload support |
-| `control_type` | string | null | Model control name associated with `control_reference`; currently Cosmos3 supports `edge`, `blur`, `depth`, `seg`, and `wsm` |
+| `source_reference` | file | null | H3 inpainting source video, up to 512 MiB; requires `mask_reference` |
+| `mask_reference` | file | null | H3 static mask image or temporal mask video, up to 512 MiB; white means regenerate |
+| `control_type` | string | null | Cosmos3: `edge`, `blur`, `depth`, `seg`, `wsm`; H3: `canny`, `depth`, `hed`, `mlsd`, `pose`, `inpaint`. See model-specific requirements below |
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
 | `video_reference` | string | null | JSON-encoded reference video payload; do not combine with `input_reference` or `image_reference` |
 | `audio_reference` | string | null | JSON-encoded audio reference for speech-to-video: `{"audio_url": "..."}` — supports HTTP(s) URLs or base64 data URLs |
@@ -231,6 +233,96 @@ upstream vLLM's media URL allowlist protection. Deployments should therefore
 treat remote media URLs as untrusted and choose this setting as part of their
 URL access policy.
 
+### MiniMax H3 control and inpainting
+
+MiniMax H3 FL2VA accepts preprocessed control videos when the server is
+started with `--controlnet-model-path /absolute/path/to/control.safetensors`.
+Use the original MiniMax H3 Fun ControlNet Union checkpoint. The checkpoint
+is loaded at startup; requests cannot select or download weights.
+
+Both `POST /v1/videos` and `POST /v1/videos/sync` accept these multipart fields:
+
+| Field | Meaning |
+| --- | --- |
+| `control_type` | `canny`, `depth`, `hed`, `mlsd`, `pose`, or `inpaint` |
+| `control_reference` | Prepared hint video; required for every type except `inpaint` |
+| `source_reference` | Optional source video for inpainting; requires `mask_reference` |
+| `mask_reference` | Static mask image or temporal mask video; required for `inpaint` |
+| `extra_params.<control_type>.control_context_scale` | Finite, non-negative strength, default `1.0`; `0` bypasses conditioning |
+
+Generated-audio quality validation is incomplete: Turbo control samples and
+a Base inpainting sample were very quiet despite valid audio streams. See
+the [H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#validation-status) for
+the tested configuration and current limitations.
+
+The hint type describes supplied pixels. Selecting `pose` does not detect
+poses, and selecting `canny` does not extract edges. Clients and ComfyUI
+preprocessing workflows prepare those videos before uploading them.
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=A person walking through a garden" \
+  -F "aspect_ratio=16:9" \
+  -F "control_type=canny" \
+  -F "control_reference=@canny.mp4;type=video/mp4" \
+  -F 'extra_params={"canny":{"control_context_scale":1.0}}' \
+  -o controlled.mp4
+```
+
+For inpainting, upload the source and mask using their explicit roles:
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F "prompt=A red jacket on the person" \
+  -F "aspect_ratio=16:9" \
+  -F "control_type=inpaint" \
+  -F "source_reference=@source.mp4;type=video/mp4" \
+  -F "mask_reference=@mask.png;type=image/png" \
+  -F 'extra_params={"inpaint":{"control_context_scale":1.0}}' \
+  -o inpainted.mp4
+```
+
+White mask values (`1`) mean regenerate; black (`0`) means preserve through
+conditioning. Masks are thresholded at `> 0.5`. Static masks broadcast across
+frames; prefer PNG for static masks and lossless FFV1/MKV for temporal masks.
+Inpainting is learned conditioning and does not guarantee pixel-exact
+compositing outside the mask. A mask without a source is permitted and uses
+zero source pixels. Missing control pixels use zero hint channels. To combine
+an edge/pose/etc. hint with inpainting, select that hint's `control_type` and
+upload all three roles.
+
+Output uses H3's 24 FPS and `17k+5` frame grid. Media is aligned to the requested
+output canvas and time grid; extra frames are truncated and short inputs hold
+their final frame. Frames are resized on the CPU before the sampled clip is
+retained or transferred to the accelerator, so retained pixel storage scales
+with the requested canvas rather than the uploaded resolution. Masks follow
+the same geometry as the source. Control
+videos' audio streams are not conditioning inputs; generated H3 audio is
+returned with the video.
+
+These fields are separate from `input_reference`, `input_references`,
+`image_reference`, `video_reference`, and `audio_reference`. Combining those
+reference/keyframe inputs with control is currently rejected. In particular,
+do not send an inpainting source via `video_reference`: that role selects
+Ref2VA rather than inpainting.
+
+Each uploaded role has a 512 MiB limit. Empty, oversized, undecodable inputs
+and invalid upload-role/control-namespace combinations return HTTP 400 before
+a job is queued. Pipeline-level validation may instead fail a queued job. Media
+validation inspects a bounded prefix; decoder errors later in a stream may
+still fail the generation job. The server owns
+the temporary upload paths and releases them on completion, failure, or
+cancellation. Send files, not server-local paths or tensors in `extra_params`.
+Only the selected control namespace may appear in the request. Models without
+H3 inpainting support continue to reject source and mask uploads.
+
+CTRL-02 can transport these fields through the existing Generate Video node;
+media must remain multipart files, separate from JSON scalar parameters.
+IMAGE batches from pose preprocessors can use ComfyUI's built-in video
+adapters at 24 FPS. Control and source are distinct roles even when they
+originate from the same clip; detector selection belongs to the client
+workflow.
+
 ### MiniMax H3 Latent-Mask Editing
 
 MiniMax H3 accepts request-scoped source media and video/audio noise masks.
@@ -327,6 +419,69 @@ curl -s http://localhost:8091/v1/videos/sync \
 Guide uploads use the same request-scoped temporary storage and cleanup as
 latent-mask editing sources. Models that do not declare timeline-guide support
 reject these fields.
+
+### MiniMax H3 Continuation Across Requests
+
+A MiniMax H3 job can continue a previous job's clip so picture and sound carry
+across the cut. Set `continue_from` to that job's id. The server keeps each
+finished H3 job's denoised video and audio latents, keyed by its job id, in the
+DiT worker, and samples the new request as a window whose first
+`continue_overlap_frames` frames repeat the end of the previous clip. Those
+frames are hidden: they are guided by the cached latents (no decode and
+re-encode, the same guides as in-request
+[latent-tail continuation](gh-file:recipes/MiniMaxAI/MiniMax-H3.md#latent-tail-continuation-with-global-temporal-positions-ab))
+and trimmed after decoding, on the chain's global AV timeline.
+
+Everything else in the request describes only the clip it returns, exactly as
+without `continue_from`:
+
+- Task inference, references, `<Picture N>` labels, LoRA, sampling, quality,
+  `num_outputs_per_prompt`, `preencode_mp4`, latent upscale, long-video
+  windows and step execution work unchanged. `latent_refine` is rejected with
+  `continue_from`, because the refine pass would re-denoise the window without
+  the hidden tail.
+- Continuations run on the base canvas: a job is cached as the latents it
+  decodes (after `latent_refine`), or, when it was upscaled, as its latents
+  before the upscale. A T2VA continuation that sets neither a size nor an
+  `aspect_ratio` keeps the source canvas; an explicit size or aspect ratio
+  must match it, and a lone `height` or `width` is rejected. Timeline guides
+  on a T2VA continuation need that explicit size or aspect ratio unless the
+  source has the default 16:9 canvas (1344x768), since guide frames are
+  encoded before the source canvas is known.
+- Timeline guide `frame_index`, FL2VA `frame_indices`, latent-edit masks and
+  source media, and `audio_mode=lock_source` driving audio refer to the returned
+  clip: frame 0 is its first new frame, and negative indices count from its end.
+
+```bash
+first=$(curl -s http://localhost:8091/v1/videos \
+  -F 'prompt=A lighthouse keeper climbs the stairs at dusk.' \
+  -F 'input_reference=@keeper.png;type=image/png' -F 'num_frames=124' | jq -r .id)
+# ...poll until completed...
+curl -s http://localhost:8091/v1/videos \
+  -F 'prompt=At the top, the keeper lights the lamp and the beam sweeps the sea.' \
+  -F 'num_frames=124' \
+  -F "extra_params={\"continue_from\":\"$first\"}"
+```
+
+- The tail rides as a frame-0 timeline guide. The FL2VA checkpoint (T2VA and
+  FL2VA requests) follows it closely; the Ref2VA checkpoint follows it far more
+  loosely, so a Ref2VA continuation can start with a visible cut. Prefer T2VA
+  or FL2VA continuations, which need the FL2VA partition (or a combined
+  service).
+- The returned length is the requested length rounded to whole 17-frame groups
+  (`124` requests return 119 frames), because the hidden overlap occupies the
+  first `17n+5` frames of the sampled window.
+- `continue_overlap_frames` defaults to `22`, must be on the `17n+5` grid and no
+  longer than the source clip. Use the source clip's canvas; a different `size`
+  is rejected, since latents cannot change size.
+- The source must be a completed job of this server. `/v1/videos/sync` can
+  continue such a job, but its own output is not addressable. With
+  `num_outputs_per_prompt > 1`, the first output is the one a later request
+  continues. A chain may span up to 300 seconds of global timeline.
+- Latents live in each DiT worker process, in an LRU of 16 clips; serve with
+  `--additional-config '{"latent_cache_clips": N}'` to change it (`0` disables
+  it). They are lost on restart and not shared across data-parallel replicas.
+  A missing or evicted source returns 400; regenerate it or start a new chain.
 
 ### Speech-to-Video
 

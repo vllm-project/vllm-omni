@@ -9,6 +9,7 @@ steps:
           - >-
             pytest -s -v
             tests/platforms/npu/test_minicpmo_code2wav_npugraph.py
+            tests/platforms/npu/test_minicpmo_cross_reference_npugraph.py
             tests/platforms/npu/test_contiguous_kv_cache.py
             tests/platforms/npu/test_npu_device_copy.py
             -m 'core_model and npu and A3 and omni'
@@ -55,6 +56,16 @@ steps:
             pytest -s -v
             tests/diffusion/layers/test_activation.py
             -m 'core_model and npu and 310P'
+            --run-level 'core_model'
+
+      - label: "Platforms Test - 310P"
+        key: ready-platforms-test-310p
+        mirror_hardwares: 310p_npu_1
+        commands:
+          - >-
+            pytest -s -v
+            tests/platforms/npu/test_310p_real_device.py
+            -m 'core_model and npu and 310P and omni'
             --run-level 'core_model'
 
   - group: ":card_index_dividers: E2E Test"

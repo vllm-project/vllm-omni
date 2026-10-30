@@ -154,6 +154,9 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     num_generation_tokens: int | None = None
     # Coalesced decode steps have no recoverable per-step ITL samples.
     is_coalesced: bool = False
+    # Duplex session stats (RFC #8325): [epoch, seq, start_ns, duration_ns] step
+    # spans of measured duplex chunks, the producing step's chunk last.
+    stage_work: list[list[int]] | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
