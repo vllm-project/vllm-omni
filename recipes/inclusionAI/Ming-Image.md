@@ -131,14 +131,39 @@ jq -r '.choices[0].message.content[].image_url.url | split(",")[1]' response.jso
 
 - The default deployment keeps Stage 0 eager and enables dynamic regional
   compilation with CUDA Graph Trees for the repeated Stage 1 DiT blocks.
-  The first request for each new image shape or layer count pays compilation
-  and graph-capture cost; warm up every production shape before measuring or
-  serving latency-sensitive traffic.
+  The compile profile moves warmup for configured shapes to startup.
 - Only one reference image and one request at a time are currently supported.
 - Design-Layer requires a reference image except during warmup.
 - A non-empty `negative_prompt` is rejected; Ming-Image uses zero negative conditioning.
 - Height and width must be divisible by 16.
 - Returned images retain the checkpoint's four RGBA channels.
+
+## Compile profile
+
+Stage 1 prewarms the transformer for configured production shapes at startup.
+Run a representative request with `VLLM_LOGGING_LEVEL=DEBUG` and read
+`num_condition_tokens` from the `Ming-Image transformer input` log. Set
+`MING_CONDITION_TOKENS` to that observed value. For example, to serve Design at 1024×1024:
+
+```bash
+vllm serve inclusionAI/Ming-Image-0.1-Design --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml --port 8091 \
+  --stage-overrides '{"1":{"additional_config":{"compile_buckets":[
+    {"height":1024,"width":1024,"num_layers":1,"num_condition_tokens":'"$MING_CONDITION_TOKENS"'}
+  ]}}}'
+```
+
+For Design-Layer, use its model name, requested `num_layers`, and observed
+conditioning length. Add an entry for each production shape; height and width
+must be divisible by 16. Serving accepts the listed resolution/layer combinations.
+New conditioning lengths compile on demand.
+
+Warmup defaults to CFG 1 for Design and CFG 2 for Design-Layer. Set the bucket's
+`guidance_scale` when using another value. Design image editing also needs
+`"has_reference":true`. Startup logs show the warmed shapes and elapsed time.
+
+To compare bucketed static compilation with the default dynamic compilation,
+add `"diffusion_compile_dynamic":false` inside the Stage 1 override.
 
 ## Step caching
 
