@@ -4,6 +4,7 @@
 
 import io
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -327,6 +328,15 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
         accuracy_dir = tmp_path / "tests/e2e/accuracy/omni_duplex_eval/results"
         monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
     monkeypatch.setenv("BUILDKITE_BRANCH", "test-branch")
+    trace_text = '{"raw_response": "No score returned"}\n'
+    if failure == "judge":
+        score_root = Path(result["omni_duplex_eval"]["accuracy"]["score_root"])
+        trace_path = score_root / "RTD_world_knowledge/362.judge.jsonl"
+        trace_path.write_text(trace_text)
+        trace_path.with_name("362.json").unlink()
+        media = score_root / ".media" / "362.mp4"
+        media.parent.mkdir()
+        media.write_bytes(b"temporary video")
     if failure == "quality":
         result["omni_duplex_eval"]["accuracy"]["pr"]["mean_all_success"] = 0.0
     elif failure == "judge":
@@ -380,6 +390,17 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
             runner.test_performance_benchmark(ServerEndpoint(), case)
     else:
         runner.test_performance_benchmark(ServerEndpoint(), case)
+
+    if failure == "judge":
+        # The accuracy fixture removes this directory after evaluation. The
+        # original reply must survive there being no valid score to summarize.
+        shutil.rmtree(result["omni_duplex_eval"]["accuracy"]["score_root"])
+        traces = list(accuracy_dir.glob("diagnostics/*/RTD_world_knowledge/362.judge.jsonl"))
+        assert len(traces) == 1
+        assert traces[0].read_text() == trace_text
+        assert (traces[0].parent / "360.json").is_file()
+        assert not (traces[0].parent / "362.json").exists()
+        assert not list(accuracy_dir.glob("diagnostics/**/*.mp4"))
 
     assert len(commands) == 1
     accuracy_paths = list(accuracy_dir.glob("result_acc_*.json"))

@@ -164,6 +164,12 @@ Artifacts retain unfinished-response counts and missing latency measurements,
 so performance comparisons can account for response coverage.
 Changes to the judge, protocol or selected samples call for fresh references.
 
+Before temporary response media is removed, the DFX accuracy writer copies
+score JSON and raw judge replies to `results/diagnostics/` under the accuracy
+output directory (`ACC_BENCH_RESULT_DIR` when set). The CUDA nightly guard
+uploads these files, including malformed replies from failed evaluations.
+These diagnostics preserve the original scores and completion checks.
+
 ## Timing interpretation
 
 The job uses the shared benchmark's server and client latency metrics.
