@@ -25,8 +25,9 @@ SSIM_THRESHOLD = 0.8
 PSNR_THRESHOLD = 19.0
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-def test_hidream_o1_image_tp2_matches_baseline(
+def _assert_matches_baseline(
+    parallel_config: DiffusionParallelConfig,
+    output_name: str,
     accuracy_artifact_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -34,7 +35,7 @@ def test_hidream_o1_image_tp2_matches_baseline(
     model = os.environ.get("HIDREAM_O1_IMAGE_MODEL", MODEL_ID)
     with OmniRunner(
         model,
-        parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
+        parallel_config=parallel_config,
         enforce_eager=True,
     ) as runner:
         outputs = runner.omni.generate(
@@ -52,7 +53,7 @@ def test_hidream_o1_image_tp2_matches_baseline(
         image = images[0].convert("RGB")
 
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
-    image.save(output_dir / "vllm_omni_tp2.png")
+    image.save(output_dir / output_name)
     assert BASELINE_PATH.exists()
     baseline = Image.open(BASELINE_PATH).convert("RGB")
     resized = image.resize(baseline.size, Image.Resampling.LANCZOS)
@@ -62,4 +63,30 @@ def test_hidream_o1_image_tp2_matches_baseline(
         diffusers_image=baseline,
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
+    )
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+def test_hidream_o1_image_tp2_matches_baseline(
+    accuracy_artifact_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_matches_baseline(
+        DiffusionParallelConfig(tensor_parallel_size=2),
+        "vllm_omni_tp2.png",
+        accuracy_artifact_root,
+        monkeypatch,
+    )
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+def test_hidream_o1_image_cfg_parallel2_matches_baseline(
+    accuracy_artifact_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _assert_matches_baseline(
+        DiffusionParallelConfig(cfg_parallel_size=2),
+        "vllm_omni_cfg_parallel2.png",
+        accuracy_artifact_root,
+        monkeypatch,
     )
