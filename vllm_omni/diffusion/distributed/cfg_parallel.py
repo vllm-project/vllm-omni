@@ -127,10 +127,12 @@ class CFGParallelMixin(metaclass=ABCMeta):
             returns a tuple), override combine_cfg_noise() for per-element CFG
             logic and set self.scheduler to a composite scheduler.
 
-            Sets ``self.transformer.do_true_cfg`` before predicting. TeaCache
-            reads it to keep one cache state per CFG branch; without it the
-            positive and negative calls of a step share a state and reuse each
-            other's residual.
+            Sets ``self.transformer.do_true_cfg`` before predicting, and stamps
+            ``self.transformer.cfg_branch`` ("positive" / "negative") around
+            each ``predict_noise`` call. TeaCache keeps one cache state per CFG
+            branch and reads the stamp instead of guessing the branch from how
+            many forwards it has seen, which goes wrong once non-CFG forwards
+            run in between (e.g. under step execution).
         """
         self._set_transformer_do_true_cfg(do_true_cfg)
 
@@ -147,10 +149,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 # Each rank computes one branch
                 if cfg_rank == 0:
                     logger.debug("CFG Parallel: Rank 0 computing positive branch")
-                    local_pred = _wrap(self.predict_noise(**positive_kwargs))
+                    local_pred = _wrap(self._predict_noise_for_cfg_branch("positive", positive_kwargs))
                 else:
                     logger.debug("CFG Parallel: Rank %d computing negative branch", cfg_rank)
-                    local_pred = _wrap(self.predict_noise(**negative_kwargs))
+                    local_pred = _wrap(self._predict_noise_for_cfg_branch("negative", negative_kwargs))
 
                 if output_slice is not None:
                     local_pred = _slice_pred(local_pred, output_slice)
@@ -170,8 +172,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
             else:
                 # Sequential CFG: compute both positive and negative
-                positive_noise_pred = _wrap(self.predict_noise(**positive_kwargs))
-                negative_noise_pred = _wrap(self.predict_noise(**negative_kwargs))
+                positive_noise_pred = _wrap(self._predict_noise_for_cfg_branch("positive", positive_kwargs))
+                negative_noise_pred = _wrap(self._predict_noise_for_cfg_branch("negative", negative_kwargs))
 
                 if output_slice is not None:
                     positive_noise_pred = _slice_pred(positive_noise_pred, output_slice)
@@ -186,10 +188,28 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 )
         else:
             # No CFG: only compute positive/conditional prediction
-            pred = self.predict_noise(**positive_kwargs)
+            pred = self._predict_noise_for_cfg_branch("positive", positive_kwargs)
             if output_slice is not None:
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred
+
+    def _predict_noise_for_cfg_branch(self, branch: str, predict_kwargs: dict[str, Any] | None) -> Any:
+        """Call ``predict_noise`` with ``transformer.cfg_branch`` set to ``branch``.
+
+        The previous value is restored afterwards, also on error, so a stale
+        stamp never leaks into calls made outside this helper.
+        """
+        if predict_kwargs is None:
+            raise ValueError(f"predict_noise kwargs for the {branch} CFG branch are required when do_true_cfg=True")
+        transformer = getattr(self, "transformer", None)
+        if transformer is None:
+            return self.predict_noise(**predict_kwargs)
+        previous = getattr(transformer, "cfg_branch", None)
+        transformer.cfg_branch = branch
+        try:
+            return self.predict_noise(**predict_kwargs)
+        finally:
+            transformer.cfg_branch = previous
 
     def cfg_normalize_function(self, noise_pred: torch.Tensor, comb_pred: torch.Tensor) -> torch.Tensor:
         """
@@ -348,6 +368,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
         assignments = _dispatch_branches(n_branches, cfg_world_size)
         my_branch_ids = assignments[cfg_rank]
         max_per_rank = max(len(a) for a in assignments)
+        if max_per_rank > 1 and getattr(self, "_cache_dit_one_call_per_cfg_rank", False):
+            # Cache-DiT counts every transformer call on a CFG rank as a denoise step, so a rank
+            # running two branches would exhaust its cache budget early while the others don't.
+            raise ValueError(
+                f"Cache-DiT with cfg_parallel_size={cfg_world_size} does not support {n_branches}-branch CFG: "
+                f"a rank would run {max_per_rank} branches per step. Set cfg_parallel_size to at least "
+                f"{n_branches}, or disable cache_dit."
+            )
 
         # Run assigned branches
         my_preds: list[tuple[torch.Tensor, ...]] = []

@@ -493,6 +493,8 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     media_io_kwargs: dict[str, Any] | None = None
     final_output: bool = False
     supports_running_prefix_cache_reset: bool = True
+    supports_pending_generation: bool = False
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
@@ -519,6 +521,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
+    scheduling_metadata_adapter: str | None = None
     # Upstream ModelConfig inputs that users pass as global CLI flags.
     served_model_name: str | list[str] | None = None
     allowed_local_media_path: str | None = None
@@ -843,18 +846,22 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_scale: float = 1.0
     lora_backend: str = "peft"
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = Field(default=64, gt=0, strict=True)
     dlo_resident_layers: int = Field(default=0, ge=0)
     host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
     host_weight_runtime_root: str | None = None
@@ -957,6 +964,9 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
         # Validate before stage construction while retaining the raw mapping
         # needed by dataclass/config serialization across process boundaries.
         parse_diffusion_offload_config(normalized.get("diffusion_offload_config"))
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
+
+        parse_reference_kv_config(normalized.get("kv_offload_config"))
         return cls(**{name: value for name, value in normalized.items() if value is not None})
 
     def __post_init__(self) -> None:
@@ -1393,7 +1403,9 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "model_arch",
         "model_stage",
         "retains_state_across_chunks",
+        "supports_pending_generation",
         "supports_running_prefix_cache_reset",
+        "recompute_preemption",
         "scheduler_cls",
         "stage_connector_spec",
         "worker_type",
@@ -1409,6 +1421,7 @@ _DIFFUSION_ENGINE_ADAPTER_METADATA_FIELDS = frozenset(
         "inline_diffusion",
         "requires_full_payload_input",
         "sampling_extra_args_keys",
+        "scheduling_metadata_adapter",
         "session_mode",
     }
 )
@@ -2052,6 +2065,7 @@ def _build_model_config(
     kwargs = _config_kwargs(engine)
     kwargs["requires_full_payload_input"] = topology.requires_full_payload_input
     kwargs["model"] = _first_defined(kwargs.get("model"), model)
+    kwargs["scheduling_metadata_adapter"] = topology.scheduling_metadata_adapter
     if "model_arch" not in kwargs:
         kwargs["model_arch"] = topology.model_arch or pipeline.model_arch or None
     if "trust_remote_code" not in kwargs and deploy.trust_remote_code is not None:
@@ -2061,8 +2075,13 @@ def _build_model_config(
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
     kwargs["final_output"] = topology.final_output
+    kwargs["supports_pending_generation"] = topology.supports_pending_generation
     if not topology.supports_running_prefix_cache_reset:
         kwargs["supports_running_prefix_cache_reset"] = False
+    # AR-only capability: diffusion stages have no KV-recompute preemption and
+    # reject unknown config fields.
+    if topology.execution_type is StageExecutionType.LLM_AR and topology.recompute_preemption != "allow":
+        kwargs["recompute_preemption"] = topology.recompute_preemption
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
     stage_runner = resolve_stage_model_runner(deploy, stage_deploy)

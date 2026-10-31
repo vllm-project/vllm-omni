@@ -58,6 +58,7 @@ from vllm_omni.config.stage_config import (
     resolve_deploy_yaml,
     update_deploy_config_async_chunk_enabled,
 )
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
@@ -123,6 +124,32 @@ def _from_pipeline_key(
         deploy_config_path=deploy_config_path,
         cli_overrides=cli_overrides,
     )
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_pending_generation_capability_reaches_both_engine_config_paths(pending, tmp_path):
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    pipeline = PipelineConfig(
+        model_type="test_pending_generation",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="codec",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                supports_pending_generation=pending,
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0)])
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0]
+    assert legacy.yaml_engine_args.get("supports_pending_generation", False) is pending
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    args = build_engine_args_dict_from_omni_stage_config(structured.stage_by_id(0), model=str(tmp_path))
+    assert OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args)).supports_pending_generation is pending
 
 
 def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
@@ -533,7 +560,7 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     monkeypatch.setattr(current_omni_platform, "device_name", "npu")
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
-    expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
     if deploy_name == "minicpmo_4_5":
         # Single-card deploy: batch sizes round up to a capture bucket so the
         # 32-entry pool covers the shape space.
@@ -945,10 +972,37 @@ stages:
     assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu"])
-def test_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
+def test_mrv2_fails_fast_on_xpu():
     with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform=platform)
+        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform="xpu")
+
+
+@pytest.mark.parametrize("stage_override", [False, True])
+def test_mrv2_config_is_allowed_on_npu(stage_override):
+    deploy = (
+        DeployConfig(stages=[StageDeployConfig(stage_id=0, model_runner="v2")])
+        if stage_override
+        else DeployConfig(model_runner="v2")
+    )
+    deploy = _apply_platform_overrides(deploy, platform="npu")
+    if stage_override:
+        assert deploy.stages[0].model_runner == "v2"
+    else:
+        assert deploy.model_runner == "v2"
+
+
+def test_fish_omni_npu_profile_is_mrv2_tp_ep():
+    deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / "fish_omni.yaml"), platform="npu")
+    stage0, stage1 = deploy.stages
+    assert stage0.model_runner == "v2"
+    assert stage0.tensor_parallel_size == 2
+    assert stage0.enable_expert_parallel is True
+    assert stage0.enforce_eager is False
+    assert stage0.gpu_memory_utilization == 0.72
+    assert stage0.devices == "0,1"
+    assert stage1.model_runner == "v1"
+    assert stage1.gpu_memory_utilization == 0.1
+    assert stage1.devices == "1"
 
 
 def _qwen3_omni_pipeline() -> PipelineConfig:
@@ -1152,6 +1206,8 @@ def test_sub_config_fields_match_structured_scopes():
         "media_io_kwargs",
         "final_output",
         "supports_running_prefix_cache_reset",
+        "supports_pending_generation",
+        "recompute_preemption",
         "active_stream_window",
         "session_mode",
         "duplex_max_sessions",
@@ -1190,6 +1246,7 @@ def test_sub_config_fields_match_structured_scopes():
         "generation_config",
         "override_generation_config",
         "enable_prompt_embeds",
+        "scheduling_metadata_adapter",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
@@ -2252,6 +2309,46 @@ def test_compact_offload_config_is_validated_during_projection():
         )
 
 
+def test_dlo_chunk_size_survives_cli_and_deploy_into_structured_config():
+    cli_config = _from_pipeline_key("hunyuan_image3_dit", cli_overrides={"dlo_chunk_size_mb": 32})
+    assert cli_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 32
+
+    pipeline = _resolve_pipeline_or_skip("hunyuan_image3_dit")
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, dlo_chunk_size_mb=128)])
+    deploy_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert deploy_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 128
+
+
+@pytest.mark.parametrize("chunk_size_mb", [0, -1])
+def test_dlo_chunk_size_rejects_non_positive_values(chunk_size_mb):
+    with pytest.raises(ValidationError):
+        omni_config_module._DiffusionConfigProjection(dlo_chunk_size_mb=chunk_size_mb)
+    with pytest.raises(ValueError, match="dlo_chunk_size_mb must be a positive integer"):
+        OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb)
+
+
+def test_dlo_chunk_size_accepts_reference_kv_config():
+    config = OmniDiffusionConfig(dlo_chunk_size_mb=32, kv_offload_config={"mode": "on"})
+
+    assert config.dlo_chunk_size_mb == 32
+    assert config.kv_offload_config == {"mode": "on"}
+
+
+@pytest.mark.parametrize(
+    "chunk_size_mb,kv_config,error",
+    [
+        (0, {"mode": "on"}, "dlo_chunk_size_mb must be a positive integer"),
+        (True, {"mode": "on"}, "dlo_chunk_size_mb must be a positive integer"),
+        (32, {"mode": "off"}, "kv_offload_config.mode must be on"),
+        (32, {"mode": "on", "kv_refresh_interval": -1}, "kv_refresh_interval must be an integer"),
+        (32, {"mode": "on", "kv_host_quantization": "unknown"}, "kv_host_quantization must be"),
+    ],
+)
+def test_dlo_and_reference_kv_config_reject_invalid_settings(chunk_size_mb, kv_config, error):
+    with pytest.raises(ValueError, match=error):
+        OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb, kv_offload_config=kv_config)
+
+
 @pytest.mark.parametrize("pipeline_async", [True, False])
 @pytest.mark.parametrize("stage_async", [None, False, True])
 def test_stage_async_chunk_opt_out_matches_legacy_config(pipeline_async, stage_async):
@@ -2511,3 +2608,28 @@ def test_mrv2_duplex_session_validation():
     ps_no_duplex = replace(ps, supports_duplex_mrv2=False)
     with pytest.raises(ValueError, match="supports session_mode 'turn' only"):
         validate_native_mrv2_session(deploy_duplex, ps_no_duplex, "v2")
+
+
+@pytest.mark.parametrize("execution_type", list(StageExecutionType))
+@pytest.mark.parametrize("mode", ["allow", "fail"])
+def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
+    pipeline = PipelineConfig(
+        model_type="test_preemption",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="test",
+                execution_type=execution_type,
+                recompute_preemption=mode,
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0)])
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0]
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+    expected = mode if execution_type is StageExecutionType.LLM_AR else "allow"
+    assert legacy.yaml_engine_args.get("recompute_preemption", "allow") == expected
+    assert structured.model_config.recompute_preemption == expected
+    if execution_type is not StageExecutionType.LLM_AR:
+        assert "recompute_preemption" not in legacy.yaml_engine_args

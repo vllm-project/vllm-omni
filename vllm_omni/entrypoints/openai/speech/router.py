@@ -204,6 +204,7 @@ async def list_voices(raw_request: Request):
     if hasattr(handler, "uploaded_speakers"):
         for voice_name, info in handler.uploaded_speakers.items():
             voice_entry = {
+                "id": voice_name,
                 "name": info.get("name", voice_name),
                 "consent": info.get("consent", ""),
                 "created_at": info.get("created_at", 0),
@@ -290,6 +291,7 @@ async def upload_voice(
         else:
             return _create_speech_error_json_response("Either 'audio_sample' or 'speaker_embedding' must be provided")
 
+        result["id"] = name.strip().lower()
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
