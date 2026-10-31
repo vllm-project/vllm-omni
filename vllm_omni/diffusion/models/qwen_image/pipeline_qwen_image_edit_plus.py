@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
 import logging
@@ -663,7 +663,7 @@ class QwenImageEditPlusPipeline(
         sigmas = req.sampling_params.sigmas
         max_sequence_length = req.sampling_params.max_sequence_length or 1024
         generator = req.sampling_params.generator
-        true_cfg_scale = req.sampling_params.true_cfg_scale or 4.0
+        true_cfg_scale = req.sampling_params.resolve_true_cfg_scale(4.0)
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
         else:
