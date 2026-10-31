@@ -35,6 +35,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.ngram_proposer_gpu import NgramProposerGPU
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
@@ -2281,14 +2282,35 @@ class GPUARModelRunner(
                         self.discard_request_mask.gpu,
                     )
                     self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
-                    # Since we couldn't run the drafter,
-                    # just use zeros for the draft tokens.
-                    self._draft_token_ids = torch.zeros(1, device=self.device, dtype=torch.int32).expand(
-                        len(self.input_batch.req_ids), self.num_spec_tokens
+            elif spec_config.use_ngram_gpu() and not spec_config.disable_padded_drafter_batch:
+                # Like upstream, GPU n-gram consumes the current device sample
+                # before async bookkeeping returns an empty CPU token list.
+                assert isinstance(self.drafter, NgramProposerGPU)
+                sampled_token_ids = sampler_output.sampled_token_ids
+                if input_fits_in_drafter:
+                    propose_draft_token_ids(sampled_token_ids)
+                elif self.valid_sampled_token_count_event is not None:
+                    # The third result is a discard-masked clone for n-gram;
+                    # bookkeeping/MTP retain the original sampler tensor.
+                    next_token_ids, valid_sampled_tokens_count, _ = self.drafter.update_token_ids_ngram(
+                        sampled_token_ids,
+                        self.input_batch,
+                        self.token_ids_gpu_tensor,
+                        self.num_tokens_no_spec_gpu,
+                        self.discard_request_mask.gpu,
                     )
-                    self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+                    self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
+
+            if not input_fits_in_drafter:
+                # Intentionally broader than old GPU/count-event arm: includes CPU n-gram and no-event Eagle/draft.
+                self._draft_token_ids = torch.zeros(1, device=self.device, dtype=torch.int32).expand(
+                    len(self.input_batch.req_ids), self.num_spec_tokens
+                )
+                self._draft_probs = None
+                self._draft_prob_req_ids = None
+                self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
         # Opt-in: without spec decode the post-sample rows are the rows the
         # discard mask keeps, so the MTP launches before bookkeeping, whose one
