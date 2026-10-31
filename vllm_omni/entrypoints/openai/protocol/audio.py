@@ -4,6 +4,7 @@
 import math
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, cast
+from urllib.parse import urlparse
 
 import numpy as np
 from pydantic import (
@@ -249,6 +250,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=True,
         description="Whether the server's configured watermarking applies to this request.",
     )
+
+    @field_validator("voice")
+    @classmethod
+    def validate_voice_not_empty(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("Invalid voice: voice cannot be empty or whitespace")
+        return v
 
     @field_validator("ref_audio", mode="before")
     @classmethod
@@ -541,6 +549,34 @@ class AudioResponse(BaseModel):
 # --- Batch Speech Models ---
 
 
+_SPEECH_REF_AUDIO_VALID_SCHEMES = frozenset({"http", "https", "data", "file"})
+_REF_AUDIO_FORMAT_ERROR = "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
+
+
+def _validate_voice_not_empty(v: str | None) -> str | None:
+    if v is not None and not v.strip():
+        raise ValueError("Invalid voice: voice cannot be empty or whitespace")
+    return v
+
+
+def _validate_ref_audio_format(ref_audio: str | list[str] | None) -> str | None:
+    """Validate a reference-audio URI and return an error message, if invalid."""
+    if not isinstance(ref_audio, str):
+        return _REF_AUDIO_FORMAT_ERROR
+    scheme = (urlparse(ref_audio).scheme or "").lower()
+    if scheme not in _SPEECH_REF_AUDIO_VALID_SCHEMES:
+        return _REF_AUDIO_FORMAT_ERROR
+    return None
+
+
+def _validate_ref_audio_uri(v: str | None) -> str | None:
+    if v is not None:
+        error = _validate_ref_audio_format(v)
+        if error:
+            raise ValueError(error)
+    return v
+
+
 class SpeechBatchItem(BaseModel):
     """Per-item input for batch speech. Only `input` is required;
     all other fields override the batch-level defaults when set."""
@@ -560,6 +596,23 @@ class SpeechBatchItem(BaseModel):
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
     watermarking: bool | None = None
+
+    @field_validator("input")
+    @classmethod
+    def validate_input_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("input cannot be empty")
+        return v
+
+    @field_validator("voice")
+    @classmethod
+    def validate_voice(cls, v: str | None) -> str | None:
+        return _validate_voice_not_empty(v)
+
+    @field_validator("ref_audio")
+    @classmethod
+    def validate_ref_audio(cls, v: str | None) -> str | None:
+        return _validate_ref_audio_uri(v)
 
 
 class BatchSpeechRequest(BaseModel):
@@ -582,6 +635,16 @@ class BatchSpeechRequest(BaseModel):
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
     watermarking: bool = True
+
+    @field_validator("voice")
+    @classmethod
+    def validate_voice(cls, v: str | None) -> str | None:
+        return _validate_voice_not_empty(v)
+
+    @field_validator("ref_audio")
+    @classmethod
+    def validate_ref_audio(cls, v: str | None) -> str | None:
+        return _validate_ref_audio_uri(v)
 
 
 class SpeechInputTokenDetails(BaseModel):
