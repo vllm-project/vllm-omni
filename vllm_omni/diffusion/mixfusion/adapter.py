@@ -22,11 +22,54 @@ from __future__ import annotations
 
 from collections.abc import Hashable
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from torch import nn
 
 from vllm_omni.diffusion.mixfusion.execution_plan import PackedExecutionPlan
+
+#: How a stream's tokens are laid out across the packed rows. ``"chunked"``
+#: streams arrive as one row per (request, chunk) and carry one chunk per
+#: position in the second dimension; ``"request"`` streams arrive as one row
+#: per request with the real token count in ``request_stream_lens``.
+StreamKind = Literal["chunked", "request"]
+
+
+@dataclass(frozen=True)
+class StreamSpec:
+    """One attention stream of a packed model call.
+
+    A model declares its streams through
+    :meth:`MixFusionAdapter.build_attention_layout`. Stream order is the token
+    order inside every packed request (e.g. text then image chunks).
+    """
+
+    name: str
+    kind: StreamKind
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("StreamSpec.name must be non-empty")
+        if self.kind not in ("chunked", "request"):
+            raise ValueError(f"StreamSpec {self.name!r} has unknown kind {self.kind!r}")
+
+
+@dataclass(frozen=True)
+class AttentionLayout:
+    """The model's declared attention streams, in per-request token order."""
+
+    streams: tuple[StreamSpec, ...]
+
+    def __post_init__(self) -> None:
+        if not self.streams:
+            raise ValueError("AttentionLayout needs at least one stream")
+        names = [spec.name for spec in self.streams]
+        if len(set(names)) != len(names):
+            raise ValueError(f"AttentionLayout stream names must be unique, got {names}")
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(spec.name for spec in self.streams)
 
 
 @dataclass
@@ -70,6 +113,16 @@ class MixFusionAdapter(Protocol):
         ``bound`` is an :class:`inspect.BoundArguments` over the model's
         forward. Return ``(False, reason)`` to keep the serial path; the
         reason is used in diagnostics.
+        """
+        ...
+
+    def build_attention_layout(self, plan: PackedExecutionPlan | None = None) -> AttentionLayout:
+        """Declare the attention streams this model packs.
+
+        The layout is step-invariant, so ``plan`` may be ``None`` while the
+        adapter is still building it. The packed-attention entry point reads
+        the layout off the armed step to know how to split the QKV inputs and
+        reassemble the outputs.
         """
         ...
 

@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+    QwenImageMixFusionAdapter,
     QwenImageTransformer2DModel,
 )
 
@@ -47,6 +48,7 @@ def _transformer() -> tuple[QwenImageTransformer2DModel, list]:
     object.__setattr__(transformer, "parallel_config", SimpleNamespace(sequence_parallel_size=1))
     object.__setattr__(transformer, "transformer_blocks", [_PlainBlock()])
     object.__setattr__(transformer, "img_in", nn.Identity())
+    object.__setattr__(transformer, "mixfusion_adapter", QwenImageMixFusionAdapter())
     pos_embed_calls: list[int] = [0]
 
     def pos_embed(img_shapes, txt_seq_lens, device):

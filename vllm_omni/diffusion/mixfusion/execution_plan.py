@@ -22,8 +22,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout
 
 
 @dataclass
@@ -31,67 +35,116 @@ class PackedExecutionPlan:
     """Per-step MixFusion packing layout, computed once and shared by all blocks.
 
     Holds the flat varlen sequence layout (cu_seqlens / max_seq_len) plus the
-    index tensors that recover per-request text rows and per-chunk image rows
-    from the packed attention output, so per-block work stays on-GPU.
+    index tensors that recover each attention stream's rows from the packed
+    attention output, so per-block work stays on-GPU. Which streams exist and
+    in what order they appear inside a request is the model's
+    ``AttentionLayout``; this plan only records their lengths and indices.
     """
 
-    cu_seqlens: list[int]
-    cu_seqlens_tensor: torch.Tensor
-    max_seq_len: int
+    chunk_size: int
+    num_chunks: int
     request_chunk_ranges: list[tuple[int, int]]
     # Number of packed rows per caller-side state (a state may hold several
     # images/prompts); output reassembly concatenates each state's rows back
     # into one tensor.
     image_row_counts: tuple[int, ...]
-    real_txt_lens: list[int]
-    seq_len_txt: int
-    chunk_size: int
     chunk_to_request: torch.Tensor
-    txt_out_idx: torch.Tensor
-    img_out_idx: torch.Tensor
-    # Target rows in the padded [num_requests * seq_len_txt] text-output space,
-    # or None when every request uses the full padded text length (no mask).
-    txt_pad_idx: torch.Tensor | None
+    # Stream name -> per-request token count, in request order.
+    request_stream_lens: dict[str, tuple[int, ...]]
+    # Padded width of each ``"request"`` stream's output buffer. The model
+    # supplies this because only it knows the caller-side padded shape.
+    stream_padded_lens: dict[str, int]
+    cu_seqlens: list[int]
+    cu_seqlens_tensor: torch.Tensor
+    max_seq_len: int
+    # Stream name -> (gather rows out of the packed result, scatter targets in
+    # the padded per-request output space or None when no padding is needed).
+    output_indices: dict[str, tuple[torch.Tensor, torch.Tensor | None]]
 
 
 def build_execution_plan(
     *,
-    seq_len_txt: int,
+    layout: AttentionLayout,
     chunk_size: int,
     request_chunk_ranges: list[tuple[int, int]],
     image_row_counts: Sequence[int],
-    real_txt_lens: list[int],
+    request_stream_lens: dict[str, Sequence[int]],
+    stream_padded_lens: dict[str, int],
     chunk_to_request: torch.Tensor,
     device: torch.device,
 ) -> PackedExecutionPlan:
+    stream_names = list(layout.names)
+    if set(request_stream_lens) != set(stream_names):
+        raise ValueError(
+            f"request_stream_lens keys {sorted(request_stream_lens)} "
+            f"do not match attention layout {sorted(stream_names)}."
+        )
+
+    num_requests = len(request_chunk_ranges)
+    if sum(int(count) for count in image_row_counts) != num_requests:
+        raise ValueError(f"image_row_counts {tuple(image_row_counts)} span {num_requests} chunked rows.")
+    lens_by_stream: dict[str, tuple[int, ...]] = {}
+    for name in stream_names:
+        lens = tuple(int(length) for length in request_stream_lens[name])
+        if len(lens) != num_requests:
+            raise ValueError(f"request_stream_lens[{name!r}] has {len(lens)} entries, expected {num_requests}.")
+        lens_by_stream[name] = lens
+
+    num_chunks = request_chunk_ranges[-1][1] if request_chunk_ranges else 0
     cu_seqlens = [0]
-    txt_out_rows: list[int] = []
-    img_out_rows: list[int] = []
-    txt_pad_rows: list[int] = []
     max_seq_len = 0
+    gather_rows: dict[str, list[int]] = {name: [] for name in stream_names}
     for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
-        txt_len = int(real_txt_lens[req_idx])
-        img_len = (chunk_end - chunk_start) * chunk_size
-        base = cu_seqlens[-1]
-        txt_out_rows.extend(range(base, base + txt_len))
-        img_out_rows.extend(range(base + txt_len, base + txt_len + img_len))
-        cu_seqlens.append(base + txt_len + img_len)
-        max_seq_len = max(max_seq_len, txt_len + img_len)
-        txt_pad_rows.extend(range(req_idx * seq_len_txt, req_idx * seq_len_txt + txt_len))
-    needs_padding = any(txt_len < seq_len_txt for txt_len in real_txt_lens)
+        if chunk_end < chunk_start:
+            raise ValueError(f"request {req_idx} has an inverted chunk range ({chunk_start}, {chunk_end}).")
+        offset = cu_seqlens[-1]
+        for spec in layout.streams:
+            length = lens_by_stream[spec.name][req_idx]
+            if spec.kind == "chunked":
+                expected = (chunk_end - chunk_start) * chunk_size
+                if length != expected:
+                    raise ValueError(
+                        f"Stream {spec.name!r} of request {req_idx} has {length} tokens, "
+                        f"expected {expected} from {chunk_end - chunk_start} chunk(s)."
+                    )
+            gather_rows[spec.name].extend(range(offset, offset + length))
+            offset += length
+        cu_seqlens.append(offset)
+        max_seq_len = max(max_seq_len, offset - cu_seqlens[-2])
+
+    output_indices: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = {}
+    for spec in layout.streams:
+        gather = torch.tensor(gather_rows[spec.name], dtype=torch.long, device=device)
+        scatter = None
+        if spec.kind == "request":
+            if spec.name not in stream_padded_lens:
+                raise ValueError(f"Stream {spec.name!r} needs an entry in stream_padded_lens.")
+            padded = int(stream_padded_lens[spec.name])
+            scatter_rows: list[int] = []
+            needs_padding = False
+            for req_idx, length in enumerate(lens_by_stream[spec.name]):
+                if length > padded:
+                    raise ValueError(
+                        f"Stream {spec.name!r} of request {req_idx} has {length} tokens, padded to {padded}."
+                    )
+                scatter_rows.extend(range(req_idx * padded, req_idx * padded + length))
+                needs_padding = needs_padding or length < padded
+            if needs_padding:
+                scatter = torch.tensor(scatter_rows, dtype=torch.long, device=device)
+        output_indices[spec.name] = (gather, scatter)
+
     return PackedExecutionPlan(
+        chunk_size=chunk_size,
+        num_chunks=num_chunks,
+        request_chunk_ranges=request_chunk_ranges,
+        image_row_counts=tuple(int(count) for count in image_row_counts),
+        chunk_to_request=chunk_to_request,
+        request_stream_lens=lens_by_stream,
+        stream_padded_lens={name: int(stream_padded_lens[name]) for name in stream_names if name in stream_padded_lens},
         cu_seqlens=cu_seqlens,
         cu_seqlens_tensor=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
         max_seq_len=max_seq_len,
-        request_chunk_ranges=request_chunk_ranges,
-        image_row_counts=tuple(int(count) for count in image_row_counts),
-        real_txt_lens=real_txt_lens,
-        seq_len_txt=seq_len_txt,
-        chunk_size=chunk_size,
-        chunk_to_request=chunk_to_request,
-        txt_out_idx=torch.tensor(txt_out_rows, dtype=torch.long, device=device),
-        img_out_idx=torch.tensor(img_out_rows, dtype=torch.long, device=device),
-        txt_pad_idx=torch.tensor(txt_pad_rows, dtype=torch.long, device=device) if needs_padding else None,
+        output_indices=output_indices,
     )
 
 

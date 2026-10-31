@@ -67,14 +67,14 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.mixfusion.adapter import PackedInputs
+from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout, PackedInputs, StreamSpec
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     PackedExecutionPlan,
     build_execution_plan,
     reassemble_chunk_rows,
     split_sequence_chunks,
 )
-from vllm_omni.diffusion.mixfusion.packed_attention import MIXFUSION_PLAN_KEY
+from vllm_omni.diffusion.mixfusion.packed_attention import MIXFUSION_PLAN_KEY, MIXFUSION_STREAMS_KEY
 from vllm_omni.diffusion.mixfusion.plan import (
     MixFusionExpandArg,
     MixFusionExpandRows,
@@ -885,21 +885,20 @@ class QwenImageCrossAttention(nn.Module):
             if mixfusion_plan is not None:
                 # MixFusion chunked layout: image chunks stay stacked on the
                 # local batch dimension while text stays request-level, so
-                # the joint cat below cannot apply. Send the text streams
-                # through the SP-joint channel and the plan through the
-                # metadata; the attention layer recovers each request to
-                # ``text + full image`` at its pre/post boundary (the
-                # all-to-all position) and returns the two stream layouts.
+                # the joint cat below cannot apply. The model declares its
+                # streams on the adapter; here the text stream rides the
+                # extra channel and image chunks stay positional, and the
+                # attention layer recovers each request to ``text + image``
+                # at its pre/post boundary (the all-to-all position).
                 attn_metadata = AttentionMetadata(
-                    joint_query=txt_query,
-                    joint_key=txt_key,
-                    joint_value=txt_value,
-                    joint_strategy="front",
-                    extra={MIXFUSION_PLAN_KEY: mixfusion_plan},
+                    extra={
+                        MIXFUSION_PLAN_KEY: mixfusion_plan,
+                        MIXFUSION_STREAMS_KEY: {"text": (txt_query, txt_key, txt_value)},
+                    },
                 )
-                img_attn_output, txt_attn_output = self.attn(img_query, img_key, img_value, attn_metadata)
-                img_attn_output = img_attn_output.flatten(2, 3).to(img_query.dtype)
-                txt_attn_output = txt_attn_output.flatten(2, 3).to(txt_query.dtype)
+                packed_outputs = self.attn(img_query, img_key, img_value, attn_metadata)
+                img_attn_output = packed_outputs["image"].flatten(2, 3).to(img_query.dtype)
+                txt_attn_output = packed_outputs["text"].flatten(2, 3).to(txt_query.dtype)
                 img_attn_output = self.to_out(img_attn_output)
                 txt_attn_output = self.to_add_out(txt_attn_output)
                 return img_attn_output, txt_attn_output
@@ -1185,6 +1184,11 @@ class QwenImageMixFusionAdapter:
     output maps back to one tensor per request.
     """
 
+    def build_attention_layout(self, plan: PackedExecutionPlan | None = None) -> AttentionLayout:
+        # Text stays request-level and opens each request's logical sequence;
+        # the image chunks follow it and are the positional Q/K/V tensors.
+        return AttentionLayout((StreamSpec("text", "request"), StreamSpec("image", "chunked")))
+
     def can_pack(self, module, bound) -> tuple[bool, str]:
         if "hidden_states" not in bound.arguments:
             # Contract: packing needs the per-request latent argument; keep
@@ -1207,6 +1211,7 @@ class QwenImageMixFusionAdapter:
             img_shapes=bound.arguments.get("img_shapes"),
             txt_seq_lens=bound.arguments.get("txt_seq_lens"),
             attention_kwargs=bound.arguments.get("attention_kwargs"),
+            attention_layout=self.build_attention_layout(),
             cached=cached,
         )
         bound.arguments["hidden_states"] = packed.hidden_states
@@ -1474,6 +1479,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         img_shapes: list[tuple[int, int, int]] | None = None,
         txt_seq_lens: list[int] | None = None,
         attention_kwargs: dict[str, Any] | None = None,
+        attention_layout: AttentionLayout | None = None,
         cached: MixFusionInputs | None = None,
     ) -> MixFusionInputs:
         """Split per-request latents into the packed chunk layout and build its plan.
@@ -1510,6 +1516,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
             raise ValueError("Qwen MixFusion requires at least one hidden-state tensor.")
         if img_shapes is None or txt_seq_lens is None:
             raise ValueError("Qwen MixFusion requires img_shapes and txt_seq_lens.")
+        if attention_layout is None:
+            attention_layout = self.mixfusion_adapter.build_attention_layout()
 
         # Normalize the all-valid text mask early: the plan and the shared
         # forward body follow this convention.
@@ -1587,15 +1595,29 @@ class QwenImageTransformer2DModel(CachedTransformer):
             mixfusion_plan = cached.plan
         else:
             image_rotary_emb = (torch.stack(image_freq_chunks, dim=0), torch.stack(text_freqs, dim=0))
+            # Per-stream token counts: request-level streams keep their real
+            # (masked) length and are padded to the caller-side width; chunked
+            # streams cover their chunks' rows.
+            request_stream_lens: dict[str, list[int]] = {}
+            stream_padded_lens: dict[str, int] = {}
+            for spec in attention_layout.streams:
+                if spec.kind == "request":
+                    request_stream_lens[spec.name] = list(real_txt_lens)
+                    stream_padded_lens[spec.name] = seq_len_txt
+                else:
+                    request_stream_lens[spec.name] = [
+                        (chunk_end - chunk_start) * chunk_size for chunk_start, chunk_end in request_chunk_ranges
+                    ]
             # Packing layout is identical across blocks and steps: build it once
             # per layout (cu_seqlens / out-gather indices as device tensors) so
             # the 60 blocks run pure GPU work.
             mixfusion_plan = build_execution_plan(
-                seq_len_txt=seq_len_txt,
+                layout=attention_layout,
                 chunk_size=chunk_size,
                 request_chunk_ranges=request_chunk_ranges,
                 image_row_counts=image_row_counts,
-                real_txt_lens=real_txt_lens,
+                request_stream_lens=request_stream_lens,
+                stream_padded_lens=stream_padded_lens,
                 chunk_to_request=torch.tensor(chunk_to_request, dtype=torch.long, device=packed_hidden_states.device),
                 device=packed_hidden_states.device,
             )

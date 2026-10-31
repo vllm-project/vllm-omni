@@ -29,6 +29,7 @@ from vllm_omni.diffusion.forward_context import (
     MixFusionStep,
     override_forward_context,
 )
+from vllm_omni.diffusion.mixfusion.adapter import AttentionLayout, StreamSpec
 from vllm_omni.diffusion.mixfusion.execution_plan import build_execution_plan
 from vllm_omni.diffusion.mixfusion.packed_attention import (
     MIXFUSION_PLAN_KEY,
@@ -183,19 +184,29 @@ def _mixfusion_inputs():
     return image_chunks, encoder_hidden_states, image_freq_chunks, text_freqs, chunk_to_request
 
 
+def _attention_layout():
+    return AttentionLayout((StreamSpec("text", "request"), StreamSpec("image", "chunked")))
+
+
 def _forward(module):
     image_chunks, encoder_hidden_states, image_freq_chunks, text_freqs, chunk_to_request = _mixfusion_inputs()
+    layout = _attention_layout()
     plan = build_execution_plan(
-        seq_len_txt=SEQ_LEN_TXT,
+        layout=layout,
         chunk_size=CHUNK_SIZE,
         request_chunk_ranges=REQUEST_CHUNK_RANGES,
         image_row_counts=[1, 1],
-        real_txt_lens=REAL_TXT_LENS,
+        request_stream_lens={
+            "text": REAL_TXT_LENS,
+            "image": [(end - start) * CHUNK_SIZE for start, end in REQUEST_CHUNK_RANGES],
+        },
+        stream_padded_lens={"text": SEQ_LEN_TXT},
         chunk_to_request=chunk_to_request,
         device=image_chunks.device,
     )
-    # The attention reads the plan from the armed step, mirroring the pipeline.
-    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(plan=plan))):
+    # The attention reads the plan and layout from the armed step, mirroring
+    # the pipeline.
+    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(plan=plan, layout=layout))):
         return module.forward(
             hidden_states=image_chunks,
             encoder_hidden_states=encoder_hidden_states,

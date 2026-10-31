@@ -113,6 +113,7 @@ class MixFusionRootHook(ModelHook):
         self._cached = packed
         step.adapter = adapter
         step.plan = packed.plan
+        step.layout = adapter.build_attention_layout(packed.plan)
         step.packed = packed
         return packed.args, packed.kwargs
 

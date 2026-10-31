@@ -38,7 +38,12 @@ from vllm_omni.diffusion.hooks.mixfusion import (
     apply_mixfusion,
     remove_mixfusion,
 )
-from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter, PackedInputs
+from vllm_omni.diffusion.mixfusion.adapter import (
+    AttentionLayout,
+    MixFusionAdapter,
+    PackedInputs,
+    StreamSpec,
+)
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     expand_per_chunk,
     reassemble_chunk_rows,
@@ -106,6 +111,9 @@ class _DummyAdapter:
         if not isinstance(bound.arguments["hidden_states"], (list, tuple)):
             return False, "hidden_states is a batched tensor (serial forward)"
         return True, ""
+
+    def build_attention_layout(self, plan=None) -> AttentionLayout:
+        return AttentionLayout((StreamSpec("text", "request"), StreamSpec("image", "chunked")))
 
     def pack_inputs(self, module, bound, *, step, cache: PackedInputs | None) -> PackedInputs:
         cached = None if cache is None or cache.adapter_state is None else cache.adapter_state["prepare_inputs"]
@@ -362,6 +370,10 @@ class _RecordingAdapter:
         self.calls.append(("can_pack", dict(bound.arguments)))
         return self._can_pack, "" if self._can_pack else "refused"
 
+    def build_attention_layout(self, plan=None):
+        self.calls.append(("build_attention_layout", plan))
+        return AttentionLayout((StreamSpec("image", "chunked"),))
+
     def pack_inputs(self, module, bound, *, step, cache):
         self.calls.append(("pack_inputs", dict(bound.arguments), cache))
         if self._returns_none:
@@ -387,7 +399,12 @@ class TestAdapterProtocol:
         with override_forward_context(ctx):
             out = model(hidden_states=x)
         assert out == ["restored"]
-        assert [call[0] for call in adapter.calls] == ["can_pack", "pack_inputs", "restore_output"]
+        assert [call[0] for call in adapter.calls] == [
+            "can_pack",
+            "pack_inputs",
+            "build_attention_layout",
+            "restore_output",
+        ]
         # The adapter sees the original forward signature (no ``self``), with
         # a positional argument bound by name; defaults stay unbound.
         assert torch.equal(adapter.calls[0][1]["hidden_states"], x)
@@ -396,6 +413,7 @@ class TestAdapterProtocol:
         assert torch.equal(model.seen[0], x * 10)
         # The step advertises what the hooks downstream need.
         assert ctx.mixfusion_step.plan == "PLAN"
+        assert ctx.mixfusion_step.layout is not None
         assert ctx.mixfusion_step.adapter is adapter
         assert ctx.mixfusion_step.packed is not None
 
