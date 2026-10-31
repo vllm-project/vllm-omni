@@ -63,6 +63,7 @@ from vllm_omni.engine.messages import (
     ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
+    TextInputUpdate,
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
@@ -3435,6 +3436,25 @@ class Orchestrator(OrchestratorBase):
             await self._handle_add_request(msg)
         elif msg_type == "streaming_update":
             await self._handle_streaming_update(msg)
+        elif msg_type == "append_text":
+            append = cast(TextInputUpdate, msg)
+            state = self.request_states.get(append.request_id)
+            if state is None:
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        request_id=append.request_id,
+                        error="No active request for text input append",
+                        fatal=False,
+                        status_code=400,
+                    )
+                )
+            else:
+                await self._dispatch_or_fail_request(
+                    lambda: self.stage_pools[state.entry_stage_id].append_text(append),
+                    req_id=state.request_id,
+                    stage_id=state.entry_stage_id,
+                    operation="append_text",
+                )
         elif msg_type == "add_companion_request":
             await self._handle_add_companion(msg)
         elif msg_type == "interaction":
