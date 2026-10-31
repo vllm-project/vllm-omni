@@ -625,6 +625,85 @@ async def test_streaming_error_chunk_marks_request_failed(mocker: MockerFixture)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chunks", [[], [b""], [b"", b""]], ids=["no-chunks", "empty-chunk", "empty-chunks"])
+async def test_audio_speech_empty_stream_fails(mocker: MockerFixture, chunks):
+    request_input = _seed_tts_request_func_input()
+    request_input.api_url = "http://test.com/v1/audio/speech"
+    response = MockResponse(200, chunks)
+    mocker.patch.object(response, "headers", new={}, create=True)
+    session = mocker.Mock()
+    session.post.return_value = response
+    pbar = mocker.Mock()
+
+    output = await async_request_openai_audio_speech(request_input, session, pbar)
+
+    assert output.success is False
+    assert "HTTP 200 but no PCM audio" in output.error
+    assert output.audio_ttfp == 0.0
+    assert output.audio_frames == 0
+    assert output.audio_duration == 0.0
+    assert output.latency > 0
+    pbar.update.assert_called_once_with(1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channels", "chunks"),
+    [(1, [b"\x00"]), (1, [b"\x00\x00", b"\x00"]), (2, [b"\x00\x00"])],
+    ids=["partial-sample", "trailing-byte", "partial-stereo-frame"],
+)
+async def test_audio_speech_incomplete_pcm_frame_fails(mocker: MockerFixture, channels, chunks):
+    request_input = _seed_tts_request_func_input()
+    request_input.api_url = "http://test.com/v1/audio/speech"
+    response = MockResponse(200, chunks)
+    mocker.patch.object(response, "headers", new={"X-Audio-Channels": str(channels)}, create=True)
+    session = mocker.Mock()
+    session.post.return_value = response
+
+    output = await async_request_openai_audio_speech(request_input, session)
+
+    assert output.success is False
+    assert "Incomplete PCM audio frame" in output.error
+    assert output.audio_frames == 0
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_accepts_frames_split_across_network_chunks(mocker: MockerFixture):
+    request_input = _seed_tts_request_func_input()
+    request_input.api_url = "http://test.com/v1/audio/speech"
+    # Two stereo PCM16 frames split inside a sample and a channel pair.
+    response = MockResponse(200, [b"", b"\x00", b"\x00" * 7])
+    mocker.patch.object(response, "headers", new={"X-Audio-Sample-Rate": "24000", "X-Audio-Channels": "2"}, create=True)
+    session = mocker.Mock()
+    session.post.return_value = response
+    clock = mocker.patch.object(patch, "time")
+    clock.perf_counter.side_effect = [100.0, 100.125, 100.25, 100.5]
+
+    output = await async_request_openai_audio_speech(request_input, session)
+
+    assert output.success is True
+    assert output.error == ""
+    assert output.audio_frames == 2
+    assert output.audio_duration == pytest.approx(2 / 24000)
+    assert output.audio_ttfp == 0.125
+    assert output.latency == 0.5
+    assert output.audio_rtf == pytest.approx(0.5 / (2 / 24000))
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_http_error_remains_failed(mocker: MockerFixture):
+    request_input = _seed_tts_request_func_input()
+    request_input.api_url = "http://test.com/v1/audio/speech"
+    session = mocker.Mock()
+    session.post.return_value = MockResponse(500, [])
+
+    output = await async_request_openai_audio_speech(request_input, session)
+
+    assert output.success is False
+    assert output.error == "Error"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("headers", "env", "expected_duration_s"),
     [

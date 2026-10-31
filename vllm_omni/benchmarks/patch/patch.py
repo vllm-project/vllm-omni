@@ -2751,6 +2751,15 @@ async def async_request_openai_audio_speech(
                 end_time = time.perf_counter()
                 output.latency = end_time - st
 
+                if total_pcm_bytes == 0:
+                    raise ValueError("Audio speech response returned HTTP 200 but no PCM audio")
+                frame_width = sample_width * channels
+                if total_pcm_bytes % frame_width:
+                    raise ValueError(
+                        f"Incomplete PCM audio frame: received {total_pcm_bytes} bytes "
+                        f"with {frame_width} bytes per frame"
+                    )
+
                 total_samples = defs.compute_audio_frames(
                     total_pcm_bytes,
                     sample_width=sample_width,
@@ -2761,9 +2770,6 @@ async def async_request_openai_audio_speech(
                     float(total_samples) / float(sample_rate) if total_samples > 0 and sample_rate > 0 else 0.0
                 )
                 output.audio_rtf = defs.compute_audio_rtf(output.latency, output.audio_duration)
-                if output.audio_duration <= 0:
-                    logger.warning("Audio duration is zero")
-
                 continuity = compute_continuity_stats(
                     chunk_arrival_times_s=chunk_arrival_times_s,
                     chunk_bytes=chunk_sizes,
@@ -2785,14 +2791,6 @@ async def async_request_openai_audio_speech(
                     except Exception as ex:
                         logger.warning("Seed-TTS WER PCM normalization failed: %s", ex)
                         output.tts_output_pcm_bytes = bytes(pcm_capture)
-                elif capture_wer_pcm:
-                    ct = response.headers.get("Content-Type", "")
-                    logger.warning(
-                        "Seed-TTS WER: HTTP 200 but no PCM bytes (Content-Type=%r, url=%s). "
-                        "Check stream=true, stream_format=audio, and response_format=pcm on the server.",
-                        ct,
-                        api_url,
-                    )
                 output.success = True
             else:
                 output.error = response.reason or ""

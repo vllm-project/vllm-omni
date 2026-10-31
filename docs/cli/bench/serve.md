@@ -57,10 +57,9 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
         "if the server is not processing requests fast enough to keep up."
 
 - `--request-rate`
-  "Number of requests per second. If this is inf, "
-        "then all the requests are sent at time 0. "
-        "Otherwise, we use Poisson process or gamma distribution "
-        "to synthesize the request arrival times."
+  Number of requests per second. With `inf`, requests become eligible immediately,
+  but `--max-concurrency` still limits how many can execute at once. Otherwise,
+  a Poisson process or gamma distribution supplies request arrival times.
 
 - `--ignore-eos`
   "Set ignore_eos flag when sending the benchmark request."
@@ -923,6 +922,80 @@ it does not establish that a supplied local mirror contains the entire official 
 Use `--videomme-save-eval-items` (or `VIDEOMME_SAVE_EVAL_ITEMS=1`) for per-request
 `videomme_eval_items` rows.
 
+### Streaming TTS: first packet and load shape
+
+For `openai-audio-speech`, `audio_ttfp` measures time from the start of the
+HTTP request to the first non-empty PCM network chunk. `e2el` measures time
+through the end of the response stream. Neither includes time waiting for the
+client's concurrency semaphore. These are client-observed timings, including
+HTTP transport and server queueing; TTFP is not the duration of the generated
+audio or the time to finish synthesis.
+
+An HTTP 200 response must contain non-empty PCM with a whole number of audio
+frames to count as successful. Frame alignment is checked after reading the
+complete stream, since a network chunk may split a sample or channel pair.
+This validates the byte layout, not speech quality. Failed responses are
+excluded from latency samples and generated-audio totals; always inspect the
+failure count as well. Throughput still uses the full benchmark duration.
+
+`max_concurrent_requests` is the peak number of overlapping successful request
+intervals, from `start_time` to `start_time + latency`. An interval excludes its
+end, so a request finishing exactly when another starts does not overlap it.
+Failed requests are excluded from this metric, and zero-duration intervals are
+empty. It is not the number of requests touching the same one-second bucket;
+output-token throughput continues to use one-second buckets.
+
+With `--request-rate inf --max-concurrency 64 --num-prompts 128`, at most 64
+requests start initially. Each replacement starts after an earlier **complete
+response**, not after its first audio packet. The resulting TTFP distribution
+mixes the initial burst with replenishment under load. Separate these workloads
+when investigating first-packet changes:
+
+| Workload | Concurrency | Requests | Interpretation |
+| --- | ---: | ---: | --- |
+| Initial burst | 64 | 64 | First packets from one burst on a warmed, idle server |
+| Short closed loop | 64 | 128 | Initial burst plus replenishment; retain for comparison with existing runs |
+| Longer closed loop | 64 | 1024 | More replenishment under load; still includes startup and drain |
+
+For example, with a Qwen3-TTS VoiceDesign server already running, execute from
+the repository root:
+
+```bash
+for count in 64 128 1024; do
+  vllm bench serve --omni \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+    --backend openai-audio-speech --endpoint /v1/audio/speech \
+    --dataset-name seed-tts-design \
+    --dataset-path benchmarks/build_dataset/seed_tts_design \
+    --seed-tts-locale en --seed 0 \
+    --extra-body '{"task_type":"VoiceDesign","language":"English","max_new_tokens":2048}' \
+    --request-rate inf --max-concurrency 64 --num-prompts "$count" \
+    --num-warmups 64 --percentile-metrics audio_ttfp,e2el,audio_rtf \
+    --metric-percentiles 50,95,99 --save-result --save-detailed \
+    --result-filename "tts-c64-n${count}.json"
+done
+```
+
+Use distinct output directories for repeated rounds. Repeat across independent
+server starts, alternate revision order, and keep weights, deployment settings,
+dependencies, hardware, warmups, and prompts fixed. Report the distribution of
+round results alongside request-level percentiles. The dataset can repeat
+templates when oversampled; `--seed` controls client sampling and does not by
+itself set a server generation seed. A longer run alone does not prove steady
+state, and its aggregate TTFP must not replace the short-run baseline. Establish
+separate baselines on the target hardware before adding new workload alerts.
+
+The Qwen3-TTS VoiceDesign nightly configuration in
+`tests/dfx/perf/tests/test_tts.json` includes `throughput_c64_n1024`, with 64
+warmup requests followed by 1024 measured requests at concurrency 64. It
+records results and checks request completion without a latency/throughput
+baseline until target-hardware measurements are available. The existing
+C64/N128 case is replaced, and its H100 thresholds are removed because they
+describe a different workload. C8/C16 and the other existing cases retain their
+baselines. During this baseline-collection period, C64 request validity is
+checked but C64 latency/throughput regressions are not gated. The new case is
+collected by the existing two-GPU TTS performance job.
+
 ### Multi-Modal Benchmark
 
 <details class="admonition abstract" markdown="1">
@@ -1055,7 +1128,7 @@ Failed requests:                         0
 Maximum request concurrency:             1  
 Benchmark duration (s):                  8.42  
 Request throughput (req/s):              0.36  
-Peak concurrent requests:                2.00  
+Peak concurrent requests:                1.00
 -------------------Peak Memory--------------------
 Mean PEAK_MEMORY_MB (MB):                58832.00  
 Median PEAK_MEMORY_MB (MB):              58832.00  
