@@ -31,6 +31,26 @@ when a compatible package is installed.
 vllm-omni serve <model> --diffusion-attention-backend FLASH_ATTN
 ```
 
+### Dense attention on Ascend NPU
+
+On NPU, this selector reuses MindIE-SD for dense noncausal attention and
+`torch_npu.npu_fusion_attention` for causal attention. Q/K/V enter the shared
+layer as `[batch, sequence, heads, head_dim]`; grouped-query attention keeps
+the smaller K/V head count. The configured softmax scale is preserved.
+
+Dense FP16/BF16 calls with head sizes 64, 96, 128, 192 or 256 can use the
+optimized path. Floating additive masks, empty Q/KV sequences and other dense head sizes/dtypes
+use SDPA within the same backend. This preserves arbitrary bias values,
+including the `0`/`-inf` prefix masks used by SenseNova. Two-dimensional
+`[batch, key_length]` masks retain the existing key-validity convention.
+Causal fallback uses bottom-right alignment when Q and KV lengths differ,
+and fully masked rows produce zero output. Kernel execution errors propagate;
+they do not trigger a retry. Packed/varlen and quantized attention retain their
+separate dispatch contracts.
+
+For the BF16 TP1/TP2 SenseNova workload and its validation limits, see the
+[SenseNova-U1.5 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SenseNova/SenseNova-U1.5.md).
+
 ### FlashAttention 4 on Blackwell
 
 Install the optional CUDA 13 extra:

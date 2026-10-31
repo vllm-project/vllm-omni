@@ -30,6 +30,7 @@ import torch.nn as nn
 import torchvision.transforms as T
 from PIL import Image
 from transformers import AutoTokenizer
+from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
@@ -595,6 +596,7 @@ class SenseNovaU1Pipeline(
 
         self.setup_diffusion_pipeline_profiler(
             profiler_targets=[
+                "_prepare_t2i",
                 "_t2i_prefix_forward",
                 "_it2i_prefix_forward",
                 "_generate_think",
@@ -1338,15 +1340,43 @@ class SenseNovaU1Pipeline(
         is_text_output = "text" in modalities
 
         if is_text_output:
-            return self._forward_text(p, input_images)
-        if input_images is not None:
-            return self._forward_it2i(p, input_images)
-        return self._forward_t2i(p)
+            output = self._forward_text(p, input_images)
+        elif input_images is not None:
+            output = self._forward_it2i(p, input_images)
+        else:
+            output = self._forward_t2i(p)
+        output.stage_durations = self._collect_stage_durations()
+        return output
+
+    def _collect_stage_durations(self) -> dict[str, float]:
+        """Export synchronized stage timings from the slowest TP rank.
+
+        All ranks call this after forward, before output transport selects the
+        primary rank. Do not put collectives in the stage_durations property:
+        callers outside model execution may only run on the primary rank.
+        """
+        if not self.enable_diffusion_pipeline_profiler:
+            return {}
+        durations = self.stage_durations
+        tp_group = get_tp_group()
+        if tp_group.world_size > 1 and durations:
+            # Every TP rank takes the same path and records the same stage keys.
+            # CPU reduction follows the profiler's device synchronization and
+            # avoids adding accelerator work to the measured stage boundaries.
+            keys = sorted(durations)
+            values = torch.tensor([durations[key] for key in keys], dtype=torch.float64, device="cpu")
+            torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.MAX, group=tp_group.cpu_group)
+            durations = dict(zip(keys, values.tolist()))
+        return durations
 
     def _forward_t2i(self, p) -> DiffusionOutput:
         """Text-to-image generation path."""
         ns = self._init_noise_and_schedule(p)
+        caches, think_text = self._prepare_t2i(ns, p)
+        return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=False)
 
+    def _prepare_t2i(self, ns, p):
+        """Tokenize, prefill (optionally think), and prepare image-prefix KV caches."""
         think_content = "<think>\n" if p.think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
         query_cond = _build_t2i_query(p.prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text=think_content)
         query_uncond = _build_t2i_query("", append_text=IMG_START_TOKEN)
@@ -1387,7 +1417,7 @@ class SenseNovaU1Pipeline(
             "idx_uncond": indexes_image_uncond,
             "mask_uncond": {"full_attention": None},
         }
-        return self._run_denoising_loop(ns, caches, p, think_text, is_it2i=False)
+        return caches, think_text
 
     def _forward_it2i(self, p, input_images: list[Image.Image]) -> DiffusionOutput:
         """Image-to-image (editing) generation path with dual CFG."""
