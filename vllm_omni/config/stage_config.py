@@ -138,6 +138,14 @@ def build_stage_runtime_overrides(
 
         result[key] = value
 
+    vae_resident_override = cli_overrides.get(f"stage_{stage_id}_dlo_vae_resident")
+    if vae_resident_override is not None and "dlo_vae_resident" not in internal_keys:
+        result["dlo_vae_resident"] = vae_resident_override
+
+    text_resident_override = cli_overrides.get(f"stage_{stage_id}_dlo_text_encoder_resident")
+    if text_resident_override is not None and "dlo_text_encoder_resident" not in internal_keys:
+        result["dlo_text_encoder_resident"] = text_resident_override
+
     return result
 
 
@@ -669,6 +677,8 @@ class StageDeployConfig:
     enable_layerwise_offload: bool | None = None
 
     enable_distributed_layerwise_offload: bool | None = None
+    dlo_vae_resident: bool | None = None
+    dlo_text_encoder_resident: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_chunk_size_mb: int | None = None
     dlo_resident_layers: int | None = None
@@ -688,6 +698,10 @@ class StageDeployConfig:
 
     def __post_init__(self) -> None:
         _normalize_stage_backend_fields(self)
+        if self.dlo_vae_resident is not None and type(self.dlo_vae_resident) is not bool:
+            raise ValueError("dlo_vae_resident must be a boolean")
+        if self.dlo_text_encoder_resident is not None and type(self.dlo_text_encoder_resident) is not bool:
+            raise ValueError("dlo_text_encoder_resident must be a boolean")
 
 
 @dataclass(frozen=True)

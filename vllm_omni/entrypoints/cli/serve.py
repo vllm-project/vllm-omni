@@ -1008,6 +1008,20 @@ class OmniServeCommand(CLISubcommand):
             "New integrations should use mode=layer and configure weight transfer per component.",
         )
         omni_config_group.add_argument(
+            "--dlo-vae-resident",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Keep loaded MiniMax H3 video and audio VAEs resident on device during "
+            "distributed layerwise offload. Requires additional device memory.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-text-encoder-resident",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Keep the loaded MiniMax H3 text encoder, including its vision module, resident on device "
+            "during distributed layerwise offload. Requires additional device memory.",
+        )
+        omni_config_group.add_argument(
             "--dlo-use-allgather",
             dest="dlo_use_allgather",
             action="store_true",
