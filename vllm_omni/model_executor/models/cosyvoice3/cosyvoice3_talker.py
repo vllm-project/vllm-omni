@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/FunAudioLLM/CosyVoice/blob/main/cosyvoice/llm/llm.py
 from collections.abc import Callable
 
@@ -21,7 +21,9 @@ class VLLMQwen2Encoder(torch.nn.Module):
         self.model = Qwen2Model(vllm_config=vllm_config, prefix=prefix)
         self.hidden_size = vllm_config.model_config.hf_config.hidden_size
 
-    def forward(self, inputs_embeds: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, inputs_embeds: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Forward pass using vLLM's attention with external KV cache.
 
         Args:
