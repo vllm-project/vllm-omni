@@ -39,12 +39,35 @@ from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, si
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
+from vllm_omni.diffusion.models.qwen_image_21.ops.gated_norm import apply_gated_norm_modulation
+from vllm_omni.diffusion.models.qwen_image_21.ops.modulation import (
+    apply_gated_residual,
+    apply_modulation,
+    prepare_modulation,
+)
+from vllm_omni.diffusion.models.qwen_image_21.ops.qk_norm_rope import apply_qk_norm_rope
+from vllm_omni.diffusion.models.qwen_image_21.ops.swiglu import fused_silu_mul
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 logger = init_logger(__name__)
+
+
+def _select_modulation_rows(params: torch.Tensor, target_token_mask: torch.Tensor | None) -> torch.Tensor:
+    r"""Broadcast per-sample modulation `params` over the token axis.
+
+    With `causal_condition`, `params` holds `batch_size + 1` rows: rows `[0, batch_size)` come from the real timestep
+    and the trailing row from `t = 0`. Text and condition-image tokens take the `t = 0` row, target-image tokens take
+    their own sample's row.
+
+    Ported from diffusers' transformer_qwenimage21._select_modulation_rows.
+    """
+    if target_token_mask is None:
+        return params.unsqueeze(1)
+    real, zero = params[:-1].unsqueeze(1), params[-1:].unsqueeze(0)
+    return torch.where(target_token_mask.view(1, -1, 1), real, zero)
 
 
 class QwenImage21KVCache(list[dict[str, dict[str, torch.Tensor]]]):
@@ -168,21 +191,6 @@ def _resolve_qwen_image21_lookup_name(
             continue
         return lookup_name.replace(weight_name, param_name), shard_id
     return lookup_name, None
-
-
-def _select_modulation_rows(params: torch.Tensor, target_token_mask: torch.Tensor | None) -> torch.Tensor:
-    r"""Broadcast per-sample modulation `params` over the token axis.
-
-    With `causal_condition`, `params` holds `batch_size + 1` rows: rows `[0, batch_size)` come from the real timestep
-    and the trailing row from `t = 0`. Text and condition-image tokens take the `t = 0` row, target-image tokens take
-    their own sample's row.
-
-    Ported from diffusers' transformer_qwenimage21._select_modulation_rows.
-    """
-    if target_token_mask is None:
-        return params.unsqueeze(1)
-    real, zero = params[:-1].unsqueeze(1), params[-1:].unsqueeze(0)
-    return torch.where(target_token_mask.view(1, -1, 1), real, zero)
 
 
 class QwenImage21TemporalTimesteps(nn.Module):
@@ -335,6 +343,8 @@ class QwenImage21SwiGLUFeedForward(nn.Module):
         self._npu_inplace_mlp = quant_config is None
 
     def forward(self, hidden_states: torch.Tensor, *, _pointwise_validated: bool = False) -> torch.Tensor:
+        if hidden_states.device.type == "cuda":
+            return self.out(fused_silu_mul(self.gate_layer(hidden_states), self.proj(hidden_states)))
         if (
             self._npu_inplace_mlp
             and hidden_states.device.type == "npu"
@@ -381,8 +391,7 @@ class QwenImage21AdaLayerNormContinuous(nn.Module):
         target_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         scale = self.linear(self.silu(conditioning_embedding).to(hidden_states.dtype))
-        scale = _select_modulation_rows(scale, target_token_mask)
-        return self.norm(hidden_states) * (1 + scale)
+        return apply_modulation(self.norm(hidden_states), scale, target_token_mask)
 
 
 class QwenImage21Rope(nn.Module):
@@ -588,22 +597,38 @@ class QwenImage21Attention(nn.Module):
         qkv, _ = self.to_qkv(hidden_states)
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
-        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
 
-        query = query.unflatten(-1, (self.num_heads, self.head_dim))
-        key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
-        value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
-
-        fused_qk = None
-        if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
-            fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
-        if fused_qk is not None:
-            query, key = fused_qk
+        if qkv.device.type == "cuda":
+            # Q and K are adjacent in the packed projection, so the whole norm + rotation
+            # chain fuses into one launch over a strided view; V is untouched. The helper
+            # falls back to norm_q/norm_k + `_apply_rotary_emb` for any ineligible input.
+            query, key = apply_qk_norm_rope(
+                qkv[..., : q_size + kv_size].unflatten(-1, (self.num_heads + self.num_kv_heads, self.head_dim)),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                freqs,
+                self.norm_q.eps,
+                self.num_heads,
+            )
+            value = qkv[..., q_size + kv_size :].unflatten(-1, (self.num_kv_heads, self.head_dim))
+            query = query.to(value.dtype)
+            key = key.to(value.dtype)
         else:
-            query = self.norm_q(query).to(value.dtype)
-            key = self.norm_k(key).to(value.dtype)
-            query = self._apply_rotary_emb(query, freqs)
-            key = self._apply_rotary_emb(key, freqs)
+            query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+            query = query.unflatten(-1, (self.num_heads, self.head_dim))
+            key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
+
+            fused_qk = None
+            if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
+                fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+            if fused_qk is not None:
+                query, key = fused_qk
+            else:
+                query = self.norm_q(query).to(value.dtype)
+                key = self.norm_k(key).to(value.dtype)
+                query = self._apply_rotary_emb(query, freqs)
+                key = self._apply_rotary_emb(key, freqs)
 
         cached_key = cached_value = None
         if kv_cache is not None:
@@ -732,16 +757,31 @@ class QwenImage21TransformerBlock(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
+        modulation_prepared: bool = False,
         prepared_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         _pointwise_validated: bool = False,
     ) -> torch.Tensor:
-        if prepared_modulation is None:
+        use_compact_modulation = (
+            hidden_states.device.type == "cuda" and prepared_modulation is None
+        ) or modulation_prepared
+        if use_compact_modulation:
+            # Each half carries a compact `[rows, 2 * channels]` scale/gate pair per sample; the
+            # fused ops read those rows directly instead of expanding them over the token axis.
             mod1, mod2 = modulation.chunk(2, dim=-1)
-            img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
-            img_gate1 = img_gate1.tanh()
+            mod1_scale, mod1_gate = mod1.chunk(2, dim=-1)
+            mod2_scale, mod2_gate = mod2.chunk(2, dim=-1)
+
+            img_modulated = apply_modulation(
+                self.img_norm1(hidden_states), mod1_scale, target_token_mask, modulation_prepared
+            )
         else:
-            scale1, img_gate1, scale2, img_gate2 = prepared_modulation
-            img_modulated = self.img_norm1(hidden_states) * scale1
+            if prepared_modulation is None:
+                mod1, mod2 = modulation.chunk(2, dim=-1)
+                img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+                img_gate1 = img_gate1.tanh()
+            else:
+                scale1, img_gate1, scale2, img_gate2 = prepared_modulation
+                img_modulated = self.img_norm1(hidden_states) * scale1
         attn_output = self.attn(
             img_modulated,
             freqs,
@@ -752,40 +792,54 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
         )
-        use_inplace_residual = (
-            hidden_states.device.type == "npu"
-            and hidden_states.dtype == torch.bfloat16
-            and hidden_states.shape[0] == 1
-            and prepared_modulation is not None  # Only prepared in eager, non-graph execution.
-            and not sp_decode
-            and sp_prefix_len == 0
-            and not (is_forward_context_available() and get_forward_context().sp_active)
-            and not torch.is_grad_enabled()
-            and not torch.compiler.is_compiling()
-        )
-        if use_inplace_residual:
-            # Mutate only the fresh projection output, preserving input ownership
-            # and the BF16 rounding between multiplication and addition.
-            attn_output.mul_(img_gate1).add_(hidden_states)
-            hidden_states = attn_output
+        if use_compact_modulation:
+            hidden_states, img_modulated2 = apply_gated_norm_modulation(
+                hidden_states,
+                attn_output,
+                mod1_gate,
+                mod2_scale,
+                target_token_mask,
+                self.img_norm2,
+                modulation_prepared,
+            )
+            hidden_states = apply_gated_residual(
+                hidden_states, self.img_mlp(img_modulated2), mod2_gate, target_token_mask, modulation_prepared
+            )
         else:
-            hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
+            use_inplace_residual = (
+                hidden_states.device.type == "npu"
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.shape[0] == 1
+                and prepared_modulation is not None  # Only prepared in eager, non-graph execution.
+                and not sp_decode
+                and sp_prefix_len == 0
+                and not (is_forward_context_available() and get_forward_context().sp_active)
+                and not torch.is_grad_enabled()
+                and not torch.compiler.is_compiling()
+            )
+            if use_inplace_residual:
+                # Mutate only the fresh projection output, preserving input ownership
+                # and the BF16 rounding between multiplication and addition.
+                attn_output.mul_(img_gate1).add_(hidden_states)
+                hidden_states = attn_output
+            else:
+                hidden_states = residual(hidden_states, attn_output, img_gate1, _validated=_pointwise_validated)
 
-        if prepared_modulation is None:
-            img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
-            img_gate2 = img_gate2.tanh()
-        else:
-            img_modulated2 = self.img_norm2(hidden_states) * scale2
-        mlp_output = (
-            self.img_mlp(img_modulated2, _pointwise_validated=True)
-            if _pointwise_validated
-            else self.img_mlp(img_modulated2)
-        )
-        if use_inplace_residual:
-            mlp_output.mul_(img_gate2).add_(hidden_states)
-            hidden_states = mlp_output
-        else:
-            hidden_states = residual(hidden_states, mlp_output, img_gate2, _validated=_pointwise_validated)
+            if prepared_modulation is None:
+                img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
+                img_gate2 = img_gate2.tanh()
+            else:
+                img_modulated2 = self.img_norm2(hidden_states) * scale2
+            mlp_output = (
+                self.img_mlp(img_modulated2, _pointwise_validated=True)
+                if _pointwise_validated
+                else self.img_mlp(img_modulated2)
+            )
+            if use_inplace_residual:
+                mlp_output.mul_(img_gate2).add_(hidden_states)
+                hidden_states = mlp_output
+            else:
+                hidden_states = residual(hidden_states, mlp_output, img_gate2, _validated=_pointwise_validated)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -1289,6 +1343,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             modulation_mask = None
         temb = self.time_text_embed(timestep, joint_hidden_states)
         modulation = self.modulation(temb)
+        compact_modulation_prepared = joint_hidden_states.device.type == "cuda"
+        if compact_modulation_prepared:
+            modulation = prepare_modulation(modulation)
 
         # Align the modulation mask with the local [prefix, target shard] layout.
         if modulation_mask is not None:
@@ -1368,7 +1425,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         prepared_modulation = None
         pointwise_validated = False
         if (
-            joint_hidden_states.device.type in {"cuda", "npu"}
+            joint_hidden_states.device.type == "npu"
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
         ):
@@ -1414,6 +1471,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 kv_cache=block_kv_cache,
                 cache_branch=cache_branch,
                 cache_write_len=cache_write_len,
+                modulation_prepared=compact_modulation_prepared,
                 prepared_modulation=prepared_modulation,
                 _pointwise_validated=pointwise_validated,
             )
@@ -1461,7 +1519,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         hidden_states = self.img_in(entry.hidden)
         timestep = torch.cat([entry.timestep, entry.timestep.new_zeros(1)], dim=0)
         temb = self.time_text_embed(timestep, hidden_states)
-        modulation = self.modulation(temb)
+        modulation = prepare_modulation(self.modulation(temb))
         for index_block, block in enumerate(self.transformer_blocks):
             hidden_states = block(
                 hidden_states=hidden_states,
@@ -1474,6 +1532,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 kv_cache=entry.block_caches[index_block],
                 cache_branch=entry.branch,
                 cache_write_len=None,
+                modulation_prepared=True,
             )
         hidden_states = self.norm_out(hidden_states, temb, entry.target_token_mask)
         return self.proj_out(hidden_states)
