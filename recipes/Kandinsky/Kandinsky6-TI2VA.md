@@ -2,6 +2,9 @@
 
 > Text/image-to-video-and-audio serving with Kandinsky 6 Pro
 
+For HD (1280×720) and Full HD (1920×1080) output from T2VA or I2VA,
+see [HD/FHD generation with integrated SR](Kandinsky6-VSR.md).
+
 ## Summary
 
 - Vendor: Kandinsky Lab ([`kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers))
@@ -25,7 +28,7 @@ uncalibrated. See "Known limitations".
 ## Supported model contract
 
 | Task | Entrypoint | Input | Output |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Text-to-video-and-audio | `vllm serve kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers --omni` / `Omni(model="kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers")` | text prompt | synchronized MP4 (H.264 video + AAC 44.1 kHz mono audio) |
 | Image-to-video-and-audio | same | text prompt + reference image | synchronized MP4, first frame conditioned on the reference image |
 
@@ -157,9 +160,9 @@ off. Pro geometry: 864x480, 125 frames, 50 steps, CFG 5.0, audio on.
 vLLM-Omni: `text_to_video.py --model kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers --enable-cpu-offload --model-class-name Kandinsky6TI2VAPipeline`,
 FlashAttention-3.
 
-| Wall / generation | Step time | Peak GPU | After load |
-|---|---|---|---|
-| 751.7 s generation (12.5 min); engine init 41 s | 14.4 s/it average | 78.39 GiB reserved (78.0 GiB nvidia-smi) | 17.74 GiB |
+| Wall / generation                               | Step time         | Peak GPU                                 | After load |
+| ----------------------------------------------- | ----------------- | ---------------------------------------- | ---------- |
+| 751.7 s generation (12.5 min); engine init 41 s | 14.4 s/it average | 78.39 GiB reserved (78.0 GiB nvidia-smi) | 17.74 GiB  |
 
 An earlier SDPA vLLM-Omni Pro run on the same GPU was 26.9 s/it and 1377 s,
 peak reserved 74.97 GiB. A 512x320 / 25-frame / 10-step SDPA smoke was 1.4 s/it
@@ -185,45 +188,45 @@ instead.
   `[-1, 1]`, `audio_sample_rate=44100`, `fps`) so the serving muxer picks
   up the correct sample rate.
 - Acceleration that is wired:
-  - Tensor parallel: the DiT loader narrows full checkpoint tensors onto
-    each rank's `ColumnParallelLinear` / `RowParallelLinear` shard.
-  - CFG parallel (`--cfg-parallel-size 2`): rank 0 runs the conditional
-    DiT, rank 1 the unconditional one, then both all-gather video and
-    audio velocities.
-  - HSDP: `_hsdp_shard_conditions` covers the indexed transformer blocks.
-    Do not combine with tensor parallel.
-  - Sequence parallel: visual tokens (and their RoPE) are sharded;
-    Ulysses all-to-all runs inside visual self-attention, Ring uses the
-    PyTorch ring kernel. Text stays replicated. Audio queries gather the
-    full visual sequence.
-  - Pipeline parallel: `visual_transformer_blocks` are split with
-    `PPMissingLayer`. Embeddings stay on the first stage, output heads on
-    the last. Activations and the final velocity are sent between stages.
-  - VAE patch parallel: Hunyuan decode splits the latent width when
-    `vae_patch_parallel_size > 1` and tiling is on.
-  - MagCache / TeaCache / Cache-DiT are registered. MagCache reuses the
-    Pro `mag_ratios`. TeaCache coefficients are **uncalibrated** (copied
-    from Qwen-Image) so skips are not quality-neutral. Cache-DiT targets
-    `visual_transformer_blocks` only and falls back to the same step cache
-    if the fused `(video, audio)` block return is rejected.
-  - FP8: online quantization runs in the DiT loader via
-    `process_weights_after_loading` after the sharded assign.
-  - `attention_engine: auto` uses FlashAttention-3 when
-    `flash_attn_interface` imports.
+    - Tensor parallel: the DiT loader narrows full checkpoint tensors onto
+      each rank's `ColumnParallelLinear` / `RowParallelLinear` shard.
+    - CFG parallel (`--cfg-parallel-size 2`): rank 0 runs the conditional
+      DiT, rank 1 the unconditional one, then both all-gather video and
+      audio velocities.
+    - HSDP: `_hsdp_shard_conditions` covers the indexed transformer blocks.
+      Do not combine with tensor parallel.
+    - Sequence parallel: visual tokens (and their RoPE) are sharded;
+      Ulysses all-to-all runs inside visual self-attention, Ring uses the
+      PyTorch ring kernel. Text stays replicated. Audio queries gather the
+      full visual sequence.
+    - Pipeline parallel: `visual_transformer_blocks` are split with
+      `PPMissingLayer`. Embeddings stay on the first stage, output heads on
+      the last. Activations and the final velocity are sent between stages.
+    - VAE patch parallel: Hunyuan decode splits the latent width when
+      `vae_patch_parallel_size > 1` and tiling is on.
+    - MagCache / TeaCache / Cache-DiT are registered. MagCache reuses the
+      Pro `mag_ratios`. TeaCache coefficients are **uncalibrated** (copied
+      from Qwen-Image) so skips are not quality-neutral. Cache-DiT targets
+      `visual_transformer_blocks` only and falls back to the same step cache
+      if the fused `(video, audio)` block return is rejected.
+    - FP8: online quantization runs in the DiT loader via
+      `process_weights_after_loading` after the sharded assign.
+    - `attention_engine: auto` uses FlashAttention-3 when
+      `flash_attn_interface` imports.
 - Known limitations:
-  - NABLA sparse attention is not registered in the framework attention
-    backend. NaviCache is not wired.
-  - Prompt expansion, NF4 Qwen, and the super-resolution cascade are not
-    part of this port.
-  - Distributed layerwise offload still uses one process unless another
-    parallel axis sets `world_size > 1` (for example tensor parallel).
-  - `_load_components` loads the Diffusers checkpoint directly rather than the
-    streamed-prefetch loader.
+    - NABLA sparse attention is not registered in the framework attention
+      backend. NaviCache is not wired.
+    - Prompt expansion, NF4 Qwen, and the super-resolution cascade are not
+      part of this port.
+    - Distributed layerwise offload still uses one process unless another
+      parallel axis sets `world_size > 1` (for example tensor parallel).
+    - `_load_components` loads the Diffusers checkpoint directly rather than the
+      streamed-prefetch loader.
 
 ## Supported features
 
 | Feature | Status | Guide |
-|---|---|---|
+| --- | --- | --- |
 | Text-to-video-and-audio | Supported (validated on H100) | — |
 | Image-to-video-and-audio | Supported (not yet validated on hardware) | — |
 | CPU offload (`--enable-cpu-offload`) | Supported (required on 80 GB) | — |
