@@ -362,6 +362,39 @@ vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
 These reference-encoder options are independent of the unified deployment.
 Evaluate cold and hot reference requests separately when enabling them.
 
+#### Ascend Local reference encoding
+
+On Ascend, `VLLM_OMNI_MOSS_REF_GRAPHS=1` enables reference ACLGraphs for the
+ordinary API-process Local encoder. Shared-host NPU encoding stays eager;
+set `VLLM_OMNI_MOSS_REF_SHARED_ENCODER=0` to use per-process encoders.
+The NPU path retains upstream SDPA, without CUDA FlashAttention or
+`torch.compile`. It captures at most three frame-aligned buckets: `(1, 4s)`,
+`(1, 8s)` and `(2, 4s)`. Larger batches are split, actual output lengths are
+preserved, and references longer than eight seconds use eager encoding.
+
+Capture requires `ASCEND_LAUNCH_BLOCKING` unset or `0` and selects
+`allow_internal_format=False` and `jit_compile=False` in the API process.
+After a capture/replay error, restart that process with reference graphs
+disabled. This feature is separate from Talker and codec graph execution;
+it does not fix Stage 0 backbone graph failures.
+
+With `torch_npu` and complete local model/tokenizer checkpoints, compare
+uncached reference encoding independently of speech generation:
+
+```bash
+python benchmarks/tts/benchmark_moss_reference_graphs.py \
+  --model /path/to/local-model \
+  --references /path/to/reference1.wav /path/to/reference2.wav \
+  --device npu:0 --repeats 5 --output /path/to/new-results
+```
+
+For offline loading, both model `config.json` and `processor_config.json`
+must select the local audio tokenizer. The benchmark uses fresh eager/graph
+processes with matched kernel settings, bypasses result caches, and reports
+capture time separately from warm encoding. Add `--profile` for untimed
+traces. These are not HTTP throughput or first-request latency measurements;
+capture itself adds startup cost. Check paired speech quality if codes differ.
+
 ### Cold versus hot reference measurements
 
 A cold reference misses the encoded-reference cache: the request pays for
