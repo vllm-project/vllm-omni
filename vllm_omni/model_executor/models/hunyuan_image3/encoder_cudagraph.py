@@ -106,7 +106,18 @@ class _BudgetedEncoderCudaGraphManager(EncoderCudaGraphManager):
     """Capture only budgets selected by vLLM's fixed-size SigLIP2 packing."""
 
     def __init__(self, vllm_config, device, dtype, model):
+        # Inspect the upstream class: our overrides would hide renamed hooks.
+        for method in (
+            "_capture_budget_graph",
+            "_num_graphs_for_budgets",
+            "_find_smallest_fitting_budget_given_tokens",
+        ):
+            if not callable(getattr(EncoderCudaGraphManager, method, None)):
+                raise RuntimeError(f"HunyuanImage3 encoder CUDA graphs: incompatible vLLM, missing method {method}.")
         super().__init__(vllm_config, device, dtype, model)
+        for field in ("path_token_budgets", "graph_misses"):
+            if not hasattr(self, field):
+                raise RuntimeError(f"HunyuanImage3 encoder CUDA graphs: incompatible vLLM, missing field {field}.")
         self.token_budgets = sorted(set(self.token_budgets))
         self.path_token_budgets = {path: sorted(set(budgets)) for path, budgets in self.path_token_budgets.items()}
 

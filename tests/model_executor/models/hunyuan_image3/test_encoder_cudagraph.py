@@ -148,6 +148,35 @@ def _cpu_manager(budgets, *, max_items=2, tp_size=1):
 
 @pytest.mark.cpu
 @pytest.mark.parametrize(
+    "method", ["_capture_budget_graph", "_num_graphs_for_budgets", "_find_smallest_fitting_budget_given_tokens"]
+)
+def test_manager_rejects_missing_upstream_hooks(monkeypatch, method):
+    from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+
+    # Checking self would still find our overrides for the first two hooks.
+    monkeypatch.delattr(EncoderCudaGraphManager, method)
+    with pytest.raises(RuntimeError, match=f"incompatible.*{method}"):
+        _cpu_manager([1024, 2048])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("field", ["path_token_budgets", "graph_misses"])
+def test_manager_rejects_missing_upstream_state(monkeypatch, field):
+    from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+
+    original_init = EncoderCudaGraphManager.__init__
+
+    def init_without_field(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        delattr(self, field)
+
+    monkeypatch.setattr(EncoderCudaGraphManager, "__init__", init_without_field)
+    with pytest.raises(RuntimeError, match=f"incompatible.*{field}"):
+        _cpu_manager([1024, 2048])
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
     "budgets, max_items, expected_vision",
     [
         ([1024, 2048, 4096, 8192], 2, [1024, 2048]),
