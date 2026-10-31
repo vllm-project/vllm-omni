@@ -30,23 +30,9 @@ from typing import Any, NamedTuple
 _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
-from kanban_assets_perf_summary import (  # noqa: E402
-    _empty_perf_status_counts,
-    build_assets_perf_summary,
-)
-from kanban_repo_config import KANBAN_REPO_URL  # noqa: E402
 from laptop_path_defaults import (  # noqa: E402
-    DEFAULT_KANBAN_REPO_ROOT_DISPLAY,
     DEFAULT_LAPTOP_REPO_ROOT_DISPLAY,
-    resolve_kanban_repo_root,
     resolve_laptop_repo_root,
-)
-from local_perf_results import (  # noqa: E402
-    collect_local_perf_test_keys,
-    local_perf_result_files,
-    perf_row_matches_local_test,
-    resolve_local_perf_result_dir,
-    row_source_file_matches_local,
 )
 from nightly_job_log_discovery import discover_job_logs, read_combined_job_logs  # noqa: E402
 from nightly_job_pytest_table import (  # noqa: E402
@@ -1365,9 +1351,6 @@ _SVG_PLUS_ISSUE = (
     '<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/>'
 )
 # Subcollapsible section icons (summary row)
-_SVG_CHART_BARS = (
-    '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>'
-)
 
 VLLM_OMNI_REPO = os.environ.get("VLLM_OMNI_ISSUE_REPO", "https://github.com/vllm-project/vllm-omni").strip().rstrip("/")
 VLLM_OMNI_BUG_ISSUE_TEMPLATE = "400-bug-report.yml"
@@ -1400,41 +1383,8 @@ def _vllm_omni_bug_env_ci_prefill() -> str:
 
 # Total raw log bytes (per failing local job) embeddable in HTML; larger logs get a notice + paths only.
 FULL_LOG_EMBED_MAX_BYTES = 2 * 1024 * 1024
-DEFAULT_KANBAN_ASSETS_DIR = (
-    Path(os.environ.get("KANBAN_ASSETS_DIR", "").strip()).resolve()
-    if os.environ.get("KANBAN_ASSETS_DIR", "").strip()
-    else None
-)
-DEFAULT_KANBAN_REPO_ROOT = resolve_kanban_repo_root()
 
 
-@dataclass
-class KanbanAssetsConfig:
-    assets_dir: Path | None
-    repo_root: Path | None
-    expected_remote: str | None = None
-    expected_branch: str | None = None
-    raw_root: Path | None = None
-    refresh_from_raw: bool = False
-    refresh_note: str | None = None
-    refresh_warnings: list[str] = field(default_factory=list)
-
-
-# Keep this list aligned with https://github.com/hsliuustc0106/vllm-omni-kanban/blob/main/scripts/mkdocs_hooks.py and
-# the maintenance note in SKILL.md.
-KANBAN_RAW_MODEL_SYNCS: tuple[tuple[str, str], ...] = (
-    ("qwen3omni", "qwen3_omni"),
-    ("qwen3tts", "qwen3_tts"),
-    ("qwen_image", "qwen_image"),
-    ("qwen_image_edit", "qwen_image_edit"),
-    ("qwen_image_edit_2509", "qwen_image_edit_2509"),
-    ("wan22", "wan22"),
-)
-KANBAN_RAW_PATTERNS = (
-    "result_test_*.json",
-    "diffusion_result_*.json",
-    "benchmark_results_*.json",
-)
 
 
 def _svg_icon(inner: str, *, size: int = 20, extra_class: str = "") -> str:
@@ -3189,539 +3139,6 @@ def _summary_row_for_bk_rec(rec: dict[str, Any]) -> list[str]:
     return _summary_row_for_job(name, [], info)
 
 
-def _perf_num(v: Any) -> str:
-    if isinstance(v, (int, float)):
-        s = f"{float(v):.4f}".rstrip("0").rstrip(".")
-        return s or "0"
-    return "N/A"
-
-
-def _perf_pct(v: Any) -> str:
-    if isinstance(v, (int, float)):
-        sign = "+" if float(v) >= 0 else ""
-        return f"{sign}{float(v):.2f}%"
-    return "N/A"
-
-
-def _as_num(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str) and value.strip():
-        try:
-            return float(value.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _fmt_mtime(path: Path) -> str:
-    try:
-        return datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
-    except OSError:
-        return ""
-
-
-def _resolve_kanban_raw_root(kanban_cfg: KanbanAssetsConfig) -> Path | None:
-    if kanban_cfg.raw_root is not None:
-        return kanban_cfg.raw_root.resolve()
-    if kanban_cfg.repo_root is not None:
-        return (kanban_cfg.repo_root / "data/buildkite_nightly_raw").resolve()
-    return None
-
-
-def _collect_kanban_raw_files(raw_root: Path | None) -> list[Path]:
-    if raw_root is None or not raw_root.is_dir():
-        return []
-    files: dict[Path, None] = {}
-    for pattern in KANBAN_RAW_PATTERNS:
-        for path in raw_root.rglob(pattern):
-            if path.is_file():
-                files[path] = None
-    return sorted(files)
-
-
-def _build_ids_from_raw_files(raw_root: Path | None, paths: list[Path]) -> list[str]:
-    if raw_root is None:
-        return []
-    ids: set[str] = set()
-    for path in paths:
-        try:
-            rel = path.relative_to(raw_root)
-        except ValueError:
-            continue
-        if not rel.parts:
-            continue
-        head = rel.parts[0]
-        if head.isdigit():
-            ids.add(head)
-    return sorted(ids, key=lambda item: int(item))
-
-
-def _kanban_raw_assets_diagnostic(
-    kanban_cfg: KanbanAssetsConfig,
-    summary: dict[str, Any],
-) -> dict[str, Any]:
-    assets_dir_txt = str(summary.get("assets_dir") or "")
-    assets_dir = Path(assets_dir_txt) if assets_dir_txt else None
-    history_files = sorted(assets_dir.glob("*_history.json")) if assets_dir and assets_dir.is_dir() else []
-    raw_root = _resolve_kanban_raw_root(kanban_cfg)
-    raw_files = _collect_kanban_raw_files(raw_root)
-    build_ids = _build_ids_from_raw_files(raw_root, raw_files)
-
-    latest_history = max(history_files, key=lambda p: p.stat().st_mtime) if history_files else None
-    latest_raw = max(raw_files, key=lambda p: p.stat().st_mtime) if raw_files else None
-    recommended = ""
-    if kanban_cfg.repo_root:
-        recommended = (
-            "python scripts/nightly_local_log_report.py --kanban-repo-root "
-            f"{kanban_cfg.repo_root} --kanban-refresh-from-raw ..."
-        )
-
-    return {
-        "raw_root": str(raw_root or ""),
-        "raw_exists": bool(raw_root and raw_root.is_dir()),
-        "raw_file_count": len(raw_files),
-        "raw_build_ids": build_ids[-5:],
-        "raw_latest_mtime": _fmt_mtime(latest_raw) if latest_raw else "",
-        "history_file_count": len(history_files),
-        "history_latest_mtime": _fmt_mtime(latest_history) if latest_history else "",
-        "recommended_command": recommended,
-    }
-
-
-def _kanban_repo_dirty(repo: Path) -> tuple[bool | None, str]:
-    proc = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=str(repo),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()
-        return None, detail[:500]
-    return bool(proc.stdout.strip()), proc.stdout.strip()[:500]
-
-
-def _kanban_python(repo: Path) -> str:
-    candidates = (
-        repo / ".venv/bin/python",
-        repo / ".venv/Scripts/python.exe",
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    return sys.executable
-
-
-def _run_kanban_refresh_from_raw(
-    kanban_repo_root: Path | None,
-    raw_root: Path | None,
-) -> tuple[str | None, list[str]]:
-    if kanban_repo_root is None:
-        return None, ["kanban raw refresh skipped: --kanban-repo-root is required."]
-    repo = kanban_repo_root.resolve()
-    if not repo.is_dir():
-        return None, [f"kanban raw refresh skipped: repo root not found: {repo}"]
-    sync_script = repo / "scripts/sync_buildkite_raw_model_results.py"
-    gen_script = repo / "scripts/generate_charts.py"
-    missing = [str(p) for p in (sync_script, gen_script) if not p.is_file()]
-    if missing:
-        return None, ["kanban raw refresh skipped: missing script(s): " + ", ".join(missing)]
-
-    dirty, detail = _kanban_repo_dirty(repo)
-    if dirty is None:
-        return None, [
-            "kanban raw refresh skipped: unable to verify clean git working tree" + (f"; {detail}" if detail else "")
-        ]
-    if dirty:
-        return None, [
-            "kanban raw refresh skipped: kanban checkout has uncommitted changes. "
-            "Commit or clean that repo before regenerating assets." + (f" Changed entries: {detail}" if detail else "")
-        ]
-
-    warnings: list[str] = []
-    synced_models = 0
-    py = _kanban_python(repo)
-    for model_name, model_keywords in KANBAN_RAW_MODEL_SYNCS:
-        cmd = [
-            py,
-            str(sync_script),
-            "--model-name",
-            model_name,
-            "--model-keywords",
-            model_keywords,
-        ]
-        if raw_root is not None:
-            cmd.extend(["--raw-root", str(raw_root.resolve())])
-        proc = subprocess.run(
-            cmd,
-            cwd=str(repo),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            warnings.append(
-                f"kanban raw sync failed for {model_name}: exit {proc.returncode}"
-                + (f"; {detail[:500]}" if detail else "")
-            )
-            continue
-        synced_models += 1
-
-    proc = subprocess.run(
-        [py, str(gen_script)],
-        cwd=str(repo),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()
-        warnings.append(
-            f"kanban generate_charts.py failed: exit {proc.returncode}" + (f"; {detail[:500]}" if detail else "")
-        )
-        return None, warnings
-
-    note = f"kanban raw refresh completed: synced {synced_models} model group(s), regenerated chart history assets."
-    return note, warnings
-
-
-_PERF_TABLE_HEADERS = [
-    "Type",
-    "Config",
-    "Test",
-    "Metric",
-    "latest",
-    "baseline",
-    "vs baseline",
-    "Status",
-]
-_CONSEC_FAIL_DAY_MAX = 5
-_CONSEC_FAIL_THRESHOLD_PCT = 10.0
-_CONSEC_FAIL_LOOKUP_LIMIT_PER_FILE = 5000
-
-
-def _metric_direction_hint(metric: str) -> str:
-    """Mirror of kanban_assets_perf_summary._metric_direction (local-only).
-
-    Keep this list aligned byte-for-byte with
-    kanban_assets_perf_summary.LOWER_BETTER_HINTS / HIGHER_BETTER_HINTS so the
-    consecutive-failure lookup computes the same direction verdict the kanban
-    baseline comparator uses for PerfRow.status.
-
-    If a metric name shows up in the focus table but is not in this list, both
-    local and kanban will treat it as `unknown` → skipped from the streak
-    lookup. (We deliberately do NOT add legacy aliases like `itl`,
-    `response_time`, `elapsed` — they aren't in kanban's source of truth.)
-    """
-    m = (metric or "").lower()
-    higher_hints = ("throughput", "qps", "tps")
-    lower_hints = (
-        "latency",
-        "ttfp",
-        "ttft",
-        "tpot",
-        "rtl",
-        "rtf",
-        "memory",
-        "e2e",
-        "duration",
-    )
-    if any(h in m for h in higher_hints):
-        return "higher_better"
-    if any(h in m for h in lower_hints):
-        return "lower_better"
-    return "unknown"
-
-
-def _iter_metric_pairs_for_history(rec: dict[str, Any]) -> list[tuple[str, float, float]]:
-    """Mirror of kanban_assets_perf_summary._iter_metric_pairs used for the
-    consecutive-failure lookup. Kept local so we don't depend on the private
-    helper.
-    """
-
-    def _to_float(value: Any) -> float | None:
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            txt = value.strip()
-            if not txt:
-                return None
-            try:
-                return float(txt)
-            except ValueError:
-                return None
-        return None
-
-    pairs: list[tuple[str, float, float]] = []
-    if not isinstance(rec, dict):
-        return pairs
-    for key, value in rec.items():
-        if not isinstance(key, str) or not key.startswith("baseline_"):
-            continue
-        metric = key[len("baseline_") :]
-        baseline = _to_float(value)
-        latest = _to_float(rec.get(metric))
-        if baseline is None or latest is None:
-            continue
-        pairs.append((metric, latest, baseline))
-    baseline_obj = rec.get("baseline")
-    if isinstance(baseline_obj, dict):
-        for metric, base_v in baseline_obj.items():
-            if not isinstance(metric, str):
-                continue
-            if any(metric == existing[0] for existing in pairs):
-                continue
-            baseline = _to_float(base_v)
-            latest = _to_float(rec.get(metric))
-            if baseline is None or latest is None:
-                continue
-            pairs.append((metric, latest, baseline))
-    return pairs
-
-
-def _history_records_from_payload(payload: Any) -> list[dict[str, Any]]:
-    """Extract the flat record list from a history JSON payload.
-
-    Supports both top-level ``records: [...]`` and group-based
-    ``groups: [{records: [...]}]`` shapes (matching the kanban
-    ``generate_charts.py`` output).
-    """
-    if not isinstance(payload, dict):
-        return []
-    records = payload.get("records")
-    if isinstance(records, list):
-        return [r for r in records if isinstance(r, dict)]
-    groups = payload.get("groups")
-    if isinstance(groups, list):
-        flat: list[dict[str, Any]] = []
-        for grp in groups:
-            if not isinstance(grp, dict):
-                continue
-            rs = grp.get("records")
-            if isinstance(rs, list):
-                flat.extend(r for r in rs if isinstance(r, dict))
-        return flat
-    return []
-
-
-def _compute_history_fail_lookup(
-    assets_dir: Path | None,
-) -> dict[tuple[str, str, str, str], dict[str, bool]]:
-    """Build ``(model_id, test_name, config_key, metric) -> {date: is_fail}``
-    by scanning the kanban ``*_history.json`` files under ``assets_dir``.
-
-    ``is_fail`` re-applies ``vs_pct < -CONSEC_FAIL_THRESHOLD_PCT`` (matching
-    ``kanban_assets_perf_summary._baseline_compare_status``). When multiple
-    records share the same date for the same key, "fail" wins (most pessimistic).
-    """
-    if assets_dir is None or not assets_dir.is_dir():
-        return {}
-    lookup: dict[tuple[str, str, str, str], dict[str, bool]] = {}
-    for history_path in sorted(assets_dir.glob("*_history.json")):
-        try:
-            payload = json.loads(history_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-        records = _history_records_from_payload(payload)
-        per_file = 0
-        for rec in records:
-            per_file += 1
-            if per_file > _CONSEC_FAIL_LOOKUP_LIMIT_PER_FILE:
-                break
-            date_raw = rec.get("date")
-            if not isinstance(date_raw, str):
-                continue
-            date = date_raw.strip()[:10]
-            if len(date) < 10:
-                continue
-            model_id = rec.get("model_id")
-            title = rec.get("title")
-            model = str(model_id or title or "")
-            if not model:
-                continue
-            test_name = str(rec.get("test_name") or "")
-            config_key = str(rec.get("config_key") or rec.get("source_file") or "")
-            for metric, latest, baseline in _iter_metric_pairs_for_history(rec):
-                if abs(baseline) < 1e-12:
-                    continue
-                direction = _metric_direction_hint(metric)
-                if direction == "unknown":
-                    continue
-                raw_pct = (latest - baseline) / baseline * 100.0
-                vs_pct = -raw_pct if direction == "lower_better" else raw_pct
-                is_fail = vs_pct < -_CONSEC_FAIL_THRESHOLD_PCT
-                key = (model, test_name, config_key, metric)
-                slot = lookup.setdefault(key, {})
-                previous = bool(slot.get(date, False))
-                slot[date] = is_fail or previous
-    return lookup
-
-
-def _consec_fail_days_from_history(
-    lookup: dict[tuple[str, str, str, str], dict[str, bool]],
-    *,
-    model: str,
-    test: str,
-    config_key: str,
-    metric: str,
-    max_days: int = _CONSEC_FAIL_DAY_MAX,
-) -> int:
-    """Count how many consecutive days (newest first) the (model, test, config,
-    metric) regressed worse than baseline by more than the threshold.
-
-    Returns 0 when the latest dated record for this key is *not* a failure or
-    when no history exists for that key.
-    """
-    by_date = lookup.get((model, test, config_key, metric))
-    if not by_date:
-        return 0
-    sorted_dates_desc = sorted(by_date.keys(), reverse=True)
-    if not sorted_dates_desc:
-        return 0
-    latest = sorted_dates_desc[0]
-    if not by_date.get(latest):
-        return 0
-    try:
-        cursor = datetime.strptime(latest, "%Y-%m-%d")
-    except ValueError:
-        return 0
-    count = 0
-    cursor_str = latest
-    for _ in range(max_days):
-        if by_date.get(cursor_str):
-            count += 1
-            cursor = cursor - timedelta(days=1)
-            cursor_str = cursor.strftime("%Y-%m-%d")
-        else:
-            break
-    return count
-
-
-def _normalize_focus_key(parts: tuple[str, str, str, str]) -> tuple[str, str, str, str]:
-    """Trim whitespace and normalize empty config_key for lookup matching.
-
-    Focus items have ``config == config_view`` (a human-readable label), while
-    history records key on ``config_key`` (a normalized slug). We collapse
-    whitespace and fall back to an empty string so the lookup hits when these
-    roughly agree.
-    """
-    model, test, config, metric = parts
-    return (
-        (model or "").strip(),
-        (test or "").strip(),
-        (config or "").strip(),
-        (metric or "").strip(),
-    )
-
-
-def _focus_item_consec_fail_days(
-    item: NightlyFocusItem,
-    lookup: dict[tuple[str, str, str, str], dict[str, bool]],
-) -> int:
-    """Compute consecutive-failing-day count for a focus item using the history
-    lookup.
-
-    Resolution order (each step short-circuits on a hit):
-
-    1. **``config_key`` (canonical slug)** — when the focus item carries the
-       slug (e.g. ``"openai-chat-omni | ... | 2500 | 900 | 8 | 32 | audio_metrics"``),
-       use it as the exact ``config_key`` in the lookup. This is the canonical
-       path — one focus row == one perf variant == one Days-failing value.
-       Multiple variants of the same ``(model, test, metric)`` therefore get
-       their own rows with their own streak.
-    2. **``config`` (human-readable config_view)** — legacy strict match
-       against the slug, kept so older callers that only set ``config`` still
-       work when the strings happen to align.
-    3. **Wildcard MAX fallback** — when the focus item carries neither a
-       matching slug nor an aligned ``config_view``, fall back to scanning
-       *all* ``config_key`` values for the same ``(model, test, metric)`` and
-       returning the worst streak. This is the previous behavior; it is only
-       used as a last resort so a missing slug cannot silently zero out the
-       Days-failing cell.
-
-    Note: step 3 is **not** the default. With the canonical slug from
-    ``_buildkite_perf_rows`` (``config_key``) attached to every focus item,
-    step 1 resolves the lookup deterministically and the row-level config
-    variant is preserved (one row per ``(c, n, ...)``). The MAX fallback is
-    what produced the user's reported "3 days" bug for qwen3_omni
-    audio_metrics — the c=1 n=4 variant had been chronically failing and the
-    fallback propagated its 3-day streak onto the c=8 n=32 row.
-    """
-    if item.config_key:
-        key = _normalize_focus_key((item.model, item.test, item.config_key, item.metric))
-        by_date = lookup.get(key)
-        if by_date:
-            return _consec_fail_days_from_history(
-                lookup,
-                model=key[0],
-                test=key[1],
-                config_key=key[2],
-                metric=key[3],
-            )
-    key_strict = _normalize_focus_key((item.model, item.test, item.config, item.metric))
-    by_date = lookup.get(key_strict)
-    if by_date:
-        return _consec_fail_days_from_history(
-            lookup,
-            model=key_strict[0],
-            test=key_strict[1],
-            config_key=key_strict[2],
-            metric=key_strict[3],
-        )
-    # Fallback: match by (model, test, metric) over any config_key in history.
-    best = 0
-    target_model, target_test, _, target_metric = key_strict
-    for (model, test, config_key, metric), dates in lookup.items():
-        if model != target_model or test != target_test or metric != target_metric:
-            continue
-        count = _consec_fail_days_from_history(
-            lookup,
-            model=model,
-            test=test,
-            config_key=config_key,
-            metric=metric,
-        )
-        if count > best:
-            best = count
-            if best >= _CONSEC_FAIL_DAY_MAX:
-                break
-    return best
-
-
-@dataclass
-class NightlyFocusItem:
-    """One baseline-backed performance row promoted to the top-level nightly focus."""
-
-    source: str
-    model: str
-    model_type: str
-    hardware: str = ""
-    config: str = ""
-    # Canonical config slug from the kanban history (e.g.
-    # "openai-chat-omni | openai-chat-omni | Qwen/... | qwen3_omni | random |
-    # 2500 | 900 | 8 | 32 | audio_metrics"). Distinct rows that share the same
-    # ``config_view`` (human-readable label) but differ in ``c``/``n`` will have
-    # distinct ``config_key`` values; that lets ``_focus_item_consec_fail_days``
-    # do a precise per-variant lookup instead of falling back to a MAX scan
-    # across all variants of ``(model, test, metric)``.
-    config_key: str = ""
-    test: str = ""
-    metric: str = ""
-    latest: Any = None
-    baseline: Any = None
-    vs_baseline_pct: Any = None
-    status: str = ""
-    consec_fail_days: int = 0
-    date: str = ""
-
-
 def _job_kind_counts(kinds: list[str]) -> dict[str, int]:
     out = {"total": len(kinds), "ok": 0, "fail": 0, "unknown": 0}
     for kind in kinds:
@@ -3742,152 +3159,27 @@ def _local_job_counts(
     return _job_kind_counts([_summary_row_kind(info) for _, _, info in job_rows])
 
 
-def _perf_counts(summary: dict[str, Any]) -> dict[str, int]:
-    counts = _empty_perf_status_counts()
-    for key, value in (summary.get("summary") or {}).items():
-        if key in counts:
-            counts[key] = int(value or 0)
-    return counts
-
-
-def _focus_item_from_perf_row(
-    source: str,
-    row: Any,
-    history_fail_lookup: dict[tuple[str, str, str, str], dict[str, bool]] | None = None,
-) -> NightlyFocusItem:
-    if isinstance(row, dict):
-        get_value = row.get
-    else:
-
-        def get_value(key, default=None):
-            return getattr(row, key, default)
-
-    out = NightlyFocusItem(
-        source=source,
-        model=str(get_value("model", "") or "unknown"),
-        model_type=str(get_value("model_type", "") or ""),
-        hardware=str(get_value("hardware", "") or ""),
-        config=str(get_value("config_view", "") or ""),
-        # ``config_key`` is the canonical slug from ``_buildkite_perf_rows``;
-        # when present it lets the consec-fail-day lookup match the exact
-        # perf variant instead of falling back to the MAX scan across all
-        # ``(model, test, metric)`` variants (see
-        # ``_focus_item_consec_fail_days``).
-        config_key=str(get_value("config_key", "") or ""),
-        test=str(get_value("test_name", "") or ""),
-        metric=str(get_value("metric", "") or ""),
-        latest=get_value("latest"),
-        baseline=get_value("baseline"),
-        vs_baseline_pct=get_value("vs_baseline_pct"),
-        status=str(get_value("status", "") or "n/a"),
-        date=str(get_value("date", "") or ""),
-    )
-    if history_fail_lookup:
-        out.consec_fail_days = _focus_item_consec_fail_days(out, history_fail_lookup)
-    return out
-
-
-def _norm_focus_hardware(value: Any) -> str:
-    """Return the focus-table hardware bucket label for a raw hardware value.
-
-    Missing / blank / non-string values collapse to ``"unknown"`` so legacy
-    ``*_history.json`` records (which may lack the field entirely) are still
-    filterable. Otherwise the trimmed string is returned verbatim so labels
-    like ``"H100"``, ``"H200"``, and ``"910"`` round-trip unchanged.
-    """
-    if value is None:
-        return "unknown"
-    text = str(value).strip()
-    return text or "unknown"
-
-
-def _focus_item_sort_key(item: NightlyFocusItem) -> tuple[int, float, str, str, str]:
-    status_rank = {"fail": 0, "normal": 1, "n/a": 2, "pass": 3}
-    pct = _as_num(item.vs_baseline_pct)
-    if pct is None:
-        pct = 999999.0
-    return (status_rank.get(item.status, 4), pct, item.source, item.model, _norm_focus_hardware(item.hardware))
-
-
-def _focus_perf_items(
-    bk_perf_summary: dict[str, Any],
-    local_perf_summary: dict[str, Any],
-    history_fail_lookup: dict[tuple[str, str, str, str], dict[str, bool]] | None = None,
-) -> list[NightlyFocusItem]:
-    items: list[NightlyFocusItem] = []
-    for row in bk_perf_summary.get("rows", []) or []:
-        items.append(_focus_item_from_perf_row("Buildkite", row, history_fail_lookup))
-    for row in local_perf_summary.get("rows", []) or []:
-        items.append(_focus_item_from_perf_row("Local", row, history_fail_lookup))
-    return items
-
-
-def _select_focus_perf_items(items: list[NightlyFocusItem]) -> tuple[str, list[NightlyFocusItem]]:
-    failed = sorted(
-        [item for item in items if item.status == "fail"],
-        key=_focus_item_sort_key,
-    )
-    if failed:
-        return "fail", failed
-    normal = sorted(
-        [item for item in items if item.status == "normal"],
-        key=_focus_item_sort_key,
-    )
-    if normal:
-        return "normal", normal[:3]
-    return "empty", []
-
-
 def _daily_focus_data(
     *,
     bk_jobs: list[dict[str, Any]] | None,
     local_job_rows: list[tuple[str, list[Path], dict[str, Any]]],
-    kanban_cfg: KanbanAssetsConfig,
-    log_dir: Path,
-    gh_token: str | None = None,
-    now: datetime | None = None,
 ) -> dict[str, Any]:
-    bk_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir, exclude_local_overlap=True)
-    local_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir)
-    history_fail_lookup = _compute_history_fail_lookup(kanban_cfg.assets_dir)
-    focus_items = _focus_perf_items(bk_perf_summary, local_perf_summary, history_fail_lookup)
-    focus_kind, _ = _select_focus_perf_items(focus_items)
     bk_job_counts = _buildkite_job_counts(bk_jobs)
     local_job_counts = _local_job_counts(local_job_rows)
-    bk_perf_counts = _perf_counts(bk_perf_summary)
-    local_perf_counts = _perf_counts(local_perf_summary)
     job_fail_count = int(bk_job_counts["fail"]) + int(local_job_counts["fail"])
-    perf_fail_count = int(bk_perf_counts["fail"]) + int(local_perf_counts["fail"])
-    if job_fail_count or perf_fail_count:
+    if job_fail_count:
         conclusion = (
-            f"Attention needed: {job_fail_count} test failure(s)/anomaly(ies) and "
-            f"{perf_fail_count} major performance regression(s) detected."
+            f"Attention needed: {job_fail_count} test failure(s)/anomaly(ies) detected."
         )
         severity = "fail"
-    elif focus_kind == "normal":
-        conclusion = (
-            "No major performance regressions; minor fluctuations remain visible in the "
-            "per-model performance tables."
-        )
-        severity = "normal"
-    elif focus_items:
-        conclusion = "No major performance regressions detected."
-        severity = "ok"
     else:
-        conclusion = "No major regressions could be determined; baseline data is missing or empty."
-        severity = "unknown"
+        conclusion = "All nightly jobs passed; no test failures detected."
+        severity = "ok"
     return {
         "conclusion": conclusion,
         "severity": severity,
-        "focus_kind": focus_kind,
         "bk_job_counts": bk_job_counts,
         "local_job_counts": local_job_counts,
-        "bk_perf_counts": bk_perf_counts,
-        "local_perf_counts": local_perf_counts,
-        "bk_perf_status": bk_perf_summary.get("status", ""),
-        "local_perf_status": local_perf_summary.get("status", ""),
-        "bk_perf_message": bk_perf_summary.get("message", ""),
-        "local_perf_message": local_perf_summary.get("message", ""),
     }
 
 
@@ -3961,8 +3253,6 @@ def _render_manifest_only_note_html(summary: dict[str, Any]) -> str:
 def _render_daily_focus_html(data: dict[str, Any]) -> str:
     bk_jobs = data["bk_job_counts"]
     local_jobs = data["local_job_counts"]
-    bk_perf = data["bk_perf_counts"]
-    local_perf = data["local_perf_counts"]
     cards = [
         _render_focus_metric_card(
             "Buildkite jobs",
@@ -3976,18 +3266,6 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
             f"ok={int(local_jobs['ok'])}, unknown={int(local_jobs['unknown'])}",
             "fail" if local_jobs["fail"] else "ok",
         ),
-        _render_focus_metric_card(
-            "Buildkite perf",
-            f"{int(bk_perf['fail'])} fail",
-            f"pass={int(bk_perf['pass'])}, normal={int(bk_perf['normal'])}, n/a={int(bk_perf['n/a'])}",
-            "fail" if bk_perf["fail"] else "ok",
-        ),
-        _render_focus_metric_card(
-            "Local perf",
-            f"{int(local_perf['fail'])} fail",
-            f"pass={int(local_perf['pass'])}, normal={int(local_perf['normal'])}, n/a={int(local_perf['n/a'])}",
-            "fail" if local_perf["fail"] else "ok",
-        ),
     ]
     parts: list[str] = []
     parts.append(f'<section class="panel nightly-focus nightly-focus--{html.escape(str(data["severity"]))}">')
@@ -3996,24 +3274,13 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
             "h2",
             _SVG_SPARK,
             html.escape("Daily focus"),
-            sub=html.escape("Performance regressions and test failures"),
+            sub=html.escape("Test failures"),
         )
     )
     parts.append(f'<p class="focus-conclusion">{html.escape(str(data["conclusion"]))}</p>')
     parts.append('<div class="focus-card-grid">')
     parts.append("\n".join(cards))
     parts.append("</div>")
-    notes = []
-    if data.get("bk_perf_status") != "ok" and data.get("bk_perf_message"):
-        notes.append(f"Buildkite perf: {data['bk_perf_message']}")
-    if data.get("local_perf_status") != "ok" and data.get("local_perf_message"):
-        notes.append(f"Local perf: {data['local_perf_message']}")
-    if notes:
-        parts.append(
-            '<div class="note"><strong>Data note:</strong><ul>'
-            + "".join(f"<li>{html.escape(str(note))}</li>" for note in notes)
-            + "</ul></div>"
-        )
     parts.append("</section>")
     return "\n".join(parts)
 
@@ -4028,365 +3295,6 @@ def _resolve_github_token() -> str | None:
         if value:
             return value
     return None
-
-
-def _render_perf_model_table_html(table_id: str, rows: list[list[str]]) -> str:
-    """Render one model performance table with per-table dropdown filters."""
-    tests = sorted({r[2] for r in rows if len(r) > 2 and r[2]})
-    metrics = sorted({r[3] for r in rows if len(r) > 3 and r[3]})
-    statuses = sorted({r[7] for r in rows if len(r) > 7 and r[7]})
-
-    def _select_html(key: str, label: str, options: list[str]) -> str:
-        opts = ['<option value="">All</option>']
-        for value in options:
-            val = html.escape(value, quote=True)
-            txt = html.escape(value)
-            opts.append(f'<option value="{val}">{txt}</option>')
-        return (
-            '<label class="perf-filter-label">'
-            f"<span>{html.escape(label)}</span>"
-            f'<select class="perf-filter-select" data-filter-key="{html.escape(key, quote=True)}">'
-            + "".join(opts)
-            + "</select></label>"
-        )
-
-    parts: list[str] = [
-        f'<div class="perf-filter-scope" data-perf-filter-scope="{html.escape(table_id, quote=True)}">',
-        '<div class="perf-filter-bar">',
-        _select_html("test", "Test", tests),
-        _select_html("metric", "Metric", metrics),
-        _select_html("status", "Status", statuses),
-        "</div>",
-    ]
-    parts.append('<div class="table-scroll">')
-    parts.append('<table class="summary perf-filter-table">')
-    parts.append("<thead><tr>")
-    for h in _PERF_TABLE_HEADERS:
-        parts.append(f"<th>{html.escape(h)}</th>")
-    parts.append("</tr></thead><tbody>")
-    for row in rows:
-        test_v = html.escape((row[2] if len(row) > 2 else ""), quote=True)
-        metric_v = html.escape((row[3] if len(row) > 3 else ""), quote=True)
-        status_v = html.escape((row[7] if len(row) > 7 else ""), quote=True)
-        parts.append(f'<tr data-perf-row="1" data-test="{test_v}" data-metric="{metric_v}" data-status="{status_v}">')
-        for cell in row:
-            parts.append(f"<td>{html.escape(cell)}</td>")
-        parts.append("</tr>")
-    parts.append("</tbody></table></div>")
-    parts.append('<p class="note perf-filter-empty" data-perf-empty hidden>No rows match filters.</p>')
-    parts.append("</div>")
-    return "\n".join(parts)
-
-
-def _grouped_rows_from_summary(summary: dict[str, Any]) -> dict[str, list[list[str]]]:
-    grouped_rows: dict[str, list[list[str]]] = {}
-    for item in summary.get("rows", []):
-        model = _md_cell(str(item.get("model") or "unknown"))
-        grouped_rows.setdefault(model, []).append(
-            [
-                _md_cell(str(item.get("model_type") or "")),
-                _md_cell(str(item.get("config_view") or "")),
-                _md_cell(str(item.get("test_name") or "")),
-                _md_cell(str(item.get("metric") or "")),
-                _perf_num(item.get("latest")),
-                _perf_num(item.get("baseline")),
-                _perf_pct(item.get("vs_baseline_pct")),
-                _md_cell(str(item.get("status") or "")),
-            ]
-        )
-    return grouped_rows
-
-
-def _filter_perf_summary_for_local(
-    summary: dict[str, Any],
-    *,
-    log_dir: Path,
-) -> dict[str, Any]:
-    result_root = log_dir.resolve()
-    resolved_dir = resolve_local_perf_result_dir(result_root)
-    perf_files = local_perf_result_files(resolved_dir) if resolved_dir else []
-    local_keys = collect_local_perf_test_keys(resolved_dir)
-
-    out = dict(summary)
-    scope: dict[str, Any] = {
-        "result_root": str(result_root),
-        "resolved_dir": str(resolved_dir) if resolved_dir else "",
-        "perf_file_count": len(perf_files),
-        "test_key_count": len(local_keys),
-    }
-
-    if not perf_files:
-        out["rows"] = []
-        out["status"] = "empty"
-        out["message"] = (
-            f"No local perf JSON under {result_root}. "
-            "Sync logs/nightly_jobs from the cluster before generating the report."
-        )
-        out["summary"] = {"pass": 0, "normal": 0, "fail": 0, "n/a": 0}
-        scope["message"] = (
-            f"No local perf JSON under {result_root}; Local performance baseline comparison "
-            f"shows only synced log-dir cases."
-        )
-        out["local_perf_scope"] = scope
-        return out
-
-    def _is_local_row(row: dict[str, Any]) -> bool:
-        # Authoritative: a genuine local run's ``source_file`` is an actual
-        # local perf JSON filename (timestamp-stripped key matches a local key).
-        # Only fall back to the looser test_name/config_key match when the row
-        # lacks ``source_file`` (e.g. older history.json without provenance),
-        # so a Buildkite record that merely shares the model slug is never
-        # misclassified as Local (see L20X-vs-H100 overlap regression).
-        if row.get("source_file"):
-            return row_source_file_matches_local(row, local_keys)
-        return perf_row_matches_local_test(row, local_keys)
-
-    filtered = [
-        row for row in summary.get("rows", []) if isinstance(row, dict) and _is_local_row(row)
-    ]
-    stats = {"pass": 0, "normal": 0, "fail": 0, "n/a": 0}
-    for row in filtered:
-        st = str(row.get("status") or "n/a")
-        stats[st] = stats.get(st, 0) + 1
-
-    out["rows"] = filtered
-    out["summary"] = stats
-    if filtered:
-        out["status"] = "ok"
-        out["message"] = ""
-        scope["message"] = (
-            f"Synced {len(perf_files)} perf JSON file(s) → showing {len(filtered)} baseline row(s) "
-            f"({len(local_keys)} test key(s))."
-        )
-    else:
-        out["status"] = "empty"
-        out["message"] = (
-            "Local perf JSON present but no kanban history rows matched. "
-            "Run prepare_kanban_before_report.py (manual_* + mkdocs build) then regenerate."
-        )
-        scope["message"] = (
-            f"{len(perf_files)} local perf JSON file(s) present but no kanban history rows matched; "
-            "run prepare_kanban_before_report.py first."
-        )
-    out["local_perf_scope"] = scope
-    return out
-
-
-def _recompute_perf_summary_stats(rows: list[dict[str, Any]]) -> dict[str, int]:
-    stats = {"pass": 0, "normal": 0, "fail": 0, "n/a": 0}
-    for row in rows:
-        st = str(row.get("status") or "n/a")
-        stats[st] = stats.get(st, 0) + 1
-    return stats
-
-
-def _is_genuinely_local_row(row: dict[str, Any], local_keys: frozenset[str]) -> bool:
-    """Whether a history.json perf row is a genuine local run.
-
-    Uses the record's ``source_file`` (the original perf JSON filename, written
-    by ``generate_charts.py``) as the authoritative provenance marker: its
-    timestamp-stripped key matches a local perf JSON key for real local runs and
-    differs for Buildkite CI runs. Falls back to the looser
-    :func:`perf_row_matches_local_test` only when ``source_file`` is absent
-    (older history.json without provenance). This prevents a Buildkite H100
-    record whose ``test_name=minicpmo_4_5`` is a substring of a local
-    ``minicpmo_4_5_omniinteract_l20x`` key from being treated as local.
-    """
-    if row.get("source_file"):
-        return row_source_file_matches_local(row, local_keys)
-    return perf_row_matches_local_test(row, local_keys)
-
-
-def _filter_perf_summary_exclude_local_overlap(
-    summary: dict[str, Any],
-    *,
-    log_dir: Path,
-    local_summary: dict[str, Any],
-) -> dict[str, Any]:
-    """Drop Buildkite rows for tests already covered in Local performance baseline comparison."""
-    if local_summary.get("status") != "ok" or not local_summary.get("rows"):
-        return summary
-
-    resolved_dir = resolve_local_perf_result_dir(log_dir.resolve())
-    local_keys = collect_local_perf_test_keys(resolved_dir)
-    if not local_keys:
-        return summary
-
-    original_rows = [row for row in summary.get("rows", []) if isinstance(row, dict)]
-    # Drop a Buildkite row only when it is genuinely a local run — i.e. its
-    # ``source_file`` is an actual local perf JSON. The looser
-    # ``perf_row_matches_local_test`` substring match (off ``test_name``) would
-    # also evict Buildkite H100 rows that merely share the model slug with a
-    # local L20X run, making the H100 row vanish from the Buildkite section AND
-    # reappear mislabeled as Local. Guarding eviction on ``source_file`` keeps
-    # such Buildkite-only rows in the Buildkite section where they belong.
-    filtered = [row for row in original_rows if not _is_genuinely_local_row(row, local_keys)]
-
-    out = dict(summary)
-    out["rows"] = filtered
-    out["summary"] = _recompute_perf_summary_stats(filtered)
-    if filtered:
-        out["status"] = "ok"
-        out["message"] = ""
-    else:
-        out["status"] = "empty"
-        out["message"] = "No Buildkite-only baseline rows; cases with local perf JSON are shown under Local Test only."
-    return out
-
-
-def _buildkite_perf_rows(
-    kanban_cfg: KanbanAssetsConfig,
-    *,
-    log_dir: Path | None = None,
-    exclude_local_overlap: bool = False,
-) -> tuple[dict[str, Any], dict[str, list[list[str]]]]:
-    # Compute local perf test keys up front so build_assets_perf_summary can
-    # gate the no-baseline fallback (baseline=0 rows) to local records only,
-    # keeping Buildkite-only no-baseline records hidden.
-    local_keys: frozenset[str] | None = None
-    if log_dir is not None:
-        resolved_dir = resolve_local_perf_result_dir(log_dir.resolve())
-        local_keys = (
-            collect_local_perf_test_keys(resolved_dir) if resolved_dir else frozenset()
-        )
-    summary = build_assets_perf_summary(
-        assets_dir=kanban_cfg.assets_dir,
-        kanban_repo_root=kanban_cfg.repo_root,
-        expected_remote=kanban_cfg.expected_remote,
-        expected_branch=kanban_cfg.expected_branch,
-        local_keys=local_keys,
-    )
-    if kanban_cfg.refresh_note:
-        summary.setdefault("warnings", []).append(kanban_cfg.refresh_note)
-    for warning in kanban_cfg.refresh_warnings:
-        summary.setdefault("warnings", []).append(warning)
-    if summary.get("status") != "ok" or kanban_cfg.refresh_warnings:
-        summary["raw_fallback"] = _kanban_raw_assets_diagnostic(kanban_cfg, summary)
-    if log_dir is not None:
-        local_summary = _filter_perf_summary_for_local(summary, log_dir=log_dir)
-        if exclude_local_overlap:
-            if local_summary.get("rows"):
-                summary = _filter_perf_summary_exclude_local_overlap(
-                    summary,
-                    log_dir=log_dir,
-                    local_summary=local_summary,
-                )
-        else:
-            summary = local_summary
-    grouped_rows = _grouped_rows_from_summary(summary)
-    return summary, grouped_rows
-
-
-def _kanban_fallback_items(summary: dict[str, Any]) -> list[str]:
-    diag = summary.get("raw_fallback") or {}
-    if not isinstance(diag, dict):
-        return []
-    items = [
-        "Local nightly_jobs is for pass/fail analysis only; Local performance baseline comparison "
-        "shows logs/nightly_jobs synced cases; Buildkite performance baseline comparison "
-        "reads all models from kanban docs/assets/charts/*_history.json.",
-    ]
-    raw_root = str(diag.get("raw_root") or "")
-    if raw_root:
-        items.append(f"kanban raw root: {raw_root}")
-    raw_count = int(diag.get("raw_file_count") or 0)
-    if diag.get("raw_exists"):
-        items.append(f"raw perf JSON files: {raw_count}")
-    else:
-        items.append("raw perf JSON root is missing or not a directory.")
-    build_ids = diag.get("raw_build_ids") or []
-    if build_ids:
-        items.append("recent raw build ids: " + ", ".join(str(v) for v in build_ids))
-    if diag.get("raw_latest_mtime"):
-        items.append(f"latest raw mtime: {diag.get('raw_latest_mtime')}")
-    items.append(f"history files: {int(diag.get('history_file_count') or 0)}")
-    if diag.get("history_latest_mtime"):
-        items.append(f"latest history mtime: {diag.get('history_latest_mtime')}")
-    if raw_count:
-        items.append(
-            "Raw data is present. Re-run with --kanban-refresh-from-raw to invoke kanban sync "
-            "+ generate_charts before rendering."
-        )
-    elif diag.get("recommended_command"):
-        items.append(f"Refresh command pattern: {diag.get('recommended_command')}")
-    return items
-
-
-def _render_kanban_fallback_html(summary: dict[str, Any]) -> str:
-    items = _kanban_fallback_items(summary)
-    if not items:
-        return ""
-    return (
-        '<div class="note"><strong>Raw data fallback diagnostics:</strong><ul>'
-        + "".join(f"<li>{html.escape(item)}</li>" for item in items)
-        + "</ul></div>"
-    )
-
-
-def _render_buildkite_perf_inner_html(
-    kanban_cfg: KanbanAssetsConfig,
-    *,
-    model_subcard_class: str = "report-subcard--bk-perf-model",
-    log_dir: Path | None = None,
-    exclude_local_overlap: bool = False,
-) -> str:
-    summary, grouped_rows = _buildkite_perf_rows(
-        kanban_cfg,
-        log_dir=log_dir,
-        exclude_local_overlap=exclude_local_overlap,
-    )
-    # Verbose diagnostic lines (Data source / Local filter / History / generated_at /
-    # Raw data fallback diagnostics) were removed: the HTML perf comparison card should
-    # focus on per-model baseline rows. Diagnostics remain available in
-    # `_buildkite_perf_rows` / `_kanban_fallback_items` for tooling.
-    parts: list[str] = []
-    warnings = summary.get("warnings") or []
-    if warnings:
-        warn_html = "".join(f"<li>{html.escape(str(w))}</li>" for w in warnings)
-        parts.append(f'<div class="note"><strong>Source config notes:</strong><ul>{warn_html}</ul></div>')
-    if summary.get("status") != "ok":
-        msg = summary.get("message") or ""
-        if msg:
-            parts.append(f'<p class="note">{html.escape(str(msg))}</p>')
-        return "\n".join(parts)
-    parts.append(
-        '<p class="hint">'
-        + (
-            "Showing baseline comparison in kanban history only for cases with perf JSON under logs/nightly_jobs."
-            if log_dir is not None and not exclude_local_overlap
-            else (
-                "Showing Buildkite-only baseline rows; cases with local perf JSON appear under Local Test only."
-                if exclude_local_overlap
-                else (
-                    f"Showing each model's latest baseline record "
-                    f"(freshest = {html.escape(str(summary.get('latest_day') or 'N/A'))}; "
-                    "models on different schedules may use different dates)."
-                )
-            )
-        )
-        + "</p>"
-    )
-    stats = summary.get("summary", {})
-    parts.append(
-        '<p class="meta"><strong>Stats:</strong> '
-        f"pass={int(stats.get('pass', 0))}, "
-        f"normal={int(stats.get('normal', 0))}, "
-        f"fail={int(stats.get('fail', 0))}, "
-        f"n/a={int(stats.get('n/a', 0))}</p>"
-    )
-    for i, model_name in enumerate(sorted(grouped_rows.keys())):
-        model_rows = grouped_rows[model_name]
-        table_html = _render_perf_model_table_html(f"perf-model-{i}", model_rows)
-        parts.append(
-            _details_subcard(
-                f"{model_name} ({len(model_rows)} rows)",
-                table_html,
-                open_default=False,
-                details_class=model_subcard_class,
-                icon_paths=_SVG_LIST,
-            )
-        )
-    return "\n".join(parts)
 
 
 def _excerpt_storage_id(report_context: str, node: str, row_index: int) -> str:
@@ -4627,13 +3535,11 @@ def _render_buildkite_section_html(
     job_records: list[dict[str, Any]] | None,
     *,
     note: str | None,
-    kanban_cfg: KanbanAssetsConfig,
     target: BkTarget,
     log_dir: Path | None = None,
     open_default: bool = False,
     chapter_title: str | None = None,
     chapter_sub: str | None = None,
-    include_perf: bool = True,
     report_kind: str = "scheduled nightly",
     details_class_suffix: str = "",
 ) -> str:
@@ -4641,7 +3547,7 @@ def _render_buildkite_section_html(
 
     Each chapter (CUDA / NPU nightly, CUDA weekly builds) is wrapped in its
     own ``<details>`` element so the user can fold or expand the whole
-    chapter independently. Inner sub-cards (Summary / Performance / Failure
+    chapter independently. Inner sub-cards (Summary / Failure
     analysis) retain their existing per-section collapsibility.
     ``chapter_title`` / ``chapter_sub`` / ``report_kind`` /
     ``details_class_suffix`` customize the weekly-build variants; the
@@ -4771,25 +3677,6 @@ def _render_buildkite_section_html(
             icon_paths=_SVG_ALERT,
         ),
     ]
-    # CUDA keeps the kanban-backed Performance baseline comparison.
-    # NPU pipeline has no kanban-side perf history yet, so the perf sub-card
-    # is omitted there; weekly-build chapters opt out via ``include_perf``.
-    # Toggle by adding/removing this `if` branch.
-    if target is not NPU_TARGET and include_perf:
-        sub_cards.insert(
-            1,
-            _details_subcard(
-                "Performance baseline comparison",
-                _render_buildkite_perf_inner_html(
-                    kanban_cfg,
-                    log_dir=log_dir,
-                    exclude_local_overlap=log_dir is not None,
-                ),
-                open_default=False,
-                details_class="report-subcard--bk-perf",
-                icon_paths=_SVG_CHART_BARS,
-            ),
-        )
     chapter_body = "\n".join(sub_cards)
 
     op = " open" if open_default else ""
@@ -5519,7 +4406,6 @@ def emit_report_html(
     log_dir: Path,
     out_fp: Any,
     bk_results: dict[BkTarget, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
-    kanban_cfg: KanbanAssetsConfig | None = None,
     weekly_results: dict[str, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
     issue_alert: bool = True,
 ) -> None:
@@ -5533,11 +4419,6 @@ def emit_report_html(
     if groups is None:
         groups = discovered
     manifest_only_total = 0
-    if kanban_cfg is None:
-        kanban_cfg = KanbanAssetsConfig(
-            assets_dir=DEFAULT_KANBAN_ASSETS_DIR,
-            repo_root=DEFAULT_KANBAN_REPO_ROOT,
-        )
     if bk_results is None:
         bk_results = {t: (None, None, None) for t in ALL_BK_TARGETS}
 
@@ -5629,10 +4510,6 @@ def emit_report_html(
             _daily_focus_data(
                 bk_jobs=cuda_jobs,
                 local_job_rows=job_rows,
-                kanban_cfg=kanban_cfg,
-                log_dir=log_dir,
-                gh_token=_resolve_github_token(),
-                now=report_now,
             )
         )
     )
@@ -5676,7 +4553,6 @@ def emit_report_html(
                 bk_build,
                 bk_jobs,
                 note=bk_note,
-                kanban_cfg=kanban_cfg,
                 target=target,
                 log_dir=log_dir,
             )
@@ -5694,12 +4570,10 @@ def emit_report_html(
                         wk_build,
                         wk_jobs,
                         note=wk_note,
-                        kanban_cfg=kanban_cfg,
                         target=CUDA_TARGET,
                         log_dir=None,
                         chapter_title=f"Buildkite (CUDA) · {wk_label} build",
                         chapter_sub=f"{CUDA_TARGET.org}/{CUDA_TARGET.pipeline} · latest {wk_label} build",
-                        include_perf=False,
                         report_kind=f"{wk_label} build",
                         details_class_suffix=f"-{kind}",
                     )
@@ -5730,19 +4604,6 @@ def emit_report_html(
             open_default=False,
             details_class="",
             icon_paths=_SVG_LIST,
-        )
-    )
-    local_chunks.append(
-        _details_subcard(
-            "Performance baseline comparison",
-            _render_buildkite_perf_inner_html(
-                kanban_cfg,
-                model_subcard_class="report-subcard--local-perf-model",
-                log_dir=log_dir,
-            ),
-            open_default=False,
-            details_class="report-subcard--local-perf-baseline",
-            icon_paths=_SVG_CHART_BARS,
         )
     )
 
@@ -6011,43 +4872,6 @@ def main() -> None:
         help="Pin Buildkite build number (default: latest scheduled nightly on main).",
     )
     parser.add_argument(
-        "--kanban-assets-dir",
-        type=Path,
-        default=DEFAULT_KANBAN_ASSETS_DIR,
-        help=f"Path to {KANBAN_REPO_URL} docs/assets/charts for Buildkite performance summary.",
-    )
-    parser.add_argument(
-        "--kanban-repo-root",
-        type=Path,
-        default=DEFAULT_KANBAN_REPO_ROOT,
-        help=(
-            f"Local clone root of {KANBAN_REPO_URL}; "
-            "resolves docs/assets/charts and enables source validation "
-            f"(default: $KANBAN_REPO_ROOT or {DEFAULT_KANBAN_REPO_ROOT_DISPLAY})."
-        ),
-    )
-    parser.add_argument(
-        "--kanban-expected-remote",
-        default=None,
-        help="Expected kanban upstream remote name (for warning only), e.g. upstream.",
-    )
-    parser.add_argument(
-        "--kanban-expected-branch",
-        default=None,
-        help="Expected kanban branch name (for warning only), e.g. main.",
-    )
-    parser.add_argument(
-        "--kanban-raw-root",
-        type=Path,
-        default=None,
-        help="Optional kanban raw perf artifact root (default: <kanban-repo-root>/data/buildkite_nightly_raw).",
-    )
-    parser.add_argument(
-        "--kanban-refresh-from-raw",
-        action="store_true",
-        help="Opt-in: run kanban raw sync + generate_charts before reading docs/assets/charts history.",
-    )
-    parser.add_argument(
         "--title",
         default=None,
         help="Report title (default: Nightly Buildkite report - <report-date>).",
@@ -6081,21 +4905,6 @@ def main() -> None:
         targets=ALL_BK_TARGETS,
     )
     weekly_results = _resolve_weekly_builds_for_report(include=not args.no_buildkite)
-    kanban_cfg = KanbanAssetsConfig(
-        assets_dir=args.kanban_assets_dir.resolve() if args.kanban_assets_dir else None,
-        repo_root=args.kanban_repo_root.resolve() if args.kanban_repo_root else None,
-        expected_remote=(args.kanban_expected_remote or "").strip() or None,
-        expected_branch=(args.kanban_expected_branch or "").strip() or None,
-        raw_root=args.kanban_raw_root.resolve() if args.kanban_raw_root else None,
-        refresh_from_raw=bool(args.kanban_refresh_from_raw),
-    )
-    if kanban_cfg.refresh_from_raw:
-        refresh_note, refresh_warnings = _run_kanban_refresh_from_raw(
-            kanban_cfg.repo_root,
-            _resolve_kanban_raw_root(kanban_cfg),
-        )
-        kanban_cfg.refresh_note = refresh_note
-        kanban_cfg.refresh_warnings = refresh_warnings
 
     if args.html_report:
         out = args.html_report
@@ -6107,7 +4916,6 @@ def main() -> None:
                 log_dir=log_dir,
                 out_fp=fp,
                 bk_results=bk_results,
-                kanban_cfg=kanban_cfg,
                 weekly_results=weekly_results,
                 issue_alert=not args.no_issue_alert,
             )
@@ -6119,7 +4927,6 @@ def main() -> None:
             log_dir=log_dir,
             out_fp=sys.stdout,
             bk_results=bk_results,
-            kanban_cfg=kanban_cfg,
             weekly_results=weekly_results,
             issue_alert=not args.no_issue_alert,
         )

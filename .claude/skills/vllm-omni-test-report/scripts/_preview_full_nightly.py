@@ -358,14 +358,6 @@ def _fake_compute_outstanding_di(gh_token=None, *, now=None, overrides=None):
     }
 
 
-def _fake_buildkite_perf_rows(kanban_cfg, *, log_dir=None, exclude_local_overlap=False):
-    return ({}, [])
-
-
-def _fake_compute_history_fail_lookup(assets_dir):
-    return {}
-
-
 def _fake_resolve_buildkite_for_report(include, build_no, targets=None):
     from nightly_local_log_report import ALL_BK_TARGETS
 
@@ -378,8 +370,6 @@ def _fake_parse_previous_nightly_di_overrides(repo_root, *, today=None):
 
 n._compute_top_legacy_prs = _fake_compute_top_legacy_prs
 n._compute_outstanding_di = _fake_compute_outstanding_di
-n._buildkite_perf_rows = _fake_buildkite_perf_rows
-n._compute_history_fail_lookup = _fake_compute_history_fail_lookup
 n._resolve_buildkite_for_report = _fake_resolve_buildkite_for_report
 n._parse_previous_nightly_di_overrides = _fake_parse_previous_nightly_di_overrides
 
