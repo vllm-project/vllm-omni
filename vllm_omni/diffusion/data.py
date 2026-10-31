@@ -2199,10 +2199,16 @@ class AttentionSpec:
     sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
+    # Split this role's Ulysses QKV all-to-all along the head axis into N
+    # groups and run each group's attention behind its own completion event, so
+    # group N's attention overlaps group N+1's collective. 0 (default) off.
+    head_overlap: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str):
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
+        if not isinstance(self.head_overlap, int) or self.head_overlap < 0:
+            raise ValueError(f"head_overlap must be a non-negative integer; got {self.head_overlap!r}")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
@@ -2381,6 +2387,7 @@ class AttentionConfig:
             "fastvideo_vsa_precision",
             "sparge",
             "block_sparse",
+            "head_overlap",
         }
         node_dict = dict(node)
         node_keys = set(node_dict)
