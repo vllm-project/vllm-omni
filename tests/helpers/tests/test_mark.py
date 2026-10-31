@@ -62,6 +62,60 @@ def test_npu_card_count_mark_is_independent_of_sku():
     assert "gpu" not in names
 
 
+def test_oot_resource_selects_matching_out_of_tree_device(monkeypatch):
+    import vllm_omni.platforms
+
+    class OutOfTreePlatform:
+        def is_out_of_tree(self):
+            return True
+
+        def get_device_name(self):
+            return "Tenstorrent Wormhole"
+
+        def get_device_count(self):
+            return 2
+
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", OutOfTreePlatform())
+    marks = hardware_marks(res={"oot": "Tenstorrent"}, num_cards=2)
+    assert _mark_names(marks) >= {"oot", "cards_2"}
+    assert next(mark for mark in marks if mark.name == "oot").kwargs == {"resource": "Tenstorrent"}
+    assert next(mark for mark in marks if mark.name == "skipif").args == (False,)
+
+
+def test_oot_resource_skips_a_different_platform(monkeypatch):
+    import vllm_omni.platforms
+
+    class InTreePlatform:
+        def is_out_of_tree(self):
+            return False
+
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", InTreePlatform())
+    marks = hardware_marks(res={"oot": "Tenstorrent"})
+    assert next(mark for mark in marks if mark.name == "skipif").args == (True,)
+
+
+@pytest.mark.parametrize(
+    ("device_name", "device_count"),
+    [("AMD MI300X", 2), ("Tenstorrent Wormhole", 1)],
+)
+def test_oot_resource_skips_mismatched_or_undersized_device(monkeypatch, device_name, device_count):
+    import vllm_omni.platforms
+
+    class OutOfTreePlatform:
+        def is_out_of_tree(self):
+            return True
+
+        def get_device_name(self):
+            return device_name
+
+        def get_device_count(self):
+            return device_count
+
+    monkeypatch.setattr(vllm_omni.platforms, "current_omni_platform", OutOfTreePlatform())
+    marks = hardware_marks(res={"oot": "Tenstorrent"}, num_cards=2)
+    assert next(mark for mark in marks if mark.name == "skipif").args == (True,)
+
+
 def test_hardware_marks_rejects_mixed_counts_on_one_item():
     with pytest.raises(ValueError, match="different per-platform num_cards"):
         hardware_marks(

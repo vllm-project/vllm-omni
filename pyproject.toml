@@ -318,6 +318,7 @@ markers = [
     "xpu: [hardware-platform] [gpu] Tests that run on XPU (auto-added)",
     "npu: [hardware-platform] Tests that run on NPU/Ascend (auto-added)",
     "musa: [hardware-platform] [gpu] Tests that run on MUSA/Moore Threads (auto-added)",
+    "oot: [hardware-platform] Tests for out-of-tree platforms (auto-added)",
     # specified computation resources marks (auto-added)
     # [hardware-resource] + [cuda]/[rocm]/[xpu]/[npu]/[musa] for hardware_test(res=...).
     # Do not put [gpu] on SKU lines: that would make gpu a res key.

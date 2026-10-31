@@ -79,3 +79,21 @@ def test_omni_disable_log_stats_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     _run_fixture(OmniServerParams(model="fake-model", use_omni=True, server_args=["--disable-log-stats"]))
     assert "--disable-log-stats" in captured
     assert "--log-stats" not in captured
+
+
+def test_omni_deploy_config_can_be_overridden_by_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _capture_server_args(monkeypatch)
+    monkeypatch.setenv("VLLM_OMNI_TEST_DEPLOY_CONFIG", "/tmp/oot-deploy.yaml")
+    _run_fixture(OmniServerParams(model="fake-model", use_omni=True))
+    assert captured[captured.index("--deploy-config") + 1] == "/tmp/oot-deploy.yaml"
+
+
+def test_omni_deploy_config_keeps_run_level_default_without_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _capture_server_args(monkeypatch)
+    monkeypatch.delenv("VLLM_OMNI_TEST_DEPLOY_CONFIG", raising=False)
+    monkeypatch.setattr(
+        "tests.helpers.stage_config.stage_config_path_for_run_level",
+        lambda config_path, run_level: f"{config_path}:{run_level}",
+    )
+    _run_fixture(OmniServerParams(model="fake-model", use_omni=True, stage_config_path="base.yaml"))
+    assert captured[captured.index("--deploy-config") + 1] == "base.yaml:core_model"

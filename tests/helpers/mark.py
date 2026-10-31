@@ -250,7 +250,7 @@ def _res_platforms() -> frozenset[str]:
     A ``[hardware-platform]`` name is a ``res`` key only if some SKU is tagged
     with that platform (``[cuda]``, ``[npu]``, …). ``cpu`` / ``gpu`` have no SKUs.
     """
-    return frozenset(p for p in get_supported_platforms() if get_skus_for_platform(p))
+    return frozenset(p for p in get_supported_platforms() if get_skus_for_platform(p)) | {"oot"}
 
 
 def _normalize_num_cards(res: dict[str, SkuSpec], num_cards: int | dict[str, int]) -> dict[str, int]:
@@ -284,6 +284,20 @@ def _normalize_num_cards(res: dict[str, SkuSpec], num_cards: int | dict[str, int
 def _marks_for_platform(platform: str, resource: SkuSpec, num_cards: int) -> list[pytest.MarkDecorator]:
     import pytest
 
+    if platform == "oot":
+        if not isinstance(resource, str):
+            raise ValueError(f"oot resource must be a string, got {resource!r}")
+        from vllm_omni.platforms import current_omni_platform
+
+        marks = [pytest.mark.oot(resource=resource), _cards_mark(num_cards)]
+        return marks + [
+            pytest.mark.skipif(
+                not current_omni_platform.is_out_of_tree()
+                or resource.casefold() not in current_omni_platform.get_device_name().casefold()
+                or current_omni_platform.get_device_count() < num_cards,
+                reason=f"Requires out-of-tree platform {resource} with {num_cards} device(s)",
+            )
+        ]
     if platform == "cuda":
         marks = _cuda_marks(res=resource, num_cards=num_cards)
     else:
@@ -310,6 +324,7 @@ def _skipif_not_platform(platform: str) -> pytest.MarkDecorator:
     from vllm_omni.platforms import current_omni_platform
 
     checkers = {
+        "oot": current_omni_platform.is_out_of_tree,
         "cuda": current_omni_platform.is_cuda,
         "rocm": current_omni_platform.is_rocm,
         "xpu": current_omni_platform.is_xpu,
