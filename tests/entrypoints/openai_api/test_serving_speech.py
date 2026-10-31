@@ -431,7 +431,15 @@ def client(test_app):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enable_scale_out", [False, True], ids=["default", "scale-out"])
-async def test_server_worker_applies_speech_only_endpoint_restrictions(mocker: MockerFixture, enable_scale_out):
+async def test_server_worker_applies_speech_only_endpoint_restrictions(
+    mocker: MockerFixture, request: pytest.FixtureRequest, enable_scale_out
+):
+    # SageMaker route registration imports a dependency that sets the process
+    # root log level. Restore the incoming level after this in-process worker.
+    root_logger = logging.getLogger()
+    root_log_level = root_logger.level
+    request.addfinalizer(lambda: root_logger.setLevel(root_log_level))
+
     class FakeCompletionHandler:
         def __init__(self):
             self.create_completion = mocker.AsyncMock(return_value={"id": "cmpl", "choices": []})
