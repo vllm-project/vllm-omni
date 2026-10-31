@@ -14,6 +14,11 @@ from vllm.config import VllmConfig
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    require_attention_schedule_fits,
+    select_attention_profile,
+)
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
@@ -51,6 +56,15 @@ class ForwardContext:
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
     total_denoise_steps: int | None = None
+    # Bound request schedule. None means unbound. () disables. A non-empty tuple
+    # selects prepared profiles while a denoise step is published.
+    attention_schedule: AttentionSchedule | None = None
+    # Whether the bound schedule is the request's own rather than an inherited service default.
+    attention_schedule_from_request: bool = False
+    # Profile selected for (attention_schedule, denoise_step_idx, total_denoise_steps);
+    # every scheduled layer in one step reads it instead of selecting again.
+    _attention_profile_key: tuple[AttentionSchedule, int, int] | None = None
+    _attention_profile: str | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
@@ -293,6 +307,44 @@ def override_paged_kv_adapter(adapter: Any | None):
         _forward_context.paged_kv_adapter = previous
 
 
+@contextmanager
+def bind_attention_schedule(schedule: AttentionSchedule | None, *, from_request: bool = False):
+    """Install one request schedule and restore the previous one on any exit.
+
+    ``from_request`` marks ranges the request sent itself; begin_scheduled_denoise checks only those.
+    """
+    if _forward_context is None:
+        raise RuntimeError("bind_attention_schedule requires an active forward context")
+    previous = _forward_context.attention_schedule, _forward_context.attention_schedule_from_request
+    _forward_context.attention_schedule = None if schedule is None else tuple(schedule)
+    _forward_context.attention_schedule_from_request = from_request
+    try:
+        yield
+    finally:
+        _forward_context.attention_schedule, _forward_context.attention_schedule_from_request = previous
+
+
+def get_attention_schedule_profile() -> str | None:
+    """Return the profile the bound schedule selects for the published step, or None.
+
+    The selection is computed once per (schedule, step, total) and reused by every
+    scheduled layer in that step.
+    """
+    ctx = _forward_context
+    if ctx is None or not ctx.attention_schedule or ctx.denoise_step_idx is None:
+        return None
+    total = ctx.total_denoise_steps
+    if total is None:
+        raise RuntimeError("an attention schedule needs total_denoise_steps published with denoise_step_idx")
+    key = (ctx.attention_schedule, ctx.denoise_step_idx, total)
+    if key != ctx._attention_profile_key:
+        ctx._attention_profile = select_attention_profile(
+            ctx.attention_schedule, ctx.denoise_step_idx, total_steps=total
+        )
+        ctx._attention_profile_key = key
+    return ctx._attention_profile
+
+
 def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
@@ -302,6 +354,66 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
             if callable(ensure_active):
                 ensure_active(step_idx)
+
+
+def begin_scheduled_denoise(total_steps: int) -> int | None:
+    """Check the request's own bound schedule against one denoise sequence before its first forward.
+
+    An inherited service default is not checked: it serves requests of any length, and a range that
+    ends after this sequence applies up to its last step.
+    Returns ``total_steps`` when a non-empty schedule is bound, else None. A pipeline that
+    publishes a total only for schedules passes the result through, so an unscheduled run
+    keeps publishing no total (RAINFUSION with end_step runs dense while the total is None).
+    Call it once per sequence that restarts at step 0.
+    """
+    if _forward_context is None or not _forward_context.attention_schedule:
+        return None
+    if _forward_context.attention_schedule_from_request:
+        require_attention_schedule_fits(_forward_context.attention_schedule, total_steps)
+    return total_steps
+
+
+@contextmanager
+def clear_scheduled_denoise_step_on_exit(total_steps: int | None):
+    """Clear the step and total a scheduled denoise loop published, on any exit of the loop.
+
+    ``total_steps`` is the result of ``begin_scheduled_denoise``. Work after the loop, such as VAE
+    decode, runs outside the denoise schedule, and a forward that raises mid-loop leaves no step
+    published either. Without a schedule (None) the context is left as the loop left it.
+    Unlike HunyuanImage-3.0's ``_clear_denoise_progress_on_exit``, which restores the timestep and
+    total on every run, this keeps unscheduled Wan2.2 runs unchanged; do not merge the two.
+    """
+    try:
+        yield
+    finally:
+        if total_steps is not None and _forward_context is not None:
+            set_forward_context_denoise_step_idx(None)
+            _forward_context.total_denoise_steps = None
+
+
+@contextmanager
+def request_denoise_progress(step_idx: int, total_steps: int, timestep: float | None = None):
+    """Publish one request's progress around its own forward and restore the previous values on any exit.
+
+    For scheduled requests that share a denoise_step call but not their progress: each request
+    is evaluated separately under its own step, total and timestep. Restoring assigns the saved
+    fields directly, so a restore never calls the paged runtime's ensure_active.
+    """
+    if _forward_context is None:
+        raise RuntimeError("request_denoise_progress requires an active forward context")
+    ctx = _forward_context
+    previous_step = ctx.denoise_step_idx
+    previous_timestep = ctx.denoise_timestep
+    previous_total = ctx.total_denoise_steps
+    try:
+        set_forward_context_denoise_step_idx(step_idx)
+        ctx.denoise_timestep = None if timestep is None else float(timestep)
+        ctx.total_denoise_steps = total_steps
+        yield
+    finally:
+        ctx.denoise_step_idx = previous_step
+        ctx.denoise_timestep = previous_timestep
+        ctx.total_denoise_steps = previous_total
 
 
 def get_paged_kv_computed_tokens() -> tuple[int, ...]:
