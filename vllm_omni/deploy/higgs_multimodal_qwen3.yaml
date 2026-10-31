@@ -122,7 +122,7 @@ platforms:
   # CUDA/v2-only and ignored on the fallbacks.
   rocm:
     model_runner: v1
-    connectors:
+    connectors: &v1_connector_geometry
       connector_of_shared_memory:
         extra:
           codec_left_context_frames: 25
@@ -139,12 +139,7 @@ platforms:
     # Stage 1 (code2wav) is a generation stage; NPU generation workers
     # reject model_runner v2 at init. Both stages run V1.
     model_runner: v1
-    connectors:
-      connector_of_shared_memory:
-        extra:
-          codec_left_context_frames: 25
-          codec_right_holdback_frames: 4
-          initial_codec_chunk_frames: 1
+    connectors: *v1_connector_geometry
     stages:
       - stage_id: 0
         enforce_eager: true
@@ -153,12 +148,7 @@ platforms:
   xpu:
     # XPU rejects any v2 stage at deploy load.
     model_runner: v1
-    connectors:
-      connector_of_shared_memory:
-        extra:
-          codec_left_context_frames: 25
-          codec_right_holdback_frames: 4
-          initial_codec_chunk_frames: 1
+    connectors: *v1_connector_geometry
     stages:
       - stage_id: 0
         # FlashInfer is not supported on XPU. Both stages share one 32 GiB card.
@@ -171,12 +161,7 @@ platforms:
         gpu_memory_utilization: 0.15
   musa:
     model_runner: v1
-    connectors:
-      connector_of_shared_memory:
-        extra:
-          codec_left_context_frames: 25
-          codec_right_holdback_frames: 4
-          initial_codec_chunk_frames: 1
+    connectors: *v1_connector_geometry
     stages:
       - stage_id: 0
         enforce_eager: true

@@ -3227,6 +3227,9 @@ class TestPlatformOverrides:
             assert extra["codec_left_context_frames"] == 25, platform
             assert extra["codec_right_holdback_frames"] == 4, platform
             assert extra["initial_codec_chunk_frames"] == 1, platform
+            # The restore is a deep merge: untouched extra keys survive.
+            assert extra["codec_chunk_frames"] == 25, platform
+            assert extra["codec_streaming"] is True, platform
 
         # The v2 default path keeps the graph-coupled chunk shape.
         cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
@@ -3241,6 +3244,12 @@ class TestPlatformOverrides:
         with pytest.raises(ValueError, match="no_such_connector"):
             _apply_platform_overrides(deploy, platform="rocm")
 
+        # And each override must itself be a mapping.
+        deploy = load_deploy_config(deploy_path)
+        deploy.platforms["rocm"]["connectors"] = {"connector_of_shared_memory": None}
+        with pytest.raises(ValueError, match="must be a mapping"):
+            _apply_platform_overrides(deploy, platform="rocm")
+
         rocm = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
         assert rocm.stages[0].attention_backend == "TRITON_ATTN"
 
@@ -3249,6 +3258,26 @@ class TestPlatformOverrides:
         assert xpu.stages[0].gpu_memory_utilization == 0.4
         assert xpu.stages[1].gpu_memory_utilization == 0.15
         assert xpu.stages[1].enforce_eager is True
+
+    def test_platform_connector_overrides_merge_with_base_config(self):
+        from vllm_omni.config.stage_config import _merge_platforms
+
+        base = {
+            "rocm": {
+                "model_runner": "v1",
+                "connectors": {
+                    "connector_of_shared_memory": {
+                        "extra": {"codec_left_context_frames": 25, "initial_codec_chunk_frames": 1}
+                    }
+                },
+            }
+        }
+        overlay = {"rocm": {"connectors": {"connector_of_shared_memory": {"extra": {"initial_codec_chunk_frames": 2}}}}}
+        merged = _merge_platforms(base, overlay)["rocm"]
+        assert merged["model_runner"] == "v1"
+        extra = merged["connectors"]["connector_of_shared_memory"]["extra"]
+        assert extra["codec_left_context_frames"] == 25
+        assert extra["initial_codec_chunk_frames"] == 2
 
     def test_higgs_audio_v3_v2_rejects_unsupported_default_sampling_params(self):
         """Non-neutral unsupported sampling defaults fail at startup under v2.
