@@ -619,12 +619,21 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     @staticmethod
     def _materialize_full_payload_entry(entry):
         if len(entry) == 2:
-            return entry
+            output, request = entry
+            if isinstance(output, dict):
+                output = dict(output)
+                output["meta.full_payload_snapshot"] = torch.ones((), dtype=torch.bool)
+            return output, request
         chunks, latest, _rows, request = entry
         output = dict(latest)
         for k, tensors in chunks.items():
             if tensors:
                 output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+        # Declares the emission a cumulative snapshot so accumulators replace
+        # instead of concatenating; see CHUNK_METADATA_KEYS in
+        # outputs/multimodal_accumulation.py. A tensor (not a bool) so every
+        # payload transport serializes it unchanged.
+        output["meta.full_payload_snapshot"] = torch.ones((), dtype=torch.bool)
         return output, request
 
     def _resolve_full_payload_replace_keys(self) -> frozenset[str]:
