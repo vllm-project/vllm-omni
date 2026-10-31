@@ -38,6 +38,40 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 MiniMax-H3 decode latency. It preserves the video encoder and audio VAE but
 can change generated pixels. Enable it with `additional_config.lightvae_decoder_path`.
 
+#### Experimental MiniMax-H3 Reference Isolation
+
+`--kv-isolate` changes MiniMax-H3's bidirectional attention: visual-reference
+queries read only visual-reference K/V, while other valid queries can read all
+valid K/V. A fixed reference condition timestep allows one reference-KV capture
+per request. Reuse uses pinned Host INT8 storage and asynchronous prefetch into
+a two-layer device ring, rather than retaining every layer's cache on device.
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va --kv-isolate
+```
+
+| Configuration | Behavior |
+|---------------|----------|
+| Neither KV flag | Existing model path |
+| Only `--kv-offload-config` | Existing periodic reference-KV refresh policy |
+| Only `--kv-isolate` | Isolation, one-time capture, Host INT8 and asynchronous prefetch |
+| Both flags | Same as isolation alone; the entire offload configuration is ignored |
+
+This option defaults to off and does not use an environment-variable switch.
+The initial implementation supports single-request full-loop inference with
+local attention or pure Ulysses, using Flash, SDPA or RainFusion. It rejects
+VDN-H3, ControlNet, latent editing, step execution, Ring/AllGather, scheduler-paged
+KV, multi-request packed inference and additional semantic masks. RainFusion
+can sparsify dynamic queries; reference queries execute reference-only dense
+attention. Cache-DiT history is invalidated at reference-version or layout
+boundaries; enabling isolation does not add a hit-priority refresh policy.
+
+**Isolation changes the learned model computation and can change prompt
+following, reference fidelity and shot timing. It is not a lossless optimization.**
+Evaluate output quality before deployment; this option does not establish that
+training or distillation is unnecessary. It is separate from cross-request
+prefix caching and does not establish support for other bidirectional models.
+
 #### Diffusion KV Prefix Caching
 
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
