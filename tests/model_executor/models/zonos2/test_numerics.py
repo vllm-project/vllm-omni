@@ -99,6 +99,54 @@ def test_checkpoint_reload_restores_interleaved_order_before_repacking():
         assert moe._expert_weights_packed
 
 
+@pytest.mark.parametrize("failure", ["missing", "duplicate", "shape", "dtype"])
+def test_failed_reload_preserves_each_experts_actual_layout_and_can_retry(failure, mocker):
+    model = Zonos2TalkerForConditionalGeneration.__new__(Zonos2TalkerForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+    for layer in model.layers:
+        layer.feed_forward = _moe(2)
+    checkpoint = {name: value.detach().clone() for name, value in model.named_parameters()}
+    model.load_weights(checkpoint.items())
+    first, second = (layer.feed_forward for layer in model.layers)
+    first._experts_kernel = mocker.Mock(spec=Zonos2TritonExperts)
+    untouched_kernel = mocker.Mock(spec=Zonos2TritonExperts)
+    second._experts_kernel = untouched_kernel
+    second_packed = second.experts.w13.detach().clone()
+    first_name = "layers.0.feed_forward.experts.w13"
+    second_name = "layers.1.feed_forward.experts.w13"
+    first_weight = checkpoint[first_name]
+    partial = [(first_name, first_weight)]
+    if failure == "duplicate":
+        partial.append((first_name, first_weight))
+    elif failure == "shape":
+        partial.append((second_name, checkpoint[second_name][:, :-1]))
+    elif failure == "dtype":
+        partial.append((second_name, checkpoint[second_name].to(torch.float64)))
+    with pytest.raises(RuntimeError, match="L0"):
+        model.load_weights(partial)
+
+    # A failed model must not execute. Its flags must still describe the
+    # written checkpoint-order layer and the untouched packed layer accurately.
+    assert not first._expert_weights_packed
+    assert first._experts_kernel is None
+    torch.testing.assert_close(first.experts.w13, first_weight, rtol=0, atol=0)
+    assert second._expert_weights_packed
+    assert second._experts_kernel is untouched_kernel
+    torch.testing.assert_close(second.experts.w13, second_packed, rtol=0, atol=0)
+    second.prepare_expert_weights()
+    torch.testing.assert_close(second.experts.w13, second_packed, rtol=0, atol=0)
+
+    assert model.load_weights(checkpoint.items()) == set(checkpoint)
+    inputs = torch.ones((2, 2))
+    expected, _ = _moe(2)(inputs, None)
+    for layer in model.layers:
+        moe = layer.feed_forward
+        assert moe._expert_weights_packed
+        actual, _ = moe(inputs, None)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("topk", [1, 2])
 def test_biased_selection_keeps_prebias_probabilities_without_renormalization(topk):
     moe = _moe(topk)

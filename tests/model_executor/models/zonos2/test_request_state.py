@@ -11,6 +11,7 @@ from torch import nn
 
 from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY
 from vllm_omni.model_executor.models.zonos2.configuration_zonos2 import Zonos2Config
+from vllm_omni.model_executor.models.zonos2.zonos2_keys import TERMINAL
 from vllm_omni.model_executor.models.zonos2.zonos2_sampler import Zonos2RequestState, Zonos2SamplingParams
 from vllm_omni.model_executor.models.zonos2.zonos2_talker import (
     Zonos2MultiEmbedder,
@@ -82,6 +83,30 @@ def test_reprefill_crosses_prompt_and_completion_without_resetting_history(model
 def test_missing_nine_codebook_history_fails_instead_of_restarting(model):
     with pytest.raises(ValueError, match="lifecycle"):
         model.preprocess(torch.zeros(3, dtype=torch.int64), None, **info("a", count=4))
+
+
+@pytest.mark.parametrize(
+    "missing_keys",
+    [(OUTPUT_TOKEN_COUNT_KEY,), (LAST_OUTPUT_TOKEN_KEY,), (OUTPUT_TOKEN_COUNT_KEY, LAST_OUTPUT_TOKEN_KEY)],
+)
+def test_missing_lifecycle_metadata_reports_runner_contract_and_cleans_state(model, missing_keys):
+    data = info("a")
+    model.preprocess(torch.zeros(3, dtype=torch.int64), None, **data)
+    for key in missing_keys:
+        del data[key]
+    with pytest.raises(ValueError, match="ZONOS2 requires runner lifecycle metadata") as error:
+        model.preprocess(torch.zeros(3, dtype=torch.int64), None, **data)
+    for key in missing_keys:
+        assert key in str(error.value)
+    assert "a" not in model._request_states
+
+
+def test_empty_lifecycle_history_accepts_explicit_none_last_token(model):
+    data = info("a")
+    assert data[OUTPUT_TOKEN_COUNT_KEY] == 0 and data[LAST_OUTPUT_TOKEN_KEY] is None
+    _, _, updates = model.preprocess(torch.zeros(3, dtype=torch.int64), None, **data)
+    assert not updates[TERMINAL]
+    assert len(model._request_states["a"].history) == 0
 
 
 def test_retraction_truncates_stale_extra_frame_before_next_sample(model):

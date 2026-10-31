@@ -15,7 +15,10 @@ The talker requires BF16 (`dtype: bfloat16` / `--dtype bfloat16`); FP16 and
 FP32 talker runs are rejected by the strict checkpoint dtype check. DAC stays
 FP32. After checkpoint validation, expert gate/up weights are repacked once
 into their existing parameter ownership; a second canonical GPU copy is not
-retained. CPU reference execution reads the same layout after packing.
+retained. Repacking is sequential and temporarily allocates one layer's packed
+tensor before releasing its old storage (384 MiB per layer in the default
+BF16 configuration); allocator caching and other workspaces also affect the
+device memory peak. CPU reference execution reads the same layout after packing.
 
 ## Optional dependencies and offline assets
 

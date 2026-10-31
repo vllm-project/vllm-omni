@@ -591,6 +591,13 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
     def _managed_preprocess(
         self, input_ids: torch.Tensor, frames: torch.Tensor, info: dict[str, Any]
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        if OUTPUT_TOKEN_COUNT_KEY not in info or LAST_OUTPUT_TOKEN_KEY not in info:
+            missing = [name for name in (OUTPUT_TOKEN_COUNT_KEY, LAST_OUTPUT_TOKEN_KEY) if name not in info]
+            raise ValueError(
+                f"ZONOS2 requires runner lifecycle metadata: missing {', '.join(missing)}. "
+                "The model runner must supply the committed output-token count and last lifecycle token "
+                "(None for an empty history) for requires_request_sampling_params models."
+            )
         key = str(info.get("_omni_req_id") or info["request_id"])
         params = Zonos2SamplingParams.from_runtime(info["_omni_sampling_params"])
         offset = int(info["_omni_num_computed_tokens"])
@@ -608,7 +615,7 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
             raise TypeError("ZONOS2 reconstruction needs full tensor code history")
         history = history.to(device=input_ids.device)
         committed = int(info[OUTPUT_TOKEN_COUNT_KEY])
-        terminal = info.get(LAST_OUTPUT_TOKEN_KEY) == STOP_TOKEN or committed >= params.max_tokens
+        terminal = info[LAST_OUTPUT_TOKEN_KEY] == STOP_TOKEN or committed >= params.max_tokens
         if committed > len(history):
             raise ValueError("Cannot reconstruct nine-codebook history from lifecycle token ids alone")
         history = history[:committed]
@@ -890,11 +897,11 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
         loaded model must never reach the forward pass.
         """
         params = dict(self.named_parameters())
-        for layer in self.layers:
-            if isinstance(layer.feed_forward, Zonos2MoE):
-                # A reload writes checkpoint order into the existing storage.
-                layer.feed_forward._expert_weights_packed = False
-                layer.feed_forward._experts_kernel = None
+        moe_w13 = {
+            f"layers.{i}.feed_forward.experts.w13": layer.feed_forward
+            for i, layer in enumerate(self.layers)
+            if isinstance(layer.feed_forward, Zonos2MoE)
+        }
         loaded: set[str] = set()
         skipped: list[str] = []
         duplicates: list[str] = []
@@ -915,6 +922,11 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
                     f"[Zonos2] L0 dtype mismatch for {name}: checkpoint {w.dtype} vs model {target.dtype}"
                 )
             target.data.copy_(w)
+            if name in moe_w13:
+                # Only a successful w13 write restores checkpoint row order.
+                # Untouched layers keep their packed layout on a failed reload.
+                moe_w13[name]._expert_weights_packed = False
+                moe_w13[name]._experts_kernel = None
             loaded.add(name)
         missing = sorted(set(params) - loaded)
         if skipped or missing or duplicates:
