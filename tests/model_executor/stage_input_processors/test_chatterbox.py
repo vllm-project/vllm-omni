@@ -42,7 +42,7 @@ from vllm_omni.request import OmniRequest
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
 
-# Each test carries its own hardware mark: an unmarked test runs in no job. The
+# Each test carries its own hardware mark, which the last test checks. The
 # tests that decode through S3Gen are on the L4 job on purpose (CPU decoding of
 # the full model is covered by test_chatterbox_s3gen.py); the rest are cpu.
 pytestmark = [pytest.mark.core_model]
@@ -692,3 +692,14 @@ def test_two_requests_interleaved_keep_their_own_schedule_and_voice(
         assert torch.equal(payloads[0].embed.speech_token, reference["speech_token"])
         assert torch.equal(payloads[0].embed.embedding, reference["embedding"])
         assert [payload.embed is None for payload in payloads[1:]] == [True] * (len(payloads) - 1)
+
+
+@pytest.mark.cpu
+def test_every_test_here_runs_in_a_ci_job() -> None:
+    """A test with neither the cpu mark nor the L4 helper's marks would be selected by no job."""
+    unmarked = [
+        name
+        for name, test in globals().items()
+        if name.startswith("test_") and not {"cpu", "cuda"} & {mark.name for mark in getattr(test, "pytestmark", [])}
+    ]
+    assert unmarked == []
