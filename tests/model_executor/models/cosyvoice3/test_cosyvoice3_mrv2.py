@@ -19,6 +19,19 @@ class _Uva:
         pass
 
 
+def test_dspark_omni_output_keeps_only_main_hidden_tensor():
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
+
+    model = CosyVoice3Model.__new__(CosyVoice3Model)
+    torch.nn.Module.__init__(model)
+    model._dspark_config = object()
+    hidden = torch.ones(4, 2)
+    aux = [hidden + 1, hidden + 2, hidden + 3]
+    output = model.make_omni_output((hidden, aux))
+    assert output.text_hidden_states is hidden
+    assert output.multimodal_outputs == {}
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_generated_only_penalty_writes_skip_prompt_and_keep_resumed_outputs():
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import _generated_only_penalty_writes
@@ -96,7 +109,8 @@ def _sample(sampler, logits, pos, fused):
         pos,
         None,
         None,
-        not fused,  # logprobs keep the tensor path
+        None,
+        return_logprobs=not fused,  # logprobs keep the tensor path
         default_top_p=0.8,
         default_top_k=25,
         win_size=10,

@@ -173,6 +173,28 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
+### Optional DSpark speculative decoding
+
+CosyVoice3 can use vLLM's DSpark drafter on the Talker stage with Model Runner V2 and tensor parallel size 1. This is opt-in and requires a compatible CosyVoice3 DSpark checkpoint; do not configure the drafter on Code2Wav. Convert the checkpoint's unified vocabulary to the speech vocabulary before serving:
+
+```bash
+python -m vllm_omni.model_executor.models.cosyvoice3.dspark \
+  /path/to/dspark-checkpoint /path/to/draft-speech
+```
+
+The conversion writes a new directory and records source and converted file hashes; it refuses to overwrite an existing directory. Add the following fields to stage 0 in a copy of the deploy configuration, retaining the other stage and connector settings:
+
+```yaml
+model_runner: v2
+speculative_config:
+  model: /path/to/draft-speech
+  method: dspark
+  num_speculative_tokens: 7
+  draft_sample_method: probabilistic
+```
+
+RAS verification includes each draft prefix in the generated-token history while excluding reference-prompt tokens. Standard sampling uses the native rejection sampler. Acceptance and end-to-end gains depend on the workload and Code2Wav cost; enabling speculative decoding does not guarantee lower latency or higher audio throughput.
+
 ### CLI client
 
 The client defaults to the official upstream zero-shot prompt, so it runs without extra flags:

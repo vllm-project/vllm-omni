@@ -835,7 +835,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
             hidden_states=hidden_states,
-            aux_hidden_states=None,
+            aux_hidden_states=self._last_aux_output if self.use_aux_hidden_state_outputs else None,
             dp_sync_state=dp_sync,
             finished_req_ids=scheduler_output.finished_req_ids,
             ec_connector_output=ec_connector_output,
