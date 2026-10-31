@@ -580,6 +580,28 @@ class Qwen3OmniMoeForConditionalGeneration(
             input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
         )
 
+    @torch.inference_mode()
+    def materialize_thinker_token_embeddings(self, token_ids: Iterable[int]) -> torch.Tensor:
+        """Materialize embeddings for verifier-committed Thinker tokens.
+        """
+        if self.model_stage != "thinker":
+            raise RuntimeError("Thinker token embeddings are only available on the Thinker stage")
+
+        # ``-1`` is the upstream sampler's empty-row sentinel.  It is not a
+        # Thinker token and must not be passed to PyTorch indexing, where it
+        # would otherwise alias the final embedding row.
+        ids = [int(token_id) for token_id in token_ids if int(token_id) >= 0]
+        device = self._module_device(self.thinker)
+        hidden_size = int(self.thinker_config.text_config.hidden_size)
+        if not ids:
+            return torch.empty((0, hidden_size), device=device, dtype=torch.bfloat16)
+
+        input_ids = torch.tensor(ids, dtype=torch.long, device=device).view(1, -1)
+        values = self.thinker.embed_input_ids(input_ids=input_ids)
+        if values.ndim == 3:
+            values = values[0]
+        return values.reshape(-1, values.shape[-1])
+
     def embed_multimodal(self, **kwargs):
         """Delegate to active model for multimodal processing."""
         return self.model.embed_multimodal(**kwargs)

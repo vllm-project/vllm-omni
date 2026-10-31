@@ -1050,6 +1050,38 @@ class GPUARModelRunner(
         combined_hidden, combined_mm = self._prefix_cache_materialize(step_id, list(req_ids))
         return hidden_states_cpu, combined_hidden, combined_mm
 
+    def _get_speculative_committed_token_ids(
+        self,
+        rid: str,
+        idx: int,
+        scheduler_output: SchedulerOutput,
+        valid_sampled_token_ids: list[list[int]],
+    ) -> list[int] | None:
+        """Return committed token IDs for the supported synchronous spec step."""
+        if self.speculative_config is None or not self.speculative_config.use_dflash():
+            return None
+        if getattr(getattr(self, "model_config", None), "async_chunk", False):
+            return None
+
+        if not scheduler_output.scheduled_spec_decode_tokens.get(rid):
+            return None
+        committed = list(valid_sampled_token_ids[idx])
+
+        # The first prefill sample is not part of the first verifier result.
+        pending = getattr(self, "_pending_full_payload_send", {}).get(rid)
+        prior_rows = pending[2].get("hidden_states.layer_0", 0) if pending else 0
+        req_state = getattr(self, "requests", {}).get(rid)
+        prompt_len = len(req_state.prompt_token_ids or []) if req_state else 0
+        output_ids = list(req_state.output_token_ids or []) if req_state else []
+        if (
+            prior_rows <= prompt_len
+            and output_ids
+            and committed
+            and int(output_ids[0]) != int(committed[0])
+        ):
+            committed.insert(0, int(output_ids[0]))
+        return committed
+
     def _build_omni_pooler_payload(
         self,
         *,
@@ -1067,10 +1099,13 @@ class GPUARModelRunner(
         hidden_seq_len: int,
         scheduled_seq_len: int,
         restored_mm: dict[str, dict[str, torch.Tensor]] | None = None,
+        committed_token_ids: list[int] | None = None,
     ) -> dict[str, object]:
+
+        has_speculative_token_delta = committed_token_ids is not None
         payload: dict[str, object] = {}
         req_hidden_states = None
-        if not audio_sparse_output:
+        if not audio_sparse_output and not has_speculative_token_delta:
             if req_hidden_states_cpu is not None and combined_hidden_states is None:
                 req_hidden_states = req_hidden_states_cpu[rid]
             else:
@@ -1094,6 +1129,29 @@ class GPUARModelRunner(
             hidden_seq_len=hidden_seq_len,
             scheduled_seq_len=scheduled_seq_len,
         )
+
+        if has_speculative_token_delta:
+            # Keep the DFlash-to-Talker contract at the model boundary.  The
+            # adapter receives verifier-committed token IDs and returns only
+            # their Thinker embeddings; query/mask rows never become payload
+            # rows.  The fallback preserves compatibility with other Omni
+            # models that have not implemented the optional adapter.
+            materialize = getattr(self.model, "materialize_thinker_token_embeddings", None)
+            if callable(materialize):
+                token_embeds = materialize(committed_token_ids or [])
+            else:
+                token_ids = torch.as_tensor(committed_token_ids or [], dtype=torch.long, device=self.device)
+                token_embeds = self.model.embed_input_ids(input_ids=token_ids)
+                if token_embeds.ndim == 3 and token_embeds.shape[0] == 1:
+                    token_embeds = token_embeds[0]
+                token_embeds = token_embeds.reshape(-1, token_embeds.shape[-1])
+            mm_payload["hidden_states.layer_0"] = _to_cpu_contiguous(token_embeds)
+            # The captured target hidden rows belong to DFlash query/mask
+            # positions.  They are not post-consumption hidden states for the
+            # committed replacement/bonus tokens, so leave them pending.
+            for key in tuple(mm_payload):
+                if key.startswith("hidden_states.layer_") and key != "hidden_states.layer_0":
+                    mm_payload.pop(key, None)
 
         # Prepend per-layer HS restored from LMCache on a KV-cache hit so the
         # talker sees the full prefix. Audio-sparse outputs skip the hidden tap
@@ -2266,6 +2324,12 @@ class GPUARModelRunner(
                         hidden_seq_len=hidden_seq_len,
                         scheduled_seq_len=scheduled_seq_len,
                         restored_mm=restored_mm,
+                        committed_token_ids=self._get_speculative_committed_token_ids(
+                            rid,
+                            idx,
+                            scheduler_output,
+                            valid_sampled_token_ids,
+                        ),
                     )
                     pooler_output.append(flatten_payload(payload))
 
