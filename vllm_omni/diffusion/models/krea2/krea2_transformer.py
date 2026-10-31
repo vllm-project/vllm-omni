@@ -24,11 +24,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import apply_rotary_emb, get_1d_rotary_pos_embed
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.layers.activation import SiluAndMul
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -108,11 +109,19 @@ class Krea2Attention(nn.Module):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_dim = hidden_size // num_heads
 
-        q_dim = self.head_dim * self.num_heads
-        kv_dim = self.head_dim * self.num_kv_heads
-        self.to_q = _linear(hidden_size, q_dim, False, quant_config, _join_prefix(prefix, "to_q"))
-        self.to_k = _linear(hidden_size, kv_dim, False, quant_config, _join_prefix(prefix, "to_k"))
-        self.to_v = _linear(hidden_size, kv_dim, False, quant_config, _join_prefix(prefix, "to_v"))
+        self.q_dim = self.head_dim * self.num_heads
+        self.kv_dim = self.head_dim * self.num_kv_heads
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.num_heads,
+            total_num_kv_heads=self.num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "to_qkv"),
+            return_bias=False,
+            disable_tp=True,
+        )
         self.to_gate = _linear(hidden_size, hidden_size, False, quant_config, _join_prefix(prefix, "to_gate"))
         self.norm_q = Krea2RMSNorm(self.head_dim, eps=eps)
         self.norm_k = Krea2RMSNorm(self.head_dim, eps=eps)
@@ -135,9 +144,10 @@ class Krea2Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        query = self.to_q(hidden_states).unflatten(-1, (self.num_heads, self.head_dim))
-        key = self.to_k(hidden_states).unflatten(-1, (self.num_kv_heads, self.head_dim))
-        value = self.to_v(hidden_states).unflatten(-1, (self.num_kv_heads, self.head_dim))
+        query, key, value = self.to_qkv(hidden_states).split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        query = query.unflatten(-1, (self.num_heads, self.head_dim))
+        key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
+        value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
         gate = self.to_gate(hidden_states)
 
         query = self.norm_q(query)
@@ -163,12 +173,20 @@ class Krea2SwiGLU(nn.Module):
         self, dim: int, hidden_dim: int, quant_config: "QuantizationConfig | None" = None, prefix: str = ""
     ) -> None:
         super().__init__()
-        self.gate = _linear(dim, hidden_dim, False, quant_config, _join_prefix(prefix, "gate"))
-        self.up = _linear(dim, hidden_dim, False, quant_config, _join_prefix(prefix, "up"))
+        self.gate_up_proj = MergedColumnParallelLinear(
+            dim,
+            [hidden_dim] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=_join_prefix(prefix, "gate_up_proj"),
+            return_bias=False,
+            disable_tp=True,
+        )
+        self.act = SiluAndMul()
         self.down = _linear(hidden_dim, dim, False, quant_config, _join_prefix(prefix, "down"))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.gate(hidden_states)) * self.up(hidden_states))
+        return self.down(self.act(self.gate_up_proj(hidden_states)))
 
 
 class Krea2TextFusionBlock(nn.Module):
@@ -426,6 +444,12 @@ class Krea2Transformer2DModel(nn.Module):
     The timestep conditions every block through one shared modulation vector plus per-block learned tables.
     """
 
+    # Fused projections, for quantization configs that resolve layers by checkpoint shard name.
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "gate_up_proj": ["gate", "up"],
+    }
+
     _repeated_blocks = ["Krea2TransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
@@ -558,14 +582,35 @@ class Krea2Transformer2DModel(nn.Module):
         return self.final_layer(hidden_states, temb)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Module/parameter names mirror the diffusers ``Krea2Transformer2DModel`` exactly, so weights map 1:1.
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".to_qkv.", ".to_q.", "q"),
+            (".to_qkv.", ".to_k.", "k"),
+            (".to_qkv.", ".to_v.", "v"),
+            (".gate_up_proj.", ".gate.", 0),
+            (".gate_up_proj.", ".up.", 1),
+        ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            for param_name, shard_name, shard_id in stacked_params_mapping:
+                if shard_name not in name:
+                    continue
+                name = name.replace(shard_name, param_name)
+                if name not in params_dict:
+                    break
+                param = params_dict[name]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                break
+            else:
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
         return loaded_params
