@@ -279,6 +279,7 @@ async def test_yue2_preemption_and_synthesis_abort(chunked, enforce_eager, monke
     import torch
     from vllm import SamplingParams
 
+    from tests.e2e.features.yue2.worker_extension import assert_preempted_requests_resumed
     from tests.helpers.runtime import get_model_prefix
     from tests.helpers.stage_config import modify_stage_config
     from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -397,7 +398,14 @@ async def test_yue2_preemption_and_synthesis_abort(chunked, enforce_eager, monke
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=600)
         observations = await probe()
         assert observations["preemptions"] > 0, observations
-        assert observations["rollbacks"] > 0, observations
+        # Every preempted song must resume through a checked row, where the
+        # probe asserts the model history never runs ahead of the tokens the
+        # engine accepted (and equals them mid-song). Recompute preemption
+        # delivers in-flight output and holds the request until it drains, so
+        # the resumed row has no discarded draw to roll back here; the
+        # rollback branch is covered in tests/worker/test_yue2_request_state.py,
+        # and this check's negative controls in tests/worker/test_yue2_lifecycle_probe.py.
+        assert_preempted_requests_resumed(observations)
         assert observations["checked_rows"] >= 4 * frames, observations
         assert observations["mixed_steps"] > 0, observations
         if enforce_eager:
