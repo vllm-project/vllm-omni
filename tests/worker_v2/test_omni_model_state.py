@@ -225,7 +225,8 @@ def test_output_spans_follow_reordered_mixed_batch():
 
 
 @pytest.mark.parametrize("hook_name", ["preprocess_decode_batch_mrv2", "preprocess_decode_batch", "legacy"])
-def test_decode_cohort_uses_batch_hook(hook_name):
+@pytest.mark.parametrize("has_mtp", [False, True])
+def test_decode_cohort_uses_batch_hook(hook_name, has_mtp):
     state = _make_state(max_num_reqs=2, has_preprocess=True)
     state.intermediate_buffer.buffers[0] = {"req_id": "r1", "meta": {"step": 1}}
     state.intermediate_buffer.buffers[1] = {"req_id": "r2", "meta": {"step": 2}}
@@ -259,7 +260,7 @@ def test_decode_cohort_uses_batch_hook(hook_name):
         assert batches == [(0, 0), (1, 1)]
         seen_text_steps.append(text_steps)
 
-    state._has_mtp = True
+    state._has_mtp = has_mtp
     state._mtp_state.apply_frame_embeddings = capture
     model_inputs = {
         "input_ids": torch.tensor([101, 202], dtype=torch.long),
@@ -274,7 +275,10 @@ def test_decode_cohort_uses_batch_hook(hook_name):
     assert [info["req_id"] for info in batch_calls[0]] == ["r1", "r2"]
     assert torch.equal(model_inputs["input_ids"], torch.tensor([111, 212]))
     assert state.intermediate_buffer.buffers[0]["meta"]["step"] == 11
-    assert torch.equal(seen_text_steps[0], torch.tensor([[51.0, 52.0], [61.0, 62.0]]))
+    if has_mtp:
+        assert torch.equal(seen_text_steps[0], torch.tensor([[51.0, 52.0], [61.0, 62.0]]))
+    else:
+        assert seen_text_steps == []
 
 
 def test_static_decode_embeddings_refresh_from_input_ids():
