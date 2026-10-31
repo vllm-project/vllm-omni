@@ -376,6 +376,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
             self.od_config.step_execution = True
+        if bool(getattr(self.od_config, "enable_mixfusion", False)) and not getattr(
+            self.od_config, "step_execution", False
+        ):
+            logger.warning("enable_mixfusion=True requires step_execution=True; enabling step execution.")
+            self.od_config.step_execution = True
 
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
             raise ValueError(
@@ -1293,6 +1298,23 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         interrupted: bool = False,
     ) -> None:
         """Step-after update: clear cached state for completed request."""
+        if isinstance(input_batch.latents, list):
+            input_batch.latents = [state.latents for state in states if state.latents is not None]
+            self.input_batch = input_batch
+            scatter_latents(states, input_batch)
+            # Include per-request errors, whose cache entries were already removed.
+            # Releasing (rather than popping the cache directly) also calls
+            # pipeline.release_step_request() and invalidates input_batch when a
+            # retired request is still in it, matching the tensor branch below.
+            self.release_step_requests(
+                [
+                    state.request_id
+                    for state in states
+                    if interrupted or state.request_denoise_completed or state.request_id not in self.state_cache
+                ]
+            )
+            return
+
         gathered_latents = torch.cat([state.latents for state in states], dim=0)
         if (
             input_batch.latents.size() == gathered_latents.size()
@@ -1487,14 +1509,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
                 else:
                     offset = 0
-                    for req in states:
+                    for req_idx, req in enumerate(states):
                         if req.latents is None:
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
                         row_num = req.latents.shape[0]
                         try:
-                            pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
+                            if isinstance(noise_pred, list):
+                                req_noise_pred = noise_pred[req_idx] if noise_pred is not None else None
+                            else:
+                                req_noise_pred = (
+                                    noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                )
+                            pipeline.step_scheduler(req, req_noise_pred)
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:
@@ -1563,7 +1589,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 )
                             )
 
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
+                    if isinstance(noise_pred, list):
+                        expected = len(states)
+                        if len(noise_pred) != expected:
+                            raise ValueError(
+                                f"Stepwise noise_pred list has {len(noise_pred)} entries, expected {expected}."
+                            )
+                    elif noise_pred is not None and offset != noise_pred.shape[0]:
                         raise ValueError(
                             f"Stepwise noise_pred consumed {offset} rows, "
                             f"but batched noise_pred has {noise_pred.shape[0]} rows."

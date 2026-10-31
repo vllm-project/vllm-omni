@@ -95,6 +95,8 @@ The `_sp_plan` mechanism allows SP **without modifying `forward()` logic**. The 
 
 This is the ideal approach for integrating sequence parallelism into new models, as it is easier to maintain and ensure compatibility with other types of acceleration.
 
+MixFusion's packed-layout hooks reuse this mechanism: a model declares `_mixfusion_plan` instead of `_sp_plan`, and the framework applies the hooks at initialization in the same way (see [MixFusion layout abstraction](diffusion_continuous_batching.md#layout-abstraction)).
+
 **How it works:**
 1. Declare `_sp_plan` dict in your transformer class
 2. Framework automatically applies hooks when `sequence_parallel_size > 1`

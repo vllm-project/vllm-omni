@@ -193,6 +193,85 @@ also applies here.
 Chunk-capable pipelines may emit intermediate results. Final-only step
 pipelines emit when the request finishes even if `streaming_output=True`.
 
+### MixFusion (Mixed-Resolution Step Batching)
+
+`StepBatchSamplingParamsKey` includes height/width/resolution, so plain step
+batching never co-schedules mixed resolutions. MixFusion relaxes those three
+fields out of the key so different resolutions can share one step batch, at the
+cost of a pipeline contract the scheduler must not assume generically:
+
+- A pipeline opts in with `supports_mixfusion: ClassVar[bool] = True`
+  (read via `getattr`, not part of the runtime protocol check). Currently
+  only `QwenImagePipeline` sets it.
+- The engine resolves the capability through the registry at startup and
+  rejects server-level `enable_mixfusion` on pipelines without it. Because
+  resolution only leaves the step-batch key under the `StepScheduler`,
+  server-level `enable_mixfusion` also enables step execution automatically
+  (same coupling as `streaming_output`).
+- The scheduler resolves the capability in `initialize()` and only then
+  applies the shape relaxation. On an unsupported pipeline, a request-level
+  `extra_args={"enable_mixfusion": True}` degrades to a no-op: resolution
+  stays in the key and per-prompt `additional_information` requests keep
+  their key.
+
+With the capability present, `QwenImagePipeline.denoise_step` dispatches on
+list latents to `_denoise_step_mixfusion`, which packs eligible requests into
+ragged latents (text-then-image token order per request) and runs one packed
+forward. Requests fall back to `_denoise_step_serial_ragged` when they carry
+image latents (edit path), raise `zero_cond_t`, run with SP>1, have active
+forward hooks, run with `do_true_cfg`, or when MixFusion hooks are not
+installed on the transformer (`_mixfusion_hooks_applied`); per-request
+thresholds (`mixfusion_min_chunk_tokens`, `mixfusion_max_chunks`) are
+aggregated as max/min across the batch. Backends without packed varlen support (e.g. NPU)
+are served by the attention layer's automatic fallback: documents are grouped
+by length into mask-free dense forwards, so the packed dispatch stays active
+and documents remain isolated without a per-request loop.
+
+Known limitation: the packed dispatch does not thread `attention_kwargs`
+into the packed forward. To keep them from being dropped silently, the
+pipeline falls back to the serial ragged path when they are set; features
+that rely on them (e.g. LoRA scales, TeaCache) therefore lose MixFusion
+batching until `_denoise_step_mixfusion` learns to forward them.
+
+#### Layout abstraction
+
+The sequence chunking/restoration primitives are model-agnostic and live in
+`vllm_omni/diffusion/mixfusion` (`MixFusionPlan`, `build_mixfusion_plan`,
+`split_sequence_chunks`, `reassemble_chunk_rows`, `expand_per_chunk`),
+analogous to how `_sp_plan` centralizes sequence-parallel layout. A model
+adopts the layout by declaring `_mixfusion_plan`, the MixFusion counterpart
+of `_sp_plan`, and does not branch on MixFusion in its forward code:
+
+```python
+_mixfusion_plan = {
+    "": MixFusionRoot(pack_method="prepare_mixfusion_inputs"),
+    "image_rope_prepare": MixFusionRopePrepare(),
+    "transformer_blocks.*.img_mod": MixFusionExpandRows(),
+}
+```
+
+- `initialize_model` applies the plan with `apply_mixfusion`, mirroring
+  `apply_sequence_parallel_if_enabled`; the hooks are registered at the
+  declared module boundaries and stay inert unless the pipeline arms a
+  `MixFusionStep` on the forward context.
+- `_denoise_step_mixfusion` arms that step for exactly the packed
+  transformer call and restores the previous value afterwards. The root
+  hook then packs the per-request latent list at the model boundary, the
+  rope hook hands forward the packed frequency tensors, and expand hooks
+  map per-request conditioning rows to per-chunk rows. Without an armed
+  step the model runs its serial forward unchanged.
+- Attention remains the one layout-aware leaf: the packed layout has
+  image-batch = num-chunks versus text-batch = num-requests, so joint
+  attention reassembles the per-request logical domain itself instead of
+  relying on a shared batch dimension. It reads the plan from the armed
+  step instead of a forward argument.
+- Paths the packed layout cannot express (`zero_cond_t`, block or root
+  hooks, non-empty `attention_kwargs`) are rejected by guards in
+  `prepare_mixfusion_inputs`, and the pipeline falls back to the serial
+  path. The fused joint QK-norm-RoPE table is disabled while a step is
+  armed, because text (per-request) and image rows (per-chunk) cannot share
+  one table.
+
 ## Model Author Guidelines
 
 When converting a request-level pipeline:
@@ -228,6 +307,9 @@ mapping, seeded concurrency, LoRA compatibility, and tensor IPC.
   request-mode extras remain unsupported.
 - Step continuous batching remains experimental; use `max_num_seqs=1` for the
   conservative step path.
+- MixFusion shape relaxation requires the pipeline `supports_mixfusion`
+  capability (Qwen-Image only); edit/zero_cond_t requests, SP>1, active
+  forward hooks, and `do_true_cfg` fall back to serial ragged execution.
 
 ## Related Implementation
 
