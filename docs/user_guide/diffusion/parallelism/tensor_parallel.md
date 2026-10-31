@@ -1,11 +1,11 @@
 # Tensor Parallelism Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Example Script](#example-script)
+- [Text Encoder Tensor Parallelism](#text-encoder-tensor-parallelism)
 - [Configuration Parameters](#configuration-parameters)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
@@ -20,17 +20,13 @@ Tensor Parallelism (TP) shards some model weights across multiple GPUs, usually 
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
 
 !!! note "TP Limitations for Diffusion Models"
-    We currently implement Tensor Parallelism (TP) only for the DiT (Diffusion Transformer) blocks. This is because the `text_encoder` component in vLLM-Omni uses the original Transformers implementation, which does not yet support TP.
+    `--tensor-parallel-size` shards only the DiT (Diffusion Transformer) blocks. The `text_encoder` uses the original Transformers implementation, so by default every TP process keeps a full copy of its weights.
 
-    - Good news: The text_encoder typically has minimal impact on overall inference performance.
-    - Bad news: When TP is enabled, every TP process retains a full copy of the text_encoder weights, leading to significant GPU memory waste.
-
-    We are actively refactoring this design to address this. For details and progress, please refer to [Issue #771](https://github.com/vllm-project/vllm-omni/issues/771).
+    For Hugging Face text encoders that ship a `base_model_tp_plan`, set `--text-encoder-tp-size` to shard the encoder too; see [Text Encoder Tensor Parallelism](#text-encoder-tensor-parallelism). Decoupling the text encoder from the DiT process is tracked in [Issue #771](https://github.com/vllm-project/vllm-omni/issues/771).
 
 ---
 
 ## Quick Start
-
 
 ### Basic Usage
 
@@ -90,14 +86,35 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
 
 ---
 
+## Text Encoder Tensor Parallelism
+
+`--text-encoder-tp-size N` (`DiffusionParallelConfig.text_encoder_tp_size`) shards the text encoder across groups of `N` DiT ranks. For pipelines that load a Hugging Face encoder (currently the Qwen-Image family: Qwen-Image, Qwen-Image-Edit, Qwen-Image-Edit-Plus, Qwen-Image-Layered), the encoder is sharded with the model's own Transformers `base_model_tp_plan`: attention and MLP projections are split, embeddings and norms stay replicated.
+
+```bash
+# Qwen-Image on 4x 32 GB GPUs without CPU offload
+vllm serve Qwen/Qwen-Image --omni --tensor-parallel-size 4 --text-encoder-tp-size 4
+```
+
+Constraints:
+
+- `N` must divide the number of ranks in one data-parallel replica (world size / `data_parallel_size`) and the encoder's attention and KV head counts (Qwen2.5-VL-7B: 28 heads, 4 KV heads, so `N` ∈ {1, 2, 4}).
+- The groups tile each data-parallel replica (`[0..N-1], [N..2N-1], ...`) and never span replicas. Every rank gets the full encoder output, so no broadcast is needed.
+- MiniMax-H3 uses its own sharded Qwen3-VL encoder for this option; other pipelines ignore it.
+
+---
+
 ## Configuration Parameters
 
 In `DiffusionParallelConfig`:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `tensor_parallel_size` | int | 1 | Number of GPUs to shard model weights across. Must divide number of heads. |
+| Parameter              | Type | Default | Description                                                                                                                     |
+| ---------------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `tensor_parallel_size` | int  | 1       | Number of GPUs to shard model weights across. Must divide number of heads.                                                      |
+| `text_encoder_tp_size` | int  | 1       | Number of DiT ranks to shard the text encoder across (see [Text Encoder Tensor Parallelism](#text-encoder-tensor-parallelism)). |
 
+-----------|------|---------|-------------|
+| `tensor_parallel_size` | int | 1 | Number of GPUs to shard model weights across. Must divide number of heads. |
+| `text_encoder_tp_size` | int | 1 | Number of DiT ranks to shard the text encoder across (see [Text Encoder Tensor Parallelism](#text-encoder-tensor-parallelism)). |
 
 ---
 
@@ -115,7 +132,6 @@ In `DiffusionParallelConfig`:
 - When maximum throughput is needed and memory is sufficient
 - Models with incompatible dimensions (e.g., Z-Image `num_heads=30`, which now supports `tensor_parallel_size=2`)
 
-
 ## Troubleshooting
 
 ### Common Issue 1: Out of Memory (OOM)
@@ -123,6 +139,7 @@ In `DiffusionParallelConfig`:
 **Symptoms**: CUDA OOM errors during model loading or inference, process crashes with memory errors
 
 **Solution**:
+
 ```python
 # Step 1: Enable TP with smallest degree
 parallel_config=DiffusionParallelConfig(tensor_parallel_size=2)
@@ -137,10 +154,10 @@ parallel_config=DiffusionParallelConfig(tensor_parallel_size=4)
 **Symptoms**: Error like "Model dimension X not divisible by tensor_parallel_size Y"
 
 **Solutions**:
+
 1. Check model-specific constraints (e.g., Z-Image only supports TP=2)
 2. Use a smaller TP size that divides model dimensions
 3. Consult [Supported Models](../../diffusion_features.md#supported-models) for compatible TP sizes
-
 
 ---
 
@@ -148,4 +165,4 @@ parallel_config=DiffusionParallelConfig(tensor_parallel_size=4)
 
 1. ✅ **Enable TP** - Set `--tensor-parallel-size` to reduce per-GPU memory
 2. ✅ **Increase TP size** - Only increase if OOM persists
-3. ⚠️ **Text encoder not sharded** - Known limitation
+3. ✅ **Shard the text encoder** - Set `--text-encoder-tp-size` for supported pipelines (Qwen-Image family, MiniMax-H3)
