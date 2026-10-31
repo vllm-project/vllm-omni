@@ -38,6 +38,7 @@ from vllm.pooling_params import PoolingParams
 from vllm_omni.config.stage_config import (
     _DEPLOY_DIR,
     _STAGE_DEPLOY_FIELDS,
+    NON_STAGE_OVERRIDE_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
     PipelineConfig,
@@ -375,7 +376,11 @@ def _stage_cli_overrides(
             ),
             **stage_scoped,
         }
-    runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
+    runtime_overrides = build_stage_runtime_overrides(
+        stage_id,
+        dict(cli_overrides),
+        warn_dropped=execution_type is not StageExecutionType.DIFFUSION,
+    )
     global_stage_fields = _global_stage_cli_fields() | _OWNER_ONLY_GLOBAL_STAGE_CLI_FIELDS
     owned_fields = None if execution_type is None else _STAGE_ENGINE_FIELDS_BY_EXECUTION_TYPE[execution_type]
     result: dict[str, Any] = {}
@@ -407,6 +412,13 @@ def _stage_cli_overrides(
                         f"Diffusion stage {stage_id} cannot override shared engine field {field_name!r}; "
                         "it has no diffusion stage-config consumer."
                     )
+                if field_name in NON_STAGE_OVERRIDE_FIELDS or field_name == "default_sampling_params":
+                    logger.warning(
+                        "Ignoring --stage-overrides[%s].%s: this field is not a per-stage override.",
+                        stage_id,
+                        field_name,
+                    )
+                    continue
                 result.setdefault(field_name, _copy_value(value))
     return result
 
@@ -2368,7 +2380,7 @@ class VllmOmniConfig:
             }
             for stage_id, parallel in strategy_result.per_stage_config.items():
                 declared = set(parallel.l1_owners)
-                explicit = build_stage_runtime_overrides(stage_id, cli_overrides)
+                explicit = build_stage_runtime_overrides(stage_id, cli_overrides, warn_dropped=False)
                 for axis, field_name in axis_fields.items():
                     if axis not in declared:
                         continue

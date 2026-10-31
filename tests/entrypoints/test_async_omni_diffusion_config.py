@@ -886,6 +886,26 @@ def test_generic_diffusion_resolves_structured_stage_without_legacy_conversion(m
     assert stage.runtime_config.devices == "0,1,2,3"
 
 
+def test_generic_diffusion_preserves_env_stage_override(mocker):
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "FakeDiffusionPipeline"),
+    )
+
+    resolved = resolve_omni_config(
+        "generic-diffusion",
+        trust_remote_code=False,
+        deploy_config_path=None,
+        cli_overrides={"num_gpus": 1},
+        stage_overrides={"0": {"env": {"TEST_ENV": "1"}}},
+        strategy_config_path=None,
+    )
+
+    assert len(resolved.stage_configs) == 1
+    assert resolved.stage_configs[0].runtime_config.env == {"TEST_ENV": "1"}
+
+
 def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):
     """Standard runtime resolves and starts the typed stage through the real launcher."""
     from vllm_omni.engine import stage_engine_startup as startup_module
