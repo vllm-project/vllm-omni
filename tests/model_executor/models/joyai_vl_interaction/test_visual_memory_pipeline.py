@@ -90,9 +90,7 @@ async def silence(h, submission):
 
 
 async def camera(h, color="red"):
-    submission = await observe(
-        h, AppendAudio(video_frames=(frame(color),)), Commit(final=True, create_response=True)
-    )
+    submission = await observe(h, AppendAudio(video_frames=(frame(color),)), Commit(final=True, create_response=True))
     await silence(h, submission)
     return submission
 
