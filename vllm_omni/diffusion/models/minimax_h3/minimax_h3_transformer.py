@@ -42,6 +42,7 @@ from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy,
 from vllm_omni.platforms import current_omni_platform
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
+from .adaln_lookup import lookup_timestep_indices
 from .controlnet import MiniMaxH3ControlNet
 from .fasth3 import _resolve_native_target
 from .minimax_h3_blocks import (
@@ -736,6 +737,14 @@ class MiniMaxH3DiTModel(nn.Module):
         self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
         self.arch = arch
+        if arch.adaln_lookup_timesteps is not None:
+            if not od_config.enforce_eager:
+                raise ValueError("MiniMax-H3 AdaLN lookup currently requires enforce_eager=True")
+            self.register_buffer(
+                "adaln_timesteps",
+                torch.tensor(arch.adaln_lookup_timesteps, dtype=torch.float32),
+                persistent=False,
+            )
         cache_config = getattr(od_config, "cache_config", {})
         enabled = (
             cache_config.get("minimax_h3_adaln_cache", True)
@@ -755,6 +764,7 @@ class MiniMaxH3DiTModel(nn.Module):
             enabled
             and current_omni_platform.is_cuda()
             and quant_config is None
+            and arch.adaln_lookup_timesteps is None
             and not conflicting_offload
             and current_omni_platform.get_device_capability(torch.accelerator.current_device_index()) == (12, 0)
         )
@@ -855,6 +865,10 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         self.controlnet = None
         if getattr(od_config, "controlnet_model_path", None):
+            if arch.adaln_lookup_timesteps is not None:
+                # Lookup checkpoints drop the dense time embedder, so the control
+                # branch has no real t_emb to condition on; reject rather than guess.
+                raise ValueError("H3 control is not supported with adaln_lookup_timesteps checkpoints")
             self.controlnet = MiniMaxH3ControlNet(arch)
         self.sp_prepare = MiniMaxH3SPPrepare()
         self.local_sp_prepare = MiniMaxH3SPPrepare()
@@ -977,6 +991,10 @@ class MiniMaxH3DiTModel(nn.Module):
         return super()._apply(fn, recurse=recurse)
 
     def post_load_weights(self) -> None:
+        if self.arch.adaln_lookup_timesteps is not None:
+            for name, param in self.named_parameters():
+                if name.endswith(".lookup_values") and param.dtype != _BF16_DTYPE:
+                    raise ValueError(f"{name} must remain BF16")
         for name, param in self.named_parameters():
             if name in MINIMAX_H3_FP32_PARAM_NAMES and param.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {param.dtype}.")
@@ -1077,6 +1095,11 @@ class MiniMaxH3DiTModel(nn.Module):
             )
             default_weight_loader(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
+        if self.arch.adaln_lookup_timesteps is not None:
+            expected_tables = {name for name in params if name.endswith(".lookup_values")}
+            missing_tables = sorted(expected_tables - loaded)
+            if missing_tables:
+                raise ValueError(f"MiniMax-H3 AdaLN lookup tables not loaded: {missing_tables}")
         return loaded
 
     @staticmethod
@@ -1229,7 +1252,10 @@ class MiniMaxH3DiTModel(nn.Module):
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
         )
 
-        t_emb = self.time_embedder(unique_timesteps)
+        if self.arch.adaln_lookup_timesteps is not None:
+            t_emb = lookup_timestep_indices(unique_timesteps, self.adaln_timesteps)
+        else:
+            t_emb = self.time_embedder(unique_timesteps)
         return embeddings, t_emb
 
     def create_reference_kv_state(
