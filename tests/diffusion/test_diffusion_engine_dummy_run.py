@@ -313,3 +313,31 @@ def test_paged_kv_admission_accepts_shape_at_profile_envelope() -> None:
     )
 
     assert engine._prepare_request_for_admission(request) is request
+
+
+@pytest.mark.parametrize(
+    "additional_config",
+    [
+        None,
+        {},
+        {"ltx2_audio_cuda_graph": {"enabled": False}},
+        {"ltx2_audio_cuda_graph": {"enabled": True}},
+    ],
+)
+def test_ltx_audio_startup_warmup_runs_with_and_without_graphs(additional_config):
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(
+        model_class_name="LTX2TextToAudioPipeline",
+        diffusion_load_format="default",
+        additional_config=additional_config,
+    )
+    engine.add_req_and_wait_for_response = Mock(return_value=SimpleNamespace(error=None))
+    engine.close = Mock()
+
+    engine.run_startup_warmup()
+
+    engine.add_req_and_wait_for_response.assert_called_once()
+    request = engine.add_req_and_wait_for_response.call_args.args[0]
+    assert request.sampling_params.num_frames == 9
+    assert request.sampling_params.num_inference_steps == 2
+    engine.close.assert_not_called()

@@ -70,11 +70,11 @@ def test_ltx_t2a_public_contract_is_audio_only():
     assert LTX2TextToAudioPipeline.support_audio_output
     assert not LTX2TextToAudioPipeline.support_image_input
     assert not hasattr(LTX2TextToAudioPipeline, "support_video_output")
-    assert LTX2TextToAudioPipeline.dummy_run_num_frames == 0
+    assert LTX2TextToAudioPipeline.dummy_run_num_frames == 9
 
 
 def test_ltx_t2a_setup_compile_prepares_norms_before_regional_compile(monkeypatch):
-    calls = []
+    calls: list[object] = []
     transformer = SimpleNamespace(prepare_regional_compile=lambda: calls.append("prepare"))
     pipe = object.__new__(LTX2TextToAudioPipeline)
     object.__setattr__(pipe, "transformer", transformer)

@@ -250,9 +250,8 @@ class LTXAudioRuntime(
     support_audio_output = True
     support_image_input = False
     supports_request_batch = False
-    # CUDA Graphs are captured lazily from the first real request, so a full
-    # startup request only shifts capture latency and needlessly runs decoding.
-    dummy_run_num_frames: ClassVar[int] = 0
+    # LTX's causal audio clock requires 8 * k + 1 frames.
+    dummy_run_num_frames: ClassVar[int] = 9
     connector_batches_cfg = False
     _default_audio_resource_limits: ClassVar[LTX2AudioResourceLimits] = LTX2AudioResourceLimits()
 
