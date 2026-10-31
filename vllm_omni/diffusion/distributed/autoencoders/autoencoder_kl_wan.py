@@ -7,7 +7,7 @@ from typing import Any, ClassVar
 import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders import AutoencoderKLWan
-from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+from diffusers.models.autoencoders.autoencoder_kl_wan import patchify, unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from vllm.logger import init_logger
@@ -509,18 +509,42 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
             return False
         if not self.is_distributed_enabled():
             return False
+        return self._spatial_shard_group_matches("decode", split_dim)
 
-        group = self.distributed_executor.group
-        world_size = dist.get_world_size(group=group)
+    def _spatial_shard_group_matches(self, stage: str, split_dim: str) -> bool:
+        world_size = dist.get_world_size(group=self.distributed_executor.group)
         requested_size = int(self.distributed_executor.parallel_size)
         if requested_size != world_size:
             logger.warning(
-                "Wan VAE spatial sharded decode currently requires vae_patch_parallel_size "
-                "to match the DIT group size; falling back to tiled decode. "
+                "Wan VAE spatial sharded %s currently requires vae_patch_parallel_size "
+                "to match the DIT group size; falling back to tiled %s. "
                 "requested=%s dit_group=%s split_dim=%s",
+                stage,
+                stage,
                 requested_size,
                 world_size,
                 split_dim,
+            )
+            return False
+        return True
+
+    def _spatial_shard_encode_enabled(self, x: torch.Tensor) -> bool:
+        split_dim = self._spatial_shard_decode_split_dim()
+        if split_dim is None or x.ndim != 5 or not self.is_distributed_enabled():
+            return False
+        # The encoder fast path inlines the convolutions the halo modules replace.
+        if is_encoder_installed(self):
+            return False
+        if not self._spatial_shard_group_matches("encode", split_dim):
+            return False
+        world_size = dist.get_world_size(group=self.distributed_executor.group)
+        if not wan_spatial_shard.can_spatial_shard_encode(self, x, split_dim=split_dim, world_size=world_size):
+            logger.info_once(
+                "Wan VAE spatial sharded encode needs the %s extent to split into equal, stride-aligned "
+                "shards across %s ranks; falling back to the unsharded encode path for input shape %s.",
+                split_dim,
+                world_size,
+                tuple(x.shape),
             )
             return False
         return True
@@ -549,6 +573,19 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
             if self.is_distributed_enabled() and self._exceeds_tile(z):
                 return self._tile_parallel_decode(z, return_dict=return_dict)
         return super()._decode(z, return_dict=return_dict)
+
+    def _encode(self, x: torch.Tensor):
+        """Run the spatially sharded encode before the native-tiling check, like ``_decode``."""
+        if getattr(self, "distributed_executor", None) is not None and self._spatial_shard_decode_split_dim():
+            patched = x if self.config.patch_size is None else patchify(x, patch_size=self.config.patch_size)
+            if self._spatial_shard_encode_enabled(patched):
+                split_dim = self._spatial_shard_decode_split_dim()
+                assert split_dim is not None
+                logger.debug("Encode running with Wan VAE spatial_shard_%s mode", split_dim)
+                return wan_spatial_shard.spatial_shard_encode(
+                    self, patched, group=self.distributed_executor.group, split_dim=split_dim
+                )
+        return super()._encode(x)
 
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
         if not self.is_distributed_enabled():
