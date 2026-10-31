@@ -541,6 +541,22 @@ class OmniStreamingVideoOutputHandler:
         track_playback: bool,
     ) -> None:
         """Deliver accepted interactions in ingress order without blocking the reader."""
+
+        async def on_rejected(event_id: str, reason: str) -> None:
+            # A rejection that arrives after the queued ack is reported as a
+            # correlated error; the generation keeps streaming.
+            logger.info("Interaction %s rejected for request %s: %s", event_id, request_id, reason)
+            interaction_event_ids.discard(event_id)
+            await self._send_error(
+                websocket,
+                "Failed to apply interaction",
+                code="interaction_failed",
+                request_id=request_id,
+                event_id=event_id,
+                send_lock=send_lock,
+                response_queue=response_queue,
+            )
+
         try:
             while True:
                 interaction = await interaction_queue.get()
@@ -551,11 +567,13 @@ class OmniStreamingVideoOutputHandler:
                                 request_id,
                                 interaction=interaction,
                                 track_playback=True,
+                                on_error=on_rejected,
                             )
                         else:
                             await self._engine_client.submit_interaction_async(
                                 request_id,
                                 interaction=interaction,
+                                on_error=on_rejected,
                             )
                         progress.touch()
                     except asyncio.CancelledError:

@@ -3643,13 +3643,13 @@ class Orchestrator(OrchestratorBase):
                 self._interaction_queue.put_nowait(interaction)
             except asyncio.QueueFull:
                 # This is a request-scoped failure: terminate the overloaded
-                # stream rather than silently dropping camera commands.
+                # stream rather than silently dropping camera commands. No
+                # event_id: an event-scoped rejection would keep the stream.
                 await self.output_async_queue.put(
                     ErrorMessage(
                         error="Too many pending interactions",
                         fatal=False,
                         request_id=interaction.request_id,
-                        event_id=interaction.interaction.get("event_id"),
                         stage_id=0,
                     )
                 )

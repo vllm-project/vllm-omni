@@ -408,6 +408,10 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             reservations = getattr(self, "_interaction_reservations", {})
             for key in [key for key in reservations if key[0] == request_id]:
                 reservations.pop(key, None)
+            finished_state = self.request_states.get(request_id)
+            if finished_state is not None:
+                with anyio.CancelScope(shield=True):
+                    await self._drain_interaction_error_tasks(finished_state)
             self._log_summary_and_cleanup(request_id)
 
     async def _release_generate_admission(self) -> None:
@@ -952,17 +956,36 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         reservations.pop(reservation_key, None)
         await self._engine_core_rpc("track_streaming_interaction", stage_ids=[0], args=(internal_id, event_id, False))
 
+    async def _release_rejected_interaction(self, request_id: str, event_id: str) -> None:
+        # The engine clears a playback reservation only when the interaction
+        # reaches it, so one rejected before delivery would block a paced
+        # stream for good. Releasing an untracked event is a no-op.
+        self._interaction_reservations_map().pop((request_id, event_id), None)
+        try:
+            await self._engine_core_rpc(
+                "track_streaming_interaction", stage_ids=[0], args=(request_id, event_id, False)
+            )
+        except Exception:
+            logger.debug("Failed to release rejected interaction %s for req %s", event_id, request_id, exc_info=True)
+
     async def submit_interaction_async(
         self,
         request_id: str,
         *,
         interaction: OmniInteractionPrompt,
         track_playback: bool = False,
+        on_error: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> float | None:
         """Apply a midway interaction to an active streaming diffusion request.
 
         ``request_id`` is the external id created by the server-side session,
         matching the value passed to :meth:`generate`.
+
+        Submission only queues the interaction. If the engine rejects it later,
+        the request keeps generating and ``on_error`` is awaited with
+        ``(event_id, message)``. One callback serves all of the request's
+        interactions; the latest one passed applies. Without a callback the
+        rejection is logged.
         """
         event = interaction.get("event")
         prompt = event.get("prompt") if isinstance(event, dict) else None
@@ -973,6 +996,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             raise ValueError("transition_chunks must be >= 0")
 
         internal_id = self._resolve_interaction_request(request_id)
+        if on_error is not None:
+            self.request_states[internal_id].interaction_error_handler = on_error
         event_id = interaction.get("event_id", "")
         reservations = self._interaction_reservations_map()
         reservation_key = (internal_id, event_id)
