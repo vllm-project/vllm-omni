@@ -203,6 +203,68 @@ class MixFusionExpandArgHook(ModelHook):
         return bound.args, bound.kwargs
 
 
+def _iter_module_path(root: nn.Module, name: str):
+    """Yield the module(s) named by ``name`` plus their ancestors.
+
+    Names use the plan's ``""`` / dotted / ``*`` syntax. Yielding every
+    intermediate module covers hooks installed on containers between a plan
+    boundary and the root (e.g. a layerwise-offload hook on a transformer
+    block, whose ``img_mod`` is a boundary).
+    """
+    if not name:
+        yield root
+        return
+    level = [root]
+    for part in name.split("."):
+        next_level = []
+        for module in level:
+            if part == "*":
+                if isinstance(module, nn.ModuleList):
+                    next_level.extend(module)
+            else:
+                child = getattr(module, part, None)
+                if isinstance(child, nn.Module):
+                    next_level.append(child)
+        if not next_level:
+            return
+        yield from next_level
+        level = next_level
+
+
+def plan_foreign_hooks(module: nn.Module, plan: dict | None) -> list[str]:
+    """Hooks, other than MixFusion's own, on modules the packed path drives.
+
+    The packed forward bypasses some module calls (boundaries, block forwards)
+    and swaps the batch layout seen by the ones it keeps, so hooks installed
+    there run with semantics they were not written for: layerwise offload
+    would prefetch with a chunk-count step size, FSDP2's unshard pre-hook
+    would all-gather against a batch dimension that no longer matches the
+    request count, and cache hooks would build keys on the packed layout.
+    Returns ``"<plan name>:<hook name>"`` descriptions; empty means the
+    packed path can run. Both the Omni hook registry and PyTorch-native hook
+    dicts are scanned.
+    """
+    foreign: set[str] = set()
+
+    def scan(module: nn.Module, name: str) -> None:
+        registry = getattr(module, "_hook_registry", None)
+        for hook_name in getattr(registry, "_hooks", None) or {}:
+            if hook_name not in MIXFUSION_HOOK_NAMES:
+                foreign.add(f"{name or '<root>'}:{hook_name}")
+        if getattr(module, "_forward_pre_hooks", None) or getattr(module, "_forward_hooks", None):
+            foreign.add(f"{name or '<root>'}:torch-native")
+
+    # The root always sees the swapped-in packed batch, whether or not the
+    # plan declares it explicitly.
+    scan(module, "")
+    for name in plan or {}:
+        for submodule in _iter_module_path(module, name):
+            if submodule is module:
+                continue
+            scan(submodule, name)
+    return sorted(foreign)
+
+
 def _spec_hook_name(spec) -> str:
     if isinstance(spec, MixFusionRoot):
         return MIXFUSION_PACK_HOOK_NAME

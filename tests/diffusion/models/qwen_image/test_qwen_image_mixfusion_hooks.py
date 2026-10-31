@@ -9,7 +9,7 @@ step size no longer matches the request count, and HSDP's ``fully_shard``
 registers native forward pre-hooks to all-gather weights against a batch
 dimension that no longer matches the request count. The packed path must
 refuse to run while blocks carry hooks -- ``prepare_mixfusion_inputs`` raises
-before any packing work -- and the pipeline must fall back to
+before any packing work -- and the driver must fall back to
 the serial path, whose per-request loops route every block through the hooked
 module call.
 """
@@ -24,7 +24,8 @@ from torch import nn
 
 from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, module_has_active_hooks
-from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
+from vllm_omni.diffusion.hooks.mixfusion import plan_foreign_hooks
+from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -66,35 +67,61 @@ def _transformer(blocks: list[nn.Module]) -> QwenImageTransformer2DModel:
     return transformer
 
 
-def _pipeline(transformer) -> QwenImagePipeline:
-    pipeline = QwenImagePipeline.__new__(QwenImagePipeline)
-    object.__setattr__(pipeline, "parallel_config", SimpleNamespace(sequence_parallel_size=1))
-    object.__setattr__(pipeline, "transformer", transformer)
-    # ``attention_kwargs`` is a read-only property over ``_attention_kwargs``;
-    # default it so dispatch guards can consult it on bare fixtures.
-    object.__setattr__(pipeline, "_attention_kwargs", None)
-    return pipeline
+def _pipeline(transformer):
+    """The driver's pipeline surface, without constructing the real pipeline."""
+    return SimpleNamespace(
+        transformer=transformer,
+        # ``interrupt`` is a read-only property on the real pipeline.
+        interrupt=False,
+        attention_kwargs=None,
+        parallel_config=SimpleNamespace(sequence_parallel_size=1),
+    )
 
 
 class _StubTransformer:
-    """Transformer stub recording packed-path calls for the pipeline tests."""
+    """Transformer stub recording packed-path calls for the driver tests."""
 
-    def __init__(self, *, hooked: bool):
-        self.hooked = hooked
+    def __init__(self, *, plan=None, blocks=None):
+        self._mixfusion_plan = plan
+        self.transformer_blocks = nn.ModuleList(blocks or [])
         self.packed_calls = 0
-        # Stamped by ``apply_mixfusion``; the pipeline refuses the packed
+        # Stamped by ``apply_mixfusion``; the driver refuses the packed
         # call when the registry never installed the hooks.
         self._mixfusion_hooks_applied = True
-
-    def has_active_block_hooks(self) -> bool:
-        return self.hooked
-
-    def has_active_root_hooks(self) -> bool:
-        return False
 
     def __call__(self, **kwargs):
         self.packed_calls += 1
         return "packed"
+
+
+class _StubAdapter:
+    """Minimal model-side adapter; the transformer stub consumes any payload."""
+
+    def build_packed_call(self, input_batch):
+        return {"hidden_states": input_batch.latents}
+
+
+def _driver(transformer):
+    driver = MixFusionDriver(_pipeline(transformer), transformer, _StubAdapter())
+    serial_inputs = []
+    driver.serial_ragged = lambda batch, states, dense_step: serial_inputs.append(batch) or "serial"
+    return driver, serial_inputs
+
+
+def _packed_input_batch():
+    return SimpleNamespace(
+        latents=[torch.zeros(1, 8, 16), torch.zeros(1, 8, 16)],
+        do_true_cfg=False,
+        image_latents=None,
+        # The driver aggregates per-request thresholds; lowering the minimum
+        # lets this tiny fixture stay packable.
+        request_extras=[{"mixfusion_min_chunk_tokens": 1}],
+        timesteps=torch.tensor([500.0]),
+    )
+
+
+def _dense_step(batch, **kwargs):
+    return "dense"
 
 
 def test_module_has_active_hooks():
@@ -157,54 +184,39 @@ def test_packed_prepare_passes_the_hook_guard_without_hooks():
         )
 
 
-def test_denoise_step_mixfusion_falls_back_to_serial_when_blocks_are_hooked():
-    pipeline = _pipeline(_StubTransformer(hooked=True))
-    serial_inputs = []
-    object.__setattr__(
-        pipeline,
-        "_denoise_step_serial_ragged",
-        lambda batch: serial_inputs.append(batch) or "serial",
+def test_driver_falls_back_to_serial_when_blocks_are_hooked():
+    transformer = _StubTransformer(
+        plan={"transformer_blocks.*": "img_mod"},
+        blocks=[_hooked_block()],
     )
-    input_batch = SimpleNamespace(
-        latents=[torch.zeros(1, 8, 16)],
-        do_true_cfg=False,
-        image_latents=None,
-    )
+    assert plan_foreign_hooks(transformer, transformer._mixfusion_plan) == ["transformer_blocks.*:layerwise_offload"]
+    driver, serial_inputs = _driver(transformer)
+    input_batch = _packed_input_batch()
 
-    assert pipeline._denoise_step_mixfusion(input_batch) == "serial"
+    assert driver.run(input_batch, states=[], dense_step=_dense_step) == "serial"
     assert serial_inputs == [input_batch]
+    assert transformer.packed_calls == 0
 
 
-def test_denoise_step_mixfusion_packs_when_blocks_are_not_hooked():
-    transformer = _StubTransformer(hooked=False)
-    pipeline = _pipeline(transformer)
-    serial_inputs = []
-    object.__setattr__(
-        pipeline,
-        "_denoise_step_serial_ragged",
-        lambda batch: serial_inputs.append(batch) or "serial",
+def test_driver_falls_back_to_serial_when_blocks_carry_native_hooks():
+    transformer = _StubTransformer(
+        plan={"transformer_blocks.*": "img_mod"},
+        blocks=[_hsdp_like_block()],
     )
-    object.__setattr__(
-        pipeline,
-        "_qwen_mixfusion_candidate",
-        lambda latents, *, min_chunk_tokens, max_chunks: (True, "", 8, 2),
-    )
-    # ``attention_kwargs`` is a read-only property over ``_attention_kwargs``.
-    object.__setattr__(pipeline, "_attention_kwargs", None)
-    input_batch = SimpleNamespace(
-        latents=[torch.zeros(1, 8, 16), torch.zeros(1, 8, 16)],
-        do_true_cfg=False,
-        image_latents=None,
-        request_extras=None,
-        timesteps=torch.tensor([500.0]),
-        guidance=None,
-        prompt_embeds=torch.zeros(2, 4, 8),
-        prompt_embeds_mask=None,
-        img_shapes=[(16, 2, 2), (16, 2, 2)],
-        txt_seq_lens=[4, 4],
-    )
+    driver, serial_inputs = _driver(transformer)
+    input_batch = _packed_input_batch()
+
+    assert driver.run(input_batch, states=[], dense_step=_dense_step) == "serial"
+    assert serial_inputs == [input_batch]
+    assert transformer.packed_calls == 0
+
+
+def test_driver_packs_when_blocks_are_not_hooked():
+    transformer = _StubTransformer(plan={"transformer_blocks.*": "img_mod"}, blocks=[_PlainBlock()])
+    driver, serial_inputs = _driver(transformer)
+    input_batch = _packed_input_batch()
 
     with override_forward_context(ForwardContext()):
-        assert pipeline._denoise_step_mixfusion(input_batch) == "packed"
+        assert driver.run(input_batch, states=[], dense_step=_dense_step) == "packed"
     assert transformer.packed_calls == 1
     assert serial_inputs == []

@@ -17,6 +17,7 @@ from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.mixfusion import apply_mixfusion
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 from vllm_omni.platforms import current_omni_platform
 
@@ -750,6 +751,12 @@ def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
     the forward context, so a model with the hooks installed still runs its
     serial forward unchanged when MixFusion is not requested.
 
+    It also mounts the model-agnostic
+    :class:`~vllm_omni.diffusion.mixfusion.driver.MixFusionDriver` on the
+    pipeline. The driver is the entry point for ragged batches even when no
+    plan or adapter exists: its serial fallback still has to run, because the
+    dense path cannot accept list latents.
+
     Args:
         model: The pipeline model (e.g., QwenImagePipeline).
         od_config: The OmniDiffusion configuration.
@@ -768,10 +775,13 @@ def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
 
         # Prefer the pipeline's declared DiT components so custom component
         # names receive the same hooks as conventional transformer names.
+        pipeline = model
         transformer_attrs = getattr(model, "_dit_modules", None)
         if not transformer_attrs:
             transformer_attrs = ("transformer", "transformer_2", "dit", "unet")
         applied_count = 0
+        first_transformer = None
+        driver = None
 
         for attr in transformer_attrs:
             if not hasattr(model, attr):
@@ -785,14 +795,43 @@ def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
             transformer = getattr(model, attr)
             if transformer is None:
                 continue
+            if first_transformer is None:
+                first_transformer = transformer
 
             plan = getattr(transformer, "_mixfusion_plan", None)
+            adapter = getattr(transformer, "mixfusion_adapter", None)
+
+            # The driver only knows the model through this adapter; prefer the
+            # first DiT that has one. A second packable DiT cannot be driven by
+            # the same step, so its hooks stay inert.
+            if driver is None and adapter is not None:
+                driver = MixFusionDriver(pipeline, transformer, adapter)
+                pipeline.mixfusion_driver = driver
+            elif driver is not None and plan is not None and driver.transformer is not transformer:
+                logger.warning_once(
+                    "MixFusion packs one DiT per step; hooks on %s stay inert.",
+                    transformer.__class__.__name__,
+                )
+
             if plan is None:
+                continue
+            if adapter is None:
+                logger.warning_once(
+                    "%s declares _mixfusion_plan but no `mixfusion_adapter`; MixFusion stays on the "
+                    "serial per-request path.",
+                    transformer.__class__.__name__,
+                )
                 continue
 
             logger.info(f"Applying MixFusion hooks to {transformer.__class__.__name__} ({attr}): {', '.join(plan)}")
             apply_mixfusion(transformer, plan)
             applied_count += 1
+
+        if driver is None and first_transformer is not None:
+            # No adapter anywhere: still mount the driver so ragged batches use
+            # its serial fallback instead of reaching the dense path with list
+            # latents.
+            pipeline.mixfusion_driver = MixFusionDriver(pipeline, first_transformer, None)
 
         # update forward context mixfusion_hooks_applied
         ctx = get_forward_context()

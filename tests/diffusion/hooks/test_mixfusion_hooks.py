@@ -366,6 +366,10 @@ class _RecordingAdapter:
         self._returns_none = returns_none
         self.calls: list[tuple] = []
 
+    def build_packed_call(self, input_batch):
+        self.calls.append(("build_packed_call", input_batch))
+        return {"hidden_states": input_batch.latents}
+
     def can_pack(self, module, bound):
         self.calls.append(("can_pack", dict(bound.arguments)))
         return self._can_pack, "" if self._can_pack else "refused"

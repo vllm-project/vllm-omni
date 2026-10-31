@@ -1189,6 +1189,22 @@ class QwenImageMixFusionAdapter:
         # the image chunks follow it and are the positional Q/K/V tensors.
         return AttentionLayout((StreamSpec("text", "request"), StreamSpec("image", "chunked")))
 
+    def build_packed_call(self, input_batch) -> dict[str, Any]:
+        # Per-request latents stay a list: the root hook packs them. The
+        # per-image conditioning tensors are passed as-is; the plan's
+        # request/row mapping handles the expansion.
+        latents = input_batch.latents
+        return {
+            "hidden_states": latents,
+            "timestep": input_batch.timesteps.to(device=latents[0].device, dtype=latents[0].dtype) / 1000,
+            "guidance": input_batch.guidance,
+            "encoder_hidden_states": input_batch.prompt_embeds,
+            "encoder_hidden_states_mask": input_batch.prompt_embeds_mask,
+            "img_shapes": input_batch.img_shapes,
+            "txt_seq_lens": input_batch.txt_seq_lens,
+            "return_dict": False,
+        }
+
     def can_pack(self, module, bound) -> tuple[bool, str]:
         if "hidden_states" not in bound.arguments:
             # Contract: packing needs the per-request latent argument; keep

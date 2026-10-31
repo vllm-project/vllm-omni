@@ -1487,7 +1487,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
+                driver = getattr(pipeline, "mixfusion_driver", None)
+                if driver is not None:
+                    # The driver forwards dense batches to the same
+                    # ``denoise_step`` and owns the packed/ragged paths.
+                    noise_pred = driver.run(input_batch, states, pipeline.denoise_step)
+                else:
+                    noise_pred = pipeline.denoise_step(input_batch, states=states)
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(

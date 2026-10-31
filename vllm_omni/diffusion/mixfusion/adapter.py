@@ -107,6 +107,16 @@ class MixFusionAdapter(Protocol):
     behind these methods.
     """
 
+    def build_packed_call(self, input_batch: Any) -> dict[str, Any]:
+        """Build this model's packed forward keyword arguments.
+
+        The driver calls ``transformer(**build_packed_call(input_batch))``
+        under an armed step; the root hook then turns that call into the
+        chunk-stacked layout. Only the adapter knows the model's forward
+        contract, so the driver never builds this call itself.
+        """
+        ...
+
     def can_pack(self, module: nn.Module, bound: Any) -> tuple[bool, str]:
         """Whether this call is packable.
 
