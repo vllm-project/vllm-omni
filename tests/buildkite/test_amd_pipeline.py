@@ -682,7 +682,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
     (
         "Qwen3-Omni SHM Leak Test",
         AMD_MERGE_PIPELINE,
-        "NonBlocking",
+        "Blocking",
         1,
         "advanced_model and rocm and MI325 and cards_2 and not nvidia_only",
     ),
@@ -2583,7 +2583,7 @@ def test_wan22_function_executes_junit_guard_before_exit(
     )
 
 
-def test_qwen3_omni_shm_leak_is_a_separate_nonblocking_merge_job() -> None:
+def test_qwen3_omni_shm_leak_is_a_separate_blocking_merge_job() -> None:
     blocking_step = _find_step("Omni Model Test Qwen3-Omni", AMD_MERGE_PIPELINE)
     shm_path = "tests/e2e/online_serving/test_qwen3_omni_shm_leak.py"
     blocking_commands = "\n".join(blocking_step["commands"])
@@ -2598,7 +2598,7 @@ def test_qwen3_omni_shm_leak_is_a_separate_nonblocking_merge_job() -> None:
 
     assert step["agent_pool"] == "mi300_2"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == ["artifacts/rocm-qwen3-omni-shm-leak/**/*"]
     assert commands.count(shm_path) == 2

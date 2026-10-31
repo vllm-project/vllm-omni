@@ -478,7 +478,7 @@ steps:
       agent_pool: mi300_2
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       timeout_in_minutes: 50
       artifact_paths:
         - artifacts/rocm-qwen3-omni-shm-leak/**/*
