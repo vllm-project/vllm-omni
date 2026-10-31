@@ -1123,7 +1123,8 @@ def _merge_platforms(
     base: dict[str, Any] | None,
     overlay: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Merge platform blocks by stage ID and named connector definition."""
+    """Deep-merge two ``platforms:`` blocks per-platform, stages by stage_id,
+    connectors by name."""
     if not base and not overlay:
         return None
     base = base or {}
@@ -1132,11 +1133,11 @@ def _merge_platforms(
     for plat in set(base) | set(overlay):
         bp = base.get(plat) or {}
         op = overlay.get(plat) or {}
-        merged_plat = {**bp, **{k: v for k, v in op.items() if k != "stages"}}
+        merged_plat = {**bp, **{k: v for k, v in op.items() if k not in ("stages", "connectors")}}
         merged_plat["stages"] = _merge_stage_lists(bp.get("stages"), op.get("stages"))
-        connectors = _merge_connectors(bp.get("connectors"), op.get("connectors"))
-        if connectors is not None:
-            merged_plat["connectors"] = connectors
+        merged_conns = _merge_connectors(bp.get("connectors"), op.get("connectors"))
+        if merged_conns is not None:
+            merged_plat["connectors"] = merged_conns
         merged[plat] = merged_plat
     return merged
 
@@ -1328,6 +1329,8 @@ def _apply_platform_overrides(
         for conn_name, override in platform_connectors.items():
             if not conns or conn_name not in conns:
                 raise ValueError(f"platform connectors override references unknown connector {conn_name!r}")
+            if not isinstance(override, dict):
+                raise ValueError(f"platform connectors override for {conn_name!r} must be a mapping")
             conns[conn_name] = _get_recursively_merged_dict(conns[conn_name], override)
     platform_stages = platform_section.get("stages", []) if platform_section else []
     base_by_id = {s.stage_id: s for s in deploy.stages}
