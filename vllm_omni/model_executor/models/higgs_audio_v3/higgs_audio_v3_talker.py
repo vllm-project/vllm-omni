@@ -151,6 +151,12 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 "Higgs Audio v3 model_runner: v2 requires async_scheduling: true on the talker stage; "
                 "enable it in the deploy profile or run this stage with model_runner: v1"
             )
+        if not use_v2_runner and vllm_config.scheduler_config.async_scheduling:
+            logger.warning(
+                "Higgs Audio v3: model_runner: v1 with async_scheduling: true is not an "
+                "exercised combination for this model; the shipped V1 profiles "
+                "(_high_throughput / _low_latency) run with async_scheduling: false."
+            )
         self._async_audio_gpu_staging = None
         model_config = getattr(vllm_config, "model_config", None)
         compilation_config = getattr(vllm_config, "compilation_config", None)
