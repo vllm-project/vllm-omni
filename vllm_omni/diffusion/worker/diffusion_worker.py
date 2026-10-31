@@ -112,6 +112,13 @@ _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
 
 def _cleanup_after_execution_error(exc: Exception) -> None:
     """Release device tensors retained by a failed execution traceback."""
+    if getattr(exc, "requires_stage_shutdown", False):
+        # A tile peer or CPU control group failed. Do not keep this worker
+        # available for another request or allocate/synchronize the failed
+        # device during normal request cleanup. The executor's liveness
+        # monitor shuts down the rest of this worker group on process exit.
+        logger.error("Fatal diffusion rank-group error; terminating worker: %s", exc)
+        raise SystemExit(1) from exc
     exc.__traceback__ = None
     try:
         gc.collect()

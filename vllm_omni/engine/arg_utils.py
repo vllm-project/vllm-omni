@@ -793,6 +793,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_tile_batch_size: int | None = None
     vae_fast_path: str = "lossless"
     vae_encode_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
@@ -804,6 +805,8 @@ class OrchestratorArgs:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    dlo_vae_resident: bool = False
+    dlo_text_encoder_resident: bool = False
     dlo_use_allgather: bool = True
     dlo_chunk_size_mb: int = 64
     dlo_resident_layers: int = 0

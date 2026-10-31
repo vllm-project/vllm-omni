@@ -1,5 +1,47 @@
 # VAE Patch Parallelism
 
+For MiniMax H3, the optional `--vae-tile-size S` sets both encoder and decoder
+square spatial tile edges in pixels in diffusion pipelines. The independent
+`--vae-tile-overlap O` sets both `tile_overlap_min` and
+`decoder_tile_overlap_min` in pixels; actual grid overlap may be larger.
+Each defaults to unset, preserving that checkpoint setting. Neither enables
+tiling, changes temporal settings, or changes the number of VAE ranks.
+S must be a positive integer and O a nonnegative integer, both divisible by
+the checkpoint spatial compression ratio. The final overlap must be strictly
+smaller than the final tile size on both grids; the pair is validated before
+any mutation. Unsupported VAE adapters reject either explicit option. The
+separate AR encoder stage does not consume these options.
+
+These options configure only the video VAE, leaving DiT weights, attention,
+and denoising settings unchanged. Reference image/video encoding can change
+conditioning latents and therefore indirectly change DiT results.
+
+Unlike tile batch size below, spatial tile size changes the grid and may
+change pixels and memory use. At 1344×768 with minimum overlap 64, S=384 gives
+12 tiles and S=512 gives six, compared with 28 at S=256. If there are fewer
+decoder tiles than VAE ranks, H3 retains its existing rank-local fallback.
+
+For MiniMax H3, `--vae-tile-batch-size K` additionally bounds the number of
+decoder spatial tiles processed by each rank in one forward when K > 1.
+The default K=1 keeps the checkpoint's original executor without adding control
+collectives. K must be a positive integer and K greater than 1 requires VAE
+tiling. This option changes local decoder scheduling, independently of the
+number of VAE ranks. Encoder scheduling remains unchanged. Other VAE adapters
+reject K greater than 1 unless they implement this capability.
+
+At 1344×768, the default H3 geometry has 28 tiles. With eight VAE ranks,
+ranks 0–3 have four tiles each and ranks 4–7 have three. At K=4 these ranks
+execute one forward with four or three tiles respectively; the tail is never
+padded. An original sample batch B becomes q×B for a group of q tiles, and
+outputs are split back into B-sized tiles before the existing gather and blend.
+At K=3, ranks may execute different numbers of local forwards. A matching
+Gloo CPU group coordinates local failures before the checkpoint device gather;
+the control barrier has a 120-second timeout. A worker process exit remains
+covered by the executor's worker monitor. A rank-group execution or control
+failure terminates the dedicated worker so this monitor closes the stage.
+Increasing K can increase memory use;
+it does not guarantee a speedup.
+
 This document describes how to add **VAE Patch Parallelism** support to a diffusion model.
 We use **Qwen-Image** as the reference implementation for decode parallel, and **Wan2.2** for encode parallel.
 

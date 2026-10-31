@@ -100,16 +100,18 @@ def extract_omni_serve_subparser_init():
     with open(serve_path, encoding="utf-8") as f:
         source = f.read()
     tree = ast.parse(source, filename=str(serve_path))
+    # Reuse the CLI validator without importing the serving module and its dependencies.
+    validators = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_positive_tile_batch_size"
+    ]
     # Find class OmniServeCommand
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == "OmniServeCommand":
             for item in node.body:
                 if isinstance(item, ast.FunctionDef) and item.name == "subparser_init":
                     # We'll exec this function body in a dummy context
-                    func_code = ast.Module(body=[item], type_ignores=[])
+                    func_code = ast.Module(body=[*validators, item], type_ignores=[])
                     code = compile(func_code, filename=str(serve_path), mode="exec")
-                    # Prepare dummy context
-                    local_vars = {}
 
                     # Provide a dummy subparsers with add_parser returning our parser
                     class DummySubparsers:
@@ -141,9 +143,10 @@ def extract_omni_serve_subparser_init():
                         "json": __import__("json"),
                         "DESCRIPTION": DESCRIPTION,
                     }
-                    exec(code, exec_globals, local_vars)
+                    # Functions resolve module-level helpers through their globals.
+                    exec(code, exec_globals)
                     # Get the function
-                    subparser_init = local_vars["subparser_init"]
+                    subparser_init = exec_globals["subparser_init"]
 
                     # Return a callable that mimics OmniServeCommand().subparser_init
                     def parser_factory():
