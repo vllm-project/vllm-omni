@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import functools
+from typing import Any
 
 import pytest
 import torch
@@ -42,10 +43,7 @@ class FakeAudioGeneration(nn.Module):
         self.cfg_alpha = cfg_alpha
         batch_size = hidden_states.shape[0] if hidden_states.ndim > 1 else 1
         fake_eos = torch.arange(batch_size, device=hidden_states.device, dtype=hidden_states.dtype)
-        frames = [
-            torch.full((1, 1, 4), float(index + 1), device=hidden_states.device)
-            for index in range(batch_size)
-        ]
+        frames = [torch.full((1, 1, 4), float(index + 1), device=hidden_states.device) for index in range(batch_size)]
         return fake_eos, {"codes": {"audio": frames}}
 
 
@@ -122,6 +120,29 @@ def test_tts_preprocess_replay_chunk_uses_absolute_computed_token_offset():
     torch.testing.assert_close(output_embeds, torch.full((1, 4), 20.0))
 
 
+def test_tts_preprocess_steady_state_decode_avoids_cuda_sync_queries(monkeypatch):
+    model = _make_voxtral_tts_model()
+    input_ids = torch.tensor([model._audio_token_id])
+    input_embeds = torch.zeros((1, 4))
+    audio_tokens = torch.tensor([[[5, 6, 7, 8]]])
+
+    def unexpected_sync_query(*args, **kwargs):
+        raise AssertionError("steady-state decode must not inspect CUDA mask values on the CPU")
+
+    monkeypatch.setattr(torch.Tensor, "any", unexpected_sync_query)
+    monkeypatch.setattr(torch.Tensor, "tolist", unexpected_sync_query)
+
+    _, output_embeds, _ = model.tts_preprocess(
+        input_ids=input_ids,
+        input_embeds=input_embeds,
+        codes={"audio": audio_tokens, "audio_history": [torch.tensor([5, 6, 7, 8])]},
+        _omni_prompt_len=4,
+        _omni_num_computed_tokens=4,
+    )
+
+    torch.testing.assert_close(output_embeds, torch.full((1, 4), 5.0))
+
+
 def test_tts_preprocess_uses_latest_feedback_without_mrv2_positions():
     model = _make_voxtral_tts_model()
     input_ids = torch.tensor([model._audio_token_id])
@@ -155,10 +176,46 @@ def test_tts_preprocess_keeps_legacy_top_level_audio_feedback():
     torch.testing.assert_close(output_embeds, torch.full((1, 4), 7.0))
 
 
+def test_v1_output_hook_persists_feedback_from_preprocess_state_delta():
+    from types import SimpleNamespace
+
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+    model = _make_voxtral_tts_model()
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.model_intermediate_buffer = {}
+    runner.requests = {"request-a": SimpleNamespace()}
+
+    _, _, update = model.tts_preprocess(torch.tensor([5]), torch.zeros((1, 4)))
+    assert update == {"codes": {"audio_history": []}}
+    runner._update_intermediate_buffer("request-a", update)
+    request_info = runner.model_intermediate_buffer["request-a"]
+
+    model.make_omni_output(
+        torch.zeros((1, 4)),
+        logits_index=torch.tensor([0]),
+        runtime_additional_information=[request_info],
+    )
+
+    torch.testing.assert_close(
+        runner.model_intermediate_buffer["request-a"]["codes"]["audio_history"][0],
+        torch.ones((1, 1, 4)),
+    )
+    _, output_embeds, _ = model.tts_preprocess(
+        torch.tensor([model._audio_token_id]),
+        torch.zeros((1, 4)),
+        _omni_prompt_len=4,
+        _omni_num_computed_tokens=4,
+        **runner.model_intermediate_buffer["request-a"],
+    )
+    torch.testing.assert_close(output_embeds, torch.ones((1, 4)))
+
+
 def test_make_omni_output_keeps_feedback_request_local():
     model = _make_voxtral_tts_model()
     model._cudagraph_acoustic_transformer = None
-    request_infos = [{"request_id": "req-a"}, {"request_id": "req-b"}]
+    request_infos: list[dict[str, Any]] = [{"request_id": "req-a"}, {"request_id": "req-b"}]
     hidden_states = torch.zeros((2, 4))
 
     output = model.make_omni_output(
@@ -202,18 +259,14 @@ def test_make_omni_output_mrv2_uses_request_slots_and_sampling_cfg():
     torch.testing.assert_close(model.model.cfg_alpha, torch.tensor([1.1, 1.7]))
     torch.testing.assert_close(request_infos[0]["codes"]["audio"], torch.full((1, 1, 4), 1.0))
     torch.testing.assert_close(request_infos[1]["codes"]["audio"], torch.full((1, 1, 4), 2.0))
-    torch.testing.assert_close(
-        request_infos[0]["codes"]["audio_history"][0], torch.full((1, 1, 4), 1.0)
-    )
-    torch.testing.assert_close(
-        request_infos[1]["codes"]["audio_history"][0], torch.full((1, 1, 4), 2.0)
-    )
+    torch.testing.assert_close(request_infos[0]["codes"]["audio_history"][0], torch.full((1, 1, 4), 1.0))
+    torch.testing.assert_close(request_infos[1]["codes"]["audio_history"][0], torch.full((1, 1, 4), 2.0))
     torch.testing.assert_close(output.text_hidden_states[[2, 0], 0], torch.tensor([0.0, 1.0]))
 
 
 def test_make_omni_output_mrv2_filters_intermediate_prefill_frames_by_request():
     model = _make_voxtral_tts_model()
-    request_infos = [
+    request_infos: list[dict[str, Any]] = [
         {"request_id": "req-prefill"},
         {"request_id": "req-decode"},
     ]
@@ -237,9 +290,7 @@ def test_make_omni_output_mrv2_filters_intermediate_prefill_frames_by_request():
     )
 
     assert "codes" not in request_infos[0]
-    torch.testing.assert_close(
-        request_infos[1]["codes"]["audio_history"][0], torch.full((1, 1, 4), 2.0)
-    )
+    torch.testing.assert_close(request_infos[1]["codes"]["audio_history"][0], torch.full((1, 1, 4), 2.0))
     audio_frames = output.multimodal_outputs["codes"]["audio"]
     assert audio_frames[0] is None
     torch.testing.assert_close(audio_frames[1], torch.full((1, 1, 4), 2.0))

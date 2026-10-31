@@ -242,8 +242,7 @@ class VoxtralTTSForConditionalGeneration(
         if isinstance(history, (list, tuple)):
             if frame_indices and max(frame_indices) >= len(history):
                 raise RuntimeError(
-                    f"Voxtral acoustic history has {len(history)} frames; "
-                    f"replay requested frame {max(frame_indices)}"
+                    f"Voxtral acoustic history has {len(history)} frames; replay requested frame {max(frame_indices)}"
                 )
             selected = [history[index].reshape(-1) for index in frame_indices]
             if not selected:
@@ -274,14 +273,49 @@ class VoxtralTTSForConditionalGeneration(
         codes = info_dict.get("codes")
         audio_tokens = codes.get("audio") if isinstance(codes, Mapping) else None
         audio_history = codes.get("audio_history") if isinstance(codes, Mapping) else None
+        # Seed persistent runner state before make_omni_output mutates the request
+        # info in place. V1 can pass a temporary empty dict when no state exists.
+        feedback_state_update = {"codes": {"audio_history": []}} if audio_history is None else {}
         prompt_len = info_dict.get("_omni_prompt_len")
         num_computed_tokens = info_dict.get("_omni_num_computed_tokens")
         replay_mask = None
         frame_embeddings = None
         has_replay_positions = prompt_len is not None and num_computed_tokens is not None
-        history_is_empty = audio_history is None or (
-            isinstance(audio_history, (list, tuple)) and len(audio_history) == 0
-        ) or (isinstance(audio_history, torch.Tensor) and audio_history.numel() == 0)
+        history_is_empty = (
+            audio_history is None
+            or (isinstance(audio_history, (list, tuple)) and len(audio_history) == 0)
+            or (isinstance(audio_history, torch.Tensor) and audio_history.numel() == 0)
+        )
+
+        # Normal autoregressive decode schedules one sampled token at the
+        # absolute position matching the newest acoustic frame. Voxtral's
+        # logits admit only an audio token or EOS; EOS requests are not
+        # scheduled again, so this one-token continuation is known to be an
+        # audio token. Use host metadata to recognize it before touching
+        # input_ids, avoiding CUDA bool()/tolist() synchronization per step.
+        if (
+            isinstance(audio_tokens, torch.Tensor)
+            and audio_history is not None
+            and prompt_len is not None
+            and num_computed_tokens is not None
+            and input_ids.numel() == 1
+        ):
+            prompt_len = int(prompt_len)
+            num_computed_tokens = int(num_computed_tokens)
+            history_length = (
+                len(audio_history)
+                if isinstance(audio_history, (list, tuple))
+                else int(audio_history.shape[0])
+                if isinstance(audio_history, torch.Tensor) and audio_history.ndim > 0
+                else 0
+            )
+            if (
+                history_length > 0
+                and num_computed_tokens >= prompt_len
+                and num_computed_tokens - prompt_len == history_length - 1
+            ):
+                multimodal_embeddings = self.model.embed_multimodal(audio_tokens=audio_tokens.to(input_ids.device))
+                return input_ids, multimodal_embeddings[0], feedback_state_update
 
         # A preempted request is replayed from its prompt. Generated Voxtral
         # audio tokens need the acoustic frame emitted for that token, by
@@ -310,12 +344,8 @@ class VoxtralTTSForConditionalGeneration(
                     # device; older frames are needed only when replaying preempted work.
                     selected_frames = audio_tokens.to(input_ids.device).reshape(1, -1)
                 else:
-                    selected_frames = self._select_feedback_frames(
-                        audio_history, frame_indices, input_ids.device
-                    )
-                multimodal_embeddings = self.model.embed_multimodal(
-                    audio_tokens=selected_frames.unsqueeze(0)
-                )
+                    selected_frames = self._select_feedback_frames(audio_history, frame_indices, input_ids.device)
+                multimodal_embeddings = self.model.embed_multimodal(audio_tokens=selected_frames.unsqueeze(0))
                 frame_embeddings = multimodal_embeddings[0]
                 replay_count = len(frame_indices)
                 if frame_embeddings.shape[0] != replay_count:
@@ -337,7 +367,7 @@ class VoxtralTTSForConditionalGeneration(
             multimodal_embeddings = self.model.embed_multimodal(**kwargs)
             if input_ids[0] == self._audio_token_id:
                 input_embeds = multimodal_embeddings[0]
-            return input_ids, input_embeds, {}
+            return input_ids, input_embeds, feedback_state_update
 
         voice = info_dict.get("voice")
         if voice is not None and self._is_prefill_step(info_dict, input_ids):
@@ -363,8 +393,8 @@ class VoxtralTTSForConditionalGeneration(
             if replay_mask is not None and bool(replay_mask.any()):
                 input_embeds = input_embeds.clone()
                 input_embeds[replay_mask] = frame_embeddings
-            return input_ids, input_embeds, {}
-        return input_ids, input_embeds, {}
+            return input_ids, input_embeds, feedback_state_update
+        return input_ids, input_embeds, feedback_state_update
 
     @staticmethod
     def _filter_ineligible_feedback_outputs(
@@ -403,14 +433,17 @@ class VoxtralTTSForConditionalGeneration(
         multimodal_outputs: object,
         request_infos: object,
         request_sample_eligible: list[bool] | tuple[bool, ...] | torch.Tensor | None = None,
+        *,
+        keep_history_on_device: bool = False,
     ) -> None:
         """Save each emitted acoustic frame in its request-local model state.
 
         The next decode step consumes this frame in tts_preprocess. Keeping it
-        in the runner's per-request buffer avoids a model-global cursor, which
-        can associate frames with the wrong request under batching.
-        request_sample_eligible excludes intermediate prompt chunks; the
-        final prompt chunk remains eligible for the first generated token.
+        in request-local state avoids a model-global cursor, which can associate
+        frames with the wrong request under batching. MRV2 may keep active
+        history on device and offload it when preempted; V1 keeps CPU history.
+        request_sample_eligible excludes intermediate prompt chunks; the final
+        prompt chunk remains eligible for the first generated token.
         """
         if not isinstance(multimodal_outputs, Mapping) or not isinstance(request_infos, (list, tuple)):
             return
@@ -435,15 +468,11 @@ class VoxtralTTSForConditionalGeneration(
             if not isinstance(request_sample_eligible, (list, tuple)) or len(request_sample_eligible) != len(
                 request_infos
             ):
-                logger.warning(
-                    "Skipping Voxtral feedback update: sample eligibility count does not match requests"
-                )
+                logger.warning("Skipping Voxtral feedback update: sample eligibility count does not match requests")
                 return
             eligible_pairs = [
                 (request_info, frame)
-                for request_info, frame, eligible in zip(
-                    request_infos, frames, request_sample_eligible, strict=True
-                )
+                for request_info, frame, eligible in zip(request_infos, frames, request_sample_eligible, strict=True)
                 if bool(eligible)
             ]
             request_infos = [request_info for request_info, _ in eligible_pairs]
@@ -459,10 +488,16 @@ class VoxtralTTSForConditionalGeneration(
                 frame = frame.unsqueeze(0)
             request_codes = request_info.setdefault("codes", {})
             if isinstance(request_codes, dict):
-                # Keep persistent replay history on CPU. Copy each emitted frame once,
-                # instead of snapshotting the growing history on every preprocess step.
+                # Own the frame so request state survives reuse of model-output buffers.
                 latest_frame = frame.detach().clone()
-                history_frame = frame.detach().to(device="cpu", copy=True).contiguous()
+                # MRV2 owns request state directly, so keep active replay
+                # frames with the request on device and offload them together
+                # only if scheduler preemption suspends that request. V1's
+                # runner serializes intermediate updates to CPU and keeps the
+                # historical behavior below.
+                history_frame = (
+                    latest_frame if keep_history_on_device else frame.detach().to(device="cpu", copy=True).contiguous()
+                )
                 request_codes["audio"] = latest_frame
                 history = request_codes.setdefault("audio_history", [])
                 if isinstance(history, list):
@@ -470,8 +505,10 @@ class VoxtralTTSForConditionalGeneration(
                 elif isinstance(history, torch.Tensor):
                     # Resumed requests normally restore a list; tolerate an
                     # older serialized runner payload that restored a tensor.
-                    history_cpu = history.detach().to(device="cpu", copy=True).contiguous()
-                    request_codes["audio_history"] = [*history_cpu.unbind(0), history_frame]
+                    stored_history = history.detach().contiguous()
+                    if not keep_history_on_device:
+                        stored_history = stored_history.to(device="cpu", copy=True).contiguous()
+                    request_codes["audio_history"] = [*stored_history.unbind(0), history_frame]
                 else:
                     request_codes["audio_history"] = [history_frame]
 
@@ -655,7 +692,10 @@ class VoxtralTTSForConditionalGeneration(
         ]
         self._filter_ineligible_feedback_outputs(multimodal_outputs, request_sample_eligible)
         self._store_feedback_frames(
-            multimodal_outputs, model_intermediate_buffer, request_sample_eligible
+            multimodal_outputs,
+            model_intermediate_buffer,
+            request_sample_eligible,
+            keep_history_on_device=True,
         )
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=multimodal_outputs)
 

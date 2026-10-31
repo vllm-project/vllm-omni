@@ -90,11 +90,7 @@ class VoxtralTTSModelState(OmniModelState):
                 frames = frames.reshape(frames.shape[0], -1)
             history = frames.detach().to(device="cpu", copy=True)
         elif isinstance(frames, (list, tuple)):
-            rows = [
-                frame.detach().reshape(-1)
-                for frame in frames
-                if isinstance(frame, torch.Tensor)
-            ]
+            rows = [frame.detach().reshape(-1) for frame in frames if isinstance(frame, torch.Tensor)]
             if not rows:
                 self._suspended_feedback_history.pop(req_id, None)
                 return

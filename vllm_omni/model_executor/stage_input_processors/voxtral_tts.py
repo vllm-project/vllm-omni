@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -57,6 +60,9 @@ def generator2tokenizer_async_chunk(
             added_frame = True
     elif not finished:
         # Some steps may not produce multimodal_output. Only flush on finish.
+        return None
+
+    if not added_frame and not finished:
         return None
 
     connector = getattr(transfer_manager, "connector", None)

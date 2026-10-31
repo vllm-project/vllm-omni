@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Voxtral TTS pipeline topology (frozen).
 
 Stage 0: audio_generation  — text → acoustic latents (LLM_AR, tokenizer owner).
