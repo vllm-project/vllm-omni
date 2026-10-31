@@ -214,6 +214,22 @@ _OMNI_MODELS = {
         "higgs_audio_v2_code2wav",
         "HiggsAudioV2Code2WavForConditionalGeneration",
     ),
+    ## zonos2
+    "Zonos2ForConditionalGeneration": (
+        "zonos2",
+        "zonos2_talker",
+        "Zonos2TalkerForConditionalGeneration",
+    ),
+    "Zonos2TalkerForConditionalGeneration": (
+        "zonos2",
+        "zonos2_talker",
+        "Zonos2TalkerForConditionalGeneration",
+    ),
+    "Zonos2Code2WavForConditionalGeneration": (
+        "zonos2",
+        "zonos2_dac_decoder",
+        "Zonos2Code2WavForConditionalGeneration",
+    ),
     ## higgs-audio v3
     "HiggsMultimodalQwen3ForConditionalGeneration": (
         "higgs_audio_v3",
