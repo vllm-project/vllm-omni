@@ -613,6 +613,7 @@ class OmniBase(PDDisaggregationMixin):
         final_stage_id_for_e2e: int,
         stage_event_cursor: int = 0,
     ) -> OmniRequestOutput | None:
+        _t_response_handling = time.perf_counter()
         req_id = result.request_id
         engine_outputs = result.engine_outputs
         stage_durations = getattr(engine_outputs, "stage_durations", {})
@@ -650,6 +651,25 @@ class OmniBase(PDDisaggregationMixin):
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
 
         _m = result.metrics
+        if _m is not None:
+            diffusion_metrics = getattr(_m, "diffusion_metrics", None) or {}
+            metric_output = engine_outputs[0] if isinstance(engine_outputs, list) and engine_outputs else engine_outputs
+            raw_diffusion_metrics = getattr(metric_output, "metrics", {}) or {}
+            if isinstance(raw_diffusion_metrics, list):
+                raw_diffusion_metrics = raw_diffusion_metrics[0] if raw_diffusion_metrics else {}
+            scheduler_wait_ms = raw_diffusion_metrics.get("scheduler_queue_wait_ms")
+            if scheduler_wait_ms is None:
+                scheduler_wait_s = diffusion_metrics.get("scheduler_queue_wait_s")
+                scheduler_wait_ms = float(scheduler_wait_s) * 1000.0 if scheduler_wait_s is not None else 0.0
+            scheduler_wait_ms = max(float(scheduler_wait_ms), 0.0)
+            pipeline_timings = getattr(_m, "pipeline_timings", None)
+            if pipeline_timings is None:
+                pipeline_timings = {}
+                _m.pipeline_timings = pipeline_timings
+            pipeline_timings["scheduler_wait_ms"] = scheduler_wait_ms
+            pipeline_timings["executor_run_ms"] = max(float(_m.stage_gen_time_ms) - scheduler_wait_ms, 0.0)
+            stage_durations["scheduler_wait_ms"] = scheduler_wait_ms
+            stage_durations["executor_run_ms"] = pipeline_timings["executor_run_ms"]
         stage_meta = self.engine.get_stage_metadata(stage_id)
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         if finished and _m is not None:
@@ -771,6 +791,18 @@ class OmniBase(PDDisaggregationMixin):
         # Generation content (outputs, prompt, images, trajectory_*, ...) is
         # copied from engine_outputs onto the returned object by
         # OmniRequestOutput.from_stage_output().
+        response_handling_ms = (time.perf_counter() - _t_response_handling) * 1000.0
+        stage_durations["response_handling_ms"] = response_handling_ms
+        request_events = metrics.stage_events.get(rid_key, [])
+        if request_events:
+            event_timings = request_events[-1].pipeline_timings
+            if event_timings is None:
+                event_timings = {}
+                request_events[-1].pipeline_timings = event_timings
+            event_timings["response_handling_ms"] = response_handling_ms
+            for key, value in stage_durations.items():
+                if key.endswith("_ms"):
+                    event_timings.setdefault(key, float(value))
         return OmniRequestOutput.from_stage_output(
             engine_outputs,
             request_id=req_id or "",
