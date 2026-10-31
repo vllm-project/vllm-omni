@@ -119,7 +119,12 @@ platforms:
   # MRV2 is CUDA-only for now (#9387 Phase 3 owns the non-CUDA platforms),
   # so every other platform falls back to the V1 runner. The stage-0
   # restores keep the fallback on the shipped V1 shape (eager + local MLP
-  # CUDA graph, no async scheduling, prefix caching).
+  # CUDA graph, no async scheduling, prefix caching). Two top-level shapes
+  # are CUDA/v2-only and inert under these fallbacks: stage-0
+  # compilation_config (eager ignores it) and stage-1 codec_graph_* (the
+  # codec CUDA graphs exist only on the v2 CUDA path). Connector settings
+  # cannot be scoped per platform, so the fallbacks stream with the v2
+  # chunk shape above.
   rocm:
     model_runner: v1
     stages:
