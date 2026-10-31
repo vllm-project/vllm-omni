@@ -294,6 +294,19 @@ _PROBE_STATS: Counter[str] = Counter()
 _PROBE_HEADROOM = 2.0
 
 
+def is_device_oom(exc: BaseException) -> bool:
+    """Whether ``exc`` means the device ran out of memory.
+
+    Besides ``torch.OutOfMemoryError`` from the caching allocator, XPU raises a
+    plain ``RuntimeError`` from Level Zero when an allocation made outside the
+    allocator (e.g. by a reduction) fails because the allocator holds the rest.
+    """
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    message = str(exc) if isinstance(exc, RuntimeError) else ""
+    return "UR_RESULT_ERROR_OUT_OF_RESOURCES" in message or "UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY" in message
+
+
 def probe_stats() -> dict[str, int]:
     """Counts of first-use probe outcomes (see ``_PROBE_STATS``), e.g. to check how often probes were declined."""
     return {key: _PROBE_STATS[key] for key in ("equal", "not_equal", "declined_memory", "declined_oom")}
@@ -405,7 +418,9 @@ def _equal_on_random_operands(
         reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
         generator.set_state(state)
         equal = _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
-    except torch.OutOfMemoryError:
+    except (torch.OutOfMemoryError, RuntimeError) as exc:
+        if not is_device_oom(exc):
+            raise
         _PROBE_STATS["declined_oom"] += 1
         return None
     _PROBE_STATS["equal" if equal else "not_equal"] += 1

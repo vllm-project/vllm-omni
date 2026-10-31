@@ -42,8 +42,12 @@ def _fp32_norm_probe(x: torch.Tensor) -> bool | None:
         direct = torch.linalg.vector_norm(probe, dim=1, keepdim=True, dtype=torch.float32)
         upcast = probe.float().norm(2, 1, keepdim=True)  # what F.normalize(x.float(), dim=1) reduces
         return bool(torch.equal(direct.view(torch.int32), upcast.view(torch.int32)))
-    except torch.OutOfMemoryError:
-        return None
+    except (torch.OutOfMemoryError, RuntimeError) as exc:
+        # XPU reports some out-of-memory failures as a Level Zero RuntimeError.
+        message = str(exc)
+        if isinstance(exc, torch.OutOfMemoryError) or "UR_RESULT_ERROR_OUT_OF" in message:
+            return None
+        raise
 
 
 def fp32_channel_norm(x: torch.Tensor) -> torch.Tensor:
