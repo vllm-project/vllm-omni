@@ -82,6 +82,10 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     # `__init__` is bypassed here: `_codec_sample_setup` still reads the
     # fused-prelude switch, so set it explicitly (eager chain, no kernels).
     model._codec_fused_prelude = False
+    # Same for the host-sampling switch: keep these tests on the device
+    # samplers they were written for (the host path needs __init__-set
+    # attributes such as _codec_seed / head_code that this double omits).
+    model._talker_codec_host_sample = False
     emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
     with torch.no_grad():
         emb.weight.zero_()

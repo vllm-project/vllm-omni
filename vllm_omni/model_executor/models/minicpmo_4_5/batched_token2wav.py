@@ -1930,7 +1930,13 @@ class BatchedToken2Wav(nn.Module):
         previous: torch.Tensor,
         window: torch.Tensor,
     ) -> torch.Tensor:
-        """Blend the overlap into ``speech`` in place and return its storage."""
+        """Blend the overlap into ``speech`` in place and return its storage.
+
+        The write is in place, so every producer of ``speech`` must hand over
+        owned storage -- never a graph's static output buffer. The graph
+        replay path satisfies this via ``replay_from_parts`` returning fresh
+        tensors; a new HiFT backend must do the same or copy first.
+        """
         overlap = min(
             int(window.shape[0] // 2),
             int(speech.shape[-1]),
@@ -2348,6 +2354,8 @@ class BatchedToken2Wav(nn.Module):
             speech, source, next_mel = self._hift_from_parts(old_mel, group_mel, old_source)
             if old_speech.shape[-1] > 0:
                 window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
+                # _fade_in_out writes in place: speech must be owned storage,
+                # never a graph's static output buffer (see _fade_in_out).
                 speech = self._fade_in_out(speech, old_speech, window)
             next_hift = {
                 "mel": next_mel,
