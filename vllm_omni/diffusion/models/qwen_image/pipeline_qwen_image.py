@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.utils import calculate_shift
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -91,19 +92,6 @@ def get_qwen_image_post_process_func(
         return image_processor.postprocess(images)
 
     return post_process_func
-
-
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
 
 
 def retrieve_timesteps(
