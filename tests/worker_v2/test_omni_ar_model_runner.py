@@ -359,6 +359,7 @@ def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> N
     assert client is None and torch.equal(inter_stage[0]["codes.audio"], req_codes[0])
 
 
+@pytest.mark.parametrize("include_hidden", [False, True])
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.parametrize(
     "hidden_padded,codes_padded",
@@ -367,7 +368,7 @@ def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> N
 )
 @pytest.mark.parametrize("lengths", [(1, 1, 1), (3, 1, 1)], ids=["decode", "mixed_prefill_decode"])
 def test_async_output_slices_request_payloads_with_graph_padding(
-    monkeypatch, mocker, async_chunk, hidden_padded, codes_padded, lengths
+    monkeypatch, mocker, async_chunk, hidden_padded, codes_padded, lengths, include_hidden
 ):
     """Sync and async transfers must exclude other requests and graph padding."""
     from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -397,7 +398,7 @@ def test_async_output_slices_request_payloads_with_graph_padding(
             torch.ones(len(lengths), dtype=torch.long),
             torch.zeros(len(lengths), dtype=torch.long),
         ),
-        text_hidden=hidden,
+        text_hidden=hidden if include_hidden else None,
         multimodal_outputs={"codes": {"audio": codes, "ref": refs}},
         input_batch=batch,
         async_chunk=async_chunk,
@@ -407,7 +408,11 @@ def test_async_output_slices_request_payloads_with_graph_padding(
         torch.testing.assert_close(payload["codes.audio"], codes[offsets[i] : offsets[i + 1]])
         torch.testing.assert_close(payload["codes.ref"], refs[i])
         if not async_chunk:
-            torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
+            assert output.pooler_output is not None
+            if include_hidden:
+                torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
+            else:
+                assert "hidden" not in payload
 
 
 def test_finalized_full_payload_latent_ledger_is_accumulated_once(monkeypatch):

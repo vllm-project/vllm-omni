@@ -9,7 +9,7 @@
 The *wire* half of each command --- which client event it decodes from and what
 fields survive decoding --- now lives in ``vllm_omni.protocol.duplex.commands``,
 which carries the whole vocabulary: the eight Tier 1 classes re-exported from
-``vllm_omni.protocol.realtime.commands``, the two Tier 2 ones and the seven
+``vllm_omni.protocol.realtime.commands``, the two Tier 2 ones and the eight
 Tier 3 ones. The engine imports that module and never the Tier 1 one directly,
 so a command that later grows a duplex extension changes one file
 (RFC #6592 P0a).
@@ -245,6 +245,11 @@ class Heartbeat(DuplexCommand, _duplex_wire.Heartbeat):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class GetSessionStats(DuplexCommand, _duplex_wire.GetSessionStats):
+    type: ClassVar[str] = "session.stats.get"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CloseSession(DuplexCommand, _duplex_wire.CloseSession):
     type: ClassVar[str] = "session.close"
 
@@ -263,6 +268,7 @@ REALTIME_COMMAND_TYPES: frozenset[str] = frozenset(
         "session.update",
         "playback.ack",
         "session.heartbeat",
+        "session.stats.get",
         "session.close",
         "turn.signal",
         "input.text.append",
@@ -307,6 +313,7 @@ __all__ = [
     "DeleteItem",
     "DuplexCommand",
     "DuplexCommandError",
+    "GetSessionStats",
     "Heartbeat",
     "REALTIME_COMMAND_TYPES",
     "RealtimeCommand",

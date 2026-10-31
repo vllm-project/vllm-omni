@@ -24,7 +24,7 @@ layers before image or video editing with other vLLM-Omni models.
 | Prompts | Text concept, up to 64 exemplar boxes with positive (`1`) / negative (`0`) labels, or both |
 | Output | Instances above `score_threshold` (default 0.5): mask (PNG or COCO RLE), `[x0, y0, x1, y1]` box and score, all at the input resolution |
 | Checkpoints | Meta's native `sam3*.safetensors` layout and Transformers exports (`Sam3Model`, `Sam3VideoModel`) |
-| Not covered | Video tracking, point prompts and interactive refinement (tracker); the tracker weights in the checkpoint are skipped |
+| Not covered | Video tracking with SAM 3.1's multiplex tracker, point prompts and interactive refinement; the tracker weights in the checkpoint are skipped. SAM 3 video tracking is in the [SAM 3 video recipe](SAM3-Video-H200.md) |
 
 ## References
 

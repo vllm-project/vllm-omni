@@ -22,6 +22,14 @@ pytestmark = [
     *hardware_marks(res={"cuda": "L4"}, num_cards=1),
 ]
 
+
+def _also_rocm_mi325(func):
+    """Add the one-card MI325 marks without changing the CUDA selection."""
+    for mark in reversed(hardware_marks(res={"rocm": "MI325"}, num_cards=1)):
+        func = mark(func)
+    return func
+
+
 _GPU = torch.accelerator.is_available() if hasattr(torch, "accelerator") else torch.cuda.is_available()
 requires_gpu = pytest.mark.skipif(not _GPU, reason="device reduction is a GPU path")
 
@@ -46,6 +54,7 @@ def _reference_uint8(video: torch.Tensor, *, compute_dtype: torch.dtype | None =
     return scaled.astype(np.uint8)
 
 
+@_also_rocm_mi325
 @requires_gpu
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_device_reduction_matches_a_float32_reference(dtype: torch.dtype) -> None:
@@ -62,6 +71,7 @@ def test_device_reduction_matches_a_float32_reference(dtype: torch.dtype) -> Non
     np.testing.assert_array_equal(produced, reference)
 
 
+@_also_rocm_mi325
 @requires_gpu
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_device_reduction_deviates_from_a_narrow_postprocess_by_at_most_one(dtype: torch.dtype) -> None:
@@ -84,6 +94,7 @@ def test_device_reduction_deviates_from_a_narrow_postprocess_by_at_most_one(dtyp
     assert deviation.any()
 
 
+@_also_rocm_mi325
 @requires_gpu
 def test_device_reduction_shrinks_hop1_payload_4x() -> None:
     """The whole point: the D2H payload drops from float32 to uint8 (4x)."""
@@ -98,6 +109,7 @@ def test_device_reduction_shrinks_hop1_payload_4x() -> None:
     assert widened_f32_bytes / reduced_bytes == pytest.approx(4.0, rel=1e-6)
 
 
+@_also_rocm_mi325
 @requires_gpu
 def test_device_reduction_stays_on_device() -> None:
     """Reduction must happen before D2H, so the result is still on the GPU."""
@@ -107,6 +119,7 @@ def test_device_reduction_stays_on_device() -> None:
     assert reduced.is_contiguous()
 
 
+@_also_rocm_mi325
 @requires_gpu
 def test_device_reduction_without_denormalize_matches_already_unit_range() -> None:
     """Pipelines with do_normalize=False emit [0,1]; skip the denorm step."""
