@@ -29,7 +29,7 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
@@ -728,7 +728,13 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        loaded_weights = loader.load_weights(weights)
+        # Diffusers re-saves the encoder as Qwen3Model, without the causal-LM prefix.
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                f"text_encoder.{name}.": f"text_encoder.model.{name}." for name in ("embed_tokens", "layers", "norm")
+            }
+        )
+        loaded_weights = loader.load_weights(weights, mapper=mapper)
         # Record components loaded by diffusers submodules to satisfy strict checks.
         loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
         # downstream pipelines (e.g. MingImagePipeline) may set ``self.text_encoder = None`` when they
