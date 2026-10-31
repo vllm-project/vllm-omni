@@ -29,6 +29,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -45,6 +46,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
+from vllm_omni.distributed.omni_connectors.utils.kv_utils import normalize_layer_kv
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms import current_omni_platform
@@ -55,6 +57,7 @@ from vllm_omni.utils.mm_outputs import (
     snapshot_mm_payload,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.kv_snapshot import PagedKVCopy
 from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.mamba_prefix_cache import prepare_mamba_prefix_cache
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -414,6 +417,9 @@ class GPUARModelRunner(
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        bind_kv_copy = getattr(self.model, "bind_runner_kv_copy", None)
+        if callable(bind_kv_copy):
+            bind_kv_copy(self._copy_request_kv)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1023,6 +1029,70 @@ class GPUARModelRunner(
                 }
             merged[req_id] = data
         return merged
+
+    def _copy_request_kv(
+        self,
+        req_id: str,
+        layer_names: Sequence[str],
+        length: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> bool:
+        """Snapshot a full-attention request into model-owned contiguous KV.
+
+        Called on the AR stream before returning output to the scheduler.
+        Unsupported cache formats leave the model's normal prefill in use.
+        """
+        groups = self.kv_cache_config.kv_cache_groups
+        request = self.requests.get(req_id)
+        if request is None or len(groups) != 1 or self.cache_config.cache_dtype != "auto":
+            return False
+        spec = groups[0].kv_cache_spec
+        if type(spec) is not FullAttentionSpec:
+            return False
+        block_size = spec.block_size
+        if self._kernel_block_sizes != [block_size] or length < 1:
+            return False
+        request_row = self.input_batch.req_id_to_index.get(req_id)
+        if request_row is None:
+            return False
+        block_ids = request.block_ids[0][: (length + block_size - 1) // block_size]
+        if len(block_ids) * block_size < length or len(layer_names) != keys.shape[0]:
+            return False
+        min_block_id, max_block_id = min(block_ids), max(block_ids)
+        context = self.compilation_config.static_forward_context
+        pairs = []
+        # Validate every layer before writing any destination data.
+        for index, name in enumerate(layer_names):
+            if name not in groups[0].layer_names:
+                return False
+            cache = context[name].kv_cache
+            if isinstance(cache, list):
+                if len(cache) != 1:
+                    return False
+                cache = cache[0]
+            pair = normalize_layer_kv(cache, req_id=req_id, layer_idx=index, block_size=block_size)
+            if pair is None:
+                return False
+            for tensor in pair:
+                if (
+                    tensor.ndim != 4
+                    or tensor.shape[1:] != (block_size, *keys.shape[2:])
+                    or tensor.dtype != keys.dtype
+                    or tensor.device != keys.device
+                    or min_block_id < 0
+                    or max_block_id >= tensor.shape[0]
+                ):
+                    return False
+            pairs.append(pair)
+        # Source addresses/strides are stable across requests. Only the live
+        # device block table changes; never upload request block IDs here.
+        copier = getattr(self, "_kv_snapshot_copier", None)
+        if copier is None:
+            copier = PagedKVCopy(pairs)
+            self._kv_snapshot_copier = copier
+        block_table = self.input_batch.block_table[0].get_device_tensor(self.input_batch.num_reqs)
+        return copier.copy(block_table, request_row, length, keys, values)
 
     def _call_prepare_runner_inputs(
         self,
