@@ -15,12 +15,14 @@ Ownership rules, all enforced here so callers cannot misalign rows:
 
 - Append-only, contiguous streams. ``append`` adds rows at the current
   end of the (session, key) stream; there is no positional write. The
-  manager only appends when the turn's hit length equals the stored
-  length (exact continuation), so a stream always describes one token
-  sequence from position 0. A turn that starts with a pool hit
-  instead seeds the stream first: materialize copies the pool-hit
-  prefix [0, hit_end) into the store, so the suffix append lands on
-  exact continuation (see ``_seed_session_rows``).
+  manager appends a batch at its session position when that position
+  equals the stored length (exact continuation); a batch starting
+  behind the stored length appends only its not-yet-stored tail, and
+  a batch starting ahead (a gap) is still refused — so a stream
+  always describes one token sequence from position 0. A turn that
+  starts with a pool hit instead seeds the stream first: materialize
+  copies the pool-hit prefix [0, hit_end) into the store, so the
+  suffix append lands on exact continuation (see ``_seed_session_rows``).
 - Coarse invalidation. ``invalidate`` drops a session's segments
   wholesale. After it, the stored length resets to 0 and the next
   append starts a fresh stream; a later turn whose hit length is
@@ -138,13 +140,44 @@ class SessionPrefixStore:
         """Append ``rows`` only when the stored length still equals
         ``expected_length``, atomically under the store lock.
 
-        This is the only safe form for the manager's continuation rule:
-        a plain length check followed by ``append`` lets a concurrent
-        ``invalidate`` slip between the two and land the rows at the
-        head of a fresh stream, where a later turn could serve them as
-        its prefix. A failed check returns False and stores nothing.
+        A safe form for the manager's continuation rule (see also
+        ``append_beyond``): a plain length check followed by ``append``
+        lets a concurrent ``invalidate`` slip between the two and land
+        the rows at the head of a fresh stream, where a later turn
+        could serve them as its prefix. A failed check returns False
+        and stores nothing.
         """
         return self._append(session_id, key, rows, expected_length=expected_length)
+
+    def append_beyond(self, session_id: SessionId, key: TensorName, batch_start: int, rows: torch.Tensor) -> bool:
+        """Append the not-yet-stored tail of a batch starting at ``batch_start``.
+
+        ``rows`` covers [batch_start, batch_start + len(rows)). Atomically
+        under the store lock:
+        - batch fully covered (batch end <= stored): no-op, returns True;
+        - batch overlaps the stored prefix (stored in [batch_start,
+          batch end)): appends only rows[stored - batch_start:], so a
+          block-truncated pool hit (offset < stored) no longer rejects
+          the whole batch and freezes the stream;
+        - batch starts ahead of the stored length (a gap): returns False
+          and stores nothing — the missing middle cannot be filled from
+          this batch, so the stream stalls exactly as before.
+        Raises ValueError for a non-tensor/empty batch, a negative
+        batch_start, or a trailing-shape mismatch with the stream.
+        """
+        if not isinstance(rows, torch.Tensor) or rows.ndim < 2 or rows.shape[0] == 0:
+            raise ValueError(f"session store append needs a non-empty per-token tensor, got {type(rows)}")
+        if batch_start < 0:
+            raise ValueError(f"session store append_beyond needs batch_start >= 0, got {batch_start}")
+        entry = (session_id, key)
+        with self._lock:
+            stored = self._lengths.get(entry, 0)
+            batch_end = batch_start + int(rows.shape[0])
+            if batch_end <= stored:
+                return True
+            if stored < batch_start:
+                return False
+            return self._append_locked(session_id, key, rows[stored - batch_start :], expected_length=stored)
 
     def _append(
         self,
@@ -156,29 +189,40 @@ class SessionPrefixStore:
     ) -> bool:
         if not isinstance(rows, torch.Tensor) or rows.ndim < 2 or rows.shape[0] == 0:
             raise ValueError(f"session store append needs a non-empty per-token tensor, got {type(rows)}")
-        entry = (session_id, key)
         with self._lock:
-            if expected_length is not None and self._lengths.get(entry, 0) != expected_length:
-                return False
-            segments = self._segments.get(entry)
-            if segments is not None and tuple(segments[0].shape[1:]) != tuple(rows.shape[1:]):
-                raise ValueError(
-                    f"session store shape mismatch for session={session_id} key={key}: "
-                    f"stream {tuple(segments[0].shape[1:])} vs rows {tuple(rows.shape[1:])}"
-                )
-            nbytes = rows.numel() * rows.element_size()
-            if self._stored_bytes + nbytes > self._max_bytes:
-                self.refused_appends += 1
-                return False
-            stored = rows.detach().clone()
-            if segments is None:
-                self._segments[entry] = [stored]
-                self._lengths[entry] = 0
-            else:
-                segments.append(stored)
-            self._lengths[entry] += int(rows.shape[0])
-            self._stored_bytes += nbytes
-            return True
+            return self._append_locked(session_id, key, rows, expected_length=expected_length)
+
+    def _append_locked(
+        self,
+        session_id: SessionId,
+        key: TensorName,
+        rows: torch.Tensor,
+        *,
+        expected_length: int | None,
+    ) -> bool:
+        """Append body; the caller must hold ``_lock`` (``_append`` / ``append_beyond``)."""
+        entry = (session_id, key)
+        if expected_length is not None and self._lengths.get(entry, 0) != expected_length:
+            return False
+        segments = self._segments.get(entry)
+        if segments is not None and tuple(segments[0].shape[1:]) != tuple(rows.shape[1:]):
+            raise ValueError(
+                f"session store shape mismatch for session={session_id} key={key}: "
+                f"stream {tuple(segments[0].shape[1:])} vs rows {tuple(rows.shape[1:])}"
+            )
+        nbytes = rows.numel() * rows.element_size()
+        if self._stored_bytes + nbytes > self._max_bytes:
+            self.refused_appends += 1
+            return False
+        stored = rows.detach().clone()
+        if segments is None:
+            self._segments[entry] = [stored]
+            self._lengths[entry] = 0
+        else:
+            segments.append(stored)
+        self._lengths[entry] += int(rows.shape[0])
+        self._stored_bytes += nbytes
+        return True
 
     def covers(self, session_id: SessionId, key: TensorName, upto: int) -> bool:
         """True when the stream holds a contiguous [0, upto) prefix.

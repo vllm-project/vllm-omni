@@ -1663,9 +1663,12 @@ class OmniPrefixCacheManager:
     ) -> None:
         """Extend session streams with this step's new rows.
 
-        Continuation rule, checked atomically (``append_if_length``):
-        append only when this step's session position equals the stored
-        length. The position is the turn-start offset (the request's
+        Continuation rule, checked atomically (``append_beyond``): a
+        batch starting at the stored length appends in full; a batch
+        starting behind it — a block-truncated pool hit, where the
+        stored stream already extends past the hit — appends only its
+        not-yet-stored tail; a batch starting ahead (a gap) is
+        refused. The position is the turn-start offset (the request's
         STARTED hit_end) plus rows this request saved earlier in the
         turn, both snapshotted into the step context at publish. For a
         start step this reduces to the pool-hit length; for decode steps
@@ -1673,9 +1676,10 @@ class OmniPrefixCacheManager:
         position, so decode rows (including coalesced decode flushes,
         which arrive via discard_step) now extend the stream instead of
         leaving a gap. A gap — a saved step this stream never saw, or a
-        post-invalidation nonzero offset — means the stored stream no
-        longer describes this prompt; appending would misalign rows, so
-        the stream stalls until a full-prefix turn rebuilds it. Immediate
+        post-invalidation nonzero offset with no pool coverage to seed
+        from — means the stored stream no longer describes this prompt;
+        appending would misalign rows, so the stream stalls until a
+        seeding turn rebuilds it. Immediate
         pool keys only: deferred mm is not on CPU at materialize time,
         and leftover mm is not a pool key. A misaligned tail, if one
         ever forms, is never served: serving requires the store to cover
@@ -1691,11 +1695,12 @@ class OmniPrefixCacheManager:
                 continue
             expected = ctx.session_offsets.get(req_id, 0) + ctx.positions.get(req_id, 0)
             for key, cur in current.items():
-                # Atomic continuation check: a concurrent invalidate
-                # between a length read and the append would land these
-                # rows at the head of a fresh stream, where a later turn
-                # could serve them as its prefix.
-                self._session_store.append_if_length(session_id, key, expected, cur[start:end])
+                # Atomic overlap handling: the check, the tail slice,
+                # and the append happen under one store-lock hold, so a
+                # concurrent invalidate cannot land these rows at the
+                # head of a fresh stream, where a later turn could serve
+                # them as its prefix.
+                self._session_store.append_beyond(session_id, key, expected, cur[start:end])
 
     def _merge_uncached_mm(
         self,

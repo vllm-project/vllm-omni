@@ -2379,6 +2379,35 @@ def test_session_append_requires_exact_continuation():
         mgr.shutdown()
 
 
+def test_session_overlap_appends_only_tail():
+    mgr, view = make_manager()
+    try:
+        # Turn 1: 8 rows stored.
+        s1 = run_session_step(mgr, view, "a", [0, 1], 0, 8, session="S")
+        mgr.materialize(s1, ["a"])
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 8
+        # Turn 2 with a block-truncated pool hit (hit=4 < stored 8) and
+        # 8 new rows spanning [4, 12): before the overlap fix the whole
+        # batch was rejected and the stream froze at 8; now only the
+        # tail [8, 12) appends, so the stream covers the full prefix.
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2], 4, 8, hit=4, session="S", finished=["a"])
+        outs = mgr.materialize(s2, ["a2"])
+        assert torch.equal(outs.hidden_states["a2"][:4], expected_rows(view.slots_for("a", 0, 4)))
+        assert torch.equal(outs.hidden_states["a2"][4:], expected_rows(view.slots_for("a2", 4, 12)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            torch.cat(
+                [
+                    expected_rows(view.slots_for("a", 0, 8)),
+                    expected_rows(view.slots_for("a2", 8, 12)),
+                ]
+            ),
+        )
+    finally:
+        mgr.shutdown()
+
+
 def test_session_binding_dropped_on_finish_but_rows_survive():
     mgr, view = make_manager()
     try:

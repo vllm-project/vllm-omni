@@ -528,9 +528,11 @@ history or ends.
   worker-visible session-end signal: a resumable binding's termination
   drops the session's rows. An ephemeral request's termination only
   unbinds; the session continues and its rows stay servable.
-- Retention: each consumed step appends its new rows only on exact
-  continuation (the step's session position equals the stored length).
-  The position is the turn-start offset (the request's STARTED hit_end)
+- Retention: each consumed step appends its new rows at their session
+  position: exact continuation appends in full, a batch starting
+  behind the stored length (a block-truncated pool hit) appends only
+  its not-yet-stored tail, and a batch starting ahead (a gap) is
+  refused. The position is the turn-start offset (the request's STARTED hit_end)
   plus rows the request saved earlier in the turn, both snapshotted into
   the step context at publish — so decode steps, which carry no pool
   hit, append at their true sequence position too. Discarded steps

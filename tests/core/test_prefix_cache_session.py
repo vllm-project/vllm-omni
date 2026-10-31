@@ -141,6 +141,43 @@ def test_append_if_length_is_atomic():
     assert torch.equal(store.fetch("sess-A", "hidden", 5), _rows(0, 5))
 
 
+def test_append_beyond_overlap_appends_only_tail():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 8))
+    # Batch [4, 12): only the not-yet-stored tail [8, 12) appends.
+    assert store.append_beyond("sess-A", "hidden", 4, _rows(4, 8))
+    assert store.stored_tokens("sess-A", "hidden") == 12
+    assert torch.equal(store.fetch("sess-A", "hidden", 12), _rows(0, 12))
+
+
+def test_append_beyond_fully_covered_is_noop():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 8))
+    assert store.append_beyond("sess-A", "hidden", 4, _rows(4, 4))
+    assert store.stored_tokens("sess-A", "hidden") == 8
+    assert torch.equal(store.fetch("sess-A", "hidden", 8), _rows(0, 8))
+
+
+def test_append_beyond_gap_is_refused():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 4))
+    # Batch [8, 12) starts ahead of the stream: the missing middle
+    # cannot be filled from this batch, so nothing is stored.
+    assert not store.append_beyond("sess-A", "hidden", 8, _rows(8, 4))
+    assert store.stored_tokens("sess-A", "hidden") == 4
+    assert torch.equal(store.fetch("sess-A", "hidden", 4), _rows(0, 4))
+    with pytest.raises(ValueError, match="batch_start >= 0"):
+        store.append_beyond("sess-A", "hidden", -1, _rows(0, 2))
+
+
+def test_append_beyond_exact_continuation_appends_in_full():
+    store = SessionPrefixStore()
+    store.append("sess-A", "hidden", _rows(0, 4))
+    assert store.append_beyond("sess-A", "hidden", 4, _rows(4, 4))
+    assert store.stored_tokens("sess-A", "hidden") == 8
+    assert torch.equal(store.fetch("sess-A", "hidden", 8), _rows(0, 8))
+
+
 def test_concurrent_append_invalidate_fetch_never_serves_misaligned_rows():
     """Writer/invalidator/reader race: a fetch is always None or the
     exact [0, upto) prefix of the current stream.
