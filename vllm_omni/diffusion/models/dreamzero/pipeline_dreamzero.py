@@ -71,6 +71,7 @@ from vllm_omni.experimental.world_models.session_state import (
     resolve_session_state_config,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.quantization import resolve_component_quant_config
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
 logger = logging.getLogger(__name__)
@@ -461,6 +462,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         transformer_kwargs["action_dim"] = ah_config["action_dim"]
         transformer_kwargs["max_state_dim"] = ah_config["max_state_dim"]
         transformer_kwargs["num_frame_per_block"] = ah_config["num_frame_per_block"]
+        transformer_kwargs["quant_config"] = resolve_component_quant_config(
+            od_config.quantization_config, "transformer"
+        )
         self.transformer = CausalWanModel(**transformer_kwargs)
 
         self.scheduler = FlowUniPCMultistepScheduler(
