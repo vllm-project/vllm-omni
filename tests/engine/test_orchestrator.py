@@ -28,6 +28,7 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.errors import NativeKVHandoffError
+from vllm_omni.engine.membership_controller import MembershipController
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
     AbortResultMessage,
@@ -1899,6 +1900,62 @@ async def test_run_shutdown(orchestrator_factory) -> None:
     assert not orchestrator_fixture.thread.is_alive()
     for stage in stages:
         assert stage.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_request_releases_live_membership_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    first_poll = asyncio.Event()
+
+    class FakeHub:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def get_replica_list(self):
+            first_poll.set()
+            return SimpleNamespace(replicas=[])
+
+        def close(self) -> None:
+            self.closed = True
+
+    import vllm_omni.engine.membership_controller as membership_module
+
+    hub = FakeHub()
+    monkeypatch.setattr(membership_module, "OmniCoordClientForHub", lambda _address: hub)
+    stage = FakeStageClient(stage_type="llm", final_output=True)
+    stage_pool = StagePool(0, [stage])
+    membership = MembershipController(
+        stage_pools=[stage_pool],
+        coordinator_pub_address="inproc://test-membership-hub",
+        load_balancer_factory=lambda: object(),
+        remote_replica_factory=lambda *_args: SimpleNamespace(),
+    )
+    membership.WATCH_INTERVAL_S = 0.01
+    request_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue,
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[stage_pool],
+        membership_controller=membership,
+    )
+
+    watcher = membership.start()
+    request_task = asyncio.create_task(orchestrator._request_handler())
+    request_handler_and_watcher = asyncio.gather(request_task, watcher)
+    try:
+        await asyncio.wait_for(first_poll.wait(), timeout=1)
+        assert not watcher.done()
+
+        request_queue.put_nowait(ShutdownRequestMessage())
+        await asyncio.wait_for(request_handler_and_watcher, timeout=2)
+    finally:
+        request_handler_and_watcher.cancel()
+        await asyncio.gather(request_handler_and_watcher, return_exceptions=True)
+
+    assert orchestrator._shutdown_event.is_set()
+    assert watcher.done()
+    assert not watcher.cancelled()
+    assert hub.closed is True
 
 
 @pytest.mark.asyncio
