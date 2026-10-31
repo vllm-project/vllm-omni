@@ -145,6 +145,10 @@ class RequestBatchSamplingParamsKey:
     # the model and must remain distinct from explicit ``lossless``.
     quality: str | None = None
 
+    # Diffusers draws a request batch on one device even when given a list of
+    # generators. Keep explicit device overrides apart from the worker default.
+    generator_device: str | None = None
+
     # Wan scheduler structure is carried through extra_args. Requests using
     # different solvers or flow shifts must not share a request batch.
     sample_solver: str | None = None

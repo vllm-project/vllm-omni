@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
 
 from fastapi import File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from PIL import Image
 from pydantic import TypeAdapter, ValidationError
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
@@ -1120,6 +1121,7 @@ async def _parse_video_form(
     flow_shift: float | None = Form(default=None),
     true_cfg_scale: float | None = Form(default=None),
     seed: int | None = Form(default=None),
+    generator_device: str | None = Form(default=None),
     generate_sound: bool | None = Form(default=None),
     sound_duration: float | None = Form(default=None, gt=0.0),
     negative_prompt: str | None = Form(default=None),
@@ -1164,6 +1166,14 @@ async def _parse_video_form(
         field_name="audio_noise_mask",
     )
 
+    # FastAPI normalizes an empty optional form string to None. Recover the
+    # submitted value so VideoGenerationRequest can reject an explicit empty
+    # device instead of treating it as omission.
+    if generator_device is None:
+        raw_generator_device = (await raw_request.form()).get("generator_device")
+        if raw_generator_device is not None:
+            generator_device = str(raw_generator_device)
+
     if input_references and any(
         item is not None for item in (parsed_image_reference, parsed_video_reference, input_reference)
     ):
@@ -1207,6 +1217,7 @@ async def _parse_video_form(
         "flow_shift": flow_shift,
         "true_cfg_scale": true_cfg_scale,
         "seed": seed,
+        "generator_device": generator_device,
         "generate_sound": generate_sound,
         "sound_duration": sound_duration,
         "negative_prompt": negative_prompt,
@@ -1219,7 +1230,11 @@ async def _parse_video_form(
         "return_stage_metrics": return_stage_metrics,
     }
     request_data = {k: v for k, v in request_data.items() if v is not None}
-    request = VideoGenerationRequest(**request_data)
+    try:
+        request = VideoGenerationRequest(**request_data)
+    except ValidationError as exc:
+        errors = [{**error, "loc": ("body", *error["loc"])} for error in exc.errors()]
+        raise RequestValidationError(errors) from exc
 
     handler = Omnivideo(raw_request)
     if handler is None:
