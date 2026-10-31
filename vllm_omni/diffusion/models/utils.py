@@ -254,3 +254,54 @@ def _load_json(model_path: str, filename: str, local_files_only: bool = True) ->
         cached = hf_api().hf_hub_download(repo_id=model_path, filename=filename)
         with open(cached) as f:
             return json.load(f)
+
+
+def load_vae_scale_factor(
+    model_path: str,
+    *,
+    config_key: str = "block_out_channels",
+    exponent_offset: int = -1,
+    default: int = 8,
+) -> int:
+    """Read ``vae/config.json`` and compute the VAE spatial downsampling factor.
+
+    Most diffusion pipelines need the scale factor before VAE weights are
+    loaded.  The standard formula is ``2 ** (len(channels) + exponent_offset)``
+    where *channels* is a list in the VAE config (``block_out_channels`` for
+    image VAEs, ``temporal_downsample`` for video VAEs).
+
+    Returns *default* when the config file or key is missing.
+    """
+    vae_config_path = os.path.join(model_path, "vae", "config.json")
+    if not os.path.exists(vae_config_path):
+        return default
+    with open(vae_config_path) as f:
+        vae_config = json.load(f)
+    channels = vae_config.get(config_key)
+    if channels is None:
+        return default
+    return 2 ** (len(channels) + exponent_offset)
+
+
+def vae_scale_factor_from_vae(
+    vae: torch.nn.Module | None,
+    *,
+    config_key: str = "block_out_channels",
+    exponent_offset: int = -1,
+    default: int = 8,
+) -> int:
+    """Compute the VAE spatial downsampling factor from a loaded VAE.
+
+    Looks for *config_key* on ``vae.config`` (diffusers-style) first, then
+    directly on *vae* (custom VAEs like Krea2/Qwen that expose the list as
+    an attribute).  Returns *default* when the VAE is ``None`` or the key
+    is absent.
+    """
+    if vae is None:
+        return default
+    channels = getattr(getattr(vae, "config", None), config_key, None)
+    if channels is None:
+        channels = getattr(vae, config_key, None)
+    if channels is None:
+        return default
+    return 2 ** (len(channels) + exponent_offset)
