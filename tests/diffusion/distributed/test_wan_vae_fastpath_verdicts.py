@@ -31,7 +31,9 @@ def integer_probe_operands(monkeypatch):
     monkeypatch.setattr(
         fp,
         "_random_like",
-        lambda t, generator, std=1.0: torch.empty_like(t).random_(-2, 3, generator=generator),
+        lambda t, generator, std=1.0: torch.empty_strided(t.shape, t.stride(), dtype=t.dtype).random_(
+            -2, 3, generator=generator
+        ),
     )
 
 
@@ -287,8 +289,8 @@ def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_asse
 
     fit_checks = []
 
-    def probe_fits(x, weight, frames=None, padding=()):
-        fit_checks.append(frames)
+    def probe_fits(x, weight):
+        fit_checks.append((x.device.type, x.shape[2]))
         return room or shortage != "no_room"
 
     def maybe_oom(t, generator, std=1.0):
@@ -321,13 +323,13 @@ def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_asse
 
     output, expected = run()
     if output is None:
-        assert not spatial_padding and shortage == "no_room"  # declined before the channels-last copy
+        assert not spatial_padding  # conv_out declines to the standard path before assembling anything
     else:
         assert torch.equal(output, expected)
     assert not cache.get(conv)  # nothing recorded: the shape stays unverified
     assert not any(fast_calls)  # the real input only went through the reference formulation
-    if spatial_padding and shortage == "no_room":
-        assert not time_assemblies  # declined before the time-assembled copy was built
+    if spatial_padding:
+        assert not time_assemblies  # probed on a template, so nothing was time-assembled
     declined = "declined_memory" if shortage == "no_room" else "declined_oom"
     assert fp.probe_stats() == {"equal": 0, "not_equal": 0, "declined_memory": 0, "declined_oom": 0, declined: 1}
 
@@ -335,8 +337,8 @@ def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_asse
     fast_calls.clear()
     fit_checks.clear()
     output, expected = run()
-    # One memory check, made for the assembled input before it exists: a probe never declines after assembly.
-    assert fit_checks == [conv._padding[4] + 1]
+    # One memory check, on a template of the assembled input: probes run before anything is assembled.
+    assert fit_checks == [("meta", conv._padding[4] + 1)]
     assert torch.equal(output, expected)
     assert list(cache[conv].values()) == [True]
     assert fast_calls[-1]  # verified, so the fast formulation ran
@@ -364,9 +366,8 @@ def test_probe_fits_counts_free_and_reserved_unallocated_memory(monkeypatch) -> 
     assert not fp._probe_fits(x, weight)
     memory.update(reserved=10, allocated=9)  # cached allocator blocks not handed out count as free
     assert fp._probe_fits(x, weight)
-    # Sized for the time-assembled input: 2 frames of padding on 3 frames needs 5/3 of the memory.
-    memory.update(free=int(need), reserved=0, allocated=0)
-    assert not fp._probe_fits(x, weight, frames=5)
+    # A template of an input not built yet is sized the same, and memory is queried on the weight's device.
+    assert fp._probe_fits(torch.empty(x.shape, device="meta"), weight)
     monkeypatch.setattr(fp.torch, "get_device_module", lambda device: object())  # no memory queries
     assert fp._probe_fits(x, weight)
 
@@ -399,10 +400,10 @@ def test_spatial_probe_policy_preserves_exact_paths(monkeypatch, channels_last: 
 @torch.no_grad()
 @pytest.mark.parametrize("path", ["norm_act", "norm_fallback", "conv_out"])
 @pytest.mark.parametrize("probe_matches", [False, True])
-def test_fused_paths_release_replaced_history_before_probe(
+def test_fused_paths_probe_before_assembly_and_release_replaced_history(
     cpu_assembly, monkeypatch, path: str, probe_matches: bool
 ) -> None:
-    """Old history must not overlap either probe operands or convolution output."""
+    """Probes run on a template before anything is assembled; old history must not overlap the convolution."""
     conv = fp.WanCausalConv3d(2, 2, 3, padding=1)
     conv.weight.fill_(1)
     conv.bias.zero_()
@@ -412,8 +413,10 @@ def test_fused_paths_release_replaced_history_before_probe(
     expected = conv(x, slots[0])
     probes = []
 
-    def probe(*args, **kwargs):
-        assert old_cache() is None, "replaced history must be released before padding/layout probes"
+    def probe(template, *args, **kwargs):
+        # Nothing is assembled yet: the slot still holds the old history and the operand is only a template.
+        assert template.device.type == "meta"
+        assert slots[0] is old_cache(), "the cache slot must not be replaced before the probe decides"
         probes.append(True)
         return probe_matches
 
@@ -429,6 +432,10 @@ def test_fused_paths_release_replaced_history_before_probe(
     monkeypatch.setattr(fp.F, "conv3d", checked_conv)
     if path == "conv_out":
         output = fp._run_conv_out_channels_last(conv, x, slots, 0)
+        if not probe_matches:
+            # A mismatch declines before assembling: the caller's standard path gets the untouched history.
+            assert output is None and probes == [True] and slots[0] is old_cache()
+            return
     else:
         norm = WanRMS_norm(2, images=False).eval()
         setattr(norm, fp.CFG_ATTR, fp.FastPathConfig(fuse_norm_cache=True, channels_last=True))
@@ -457,4 +464,4 @@ def test_other_runtime_errors_in_a_probe_are_not_swallowed(monkeypatch) -> None:
 
     monkeypatch.setattr(fp, "_random_like", broken)
     with pytest.raises(RuntimeError, match="some other failure"):
-        fp._equal_on_random_operands(x, conv.weight, lambda a, w: a, lambda a, w: a, lambda a: a, memory_checked=True)
+        fp._equal_on_random_operands(x, conv.weight, lambda a, w: a, lambda a, w: a, lambda a: a)

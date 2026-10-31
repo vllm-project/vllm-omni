@@ -461,13 +461,16 @@ def test_conv_out_channels_last_verdict_is_recorded_and_exact(layout: str) -> No
     reference = WanCausalConv3d.forward(conv, chunk, cache)
     fast_cache = [cache.clone()]
     out = fp._run_conv_out_channels_last(conv, chunk, fast_cache, 0)
-    assert out is not None  # the verdict decides which formulation's result is returned, both are exact
-    assert out.is_contiguous()
-    assert _bits_equal(out, reference)
     verdicts = fp._CONV_OUT_LAYOUT_VERDICTS[conv]
-    assert len(verdicts) == 1
-    assert torch.equal(fast_cache[0], torch.cat([cache, chunk], dim=2)[:, :, -CACHE_T:])
-    assert fast_cache[0].is_contiguous()
+    assert len(verdicts) == 1  # probed on a template before assembling
+    if next(iter(verdicts.values())):
+        assert out is not None and out.is_contiguous()
+        assert _bits_equal(out, reference)
+        assert torch.equal(fast_cache[0], torch.cat([cache, chunk], dim=2)[:, :, -CACHE_T:])
+        assert fast_cache[0].is_contiguous()
+    else:
+        assert out is None  # declined before assembling: the standard path gets the untouched cache
+        assert torch.equal(fast_cache[0], cache)
     again = fp._run_conv_out_channels_last(conv, chunk, [cache.clone()], 0)
     if next(iter(verdicts.values())):
         assert again is not None and _bits_equal(again, reference)
