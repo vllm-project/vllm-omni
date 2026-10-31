@@ -33,6 +33,8 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
+from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer
 from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -447,11 +449,32 @@ def _nar_pre_attention(x, w_norm, w_qkv, w_q_norm, w_k_norm, cos, sin, eps: floa
     return q, k, v.reshape(tokens, kv_heads, head_dim)
 
 
+_USE_FLASHINFER_SILU = current_platform.is_cuda() and has_flashinfer()
+
+
+# FlashInfer's Python/JIT wrapper cannot be traced inside our fullgraph region.
+@torch.library.custom_op("vllm_omni::yue2_silu_and_mul", mutates_args=())
+def _flashinfer_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    from flashinfer.activation import silu_and_mul
+
+    return silu_and_mul(x, enable_pdl=False)
+
+
+@_flashinfer_silu_and_mul.register_fake
+def _fake_flashinfer_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    return x.new_empty(x.shape[:-1] + (x.shape[-1] // 2,))
+
+
 def _nar_post_attention(x, attn, w_o, w_norm, w_gate_up, w_down, eps: float):
     """o_proj + residual -> pre-MLP norm -> fused gate/up SiLU MLP + residual."""
     x = x + F.linear(attn.flatten(1), w_o)
-    gate, up = F.linear(_rms(x, w_norm, eps), w_gate_up).chunk(2, dim=-1)
-    return x + F.linear(F.silu(gate) * up, w_down)
+    gate_up = F.linear(_rms(x, w_norm, eps), w_gate_up)
+    if _USE_FLASHINFER_SILU and gate_up.is_cuda and gate_up.dtype == torch.bfloat16:
+        activated = _flashinfer_silu_and_mul(gate_up)
+    else:
+        gate, up = gate_up.chunk(2, dim=-1)
+        activated = F.silu(gate) * up
+    return x + F.linear(activated, w_down)
 
 
 _COMPILED: dict[str, Callable] = {}
@@ -460,8 +483,8 @@ _COMPILED: dict[str, Callable] = {}
 def _nar_kernels() -> tuple[Callable, Callable]:
     """The per-layer NAR halves, compiled once for any token count.
 
-    Compilation fuses the RMSNorm/RoPE/SiLU elementwise chains that dominate
-    the eager NAR pass after its GEMMs and attention.
+    Compilation fuses RMSNorm/RoPE and the residual chains; a custom op keeps
+    the FlashInfer SiLU kernel inside the compiled graph when available.
     """
     if "pre" not in _COMPILED:
         pre, post = _nar_pre_attention, _nar_post_attention
@@ -550,10 +573,21 @@ def fuse_nar_projections(layers: nn.ModuleList) -> list[tuple[torch.Tensor, ...]
     return fused
 
 
+def _clear_exception_tracebacks(error: BaseException | None) -> None:
+    # Chained exceptions also retain failed generator locals and GPU tensors.
+    errors, seen = [error], set()
+    while errors:
+        error = errors.pop()
+        if error is not None and id(error) not in seen:
+            seen.add(id(error))
+            error.__traceback__ = None
+            errors.extend((error.__cause__, error.__context__))
+
+
 class CachedNAR:
     """One acoustic chunk: AR prefix K/V prefilled once, ODE walks the NAR path."""
 
-    def __init__(self, model, chunk: Chunk, pool: tuple[int, int] | None = None):
+    def __init__(self, model, chunk: Chunk, pool: tuple[int, int] | None = None, kv=None):
         self.model = model
         self.chunk = chunk
         self.pool = pool
@@ -576,6 +610,17 @@ class CachedNAR:
         self.bounds_k = _sequence_bounds(self.ar_length + self.nar_length, self.device)
         self.graph: torch.cuda.CUDAGraph | None = None
         self.last_use: torch.cuda.Event | None = None
+        self.keys = self.values = None
+        if kv is not None:
+            shape = (
+                int(model.config.num_hidden_layers),
+                self.ar_length + self.nar_length,
+                int(model.config.num_key_value_heads),
+                int(model.config.head_dim),
+            )
+            if len(kv) != 2 or any(t.shape != shape or t.dtype != self.dtype or t.device != self.device for t in kv):
+                raise ValueError("Condition KV storage does not match the acoustic chunk")
+            self.keys, self.values = kv
         self._prefill()
 
     def _prefill(self):
@@ -584,8 +629,9 @@ class CachedNAR:
         config = model.config
         total = self.ar_length + self.nar_length
         shape = (len(backbone.layers), total, int(config.num_key_value_heads), int(config.head_dim))
-        self.keys = torch.empty(shape, dtype=self.dtype, device=self.device)
-        self.values = torch.empty(shape, dtype=self.dtype, device=self.device)
+        if self.keys is None:
+            self.keys = torch.empty(shape, dtype=self.dtype, device=self.device)
+            self.values = torch.empty(shape, dtype=self.dtype, device=self.device)
         ids = torch.tensor(self.chunk.ar_tokens, dtype=torch.long).to(self.device, non_blocking=True)
         cos, sin = model.rotary(torch.arange(self.ar_length, device=self.device)[None])
         x = backbone.embed_tokens(ids)  # [T, H]
@@ -619,24 +665,46 @@ class CachedNAR:
                 self.state_in.copy_(state)
                 self.time_in.fill_(raw_t)
                 return self._velocity(self.state_in, self.time_in)
-            self.graph = torch.cuda.CUDAGraph()
-            if torch.cuda.current_stream(self.device) == torch.cuda.default_stream(self.device):
-                with torch.cuda.graph(self.graph, pool=self.pool, capture_error_mode="thread_local"):
-                    self.velocity_out = self._velocity(self.state_in, self.time_in)
-            else:
-                # Already on a side stream (the async synthesis path): capture
-                # in place, without torch.cuda.graph's device-wide sync, which
-                # would stall the decode loop behind every queued kernel.
-                self.graph.capture_begin(pool=self.pool, capture_error_mode="thread_local")
-                try:
-                    self.velocity_out = self._velocity(self.state_in, self.time_in)
-                finally:
-                    self.graph.capture_end()
+            try:
+                self._capture_velocity()
+            except RuntimeError as error:
+                # capture_end may wrap OOM in cudaErrorStreamCaptureInvalidated (901).
+                oom = isinstance(error, torch.OutOfMemoryError) or (
+                    isinstance(error, torch.AcceleratorError)
+                    and getattr(error, "error_code", None) == 901
+                    and isinstance(error.__context__, torch.OutOfMemoryError)
+                )
+                if not oom:
+                    raise
+                logger.warning(
+                    "YuE2 NAR graph capture ran out of memory: %s",
+                    str(error if isinstance(error, torch.OutOfMemoryError) else error.__context__),
+                )
+                self.graph.reset()
+                self.graph = self.velocity_out = None
+                _clear_exception_tracebacks(error)
+            if self.graph is None:
+                # Leave the exception handler before reclaiming failed-frame tensors.
+                torch.accelerator.synchronize(self.device)
+                torch.accelerator.empty_cache()
+                self._capture_velocity()
         # The graph reads its inputs from the addresses it was captured with.
         self.state_in.copy_(state)
         self.time_in.fill_(raw_t)
         self.graph.replay()
         return self.velocity_out
+
+    def _capture_velocity(self) -> None:
+        self.graph = torch.cuda.CUDAGraph()
+        if torch.cuda.current_stream(self.device) == torch.cuda.default_stream(self.device):
+            with torch.cuda.graph(self.graph, pool=self.pool, capture_error_mode="thread_local"):
+                self.velocity_out = self._velocity(self.state_in, self.time_in)
+        else:
+            self.graph.capture_begin(pool=self.pool, capture_error_mode="thread_local")
+            try:
+                self.velocity_out = self._velocity(self.state_in, self.time_in)
+            finally:
+                self.graph.capture_end()
 
     def _velocity(self, state: torch.Tensor, raw_t: torch.Tensor) -> torch.Tensor:
         model = self.model
@@ -1667,6 +1735,7 @@ class _RequestState:
     finish_ready: bool = False
     end_drawn: bool = False  # the engine counts a drawn end (or its HOLD) too
     job: _SynthesisJob | None = None  # async synthesis in flight
+    acoustic_ready_at: float = 0.0  # monotonic time used by the optional batch window
     hold_steps: int = 0  # HOLD_TOKEN steps emitted while it runs
     # Engine output count once the emitted end token is accepted, and the
     # shipped (audio, truncated, error). A preemption can drop the step that
@@ -1675,7 +1744,7 @@ class _RequestState:
     delivered: tuple[torch.Tensor, bool, bool] | None = None
 
 
-SongWork = Callable[[list], Generator[None, None, torch.Tensor]]
+SongWork = Callable[[list], Generator[torch.cuda.Event | None, None, torch.Tensor]]
 
 
 class _SynthesisJob:
@@ -1696,13 +1765,14 @@ class _SynthesisJob:
 
     def __init__(self, request_id: str, song: SongWork):
         """``song(keep)`` yields once per enqueued work unit and returns the
-        device audio [2, samples]; what it appends to ``keep`` stays alive
-        until the job is released."""
+        device audio [2, samples]. Yielding an unrecorded event pauses work
+        until all prior units finish; completed NAR engines are then retired."""
         self.request_id = request_id
         self.song = song
         self.stream: torch.cuda.Stream | None = None
-        self.work: Iterator[None] | None = None
+        self.work: Iterator[torch.cuda.Event | None] | None = None
         self.inflight: list[torch.cuda.Event] = []
+        self.waiting: torch.cuda.Event | None = None
         self.event: torch.cuda.Event | None = None  # recorded after the last unit
         self.audio: torch.Tensor | None = None  # pinned host copy
         self.finite: torch.Tensor | None = None  # pinned pre-clamp validity flag
@@ -1719,7 +1789,7 @@ class _SynthesisJob:
     def started(self) -> bool:
         return self.t_start is not None
 
-    def _run(self) -> Iterator[None]:
+    def _run(self) -> Iterator[torch.cuda.Event | None]:
         audio = yield from self.song(self.keep)
         # Check before clipping: clipping maps infinities to finite +/-1.
         # Both copies target pinned allocations and complete before self.event.
@@ -1741,6 +1811,10 @@ class _SynthesisJob:
         """Enqueue work units up to MAX_INFLIGHT ahead of the GPU; never waits."""
         if self.work is None or self.event is not None or self.error is not None:
             return
+        if self.waiting is not None:
+            if not self.waiting.query():
+                return
+            self.waiting = None
         with torch.cuda.stream(self.stream), torch.inference_mode():
             while True:
                 # Completed chunks need not keep all their K/V and private
@@ -1754,7 +1828,7 @@ class _SynthesisJob:
                 if len(self.inflight) >= self.MAX_INFLIGHT:
                     return
                 try:
-                    next(self.work)
+                    barrier = next(self.work)
                 except StopIteration:
                     self.event = torch.cuda.Event()
                     self.event.record(self.stream)
@@ -1765,6 +1839,10 @@ class _SynthesisJob:
                     # rejects a bad song with ValueError. Either fails only
                     # this request (see finish); anything else is a bug.
                     self.error = exc
+                    return
+                if barrier is not None:
+                    barrier.record(self.stream)
+                    self.waiting = barrier
                     return
                 unit = torch.cuda.Event()
                 unit.record(self.stream)
@@ -1782,7 +1860,9 @@ class _SynthesisJob:
     def drain(self) -> None:
         """Enqueue and wait for everything (a request out of hold budget)."""
         while self.work is not None and self.event is None and self.error is None:
-            if self.inflight:
+            if self.waiting is not None:
+                self.waiting.synchronize()
+            elif self.inflight:
                 self.inflight[0].synchronize()
             self.advance()
 
@@ -1803,10 +1883,12 @@ class _SynthesisJob:
         if self.work is not None:
             self.work.close()
             self.work = None
+        _clear_exception_tracebacks(self.error)
         for item in self.keep:
             if isinstance(item, CachedNAR):
                 item.close()
         self.keep.clear()
+        self.waiting = None
         self.stream = None
         self._released = True
 
@@ -1828,7 +1910,7 @@ class _SynthesisJob:
         if self.cancelled:
             return torch.zeros((2, 0)), True
         if self.error is not None:
-            logger.error("YuE2 synthesis failed for req=%s: %r", self.request_id, self.error)
+            logger.error("YuE2 synthesis failed for req=%s: %r", self.request_id, self.error, exc_info=self.error)
             return torch.zeros((2, 0)), True
         if self.finite is None or not bool(self.finite):
             logger.error("YuE2 synthesis produced non-finite audio for req=%s", self.request_id)
@@ -2086,13 +2168,20 @@ class Yue2ForCausalLM(nn.Module):
 
     def _vae_model(self, device: torch.device) -> YuE2VAE:
         if self._vae is None:
-            vae_path = os.environ.get("YUE2_VAE", DEFAULT_VAE_ID)
+            vae_path = self.config.yue2_vae_path or os.environ.get("YUE2_VAE", DEFAULT_VAE_ID)
             logger.info("Loading YuE2 VAE decoder from %s", vae_path)
             # Keep the VAE out of the module tree (__dict__, not an nn.Module
             # attribute): the checkpoint has no VAE keys, so a registered
             # submodule would trip DefaultModelLoader.track_weights_loading,
             # and a model-wide dtype/device pass would change VAE numerics.
-            self.__dict__["_vae"] = YuE2VAE.from_pretrained(vae_path, decoder_only=True, device="cpu")
+            self.__dict__["_vae"] = YuE2VAE.from_pretrained(
+                vae_path,
+                revision=self.config.yue2_vae_revision,
+                token=self.vllm_config.model_config.hf_token,
+                cache_dir=self.vllm_config.load_config.download_dir,
+                decoder_only=True,
+                device="cpu",
+            )
         if self._vae_device != device:
             self._vae.to(device)
             self._vae_device = device
@@ -2475,7 +2564,7 @@ class Yue2ForCausalLM(nn.Module):
 
         if self._pinned is None or self._pinned.shape[1] < count:
             self._pinned = torch.empty((2, max(count, 64)), dtype=torch.long, pin_memory=True)
-        host = self._pinned[:, :count]
+        host = self._pinned.view(-1)[: 2 * count].view(2, count)
         # Async into pinned memory; the next sample() call resolves it.
         host.copy_(drawn, non_blocking=True)
         event = torch.Event()
@@ -2540,10 +2629,12 @@ class Yue2ForCausalLM(nn.Module):
 
     def _song_iter(
         self, prefix_ids: list[int], codec: list[int], seed: int, keep: list
-    ) -> Generator[None, None, torch.Tensor]:
+    ) -> Generator[torch.cuda.Event | None, None, torch.Tensor]:
         """NAR + VAE for one song as work units; returns the device audio."""
         latents = yield from synthesize_iter(self, prefix_ids, codec, seed, keep, self._synthesis.graph_pool)
         keep.append(latents)
+        # Retire completed NAR buffers before allocating VAE workspace.
+        yield torch.cuda.Event()
         return (yield from self._decode_latents_iter(latents))
 
     def _queue_synthesis(self, state: _RequestState) -> None:
