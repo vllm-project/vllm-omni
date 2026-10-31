@@ -54,6 +54,18 @@ def cosyvoice3_packed_inference_enabled() -> bool:
     return cosyvoice3_full_response_enabled() or cosyvoice3_packed_streaming_enabled()
 
 
+def compile_cosyvoice3_padded_dit(estimator: torch.nn.Module, device: torch.device) -> None:
+    """Compile the padded estimator without changing its attention backend."""
+    if device.type != "cuda":
+        raise ValueError("cosyvoice3_compile_dit requires a CUDA device")
+    if cosyvoice3_packed_inference_enabled():
+        raise ValueError("cosyvoice3_compile_dit is for padded DiT, not the packed Flow profiles")
+    backends = {block.attn.attn.attn_backend.get_name() for block in estimator.transformer_blocks}
+    if len(backends) != 1 or not backends <= {"CUDNN_ATTN", "FLASH_ATTN", "TORCH_SDPA"}:
+        raise ValueError(f"cosyvoice3_compile_dit does not support the selected attention backends: {sorted(backends)}")
+    estimator.forward = torch.compile(estimator.forward, options={"emulate_precision_casts": True})
+
+
 def cosyvoice3_standard_sampling(config: object) -> bool:
     """Select ordinary sampling; RAS remains the default checkpoint behavior.
 
