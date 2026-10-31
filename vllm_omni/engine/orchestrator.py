@@ -123,6 +123,23 @@ def _event_driven_orch_enabled() -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _stage_request_error_text(eco: Any, fallback: str) -> tuple[str, str | None]:
+    """Prefer RequestError.message over stop_reason for a stage failure.
+
+    A paused engine sets ``error`` and leaves ``stop_reason`` unset. Bare
+    ``FinishReason.ERROR`` outputs keep the historical fallback.
+    """
+    request_error = getattr(eco, "error", None)
+    message = getattr(request_error, "message", None)
+    code = getattr(request_error, "code", None)
+    if isinstance(message, str) and message:
+        return message, code if isinstance(code, str) else None
+    stop_reason = getattr(eco, "stop_reason", None)
+    if isinstance(stop_reason, str) and stop_reason:
+        return stop_reason, None
+    return fallback, None
+
+
 def _build_terminal_empty_output(
     request_id: str,
     *,
@@ -965,6 +982,7 @@ class OrchestratorBase:
         pool = self.stage_pools[stage_id]
         await self._route_upstream_first_audio(stage_id, replica_id, raw_outputs)
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+        reported_session_errors: set[str] = set()
 
         for eco in raw_outputs.outputs:
             mm_cache_miss_hashes = getattr(eco, "mm_cache_miss_hashes", None)
@@ -1003,21 +1021,27 @@ class OrchestratorBase:
 
             # A non-session ERROR is fatal to the whole request. Handle it
             # before normal terminal routing so it reaches the client once.
+            # Cleanup pops the output-processor entry, so process_outputs will
+            # not see this output. Prefer RequestError.message: a paused engine
+            # sets error and leaves stop_reason unset.
             if (
                 getattr(eco, "finish_reason", None) == FinishReason.ERROR
                 and not segment_finished
                 and not req_state.session_owned
             ):
-                reason = (
-                    "Multi-modal processor cache miss. Please retry the request."
-                    if mm_cache_miss_hashes
-                    else getattr(eco, "stop_reason", None)
-                )
-                await self._handle_stage_error(
-                    stage_id,
-                    eco,
-                    error=reason if isinstance(reason, str) and reason else "Stage request failed",
-                )
+                reason, error_type = _stage_request_error_text(eco, "Stage request failed")
+                if mm_cache_miss_hashes:
+                    reason = "Multi-modal processor cache miss. Please retry the request."
+                    error_type = None
+                if error_type is None:
+                    await self._handle_stage_error(stage_id, eco, error=reason)
+                else:
+                    await self._handle_stage_error(
+                        stage_id,
+                        eco,
+                        error=reason,
+                        error_type=error_type,
+                    )
                 continue
 
             # Only streaming requests maintain the per-stage segment snapshot.
@@ -1041,12 +1065,18 @@ class OrchestratorBase:
             ):
                 raw_terminal_request_ids.add(req_state.request_id)
 
-            await self._report_duplex_session_request_error(
-                stage_id,
-                replica_id,
-                eco,
-                req_state,
-            )
+            if (
+                await self._report_duplex_session_request_error(
+                    stage_id,
+                    replica_id,
+                    eco,
+                    req_state,
+                )
+                is True
+            ):
+                reported_session_errors.add(req_state.request_id)
+                if request_id is not None:
+                    reported_session_errors.add(request_id)
             if isinstance(getattr(eco, "stage_work", None), list):
                 self._collect_duplex_stage_work(stage_id, eco, req_state)
 
@@ -1056,6 +1086,12 @@ class OrchestratorBase:
             raw_outputs,
             iteration_stats=iteration_stats,
         )
+        if reported_session_errors:
+            # Duplex already enqueued the client error. Drop a processor
+            # from_error for the same id so it is not delivered again.
+            processed = [
+                output for output in processed if getattr(output, "request_id", None) not in reported_session_errors
+            ]
 
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
             self._stat_logger.record(
@@ -1560,12 +1596,26 @@ class OrchestratorBase:
 
             await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
-    async def _handle_stage_error(self, stage_id: int, output: Any, *, error: str | None = None) -> None:
+    async def _handle_stage_error(
+        self,
+        stage_id: int,
+        output: Any,
+        *,
+        error: str | None = None,
+        error_type: str | None = None,
+    ) -> None:
         """Emit a frontend-visible error and clean up request state."""
         if self._cfg_tracker.is_companion(output.request_id):
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
         else:
             parent_id = output.request_id
+        resolved_error_type: str | None
+        if getattr(output, "mm_cache_miss_hashes", None):
+            resolved_error_type = "ServiceUnavailableError"
+        elif error_type is not None:
+            resolved_error_type = error_type
+        else:
+            resolved_error_type = getattr(output, "error_type", None)
         await self.output_async_queue.put(
             ErrorMessage(
                 request_id=parent_id,
@@ -1574,9 +1624,7 @@ class OrchestratorBase:
                 status_code=503
                 if getattr(output, "mm_cache_miss_hashes", None)
                 else getattr(output, "error_status_code", None),
-                error_type="ServiceUnavailableError"
-                if getattr(output, "mm_cache_miss_hashes", None)
-                else getattr(output, "error_type", None),
+                error_type=resolved_error_type,
                 mm_cache_miss_hashes=getattr(output, "mm_cache_miss_hashes", None),
             )
         )
@@ -2001,7 +2049,7 @@ class OrchestratorBase:
         replica_id: int | None,
         eco: Any,
         req_state: OrchestratorRequestState,
-    ) -> None:
+    ) -> bool:
         """Turn a scheduler-side error finish of a duplex session request into a request error.
 
         A duplex session request is resumable, so its terminal outputs are
@@ -2015,13 +2063,12 @@ class OrchestratorBase:
         the serving layer can fail and close the session.
         """
         if not req_state.session_owned:
-            return
+            return False
         if getattr(eco, "finish_reason", None) != FinishReason.ERROR:
-            return
+            return False
         if getattr(eco, "is_segment_finished", False):
-            return
-        stop_reason = getattr(eco, "stop_reason", None)
-        error = stop_reason if isinstance(stop_reason, str) and stop_reason else "duplex session request failed"
+            return False
+        error, error_type = _stage_request_error_text(eco, "duplex session request failed")
         logger.error(
             "[Orchestrator] Duplex session request %s failed at stage-%s replica-%s: %s",
             req_state.request_id,
@@ -2032,12 +2079,14 @@ class OrchestratorBase:
         await self.output_async_queue.put(
             ErrorMessage(
                 error=error,
+                error_type=error_type,
                 fatal=False,
                 request_id=req_state.request_id,
                 stage_id=stage_id,
                 mm_cache_miss_hashes=getattr(eco, "mm_cache_miss_hashes", None),
             )
         )
+        return True
 
     async def _finish_raw_terminal_requests(
         self,

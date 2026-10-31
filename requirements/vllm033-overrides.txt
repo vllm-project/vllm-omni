@@ -1,0 +1,4 @@
+# vLLM 0.33 requires Pillow 13. Gradio 6 still declares pillow<13, including
+# when pulled in only by VoxCPM inference tests. Retain the vLLM requirement.
+# Remove when https://github.com/gradio-app/gradio/issues/13999 is released.
+pillow>=13.0.0,<14

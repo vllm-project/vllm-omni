@@ -1448,6 +1448,7 @@ async def test_multistage_app_state_key_snapshot(
     monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
+    monkeypatch.setattr(api_server, "OnlineDerenderer", _FakeCtor)
     monkeypatch.setattr(api_server, "OpenAIServingResponses", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _FakeCtor)

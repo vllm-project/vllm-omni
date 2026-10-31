@@ -42,9 +42,10 @@ class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
         self,
         hf_config,
         hf_text_config,
+        revision: str | None = None,
         stage_config_name: str | None = None,
     ):
-        super().__init__(hf_config, hf_text_config)
+        super().__init__(hf_config, hf_text_config, revision)
         self.stage_config_name = stage_config_name
 
     def get_quantization_config(self):
@@ -239,9 +240,10 @@ class OmniModelConfig(ModelConfig):
             convertor = OmniModelArchConfigConvertor(
                 self.hf_config,
                 self.hf_text_config,
+                revision=getattr(self, "revision", None),
                 stage_config_name=self.hf_config_name,
             )
-            return convertor.convert()
+            return convertor.convert(supports_multimodal=self._supports_multimodal_for_mm_prefix())
         return super().get_model_arch_config()
 
     def draw_hf_text_config(self) -> PretrainedConfig:

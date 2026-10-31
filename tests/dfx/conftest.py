@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import threading
 from collections.abc import Mapping
@@ -545,6 +546,27 @@ def resolve_baseline_for_sweep(
     }
 
 
+def _save_duplex_eval_diagnostics(score_root: str, accuracy_path: Path) -> None:
+    """Keep judge evidence before the accuracy fixture deletes temporary media."""
+    if not score_root or not (source_root := Path(score_root).resolve()).is_dir():
+        return
+    diagnostics_root = accuracy_path.parent.resolve() / "diagnostics"
+    # Snapshot first, excluding earlier exports if the configured roots overlap.
+    sources = [
+        path
+        for path in source_root.rglob("*")
+        if path.is_file()
+        and ".media" not in path.relative_to(source_root).parts
+        and not path.is_relative_to(diagnostics_root)
+        and (path.suffix == ".json" or path.name.endswith(".judge.jsonl"))
+    ]
+    destination = diagnostics_root / f"{accuracy_path.stem}-{source_root.parent.name}"
+    for source in sources:
+        target = destination / source.relative_to(source_root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+
 def run_benchmark(
     args: list[str],
     test_name: str,
@@ -721,6 +743,8 @@ def run_benchmark(
             encoding="utf-8",
         )
         print(f"Accuracy result saved to {accuracy_path}")
+        if isinstance(score_root := accuracy.get("score_root"), str):
+            _save_duplex_eval_diagnostics(score_root, accuracy_path)
         from vllm_omni.platforms import current_omni_platform
 
         # Preserve the accuracy job's torch_npu shutdown exception while

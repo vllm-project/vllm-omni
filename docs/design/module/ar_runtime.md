@@ -32,6 +32,11 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+MOSS Local's fused and separate depth-attention paths share an explicitly
+rounded initial weighted value and the same FMA accumulation order. This
+preserves bitwise parity when the compiler inlines attention into sampling,
+including SM89 code generation affected by LLVM SLP reduction reordering.
+
 ## Full-payload input scheduling
 
 For a downstream, non-async stage with `requires_full_payload_input`,

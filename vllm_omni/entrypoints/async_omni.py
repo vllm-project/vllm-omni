@@ -22,6 +22,10 @@ import anyio
 import msgspec
 from vllm import TokensPrompt
 from vllm.config.profiler import validate_profile_iteration_bounds
+from vllm.distributed.weight_transfer.base import (
+    WeightTransferInitRequest,
+    WeightTransferUpdateRequest,
+)
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -1184,6 +1188,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -1194,16 +1199,19 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             stages: List of stage IDs to profile. If None, profiles all stages.
             delay_iterations: Optional per-session delayed start (vLLM compat).
             max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
         """
         validate_profile_iteration_bounds(delay_iterations, max_iterations)
         # Mirror upstream ExecutorBase.profile: forward the per-session
         # controls as kwargs only when set, so workers without them keep
         # working with plain (is_start, profile_prefix) args.
-        kwargs: dict[str, int] = {}
+        kwargs: dict[str, Any] = {}
         if delay_iterations is not None:
             kwargs["delay_iterations"] = delay_iterations
         if max_iterations is not None:
             kwargs["max_iterations"] = max_iterations
+        if profiler_kwargs is not None:
+            kwargs["profiler_kwargs"] = profiler_kwargs
         return await self.collective_rpc(
             method="profile",
             args=(True, profile_prefix),
@@ -1693,12 +1701,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 raise RuntimeError(f"{method} failed on a stage: {result.get('error', result)}")
         return results
 
-    async def init_weight_transfer_engine(self, init_info: dict) -> None:
+    async def init_weight_transfer_engine(self, init_request: WeightTransferInitRequest | dict) -> None:
         """Initialize weight transfer mechanism across all stages.
 
         Args:
-            init_info: Backend-specific initialization information
+            init_request: Upstream request, or the raw init dict Omni HTTP
+                routes and tests already pass. Stage workers still receive
+                that dict.
         """
+        init_info = init_request if isinstance(init_request, dict) else init_request.init_info
         await self._weight_transfer_rpc("init_weight_transfer_engine", (init_info,))
         logger.info("[%s] Weight transfer engine initialized", self._name)
 
@@ -1711,12 +1722,15 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         await self._weight_transfer_rpc("start_weight_update")
         logger.info("[%s] Weight update session started", self._name)
 
-    async def update_weights(self, update_info: dict) -> None:
+    async def update_weights(self, request: WeightTransferUpdateRequest | dict | list) -> None:
         """Send weight update chunk to all stages.
 
         Args:
-            update_info: Backend-specific update information containing weight data
+            request: Upstream request, or the raw update dict/list Omni HTTP
+                routes and tests already pass. Stage workers still receive
+                that payload.
         """
+        update_info = request if isinstance(request, (dict, list)) else request.update_info
         await self._weight_transfer_rpc("update_weights", (update_info,))
         logger.debug("[%s] Weight chunk forwarded to stages", self._name)
 

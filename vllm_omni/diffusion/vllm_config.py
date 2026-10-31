@@ -93,6 +93,9 @@ class _DiffusionVllmModelConfig:
     # narrow compatibility surface here instead of manufacturing a second
     # model configuration object in the Worker backend.
     is_mm_prefix_lm: bool = False
+    # Diffusion supplies attention specs directly and uses native default
+    # grouping rather than a registered model's SupportsKVCacheGrouping hook.
+    supports_kv_cache_grouping: bool = False
     rswa_window: int | None = None
     _attention_num_heads: int | None = field(default=None, init=False, repr=False)
     _attention_num_kv_heads: int | None = field(default=None, init=False, repr=False)

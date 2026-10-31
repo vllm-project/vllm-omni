@@ -79,10 +79,13 @@ def _attend(
         scores = tl.where(s[None, :] == POSITION, sp[:, None], scores)
         probs = tl.exp(scores - tl.max(scores, axis=1)[:, None])
         probs = probs / tl.sum(probs, axis=1)[:, None]
-        result = v * tl.sum(tl.where(s[None, :] == POSITION, probs, 0.0), axis=1)[:, None]
+        # Pin the accumulator's rounding. LLVM SLP can otherwise contract the
+        # initial product with the first add differently when this body is
+        # inlined into sampling on SM89, breaking fused/unfused bitwise parity.
+        result = libdevice.mul_rn(v, tl.sum(tl.where(s[None, :] == POSITION, probs, 0.0), axis=1)[:, None])
         for p in tl.static_range(POSITION):
             vp = tl.load(V + base + p * D, dmask, 0, eviction_policy=CACHE_LOAD).to(tl.float32)
-            result += vp * tl.sum(tl.where(s[None, :] == p, probs, 0.0), axis=1)[:, None]
+            result = tl.fma(vp, tl.sum(tl.where(s[None, :] == p, probs, 0.0), axis=1)[:, None], result)
     if LATE and not LAST:
         tl.store(K + base + POSITION * D, k, dmask, eviction_policy="evict_last")
         tl.store(V + base + POSITION * D, v, dmask, eviction_policy="evict_last")

@@ -25,7 +25,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 )
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
 
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
@@ -1022,3 +1022,6 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         if self._finalize_output is not None:
             return self._finalize_output(self.model_runner_output)
         return self.model_runner_output
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        return self.model_runner_output.kv_connector_output

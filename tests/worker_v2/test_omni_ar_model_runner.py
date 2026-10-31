@@ -153,6 +153,8 @@ def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, 
 def test_last_pp_rank_orchestration_and_kv_resolver(
     monkeypatch, needs_history, include_hidden, engine_output_type
 ) -> None:
+    # Native prompt-logprob preparation otherwise pins memory using CUDA.
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     input_batch = SimpleNamespace(req_ids=["req"], num_reqs=1, seq_lens=torch.tensor([3]))
     input_batch.idx_mapping, input_batch.query_start_loc = torch.tensor([0]), torch.tensor([0, 1])

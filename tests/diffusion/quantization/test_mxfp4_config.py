@@ -1112,7 +1112,9 @@ def test_single_scale_prepares_one_weight_for_both_activation_precisions(online,
     )
     cls = mxfp4_config.NPUMxfp4OnlineLinearMethod if online else mxfp4_config.NPUMxfp4LinearMethod
     method = cls(config, prefix="blocks.0.attn1.to_qkv")
-    layer = torch.nn.Linear(64, 2, bias=False, dtype=torch.bfloat16)
+    # Match create_weights' inference parameters: native replacement preserves
+    # the existing parameter's requires_grad flag when packing integer weights.
+    layer = torch.nn.Linear(64, 2, bias=False, dtype=torch.bfloat16).requires_grad_(False)
     layer.orig_dtype = torch.bfloat16
     if not online:
         layer.register_parameter("weight_scale", torch.nn.Parameter(torch.full((2, 2), 127, dtype=torch.uint8), False))

@@ -5166,7 +5166,8 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
     assert isinstance(response, JSONResponse)
     assert response.status_code == 500
     assert response.body.decode("utf-8") == (
-        '{"error":{"message":"engine dead","type":"InternalServerError","param":null,'
+        '{"error":{"message":"The server had an error while processing your request.",'
+        '"type":"InternalServerError","param":null,'
         '"code":500,"request_id":"speech-req-1","error_stage_id":1}}'
     )
     terminate_mock.assert_called_once()

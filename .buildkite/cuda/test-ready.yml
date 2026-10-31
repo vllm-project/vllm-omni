@@ -25,7 +25,7 @@ steps:
       - label: "Simple · Engine&Entrypoints&Diffusion Test"
         timeout_in_minutes: 20
         commands:
-          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
+          - "VLLM_OMNI_CPU_XDIST_SCOPE=simple-engine pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu' -n 4 --dist=loadfile"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"
@@ -192,12 +192,13 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      # The live client waits for a learned turn terminator; use real weights.
       - label: "Omni · MiniCPM-o 4.5 Duplex Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_function
         commands:
           - |
             timeout 35m bash -c "
-              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'core_model'
+              pytest -s -v tests/e2e/online_serving/test_minicpmo_4_5_duplex.py tests/e2e/online_serving/test_duplex_client_live.py -m 'core_model and cuda' --run-level 'advanced_model'
             "
         mirror_hardwares: h100_1
 

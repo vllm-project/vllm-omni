@@ -293,8 +293,30 @@ class StageConfigFactory:
         trust_remote_code: bool,
         deploy_config_path: str | None = None,
         user_deploy_config: DeployConfig | None = None,
+        pipeline_name: str | None = None,
     ) -> PipelineConfig | None:
         """Resolve the PipelineConfig for a model path/name."""
+        if pipeline_name:
+            if user_deploy_config is not None and user_deploy_config.pipeline not in (None, pipeline_name):
+                raise ValueError(
+                    f"--pipeline {pipeline_name!r} conflicts with deploy config "
+                    f"pipeline {user_deploy_config.pipeline!r}"
+                )
+            registered = OMNI_PIPELINES.get(pipeline_name)
+            if registered is None:
+                raise KeyError(
+                    f"Pipeline {pipeline_name!r} is not registered to OMNI_PIPELINES. "
+                    f"Available: {sorted(OMNI_PIPELINES)}"
+                )
+            if callable(registered):
+                hf_config = cls.get_hf_config(model=model, trust_remote_code=trust_remote_code)
+                pipeline_cfg = registered(hf_config)
+            else:
+                pipeline_cfg = registered
+            if pipeline_cfg is None:
+                raise KeyError(f"Pipeline {pipeline_name!r} did not resolve to a PipelineConfig")
+            return pipeline_cfg
+
         model_type = cls.try_infer_model_type(model=model, trust_remote_code=trust_remote_code)
         hf_config = cls.get_hf_config(model=model, trust_remote_code=trust_remote_code)
 
@@ -399,8 +421,10 @@ class StageConfigFactory:
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None,
         strategy_specs: Mapping[Any, Any] | None = None,
+        pipeline_name: str | None = None,
     ) -> VllmOmniConfig | None:
         """Build the structured Omni config for a model/deploy pair."""
+        pipeline_name = pipeline_name or cli_overrides.pop("pipeline", None)
         user_deploy_config = cls._load_user_deploy_config(deploy_config_path)
         pipeline_cfg = cls.get_pipeline_config(
             model=model,
@@ -409,6 +433,7 @@ class StageConfigFactory:
             trust_remote_code=bool(trust_remote_code),
             deploy_config_path=deploy_config_path,
             user_deploy_config=user_deploy_config,
+            pipeline_name=pipeline_name,
         )
         if pipeline_cfg is None:
             return None

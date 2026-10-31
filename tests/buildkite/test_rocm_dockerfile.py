@@ -31,9 +31,9 @@ def _line_index(lines: list[str], prefix: str) -> int:
     return matches[0]
 
 
-def test_rocm_base_tracks_cuda_vllm_release() -> None:
-    # CI installs the exact final wheel on its digest-pinned release image;
-    # production CUDA/ROCm images track the same stable release.
+def test_rocm_base_tracks_cuda_bootstrap_release() -> None:
+    # Bootstrap images must exist; the candidate runtime is installed later
+    # from the pinned CUDA wheel or the matching ROCm source commit.
     assert _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_IMAGE") == "vllm/vllm-openai"
     assert "@sha256:" in _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_TAG")
     assert len(_docker_arg(CUDA_CI_DOCKERFILE, "VLLM_PRECOMPILED_WHEEL_COMMIT")) == 40
@@ -45,11 +45,11 @@ def test_rocm_base_tracks_cuda_vllm_release() -> None:
     assert separator, f"expected a tagged ROCm base image, got {rocm_base}"
     assert cuda_image == "vllm/vllm-openai"
     assert image_ref == "vllm/vllm-openai-rocm"
-    assert image_tag == cuda_release_tag == f"v{_docker_arg(CUDA_CI_DOCKERFILE, 'VLLM_VERSION')}"
+    assert image_tag == cuda_release_tag == _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_TAG").split("@")[0]
 
 
-def test_rocm_defaults_to_prebuilt_base_image() -> None:
-    assert _docker_arg(ROCM_DOCKERFILE, "USE_NIGHTLY_BUILD") == "0"
+def test_rocm_defaults_to_building_the_candidate_runtime() -> None:
+    assert _docker_arg(ROCM_DOCKERFILE, "USE_NIGHTLY_BUILD") == "1"
 
 
 def test_amd_build_uses_registry_cache() -> None:
@@ -112,12 +112,16 @@ def test_rocm_build_context_excludes_git_history() -> None:
 
 
 def test_rocm_source_ref_tracks_cuda_vllm_release() -> None:
-    # The opt-in ROCm source rebuild defaults to the released CUDA vLLM tag;
-    # CI itself pins the release wheel via VLLM_PRECOMPILED_WHEEL_COMMIT.
-    cuda_release_tag = _docker_arg(CUDA_RELEASE_DOCKERFILE, "BASE_IMAGE").rpartition(":")[2]
+    # Both runtime installations must track the candidate, independently of
+    # the older published images used to bootstrap their dependencies.
+    cuda_version = _docker_arg(CUDA_RELEASE_DOCKERFILE, "VLLM_VERSION")
     rocm_source_ref = _docker_arg(ROCM_DOCKERFILE, "VLLM_VERSION_OR_COMMIT_HASH")
 
-    assert rocm_source_ref == cuda_release_tag == f"v{_docker_arg(CUDA_CI_DOCKERFILE, 'VLLM_VERSION')}"
+    assert cuda_version == _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_VERSION")
+    assert rocm_source_ref == _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_PRECOMPILED_WHEEL_COMMIT")
+    assert _docker_arg(CUDA_RELEASE_DOCKERFILE, "VLLM_PRECOMPILED_WHEEL_COMMIT") == _docker_arg(
+        CUDA_CI_DOCKERFILE, "VLLM_PRECOMPILED_WHEEL_COMMIT"
+    )
 
 
 def test_rocm_dockerfile_contains_vllm_api_canary() -> None:

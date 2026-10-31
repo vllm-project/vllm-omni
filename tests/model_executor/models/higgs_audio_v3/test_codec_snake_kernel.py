@@ -8,10 +8,18 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.cudnn import deterministic_cudnn
 from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model]
+
+
+@pytest.fixture
+def with_deterministic_cudnn():
+    with deterministic_cudnn():
+        yield
+
 
 requires_cuda = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")
 
@@ -124,7 +132,7 @@ def test_fuse_dac_decoder_keeps_state_dict_and_falls_back_on_cpu():
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @torch.inference_mode()
-def test_fused_decoder_graph_replays_changed_inputs(dtype):
+def test_fused_decoder_graph_replays_changed_inputs(dtype, with_deterministic_cudnn):
     reference, fused = _dac_decoder_pair("cuda", dtype)
     x = torch.randn(2, _DAC_CONFIG["hidden_size"], 8, device="cuda").to(dtype)
     stream = torch.cuda.Stream()

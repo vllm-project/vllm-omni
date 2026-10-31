@@ -46,7 +46,13 @@ def runner(monkeypatch):
     # Exercise the real capturer, block store, worker and scheduler connectors
     # with CPU tensors; importing vllm-ascend or owning NPU hardware is unnecessary.
     monkeypatch.setattr(routed_experts_capturer, "current_platform", SimpleNamespace(device_type="cpu"))
-    monkeypatch.setattr(routed_experts_capturer, "get_forward_context", lambda: SimpleNamespace(dp_metadata=None))
+    # Upstream RoutedExpertsCapturer reads batch_descriptor when dp_metadata
+    # is absent. ForwardContext.batch_descriptor defaults to None.
+    monkeypatch.setattr(
+        routed_experts_capturer,
+        "get_forward_context",
+        lambda: SimpleNamespace(dp_metadata=None, batch_descriptor=None),
+    )
     monkeypatch.setattr(worker, "get_tp_group", lambda: SimpleNamespace(is_first_rank=True))
     runner = _Runner()
     runner.model = torch.nn.Sequential(_AscendMoE())
@@ -105,7 +111,19 @@ def test_routing_reaches_scheduler_and_owns_legacy_batch_snapshot(runner):
     _capture(runner, [[7, 8]] * 4)
     output = runner._finish_omni_aux_output(pending, step, torch.tensor([[5]]))
     request = SimpleNamespace(request_id="r", num_tokens=5)
-    rows = AuxOutputSchedulerConnector().take_output(request, output)
+    # Pinned AuxOutputSchedulerConnector requires a KV cache manager.
+    # take_output only reads the request and worker rows; the stub supplies
+    # the constructor's disabled-feature defaults.
+    rows = AuxOutputSchedulerConnector(
+        SimpleNamespace(
+            coordinator=SimpleNamespace(
+                full_attention_group_id=0,
+                single_type_managers={0: SimpleNamespace(block_size=4)},
+            ),
+            block_pool=SimpleNamespace(hash_block_size=4),
+            kv_cache_config=SimpleNamespace(num_blocks=8),
+        )
+    ).take_output(request, output)
     np.testing.assert_array_equal(rows, expected)
     assert output["r"].token_start == 0
     assert runner.synchronized == 1

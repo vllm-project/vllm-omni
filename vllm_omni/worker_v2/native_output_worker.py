@@ -6,7 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from threading import BoundedSemaphore, Lock
 from typing import Any
 
-from vllm.v1.outputs import AsyncModelRunnerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, KVConnectorOutput
 
 
 class NativeAsyncOutput(AsyncModelRunnerOutput):
@@ -17,6 +17,9 @@ class NativeAsyncOutput(AsyncModelRunnerOutput):
         self._plane = plane
         self.copy_event = copy_event
         self._resolved: Future = Future()
+        # Filled when the worker future yields an output, before plane attach.
+        # enqueue_output salvages this after get_output() raises.
+        self._kv_connector_output: KVConnectorOutput | None = None
 
     def get_output(self) -> Any:
         # Like the upstream lazy AsyncOutputFuture, consumption belongs to one
@@ -25,6 +28,7 @@ class NativeAsyncOutput(AsyncModelRunnerOutput):
             try:
                 assert self._future is not None
                 output = self._future.result()
+                self._kv_connector_output = getattr(output, "kv_connector_output", None)
                 output.omni_connector_output = self._plane.get_omni_connector_output()
                 self._resolved.set_result(output)
             except Exception as error:
@@ -35,6 +39,26 @@ class NativeAsyncOutput(AsyncModelRunnerOutput):
                     self._future = None
                     self._plane = None
         return self._resolved.result()
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        # Do not block the engine thread. A connector output captured before
+        # plane attach survives a later get_output() failure. Otherwise only a
+        # future that has already finished can be salvaged.
+        snap = getattr(self, "_kv_connector_output", None)
+        if snap is not None:
+            return snap
+        future = (
+            self._resolved
+            if getattr(self, "_resolved", None) is not None and self._resolved.done()
+            else getattr(self, "_future", None)
+        )
+        if future is None or not future.done():
+            return None
+        try:
+            output = future.result()
+        except Exception:
+            return None
+        return getattr(output, "kv_connector_output", None)
 
 
 class NativeOutputWorker:

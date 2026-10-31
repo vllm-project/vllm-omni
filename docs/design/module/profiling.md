@@ -32,6 +32,12 @@ validation to the engine configuration. See the
 [offline profiling guide](../../contributing/profiling.md#offline-qwen25-omni-and-cosyvoice3-examples)
 for commands and the shared helper API.
 
+AR worker profiling forwards vLLM's per-session `profiler_kwargs` to the
+Torch profiler constructor. Overrides apply only while profiling is inactive;
+omitting them on a later session restores the configured defaults. Stage/rank
+trace naming and the default trace export handler remain in place unless the
+caller explicitly overrides the handler.
+
 ## Candidate invariants
 
 ### PROFILE-INV-001: Profiling is opt-in

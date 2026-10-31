@@ -11,10 +11,11 @@
 For ROCm, vLLM-Omni currently recommends the setup steps through Docker Images.
 
 vLLM-Omni depends on the matching major/minor release of vLLM. This source
-checkout targets vLLM 0.32.0. The matching ROCm wheel and final 0.32.0
-ROCm base image are published; ROCm compatibility for this source checkout
-has not been validated. The pre-built Omni wheel instructions below install
-the published 0.30.0 release with its matching vLLM dependency.
+checkout targets vLLM 0.33.0rc3.dev3+g4ba787ec9. A matching candidate ROCm image is not
+published, so the Dockerfile builds the candidate from source on the
+published 0.32.0 bootstrap image. ROCm runtime validation remains pending.
+The pre-built Omni wheel instructions below retain the published 0.30.0
+release with its matching vLLM dependency.
 
 The Dockerfile's `BASE_IMAGE` pin applies only to Docker builds. The
 `vllm-omni` package does not install vLLM as a dependency, so non-Docker source
@@ -52,14 +53,10 @@ uv pip install onnxruntime-rocm
 
 #### Installation of vLLM
 
-The published `0.32.0+rocm723` wheel is available from
-`https://wheels.vllm.ai/rocm/0.32.0/rocm723` for Linux x86_64 and Python 3.12.
-It requires the matching ROCm 7.2.3 PyTorch/Triton builds, rather than the
-CUDA packages. Its version file omits the source commit ID, so it has not
-been verified as the exact source pin below. The older 0.31.0 ROCm wheel is
-not a validated substitute. An experimental source build must use that
-exact release commit and upstream's matching ROCm/PyTorch requirements;
-both paths still need ROCm runtime validation with this checkout.
+Build vLLM from the frozen 0.33.0rc3.dev3+g4ba787ec9 source commit using upstream's matching
+ROCm/PyTorch requirements, or use the Docker source build below. The older
+0.32.0 ROCm wheel does not provide the candidate APIs used by this checkout.
+ROCm runtime validation remains pending.
 
 #### Installation of vLLM-Omni
 
@@ -79,7 +76,7 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout 5df63a7203cdb9328d824a27b682e77c7b9928be
+git checkout 4ba787ec9959e566d3b587a796dff07673324da5
 python3 -m pip install -r requirements/rocm.txt
 python3 setup.py develop
 ```
@@ -90,14 +87,10 @@ python3 setup.py develop
 
 #### Build docker image
 
-The source build defaults to the published upstream base image
-`vllm/vllm-openai-rocm:v0.32.0`, matching this checkout's target release.
-The optional vLLM source rebuild also defaults to `v0.32.0`. ROCm runtime
-validation with this checkout remains pending.
-Older or custom bases must provide the vLLM APIs checked by the Dockerfile's
-image-build canary. This upstream base is distinct from the prebuilt
-`vllm/vllm-omni-rocm` images discussed below; their published-tag availability
-is tracked in [#7405](https://github.com/vllm-project/vllm-omni/issues/7405).
+The Dockerfile starts from `vllm/vllm-openai-rocm:v0.32.0` and defaults to
+`USE_NIGHTLY_BUILD=1` with source commit `4ba787ec9959e566d3b587a796dff07673324da5`. Its development dependency
+install uses `requirements/vllm033-overrides.txt` for the Gradio/Pillow
+constraint conflict. ROCm runtime validation remains pending.
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .

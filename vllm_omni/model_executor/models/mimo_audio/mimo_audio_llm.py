@@ -15,6 +15,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Model as TransformerQwen2Model,
 )
 from vllm.config import VllmConfig
+from vllm.config.multimodal import MultiModalDummyOptions
 from vllm.forward_context import get_forward_context
 from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -385,14 +386,20 @@ class MimoAudioDummyInputsBuilder(BaseDummyInputsBuilder[MimoAudioProcessingInfo
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
         feature_extractor = self.info.get_feature_extractor()
 
         sampling_rate = feature_extractor.sampling_rate
         audio_len = feature_extractor.chunk_length * sampling_rate
-        num_audios = mm_counts.get("audio", 0)
 
-        return {"audio": self._get_dummy_audios(length=audio_len, num_audios=num_audios)}
+        return {
+            "audio": self._get_dummy_audios(
+                length=audio_len,
+                num_audios=mm_counts.get("audio", 0),
+                overrides=mm_options.get("audio"),
+            )
+        }
 
 
 class MimoAudioMultiModalProcessor(BaseMultiModalProcessor[MimoAudioProcessingInfo]):

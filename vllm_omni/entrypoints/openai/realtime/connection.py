@@ -1874,7 +1874,15 @@ class OpenAIFullDuplexConnection:
                 if text:
                     messages.append({"role": "system", "content": text})
 
-        request = ChatCompletionRequest(model=self.model_name, messages=messages)
+        # Prompt-length probes reserve output tokens themselves. Pin
+        # ChatCompletionRequest.build_tok_params leaves max_output_tokens
+        # unset when max_tokens is omitted, so pass 0 to measure the prompt
+        # against the full context window.
+        request = ChatCompletionRequest(
+            model=self.model_name,
+            messages=messages,
+            max_completion_tokens=0,
+        )
         _, (engine_input,) = await chat_handler._preprocess_chat(
             request,
             messages,

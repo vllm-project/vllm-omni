@@ -586,6 +586,40 @@ def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder()
     assert sched._new_prompt_len_snapshot[session.request_id] == 2
 
 
+def test_stage0_streaming_update_keeps_full_hash_block() -> None:
+    """A fully computed length that is a multiple of hash_block_size must keep that block.
+
+    The pin deletes ``block_hashes[keep_end // hash_block_size:]`` with
+    ``keep_end = num_tokens - 1``. Clamping the computed frontier to
+    ``num_tokens - 1`` before that delete drops hash 0 when the length is 16.
+    """
+    sched = _make_scheduler(stage_id=0)
+    # Request stores this list. Compare against a copy so the extension
+    # inside _update_request_as_session does not rewrite the expected prefix.
+    prompt = list(range(16))
+    expected_prefix = list(prompt)
+    session = Request(
+        request_id="req-ar-hash-block",
+        prompt_token_ids=prompt,
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        arrival_time=100.0,
+        block_hasher=None,
+    )
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    session.num_computed_tokens = 16
+    session.block_hashes.append("h0")
+
+    sched._update_request_as_session(session, _make_update([10, 20]))
+
+    assert session.prompt_token_ids[:16] == expected_prefix
+    assert list(session._all_token_ids[:16]) == expected_prefix
+    assert session.prompt_token_ids[-2:] == [10, 20]
+    assert list(session._all_token_ids[-2:]) == [10, 20]
+    assert session.block_hashes[0] == "h0"
+    assert session.num_computed_tokens >= 16
+
+
 def test_stage0_basic_window_rebuilds_below_low_watermark() -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
@@ -1405,6 +1439,8 @@ def test_overflow_guard_survives_eager_abort_until_fifo_cleanup(mocker, fifo_pub
     other.status = RequestStatus.RUNNING
     sched.running.append(other)
     engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    # EngineCore.__init__ sets this; __new__ skips it. False is the unpaused default.
+    engine.reject_new_requests = False
     engine.scheduler = sched
     engine.engines_running = False
     engine.batch_queue = None

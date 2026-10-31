@@ -50,6 +50,18 @@ class Modality(IntEnum):
     TIME = 3
 
 
+def _add_stored_gemm_outputs(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Add GEMM outputs after each result has been stored.
+
+    Inductor rewrites ``gemm + gemm`` as ``addmm`` and adds in the accumulator,
+    skipping the bf16 store eager inserts between the GEMM and the add.
+    Promoting the compiled add restores that store-then-add rounding.
+    """
+    if torch.compiler.is_compiling():
+        return (left.float() + right.float()).to(dtype=left.dtype)
+    return left + right
+
+
 class Magi2Attention(nn.Module):
     def __init__(
         self,
@@ -315,7 +327,10 @@ class Magi2MultiHeadMoELayer(nn.Module):
         # separately keeps both GEMM outputs and the down-projection inputs dense.
         shared = swiglu7(self.shared_expert_fc1(normalized))
         modality = swiglu7(self.modality_specific_shared_expert_fc1(normalized, dispatcher))
-        return self.shared_expert_fc2(shared) + self.modality_specific_shared_expert_fc2(modality, dispatcher)
+        return _add_stored_gemm_outputs(
+            self.shared_expert_fc2(shared),
+            self.modality_specific_shared_expert_fc2(modality, dispatcher),
+        )
 
     def route_input(
         self,
@@ -331,7 +346,10 @@ class Magi2MultiHeadMoELayer(nn.Module):
         routed: torch.Tensor,
         dispatcher: ModalityDispatcher,
     ) -> torch.Tensor:
-        return self.merge_linear(routed) + self._shared_experts(normalized, dispatcher)
+        return _add_stored_gemm_outputs(
+            self.merge_linear(routed),
+            self._shared_experts(normalized, dispatcher),
+        )
 
 
 class Magi2PreAdapter(nn.Module):

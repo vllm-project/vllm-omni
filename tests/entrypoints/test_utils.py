@@ -368,6 +368,7 @@ class TestResolveOmniConfig:
             cli_overrides={"model_class_name": model_class_name, "trust_remote_code": False},
             deploy_config_path=deploy_config_path,
             strategy_specs=None,
+            pipeline_name=None,
         )
         assert resolved.config_path == deploy_config_path
 
@@ -558,6 +559,7 @@ class TestResolveOmniConfig:
             cli_overrides=expected_overrides,
             deploy_config_path="deploy.yaml",
             strategy_specs=strategy_specs,
+            pipeline_name=None,
         )
         create_legacy.assert_not_called()
         load_strategy.assert_called_once_with("strategy.yaml")

@@ -87,6 +87,8 @@ steps:
         artifact_paths:
           - tests/dfx/perf/results/*.json
           - tests/e2e/accuracy/omni_duplex_eval/results/*.json
+          - tests/e2e/accuracy/omni_duplex_eval/results/diagnostics/**/*.json
+          - tests/e2e/accuracy/omni_duplex_eval/results/diagnostics/**/*.judge.jsonl
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omni_duplex_eval/results

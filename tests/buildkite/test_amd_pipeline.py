@@ -2945,7 +2945,9 @@ def test_minicpmo_ready_jobs_select_marked_core_model_nodes() -> None:
         assert step["artifact_paths"] == [f"{artifact}/**/*"]
         assert f"--kill-after=1m {command_timeout}" in command
         assert _MINICPMO_READY_MARKER in command
-        assert "--run-level core_model" in command
+        # The public client waits for a model-generated turn terminator.
+        run_level = "advanced_model" if label == "ROCm · MiniCPM-o 4.5 Duplex Coverage" else "core_model"
+        assert f"--run-level {run_level}" in command
         assert command.count("--shard-id=0 --num-shards=1") == 2
         assert "test_minicpmo_4_5_duplex_mrv2.py" not in command
         assert "test_minicpmo_4_5_ready.json" not in command

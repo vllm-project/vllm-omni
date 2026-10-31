@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # tests/test_omni_torch_profiler.py
 from __future__ import annotations
 
@@ -151,7 +154,7 @@ def fake_config(tmp_path):
 
 @pytest.fixture
 def fake_profiler_factory(monkeypatch):
-    created = {}
+    created: dict[str, object] = {}
 
     def fake_profile(*args, **kwargs):
         profiler = FakeTorchProfiler(on_trace_ready=kwargs.get("on_trace_ready"))
@@ -172,6 +175,27 @@ def wrapper(fake_config, fake_profiler_factory):
         local_rank=0,
         activities=["CPU", "CUDA"],
     )
+
+
+def test_session_profiler_kwargs_override_and_reset_defaults(wrapper, fake_profiler_factory):
+    wrapper._active = False
+    overrides = {"record_shapes": False, "with_stack": False}
+    wrapper.set_profiler_kwargs(overrides)
+    assert fake_profiler_factory["kwargs"]["record_shapes"] is False
+    assert fake_profiler_factory["kwargs"]["with_stack"] is False
+    assert fake_profiler_factory["kwargs"]["on_trace_ready"] == wrapper._on_trace_ready
+    assert overrides == {"record_shapes": False, "with_stack": False}
+
+    wrapper.set_profiler_kwargs(None)
+    assert fake_profiler_factory["kwargs"]["record_shapes"] is True
+    assert fake_profiler_factory["kwargs"]["with_stack"] is True
+
+
+def test_session_profiler_kwargs_do_not_replace_an_active_profiler(wrapper):
+    wrapper._active = True
+    original = wrapper.profiler
+    wrapper.set_profiler_kwargs({"record_shapes": False})
+    assert wrapper.profiler is original
 
 
 def test_set_trace_filename_creates_timestamped_session_dir(wrapper, monkeypatch, tmp_path):

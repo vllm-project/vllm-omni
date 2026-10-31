@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import huggingface_hub
 import vllm.envs as envs
 from omegaconf import OmegaConf
+from vllm.config.profiler import validate_profile_iteration_bounds
 from vllm.exceptions import RetryableRequestError
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
@@ -794,6 +795,10 @@ class OmniBase(PDDisaggregationMixin):
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+        profiler_kwargs: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -802,11 +807,34 @@ class OmniBase(PDDisaggregationMixin):
         Args:
             profile_prefix: Optional prefix for the trace file names.
             stages: List of stage IDs to profile. If None, profiles all stages.
+            delay_iterations: Optional per-session delayed start (vLLM compat).
+            max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
 
         Returns:
             List of results from each stage.
         """
-        return self.engine.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
+        validate_profile_iteration_bounds(delay_iterations, max_iterations)
+        kwargs: dict[str, Any] = {}
+        if delay_iterations is not None:
+            kwargs["delay_iterations"] = delay_iterations
+        if max_iterations is not None:
+            kwargs["max_iterations"] = max_iterations
+        if profiler_kwargs is not None:
+            kwargs["profiler_kwargs"] = profiler_kwargs
+        # Omit kwargs when unset so existing profile RPC call shapes stay stable.
+        if kwargs:
+            return self.engine.collective_rpc(
+                method="profile",
+                args=(True, profile_prefix),
+                kwargs=kwargs,
+                stage_ids=stages,
+            )
+        return self.engine.collective_rpc(
+            method="profile",
+            args=(True, profile_prefix),
+            stage_ids=stages,
+        )
 
     def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         """Stop profiling specified stages.

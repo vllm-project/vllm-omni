@@ -1,5 +1,5 @@
 # Common dependencies for all platforms
-# Match vLLM v0.32.0's supported Transformers range. The release runtime
+# Use the 5.16+ Transformers APIs shared with vLLM v0.33.0. The release runtime
 # uses the 5.16+ model and tokenizer APIs; the former <5.15 cap conflicts.
 # MOSS-TTS-Nano's list/set weight-loading compatibility is handled by
 # transformers_keys_to_ignore_compat in model_executor/models/utils.py.

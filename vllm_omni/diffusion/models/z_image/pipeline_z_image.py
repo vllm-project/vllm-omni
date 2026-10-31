@@ -220,7 +220,11 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             od_config,
             hf_config=text_encoder_config,
         ).to(self._execution_device)
-        if text_encoder_config.tie_word_embeddings:
+        # Online FP8 rewrites lm_head.weight in place (transpose + fp8). Sharing
+        # that storage with the token embedding turns vocab lookup into an OOB
+        # gather. Leave the tied head detached whenever a quant config is set;
+        # prompt encoding reads hidden states, not logits.
+        if text_encoder_config.tie_word_embeddings and not od_config.quantization_config:
             self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
 
         vae_config = DistributedAutoencoderKL.load_config(model, subfolder="vae", local_files_only=local_files_only)
