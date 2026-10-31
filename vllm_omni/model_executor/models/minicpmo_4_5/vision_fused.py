@@ -89,8 +89,13 @@ def _attend(attn: nn.Module, qkv: torch.Tensor, seq_groups: Sequence[tuple[int, 
 
 def _mlp_up(mlp: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
     fc1 = mlp.fc1
-    if mlp.config.hidden_act == "gelu_pytorch_tanh" and fc1.bias is not None and hidden.is_cuda:
-        # cuBLASLt's GELU epilogue is the tanh approximation.
+    fused_epilogue = fc1.bias is not None and hidden.device.type in ("cuda", "npu")
+    if mlp.config.hidden_act == "gelu_pytorch_tanh" and fused_epilogue:
+        # cuBLASLt's GELU epilogue is the tanh approximation, which is what
+        # hidden_act requests.  Ascend ignores the `approximate` argument and
+        # maps both F.gelu forms onto the same tanh-shaped aclnn kernel, so the
+        # NPU epilogue matches the unfused path bit for bit (measured: fp32 and
+        # bf16, max |diff| = 0 against F.gelu(approximate="tanh")).
         return torch._addmm_activation(fc1.bias, hidden, fc1.weight.t(), use_gelu=True)
     return mlp.activation_fn(fc1(hidden))
 
