@@ -5,11 +5,23 @@
 
 import json
 from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@dataclass
+class ServerEndpoint:
+    """Stand-in for the launched Omni server used by ``test_performance_benchmark``."""
+
+    host: str = "localhost"
+    port: int = 8000
+    model: str = "model"
+    judge_base_url: str | None = None
 
 
 def test_task_excluded_from_cli_args():
@@ -823,7 +835,7 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
     # The result contract is covered above; exercise actual CLI assembly here.
     monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
-    server = SimpleNamespace(host="localhost", port=8000, model="model", judge_base_url=judge_url)
+    server = ServerEndpoint(judge_base_url=judge_url)
     case = {
         "test_name": "test_duplex",
         "params": {f"{prefix}_evaluate": True, "num_prompts": [1], "max_concurrency": [1]},
@@ -840,7 +852,6 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
 
 @pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
 def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, hardware, enforce_score_floors):
-    from dataclasses import dataclass
     from pathlib import Path
 
     from tests.dfx.perf.scripts import run_benchmark
@@ -858,13 +869,6 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, har
     assert params["duplex_eval_evaluate"]
     assert params["duplex_eval_score_floor_hardware"] == ["H100", "B200", "A3"]
 
-    @dataclass
-    class ServerEndpoint:
-        host: str = "localhost"
-        port: int = 8000
-        model: str = "openbmb/MiniCPM-o-4_5"
-        judge_base_url: str = "http://localhost:8001"
-
     calls = []
     monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
     monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: hardware)
@@ -875,7 +879,10 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, har
 
     monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
     monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
-    run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
+    run_benchmark.test_performance_benchmark(
+        ServerEndpoint(model="openbmb/MiniCPM-o-4_5", judge_base_url="http://localhost:8001"),
+        {"test_name": config["test_name"], "params": params},
+    )
     assert len(calls) == 1
     call = calls[0]
     parser = TrackingArgumentParser()
@@ -1119,6 +1126,256 @@ def test_omniinteract_aggregate_rejects_pooled_ia_qtf1_below_floor():
             _omniinteract_aggregate_params("1qna", group="fail"),
             4,
         )
+
+
+def test_minicpmo_omniinteract_local_config_uses_c8_and_ephemeral_artifacts():
+    config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omniinteract.json").read_text())[0]
+    assert config["omniinteract_aggregate_min_ia_qtf1"] == 0.2
+    subsets = []
+    for params in config["benchmark_params"]:
+        assert params["max_concurrency"] == [8]
+        assert params["num_prompts"] == [8]
+        assert params["omniinteract_persist_artifacts"] is False
+        assert "omniinteract_output_dir" not in params
+        subsets.append(params["omniinteract_subsets"])
+    assert subsets == ["1q1a", "1q1a_math", "1qna"]
+
+
+def test_omniinteract_run_benchmark_writes_result_acc(tmp_path, monkeypatch):
+    import io
+
+    from tests.dfx import conftest as dfx
+
+    perf_dir = tmp_path / "perf"
+    perf_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    monkeypatch.setenv("BUILDKITE_BRANCH", "acc-branch")
+    payload = {
+        "date": "20261027-120000",
+        "model_id": "openbmb/MiniCPM-o-4_5",
+        "completed": 4,
+        "failed": 0,
+        "num_prompts": 4,
+        "max_concurrency": 8,
+        "omniinteract": {
+            "total": 4,
+            "success": 4,
+            "failed": 0,
+            "artifacts_complete": True,
+            "accuracy": {
+                "status": "ok",
+                "failed": 0,
+                "evaluated": 4,
+                "summary": {
+                    "IA_QTF1": 0.25,
+                    "Precision": 0.5,
+                    "Recall": 0.2,
+                    "Global_TP": 1.0,
+                    "Global_FP": 1,
+                    "Global_FN": 4,
+                },
+            },
+        },
+    }
+
+    class BenchmarkProcess:
+        def __class_getitem__(cls, item):
+            return cls
+
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            path = Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload))
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    result = dfx.run_benchmark(
+        [
+            "--model",
+            "openbmb/MiniCPM-o-4_5",
+            "--dataset-path",
+            "lucky-lance/OmniInteract",
+            "--omniinteract-evaluate",
+            "--omniinteract-subsets",
+            "1q1a",
+            "--max-concurrency",
+            "8",
+        ],
+        test_name="test_minicpmo_4_5_omniinteract",
+        flow=8,
+        dataset_name="omniinteract",
+        num_prompt=4,
+        resource_label="H100",
+        accuracy_baseline={"omniinteract_aggregate_min_ia_qtf1": 0.2},
+    )
+    acc_paths = list(perf_dir.glob("result_acc_*.json"))
+    assert len(acc_paths) == 1
+    assert "omniinteract_1q1a" in acc_paths[0].name
+    saved = json.loads(acc_paths[0].read_text())
+    assert saved["dataset"] == "omniinteract"
+    assert saved["name"] == "1q1a"
+    assert saved["test_name"] == "test_minicpmo_4_5_omniinteract"
+    assert saved["Hardware"] == result["Hardware"]
+    assert saved["accuracy"]["IA_QTF1"] == 0.25
+    assert saved["accuracy"]["status"] == "ok"
+    assert saved["max_concurrency"] == 8
+    assert saved["baseline"] == {"omniinteract_aggregate_min_ia_qtf1": 0.2}
+    assert saved["branch"] == "acc-branch"
+
+
+def test_omniinteract_ephemeral_artifacts_override_output_dir(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    persistent = tmp_path / "should-not-use"
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 4}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")
+    run_benchmark.test_performance_benchmark(
+        server,
+        {
+            "test_name": "test_minicpmo_4_5_omniinteract",
+            "params": {
+                "dataset_name": "omniinteract",
+                "omniinteract_evaluate": True,
+                "omniinteract_persist_artifacts": False,
+                "omniinteract_output_dir": str(persistent),
+                "num_prompts": [4],
+                "max_concurrency": [8],
+            },
+        },
+    )
+    args = calls[0]["args"]
+    assert "--omniinteract-persist-artifacts" not in args
+    output_dir = Path(args[args.index("--omniinteract-output-dir") + 1])
+    assert output_dir != persistent
+    assert not output_dir.exists()
+    assert not persistent.exists()
+
+
+def test_omniinteract_persisted_artifacts_keep_configured_output_dir(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    persistent = tmp_path / "keep"
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 4}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    server = ServerEndpoint(judge_base_url="http://127.0.0.1:8001")
+    run_benchmark.test_performance_benchmark(
+        server,
+        {
+            "test_name": "test_minicpmo_4_5_omniinteract",
+            "params": {
+                "dataset_name": "omniinteract",
+                "omniinteract_evaluate": True,
+                "omniinteract_persist_artifacts": True,
+                "omniinteract_output_dir": str(persistent),
+                "num_prompts": [4],
+                "max_concurrency": [8],
+            },
+        },
+    )
+    args = calls[0]["args"]
+    assert args[args.index("--omniinteract-output-dir") + 1] == str(persistent)
+
+
+def test_omniinteract_aggregate_writes_result_acc(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    runner._reset_omniinteract_aggregate_counts()
+    result = _omniinteract_accuracy_result(tp=6.157502, fp=9, fn=8)
+    result["model_id"] = "openbmb/MiniCPM-o-4_5"
+    result["test_name"] = "test_minicpmo_4_5_omniinteract"
+    result["Hardware"] = "H100"
+    result["date"] = "20261027-120000"
+    result["num_prompts"] = 4
+    result["max_concurrency"] = 8
+    runner.assert_result(result, _omniinteract_aggregate_params("1q1a", group="write-acc"), 4)
+    assert list(tmp_path.glob("result_acc_*omniinteract_aggregate_*.json")) == []
+    runner.assert_result(
+        _omniinteract_accuracy_result(tp=1.133541, fp=2, fn=2),
+        _omniinteract_aggregate_params("1q1a_math", group="write-acc"),
+        4,
+    )
+    last = _omniinteract_accuracy_result(tp=0.0, fp=11, fn=18, ia_qtf1=0.0)
+    for key in ("model_id", "test_name", "Hardware", "date", "num_prompts", "max_concurrency"):
+        last[key] = result[key]
+    runner.assert_result(last, _omniinteract_aggregate_params("1qna", group="write-acc"), 4)
+    written = runner._maybe_write_omniinteract_aggregate_accuracy_result(
+        last,
+        _omniinteract_aggregate_params("1qna", group="write-acc"),
+    )
+    assert written is not None
+    saved = json.loads(written.read_text())
+    assert saved["name"] == "aggregate"
+    assert saved["dataset"] == "omniinteract"
+    assert saved["num_prompts"] == 12
+    assert saved["generation"]["completed"] == 12
+    assert saved["generation"]["failed"] == 0
+    assert saved["generation"]["subsets"] == ["1q1a", "1q1a_math", "1qna"]
+    assert saved["accuracy"]["status"] == "ok"
+    assert saved["benchmark_exit_code"] == 0
+    assert saved["accuracy"]["IA_QTF1"] == runner._ia_qtf1_from_counts(7.291043, 22, 28)
+    assert saved["accuracy"]["Global_TP"] == 7.291043
+    assert saved["max_concurrency"] == 8
+
+
+def test_omniinteract_aggregate_writes_failed_result_acc_when_floor_missed(tmp_path, monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    runner._reset_omniinteract_aggregate_counts()
+    first = _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0)
+    first["model_id"] = "openbmb/MiniCPM-o-4_5"
+    first["test_name"] = "test_minicpmo_4_5_omniinteract"
+    first["Hardware"] = "H100"
+    first["date"] = "20261027-120000"
+    first["max_concurrency"] = 8
+    runner.assert_result(first, _omniinteract_aggregate_params("1q1a", group="write-fail"), 4)
+    runner.assert_result(
+        _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0),
+        _omniinteract_aggregate_params("1q1a_math", group="write-fail"),
+        4,
+    )
+    last = _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0)
+    for key in ("model_id", "test_name", "Hardware", "date", "max_concurrency"):
+        last[key] = first[key]
+    with pytest.raises(AssertionError, match="aggregate All Global IA-QTF1"):
+        runner.assert_result(last, _omniinteract_aggregate_params("1qna", group="write-fail"), 4)
+    written = runner._maybe_write_omniinteract_aggregate_accuracy_result(
+        last,
+        _omniinteract_aggregate_params("1qna", group="write-fail"),
+    )
+    assert written is not None
+    saved = json.loads(written.read_text())
+    assert saved["name"] == "aggregate"
+    assert saved["num_prompts"] == 12
+    assert saved["generation"]["completed"] == 12
+    assert saved["generation"]["failed"] == 0
+    assert saved["accuracy"]["status"] == "failed"
+    assert saved["benchmark_exit_code"] == 1
 
 
 def test_omniinteract_aggregate_rejects_entirely_skipped_subset():

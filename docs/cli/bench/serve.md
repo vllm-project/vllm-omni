@@ -723,11 +723,14 @@ token interval is present within a continuous generation segment. Model-unit pac
 excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
 `response_created_to_first_audio_ms` as client-envelope diagnostics.
 
-The checked-in local performance configuration measures four deterministic cases from `1q1a`, `1q1a_math`, and
-`1qna` (12 videos total), with no benchmark warmups and a maximum concurrency of two. Each subset also sends one readiness request before its
-measured cases. The runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
-(`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to the process). After artifacts land it
-scores All Global IA-QTF1 through that local judge. This is protocol-compatible with the paper metric, not a GPT-4o
+The checked-in local performance configuration measures eight deterministic cases from `1q1a`, `1q1a_math`, and
+`1qna` (24 videos total), with no benchmark warmups and a maximum concurrency of eight. Each subset also sends one readiness request before its
+measured cases. Case WAV, transcript, event, and evaluation artifacts are written to a temporary directory during the
+run and deleted afterwards; they are not kept under `tests/dfx/perf/results/omniinteract/`. The runner starts MiniCPM-o 4.5 on the first visible GPU and a text judge
+(`Qwen/Qwen2.5-7B-Instruct`) on the second (`CUDA_VISIBLE_DEVICES=1` relative to the process). After each subset finishes it
+scores All Global IA-QTF1 through that local judge and writes a `result_acc_*.json` next to the performance
+JSON (`ACC_BENCH_RESULT_DIR`, else `BENCHMARK_DIR`). After all three subsets finish, pooled TP/FP/FN are written as
+`result_acc_*_omniinteract_aggregate_*.json`. This is protocol-compatible with the paper metric, not a GPT-4o
 paper-table score. Run it from the repository root with two visible GPUs:
 
 ```bash
@@ -742,7 +745,7 @@ bash tools/nightly/run_nightly_jobs.sh \
 The first run downloads the pinned OmniInteract archive and the judge weights into `HF_HOME`; later runs reuse that cache.
 
 It requires every case to commit its input, complete any emitted response lifecycles, and publish the expected WAV,
-transcript, event, and result artifacts without errors. A valid LISTEN-only case may have no response audio or transcript
+transcript, event, and result artifacts without errors while the temporary output directory exists. A valid LISTEN-only case may have no response audio or transcript
 chunks. Official-manifest eligibility is reported separately because clipped or cancelled output is a benchmark-quality
 signal, not a transport failure. Accuracy must finish with `status=ok` on every subset. After all three subsets finish,
 All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above

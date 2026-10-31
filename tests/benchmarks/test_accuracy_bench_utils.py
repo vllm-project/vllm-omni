@@ -57,9 +57,14 @@ from tests.e2e.accuracy.helpers import (
     _acc_result_filename,
     _validate_seed_tts,
     _write_accuracy_result_metadata,
+    _DUPLEX_EVAL_DEFAULT_ACC_DIR,
+    dfx_accuracy_result_dir,
+    flatten_omniinteract_accuracy_metrics,
+    omniinteract_accuracy_result_dir,
     parse_acc_benchmark_args,
     seed_tts_eval_env,
     sync_dataset_env_from_ns,
+    write_dfx_accuracy_result,
 )
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
 
@@ -105,6 +110,82 @@ def test_videomme_bench_argv_uses_local_directory(monkeypatch, tmp_path: Path):
 def test_acc_result_filename(model: str, expected: str) -> None:
     when = datetime(2026, 10, 14, 16, 48, 0)
     assert _acc_result_filename(model, "daily_omni", when=when) == expected
+
+
+def test_flatten_omniinteract_accuracy_metrics_lifts_summary_scores() -> None:
+    payload = flatten_omniinteract_accuracy_metrics(
+        {
+            "status": "ok",
+            "summary": {"IA_QTF1": 0.25, "Global_TP": 1.0, "Global_FP": 2, "Global_FN": 3},
+        }
+    )
+    assert payload["status"] == "ok"
+    assert payload["IA_QTF1"] == 0.25
+    assert payload["Global_TP"] == 1.0
+    assert payload["Global_FP"] == 2
+    assert payload["Global_FN"] == 3
+
+
+def test_flatten_omniinteract_accuracy_metrics_keeps_existing_top_level() -> None:
+    payload = flatten_omniinteract_accuracy_metrics(
+        {
+            "status": "ok",
+            "IA_QTF1": 0.9,
+            "summary": {"IA_QTF1": 0.1, "Precision": 0.5},
+        }
+    )
+    assert payload["IA_QTF1"] == 0.9
+    assert payload["Precision"] == 0.5
+
+
+def test_omniinteract_accuracy_result_dir_prefers_acc_then_benchmark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    monkeypatch.delenv("BENCHMARK_DIR", raising=False)
+    assert omniinteract_accuracy_result_dir() == Path("tests/e2e/accuracy/omniinteract/results")
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path / "perf"))
+    assert omniinteract_accuracy_result_dir() == tmp_path / "perf"
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "acc"))
+    assert omniinteract_accuracy_result_dir() == tmp_path / "acc"
+
+
+def test_duplex_eval_accuracy_result_dir_ignores_benchmark_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path / "perf"))
+    assert dfx_accuracy_result_dir(_DUPLEX_EVAL_DEFAULT_ACC_DIR) == _DUPLEX_EVAL_DEFAULT_ACC_DIR
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(tmp_path / "acc"))
+    assert dfx_accuracy_result_dir(_DUPLEX_EVAL_DEFAULT_ACC_DIR) == tmp_path / "acc"
+
+
+def test_write_dfx_accuracy_result_envelope(tmp_path: Path) -> None:
+    path = tmp_path / "result_acc_MiniCPM-o-4_5_omniinteract_20261027_120000.json"
+    write_dfx_accuracy_result(
+        path,
+        test_name="test_minicpmo_4_5_omniinteract",
+        name="1q1a",
+        model_id="openbmb/MiniCPM-o-4_5",
+        dataset="omniinteract",
+        dataset_path="lucky-lance/OmniInteract",
+        date="20261027-120000",
+        hardware="H100",
+        baseline={"omniinteract_aggregate_min_ia_qtf1": 0.2, "unused": None},
+        branch="main",
+        num_prompts=4,
+        max_concurrency=8,
+        benchmark_exit_code=0,
+        generation={"completed": 4, "failed": 0},
+        accuracy={"status": "ok", "IA_QTF1": 0.25},
+    )
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["dataset"] == "omniinteract"
+    assert saved["name"] == "1q1a"
+    assert saved["model_id"] == "openbmb/MiniCPM-o-4_5"
+    assert saved["accuracy"]["IA_QTF1"] == 0.25
+    assert saved["max_concurrency"] == 8
+    assert saved["baseline"] == {"omniinteract_aggregate_min_ia_qtf1": 0.2}
+    assert saved["num_prompts"] == 4
+    assert saved["benchmark_exit_code"] == 0
 
 
 def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
