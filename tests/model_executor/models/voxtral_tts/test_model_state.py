@@ -84,12 +84,12 @@ def test_scheduler_preemption_restores_voxtral_frames_without_cross_request_leak
     from vllm.sampling_params import SamplingParams
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.request import Request, RequestStatus
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 
     from tests.core.sched.test_omni_recompute_preemption import _scheduler
     from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts import (
         VoxtralTTSForConditionalGeneration,
     )
-    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
     from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
 
     class FakeAudioGeneration:
