@@ -1226,6 +1226,12 @@ class DiffusionWorker:
             del weight_transfer_engine
 
         if model_runner is not None:
+            try:
+                release = getattr(model_runner, "release_captured_graphs", None)
+                if callable(release):
+                    release()
+            except Exception:
+                logger.exception("Failed to release diffusion CUDA graphs before communicator shutdown")
             mgr = getattr(model_runner, "kv_transfer_manager", None)
             if mgr is None:
                 mgr = getattr(model_runner, "_kv_transfer_manager", None)

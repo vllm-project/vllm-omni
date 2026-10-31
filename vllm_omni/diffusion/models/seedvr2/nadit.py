@@ -8,7 +8,7 @@ import hashlib
 import math
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from math import ceil, sqrt
 
 import torch
@@ -21,6 +21,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.models.seedvr2 import config as seedvr2_envs
 
 
 def validate_seedvr2_parallel_config(parallel: DiffusionParallelConfig) -> None:
@@ -290,13 +291,44 @@ class NaMMRotaryEmbedding3d(nn.Module):
         # must already match the port's parameter layout.
         self.register_buffer("freqs", lang_freqs(self.axis_dim, theta), persistent=True)
         self._axis_cache: dict[tuple, torch.Tensor] = {}
+        self._frequency_token: tuple | None = None
+        self._frequency_values: tuple[float, ...] | None = None
+        self.register_load_state_dict_post_hook(self._clear_loaded_frequency_cache)
+
+    def clear_frequency_cache(self) -> None:
+        self._axis_cache.clear()
+        self._frequency_token = None
+        self._frequency_values = None
+
+    def _clear_loaded_frequency_cache(self, module: nn.Module, incompatible_keys: object) -> None:
+        self.clear_frequency_cache()
+
+    def _check_frequency_generation(self) -> None:
+        try:
+            version = self.freqs._version
+        except RuntimeError:  # Inference tensors: the checkpoint loader explicitly invalidates.
+            version = None
+        token = (id(self.freqs), version, str(self.freqs.device), self.freqs.dtype)
+        if token != self._frequency_token:
+            self.clear_frequency_cache()
+            self._frequency_token = token
+
+    def frequency_signature(self) -> tuple[int, int, tuple[float, ...]]:
+        self._check_frequency_generation()
+        if self._frequency_values is None:
+            self._frequency_values = tuple(self.freqs.detach().cpu().float().tolist())
+        return self.rot_dim, self.num_axes, self._frequency_values
 
     # -- frequency construction -------------------------------------------
-    def _axis_angles(self, positions: torch.Tensor, *, device, dtype) -> torch.Tensor:
-        key = (positions.numel(), int(positions[0]), float(positions[-1]), str(device), str(dtype))
+    def _axis_angles(self, length: int, *, device, dtype) -> torch.Tensor:
+        self._check_frequency_generation()
+        # All callers use the regular [0, length) axis, known from CPU geometry.
+        # Do not allocate arange on CUDA and read its endpoints back to the host.
+        key = (length, str(device), str(dtype))
         cached = self._axis_cache.get(key)
         if cached is None:
-            cached = _axis_table(positions.to(torch.float32), self.freqs.float()).to(device=device, dtype=dtype)
+            positions = torch.arange(length, device=self.freqs.device, dtype=torch.float32)
+            cached = _axis_table(positions, self.freqs.float()).to(device=device, dtype=dtype)
             if len(self._axis_cache) > 256:
                 self._axis_cache.clear()
             self._axis_cache[key] = cached
@@ -305,10 +337,8 @@ class NaMMRotaryEmbedding3d(nn.Module):
     def _table(self, dims: tuple[int, ...], *, device, dtype) -> torch.Tensor:
         """Axial table of shape ``(*dims, rot_dim)`` (``get_axial_freqs``)."""
         axes = []
-        ref = self.freqs
         for axis, dim in enumerate(dims):
-            positions = torch.arange(dim, device=ref.device, dtype=torch.float32)
-            angles = self._axis_angles(positions, device=device, dtype=dtype)
+            angles = self._axis_angles(dim, device=device, dtype=dtype)
             shape = [1] * len(dims) + [angles.shape[-1]]
             shape[axis] = dim
             axes.append(angles.reshape(shape))
@@ -342,9 +372,7 @@ class NaMMRotaryEmbedding3d(nn.Module):
         """``[text_len, rot_dim]`` text frequencies (one axis repeated ``rope_dim`` times)."""
         if text_len <= 0:
             return torch.empty((0, self.rot_dim), device=device, dtype=dtype)
-        angles = self._axis_angles(
-            torch.arange(text_len, device=self.freqs.device, dtype=torch.float32), device=device, dtype=dtype
-        )
+        angles = self._axis_angles(text_len, device=device, dtype=dtype)
         return angles.repeat(1, self.num_axes)
 
     # -- forward ----------------------------------------------------------
@@ -362,6 +390,67 @@ class NaMMRotaryEmbedding3d(nn.Module):
         txt_q = apply_rotary_emb(txt_freqs, txt_q.transpose(0, 1)).transpose(0, 1)
         txt_k = apply_rotary_emb(txt_freqs, txt_k.transpose(0, 1)).transpose(0, 1)
         return vid_q, vid_k, txt_q, txt_k
+
+
+@dataclass(frozen=True)
+class SeedVR2RotaryTables:
+    video_freqs: torch.Tensor
+    text_freqs: torch.Tensor
+    video_cos: torch.Tensor
+    video_sin: torch.Tensor
+    text_cos: torch.Tensor
+    text_sin: torch.Tensor
+
+
+class SeedVR2RotaryCache:
+    """Bounded, request-owned tables; only equal frequency values share storage."""
+
+    def __init__(self, capacity: int = 8) -> None:
+        if capacity < 1:
+            raise ValueError("Rotary cache capacity must be positive")
+        self.capacity = capacity
+        self.entries: OrderedDict[tuple, SeedVR2RotaryTables] = OrderedDict()
+        self.hits = 0
+        self.builds = 0
+
+    def get(
+        self,
+        rope: NaMMRotaryEmbedding3d,
+        shapes: Sequence[tuple[int, int, int]],
+        text_len: int,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> SeedVR2RotaryTables:
+        shapes = tuple(tuple(int(v) for v in row) for row in shapes)
+        key = (rope.frequency_signature(), shapes, int(text_len), str(device), dtype)
+        tables = self.entries.get(key)
+        if tables is not None:
+            self.entries.move_to_end(key)
+            self.hits += 1
+            return tables
+        video = rope.window_freqs_batch(list(shapes), text_len, device=device, dtype=dtype)
+        text = rope.text_freqs(text_len, device=device, dtype=dtype)
+        tables = SeedVR2RotaryTables(
+            video, text, video.float().cos(), video.float().sin(), text.float().cos(), text.float().sin()
+        )
+        self.entries[key] = tables
+        self.builds += 1
+        if len(self.entries) > self.capacity:
+            self.entries.popitem(last=False)
+        return tables
+
+
+def apply_rotary_emb_cached(cos: torch.Tensor, sin: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    """Same fp32 rotation and cast order as apply_rotary_emb, with cached trig."""
+    rot_dim = cos.shape[-1]
+    if rot_dim > t.shape[-1] or cos.shape[0] < t.shape[-2]:
+        raise ValueError("Cached rotary table does not cover the input")
+    middle = t[..., :rot_dim].float()
+    rotated = middle * cos[-t.shape[-2] :] + rotate_half(middle) * sin[-t.shape[-2] :]
+    if rot_dim == t.shape[-1]:
+        return rotated.to(t.dtype)
+    return torch.cat((rotated, t[..., rot_dim:]), dim=-1).to(t.dtype)
 
 
 #: Bumped whenever assignment or routing semantics change.
@@ -803,10 +892,15 @@ class WindowPlanCache:
     group or device changes.
     """
 
-    def __init__(self, capacity: int = 32) -> None:
+    def __init__(self, capacity: int = 32, max_bytes: int = 128 * 1024 * 1024) -> None:
+        if max_bytes < 0:
+            raise ValueError("CPU plan cache byte budget must be non-negative")
         if capacity < 1:
             raise ValueError(f"capacity must be >= 1, got {capacity}")
         self._capacity = capacity
+        self.max_bytes = max_bytes
+        self.resident_bytes = 0
+        self._order = OrderedDict()
         self._layouts: OrderedDict[WindowLayoutKey, WindowLayout] = OrderedDict()
         self._assignments: OrderedDict[tuple, WindowAssignment] = OrderedDict()
         self._rank_plans: OrderedDict[tuple, RankWindowPlan] = OrderedDict()
@@ -817,12 +911,24 @@ class WindowPlanCache:
     def _touch(self, cache: OrderedDict, key):
         value = cache.pop(key)
         cache[key] = value
+        self._order.move_to_end((id(cache), key))
         return value
 
     def _store(self, cache: OrderedDict, key, value):
+        size = _plan_tensor_bytes(value)
+        if size > self.max_bytes:
+            return value
+        while self._order and self.resident_bytes + size > self.max_bytes:
+            (_, retired_key), (retired_cache, retired_bytes) = self._order.popitem(last=False)
+            retired_cache.pop(retired_key)
+            self.resident_bytes -= retired_bytes
         cache[key] = value
+        self._order[(id(cache), key)] = (cache, size)
+        self.resident_bytes += size
         while len(cache) > self._capacity:
-            cache.popitem(last=False)
+            retired_key, _ = cache.popitem(last=False)
+            _, retired_bytes = self._order.pop((id(cache), retired_key))
+            self.resident_bytes -= retired_bytes
         return value
 
     def clear(self) -> None:
@@ -830,6 +936,8 @@ class WindowPlanCache:
         self._assignments.clear()
         self._rank_plans.clear()
         self._routes.clear()
+        self._order.clear()
+        self.resident_bytes = 0
 
     def layout(self, token_grid, window_method, window=DEFAULT_WINDOW, geometry_version=GEOMETRY_VERSION):
         key = (tuple(token_grid), window_method, tuple(window), int(geometry_version))
@@ -892,11 +1000,80 @@ class WindowPlanCache:
 # =============================================================================
 
 
+def _plan_device(device: torch.device | str) -> torch.device:
+    device = torch.device(device)
+    # "cuda" follows the current device; it is not a stable cache identity.
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.accelerator.current_device_index())
+    return device
+
+
+def _plan_tensor_bytes(value) -> int:
+    """Count unique retained tensor storages, including views, without GPU reads."""
+    storages = {}
+
+    def visit(item):
+        if isinstance(item, torch.Tensor):
+            storage = item.untyped_storage()
+            storages[(str(item.device), storage.data_ptr())] = storage.nbytes()
+        elif is_dataclass(item):
+            for descriptor in fields(item):
+                visit(getattr(item, descriptor.name))
+        elif isinstance(item, (tuple, list)):
+            for part in item:
+                visit(part)
+
+    visit(value)
+    return sum(storages.values())
+
+
+class DeviceWindowPlanCache:
+    """Model-owned, byte-bounded read-only indices. No activations or groups.
+
+    An evicted plan stays alive while a request holds its tensors. This bounds
+    cache residency, not memory held by active consumers or CUDA graph pools.
+    Callers must never mutate cached tensors or put live request state here.
+    """
+
+    def __init__(self, max_bytes: int = 64 * 1024 * 1024, capacity: int = 128):
+        if capacity < 1:
+            raise ValueError("plan cache capacity must be positive")
+        self.capacity = capacity
+        if max_bytes < 0:
+            raise ValueError("plan cache byte budget must be non-negative")
+        self.max_bytes = max_bytes
+        self.resident_bytes = 0
+        self.entries = OrderedDict()
+        self.hits = 0
+        self.builds = 0
+
+    def clear(self):
+        self.entries.clear()
+        self.resident_bytes = 0
+
+    def get(self, key, build):
+        if key in self.entries:
+            self.hits += 1
+            self.entries.move_to_end(key)
+            return self.entries[key][0]
+        value = build()
+        self.builds += 1
+        size = _plan_tensor_bytes(value)
+        if size > self.max_bytes:
+            return value
+        while self.entries and (self.resident_bytes + size > self.max_bytes or len(self.entries) >= self.capacity):
+            _, (_, retired_bytes) = self.entries.popitem(last=False)
+            self.resident_bytes -= retired_bytes
+        self.entries[key] = (value, size)
+        self.resident_bytes += size
+        return value
+
+
 def materialize_redistribution_plan(
     plan: WindowRedistributionPlan, *, device: torch.device | str
 ) -> DeviceWindowRedistributionPlan:
     """Move one CPU redistribution plan to the device (index tensors only)."""
-    device = torch.device(device)
+    device = _plan_device(device)
     return DeviceWindowRedistributionPlan(
         send_indices=plan.send_indices.to(device=device, dtype=torch.int64, non_blocking=True),
         recv_to_dst_indices=plan.recv_to_dst_indices.to(device=device, dtype=torch.int64, non_blocking=True),
@@ -1042,6 +1219,7 @@ class WindowLayoutManager:
         num_layers: int = 32,
         cache: WindowPlanCache | None = None,
         planner_version: int = PLANNER_VERSION,
+        device_cache: DeviceWindowPlanCache | None = None,
     ) -> None:
         if group is not None and world_size != dist.get_world_size(group):
             raise ValueError(
@@ -1061,6 +1239,7 @@ class WindowLayoutManager:
         self.planner_version = int(planner_version)
         self.cache = shared_plan_cache() if cache is None else cache
         self.transitions = 0
+        self.device_cache = device_cache
         self._device: torch.device | None = None
         self._device_plans: dict[tuple[WindowLayoutKey, WindowLayoutKey], DeviceWindowRedistributionPlan] = {}
 
@@ -1097,7 +1276,20 @@ class WindowLayoutManager:
             src_assignment = self.assignment(src_layout)
             dst_assignment = self.assignment(dst_layout)
             routes = self.cache.route(src_layout, src_assignment, dst_layout, dst_assignment)
-            plan = materialize_redistribution_plan(routes[self.rank], device=self.device)
+
+            def build():
+                return materialize_redistribution_plan(routes[self.rank], device=self.device)
+
+            cache_key = (
+                "route",
+                src_layout.key,
+                dst_layout.key,
+                self.world_size,
+                self.rank,
+                self.planner_version,
+                str(self.device),
+            )
+            plan = build() if self.device_cache is None else self.device_cache.get(cache_key, build)
             self._device_plans[key] = plan
         return plan
 
@@ -1108,7 +1300,7 @@ class WindowLayoutManager:
         return self._device
 
     def set_device(self, device: torch.device | str) -> None:
-        device = torch.device(device)
+        device = _plan_device(device)
         if self._device != device:
             self._device = device
             self._device_plans.clear()
@@ -1131,7 +1323,10 @@ class WindowLayoutManager:
         )
         plan = self.device_plan(src_layout, dst_layout)
         if not plan.network_exchange_required and plan.send_indices.numel() == hidden.shape[0]:
-            if torch.equal(plan.send_indices, torch.arange(hidden.shape[0], device=hidden.device)):
+            cpu_plan = self.cache.route(
+                src_layout, self.assignment(src_layout), dst_layout, self.assignment(dst_layout)
+            )[self.rank]
+            if torch.equal(cpu_plan.send_indices, torch.arange(hidden.shape[0])):
                 return hidden
         self.transitions += 1
         return redistribute_window_rows(hidden, plan, group=self.group)
@@ -1151,6 +1346,11 @@ class LocalWindowContext:
     text_len: int
     local_windows: int
     global_windows: int
+    cache_enabled: bool = True
+    cpu_window_shapes: tuple[tuple[int, int, int], ...] | None = None
+    cpu_joint_offsets: tuple[int, ...] | None = None
+    sdpa_groups: tuple[tuple[int, int, torch.Tensor], ...] | None = None
+    rotary_cache: SeedVR2RotaryCache = field(default_factory=SeedVR2RotaryCache, repr=False)
 
     @property
     def num_video_tokens(self) -> int:
@@ -1166,6 +1366,8 @@ class LocalWindowContext:
 
     @property
     def max_joint_len(self) -> int:
+        if self.cpu_joint_offsets is not None:
+            return max((b - a for a, b in zip(self.cpu_joint_offsets, self.cpu_joint_offsets[1:])), default=0)
         return int(self.joint_lengths.max()) if self.local_windows else 0
 
 
@@ -1177,54 +1379,61 @@ def build_local_window_context(
     device: torch.device | str,
 ) -> LocalWindowContext:
     """Build the device-local attention metadata for one rank and one layout."""
-    device = torch.device(device)
-    window_shapes = rank_plan.window_shapes.to(device=device, dtype=torch.int64, non_blocking=True)
-    video_cu_seqlens = rank_plan.video_cu_seqlens.to(device=device, non_blocking=True)
-    num_windows = int(window_shapes.shape[0])
-    num_video = int(rank_plan.global_token_ids.numel())
+    # Planner tensors live on the CPU. Validate and construct *all* indices
+    # there, then materialize once; int(cuda_tensor) here serializes each window.
+    device = _plan_device(device)
+    if rank_plan.video_cu_seqlens.device.type != "cpu" or rank_plan.window_shapes.device.type != "cpu":
+        raise ValueError("window context preparation requires CPU planner metadata")
+    video_cu = rank_plan.video_cu_seqlens
+    joint_cu = joint_cu_seqlens(video_cu, text_len)
+    video_offsets = tuple(int(v) for v in video_cu.tolist())
+    joint_offsets = tuple(int(v) for v in joint_cu.tolist())
+    num_windows = rank_plan.num_local_windows
+    num_video = rank_plan.num_local_tokens
+    if video_offsets[-1] != num_video:
+        raise ValueError("window offsets do not cover the rank's video rows")
+    joint_pieces, vid_pieces, txt_pieces = [], [], []
+    text_ids = torch.arange(num_video, num_video + text_len, dtype=torch.int64)
+    for index, (start, end) in enumerate(zip(video_offsets, video_offsets[1:])):
+        count = end - start
+        base = joint_offsets[index]
+        joint_pieces.extend((torch.arange(start, end, dtype=torch.int64), text_ids))
+        vid_pieces.append(torch.arange(base, base + count, dtype=torch.int64))
+        txt_pieces.append(torch.arange(base + count, joint_offsets[index + 1], dtype=torch.int64))
 
-    if num_windows:
-        lengths = (video_cu_seqlens[1:] - video_cu_seqlens[:-1]).to(torch.int64)
-        # The joint offsets come from the shared helper; the packing and unpacking
-        # indices below are derived from exactly the same values.
-        joint_cu = joint_cu_seqlens(video_cu_seqlens, text_len)
-        window_joint_lengths = lengths + int(text_len)
-        joint_offsets = torch.cumsum(window_joint_lengths, dim=0)
-        base = joint_offsets - window_joint_lengths
-        joint_pieces = []
-        vid_pieces = []
-        txt_pieces = []
-        text_range = torch.arange(int(text_len), dtype=torch.int64, device=device)
-        for index in range(num_windows):
-            start = int(video_cu_seqlens[index])
-            count = int(lengths[index])
-            window_base = int(base[index])
-            text_base = window_base + count
-            joint_pieces.append(torch.arange(start, start + count, dtype=torch.int64, device=device))
-            joint_pieces.append(torch.arange(num_video, num_video + int(text_len), dtype=torch.int64, device=device))
-            vid_pieces.append(torch.arange(window_base, window_base + count, dtype=torch.int64, device=device))
-            txt_pieces.append(text_range + text_base)
-        joint_order = torch.cat(joint_pieces)
-        vid_src = torch.cat(vid_pieces) if vid_pieces else torch.empty(0, dtype=torch.int64, device=device)
-        txt_src = torch.cat(txt_pieces) if txt_pieces else torch.empty(0, dtype=torch.int64, device=device)
-    else:
-        # Empty rank: the same helper must produce a device-local int32 ``[0]``.
-        joint_cu = joint_cu_seqlens(video_cu_seqlens, text_len)
-        joint_order = torch.empty(0, dtype=torch.int64, device=device)
-        vid_src = torch.empty(0, dtype=torch.int64, device=device)
-        txt_src = torch.empty(0, dtype=torch.int64, device=device)
+    def materialize(pieces):
+        tensor = torch.cat(pieces) if pieces else torch.empty(0, dtype=torch.int64)
+        return tensor.to(device=device, non_blocking=True)
 
+    lengths = [b - a for a, b in zip(joint_offsets, joint_offsets[1:])]
+    groups = tuple(
+        (
+            length,
+            lengths.count(length),
+            materialize(
+                [
+                    torch.arange(joint_offsets[i], joint_offsets[i + 1], dtype=torch.int64)
+                    for i, size in enumerate(lengths)
+                    if size == length
+                ]
+            ),
+        )
+        for length in sorted(set(lengths))
+    )
     return LocalWindowContext(
         layout_key=rank_plan.layout_key,
-        window_shapes=window_shapes,
-        video_cu_seqlens=video_cu_seqlens,
-        joint_cu_seqlens=joint_cu,
-        joint_order=joint_order,
-        vid_src=vid_src,
-        txt_src=txt_src,
+        window_shapes=rank_plan.window_shapes.to(device=device, non_blocking=True),
+        video_cu_seqlens=video_cu.to(device=device, non_blocking=True),
+        joint_cu_seqlens=joint_cu.to(device=device, non_blocking=True),
+        joint_order=materialize(joint_pieces),
+        vid_src=materialize(vid_pieces),
+        txt_src=materialize(txt_pieces),
         text_len=int(text_len),
         local_windows=num_windows,
         global_windows=int(global_windows),
+        cpu_window_shapes=tuple(tuple(int(v) for v in row) for row in rank_plan.window_shapes.tolist()),
+        cpu_joint_offsets=joint_offsets,
+        sdpa_groups=groups,
     )
 
 
@@ -1262,6 +1471,7 @@ class SeedVR2WindowRuntime:
         methods: tuple[str, ...] = DEFAULT_WINDOW_METHODS,
         num_layers: int = 32,
         planner_version: int = PLANNER_VERSION,
+        device_cache: DeviceWindowPlanCache | None = None,
     ) -> None:
         self.text_len = int(text_len)
         self.world_size = int(world_size)
@@ -1277,6 +1487,7 @@ class SeedVR2WindowRuntime:
             methods=methods,
             num_layers=num_layers,
             planner_version=planner_version,
+            device_cache=device_cache,
         )
         self._contexts: dict[WindowLayoutKey, LocalWindowContext] = {}
         self.stats: dict[str, int] = {
@@ -1293,15 +1504,36 @@ class SeedVR2WindowRuntime:
         return self.manager.layer_layout(layer_index)
 
     def context(self, layout: WindowLayout, device: torch.device | str) -> LocalWindowContext:
+        device = _plan_device(device)
         ctx = self._contexts.get(layout.key)
         if ctx is None or ctx.joint_order.device != torch.device(device):
             rank_plan = self.manager.rank_plan(layout)
-            ctx = build_local_window_context(
-                rank_plan,
-                text_len=self.text_len,
-                global_windows=layout.num_windows,
-                device=device,
+
+            def build():
+                prepared = build_local_window_context(
+                    rank_plan, text_len=self.text_len, global_windows=layout.num_windows, device=device
+                )
+                # Only immutable metadata is shared; rotary caches and all
+                # request runtime state remain owned by the fresh context.
+                return tuple(
+                    (item.name, getattr(prepared, item.name))
+                    for item in fields(prepared)
+                    if item.name not in ("cache_enabled", "rotary_cache")
+                )
+
+            cache_key = (
+                "attention",
+                layout.key,
+                self.world_size,
+                self.rank,
+                self.manager.planner_version,
+                self.text_len,
+                str(torch.device(device)),
             )
+            cache = self.manager.device_cache
+            metadata = build() if cache is None else cache.get(cache_key, build)
+            ctx = LocalWindowContext(**dict(metadata))
+            ctx.cache_enabled = seedvr2_envs.VLLM_OMNI_SEEDVR2_DIT_CACHE
             self._contexts[layout.key] = ctx
         return ctx
 
@@ -1309,22 +1541,37 @@ class SeedVR2WindowRuntime:
     def local_rows_for(self, canonical_rows: torch.Tensor, layout: WindowLayout) -> torch.Tensor:
         """Select this rank's rows of a canonical ``[N, C]`` tensor."""
         rank_plan = self.manager.rank_plan(layout)
-        ids = rank_plan.global_token_ids.to(canonical_rows.device)
+        ids = self._canonical_ids(rank_plan, canonical_rows.device)
         return canonical_rows.index_select(0, ids)
+
+    def _canonical_ids(self, rank_plan: RankWindowPlan, device: torch.device):
+        def build():
+            return rank_plan.global_token_ids.to(device)
+
+        key = (
+            "canonical",
+            rank_plan.layout_key,
+            self.world_size,
+            rank_plan.rank,
+            self.manager.planner_version,
+            str(device),
+        )
+        cache = self.manager.device_cache
+        return build() if cache is None else cache.get(key, build)
 
     def to_canonical_rows(self, local_rows: torch.Tensor, layout: WindowLayout) -> torch.Tensor:
         """Gather every rank's rows back into canonical token order (all ranks)."""
         rank_plan = self.manager.rank_plan(layout)
-        local_ids = rank_plan.global_token_ids
         num_tokens = layout.num_tokens
         if self.world_size == 1 or self.group is None:
             out = torch.empty((num_tokens,) + local_rows.shape[1:], dtype=local_rows.dtype, device=local_rows.device)
-            return out.index_copy(0, local_ids.to(local_rows.device), local_rows)
+            return out.index_copy(0, self._canonical_ids(rank_plan, local_rows.device), local_rows)
 
-        counts = torch.tensor([int(local_ids.numel())], dtype=torch.int64, device=local_rows.device)
-        all_counts = [torch.zeros_like(counts) for _ in range(self.world_size)]
-        dist.all_gather(all_counts, counts, group=self.group)
-        sizes = [int(c) for c in all_counts]
+        # The deterministic CPU assignment already describes every rank.
+        # Only the video rows need communication, not their known sizes.
+        sizes = self.manager.assignment(layout).rank_token_counts
+        if local_rows.shape[0] != sizes[self.rank]:
+            raise ValueError("local video row count does not match the window assignment")
         max_rows = max(sizes) if sizes else 0
         padded = torch.zeros((max_rows,) + local_rows.shape[1:], dtype=local_rows.dtype, device=local_rows.device)
         if local_rows.shape[0]:
@@ -1336,7 +1583,7 @@ class SeedVR2WindowRuntime:
         for source, rows in enumerate(gathered):
             if sizes[source] == 0:
                 continue
-            ids = self.manager.rank_plan_for(layout, source).global_token_ids.to(local_rows.device)
+            ids = self._canonical_ids(self.manager.rank_plan_for(layout, source), local_rows.device)
             out.index_copy_(0, ids, rows[: sizes[source]])
         return out
 
@@ -1620,6 +1867,29 @@ def grouped_window_sdpa(
     """
     if ctx.local_windows == 0:
         return torch.empty_like(q)
+    if ctx.cache_enabled:
+        if ctx.sdpa_groups is None:
+            # Normal runtime uses CPU planner metadata, avoiding device-to-host reads.
+            offsets = ctx.cpu_joint_offsets
+            if offsets is None:
+                offsets = tuple(ctx.joint_cu_seqlens.cpu().tolist())
+            lengths = [end - start for start, end in zip(offsets, offsets[1:])]
+            groups = []
+            for length in sorted(set(lengths)):
+                ids = [i for i, size in enumerate(lengths) if size == length]
+                rows = torch.cat([torch.arange(offsets[i], offsets[i] + length, dtype=torch.int64) for i in ids]).to(
+                    device=q.device
+                )
+                groups.append((length, len(ids), rows))
+            ctx.sdpa_groups = tuple(groups)
+        out = torch.empty_like(q)
+        for length, num, rows in ctx.sdpa_groups:
+            qq = q.index_select(0, rows).view(num, length, q.shape[1], q.shape[2]).transpose(1, 2)
+            kk = k.index_select(0, rows).view(num, length, k.shape[1], k.shape[2]).transpose(1, 2)
+            vv = v.index_select(0, rows).view(num, length, v.shape[1], v.shape[2]).transpose(1, 2)
+            attended = F.scaled_dot_product_attention(qq, kk, vv, scale=softmax_scale)
+            out.index_copy_(0, rows, attended.transpose(1, 2).reshape(-1, q.shape[1], q.shape[2]))
+        return out
     lengths = ctx.joint_lengths
     offsets = ctx.joint_cu_seqlens.to(torch.int64)
     out = torch.empty_like(q)
@@ -1712,6 +1982,20 @@ class NaSwinAttention(nn.Module):
 
     def _apply_rope(self, vid_q, vid_k, txt_q, txt_k, ctx: LocalWindowContext):
         device = vid_q.device
+        if ctx.cache_enabled:
+            if ctx.cpu_window_shapes is None:
+                ctx.cpu_window_shapes = tuple(tuple(int(v) for v in row) for row in ctx.window_shapes.cpu().tolist())
+            tables = ctx.rotary_cache.get(
+                self.rope, ctx.cpu_window_shapes, ctx.text_len, device=device, dtype=torch.float32
+            )
+            if tables.video_freqs.shape[0] != vid_q.shape[0]:
+                raise ValueError("Cached window RoPE does not cover video rows")
+            return (
+                apply_rotary_emb_cached(tables.video_cos, tables.video_sin, vid_q.transpose(0, 1)).transpose(0, 1),
+                apply_rotary_emb_cached(tables.video_cos, tables.video_sin, vid_k.transpose(0, 1)).transpose(0, 1),
+                apply_rotary_emb_cached(tables.text_cos, tables.text_sin, txt_q.transpose(0, 1)).transpose(0, 1),
+                apply_rotary_emb_cached(tables.text_cos, tables.text_sin, txt_k.transpose(0, 1)).transpose(0, 1),
+            )
         vid_freqs = self.rope.window_freqs_batch(ctx.window_shapes, ctx.text_len, device=device, dtype=torch.float32)
         txt_freqs = self.rope.text_freqs(ctx.text_len, device=device, dtype=torch.float32)
         if vid_freqs.shape[0] != vid_q.shape[0]:
@@ -1920,6 +2204,8 @@ class SeedVR2NaDiT(nn.Module):
         self.num_layers = int(num_layers)
         self.window = tuple(int(v) for v in window)
         self.window_method = tuple(window_method)
+        self.device_plan_cache = DeviceWindowPlanCache()
+        self.core_graphs = None
 
         self.vid_in = _NaPatchIn(in_channels=vid_in_channels, patch_size=self.patch_size, dim=vid_dim)
         self.txt_in = nn.Linear(txt_in_dim, txt_dim) if txt_in_dim != txt_dim else nn.Identity()
@@ -1950,6 +2236,20 @@ class SeedVR2NaDiT(nn.Module):
         self.vid_out_ada = OutAda(vid_dim)
         self.vid_out = _NaPatchOut(out_channels=vid_out_channels, patch_size=self.patch_size, dim=vid_dim)
 
+    def _apply(self, fn, recurse=True):
+        self.release_captured_graphs()
+        self.device_plan_cache.clear()
+        return super()._apply(fn, recurse=recurse)
+
+    def release_captured_graphs(self):
+        if self.core_graphs is not None:
+            self.core_graphs.close()
+            self.core_graphs = None
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        self.release_captured_graphs()
+        return super()._load_from_state_dict(*args, **kwargs)
+
     # -- runtime -----------------------------------------------------------
     def build_runtime(
         self,
@@ -1977,10 +2277,20 @@ class SeedVR2NaDiT(nn.Module):
             window=self.window,
             methods=self.window_method,
             num_layers=self.num_layers,
+            device_cache=self.device_plan_cache,
         )
 
-    def token_grid_for(self, vid_shape: torch.Tensor) -> tuple[int, int, int]:
-        frames, height, width = (int(v) for v in vid_shape[0].tolist())
+    @staticmethod
+    def latent_geometry(vid_shape: torch.Tensor | tuple[int, int, int]) -> tuple[int, int, int]:
+        # Tensor callers remain supported; the serving pipeline passes known CPU
+        # geometry so no device metadata read is needed in its hot path.
+        values = vid_shape[0].tolist() if isinstance(vid_shape, torch.Tensor) else vid_shape
+        if len(values) != 3 or any(int(v) <= 0 for v in values):
+            raise ValueError("latent geometry must contain three positive dimensions")
+        return tuple(int(v) for v in values)
+
+    def token_grid_for(self, vid_shape: torch.Tensor | tuple[int, int, int]) -> tuple[int, int, int]:
+        frames, height, width = self.latent_geometry(vid_shape)
         t, h, w = self.patch_size
         if t > 1 and frames % t != 1:
             raise ValueError(f"frame count {frames} must satisfy frames % {t} == 1")
@@ -1991,7 +2301,7 @@ class SeedVR2NaDiT(nn.Module):
         self,
         vid: torch.Tensor,
         txt: torch.Tensor,
-        vid_shape: torch.Tensor,
+        vid_shape: torch.Tensor | tuple[int, int, int],
         txt_shape: torch.Tensor,
         timestep,
         runtime: SeedVR2WindowRuntime | None = None,
@@ -2005,8 +2315,8 @@ class SeedVR2NaDiT(nn.Module):
         same planner, so a regular -> shifted transition still permutes rows.
         """
         weight = next(self.vid_in.parameters())
-        frames, height, width = (int(v) for v in vid_shape[0].tolist())
-        token_grid = self.token_grid_for(vid_shape)
+        frames, height, width = self.latent_geometry(vid_shape)
+        token_grid = self.token_grid_for((frames, height, width))
 
         txt_tokens = self.txt_in(txt.to(weight.dtype))
         text_len = int(txt_tokens.shape[0])
@@ -2019,10 +2329,32 @@ class SeedVR2NaDiT(nn.Module):
 
         first_layout = runtime.layout_for_layer(0)
         local_rows = runtime.local_rows_for(canonical_rows, first_layout)
+        entry = getattr(runtime, "_seedvr2_core_graph_entry", None)
+        if entry is None:
+            vid_hidden = self.forward_core(local_rows, txt_tokens, timestep, runtime)
+        else:
+            vid_hidden = self.core_graphs.replay(entry, (local_rows, txt_tokens, timestep), runtime)
+        vid_hidden = runtime.to_canonical_rows(vid_hidden, runtime.layout_for_layer(self.num_layers - 1))
+        return NaDiTOutput(vid_sample=unpatchify(vid_hidden, token_grid, self.patch_size))
+
+    def forward_core(
+        self,
+        local_rows: torch.Tensor,
+        txt_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+        runtime: SeedVR2WindowRuntime,
+    ) -> torch.Tensor:
+        """Project rank-local input, execute all blocks, and project local output.
+
+        Text input projection, patchify/row selection and final canonical
+        reconstruction remain in ``forward``. This boundary does not enable
+        CUDA graphs or change request ownership: callers own the runtime and
+        must keep every rank's collective order consistent.
+        """
         vid_hidden = self.vid_in.proj(local_rows)
         emb = self.emb_in(timestep, device=vid_hidden.device, dtype=vid_hidden.dtype)
 
-        current = first_layout.key
+        current = runtime.layout_for_layer(0).key
         for index, block in enumerate(self.blocks):
             layout = runtime.layout_for_layer(index)
             vid_hidden = runtime.ensure_layout(vid_hidden, current, layout.key)
@@ -2030,9 +2362,7 @@ class SeedVR2NaDiT(nn.Module):
             ctx = runtime.context(layout, vid_hidden.device)
             vid_hidden, txt_tokens = block(vid_hidden, txt_tokens, emb, ctx, runtime)
 
-        vid_hidden = self._output_projection(vid_hidden, emb)
-        vid_hidden = runtime.to_canonical_rows(vid_hidden, runtime.layout_for_layer(self.num_layers - 1))
-        return NaDiTOutput(vid_sample=unpatchify(vid_hidden, token_grid, self.patch_size))
+        return self._output_projection(vid_hidden, emb)
 
     # -- attention path reporting -----------------------------------------
     def attention_path_summary(self) -> dict:
