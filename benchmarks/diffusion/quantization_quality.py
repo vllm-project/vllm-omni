@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Benchmark quantization quality loss for diffusion models (image & video).
@@ -62,6 +62,7 @@ Output directory structure (--output-dir, default: ./quant_bench_output):
 
 import argparse
 import gc
+import json
 import time
 from pathlib import Path
 
@@ -150,7 +151,7 @@ def _build_omni_kwargs(args, quantization=None):
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
     }
-    if quantization:
+    if quantization is not None:
         kwargs["quantization_config"] = quantization
     return kwargs
 
@@ -265,9 +266,9 @@ def run_benchmark(args):
     seed = args.seed
 
     # Determine configs to benchmark
-    configs = []  # list of (label, quantization_method)
-    for method in args.quantization:
-        configs.append((method, method))
+    configs = [(method, method) for method in args.quantization]
+    if args.quantization_config is not None:
+        configs.append(("component", args.quantization_config))
 
     # --- Baseline run ---
     print("\n" + "=" * 60)
@@ -435,6 +436,13 @@ def run_benchmark(args):
         print(f"Quantized outputs in {qt_dir}")
 
 
+def _parse_quantization_config(value: str) -> dict[str, object]:
+    config = json.loads(value)
+    if not isinstance(config, dict) or not config:
+        raise argparse.ArgumentTypeError("quantization config must be a non-empty JSON object")
+    return config
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Benchmark quantization quality loss for diffusion models.",
@@ -447,11 +455,17 @@ def parse_args():
         choices=["t2i", "t2v"],
         help="Task type: t2i (text-to-image) or t2v (text-to-video).",
     )
-    parser.add_argument(
+    quantization_group = parser.add_mutually_exclusive_group(required=True)
+    quantization_group.add_argument(
         "--quantization",
         nargs="+",
-        required=True,
+        default=[],
         help="One or more quantization methods to benchmark (e.g. fp8 int8 bitsandbytes).",
+    )
+    quantization_group.add_argument(
+        "--quantization-config",
+        type=_parse_quantization_config,
+        help="JSON quantization config, including per-component quantization.",
     )
     parser.add_argument(
         "--prompts",
