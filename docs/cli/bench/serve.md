@@ -1090,6 +1090,33 @@ Use the same pattern with `--endpoint /v1/images/edits` or `--endpoint /v1/video
 - `video_rtf = video_generation_time_ms / 1000 / video_duration`, where `video_generation_time_ms` comes from response `stage_durations` (or `inference_time_s` as fallback)
 - If generation time is missing, falls back to `e2el / video_duration` (this fallback *does* include poll overhead)
 
+#### Diffusion generation flags
+
+Instead of setting `--endpoint` plus a hand-written `--extra-body`, diffusion runs can select the task and generation parameters directly:
+
+```bash
+vllm bench serve --omni \
+  --diffusion-task t2i \
+  --width 1024 --height 1024 \
+  --num-inference-steps 20 \
+  --model ~/models/Qwen/Qwen-Image \
+  --num-prompts 10
+```
+
+- `--diffusion-task` auto-maps to the endpoint: `t2i` -> `/v1/images/generations`, `i2i` -> `/v1/images/edits`, `t2v`/`i2v` -> `/v1/videos`. An explicit `--endpoint` wins over the mapping. Note that `i2i` keeps the image-edits path, where these generation flags do not apply (edit requests carry their own parameters).
+- `--width`, `--height`, `--num-inference-steps`, `--num-frames`, and `--fps` (video) are merged into each request body. They take precedence over the same keys passed via `--extra-body`; keys only present in `--extra-body` are kept.
+- `--diffusion-dataset` selects the prompt source: `random` (synthetic prompts, default), `vbench` (downloads VBench t2v prompts), or `custom` (reads `--dataset-path` JSONL, one `{"prompt": ...}` object per line).
+- `--random-request-config` accepts a JSON array of weighted profiles; each request samples one profile and its keys become per-request overrides. Example:
+
+```bash
+  --random-request-config '[
+    {"width": 512,  "height": 512, "num_inference_steps": 4},
+    {"width": 1024, "height": 768, "num_inference_steps": 8, "weight": 2.0}
+  ]'
+```
+
+`weight` defaults to `1.0`; other keys (e.g. `prompt`) are optional.
+
 ### Multi-Stage Benchmark
 
 <details class="admonition abstract" markdown="1">
