@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Functional tests for pydub removal.
 
 Verifies that the new av/numpy/torchaudio replacements produce
@@ -137,11 +140,10 @@ def test_tts_pcm_export_non_wav_path():
 
 
 def test_media_merge_and_export():
-    """media.py: _merge_base64_audio_to_segment decode + concat + export WAV."""
-    chunks_b64 = []
-    for dur in [0.5, 0.3]:
-        wav_bytes, _, _ = _make_wav_bytes(sample_rate=16000, channels=1, sample_width=2, duration_sec=dur)
-        chunks_b64.append(base64.b64encode(wav_bytes).decode())
+    """Merge a WAV header + PCM stream, then export the complete waveform."""
+    wav_bytes, pcm_bytes, _ = _make_wav_bytes(sample_rate=16000, channels=1, sample_width=2, duration_sec=0.8)
+    split = len(wav_bytes) - len(pcm_bytes) + 16000  # First 0.5 seconds of PCM16.
+    chunks_b64 = [base64.b64encode(chunk).decode() for chunk in (wav_bytes[:split], wav_bytes[split:])]
 
     merged = _merge_base64_audio_to_segment(chunks_b64)
 

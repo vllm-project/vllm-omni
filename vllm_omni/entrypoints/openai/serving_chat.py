@@ -123,7 +123,7 @@ from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, create_wav_header
 from vllm_omni.entrypoints.openai.image_api_utils import (
     encode_image_base64_with_compression,
     validate_layered_layers,
@@ -1625,6 +1625,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         modality_finished: list[set[str]] = [set() for _ in range(num_choices)]
         modality_seen: list[set[str]] = [set() for _ in range(num_choices)]
         stop_reason_emitted: list[bool] = [False] * num_choices
+        wav_header_sent: set[int] = set()
         # Preserve text truncation until the final audio/terminal event.
         text_limit_reached = [False] * num_choices
         num_prompt_tokens = 0
@@ -2326,7 +2327,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
 
                     role = self.get_chat_request_role(request)
-                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
+                    choices_data, header_emitted_indices = self._create_audio_choice(
+                        omni_res,
+                        role,
+                        request,
+                        stream=True,
+                        wav_header_sent=wav_header_sent,
+                    )
                     if isinstance(choices_data, ErrorResponse):
                         logger.error(
                             "Skipping audio chunk for request %s: %s",
@@ -2334,6 +2341,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices_data.error.message,
                         )
                         continue
+                    wav_header_sent.update(header_emitted_indices)
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2619,7 +2627,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                     ]
             elif omni_outputs.final_output_type == "audio":
-                audio_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                audio_data, _ = self._create_audio_choice(omni_outputs, role, request, stream=False)
                 if isinstance(audio_data, ErrorResponse):
                     return audio_data
                 pending_audio_choices.extend(audio_data)
@@ -2989,115 +2997,163 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return choices
 
     def _create_audio_choice(
-        self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
-    ) -> list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse:
+        self,
+        omni_outputs: OmniRequestOutput,
+        role: str,
+        request: ChatCompletionRequest,
+        stream: bool = False,
+        wav_header_sent: set[int] | None = None,
+    ) -> tuple[
+        list[ChatCompletionResponseChoice] | list[ChatCompletionResponseStreamChoice] | ErrorResponse,
+        set[int],
+    ]:
+        """Encode each audio choice and report the indices whose WAV header was emitted."""
         choices: list[ChatCompletionResponseChoice] = []
-        final_res = omni_outputs
-        # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
+        stream_choices: list[ChatCompletionResponseStreamChoice] = []
+        header_emitted_indices: set[int] = set()
+        if wav_header_sent is None:
+            wav_header_sent = set()
+        # OMNI: Access multimodal_output from each CompletionOutput, not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
         # The attribute is attached dynamically when stage audio arrives; fall
         # back to the no-audio error response instead of an AttributeError 500
         # when the pipeline produced no audio for this request.
-        mm_output = getattr(final_res.outputs[0], "multimodal_output", None) or {}
-        audio_data = mm_output.get("audio")
-        if isinstance(audio_data, list):
-            if not audio_data:
-                audio_tensor = None
-            elif stream:
-                audio_tensor = audio_data[-1]
+        for output in omni_outputs.outputs:
+            mm_output = getattr(output, "multimodal_output", None) or {}
+            audio_data = mm_output.get("audio")
+            if isinstance(audio_data, list):
+                if not audio_data:
+                    audio_tensor = None
+                elif stream:
+                    audio_tensor = audio_data[-1]
+                else:
+                    audio_tensor = torch.cat(audio_data, dim=-1)
             else:
-                audio_tensor = torch.cat(audio_data, dim=-1)
-        else:
-            audio_tensor = audio_data
-        if audio_tensor is None:
-            if not stream:
-                return self._create_error_response("Audio generation completed but no audio was produced.")
-            # A streamed message can legitimately carry no waveform: the talker
-            # may emit an empty speech segment, and Stage 2 then reports the
-            # chunk with metadata only. Emit an empty audio delta so the
-            # caller's finish_reason bookkeeping still runs and the stream
-            # terminates normally instead of raising mid-generation.
-            return [
-                ChatCompletionResponseStreamChoice(
-                    index=output.index,
-                    delta=DeltaMessage(role=role, content=""),
-                    logprobs=None,
-                    finish_reason=output.finish_reason,
-                    stop_reason=output.stop_reason,
-                    token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                audio_tensor = audio_data
+            if audio_tensor is None or audio_tensor.numel() == 0:
+                if not stream:
+                    return self._create_error_response("Audio generation completed but no audio was produced."), set()
+                # Metadata-only and zero-size waveforms must not consume this
+                # choice's WAV header, but still participate in finish handling.
+                stream_choices.append(
+                    ChatCompletionResponseStreamChoice(
+                        index=output.index,
+                        delta=DeltaMessage(role=role, content=""),
+                        logprobs=None,
+                        finish_reason=output.finish_reason,
+                        stop_reason=output.stop_reason,
+                        token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                    )
                 )
-                for output in final_res.outputs
-            ]
-        audio_tensor = audio_tensor.detach().cpu().float().numpy()
+                continue
+            audio_tensor = audio_tensor.detach().cpu().float().numpy()
 
-        # Ensure audio is 1D (flatten if needed)
-        if audio_tensor.ndim > 1:
-            audio_tensor = audio_tensor.flatten()
+            # Remove singleton batch/mono axes while preserving stereo's
+            # channel and sample axes, including a single-frame waveform.
+            while audio_tensor.ndim > 2 and audio_tensor.shape[0] == 1:
+                audio_tensor = audio_tensor.squeeze(axis=0)
+            if audio_tensor.ndim == 2 and audio_tensor.shape[0] == 1:
+                audio_tensor = audio_tensor.squeeze(axis=0)
 
-        # Prefer the talker-reported sample rate when present. Qwen3-Omni
-        # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
-        # AudioVAE rate via multimodal_output["sr"].
-        sr_raw = mm_output.get("sr")
-        if isinstance(sr_raw, (list, tuple)):
-            sr_raw = next((item for item in sr_raw if item is not None), None)
-        if sr_raw is None:
-            sample_rate = 24000
-        elif hasattr(sr_raw, "item"):
-            sample_rate = int(sr_raw.item())
-        else:
-            sample_rate = int(sr_raw)
+            # Prefer the talker-reported sample rate when present. Qwen3-Omni
+            # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
+            # AudioVAE rate via multimodal_output["sr"].
+            sr_raw = mm_output.get("sr")
+            if isinstance(sr_raw, (list, tuple)):
+                sr_raw = next((item for item in sr_raw if item is not None), None)
+            if sr_raw is None:
+                sample_rate = 24000
+            elif hasattr(sr_raw, "item"):
+                sample_rate = int(sr_raw.item())
+            else:
+                sample_rate = int(sr_raw)
 
-        audio_format = self._resolve_audio_format(request)
-        if isinstance(audio_format, ErrorResponse):
-            return audio_format
+            audio_format = self._resolve_audio_format(request)
+            if isinstance(audio_format, ErrorResponse):
+                return audio_format, set()
 
-        audio_obj = CreateAudio(
-            audio_tensor=audio_tensor,
-            sample_rate=sample_rate,
-            response_format=audio_format,
-            speed=1.0,
-            base64_encode=True,
-        )
+            if stream and audio_format == "wav":
+                # Stream a separate WAV file for each choice. Empty PCM must
+                # leave that choice's header available for its first waveform.
+                pcm_obj = CreateAudio(
+                    audio_tensor=audio_tensor,
+                    sample_rate=sample_rate,
+                    response_format="pcm",
+                    speed=1.0,
+                    base64_encode=False,
+                )
+                audio_response: AudioResponse = self.create_audio(pcm_obj)
+                pcm_bytes = audio_response.audio_data
+                assert isinstance(pcm_bytes, bytes)
+                if pcm_bytes and output.index not in wav_header_sent:
+                    audio_metadata = audio_response.audio_metadata
+                    assert audio_metadata is not None
+                    pcm_bytes = (
+                        create_wav_header(
+                            sample_rate=audio_metadata.sample_rate_hz,
+                            num_channels=audio_metadata.channels,
+                            bits_per_sample=16,
+                        )
+                        + pcm_bytes
+                    )
+                    header_emitted_indices.add(output.index)
+                audio_base64 = base64.b64encode(pcm_bytes).decode("utf-8")
+                if audio_response.audio_metadata is not None:
+                    audio_response.audio_metadata = audio_response.audio_metadata.model_copy(update={"format": "wav"})
+            else:
+                audio_request = CreateAudio(
+                    audio_tensor=audio_tensor,
+                    sample_rate=sample_rate,
+                    response_format=audio_format,
+                    speed=1.0,
+                    base64_encode=True,
+                )
 
-        audio_response: AudioResponse = self.create_audio(audio_obj)
-        audio_base64 = audio_response.audio_data
+                audio_response = self.create_audio(audio_request)
+                encoded_audio = audio_response.audio_data
+                assert isinstance(encoded_audio, str)
+                audio_base64 = encoded_audio
 
-        # Generate unique ID for the audio
-        audio_id = f"audio-{uuid.uuid4().hex[:16]}"
+            # Generate unique ID for the audio
+            audio_id = f"audio-{uuid.uuid4().hex[:16]}"
 
-        # Set expiration time (e.g., 24 hours from now) as Unix timestamp
-        expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
+            # Set expiration time (e.g., 24 hours from now) as Unix timestamp
+            expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
 
-        # Create OpenAIChatCompletionAudio object with all required fields
-        audio_obj = OpenAIChatCompletionAudio(
-            id=audio_id,
-            data=audio_base64,
-            expires_at=expires_at,
-            transcript="",  # Empty transcript if not available
-        )
+            # Create OpenAIChatCompletionAudio object with all required fields
+            audio_obj = OpenAIChatCompletionAudio(
+                id=audio_id,
+                data=audio_base64,
+                expires_at=expires_at,
+                transcript="",  # Empty transcript if not available
+            )
 
-        for output in final_res.outputs:
             if stream:
-                choice_data = OmniChatCompletionResponseStreamChoice(
-                    index=output.index,
-                    delta=DeltaMessage(role=role, content=audio_base64),
-                    audio_metadata=audio_response.audio_metadata,
-                    logprobs=None,
-                    finish_reason=output.finish_reason,
-                    stop_reason=output.stop_reason,
-                    token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                stream_choices.append(
+                    OmniChatCompletionResponseStreamChoice(
+                        index=output.index,
+                        delta=DeltaMessage(role=role, content=audio_base64),
+                        audio_metadata=audio_response.audio_metadata,
+                        logprobs=None,
+                        finish_reason=output.finish_reason,
+                        stop_reason=output.stop_reason,
+                        token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                    )
                 )
             else:
-                choice_data = OmniChatCompletionResponseChoice(
-                    index=output.index,
-                    message=ChatMessage(role=role, audio=audio_obj),
-                    audio_metadata=audio_response.audio_metadata,
-                    logprobs=None,
-                    finish_reason="stop",
-                    stop_reason=output.stop_reason,
+                choices.append(
+                    OmniChatCompletionResponseChoice(
+                        index=output.index,
+                        message=ChatMessage(role=role, audio=audio_obj),
+                        audio_metadata=audio_response.audio_metadata,
+                        logprobs=None,
+                        finish_reason="stop",
+                        stop_reason=output.stop_reason,
+                    )
                 )
-            choices.append(choice_data)
-        return choices
+        if stream:
+            return stream_choices, header_emitted_indices
+        return choices, header_emitted_indices
 
     def _create_image_choice(
         self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False

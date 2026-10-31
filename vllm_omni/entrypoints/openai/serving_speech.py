@@ -11,7 +11,6 @@ import json
 import math
 import os
 import re
-import struct
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -42,7 +41,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.stage_config import StagePipelineConfig
-from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler
+from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, StreamingAudioResampler, create_wav_header
 from vllm_omni.entrypoints.openai.errors import InvalidPresetVoiceReferenceError, InvalidVoiceReferenceError
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
@@ -165,47 +164,6 @@ def _is_default_voice(voice, supported_speakers):
     """Check if a lowercased voice name is the placeholder default and not
     an actual registered/built-in speaker."""
     return voice == _DEFAULT_VOICE_NAME and voice not in supported_speakers
-
-
-def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
-    """Create a WAV header with placeholder size values for streaming.
-
-    Uses 0xFFFFFFFF as placeholder for data size fields, which is accepted
-    by most audio clients and matches OpenAI's streaming WAV implementation.
-
-    Args:
-        sample_rate: Audio sample rate in Hz
-        num_channels: Number of audio channels (1 for mono, 2 for stereo)
-        bits_per_sample: Bits per sample (typically 16)
-
-    Returns:
-        44-byte WAV header as bytes
-    """
-    byte_rate = sample_rate * num_channels * bits_per_sample // 8
-    block_align = num_channels * bits_per_sample // 8
-
-    # Use 0xFFFFFFFF as placeholder for unknown size (streaming)
-    placeholder_size = 0xFFFFFFFF
-
-    # ref https://docs.fileformat.com/audio/wav/
-    header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",  # ChunkID
-        placeholder_size,  # ChunkSize (placeholder)
-        b"WAVE",  # Format
-        b"fmt ",  # Subchunk1ID
-        16,  # Subchunk1Size (16 for PCM)
-        1,  # AudioFormat (1 for PCM)
-        num_channels,  # NumChannels
-        sample_rate,  # SampleRate
-        byte_rate,  # ByteRate
-        block_align,  # BlockAlign
-        bits_per_sample,  # BitsPerSample
-        b"data",  # Subchunk2ID
-        placeholder_size,  # Subchunk2Size (placeholder)
-    )
-
-    return header
 
 
 def _infer_audio_num_channels(audio: np.ndarray) -> int:
@@ -1968,7 +1926,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
                         num_channels = _infer_audio_num_channels(np.asarray(chunk_np))
-                        wav_header = _create_wav_header(
+                        wav_header = create_wav_header(
                             sample_rate=output_sample_rate,
                             num_channels=num_channels,
                             bits_per_sample=16,
@@ -2004,7 +1962,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     output_sample_rate = target_sample_rate or sample_rate_val
                     wav_header = None
                     if response_format == "wav" and first_chunk:
-                        wav_header = _create_wav_header(
+                        wav_header = create_wav_header(
                             sample_rate=output_sample_rate,
                             num_channels=1,
                             bits_per_sample=16,

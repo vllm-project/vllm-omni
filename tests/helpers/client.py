@@ -441,8 +441,8 @@ class OnlineOmniClient:
         """Wall clock from *before* ``chat.completions.create`` through stream drain + local decode."""
         result = OmniResponse()
         try:
-            text_content = ""
-            audio_data = []
+            text_by_choice: dict[int, str] = {}
+            audio_by_choice: dict[int, list[str]] = {}
             for chunk in chat_completion:
                 if result.request_id is None:
                     result.request_id = getattr(chunk, "id", None)
@@ -450,9 +450,9 @@ class OnlineOmniClient:
                     content = getattr(getattr(choice, "delta", None), "content", None)
                     modality = getattr(chunk, "modality", None)
                     if modality == "audio" and content:
-                        audio_data.append(content)
+                        audio_by_choice.setdefault(choice.index, []).append(content)
                     elif modality == "text" and content:
-                        text_content += content
+                        text_by_choice[choice.index] = text_by_choice.get(choice.index, "") + content
                 # Usage is yielded after the last token
                 if chunk.usage:
                     result.prompt_tokens = chunk.usage.prompt_tokens
@@ -460,12 +460,16 @@ class OnlineOmniClient:
                         result.cached_tokens = details.cached_tokens
                         result.multimodal_tokens = getattr(details, "multimodal_tokens", None)
 
+            # OmniResponse represents one choice. Keep its text and waveform
+            # together rather than mixing separate alternatives into one result.
+            choice_index = min(audio_by_choice.keys() | text_by_choice.keys(), default=0)
+            audio_data = audio_by_choice.get(choice_index, [])
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
                 wav_buf = BytesIO()
                 merged_seg.export(wav_buf, format="wav")
                 result.audio_bytes = wav_buf.getvalue()
-            result.text_content = text_content
+            result.text_content = text_by_choice.get(choice_index, "")
             result.audio_data = audio_data
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
