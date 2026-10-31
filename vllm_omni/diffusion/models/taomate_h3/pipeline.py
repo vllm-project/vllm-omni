@@ -36,6 +36,7 @@ import numpy as np
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.taomate_h3_prompt import sync_prompt_length
@@ -555,9 +556,9 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         _validate_parallel_config(od_config)
         if bool(getattr(od_config, "step_execution", False)) is False:
-            logger.warning(
-                "TaoMate-H3 is a streaming model; serve it with step_execution=true and streaming_output=true "
-                "on the AR-Diffusion engine (see vllm_omni/deploy/taomate_h3_usp4_realtime.yaml)."
+            logger.info(
+                "TaoMate-H3 full-request mode returns joined audio/video. For incremental output, use "
+                "step_execution=true and streaming_output=true (see vllm_omni/deploy/taomate_h3_usp4_realtime.yaml)."
             )
         super().__init__(od_config=od_config, prefix=prefix)
         model_config = dict(getattr(od_config, "model_config", None) or {})
@@ -1025,6 +1026,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         last: DiffusionOutput | None = None
         while not state.request_denoise_completed:
             for _ in range(STUDENT_STEPS):
+                check_request_cancellation()
                 velocity = self.denoise_step(cast(InputBatch, None), states=[state])
                 assert velocity is not None
                 self.step_scheduler(state, velocity)
