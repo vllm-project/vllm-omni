@@ -1514,6 +1514,26 @@ def test_h3_latent_edit_uploads_reach_generation_and_are_cleaned(endpoint, test_
     assert not Path(multi_modal_data["source_audio"]).exists()
 
 
+def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={"prompt": "A red fox in fresh snow.", "extra_params": json.dumps({"regenerate": True})},
+        files=[("source_video", ("draft.mp4", b"draft-video", "video/mp4"))],
+    )
+
+    assert response.status_code == 200
+    multi_modal_data = engine.captured_prompt["multi_modal_data"]
+    assert engine.captured_latent_edit_source_bytes == {"source_video": b"draft-video"}
+    assert "video_noise_mask" not in multi_modal_data and "audio_noise_mask" not in multi_modal_data
+
+
 def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):
     response = test_client.post(
         "/v1/videos/sync",
