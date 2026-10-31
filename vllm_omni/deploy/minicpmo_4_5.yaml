@@ -64,6 +64,17 @@ connectors:
       micro_batch_size: 4
       cfm_precapture_empty_cache: true
       cfm_max_graphs: 32
+      # Capture the HiFT / default-voice Euler / flow-encoder graphs from the
+      # worker warmup hook instead of on the first request. Stage 2 has no
+      # warmup forward of its own, so the deferred sweep otherwise lands on the
+      # first real request and blocks the engine for ~1-2 s per graph.
+      #
+      # These graphs still sit outside the profiled KV budget, exactly as on the
+      # lazy path (the sweep runs after profiling), so keep headroom in
+      # gpu_memory_utilization here. The move only changes when an OOM surfaces:
+      # startup instead of the first request. Overlays that still set
+      # cfm_graph_precapture_after_load get a warning; it no longer has any effect.
+      cfm_graph_precapture_at_init: true
       # Default CUDA speaker path: CPU-reference TensorRT, not full DiT TensorRT.
       # Missing TensorRT falls back to the Torch speaker. Non-CUDA ignores the
       # flag. Set false in an overlay to keep Torch. token2wav_trt /
