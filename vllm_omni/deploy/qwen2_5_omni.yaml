@@ -17,6 +17,8 @@
 #     compiling its decode changes image-conditioned greedy text (the compiled
 #     kernels pick a different argmax mid-answer) and is slower for that
 #     prefill shape, while it only saves ~8% end-to-end on text/audio.
+#     The thinker's image encoder CUDA graphs need `enforce_eager: false` on
+#     the thinker (see the Qwen2.5-Omni online serving example).
 #     ROCm keeps both eager because capturing there is not validated yet; NPU
 #     keeps the talker eager for the same reason. XPU overrides are documented
 #     below.

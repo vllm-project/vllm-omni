@@ -16,6 +16,19 @@ steps:
           - "pytest -sv tests/model_executor -m 'core_model and cpu'"
         mirror_hardwares: l4_1
 
+      - label: "Simple · Qwen2.5-Omni Encoder Graph TP=2 Test"
+        timeout_in_minutes: 15
+        source_file_dependencies:
+          - tests/model_executor/models/qwen2_5_omni/test_qwen2_5_omni_vision_encoder_cudagraph_tp_cuda.py
+          - tests/model_executor/models/qwen2_5_omni/test_qwen2_5_omni_vision_encoder_cudagraph_cuda.py
+          - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni.py
+          - vllm_omni/model_executor/models/qwen2_5_omni/qwen2_5_omni_thinker.py
+          - vllm_omni/model_executor/models/qwen2_5_omni/vision_encoder_cudagraph.py
+          - vllm_omni/worker/encoder_cudagraph.py
+        commands:
+          - "pytest -sv tests/model_executor/models/qwen2_5_omni/test_qwen2_5_omni_vision_encoder_cudagraph_tp_cuda.py -m 'core_model and cuda and L4 and cards_2' --run-level=core_model"
+        mirror_hardwares: l4_2
+
       - label: "Simple · Diffusion Models Test"
         timeout_in_minutes: 20
         commands:
