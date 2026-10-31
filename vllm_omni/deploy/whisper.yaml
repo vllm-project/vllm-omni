@@ -1,0 +1,27 @@
+# Whisper ASR deploy: single-stage encoder-decoder speech-to-text.
+pipeline: whisper
+model_runner: v1
+async_chunk: false
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    tensor_parallel_size: 1
+    max_num_seqs: 32
+    max_model_len: 448
+    gpu_memory_utilization: 0.85
+    max_num_batched_tokens: 4096
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 440
+
+platforms:
+  tpu:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        devices: "0"
+        gpu_memory_utilization: 0.75

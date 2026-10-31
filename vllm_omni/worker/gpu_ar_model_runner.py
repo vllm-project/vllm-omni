@@ -1323,11 +1323,17 @@ class GPUARModelRunner(
             )
             runner_assisted_full_attn = runner_assisted_context_enabled
 
+        # Encoder-decoder models can only compile the pure decode steps where no
+        # encoder inputs are present. Use eager for the first pass.
+        num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
+        has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        is_padding = self._prepare_padding_mask(num_tokens_unpadded, num_tokens_padded)
         try:
             with (
                 nullcontext(),
@@ -1340,6 +1346,8 @@ class GPUARModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
+                    skip_compiled=has_encoder_input,
+                    is_padding=is_padding,
                 ),
                 record_function_or_nullcontext("gpu_model_runner: forward"),
                 self.maybe_get_kv_connector_output(

@@ -174,7 +174,14 @@ class AsyncOmniEngine(OmniEngineBase):
             return None, prompt
 
         prompts = prompt if isinstance(prompt, list) else [prompt]
-        if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
+        if not any(
+            isinstance(p, dict)
+            and (
+                p.get("multi_modal_data")
+                or (isinstance(p.get("encoder_prompt"), dict) and p["encoder_prompt"].get("multi_modal_data"))
+            )
+            for p in prompts
+        ):
             return None, prompt
 
         if self._stage_pool_is_distributed(stage0_pool):

@@ -141,6 +141,7 @@ from vllm_omni.model_executor.models.wan2_2.pipeline import (
     WAN2_2_PIPELINE,
     WAN2_2_TI2V_PIPELINE,
 )
+from vllm_omni.model_executor.models.whisper.pipeline import WHISPER_PIPELINE
 from vllm_omni.model_executor.models.yue2.pipeline import YUE2_PIPELINE
 
 logger = init_logger(__name__)
@@ -242,6 +243,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "wan2_2_eg": WAN2_2_EG_PIPELINE,
     "wan2_2_egd": WAN2_2_EGD_PIPELINE,
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
+    "whisper": WHISPER_PIPELINE,
     "yue2": YUE2_PIPELINE,
 }
 
