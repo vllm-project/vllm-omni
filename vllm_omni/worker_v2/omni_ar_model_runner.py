@@ -192,6 +192,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
             raw_output, input_batch, self.req_states
         )
+        prefix_cache_rewrite = self._prefix_cache_save_mrv2(input_batch, text_hidden, multimodal_outputs)
         if bool(getattr(self.model_config, "async_chunk", False)) and multimodal_outputs:
             multimodal_outputs = self._retain_multimodal_outputs(multimodal_outputs)
             snapshot_slot = self._last_multimodal_snapshot_slot
@@ -305,7 +306,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
             multimodal_outputs=multimodal_outputs if need_pooler else None,
             input_batch=input_batch if need_pooler else None,
             async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
-            finalize_output=(None if materialize_native else self._finalize_native_data_plane_output),
+            finalize_output=self._prefix_cache_output_finalizer(
+                prefix_cache_rewrite,
+                None if materialize_native else self._finalize_native_data_plane_output,
+                mergeable=sampling_output.finalize_multimodal is None and streaming_audio is None,
+            ),
             finalize_multimodal=sampling_output.finalize_multimodal,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,

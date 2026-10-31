@@ -48,6 +48,7 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import (
 )
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
+from vllm_omni.worker_v2.prefix_cache import MRv2PrefixCacheMixin
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
 if TYPE_CHECKING:
@@ -87,7 +88,7 @@ def _supports_full_graph_aux_outputs(model: Any) -> bool:
     return _needs_capture_tensor_unwrap(model) and bool(getattr(model, "supports_mrv2_full_graph_aux_outputs", False))
 
 
-class OmniGPUModelRunner(GPUModelRunner):
+class OmniGPUModelRunner(MRv2PrefixCacheMixin, GPUModelRunner):
     """Thin layer over v2 ``GPUModelRunner`` for Omni lifecycle hooks."""
 
     supports_mm_inputs: bool
@@ -359,6 +360,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         output.omni_connector_output = plane.get_omni_connector_output()
         return output
 
+    def release_omni_shm_resources(self, request_ids: list[str]) -> int:
+        plane = getattr(self, "_omni_data_plane", None)
+        return 0 if plane is None else plane.release_shm_resources(request_ids)
+
     def _reserve_native_data_plane_outputs(self, req_ids: list[str]) -> None:
         plane = getattr(self, "_omni_data_plane", None)
         if plane is not None:
@@ -579,6 +584,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         randomize_inputs: bool = False,
     ) -> Any:
         if not dummy_run:
+            # Before finish_requests: finished writes escalate while their slots are live.
+            self._prefix_cache_step_begin(scheduler_output)
             self._prepare_native_data_plane(scheduler_output)
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
@@ -690,6 +697,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                     input_batch.num_scheduled_tokens,
                 )
                 self._set_active_loras(*lora_inputs)
+            # Encode vision and audio before language-model attention metadata.
+            # A long video's ViT FlashAttention workspace and the prefill's FA3
+            # scheduler workspace do not fit together; V1 runs the encoder first.
+            input_ids, inputs_embeds, ec_connector_output = self._prepare_mm_inputs(
+                scheduler_output,
+                input_batch,
+                dummy_run=False,
+            )
         else:
             input_batch = self._make_dummy_input_batch(
                 batch_desc.num_reqs or num_reqs,
@@ -736,11 +751,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.kv_cache_config,
                 for_capture=(dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL) or runner_assisted_capture,
             )
-        input_ids, inputs_embeds, ec_connector_output = self._prepare_mm_inputs(
-            scheduler_output,
-            input_batch,
-            dummy_run=dummy_run,
-        )
+        if dummy_run:
+            # Real steps encode above, before this metadata exists. Dummy steps
+            # only fill the static embed buffer and do not run the ViT.
+            input_ids, inputs_embeds, ec_connector_output = self._prepare_mm_inputs(
+                scheduler_output,
+                input_batch,
+                dummy_run=True,
+            )
 
         model_inputs: dict[str, Any] = {
             "input_ids": input_ids,

@@ -4,6 +4,7 @@
 
 import threading
 import time
+import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import torch
 from vllm import SamplingParams
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
@@ -50,6 +52,7 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_output_closed=False,
         _native_outputs_in_flight=defaultdict(int),
         _native_terminal_pending=set(),
+        _deferred_shm_releases=set(),
         _async_chunk=True,
         _pending_full_payload_send={},
         _put_req_chunk=defaultdict(int),
@@ -754,3 +757,31 @@ def test_native_snapshot_distinguishes_fresh_samples_from_ledger_tail(plane):
     assert next_snapshot.last_output_token_id == 2150
     assert next_snapshot.sampled_token_ids == []
     assert first.sampled_token_ids == [2150]
+
+
+def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
+    """A text-only request never runs the Talker, so the producer must unlink."""
+    ext_id = f"release_{uuid.uuid4().hex}"
+    connector = SharedMemoryConnector({"stage_id": 0})
+    plane.__dict__.update(_omni_connector=connector, _stage_id=0, _request_ids_mapping={})
+    plane.register_request(_new_request(external_req_id=ext_id))
+    sibling_key = f"{ext_id}_1_0_0"
+    try:
+        for key in (f"{ext_id}_0_0", sibling_key):
+            assert connector.put("0", "1", key, key)[0]
+
+        # Released while the terminal marker is still unsent: nothing yet.
+        assert plane.release_shm_resources([ext_id]) == 0
+        assert f"{ext_id}_0_0" in connector._pending_keys
+        assert connector.put("0", "1", f"{ext_id}_0_1", "finish")[0]
+        plane._cleanup_finished_entries(["internal"])
+
+        assert not plane._deferred_shm_releases
+        assert not any(k.startswith(f"{ext_id}_0_") for k in connector._pending_keys)
+        assert connector.get("0", "1", f"{ext_id}_0_1") is None
+        assert connector.get("0", "1", sibling_key)[0] == sibling_key
+
+        assert connector.put("0", "1", f"{ext_id}_0_2", "late")[0]
+        assert plane.release_shm_resources([ext_id, "unknown"]) == 1
+    finally:
+        connector.close()

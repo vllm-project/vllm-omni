@@ -316,7 +316,7 @@ def test_live_req_reentering_new_reqs_is_not_a_hit():
     s3 = run_step(mgr, view, {"b": ([3], 0, 2)}, finished=["a"])
     mgr.materialize(s3, ["b"])
     s4 = run_step(mgr, view, {"a": ([0, 1, 4], 8, 4)}, new_hits={"a": 8}, finished=["b"])
-    assert mgr._step_ctxs[s4].hits == {"a": (8, [0, 1])}
+    assert mgr._step_ctxs[s4].hits == {"a": (8, [0, 1], 0)}
     outs = mgr.materialize(s4, ["a"])
     assert outs.hidden_states["a"].shape == (12, HIDDEN)
     assert torch.equal(outs.hidden_states["a"][:8], expected_rows(view.slots_for("a", 0, 8)))
@@ -335,7 +335,7 @@ def test_manager_trusts_started_event_without_a_second_lifecycle_table():
                 (PrefixCacheRequestEvent("a", PrefixCacheEventKind.STARTED, hit_end=4, block_ids=((0,),)),), ()
             )
         )
-        assert mgr._hit_spans == {"a": (4, [0])}
+        assert mgr._hit_spans == {"a": (4, [0], 0)}
     finally:
         mgr.shutdown()
 
@@ -365,7 +365,7 @@ def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
                 num_tokens_padded=1,
                 write_layout=adapter.build_write_layout(view, num_scheduled_tokens={"a": 1}),
             )
-        assert mgr._step_ctxs[second].hits == {"a": (4, [0])}
+        assert mgr._step_ctxs[second].hits == {"a": (4, [0], 0)}
         merged = mgr.materialize(second, ["a"]).hidden_states["a"]
         assert torch.equal(merged, expected_rows(view.slots_for("a", 0, 5)))
         third = run_step(mgr, view, {"a": ([0, 1], 5, 1)}, new_hits={"a": 4})
