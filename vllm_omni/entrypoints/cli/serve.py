@@ -904,6 +904,12 @@ class OmniServeCommand(CLISubcommand):
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
         )
         omni_config_group.add_argument(
+            "--completion-boundary-batching",
+            action="store_true",
+            help="Group non-streaming diffusion steps until the first request completes. "
+            "Requires --step-execution and one device; new arrivals wait for the next boundary.",
+        )
+        omni_config_group.add_argument(
             "--request-batch-max-wait-ms",
             type=_nonneg_finite_float,
             default=0.0,

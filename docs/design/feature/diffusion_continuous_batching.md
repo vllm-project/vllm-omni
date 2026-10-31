@@ -11,7 +11,7 @@ and output delivery. For user-facing configuration and CLI examples, see
 `max_num_seqs` as that mode's scheduler capacity:
 
 | Configuration | Engine mode | Scheduler | Execution |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `step_execution=False`, `max_num_seqs=1` | `REQUEST_BATCH` | `RequestScheduler` | One complete request-level `forward()` |
 | `step_execution=False`, `max_num_seqs>1` | `REQUEST_BATCH` | `RequestScheduler` | One fused `forward()` over compatible requests |
 | `step_execution=True`, `max_num_seqs=1` | `STEP_BATCH` | `StepScheduler` | One request advanced one denoise step per scheduler tick |
@@ -139,7 +139,7 @@ Step execution exposes denoising progress to the scheduler. A supporting
 pipeline implements four stateful operations:
 
 | Operation | Responsibility |
-|---|---|
+| --- | --- |
 | `prepare_encode(state)` | Validate input, encode prompts, initialize latents and timesteps, and create request-local scheduler state |
 | `denoise_step(input_batch, *, states=...)` | Run one denoise forward for the scheduler-provided request states |
 | `step_scheduler(state, noise_pred)` | Update latents and advance request progress |
@@ -192,6 +192,28 @@ also applies here.
 
 Chunk-capable pipelines may emit intermediate results. Final-only step
 pipelines emit when the request finishes even if `streaming_output=True`.
+
+### Optional Completion-Boundary Grouping
+
+`completion_boundary_batching=True` keeps an admitted step cohort on the worker
+until its first completion, rather than returning through the engine after every
+step. It is disabled by default and limited to single-device, non-streaming step
+execution with dense legacy KV state. Paged scheduler KV is excluded because
+its page admission is owned by each scheduler wave. `StepScheduler` remains the
+admission and lifecycle owner and consumes the actual `RunnerOutput.step_index` after the grouped call.
+
+The runner initializes newly admitted requests once, then reuses the ordinary
+single-step core with cached-request envelopes. It bounds the local loop using
+the initialized `StepRequestState.total_steps` rather than assuming that the
+requested step count equals the pipeline's actual schedule length. It returns
+on the first terminal or emitted result, error, interrupt, or interaction wait.
+A nonadvancing step fails instead of spinning indefinitely. Existing runner
+exception cleanup releases the cohort if grouped execution raises.
+
+This changes when admission and engine cancellation can take effect, not the
+pipeline's denoising equations or its compatibility keys. Per-step tensor work is
+still performed. See the [execution guide](../../user_guide/diffusion/execution_modes.md#completion-boundary-batching-experimental)
+for configuration and latency tradeoffs.
 
 ## Model Author Guidelines
 

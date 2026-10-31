@@ -791,6 +791,7 @@ class OrchestratorArgs:
     video_output_transport: dict[str, object] | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
+    completion_boundary_batching: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_fast_path: str = "lossless"
