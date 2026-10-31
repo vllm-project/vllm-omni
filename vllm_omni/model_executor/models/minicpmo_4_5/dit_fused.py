@@ -124,8 +124,9 @@ def gather_causal_cache(history: torch.Tensor, index: torch.Tensor) -> torch.Ten
 
 def _mlp(mlp: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
     rows = hidden.reshape(-1, int(hidden.shape[-1]))
-    if mlp.act.approximate == "tanh" and rows.is_cuda and mlp.fc1.bias is not None:
-        # cuBLASLt applies bias + tanh-GELU in the GEMM epilogue.
+    fused_epilogue = rows.device.type in ("cuda", "npu") and mlp.fc1.bias is not None
+    if mlp.act.approximate == "tanh" and fused_epilogue:
+        # cuBLASLt / aclnn apply bias + tanh-GELU in the GEMM epilogue.
         inner = torch._addmm_activation(mlp.fc1.bias, rows, mlp.fc1.weight.t(), use_gelu=True)
     else:
         inner = mlp.act(F.linear(rows, mlp.fc1.weight, mlp.fc1.bias))
