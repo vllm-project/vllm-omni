@@ -266,7 +266,7 @@ def test_replaced_cache_is_released_before_convolution(cpu_assembly, monkeypatch
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("shortage", ["no_room", "out_of_memory"])
+@pytest.mark.parametrize("shortage", ["no_room", "out_of_memory", "level_zero_out_of_resources"])
 def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_assembly, monkeypatch, shortage) -> None:
     """A probe that does not fit leaves the shape unverified: reference formulation now, a probe once memory allows."""
     cache_name, cache = verdict_cache
@@ -294,6 +294,8 @@ def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_asse
     def maybe_oom(t, generator, std=1.0):
         if not room and shortage == "out_of_memory":
             raise torch.OutOfMemoryError("probe")
+        if not room and shortage == "level_zero_out_of_resources":  # how XPU reports some device OOMs
+            raise RuntimeError("level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)")
         return random_like(t, generator, std)
 
     monkeypatch.setattr(fp, "_probe_fits", probe_fits)
@@ -444,3 +446,15 @@ def test_fused_paths_release_replaced_history_before_probe(
     assert probes == [True]
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     torch.testing.assert_close(slots[0], x, rtol=0, atol=0)
+
+
+def test_other_runtime_errors_in_a_probe_are_not_swallowed(monkeypatch) -> None:
+    conv = fp.WanCausalConv3d(2, 2, 3, padding=1)
+    x = torch.ones(1, 2, 3, 3, 4)
+
+    def broken(t, generator, std=1.0):
+        raise RuntimeError("some other failure")
+
+    monkeypatch.setattr(fp, "_random_like", broken)
+    with pytest.raises(RuntimeError, match="some other failure"):
+        fp._equal_on_random_operands(x, conv.weight, lambda a, w: a, lambda a, w: a, lambda a: a, memory_checked=True)
