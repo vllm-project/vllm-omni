@@ -546,23 +546,36 @@ def resolve_baseline_for_sweep(
     }
 
 
-def _save_duplex_eval_diagnostics(score_root: str, accuracy_path: Path) -> None:
-    """Keep judge evidence before the accuracy fixture deletes temporary media."""
-    if not score_root or not (source_root := Path(score_root).resolve()).is_dir():
+def _save_duplex_eval_diagnostics(
+    score_root: str | None, accuracy_path: Path, *, response_root: str | None = None
+) -> None:
+    """Keep judge and failed-session evidence before temporary outputs are deleted."""
+    roots = []
+    run_name = None
+    if score_root and (source_root := Path(score_root).resolve()).is_dir():
+        roots.append((source_root, Path()))
+        run_name = source_root.parent.name
+    if response_root:
+        response_path = Path(response_root).resolve()
+        if (failed_root := response_path / "failed_sessions").is_dir():
+            roots.append((failed_root, Path("failed_sessions")))
+            run_name = response_path.name
+    if not roots:
         return
     diagnostics_root = accuracy_path.parent.resolve() / "diagnostics"
     # Snapshot first, excluding earlier exports if the configured roots overlap.
     sources = [
-        path
+        (path, namespace / path.relative_to(source_root))
+        for source_root, namespace in roots
         for path in source_root.rglob("*")
         if path.is_file()
         and ".media" not in path.relative_to(source_root).parts
         and not path.is_relative_to(diagnostics_root)
         and (path.suffix == ".json" or path.name.endswith(".judge.jsonl"))
     ]
-    destination = diagnostics_root / f"{accuracy_path.stem}-{source_root.parent.name}"
-    for source in sources:
-        target = destination / source.relative_to(source_root)
+    destination = diagnostics_root / f"{accuracy_path.stem}-{run_name}"
+    for source, relative_path in sources:
+        target = destination / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
 
@@ -743,8 +756,13 @@ def run_benchmark(
             encoding="utf-8",
         )
         print(f"Accuracy result saved to {accuracy_path}")
-        if isinstance(score_root := accuracy.get("score_root"), str):
-            _save_duplex_eval_diagnostics(score_root, accuracy_path)
+        score_root = accuracy.get("score_root")
+        response_root = duplex.get("response_root") if isinstance(duplex, dict) else None
+        _save_duplex_eval_diagnostics(
+            score_root if isinstance(score_root, str) else None,
+            accuracy_path,
+            response_root=response_root if isinstance(response_root, str) else None,
+        )
         from vllm_omni.platforms import current_omni_platform
 
         # Preserve the accuracy job's torch_npu shutdown exception while
