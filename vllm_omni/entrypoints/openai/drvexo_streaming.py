@@ -163,15 +163,11 @@ async def stream_reply(client, backend, payload, audio_output, speech_language="
 
     async def orchestrate():
         workers = [asyncio.create_task(generate_text()), asyncio.create_task(synthesize())]
-        cancelled = False
         try:
             result, audio = await asyncio.gather(*workers)
             await events.put(
                 {"type": "done", **result, **audio, "elapsed_seconds": round(time.monotonic() - started, 3)}
             )
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
         except Exception as error:
             await events.put({"type": "error", "detail": str(error)})
         finally:
@@ -179,8 +175,9 @@ async def stream_reply(client, backend, payload, audio_output, speech_language="
                 for worker in workers:
                     worker.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
-            if not cancelled:
-                await events.put(None)
+        # A cancellation during an error-event put must skip the terminal put:
+        # the consumer has disconnected and a full queue can no longer drain.
+        await events.put(None)
 
     job = asyncio.create_task(orchestrate())
     try:

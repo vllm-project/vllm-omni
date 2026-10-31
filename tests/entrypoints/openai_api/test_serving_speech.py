@@ -2978,6 +2978,28 @@ class TestTTSMethods:
         assert additional["voice_name"] == "alice"
         assert additional["voice_created_at"] == 0
 
+    def test_voxcpm2_voice_reupload_changes_default_cache_salt(self, speech_server, mocker):
+        """A re-upload under the same voice name must mint a fresh salt."""
+        speech_server._tts_model_type = "voxcpm2"
+        speech_server._adapter = speech_server._get_tts_adapter()
+        speech_server._adapter.capabilities = replace(
+            speech_server._adapter.capabilities,
+            precomputed_speakers={},
+        )
+        speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        speech_server.engine_client.generate = mocker.MagicMock(return_value=iter(()))
+        speech_server._adapter._build_prompt = mocker.AsyncMock(side_effect=lambda *a, **kw: {"prompt_token_ids": [1]})
+
+        speech_server.uploaded_speakers = {"bob": {"created_at": 100}}
+        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Bob")))
+        salt_first = speech_server.engine_client.generate.call_args.kwargs["prompt"]["cache_salt"]
+
+        speech_server.uploaded_speakers = {"bob": {"created_at": 200}}
+        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Bob")))
+        salt_second = speech_server.engine_client.generate.call_args.kwargs["prompt"]["cache_salt"]
+
+        assert salt_first != salt_second
+
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""
         req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")

@@ -4,8 +4,26 @@
 """Request-local entry into the resident native Talker/Codec; no second LLM."""
 
 import uuid
+from pathlib import Path
 
 import anyio
+
+
+def load_speech_tokenizer(model_directory):
+    """Load the local Talker text tokenizer once, before mounting its routes.
+
+    The complete DRVEXO pipeline selects the bundle's ``talker`` subdirectory.
+    Match the native prompt builder's tokenizer settings, without loading weights.
+    """
+    import transformers
+    from transformers import AutoTokenizer
+
+    kwargs = dict(trust_remote_code=True, use_fast=True, local_files_only=True)
+    if transformers.__version__ < "5":
+        kwargs["fix_mistral_regex"] = True
+    tokenizer = AutoTokenizer.from_pretrained(str(Path(model_directory) / "talker"), **kwargs)
+    tokenizer.padding_side = "left"
+    return tokenizer
 
 
 def speech_prompt(text, language="Auto"):

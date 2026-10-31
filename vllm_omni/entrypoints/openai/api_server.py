@@ -170,6 +170,7 @@ from vllm_omni.entrypoints.openai.protocol.rollout import (
     CreateSessionRequest,
     RolloutStepRequest,
 )
+from vllm_omni.entrypoints.openai.protocol.run import RunRequest
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
     VideoGenerationRequest,
@@ -186,6 +187,7 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
+from vllm_omni.entrypoints.openai.serving_run import ServingRun, run_endpoint_restrictions
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -447,10 +449,15 @@ async def omni_run_server_worker(
 
         chat = getattr(app.state, "openai_serving_chat", None)
         config = getattr(getattr(chat, "model_config", None), "hf_config", None)
-        if getattr(config, "model_type", None) == "drvexo_speech_8b":
+        if chat is not None and getattr(config, "model_type", None) == "drvexo_speech_8b":
             from .drvexo_routes import router as drvexo_router
+            from .drvexo_speech import load_speech_tokenizer
 
             app.state.drvexo_decision_limiter = anyio.CapacityLimiter(1)
+            if getattr(engine_client, "num_stages", 0) == 3:
+                app.state.drvexo_speech_tokenizer = await anyio.to_thread.run_sync(
+                    load_speech_tokenizer, chat.model_config.model
+                )
             app.include_router(drvexo_router)
 
         # The inherited routes assume a tokenization handler. Pure diffusion
@@ -465,6 +472,9 @@ async def omni_run_server_worker(
             shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
+
+        # Shutdown run requests unless we enabled it directly
+        shutdown_unsupported_routes(app, run_endpoint_restrictions())
 
         # Start background processes
         await STORAGE_MANAGER.start()
@@ -785,6 +795,7 @@ async def _init_duplex_app_state(
         "openai_streaming_video_output",
         "openai_serving_realtime_robot",
         "anthropic_serving_messages",
+        "run_serving",
     ):
         setattr(state, attribute, None)
     state.openai_serving_duplex = OmniDuplexSessionHandler(duplex_omni=engine_client)
@@ -960,6 +971,7 @@ async def omni_init_app_state(
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
+    state.run_serving = ServingRun(engine_client)
 
     # Initialize the API surface for the selected engine, not just the model.
     if isinstance(engine_client, DuplexOmni):
@@ -1990,6 +2002,28 @@ async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
     )
     await websocket.close(code=1008)
     return True
+
+
+@router.post("/v1/run", dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def run_stage(request: RunRequest, raw_request: Request):
+    """Run one pipeline stage and return its encoded result; see `ServingRun`."""
+    serving: ServingRun | None = raw_request.app.state.run_serving
+    if serving is None:
+        return _unsupported_api_response(raw_request, "Run API")
+    request_id = f"run-{random_uuid()}"
+    raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+    try:
+        response = await serving.run(request, request_id=request_id)
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except OmniClientError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ValueError as exc:
+        # Includes stage_input payloads that fail to decode.
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+    return response.model_dump(exclude_none=True)
 
 
 # RL Rollout serving (RFC #3747, P0)

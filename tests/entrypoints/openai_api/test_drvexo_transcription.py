@@ -295,3 +295,17 @@ async def test_recursive_serving_failure_keeps_server_error_identity(mocker, err
     handler._create_chat_completion = AsyncMock(side_effect=error("internal recursive error"))
     with pytest.raises(error, match="internal recursive error"):
         await OmniOpenAIServingChat._create_chat_completion(handler, req)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [ValueError, TypeError])
+async def test_chat_validation_errors_remain_client_errors(mocker, error):
+    from vllm_omni.entrypoints.openai import drvexo_decision
+
+    handler = object.__new__(OmniOpenAIServingChat)
+    handler.model_config = _ServingModelConfig(hf_config=_HFConfig("drvexo_speech_8b", True))
+    mocker.patch.object(drvexo_decision, "validate_chat_request", side_effect=error("bad request"))
+    response = mocker.patch.object(handler, "_create_error_response", return_value="client-error")
+    req = ChatCompletionRequest(model="test", messages=[{"role": "user", "content": "hi"}])
+    assert await handler._create_chat_completion(req) == "client-error"
+    response.assert_called_once_with("bad request", status_code=400)

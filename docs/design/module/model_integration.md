@@ -88,7 +88,11 @@ serialized routing metadata. A processed request's buffer is authoritative;
 the raw prompt is only a fallback, including for other pipelines using this
 shared path. On admission the runner combines that buffer with the same
 request's decoded routing metadata (routing keys win conflicts), then installs
-one snapshot. Omitted keys from an earlier admission are cleared, apart from
+a snapshot when the combined payload is nonempty. An empty admission means
+no metadata update and preserves preseeded or resumed state. Invalid legacy
+serialized metadata is logged and ignored within its decoding boundary;
+valid current-request buffer data and other admissions are still processed.
+For a nonempty snapshot, omitted keys from an earlier admission are cleared, apart from
 the existing streaming `meta.num_processed_tokens` / `meta.resumable` lifecycle
 fields. Model-produced incremental updates still use the separate merge path.
 A direct speech request carries its caller text and fixed-reply provenance in
@@ -98,3 +102,5 @@ Qwen3-TTS subfolder reads keep a selected `DefaultModelLoader` subclass,
 including the unified-checkpoint loader. Other outer-model loader protocols
 fall back to a separate native `auto` loader for tokenizer assets, without
 mutating their outer load configuration or forwarding format-specific options.
+This includes an outer `dummy` loader: native speech-tokenizer subfolder assets
+are deliberately loaded from disk rather than dummy-initialized.

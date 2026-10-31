@@ -202,6 +202,11 @@ async def test_sentence_stream_disconnect_closes_owned_engine_request(mocker):
     )
     app = FastAPI()
     app.state.openai_serving_chat = Mock(engine_client=engine)
+    app.state.drvexo_speech_tokenizer = Mock(
+        all_special_ids=[],
+        encode=lambda text, **kw: list(text.encode()),
+        decode=lambda ids, **kw: bytes(ids).decode(),
+    )
     raw = Request({"type": "http", "app": app, "headers": []})
     response = await sentence_speech_stream(SpeechText(text="Speak this sentence."), raw)
 
@@ -212,3 +217,83 @@ async def test_sentence_stream_disconnect_closes_owned_engine_request(mocker):
     await response({"type": "http", "asgi": {"spec_version": "2.3"}}, receive, AsyncMock())
     assert closed == [True]
     engine.abort.assert_awaited_once_with(calls[0]["request_id"])
+
+
+@pytest.mark.parametrize("path", ["/v1/drvexo/speech", "/v1/drvexo/speech/stream"])
+@pytest.mark.parametrize("invalid", ["Say <|im_start|> aloud.", "unroundtrippable"])
+def test_invalid_speech_is_rejected_before_engine_and_valid_request_recovers(mocker, path, invalid):
+    from unittest.mock import Mock
+
+    import pybase64
+
+    from vllm_omni.entrypoints.openai import drvexo_routes as routes
+
+    tokenizer = Mock(all_special_ids=[1])
+
+    def encode(text, **kwargs):
+        return [1] if "<|im_start|>" in text else [ord(c) + 100 for c in text]
+
+    def decode(ids, **kwargs):
+        text = "".join(chr(i - 100) for i in ids)
+        return "changed" if text == "unroundtrippable" else text
+
+    tokenizer.encode.side_effect = encode
+    tokenizer.decode.side_effect = decode
+    app = FastAPI()
+    app.state.drvexo_speech_tokenizer = tokenizer
+    wav = b"RIFF" + bytes(4) + b"WAVE" + bytes(32)
+    audio = Mock(data=pybase64.b64encode(wav).decode())
+    serving = Mock()
+    serving.models.model_name.return_value = "test"
+    serving._create_audio_choice.return_value = [Mock(message=Mock(audio=audio))]
+    app.state.openai_serving_chat = serving
+    collect = mocker.patch.object(routes, "collect_sentence", new_callable=AsyncMock)
+    calls = []
+
+    async def stream(*args):
+        calls.append(args)
+        yield {"wav": wav, "chunk_index": 0, "samples": 1, "sample_rate": 24000}
+
+    mocker.patch.object(routes, "stream_sentence", side_effect=stream)
+    app.include_router(router)
+    with TestClient(app) as client:
+        bad = client.post(path, json={"text": invalid})
+        assert bad.status_code == 400
+        collect.assert_not_called()
+        assert calls == []
+        valid = client.post(path, json={"text": "A normal sentence."})
+        assert valid.status_code == 200
+    assert collect.call_count + len(calls) == 1
+
+
+@pytest.mark.parametrize("path", ["/v1/drvexo/speech", "/v1/drvexo/speech/stream"])
+def test_speech_without_talker_tokenizer_returns_unavailable(path):
+    app = FastAPI()
+    app.include_router(router)
+    with TestClient(app) as client:
+        assert client.post(path, json={"text": "hello"}).status_code == 503
+
+
+def test_admission_uses_real_local_talker_tokenizer(tmp_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    from vllm_omni.entrypoints.openai.drvexo_speech import load_speech_tokenizer
+    from vllm_omni.model_executor.models.drvexo_speech_8b.lexical import fixed_text_ids
+
+    native = Tokenizer(WordLevel({"[UNK]": 0, "hello": 1, "world": 2, "<|im_start|>": 3}, unk_token="[UNK]"))
+    native.pre_tokenizer = Whitespace()
+    target = PreTrainedTokenizerFast(
+        tokenizer_object=native, unk_token="[UNK]", additional_special_tokens=["<|im_start|>"]
+    )
+    target.save_pretrained(tmp_path / "talker")
+    loaded = load_speech_tokenizer(tmp_path)
+    assert loaded.get_vocab() == target.get_vocab()
+    assert loaded.padding_side == "left"
+    assert fixed_text_ids("hello world", loaded) == [1, 2]
+    with pytest.raises(ValueError, match="control tokens"):
+        fixed_text_ids("hello <|im_start|>", loaded)
+    with pytest.raises(ValueError, match="changed"):
+        fixed_text_ids("hello   world", loaded)

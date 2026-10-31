@@ -81,3 +81,31 @@ def test_request_transport_snapshot_drops_previous_payload_keys():
         )
     )
     assert runner.model_intermediate_buffer["request"] == {"only": "legacy"}
+
+
+@pytest.mark.parametrize("empty", [None, {}])
+def test_empty_admission_preserves_preseeded_buffer(empty):
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.requests = {"request": RequestState()}
+    previous = {"seeded": True, "meta": {"num_processed_tokens": 3}}
+    runner.model_intermediate_buffer = {"request": previous}
+    runner._decode_and_store_request_payloads(ScheduledBatch([ScheduledRequest("request", {}, empty)]))
+    assert runner.model_intermediate_buffer["request"] == previous
+
+
+def test_bad_legacy_payload_does_not_fail_other_admissions():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.requests = {key: RequestState() for key in ("bad", "valid", "current")}
+    runner.model_intermediate_buffer = {"bad": {"seeded": True}}
+    runner._decode_and_store_request_payloads(
+        ScheduledBatch(
+            [
+                ScheduledRequest("bad", {}, object()),
+                ScheduledRequest("valid", {}, serialize_additional_information({"fresh": True})),
+                ScheduledRequest("current", {"text": ["keep this"]}, object()),
+            ]
+        )
+    )
+    assert runner.model_intermediate_buffer["bad"] == {"seeded": True}
+    assert runner.model_intermediate_buffer["valid"] == {"fresh": True}
+    assert runner.model_intermediate_buffer["current"] == {"text": ["keep this"]}

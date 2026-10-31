@@ -425,12 +425,17 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       # The step is 20 minutes. The command leaves five minutes for preflight.
       timeout_in_minutes: 20
+      artifact_paths:
+        - "artifacts/rocm-device-reduction/**/*"
       commands:
         - |
-          timeout --signal=TERM --kill-after=1m 15m bash <<'DEVICE_REDUCTION_READY'
+          set -euo pipefail
+          export ROCM_DEVICE_REDUCTION_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-device-reduction"
+          mkdir -p "$$ROCM_DEVICE_REDUCTION_ARTIFACT_DIR"
+          bash <<'DEVICE_REDUCTION_READY'
           set -euo pipefail
           nodes=(
             "tests/diffusion/test_device_reduction.py::test_device_reduction_matches_a_float32_reference[dtype0]"
@@ -465,13 +470,26 @@ steps:
             echo "Device-reduction READY collection drifted from the pinned GPU nodes" >&2
             exit 1
           fi
-          pytest -s -v \
+          DEVICE_REDUCTION_READY
+        - |
+          status=0
+          timeout --signal=TERM --kill-after=1m 15m \
+            pytest -s -v \
             tests/diffusion/test_device_reduction.py \
             tests/diffusion/test_wan_device_reduction.py \
             tests/diffusion/test_diffusion_engine.py::test_move_tensor_tree_moves_nested_cuda_tensors_to_cpu \
             -m "core_model and diffusion and rocm and MI325 and cards_1" \
-            --run-level "core_model"
-          DEVICE_REDUCTION_READY
+            --run-level "core_model" \
+            --junitxml="$$ROCM_DEVICE_REDUCTION_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 17 and skipped == 0; print(f"Expected exactly 17 executed device-reduction GPU tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_DEVICE_REDUCTION_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
 
 
     - label: "ROCm · Tiny Diffusion Base GPU Test"
@@ -628,6 +646,57 @@ steps:
         -m "core_model and omni and rocm and MI325 and cards_1" \
         --run-level "core_model"
       ENGINE_ABORT_READY
+
+- label: "ROCm · Distributed Buffer GPU Smokes"
+  agent_pool: mi300_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  # The step is 30 minutes. The command leaves ten minutes for preflight.
+  timeout_in_minutes: 30
+  artifact_paths:
+    - "artifacts/rocm-distributed-buffer/**/*"
+  commands:
+    - export ROCM_DISTRIBUTED_BUFFER_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-distributed-buffer"
+    - mkdir -p "$$ROCM_DISTRIBUTED_BUFFER_ARTIFACT_DIR"
+    - |
+      set -euo pipefail
+      nodes=(
+        "tests/distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::TestManagedBuffer::test_to_bytes_cuda_pool"
+        "tests/distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::TestMooncakePackedPayloadSmoke::test_from_bytes_device_cuda_round_trip"
+      )
+      printf '%s\n' "$${nodes[@]}" | sort > /tmp/distributed-buffer-ready-expected.txt
+      pytest -q \
+        tests/distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py \
+        -m "core_model and rocm and MI325 and cards_1" \
+        --run-level "core_model" \
+        --collect-only \
+        | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+        | sort > /tmp/distributed-buffer-ready-collected.txt
+      if ! diff -u /tmp/distributed-buffer-ready-expected.txt /tmp/distributed-buffer-ready-collected.txt; then
+        echo "Distributed buffer READY collection drifted from the two GPU smokes" >&2
+        exit 1
+      fi
+    - |
+      nodes=(
+        "tests/distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::TestManagedBuffer::test_to_bytes_cuda_pool"
+        "tests/distributed/omni_connectors/test_mooncake_transfer_engine_buffer.py::TestMooncakePackedPayloadSmoke::test_from_bytes_device_cuda_round_trip"
+      )
+      status=0
+      timeout --signal=TERM --kill-after=1m 20m \
+        pytest -s -v "$${nodes[@]}" \
+        -m "core_model and rocm and MI325 and cards_1" \
+        --run-level "core_model" \
+        --junitxml="$$ROCM_DISTRIBUTED_BUFFER_ARTIFACT_DIR/pytest.xml" || status=$$?
+      if [[ "$$status" -eq 0 ]]; then
+        if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 2 and skipped == 0; print(f"Expected exactly two executed distributed buffer GPU smokes; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_DISTRIBUTED_BUFFER_ARTIFACT_DIR/pytest.xml"
+        then
+          status=0
+        else
+          status=$$?
+        fi
+      fi
+      (exit "$$status")
 
 - label: "ROCm · One-Card Worker GPU Test"
   agent_pool: mi300_1

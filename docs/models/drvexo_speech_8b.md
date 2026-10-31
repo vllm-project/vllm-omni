@@ -28,6 +28,9 @@ at stage 2. Thinker output text conditions Talker; asynchronous chunks are
 used on the Talker-to-Codec edge. A stored hidden-state bridge is retained for
 checkpoint compatibility and is not the validated generated-text speech path.
 
+For the tested hardware profile and verification commands, see the
+[DGX Spark GB10 recipe](../../recipes/DRVEXO/DRVEXO-Speech-8B-GB10.md).
+
 ## Development launch
 
 Install the dependencies for the checked-out vLLM-Omni revision, then install

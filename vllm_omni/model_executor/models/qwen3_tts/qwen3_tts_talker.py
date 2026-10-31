@@ -1407,6 +1407,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Subfolder assets require the DefaultModelLoader iterator protocol.
         # Registered subclasses (including unified checkpoints) keep their
         # iterator; unrelated outer-model formats retain the native fallback.
+        # Even an outer dummy loader needs real native speech-tokenizer assets
+        # here. Drop its incompatible format/options only for this subfolder.
         if not isinstance(model_loader, DefaultModelLoader):
             model_loader = DefaultModelLoader(
                 replace(self.vllm_config.load_config, load_format="auto", model_loader_extra_config={})

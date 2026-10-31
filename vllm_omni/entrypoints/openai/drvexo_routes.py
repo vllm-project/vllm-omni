@@ -16,6 +16,8 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from vllm.entrypoints.serve.utils.api_utils import with_cancellation
 
+from vllm_omni.model_executor.models.drvexo_speech_8b.lexical import fixed_text_ids
+
 from .drvexo_decision import general_decision
 from .drvexo_speech import collect_sentence, stream_sentence
 from .drvexo_streaming import stream_reply
@@ -89,12 +91,23 @@ def stream_payload(request):
     return payload
 
 
+def validate_speech_text(text: str, raw_request: Request) -> None:
+    if not text.strip():
+        raise HTTPException(400, "Nonempty text required")
+    tokenizer = getattr(raw_request.app.state, "drvexo_speech_tokenizer", None)
+    if tokenizer is None:
+        raise HTTPException(503, "Sentence speech requires the complete DRVEXO pipeline")
+    try:
+        fixed_text_ids(text, tokenizer)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 async def sentence_speech(body: SpeechText, raw_request: Request):
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.sampling_params import RequestOutputKind
 
-    if not body.text.strip():
-        raise HTTPException(400, "Nonempty text required")
+    validate_speech_text(body.text, raw_request)
     serving = raw_request.app.state.openai_serving_chat
     final = await collect_sentence(serving.engine_client, body.text, body.language, RequestOutputKind.FINAL_ONLY)
     req = ChatCompletionRequest(
@@ -118,8 +131,7 @@ async def sentence_speech(body: SpeechText, raw_request: Request):
 
 
 async def sentence_speech_stream(body: SpeechText, raw_request: Request):
-    if not body.text.strip():
-        raise HTTPException(400, "Nonempty text required")
+    validate_speech_text(body.text, raw_request)
 
     async def generate():
         source = stream_sentence(raw_request.app.state.openai_serving_chat.engine_client, body.text, body.language)

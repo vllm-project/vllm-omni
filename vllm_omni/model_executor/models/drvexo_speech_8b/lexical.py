@@ -9,6 +9,18 @@ Thinker's segmentation. Control tokens must never be pronounced as words.
 """
 
 
+def fixed_text_ids(text, tokenizer):
+    """Share caller-text validation between HTTP admission and Talker."""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Fixed speech requires nonempty text")
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    if not ids or any(i in tokenizer.all_special_ids for i in ids):
+        raise ValueError("Fixed speech cannot contain control tokens")
+    if tokenizer.decode(ids, skip_special_tokens=False) != text:
+        raise ValueError("Fixed speech tokenization changed the reply")
+    return ids
+
+
 class GeneratedTokenRouter:
     def __init__(self, source_tokenizer, target_tokenizer):
         self.source = source_tokenizer
@@ -37,13 +49,7 @@ class GeneratedTokenRouter:
 
     def prepare_fixed(self, text):
         """Tokenize an explicitly fixed reply without claiming LLM provenance."""
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("Fixed speech requires nonempty text")
-        ids = self.target.encode(text, add_special_tokens=False)
-        if not ids or any(i in self.target.all_special_ids for i in ids):
-            raise ValueError("Fixed speech cannot contain control tokens")
-        if self.target.decode(ids, skip_special_tokens=False) != text:
-            raise ValueError("Fixed speech tokenization changed the reply")
+        ids = fixed_text_ids(text, self.target)
         return self.prefix + ids + self.suffix
 
     def prepare(self, generated_ids, expected_text):

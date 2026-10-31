@@ -87,6 +87,7 @@ class _FakeHFConfig:
 @dataclass
 class _FakeChatModelConfig:
     hf_config: _FakeHFConfig
+    model: str = "local-bundle"
 
 
 @dataclass
@@ -117,10 +118,23 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, model_
     @asynccontextmanager
     async def fake_build_async_omni(*_args, **kwargs):
         captured.update(kwargs)
-        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        engine = _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        engine.num_stages = 3
+        yield engine
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
     monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
+
+    from vllm_omni.entrypoints.openai import drvexo_speech
+
+    tokenizer = object()
+    loaded = []
+
+    def load_tokenizer(path):
+        loaded.append(path)
+        return tokenizer
+
+    monkeypatch.setattr(drvexo_speech, "load_speech_tokenizer", load_tokenizer)
 
     async def fake_init_app_state(_engine, state, _args):
         state.openai_serving_chat = _FakeServingChat(_FakeChatModelConfig(_FakeHFConfig(model_type)))
@@ -137,8 +151,11 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, model_
         assert app.state.api_server_count == 2
         if model_type == "drvexo_speech_8b":
             assert app.state.drvexo_decision_limiter.total_tokens == 1
+            assert app.state.drvexo_speech_tokenizer is tokenizer
+            assert loaded == ["local-bundle"]
         else:
             assert not hasattr(app.state, "drvexo_decision_limiter")
+            assert loaded == []
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task
@@ -180,6 +197,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("WEBSOCKET", "/v1/realtime"),
     ("WEBSOCKET", "/v1/realtime/robot/openpi"),
     ("WEBSOCKET", "/v1/duplex"),
+    ("POST", "/v1/run"),
     ("POST", "/v1/realtime/sessions"),
     ("POST", "/v1/realtime/sessions/{session_id}/step"),
     ("POST", "/v1/realtime/sessions/{session_id}/reset"),
@@ -228,6 +246,7 @@ _DIFFUSION_APP_STATE_KEYS = {
     "openai_streaming_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -259,6 +278,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "openai_serving_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -398,6 +418,7 @@ class _FakeSocket:
 
 class _FakeEngineClient:
     config_path: str | None = None
+    num_stages: int = 0
 
     def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
         self.stage_configs = stage_configs if stage_configs is not None else []

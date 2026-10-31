@@ -723,12 +723,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 logger.error(f"Error decoding prompt embeds: {e}")
             # Both transports describe this admission's snapshot. Routing
             # metadata overlays this request's payload, never a previous chunk.
-            model_buffer = getattr(new_req_data, "model_intermediate_buffer", None)
-            info_dict = deserialize_additional_information(new_req_data.additional_information)
-            payload = dict(model_buffer) if isinstance(model_buffer, dict) else {}
-            if info_dict:
-                payload.update(info_dict)
-            self._replace_intermediate_buffer(req_id, payload)
+            self._admit_request_payload(req_id, new_req_data)
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1383,16 +1378,27 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             pe_cpu = self._resolve_prompt_embeds_cpu(getattr(nr, "prompt_embeds", None))
             if pe_cpu is not None:
                 setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
-            model_buffer = getattr(nr, "model_intermediate_buffer", None)
-            payload = dict(model_buffer) if isinstance(model_buffer, dict) else {}
-            info_payload = getattr(nr, "additional_information", None)
-            if info_payload is not None:
-                logger.warning_once(
-                    "additional_information on request data is deprecated, use model_intermediate_buffer"
+            self._admit_request_payload(req_id, nr)
+
+    def _admit_request_payload(self, req_id: str, request_data) -> None:
+        """Nonempty admissions replace a snapshot; absence preserves seeded state."""
+        model_buffer = getattr(request_data, "model_intermediate_buffer", None)
+        payload = dict(model_buffer) if isinstance(model_buffer, dict) else {}
+        info_payload = getattr(request_data, "additional_information", None)
+        if info_payload is not None:
+            logger.warning_once("additional_information on request data is deprecated, use model_intermediate_buffer")
+            try:
+                info = deserialize_additional_information(info_payload)
+            except Exception:
+                # Keep the historical logged-invalid-legacy-metadata behavior.
+                # Catch only decoding, never unrelated runner/model failures or
+                # the other requests admitted in this scheduler step.
+                logger.exception(
+                    "Error decoding additional_information for request %s; ignoring legacy metadata", req_id
                 )
-            info_dict = deserialize_additional_information(info_payload)
-            if info_dict:
-                payload.update(info_dict)
+            else:
+                payload.update(info)
+        if payload:
             self._replace_intermediate_buffer(req_id, payload)
 
     def _gather_runtime_additional_information(self) -> list[dict]:

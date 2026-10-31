@@ -165,7 +165,8 @@ async def test_busy_decision_rejected_without_engine_work():
 
 
 @pytest.mark.asyncio
-async def test_scoring_timeout_aborts_owned_candidate_and_releases_admission(mocker):
+@pytest.mark.parametrize("blocked_candidate", [1, 2])
+async def test_scoring_timeout_aborts_owned_candidate_and_releases_admission(mocker, blocked_candidate):
     from fastapi import HTTPException
 
     from vllm_omni.entrypoints.openai import drvexo_decision as module
@@ -174,6 +175,15 @@ async def test_scoring_timeout_aborts_owned_candidate_and_releases_admission(moc
 
     async def generate(**kwargs):
         calls.append(kwargs)
+        if len(calls) < blocked_candidate:
+            yield _DecisionOutput(
+                error=None,
+                multimodal_output={
+                    "drvexo_general_scores": [torch.tensor([1.0])],
+                    "drvexo_general_status": [torch.tensor([1])],
+                },
+            )
+            return
         try:
             await anyio.sleep_forever()
             yield None
@@ -187,5 +197,6 @@ async def test_scoring_timeout_aborts_owned_candidate_and_releases_admission(moc
         await general_decision(body(), raw)
     assert error.value.status_code == 504
     assert closed == [True]
-    engine.abort.assert_awaited_once_with(calls[0]["request_id"])
+    assert len(calls) == blocked_candidate
+    engine.abort.assert_awaited_once_with(calls[-1]["request_id"])
     assert raw.app.state.drvexo_decision_limiter.borrowed_tokens == 0
