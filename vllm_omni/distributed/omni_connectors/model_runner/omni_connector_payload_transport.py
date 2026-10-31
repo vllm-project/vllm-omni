@@ -1003,9 +1003,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         returned a chunk may already have the next one, so only those
         requests are polled again. A miss means that chunk is not in the
         connector yet; rescanning it opens a missing lock file and holds the
-        GIL against the model thread for the whole burst. The wait is also
-        the recheck for a non-AR payload deferred until the scheduler takes
-        the previous one.
+        GIL against the model thread for the whole burst. Requests registered
+        during a burst join it on the next pass, so a long stream does not
+        hold back another request's first chunk. The wait is also the
+        recheck for a non-AR payload deferred until the scheduler takes the
+        previous one.
         """
         _recv_poll_count = 0
         while not self._stop_event.is_set():
@@ -1029,9 +1031,17 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     _recv_poll_count,
                 )
 
+            known = set(pending_ids)
             active = pending_ids
             while active and not self._stop_event.is_set():
                 active = self._poll_pending_requests_once(active)
+                if not active:
+                    break
+                with self._lock:
+                    arrived = [req_id for req_id in self._pending_load_reqs if req_id not in known]
+                if arrived:
+                    known.update(arrived)
+                    active = [*active, *arrived]
 
             if not self._stop_event.is_set():
                 self._wait_for_next_payload(generation)

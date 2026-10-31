@@ -4,8 +4,9 @@
 # Runner selection:
 #   Model Runner V2 is the default on CUDA. Set `model_runner: v1` in an
 #   overlay to opt out. The `platforms:` sections keep V1 on NPU, XPU, ROCm
-#   and MUSA. The Thinker prefix cache is opt-in on both runners (see stage
-#   0). Duplex keeps V1 in qwen3_omni_duplex.yaml.
+#   and MUSA. The Thinker prefix cache is on for CUDA on both runners (stage
+#   0); the platform sections and qwen3_omni_moe_mrv2.yaml turn it off.
+#   Duplex keeps V1 in qwen3_omni_duplex.yaml.
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
 # vllm_omni/config/stage_config.py). Notable implicit defaults for this

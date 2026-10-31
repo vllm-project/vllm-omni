@@ -96,6 +96,7 @@ def _host(connector: _Connector) -> _Host:
             additional_information=None,
             prompt_token_ids=[],
             num_computed_tokens=0,
+            payload_sender_info=None,
         )
         host.register_chunk_recv(request)
     return host
@@ -195,6 +196,62 @@ def _burst(loop) -> tuple[int, int, int]:
         stop.set()
         producer.join(timeout=1)
         host.shutdown_omni_connectors()
+
+
+class _StreamingConnector(_Connector):
+    """r0 always has its next chunk queued; ``late`` registers mid-stream."""
+
+    def __init__(self, stream_len: int) -> None:
+        super().__init__()
+        self.host: _Host | None = None
+        self.stream_len = stream_len
+        self.r0_chunks = 0
+        self.late_at: int | None = None
+        self.done = threading.Event()
+
+    def get(self, from_stage, to_stage, get_key, metadata=None):
+        result = super().get(from_stage, to_stage, get_key, metadata)
+        if result is None:
+            return None
+        if get_key.startswith("r0_0_"):
+            self.r0_chunks += 1
+            if self.r0_chunks == 2:
+                assert self.host is not None
+                self.host.register_chunk_recv(
+                    SimpleNamespace(
+                        request_id="late",
+                        external_req_id="late",
+                        additional_information=None,
+                        prompt_token_ids=[],
+                        num_computed_tokens=0,
+                        payload_sender_info=None,
+                    )
+                )
+                self.put("0", "1", "late_0_0", {"embed": {"decode": [0]}})
+            if self.r0_chunks < self.stream_len:
+                self.put("0", "1", f"r0_0_{self.r0_chunks}", {"embed": {"decode": [self.r0_chunks]}})
+            else:
+                self.done.set()
+        elif get_key.startswith("late_0_"):
+            self.late_at = self.r0_chunks
+            self.done.set()
+        return result
+
+
+def test_request_registered_during_a_burst_is_polled_before_it_ends():
+    stream_len = 200
+    connector = _StreamingConnector(stream_len)
+    host = _host(connector)
+    connector.host = host
+    connector.put("0", "1", "r0_0_0", {"embed": {"decode": [0]}})
+    host._recv_thread = threading.Thread(target=_Host._recv_loop, args=(host,), daemon=True)
+    host._recv_thread.start()
+    try:
+        assert connector.done.wait(timeout=10)
+    finally:
+        host.shutdown_omni_connectors()
+    assert connector.late_at is not None
+    assert connector.late_at < stream_len // 2
 
 
 def test_burst_receive_yields_the_model_thread():
