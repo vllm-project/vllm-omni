@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Correctness tests for Sensenova-U1 Triton kernels.
 
@@ -15,8 +15,11 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [
     pytest.mark.core_model,
+    *hardware_marks(res={"cuda": "L4"}),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
@@ -67,7 +70,10 @@ class KernelInput:
 
 
 try:
-    from vllm_omni.diffusion.models.sensenova_u1.fused_rmsnorm_rope import triton_qk_norm_rope
+    from vllm_omni.diffusion.models.sensenova_u1.fused_rmsnorm_rope import (
+        qk_norm_rope_kernel,
+        triton_qk_norm_rope,
+    )
 
     _TRITON_AVAILABLE = True
 except ImportError:
@@ -166,15 +172,15 @@ def reference_kernel(
     return query, key
 
 
-def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int) -> KernelInput:
+def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int, batch_size: int = B) -> KernelInput:
     gen = torch.Generator(device=device)
     gen.manual_seed(seed + seq_len)
 
     # Match real model layout: q/k/v are views split from fused qkv.
-    qkv = torch.randn(B, seq_len, QKV_DIM, device=device, dtype=dtype, generator=gen)
+    qkv = torch.randn(batch_size, seq_len, QKV_DIM, device=device, dtype=dtype, generator=gen)
     q, k, _v = qkv.split([H_Q * HEAD_DIM, H_K * HEAD_DIM, H_K * HEAD_DIM], dim=-1)
-    q = q.view(B, seq_len, H_Q, HEAD_DIM)
-    k = k.view(B, seq_len, H_K, HEAD_DIM)
+    q = q.view(batch_size, seq_len, H_Q, HEAD_DIM)
+    k = k.view(batch_size, seq_len, H_K, HEAD_DIM)
 
     q_norm_weight = torch.randn(T_DIM, device=device, dtype=dtype, generator=gen)
     k_norm_weight = torch.randn(T_DIM, device=device, dtype=dtype, generator=gen)
@@ -183,8 +189,8 @@ def make_input(seq_len: int, dtype: torch.dtype, device: torch.device, seed: int
 
     # Match Qwen3RotaryEmbedding: emb = torch.cat((freqs, freqs), dim=-1).
     def make_rope_pair(dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_half = torch.randn(B, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
-        sin_half = torch.randn(B, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
+        cos_half = torch.randn(batch_size, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
+        sin_half = torch.randn(batch_size, seq_len, dim // 2, device=device, dtype=dtype, generator=gen)
         return torch.cat((cos_half, cos_half), dim=-1), torch.cat((sin_half, sin_half), dim=-1)
 
     cos_t, sin_t = make_rope_pair(T_DIM)
@@ -230,3 +236,42 @@ def test_fused_qk_norm_rope_matches_reference(seq_len: int, dtype: torch.dtype, 
 
     assert_close_with_error_stats(out_q, ref_q, name="query", atol=atol, rtol=rtol)
     assert_close_with_error_stats(out_k, ref_k, name="key", atol=atol, rtol=rtol)
+
+
+@triton_available
+@pytest.mark.parametrize("seq_len", [1, 9, 260, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_fused_qk_writes_kv_into_resident_suffix(seq_len, dtype, batch_size, mocker):
+    data = make_input(seq_len, dtype=dtype, device=DEVICE, seed=SEED, batch_size=batch_size)
+    expected_q, expected_k = triton_qk_norm_rope(*data.args(), EPS)
+    # Strided V matches a slice of a fused QKV projection.
+    value = torch.randn(batch_size, seq_len, H_K * 3, HEAD_DIM, device=DEVICE, dtype=dtype)[:, :, H_K : 2 * H_K]
+    launch = mocker.spy(qk_norm_rope_kernel, "run")
+    compiled_kernels = []
+    tail = 3
+    for prefix in (7, 64, 257):
+        k = torch.full((batch_size, prefix + seq_len + tail, H_K, HEAD_DIM), 17, device=DEVICE, dtype=dtype)
+        v = torch.full_like(k, 19)
+        key_out = k[:, prefix : prefix + seq_len].transpose(1, 2)
+        value_out = v[:, prefix : prefix + seq_len].transpose(1, 2)
+        q, got_k = triton_qk_norm_rope(*data.args(), EPS, key_output=key_out, value=value, value_output=value_out)
+        compiled_kernels.append(launch.spy_return)
+        assert got_k.data_ptr() == key_out.data_ptr()
+        torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(got_k, expected_k, rtol=0, atol=0)
+        torch.testing.assert_close(value_out, value.transpose(1, 2), rtol=0, atol=0)
+        assert q.transpose(1, 2).is_contiguous()
+        assert torch.all(k[:, :prefix] == 17) and torch.all(k[:, -tail:] == 17)
+        assert torch.all(v[:, :prefix] == 19) and torch.all(v[:, -tail:] == 19)
+    # Varying the prefix changes the output batch strides, not the kernel.
+    assert compiled_kernels[0] is not None
+    assert all(kernel is compiled_kernels[0] for kernel in compiled_kernels)
+
+
+@triton_available
+def test_fused_qk_rejects_a_short_output_buffer():
+    data = make_input(9, dtype=torch.bfloat16, device=DEVICE, seed=SEED)
+    short = torch.empty(B, H_K, 8, HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="key_output"):
+        triton_qk_norm_rope(*data.args(), EPS, key_output=short)
