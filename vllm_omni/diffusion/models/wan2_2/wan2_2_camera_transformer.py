@@ -9,6 +9,7 @@ DreamX (``models/wan_transformer3d.py``). The camera (PRoPE) path runs single-GP
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 
 import regex as re
@@ -163,7 +164,7 @@ class WanCameraTransformerBlock(WanTransformerBlock):
         vsa_dit_seq_shape: tuple[int, int, int] | None = None,
         preserve_vsa_all_blocks: bool = False,
     ) -> torch.Tensor:
-        from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+        from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
 
         if temb.ndim == 4:
             # temb: [B, seq, 6, inner_dim] (wan2.2 ti2v)
@@ -184,7 +185,18 @@ class WanCameraTransformerBlock(WanTransformerBlock):
 
         # 1. Self-attention (+ parallel PRoPE camera self-attention).
         norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
-        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
+        self_attn_extra = {}
+        if vsa_dit_seq_shape is not None:
+            self_attn_extra["vsa_dit_seq_shape"] = vsa_dit_seq_shape
+        if preserve_vsa_all_blocks:
+            self_attn_extra["preserve_vsa_all_blocks"] = True
+        video_layout = None
+        if vsa_dit_seq_shape is not None:
+            grid = tuple(int(dim) for dim in vsa_dit_seq_shape)
+            video_layout = VideoTokenLayout(prefix_len=0, latent_grid=grid, used_len=math.prod(grid))
+        self_attn_metadata = AttentionMetadata(
+            attn_mask=hidden_states_mask, extra=self_attn_extra, video_layout=video_layout
+        )
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         if self.cam_self_attn is not None and self._cam_emb is not None:
             # Same modulated-normed activation feeds both branches; summed before gate.

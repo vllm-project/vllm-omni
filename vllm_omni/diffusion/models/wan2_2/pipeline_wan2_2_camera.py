@@ -21,7 +21,7 @@ import torch
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
 
-from vllm_omni.config.stage_config import DiffusionStageRole
+from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -212,7 +212,14 @@ class Wan22CameraPipeline(Wan22Pipeline):
         self.is_dmd = False
         self.has_transformer_2 = False
         self.boundary_ratio = od_config.boundary_ratio
-        self.stage_role = DiffusionStageRole.FULL
+        self.stage_role = resolve_diffusion_stage_role(
+            getattr(od_config, "stage_role", None),
+            getattr(od_config, "model_stage", None),
+        )
+        if self.stage_role != DiffusionStageRole.FULL:
+            raise NotImplementedError(
+                f"DreamX camera pipeline only supports the full stage role, got {self.stage_role.value!r}"
+            )
         self.encode_only = False
 
         # Transformer weights come from the DreamX repo ROOT. Use subfolder=None
