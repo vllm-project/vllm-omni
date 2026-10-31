@@ -381,6 +381,22 @@ class BreezeForConditionalGeneration(nn.Module):
                 loaded.add(name)
             elif not name.startswith(("codec_model.", "backbone_model.embed_tokens.", "embed_text_tokens.")):
                 raise ValueError(f"Unexpected Breeze checkpoint parameter: {name}")
+        # Qwen's loader reports a packed destination after any source shard.
+        # Require every split projection unless the complete packed weight exists.
+        backbone_sources = {name for name, _ in backbone}
+        missing_sources: set[str] = set()
+        for name, _ in self.model.named_parameters():
+            for packed, parts in (
+                ("qkv_proj.weight", ("q_proj", "k_proj", "v_proj")),
+                ("gate_up_proj.weight", ("gate_proj", "up_proj")),
+            ):
+                if name.endswith("." + packed) and name not in backbone_sources:
+                    prefix = name.removesuffix(packed)
+                    missing_sources.update(
+                        prefix + part + ".weight" for part in parts if prefix + part + ".weight" not in backbone_sources
+                    )
+        if missing_sources:
+            raise ValueError(f"Missing Breeze backbone projections: {sorted(missing_sources)}")
         loaded.update("model." + name for name in self.model.load_weights(backbone))
         for target, parameter in self.depth_decoder.named_parameters():
             if target == "codebooks_head":
