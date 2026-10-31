@@ -360,7 +360,7 @@ class HiggsAudioV2Code2Wav(nn.Module):
                 logger.warning("HiggsAudioV2Code2Wav: decode skipped (%s)", exc)
                 wavs.append(empty)
                 continue
-            wavs.append(pcm.squeeze(0).squeeze(0).to(torch.float32).cpu())
+            wavs.append(pcm.squeeze(0).squeeze(0).to(torch.float32))
 
         return OmniOutput(
             text_hidden_states=None,
