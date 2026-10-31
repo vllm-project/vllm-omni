@@ -163,7 +163,7 @@ class FlashInferAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
-    def supports_dense_attention_mask(cls, attention_spec: object | None = None) -> bool:
+    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
         return cls.supports_attention_mask(attention_spec)
 
     @staticmethod
