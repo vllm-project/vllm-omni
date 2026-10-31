@@ -754,12 +754,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         return helper
 
     def get_language_model(self) -> torch.nn.Module:
-        """The Thinker's text decoder; drafters share its embedding and lm_head."""
+        """The stage's decoder; drafters share its embedding and lm_head."""
         if self.thinker is not None:
             return self.thinker.get_language_model()
+        if self.talker is not None and hasattr(self.talker, "get_language_model"):
+            return self.talker.get_language_model()
         return self.model
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        if self.model_stage == "tts":
+            # The Talker decoder returns them with its hidden states.
+            self.talker.set_aux_hidden_state_layers(layers)
+            return
         # Only the MRv2 Thinker forward hands target layers to the drafter.
         if self.model_stage != "llm" or not self._use_v2_model_runner:
             raise NotImplementedError(

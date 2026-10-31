@@ -37,12 +37,23 @@ def _talker(max_reqs: int = 8, max_position_embeddings: int = 4096):
 
 
 def _batch(rows: list[dict], *, pad_to: int | None = None):
-    """rows: one dict per request with slot, prompt_len, span (token ids) and prefill flag."""
+    """rows: one dict per request with slot, prompt_len, span (token ids) and prefill flag.
+
+    A row with ``drafts=k`` verifies the last k ids of its span (k + 1 logits rows).
+    """
     ids = [token for row in rows for token in row["span"]]
     num_tokens = len(ids)
     padded = pad_to or num_tokens
     starts = np.cumsum([0] + [len(row["span"]) for row in rows])
     seq_lens = [row["computed"] + len(row["span"]) for row in rows]
+    positions = [pos for row in rows for pos in range(row["computed"], row["computed"] + len(row["span"]))]
+    logits_indices, expanded_slots, local_pos, cu_num_logits = [], [], [], [0]
+    for row, end in zip(rows, starts[1:]):
+        drafts = row.get("drafts", 0)
+        logits_indices += [int(end) - 1 - drafts + j for j in range(drafts + 1)]
+        expanded_slots += [row["slot"]] * (drafts + 1)
+        local_pos += list(range(drafts + 1))
+        cu_num_logits.append(cu_num_logits[-1] + drafts + 1)
     return SimpleNamespace(
         num_reqs=len(rows),
         has_prefill=any(row["prefill"] for row in rows),
@@ -50,7 +61,11 @@ def _batch(rows: list[dict], *, pad_to: int | None = None):
         idx_mapping_np=np.array([row["slot"] for row in rows]),
         idx_mapping=torch.tensor([row["slot"] for row in rows]),
         input_ids=torch.tensor(ids + [0] * (padded - num_tokens), dtype=torch.int32),
-        logits_indices=torch.tensor(starts[1:] - 1),
+        positions=torch.tensor(positions + [0] * (padded - num_tokens)),
+        logits_indices=torch.tensor(logits_indices),
+        expanded_idx_mapping=torch.tensor(expanded_slots),
+        expanded_local_pos=torch.tensor(local_pos, dtype=torch.int32),
+        cu_num_logits=torch.tensor(cu_num_logits, dtype=torch.int32),
         seq_lens=torch.tensor(seq_lens + [0] * 2, dtype=torch.int32),
     ), padded
 
@@ -428,3 +443,166 @@ def test_turn_decode_does_not_build_duplex_limit_tensors(monkeypatch):
         model_intermediate_buffer=[{}],
     )
     assert talker._mrv2_masked_eos is None
+
+
+def test_mrv2_output_marks_each_draft_row() -> None:
+    talker = _talker()
+    prompt_lens = {0: 4, 1: 4, 3: 4096 - 100}
+    limit = min(_OFFLINE_CODEC_MAX_NEW_TOKENS, 100) - 1
+    rows = [
+        # Three codes so far, then drafts 21, EOS and 30: the codes end at the EOS input.
+        dict(slot=0, prompt_len=4, computed=6, span=[17, 21, _EOS, 30], prefill=False, drafts=3),
+        dict(slot=1, prompt_len=4, computed=5, span=[8], prefill=False),
+        # Drafts that run past the length cap.
+        dict(
+            slot=3,
+            prompt_len=prompt_lens[3],
+            computed=prompt_lens[3] + limit - 2,
+            span=[5, 6, 7],
+            prefill=False,
+            drafts=2,
+        ),
+    ]
+    batch, _ = _batch(rows)
+    out = talker.make_omni_output_mrv2(
+        torch.zeros((8, 4)), input_batch=batch, req_states=_req_states(prompt_lens), model_intermediate_buffer=[{}] * 3
+    )
+    assert out.multimodal_outputs["codes"]["audio"][:, 0].tolist() == batch.input_ids.tolist()
+    valid = out.multimodal_outputs["meta"]["codec_frame_valid"]
+    assert valid.tolist() == [True, True, False, False, True, True, True, True]
+    forced = talker.take_mrv2_forced_eos(batch, None, 8)
+    assert forced.tolist() == [False, False, True, True, False, False, True, True]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("output_count", [3, 14, 20])
+def test_codec_penalty_window_includes_the_steps_earlier_drafts(device, output_count):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+        _apply_batched_repetition_penalty,
+        _CodecWindowPenaltiesState,
+    )
+
+    prompt_lens = torch.tensor([3, 0, 2], device=device)
+    lengths = prompt_lens + output_count
+    tokens = torch.zeros(3, 64, dtype=torch.long, device=device)
+    prefixes = torch.full((3, 16), -1, dtype=torch.long, device=device)
+    drafts = {2: [7, 7, 4], 0: [2]}
+    histories, slots, local_pos, input_ids = [], [], [], []
+    for slot, prefix in [(2, [5, 5, 5, 9]), (0, [7, 7])]:
+        output = ([1, 7, 2] * 7)[:output_count]
+        start = int(prompt_lens[slot])
+        tokens[slot, start : start + output_count] = torch.tensor(output, device=device)
+        prefixes[slot, -len(prefix) :] = torch.tensor(prefix, device=device)
+        # Logits row j of a request follows its last code and the step's first j drafts.
+        input_ids += [output[-1], *drafts[slot]]
+        for j in range(len(drafts[slot]) + 1):
+            histories.append(torch.tensor(prefix + output + drafts[slot][:j]))
+            slots.append(slot)
+            local_pos.append(j)
+    logits = torch.linspace(-3, 3, 32, device=device).repeat(len(histories), 1)
+    expected = _apply_batched_repetition_penalty(logits.cpu(), histories, penalty=1.05, window_size=16)
+
+    state = object.__new__(_CodecWindowPenaltiesState)
+    state.window_size = 16
+    state.base = SimpleNamespace(apply=lambda logits, ctx: logits)
+    state.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=tokens),
+        total_len=SimpleNamespace(gpu=lengths),
+        prompt_len=SimpleNamespace(gpu=prompt_lens),
+    )
+    state.repetition_penalty = SimpleNamespace(gpu=torch.full((3,), 1.05, device=device))
+    state.use_window = np.ones(3, dtype=bool)
+    state.history_prefix = prefixes
+    ctx = SimpleNamespace(
+        idx_mapping_np=np.array([2, 0]),
+        expanded_idx_mapping=torch.tensor(slots, device=device),
+        expanded_local_pos=torch.tensor(local_pos, dtype=torch.int32, device=device),
+        input_ids=torch.tensor(input_ids, device=device),
+    )
+    torch.testing.assert_close(state.apply(logits, ctx).cpu(), expected)
+
+
+def test_draft_verification_forces_codec_eos_per_row(mocker):
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45TalkerRejectionSampler
+
+    batch, _ = _batch(
+        [
+            dict(slot=0, prompt_len=4, computed=6, span=[17, 21], prefill=False, drafts=1),
+            dict(slot=1, prompt_len=4, computed=0, span=[0] * 4, prefill=True),
+        ]
+    )
+    seen = {}
+
+    def verify(logits, input_batch, draft_logits, invalid_drafts):
+        seen["logits"] = logits.clone()
+        # min_tokens blanked the prefill row's forced EOS: its sample is arbitrary.
+        return SimpleNamespace(sampled_token_ids=torch.tensor([[3, 4], [5, 0]]), num_sampled=torch.tensor([2, 1]))
+
+    mocker.patch.object(RejectionSampler, "__call__", autospec=True, side_effect=lambda self, *args: verify(*args))
+    forced = torch.tensor([False, True, True])
+    talker = SimpleNamespace(
+        _codec_eos_id=7, _mrv2_masked_eos=None, take_mrv2_forced_eos=mocker.Mock(return_value=forced)
+    )
+    rejection = object.__new__(MiniCPMO45TalkerRejectionSampler)
+    rejection.sampler = SimpleNamespace(req_states=object())
+    rejection.talker = talker
+    out = rejection(torch.zeros(3, 8), batch)
+    talker.take_mrv2_forced_eos.assert_called_once_with(batch, rejection.sampler.req_states, 3)
+    # A forced row's target is codec EOS alone, so only an EOS draft is accepted there.
+    assert seen["logits"][0].tolist() == [0.0] * 8
+    for row in (1, 2):
+        assert seen["logits"][row, 7] == 0 and torch.isinf(seen["logits"][row, :7]).all()
+    assert out.sampled_token_ids.tolist() == [[3, 7], [7, 0]]
+
+
+def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
+    import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts as module
+
+    talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    talker._k_step_frames = 0
+    talker.vllm_config = SimpleNamespace(speculative_config=None)
+    mocker.patch.object(module, "_install_mrv2_talker_sampler", return_value="talker-sampler")
+    sampler = SimpleNamespace(req_states=SimpleNamespace(device="cpu"))
+    assert talker.mrv2_custom_sampler(sampler) == ("talker-sampler", None)
+    talker.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=7, enable_adaptive_verification=False, rejection_sample_method="standard"
+        )
+    )
+    talker_sampler, rejection = talker.mrv2_custom_sampler(sampler)
+    assert talker_sampler == "talker-sampler"
+    assert isinstance(rejection, module.MiniCPMO45TalkerRejectionSampler)
+    # The stock sampler carries the codec window penalty installed above.
+    assert rejection.sampler is sampler
+    assert rejection.talker is talker
+
+
+def test_drafter_loading_finds_the_codec_table_and_head():
+    talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker.emb_code = torch.nn.ModuleList([torch.nn.Embedding(10, 4)])
+    talker.head_code = torch.nn.ModuleList([torch.nn.Linear(4, 10, bias=False)])
+    view = talker.get_language_model()
+    assert view.model.embed_tokens is talker.emb_code[0]
+    assert view.lm_head is talker.head_code[0]
+
+
+@pytest.mark.parametrize("v2,session,ok", [(True, "turn", True), (True, "duplex", False), (False, "turn", False)])
+def test_talker_drafter_layers_need_turn_sessions_on_mrv2(mocker, v2, session, ok):
+    talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker._use_v2_model_runner = v2
+    talker._k_step_frames = 0
+    talker.vllm_config = SimpleNamespace(model_config=SimpleNamespace(session_mode=session))
+    talker.tts_model = mocker.Mock()
+    if ok:
+        talker.set_aux_hidden_state_layers((2, 10, 17))
+        talker.tts_model._set_aux_hidden_state_layers.assert_called_once_with((2, 10, 17))
+    else:
+        with pytest.raises(NotImplementedError, match="turn sessions"):
+            talker.set_aux_hidden_state_layers((2, 10, 17))
+        talker.tts_model._set_aux_hidden_state_layers.assert_not_called()
