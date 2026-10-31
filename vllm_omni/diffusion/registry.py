@@ -802,6 +802,8 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
 _DIFFUSION_PRE_PROCESS_FUNCS = {
     "MOSSImagePipeline": "get_mossimage_pre_process_func",
     "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
+    "OmniVoicePipeline": "get_omnivoice_pre_process_func",
+    "OmniVoice": "get_omnivoice_pre_process_func",
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
