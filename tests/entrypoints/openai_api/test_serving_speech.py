@@ -459,6 +459,7 @@ async def test_server_worker_applies_speech_only_endpoint_restrictions(mocker: M
         stage_configs: list[object] = []
 
         def __init__(self):
+            self.engine = SimpleNamespace(tracer_provider=None)
             self.generate = mocker.AsyncMock()
 
         async def get_supported_tasks(self):

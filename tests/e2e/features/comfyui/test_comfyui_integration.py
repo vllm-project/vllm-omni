@@ -638,6 +638,7 @@ def mock_async_omni(
         mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=server_case.tokenizer)
 
     mock_instance = mocker.AsyncMock(spec=RealAsyncOmni)
+    mock_instance.engine = SimpleNamespace(tracer_provider=None)
     mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
 
     mock_instance.stage_list = server_case.stage_list
