@@ -1516,6 +1516,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         Discards the last sampled output token from the prior input chunk at
         stage 0.
         """
+        session.max_tokens = update.max_tokens
         req_id = session.request_id
         set_request_perf_chunk(session, perf_chunk_from_buffer(getattr(update, "model_intermediate_buffer", None)))
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
