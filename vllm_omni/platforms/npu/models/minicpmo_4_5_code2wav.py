@@ -278,24 +278,19 @@ def _patched_estimator_step(
             "cfm_estimator",
             (x, mu, time_embedding, speakers, cond, cnn_cache, att_cache, *mask_inputs),
             (True, valid_frames),
-            lambda step_x,
-            step_mu,
-            step_time,
-            step_speakers,
-            step_cond,
-            step_cnn,
-            step_att,
-            *rest: _graphable_estimator_step(
-                self,
-                estimator,
-                x=step_x,
-                mu=step_mu,
-                time_embedding=step_time,
-                speakers=step_speakers,
-                cond=step_cond,
-                cnn_cache=step_cnn,
-                att_cache=step_att,
-                **_step_kwargs(rest),
+            lambda step_x, step_mu, step_time, step_speakers, step_cond, step_cnn, step_att, *rest: (
+                _graphable_estimator_step(
+                    self,
+                    estimator,
+                    x=step_x,
+                    mu=step_mu,
+                    time_embedding=step_time,
+                    speakers=step_speakers,
+                    cond=step_cond,
+                    cnn_cache=step_cnn,
+                    att_cache=step_att,
+                    **_step_kwargs(rest),
+                )
             ),
         )
     )
