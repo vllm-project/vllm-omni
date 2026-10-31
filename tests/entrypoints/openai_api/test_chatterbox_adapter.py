@@ -177,14 +177,18 @@ def reference(seconds: float, seed: int, sample_rate: int = 24000, mime: str = "
     return f"data:{mime};base64,{base64.b64encode(buffer.getvalue()).decode()}"
 
 
-def deploy_on_cpu(name: str) -> str:
+def deploy_on_cpu(name: str, max_num_seqs: int | None = None) -> str:
     """A copy of deploy file ``name`` with its reference encoders on this host's CPU.
 
-    Every CUDA profile conditions on ``cuda:0``; these tests build servers on a CPU host.
+    Every CUDA profile conditions on ``cuda:0``; these tests build servers on a
+    CPU host. ``max_num_seqs`` replaces stage 0's, which sizes the encoder
+    batch: encoding a shipped profile's 64 references on a shared CPU runner
+    can outlast a test's wait.
     """
-    return modify_stage_config(
-        get_deploy_config_path(name), updates={"stages": {0: {"additional_config.conditioning_device": "cpu"}}}
-    )
+    stage: dict[str, object] = {"additional_config.conditioning_device": "cpu"}
+    if max_num_seqs is not None:
+        stage["max_num_seqs"] = max_num_seqs
+    return modify_stage_config(get_deploy_config_path(name), updates={"stages": {0: stage}})
 
 
 def encoder(adapter: ChatterboxAdapter) -> VoiceConditioner:
@@ -316,15 +320,15 @@ async def test_original_controls_default_to_the_deploy_files(original, extra_par
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("variant", "adapter_cls", "seconds", "admission"),
-    [("turbo", ChatterboxAdapter, 5.04, 64), ("original", ChatterboxOriginalAdapter, 1.0, 64)],
+    ("variant", "adapter_cls", "seconds", "max_num_seqs", "admission"),
+    [("turbo", ChatterboxAdapter, 5.04, 8, 8), ("original", ChatterboxOriginalAdapter, 1.0, 16, 8)],
 )
 async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
-    request, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds, admission
+    request, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds, max_num_seqs, admission
 ):
     """Everything queued while the encoders are busy goes through them as one batch, with no cap of its own.
 
-    The profile admits ``admission`` requests (Original's 128 sequences are 64
+    Stage 0 admits ``admission`` requests (Original's 16 sequences are 8
     guided pairs), so that many references arriving together are one
     admission. The first batch is held so that the other references queue
     behind it; the batch after it is all of them. Each clip is 40 ms (one
@@ -334,7 +338,7 @@ async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
     """
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
     model_dir = request.getfixturevalue("original_model_dir" if variant == "original" else "model_dir")
-    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY[variant])))
+    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY[variant], max_num_seqs)))
     concurrent = speech._adapter
     assert isinstance(concurrent, adapter_cls)
     assert concurrent.conditioning_capacity == admission
@@ -457,7 +461,7 @@ async def test_cancelled_wave_cannot_overfill_encoder_queue(
 ):
     """Cancelled waiters keep their encoder work, and with it the slots a new wave would take."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(original_model_dir, deploy_on_cpu(DEPLOY["original"])))
+    speech = serving(engine_client(original_model_dir, deploy_on_cpu(DEPLOY["original"], max_num_seqs=16)))
     original = speech._adapter
     assert isinstance(original, ChatterboxOriginalAdapter)
     admission = original.conditioning_capacity
@@ -512,6 +516,18 @@ def test_shipped_profiles_condition_on_the_stages_gpu(deploy: str) -> None:
     """Both deploy files put the reference encoders on the stages' GPU."""
     stage = resolve_deploy_yaml(get_deploy_config_path(deploy))["stages"][0]
     assert stage["additional_config"]["conditioning_device"] == "cuda:0"
+
+
+@pytest.mark.parametrize("variant", list(DEPLOY))
+def test_shipped_profiles_admit_64_references(request, tmp_path, monkeypatch, clean_speaker_cache, variant):
+    """Both deploy files encode 64 references together: Original's 128 sequences are 64 guided pairs."""
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
+    model_dir = request.getfixturevalue("original_model_dir" if variant == "original" else "model_dir")
+    speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY[variant])))
+    try:
+        assert speech._adapter.conditioning_capacity == 64
+    finally:
+        speech.shutdown()
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["runtime_config", "engine_args"])
