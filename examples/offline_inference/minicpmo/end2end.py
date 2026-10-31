@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-Offline end-to-end inference for MiniCPM-o 4.5 (thinker + talker/Token2Wav).
+Offline end-to-end inference for MiniCPM-o 4.5 (Thinker → Talker → Code2Wav).
 
 MiniCPM-o uses placeholders ``(<image>./</image>)``, ``(<audio>./</audio>)``,
 and ``(<video>./</video>)``. Speech output requires a ``<|tts_bos|>`` suffix on
 the assistant prefix (equivalent to online ``chat_template_kwargs.use_tts_template``).
 """
 
+import copy
 import os
 import time
 from typing import NamedTuple
@@ -295,17 +296,10 @@ def main(args):
         detokenize=True,
         repetition_penalty=1.1,
     )
-    # Stage 1 (talker + Token2Wav): max_tokens=1 satisfies the scheduler;
-    # waveform is produced in-process by Token2Wav.
-    talker_sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        top_k=-1,
-        max_tokens=1,
-        seed=SEED,
-        detokenize=False,
-    )
-    sampling_params_list = [thinker_sampling_params, talker_sampling_params][: omni.num_stages]
+    # The Talker (stage 1) samples speech codes autoregressively and Code2Wav
+    # (stage 2) turns them into a waveform; both keep the deploy defaults.
+    sampling_params_list = copy.deepcopy(omni.default_sampling_params_list)
+    sampling_params_list[0] = thinker_sampling_params
 
     if args.txt_prompts is None:
         prompts = [query_result.inputs for _ in range(args.num_prompts)]
@@ -367,7 +361,7 @@ def main(args):
             if audio_numpy.ndim > 1:
                 audio_numpy = audio_numpy.flatten()
 
-            # MiniCPM-o 4.5 Token2Wav emits 24 kHz mono.
+            # MiniCPM-o 4.5 Code2Wav emits 24 kHz mono.
             sf.write(output_wav, audio_numpy, samplerate=24000, format="WAV")
             print(f"Request ID: {request_id}, Saved audio to {output_wav}")
 

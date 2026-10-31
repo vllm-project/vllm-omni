@@ -339,9 +339,8 @@ them unless `--allow-invalid-clock` is explicit.
   request-owned Flow/HiFT caches and batches exact-shape-compatible chunks.
 - Reference audio travels with the first codec chunk; Stage 2 owns its
   temporary prompt WAV and evicts prompt features when the request finishes.
-- Codec sampling reads the checkpoint `tts_config` (default deterministic
-  seed 42). Stage-1 YAML sampling parameters govern only the binary
-  continue/stop token exposed to vLLM.
+- Stage-1 `default_sampling_params` in the deploy YAML drive the Talker's
+  codec sampling (default seed 42).
 - `StageRequestStats.batch_size` is request-scoped and does not report the
   scheduler's execution batch.
 - Stage 0 and Stage 1 use vLLM CUDA Graph capture. Stage 2 remains eager until
