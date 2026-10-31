@@ -25,7 +25,7 @@ steps:
       - label: "Simple · Engine&Entrypoints&Diffusion Test"
         timeout_in_minutes: 20
         commands:
-          - "pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu'"
+          - "VLLM_OMNI_CPU_XDIST_SCOPE=simple-engine pytest -sv tests/entrypoints tests/engine tests/diffusion --ignore=tests/diffusion/models -m 'core_model and cpu' -n 4 --dist=loadfile"
         mirror_hardwares: l4_1
 
       - label: "Simple · Other Test"

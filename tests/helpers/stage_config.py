@@ -650,8 +650,12 @@ def _materialize_ci_overlay(model_type: str) -> Path:
     if model_type not in _CI_OVERLAYS:
         raise KeyError(f"No CI overlay registered for {model_type!r}. Available: {sorted(_CI_OVERLAYS)}")
 
-    _CI_GENERATED_DIR.mkdir(parents=True, exist_ok=True)
-    out = _CI_GENERATED_DIR / f"{model_type}.yaml"
+    # Each process owns its base overlays; caller-specific variants already
+    # use unique mkstemp files in modify_stage_config. Workers must not
+    # rewrite another process's base file while it is being loaded.
+    generated_dir = _CI_GENERATED_DIR / str(os.getpid())
+    generated_dir.mkdir(parents=True, exist_ok=True)
+    out = generated_dir / f"{model_type}.yaml"
 
     overlay = {**_CI_OVERLAYS[model_type]}
     base = overlay.get("base_config")
