@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +14,7 @@ def _init_distributed(monkeypatch):
     """The native transformer uses vLLM parallel linear layers, which require a
     tensor-parallel group; initialize a single-process group for CPU tests
     (mirrors tests/diffusion/models/sana_video/test_transformer_sana_video.py)."""
+    from tests.helpers.runtime import assign_ephemeral_master_port
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -26,8 +26,7 @@ def _init_distributed(monkeypatch):
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
         lambda *_args, **_kwargs: default_unquantized_gemm,
     )
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29502")
+    assign_ephemeral_master_port()
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
     initialize_model_parallel()
     yield

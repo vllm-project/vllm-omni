@@ -9,8 +9,6 @@ prefix rooted at the block prefix.  This is critical for quantized weight loadin
 to match checkpoint keys to the correct model parameters.
 """
 
-import os
-
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -25,14 +23,14 @@ _HEAD_DIM = _DIM // _HEADS
 def _init_distributed():
     """Initialize the minimal distributed environment required by
     vLLM parallel linear layers (tensor-parallel group must exist)."""
+    from tests.helpers.runtime import assign_ephemeral_master_port
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29502")
+    assign_ephemeral_master_port()
     init_distributed_environment(
         world_size=1,
         rank=0,

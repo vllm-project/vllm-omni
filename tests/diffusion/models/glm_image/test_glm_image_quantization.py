@@ -6,8 +6,6 @@ These tests verify that the GLM-Image DiT transformer correctly accepts and uses
 quantization configs for W4A16/AutoRound quantization support.
 """
 
-import os
-
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -37,14 +35,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _init_distributed():
     """Initialize the minimal distributed environment required by
     ReplicatedLinear (tensor-parallel group must exist)."""
+    from tests.helpers.runtime import assign_ephemeral_master_port
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29502")
+    assign_ephemeral_master_port()
     init_distributed_environment(
         world_size=1,
         rank=0,

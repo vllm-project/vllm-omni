@@ -13,7 +13,11 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
+    # xdist's worker copies ``xdist_group`` onto the nodeid in its own
+    # collection hook. This hook has to run first, or ``--dist=loadgroup``
+    # never sees the group and schedules each test on its own.
     _pin_xdist_serial(config, items)
 
 
