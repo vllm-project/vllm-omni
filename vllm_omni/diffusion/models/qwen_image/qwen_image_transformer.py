@@ -41,12 +41,6 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
-from vllm_omni.diffusion.distributed.mixfusion_plan import (
-    MixFusionExpandArg,
-    MixFusionExpandRows,
-    MixFusionRoot,
-    MixFusionRopePrepare,
-)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -73,12 +67,18 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.diffusion.mixfusion.layout import (
-    MixFusionPlan,
-    build_mixfusion_plan,
+from vllm_omni.diffusion.mixfusion.execution_plan import (
+    PackedExecutionPlan,
+    build_execution_plan,
     split_sequence_chunks,
 )
 from vllm_omni.diffusion.mixfusion.packed_attention import MIXFUSION_PLAN_KEY
+from vllm_omni.diffusion.mixfusion.plan import (
+    MixFusionExpandArg,
+    MixFusionExpandRows,
+    MixFusionRoot,
+    MixFusionRopePrepare,
+)
 
 logger = init_logger(__name__)
 
@@ -1164,7 +1164,7 @@ class MixFusionInputs:
     # Chunk-stacked image stream, already projected by ``img_in``.
     encoder_hidden_states_mask: torch.Tensor | None  # normalized: None when all-valid
     image_rotary_emb: tuple[torch.Tensor, torch.Tensor]
-    plan: MixFusionPlan
+    plan: PackedExecutionPlan
     image_row_counts: list[int]
     # Step-invariant layout, kept for the ``cached`` fast path:
     row_vid_freqs: list[torch.Tensor]
@@ -1244,7 +1244,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
     }
 
     # MixFusion packed-layout plan (the MixFusion counterpart of _sp_plan, see
-    # distributed/mixfusion_plan.py). The pipeline arms a MixFusionStep on the
+    # mixfusion/plan.py). The pipeline arms a MixFusionStep on the
     # forward context per packed denoise step; these boundary hooks then run
     # the chunk-stacked layout without any MixFusion branching in forward().
     _mixfusion_plan = {
@@ -1532,7 +1532,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
             # Packing layout is identical across blocks and steps: build it once
             # per layout (cu_seqlens / out-gather indices as device tensors) so
             # the 60 blocks run pure GPU work.
-            mixfusion_plan = build_mixfusion_plan(
+            mixfusion_plan = build_execution_plan(
                 seq_len_txt=seq_len_txt,
                 chunk_size=chunk_size,
                 request_chunk_ranges=request_chunk_ranges,

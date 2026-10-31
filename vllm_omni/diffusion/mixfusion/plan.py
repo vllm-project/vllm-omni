@@ -15,7 +15,8 @@ Unlike an ``_sp_plan``, the packed layout is data-dependent per denoise step
 (chunk count and request shapes), so there is no static config object: the
 pipeline arms a :class:`~vllm_omni.diffusion.forward_context.MixFusionStep`
 on the forward context and the root hook derives the concrete
-:class:`~vllm_omni.diffusion.mixfusion.layout.MixFusionPlan` from the batch.
+:class:`~vllm_omni.diffusion.mixfusion.execution_plan.PackedExecutionPlan`
+from the batch.
 
 Example::
 

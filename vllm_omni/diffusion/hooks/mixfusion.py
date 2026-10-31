@@ -4,7 +4,7 @@
 
 Mirrors :mod:`vllm_omni.diffusion.hooks.sequence_parallel`: the model declares
 a ``_mixfusion_plan`` (see
-:mod:`vllm_omni.diffusion.distributed.mixfusion_plan`) and the pipeline arms
+:mod:`vllm_omni.diffusion.mixfusion.plan`) and the pipeline arms
 a :class:`~vllm_omni.diffusion.forward_context.MixFusionStep` on the forward
 context for each packed denoise step. These hooks execute the packed
 chunk-stacked layout at the declared module boundaries, keeping transformer
@@ -19,21 +19,21 @@ from __future__ import annotations
 
 from torch import nn
 
-from vllm_omni.diffusion.distributed.mixfusion_plan import (
-    MixFusionExpandArg,
-    MixFusionExpandRows,
-    MixFusionRoot,
-    MixFusionRopePrepare,
-)
 from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
 from vllm_omni.diffusion.hooks.sequence_parallel import _get_submodule_by_name
-from vllm_omni.diffusion.mixfusion.layout import (
+from vllm_omni.diffusion.mixfusion.execution_plan import (
     expand_per_chunk,
     reassemble_chunk_rows,
+)
+from vllm_omni.diffusion.mixfusion.plan import (
+    MixFusionExpandArg,
+    MixFusionExpandRows,
+    MixFusionRoot,
+    MixFusionRopePrepare,
 )
 
 # Fixed hook names, one per plan spec type (each target module owns its own

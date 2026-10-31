@@ -3,7 +3,7 @@
 """Tests for the MixFusion module-boundary hooks (CPU).
 
 The hooks implement the packed chunk-stacked layout purely at declared module
-boundaries (see ``distributed/mixfusion_plan.py``), mirroring the SP hook
+boundaries (see ``mixfusion/plan.py``), mirroring the SP hook
 mechanism. These tests use a minimal stand-in transformer whose pack method
 reuses the real ``split_sequence_chunks`` layout, and verify:
 
@@ -25,12 +25,6 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.distributed.mixfusion_plan import (
-    MixFusionExpandArg,
-    MixFusionExpandRows,
-    MixFusionRoot,
-    MixFusionRopePrepare,
-)
 from vllm_omni.diffusion.forward_context import (
     ForwardContext,
     MixFusionStep,
@@ -41,10 +35,16 @@ from vllm_omni.diffusion.hooks.mixfusion import (
     apply_mixfusion,
     remove_mixfusion,
 )
-from vllm_omni.diffusion.mixfusion.layout import (
+from vllm_omni.diffusion.mixfusion.execution_plan import (
     expand_per_chunk,
     reassemble_chunk_rows,
     split_sequence_chunks,
+)
+from vllm_omni.diffusion.mixfusion.plan import (
+    MixFusionExpandArg,
+    MixFusionExpandRows,
+    MixFusionRoot,
+    MixFusionRopePrepare,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]

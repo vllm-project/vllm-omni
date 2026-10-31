@@ -27,7 +27,7 @@ import torch
 
 
 @dataclass
-class MixFusionPlan:
+class PackedExecutionPlan:
     """Per-step MixFusion packing layout, computed once and shared by all blocks.
 
     Holds the flat varlen sequence layout (cu_seqlens / max_seq_len) plus the
@@ -50,7 +50,7 @@ class MixFusionPlan:
     txt_pad_idx: torch.Tensor | None
 
 
-def build_mixfusion_plan(
+def build_execution_plan(
     *,
     seq_len_txt: int,
     chunk_size: int,
@@ -58,7 +58,7 @@ def build_mixfusion_plan(
     real_txt_lens: list[int],
     chunk_to_request: torch.Tensor,
     device: torch.device,
-) -> MixFusionPlan:
+) -> PackedExecutionPlan:
     cu_seqlens = [0]
     txt_out_rows: list[int] = []
     img_out_rows: list[int] = []
@@ -74,7 +74,7 @@ def build_mixfusion_plan(
         max_seq_len = max(max_seq_len, txt_len + img_len)
         txt_pad_rows.extend(range(req_idx * seq_len_txt, req_idx * seq_len_txt + txt_len))
     needs_padding = any(txt_len < seq_len_txt for txt_len in real_txt_lens)
-    return MixFusionPlan(
+    return PackedExecutionPlan(
         cu_seqlens=cu_seqlens,
         cu_seqlens_tensor=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
         max_seq_len=max_seq_len,

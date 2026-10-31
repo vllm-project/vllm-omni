@@ -23,7 +23,7 @@ from __future__ import annotations
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.mixfusion.layout import MixFusionPlan
+from vllm_omni.diffusion.mixfusion.execution_plan import PackedExecutionPlan
 
 MIXFUSION_PLAN_KEY = "mixfusion_plan"
 
@@ -48,7 +48,7 @@ def run_mixfusion_packed_attention(
     Returns ``(image, text)`` attention outputs in the input stream layouts
     (chunk-stacked and request-level respectively).
     """
-    plan: MixFusionPlan = attn_metadata.extra[MIXFUSION_PLAN_KEY]
+    plan: PackedExecutionPlan = attn_metadata.extra[MIXFUSION_PLAN_KEY]
     txt_query = attn_metadata.joint_query
     txt_key = attn_metadata.joint_key
     txt_value = attn_metadata.joint_value

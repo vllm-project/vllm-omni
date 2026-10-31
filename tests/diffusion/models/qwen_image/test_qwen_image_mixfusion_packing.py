@@ -29,13 +29,13 @@ from vllm_omni.diffusion.forward_context import (
     MixFusionStep,
     override_forward_context,
 )
+from vllm_omni.diffusion.mixfusion.execution_plan import build_execution_plan
 from vllm_omni.diffusion.mixfusion.packed_attention import (
     MIXFUSION_PLAN_KEY,
     run_mixfusion_packed_attention,
 )
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageCrossAttention,
-    build_mixfusion_plan,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -185,7 +185,7 @@ def _mixfusion_inputs():
 
 def _forward(module):
     image_chunks, encoder_hidden_states, image_freq_chunks, text_freqs, chunk_to_request = _mixfusion_inputs()
-    plan = build_mixfusion_plan(
+    plan = build_execution_plan(
         seq_len_txt=SEQ_LEN_TXT,
         chunk_size=CHUNK_SIZE,
         request_chunk_ranges=REQUEST_CHUNK_RANGES,
