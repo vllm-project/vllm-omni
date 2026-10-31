@@ -35,6 +35,7 @@ via ``on_requests_finished``.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterable
 from typing import Any
 
@@ -105,6 +106,8 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         self._hidden = int(getattr(talker_cfg, "hidden_size", 1152))
         self._vocab = max(int(getattr(talker_cfg, "vocab_size", 1024)), 2)
         self._dtype = getattr(vllm_config.model_config, "dtype", torch.bfloat16)
+        self._cas_cache: OrderedDict[tuple[int, torch.device, torch.dtype], torch.Tensor] = OrderedDict()
+        self.register_buffer("_cas_singleton_mask", None, persistent=False)
         self._speaker_name = getattr(self.config, "inference_speaker_name", "Aria") or "Aria"
 
         # Omni AR runner contract flags.
@@ -444,12 +447,29 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
     # ------------------------------------------------------------------
     # Native-vLLM path (experimental; see __init__).
     # ------------------------------------------------------------------
-    def _encode_cas_rows(self, ids: torch.Tensor) -> torch.Tensor:
-        """Batched CharAwareSubwordEncoder rows for timeline tokens ([n, H])."""
-        model = self.tts.tts_model
-        mask = torch.ones(1, ids.numel(), dtype=torch.bool, device=ids.device)
+    def _encode_cas_rows(self, ids: torch.Tensor, *, token_id: int | None = None) -> torch.Tensor:
+        """Encode timeline rows ([n, H]); cached singleton rows are shared and read-only."""
+        encoder = self.tts.tts_model.embed_subword
+        width = ids.numel()
+        key = None
+        # Memoize singleton inputs only when their token is already on the
+        # host. Wider cohorts retain their exact padding geometry, and cache
+        # lookup never adds a device-to-host sync.
+        if width == 1 and (token_id is not None or ids.device.type == "cpu"):
+            weight = encoder.embed_tokens.weight
+            key = (token_id if token_id is not None else int(ids[0]), weight.device, weight.dtype)
+            cached = self._cas_cache.get(key)
+            if cached is not None:
+                self._cas_cache.move_to_end(key)
+                return cached
+        mask = self._cas_singleton_mask if width == 1 else torch.ones(1, width, dtype=torch.bool, device=ids.device)
         with torch.inference_mode():
-            return model.embed_subword(ids.unsqueeze(0), mask)[0]
+            rows = encoder(ids.unsqueeze(0), mask)[0]
+        if key is not None:
+            self._cas_cache[key] = rows
+            if len(self._cas_cache) > 128:
+                self._cas_cache.popitem(last=False)
+        return rows
 
     def _init_native_session(self, request_id: str, info: dict[str, Any], device: torch.device) -> dict[str, Any]:
         from vllm_omni.model_executor.models.nemotron_voicechat.talker_native import (
@@ -566,8 +586,9 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         latest = self._try_timeline(info)
         old_len = int(session["timeline"].numel())
         if latest is not None and latest.numel() > old_len:
+            token_id = int(latest[old_len]) if latest.device.type == "cpu" and latest.numel() == old_len + 1 else None
             latest = latest.to(device)
-            new_rows = self._encode_cas_rows(latest[old_len:].to(torch.long))
+            new_rows = self._encode_cas_rows(latest[old_len:], token_id=token_id)
             session["timeline"] = latest
             session["cas_table"] = torch.cat([session["cas_table"], new_rows.to(session["cas_table"].dtype)], dim=0)
         if self._upstream_finished(info):
@@ -1011,6 +1032,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         decode happens in code2wav — but keeping its dtype canonical avoids
         surprises if warmup paths touch it).
         """
+        self._cas_cache.clear()
         from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.duplex_ear_tts import (
             DuplexEARTTS,
         )
@@ -1087,6 +1109,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         if hasattr(tts, "audio_codec") and tts.audio_codec is not None:
             tts.audio_codec.to(dtype=torch.float32)
         self.tts = tts.eval()
+        self._cas_singleton_mask = torch.ones((1, 1), dtype=torch.bool, device=device)
         logger.info(
             "NemotronVoiceChat talker loaded EAR-TTS: %d tensors, speaker=%s, guidance=%s",
             len(state),
