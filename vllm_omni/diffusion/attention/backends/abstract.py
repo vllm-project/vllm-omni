@@ -371,6 +371,19 @@ class AttentionImpl(ABC, Generic[T]):
         del query, key, value, attn_metadata
         return ExecutionPathResult.unmigrated(type(self).__name__, context)
 
+    def graph_phase(self, attn_metadata: "AttentionMetadata | None") -> int:
+        """Tag the kernel this forward would use, for graph-capture keying.
+
+        Backends whose kernel choice depends on the denoise step override this,
+        so a captured graph is never replayed across a kernel switch. Return a
+        non-negative tag for a replayable kernel; return a negative value to
+        declare this forward uncapturable (for example when the path reads a
+        tensor whose address is not stable across forwards, which a captured
+        graph would bake in). The default is one capturable phase because most
+        backends ignore the step index.
+        """
+        return 0
+
     def forward(
         self,
         query: torch.Tensor,
