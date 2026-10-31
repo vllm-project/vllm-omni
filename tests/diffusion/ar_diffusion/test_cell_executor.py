@@ -21,6 +21,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     NoisyKVCache,
     NoisyKVState,
 )
+from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -317,3 +318,50 @@ def test_same_rank_clean_receives_final_latent_without_adapter_cache():
     run_cell_pipeline(ctx=ctx, adapter=StatelessAdapter())
     assert not ctx.inflight
     assert ctx.kv.resident_versions == 0
+
+
+def test_cell_failure_releases_only_the_failed_request():
+    """A cell failure must not drop versions owned by another request in the pool.
+
+    ``NoisyKVState.reset_all()`` clears the whole pool, so using it for a
+    request-scoped failure also destroys live versions of a request that was
+    never part of this execution context.
+    """
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=2,
+            num_denoise_steps=1,
+            step_replicas=1,
+            layer_groups=1,
+            ordering=Ordering.SELF_FORCING,
+            kv_history_chunks=1,
+        )
+    )
+    cache = NoisyKVCache(
+        ARDiffusionNoisyKVSpec(
+            num_layers=1,
+            num_kv_heads=1,
+            head_size=1,
+            block_size=4,
+            max_chunk_tokens=4,
+            max_history_chunks=1,
+        ),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=1,
+        max_batch_size=1,
+    )
+    ctx = ARDiffusionCellContext(
+        spec=CellRunSpec(topology=CellTopology(step_replicas=1, layer_groups=1), rank=0),
+        kv=NoisyKVState(cache),
+    )
+    assert ctx.admit("A", plan, chunk_tokens=4, slot=0)
+    cache.pool.alloc(("A", 0, 0, 0))
+    cache.pool.alloc(("B", 0, 0, 0))
+
+    ARDiffusionModelRunner._release_cell_requests(ctx)
+
+    assert not cache.pool.has(("A", 0, 0, 0))
+    assert cache.pool.has(("B", 0, 0, 0))
+    assert not ctx.inflight
+    assert not ctx.pending
