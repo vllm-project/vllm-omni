@@ -1661,6 +1661,33 @@ class DiffusionEngine:
                         output = fut.result(timeout=_async_output_timeout())
                     return output
 
+    def _profile_args(
+        self,
+        is_start: bool,
+        profile_prefix: str | None,
+        delay_iterations: int | None,
+        max_iterations: int | None,
+    ) -> tuple[tuple[bool, str | None], dict[str, int]]:
+        if is_start:
+            if profile_prefix is None:
+                profile_prefix = f"diffusion_{int(time.time())}"
+            logger.info(f"Starting diffusion profiling with prefix: {profile_prefix}")
+        else:
+            logger.info("Stopping diffusion profiling...")
+
+        kwargs: dict[str, int] = {}
+        if delay_iterations is not None:
+            kwargs["delay_iterations"] = delay_iterations
+        if max_iterations is not None:
+            kwargs["max_iterations"] = max_iterations
+        return (is_start, profile_prefix), kwargs
+
+    def _profile_failed(self, is_start: bool, e: Exception) -> None:
+        action = "start" if is_start else "stop"
+        logger.error(f"Failed to {action} profiling on workers", exc_info=True)
+        if is_start:
+            raise RuntimeError(f"Could not {action} profiler: {e}") from e
+
     def profile(
         self,
         is_start: bool = True,
@@ -1671,34 +1698,49 @@ class DiffusionEngine:
     ) -> None:
         """Start or stop profiling on all diffusion workers.
 
+        Before the busy loop starts, this runs on the calling thread. With the
+        in-process executor, the torch profiler session is thread-local, so use
+        :meth:`async_profile` from event-loop callers instead.
+
         Args:
             is_start: True to start profiling, False to stop.
             profile_prefix: Optional prefix for trace filename.
             delay_iterations: Per-session worker steps before profiling starts.
             max_iterations: Per-session limit on profiled worker steps.
         """
-        if is_start:
-            if profile_prefix is None:
-                profile_prefix = f"diffusion_{int(time.time())}"
-            logger.info(f"Starting diffusion profiling with prefix: {profile_prefix}")
-        else:
-            logger.info("Stopping diffusion profiling...")
-
+        args, kwargs = self._profile_args(is_start, profile_prefix, delay_iterations, max_iterations)
         try:
-            kwargs: dict[str, int] = {}
-            if delay_iterations is not None:
-                kwargs["delay_iterations"] = delay_iterations
-            if max_iterations is not None:
-                kwargs["max_iterations"] = max_iterations
             if kwargs:
-                self.collective_rpc(method="profile", args=(is_start, profile_prefix), kwargs=kwargs)
+                self.collective_rpc(method="profile", args=args, kwargs=kwargs)
             else:
-                self.collective_rpc(method="profile", args=(is_start, profile_prefix))
+                self.collective_rpc(method="profile", args=args)
         except Exception as e:
-            action = "start" if is_start else "stop"
-            logger.error(f"Failed to {action} profiling on workers", exc_info=True)
-            if is_start:
-                raise RuntimeError(f"Could not {action} profiler: {e}") from e
+            self._profile_failed(is_start, e)
+
+    async def async_profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
+        """Async variant of :meth:`profile` that always runs on the busy loop.
+
+        The in-process executor runs the worker on the busy-loop thread, and the
+        torch profiler session is thread-local. If start ran on another thread
+        (the busy loop only starts with the first request), stop finds no
+        session on the busy loop and kineto's trace save() segfaults. Starting
+        the loop here keeps start, the profiled requests, and stop on one thread.
+        """
+        args, kwargs = self._profile_args(is_start, profile_prefix, delay_iterations, max_iterations)
+        try:
+            if kwargs:
+                await self.async_collective_rpc(method="profile", args=args, kwargs=kwargs)
+            else:
+                await self.async_collective_rpc(method="profile", args=args)
+        except Exception as e:
+            self._profile_failed(is_start, e)
 
     def run_startup_warmup(self) -> None:
         try:
