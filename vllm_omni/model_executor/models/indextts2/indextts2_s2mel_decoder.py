@@ -1252,6 +1252,14 @@ class IndexTTS2S2MelDecoder(nn.Module):
                     "S2Mel DiT torch.compile skipped on device type %s",
                     device.type,
                 )
+        elif self.s2mel_dit_cuda_graph and device.type == "cuda":
+            cfm = self.s2mel.models["cfm"] if "cfm" in self.s2mel.models else None
+            estimator = getattr(cfm, "estimator", None) if cfm is not None else None
+            if estimator is not None:
+                self._enable_dit_cuda_graph(estimator)
+        if device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         self._dit_runtime_configured = True
 
     def _warmup_external_models(self) -> None:
