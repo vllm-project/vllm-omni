@@ -26,25 +26,30 @@ if TYPE_CHECKING:
 class MixFusionStep:
     """Pipeline-armed record of one packed MixFusion denoise step.
 
-    The pipeline sets only the activation policy (chunk-size bounds from the
-    per-request extras); the MixFusion root hook fills ``plan`` / ``packed`` /
-    ``image_row_counts`` while the forward runs. A new ForwardContext is
-    created per ``execute_model`` call, and the pipeline restores
-    ``mixfusion_step`` in a ``finally``, so nothing here leaks across steps.
+    The driver sets the activation policy (chunk-size bounds from the
+    per-request extras) and optionally the model adapter; the MixFusion root
+    hook fills ``adapter`` / ``layout`` / ``plan`` / ``packed`` while the
+    forward runs. A new ForwardContext is created per ``execute_model`` call,
+    and the pipeline restores ``mixfusion_step`` in a ``finally``, so nothing
+    here leaks across steps.
 
     All tensor/plan fields are deliberately opaque (``Any``): the common
-    context module must not import the MixFusion layout types.
+    context module must not import the MixFusion layout or adapter types.
     """
 
-    # Packing policy, read by the pack method (per-request extras defaults).
+    # Packing policy, read by the driver (per-request extras defaults).
     min_chunk_tokens: int = 256
     max_chunks: int = 128
+    # Model-side adapter; the root hook falls back to ``module.mixfusion_adapter``
+    # when the driver does not set one here.
+    adapter: Any = None
+    # Attention stream layout (opaque; set by the adapter).
+    layout: Any = None
     # Filled by the root hook while the packed forward runs:
     plan: Any = None
-    image_row_counts: list[int] | None = None
-    # (packed hidden states, vid_freqs, txt_freqs) as handed out by the
-    # ``image_rope_prepare`` boundary.
-    packed: tuple[Any, Any, Any] | None = None
+    # ``PackedInputs`` from the adapter: rewritten call, boundary outputs and
+    # its private state. Opaque to the framework.
+    packed: Any = None
 
 
 @dataclass

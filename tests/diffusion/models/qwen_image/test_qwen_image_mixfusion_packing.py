@@ -189,6 +189,7 @@ def _forward(module):
         seq_len_txt=SEQ_LEN_TXT,
         chunk_size=CHUNK_SIZE,
         request_chunk_ranges=REQUEST_CHUNK_RANGES,
+        image_row_counts=[1, 1],
         real_txt_lens=REAL_TXT_LENS,
         chunk_to_request=chunk_to_request,
         device=image_chunks.device,

@@ -39,6 +39,10 @@ class PackedExecutionPlan:
     cu_seqlens_tensor: torch.Tensor
     max_seq_len: int
     request_chunk_ranges: list[tuple[int, int]]
+    # Number of packed rows per caller-side state (a state may hold several
+    # images/prompts); output reassembly concatenates each state's rows back
+    # into one tensor.
+    image_row_counts: tuple[int, ...]
     real_txt_lens: list[int]
     seq_len_txt: int
     chunk_size: int
@@ -55,6 +59,7 @@ def build_execution_plan(
     seq_len_txt: int,
     chunk_size: int,
     request_chunk_ranges: list[tuple[int, int]],
+    image_row_counts: Sequence[int],
     real_txt_lens: list[int],
     chunk_to_request: torch.Tensor,
     device: torch.device,
@@ -79,6 +84,7 @@ def build_execution_plan(
         cu_seqlens_tensor=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
         max_seq_len=max_seq_len,
         request_chunk_ranges=request_chunk_ranges,
+        image_row_counts=tuple(int(count) for count in image_row_counts),
         real_txt_lens=real_txt_lens,
         seq_len_txt=seq_len_txt,
         chunk_size=chunk_size,

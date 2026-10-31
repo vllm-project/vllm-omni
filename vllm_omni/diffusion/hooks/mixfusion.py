@@ -10,12 +10,18 @@ context for each packed denoise step. These hooks execute the packed
 chunk-stacked layout at the declared module boundaries, keeping transformer
 and block ``forward`` code free of MixFusion branching.
 
+The hooks contain no model-specific knowledge: packing, boundary outputs and
+output restoration are delegated to the model's
+:class:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter`.
+
 All hooks are inert unless the forward context carries an armed
 ``mixfusion_step``, so the same model runs its serial path unchanged when
 MixFusion is not active.
 """
 
 from __future__ import annotations
+
+import inspect
 
 from torch import nn
 
@@ -25,28 +31,26 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook
 from vllm_omni.diffusion.hooks.sequence_parallel import _get_submodule_by_name
-from vllm_omni.diffusion.mixfusion.execution_plan import (
-    expand_per_chunk,
-    reassemble_chunk_rows,
-)
+from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter, PackedInputs
+from vllm_omni.diffusion.mixfusion.execution_plan import expand_per_chunk
 from vllm_omni.diffusion.mixfusion.plan import (
     MixFusionExpandArg,
     MixFusionExpandRows,
+    MixFusionReplaceOutput,
     MixFusionRoot,
-    MixFusionRopePrepare,
 )
 
 # Fixed hook names, one per plan spec type (each target module owns its own
 # registry, so the same name on ``transformer_blocks.*.img_mod`` instances
 # never collides).
 MIXFUSION_PACK_HOOK_NAME = "mixfusion_pack"
-MIXFUSION_ROPE_HOOK_NAME = "mixfusion_rope_prepare"
+MIXFUSION_REPLACE_OUTPUT_HOOK_NAME = "mixfusion_replace_output"
 MIXFUSION_EXPAND_ROWS_HOOK_NAME = "mixfusion_expand_rows"
 MIXFUSION_EXPAND_ARG_HOOK_NAME = "mixfusion_expand_arg"
 
 MIXFUSION_HOOK_NAMES = (
     MIXFUSION_PACK_HOOK_NAME,
-    MIXFUSION_ROPE_HOOK_NAME,
+    MIXFUSION_REPLACE_OUTPUT_HOOK_NAME,
     MIXFUSION_EXPAND_ROWS_HOOK_NAME,
     MIXFUSION_EXPAND_ARG_HOOK_NAME,
 )
@@ -63,86 +67,92 @@ def _active_step():
     return get_forward_context().mixfusion_step
 
 
+def _resolve_adapter(module: nn.Module, step) -> MixFusionAdapter:
+    """Return the model's adapter, falling back to the step-carried one."""
+    adapter = getattr(module, "mixfusion_adapter", None)
+    if adapter is None:
+        adapter = step.adapter
+    if adapter is None:
+        raise TypeError(
+            f"MixFusion is armed but {type(module).__name__} declares no "
+            "`mixfusion_adapter`. Add a MixFusionAdapter attribute to the model "
+            "(see vllm_omni/diffusion/mixfusion/adapter.py) or leave MixFusion off."
+        )
+    return adapter
+
+
 class MixFusionRootHook(ModelHook):
     """Root (``""``) boundary: pack before forward, reassemble after it.
 
-    ``pre_forward`` calls the transformer's pack method (default
-    ``prepare_mixfusion_inputs``) on the per-request latent list and swaps the
-    chunk-stacked batch into ``hidden_states``; ``post_forward`` reassembles
-    the per-request outputs via :func:`reassemble_chunk_rows`.
+    ``pre_forward`` binds the model's forward call and delegates to the
+    adapter: it decides whether the call is packable and rewrites it into the
+    packed layout. ``post_forward`` asks the adapter to turn the packed output
+    back into one output per request.
     """
 
-    def __init__(self, pack_method: str = "prepare_mixfusion_inputs") -> None:
-        self._pack_method = pack_method
+    def __init__(self) -> None:
         # Bundle from the previous denoise step: the layout (RoPE tables,
-        # plan, row counts) depends only on request shapes, so it is reused
-        # via the pack method's ``cached`` fast path. Cleared by reset_state.
-        self._cached = None
+        # plan, row counts) depends only on request shapes, so the adapter
+        # reuses it through the ``cache`` argument. Cleared by reset_state.
+        self._cached: PackedInputs | None = None
 
     def pre_forward(self, module, *args, **kwargs):
         step = _active_step()
         if step is None:
             return args, kwargs
-        if "hidden_states" not in kwargs:
-            # Contract: the packed call must pass hidden_states by keyword; the
-            # pipeline already does. Keep the failure actionable rather than
-            # silently packing nothing.
-            raise TypeError(
-                "MixFusion packing requires `hidden_states` to be passed as a "
-                "keyword argument to the transformer forward."
-            )
-        if not isinstance(kwargs["hidden_states"], (list, tuple)):
-            # A batched tensor means a non-packed forward while the step is
-            # armed (e.g. memory profiling): stay serial.
+        adapter = _resolve_adapter(module, step)
+        bound = inspect.signature(module.forward).bind(*args, **kwargs)
+        can_pack, _ = adapter.can_pack(module, bound)
+        if not can_pack:
+            # A batched tensor while the step is armed (e.g. memory
+            # profiling): stay serial.
             return args, kwargs
-        packed = getattr(module, self._pack_method)(
-            hidden_states=kwargs["hidden_states"],
-            encoder_hidden_states=kwargs["encoder_hidden_states"],
-            encoder_hidden_states_mask=kwargs.get("encoder_hidden_states_mask"),
-            img_shapes=kwargs.get("img_shapes"),
-            txt_seq_lens=kwargs.get("txt_seq_lens"),
-            attention_kwargs=kwargs.get("attention_kwargs"),
-            cached=self._cached,
-        )
+        packed = adapter.pack_inputs(module, bound, step=step, cache=self._cached)
+        if packed is None:
+            return args, kwargs
         self._cached = packed
+        step.adapter = adapter
         step.plan = packed.plan
-        step.image_row_counts = packed.image_row_counts
-        # Forward unpacks ``image_rope_prepare`` as
-        # ``hidden_states, vid_freqs, txt_freqs``; hand it the root-computed
-        # packed triple so that boundary becomes a no-op.
-        step.packed = (packed.hidden_states, *packed.image_rotary_emb)
-        kwargs["hidden_states"] = packed.hidden_states
-        kwargs["encoder_hidden_states_mask"] = packed.encoder_hidden_states_mask
-        return args, kwargs
+        step.packed = packed
+        return packed.args, packed.kwargs
 
     def post_forward(self, module, output):
         step = _active_step()
-        if step is None or step.plan is None:
+        if step is None or step.packed is None:
             return output
         # ``forward`` always returns Transformer2DModelOutput here (the model
         # ignores return_dict today); hand the pipeline the bare per-request
-        # list the packed path already produced pre-hook.
-        return reassemble_chunk_rows(output.sample, step.plan.request_chunk_ranges, step.image_row_counts)
+        # list the adapter restores.
+        return step.adapter.restore_output(module, output, step.packed.plan)
 
     def reset_state(self, module):
         self._cached = None
         return module
 
 
-class MixFusionRopePrepareHook(ModelHook):
-    """``image_rope_prepare`` boundary: return the root-computed packed tensors.
+class MixFusionReplaceOutputHook(ModelHook):
+    """Declared boundary: return the adapter-computed value for this module.
 
-    The packed hidden states (already projected by ``img_in``) and the RoPE
-    tables are produced by the root hook, because only the root boundary also
-    sees the text stream. Recomputing them here would either run on the wrong
-    layout (``img_in`` on a list) or repeat the projection/pos_embed work.
+    The value comes from ``PackedInputs.boundary_outputs``: the adapter
+    computes it once at the root, where the request list and text stream are
+    still visible. Recomputing it here would either run on the wrong layout or
+    repeat projection / ``pos_embed`` work.
     """
+
+    def __init__(self, boundary: str) -> None:
+        self._boundary = boundary
 
     def new_forward(self, module, *args, **kwargs):
         step = _active_step()
         if step is None or step.packed is None:
             return module._omni_original_forward(*args, **kwargs)
-        return step.packed
+        try:
+            return step.packed.boundary_outputs[self._boundary]
+        except KeyError:
+            raise KeyError(
+                f"MixFusion boundary output {self._boundary!r} was not produced "
+                f"by {type(step.adapter).__name__}; declared on {type(module).__name__}."
+            ) from None
 
 
 class MixFusionExpandRowsHook(ModelHook):
@@ -160,43 +170,43 @@ class MixFusionExpandRowsHook(ModelHook):
 
 
 class MixFusionExpandArgHook(ModelHook):
-    """Input side: expand a positional argument to per-chunk rows.
+    """Input side: expand a named forward argument to per-chunk rows.
 
-    E.g. ``norm_out(x, temb)`` receives per-request ``temb`` alongside
-    chunk-stacked hidden states.
+    E.g. ``norm_out(x, conditioning_embedding)`` receives per-request
+    conditioning alongside chunk-stacked hidden states.
     """
 
-    def __init__(self, arg_index: int, expected_dims: int = 2) -> None:
-        self._arg_index = arg_index
+    def __init__(self, arg_name: str, expected_dims: int = 2) -> None:
+        self._arg_name = arg_name
         self._expected_dims = expected_dims
 
     def pre_forward(self, module, *args, **kwargs):
         step = _active_step()
         if step is None or step.plan is None:
             return args, kwargs
-        args = list(args)
-        if self._arg_index >= len(args):
-            raise IndexError(
-                f"MixFusionExpandArg on {type(module).__name__} expects "
-                f"positional argument {self._arg_index}, got {len(args)} "
-                "positional arguments."
+        bound = inspect.signature(module.forward).bind(*args, **kwargs)
+        if self._arg_name not in bound.arguments:
+            raise TypeError(
+                f"MixFusionExpandArg on {type(module).__name__} expects a forward "
+                f"argument named {self._arg_name!r}; signature is "
+                f"{inspect.signature(module.forward)}."
             )
-        tensor = args[self._arg_index]
+        tensor = bound.arguments[self._arg_name]
         if tensor.dim() != self._expected_dims:
             raise ValueError(
-                f"{type(module).__name__} argument {self._arg_index} must be "
+                f"{type(module).__name__} argument {self._arg_name!r} must be "
                 f"{self._expected_dims}-D for MixFusion expansion, got shape "
                 f"{tuple(tensor.shape)}."
             )
-        args[self._arg_index] = expand_per_chunk(tensor, step.plan.chunk_to_request)
-        return tuple(args), kwargs
+        bound.arguments[self._arg_name] = expand_per_chunk(tensor, step.plan.chunk_to_request)
+        return bound.args, bound.kwargs
 
 
 def _spec_hook_name(spec) -> str:
     if isinstance(spec, MixFusionRoot):
         return MIXFUSION_PACK_HOOK_NAME
-    if isinstance(spec, MixFusionRopePrepare):
-        return MIXFUSION_ROPE_HOOK_NAME
+    if isinstance(spec, MixFusionReplaceOutput):
+        return MIXFUSION_REPLACE_OUTPUT_HOOK_NAME
     if isinstance(spec, MixFusionExpandRows):
         return MIXFUSION_EXPAND_ROWS_HOOK_NAME
     if isinstance(spec, MixFusionExpandArg):
@@ -206,13 +216,13 @@ def _spec_hook_name(spec) -> str:
 
 def _spec_hook(spec) -> ModelHook:
     if isinstance(spec, MixFusionRoot):
-        return MixFusionRootHook(spec.pack_method)
-    if isinstance(spec, MixFusionRopePrepare):
-        return MixFusionRopePrepareHook()
+        return MixFusionRootHook()
+    if isinstance(spec, MixFusionReplaceOutput):
+        return MixFusionReplaceOutputHook(spec.boundary)
     if isinstance(spec, MixFusionExpandRows):
         return MixFusionExpandRowsHook()
     if isinstance(spec, MixFusionExpandArg):
-        return MixFusionExpandArgHook(spec.arg_index, spec.expected_dims)
+        return MixFusionExpandArgHook(spec.arg_name, spec.expected_dims)
     raise TypeError(f"Unsupported MixFusion plan entry: {type(spec).__name__} ({spec!r})")
 
 

@@ -14,23 +14,27 @@ wildcard) to one of the declarative types below.
 Unlike an ``_sp_plan``, the packed layout is data-dependent per denoise step
 (chunk count and request shapes), so there is no static config object: the
 pipeline arms a :class:`~vllm_omni.diffusion.forward_context.MixFusionStep`
-on the forward context and the root hook derives the concrete
+on the forward context and the root hook asks the model's
+:class:`~vllm_omni.diffusion.mixfusion.adapter.MixFusionAdapter` to derive the
+concrete
 :class:`~vllm_omni.diffusion.mixfusion.execution_plan.PackedExecutionPlan`
 from the batch.
 
 Example::
 
     class MyTransformer(nn.Module):
+        mixfusion_adapter = MyMixFusionAdapter()
+
         _mixfusion_plan = {
             # Pack the per-request latent list before forward, restore the
             # per-request list after it.
-            "": MixFusionRoot(pack_method="prepare_mixfusion_inputs"),
-            # Hand out the packed hidden states / RoPE tables computed at
-            # the root instead of recomputing them on the packed batch.
-            "image_rope_prepare": MixFusionRopePrepare(),
+            "": MixFusionRoot(),
+            # Hand out the packed hidden states / RoPE tables produced by the
+            # adapter instead of recomputing them on the packed batch.
+            "image_rope_prepare": MixFusionReplaceOutput(boundary="rope"),
             # Expand per-request conditioning rows to per-chunk rows.
             "transformer_blocks.*.img_mod": MixFusionExpandRows(),
-            "norm_out": MixFusionExpandArg(arg_index=1),
+            "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
         }
 """
 
@@ -49,29 +53,29 @@ class MixFusionRoot:
 
     The root is the only boundary that sees both the per-request latent list
     and the text stream (whose padded width participates in every RoPE
-    table), so the packing work has to start there. ``pre_forward`` calls the
-    transformer method named by ``pack_method`` and replaces the
-    ``hidden_states`` keyword with the chunk-stacked batch;
-    ``post_forward`` reassembles the per-request outputs.
-
-    Args:
-        pack_method: Name of the transformer method that turns a list of
-            per-request latents into the packed inputs, e.g.
-            ``QwenImageTransformer2DModel.prepare_mixfusion_inputs``.
+    table), so the packing work has to start there. ``pre_forward`` delegates
+    to the model's :class:`MixFusionAdapter`, which rewrites the bound forward
+    call; ``post_forward`` asks the adapter to reassemble the per-request
+    outputs.
     """
-
-    pack_method: str = "prepare_mixfusion_inputs"
 
 
 @dataclass(frozen=True)
-class MixFusionRopePrepare:
-    """``image_rope_prepare`` boundary: return the root-computed packed tensors.
+class MixFusionReplaceOutput:
+    """Return an adapter-computed value instead of running this forward.
 
-    The packed hidden states (already projected by ``img_in``) and the RoPE
-    tables are produced by the root hook, because only that boundary also
-    sees the text stream. Recomputing them here would either run on the
-    wrong layout or repeat the projection / ``pos_embed`` work.
+    The value comes from ``PackedInputs.boundary_outputs[boundary]``: the
+    adapter computes it once at the root (where the text stream is still
+    visible) and the framework hands it back at this boundary, so the module's
+    original forward never runs on the packed batch.
+
+    Args:
+        boundary: Key into ``PackedInputs.boundary_outputs``; chosen by the
+            adapter, e.g. ``"rope"`` for the packed hidden states and RoPE
+            tables of an image-RoPE boundary.
     """
+
+    boundary: str
 
 
 @dataclass(frozen=True)
@@ -85,17 +89,20 @@ class MixFusionExpandRows:
 
 @dataclass(frozen=True)
 class MixFusionExpandArg:
-    """Input side: expand positional argument ``arg_index`` to per-chunk rows.
+    """Input side: expand forward argument ``arg_name`` to per-chunk rows.
 
     Use on modules that consume a per-request conditioning tensor alongside
-    chunk-stacked hidden states (e.g. ``norm_out(x, temb)``).
+    chunk-stacked hidden states (e.g.
+    ``norm_out(x, conditioning_embedding)``).
 
     Args:
-        arg_index: Index of the positional argument to expand.
+        arg_name: Name of the forward argument to expand. Bound by signature,
+            so it works whether the caller passed it positionally or by
+            keyword.
         expected_dims: Rank the argument must have before expansion; guards
             against signature drift turning the expansion into a silent
             reshape of the wrong tensor.
     """
 
-    arg_index: int
+    arg_name: str
     expected_dims: int = 2

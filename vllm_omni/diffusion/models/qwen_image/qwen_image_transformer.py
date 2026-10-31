@@ -67,17 +67,19 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.mixfusion.adapter import PackedInputs
 from vllm_omni.diffusion.mixfusion.execution_plan import (
     PackedExecutionPlan,
     build_execution_plan,
+    reassemble_chunk_rows,
     split_sequence_chunks,
 )
 from vllm_omni.diffusion.mixfusion.packed_attention import MIXFUSION_PLAN_KEY
 from vllm_omni.diffusion.mixfusion.plan import (
     MixFusionExpandArg,
     MixFusionExpandRows,
+    MixFusionReplaceOutput,
     MixFusionRoot,
-    MixFusionRopePrepare,
 )
 
 logger = init_logger(__name__)
@@ -1173,6 +1175,58 @@ class MixFusionInputs:
     key: tuple
 
 
+class QwenImageMixFusionAdapter:
+    """Model-side half of MixFusion for the Qwen image transformer.
+
+    The common root hook binds this model's forward call and delegates to the
+    adapter (see :mod:`vllm_omni.diffusion.mixfusion.adapter`): this class is
+    the only place that knows the forward signature (a per-request latent
+    list plus per-image prompts), the packed call's shape and how the packed
+    output maps back to one tensor per request.
+    """
+
+    def can_pack(self, module, bound) -> tuple[bool, str]:
+        if "hidden_states" not in bound.arguments:
+            # Contract: packing needs the per-request latent argument; keep
+            # the failure actionable rather than silently packing nothing.
+            raise TypeError(
+                f"MixFusion packing requires a `hidden_states` argument in the {type(module).__name__} forward call."
+            )
+        if not isinstance(bound.arguments["hidden_states"], (list, tuple)):
+            # A batched tensor means a non-packed forward while the step is
+            # armed (e.g. memory profiling): stay serial.
+            return False, "hidden_states is a batched tensor (serial forward)"
+        return True, ""
+
+    def pack_inputs(self, module, bound, *, step, cache: PackedInputs | None) -> PackedInputs:
+        cached = None if cache is None or cache.adapter_state is None else cache.adapter_state.get("prepare_inputs")
+        packed = module.prepare_mixfusion_inputs(
+            hidden_states=bound.arguments["hidden_states"],
+            encoder_hidden_states=bound.arguments.get("encoder_hidden_states"),
+            encoder_hidden_states_mask=bound.arguments.get("encoder_hidden_states_mask"),
+            img_shapes=bound.arguments.get("img_shapes"),
+            txt_seq_lens=bound.arguments.get("txt_seq_lens"),
+            attention_kwargs=bound.arguments.get("attention_kwargs"),
+            cached=cached,
+        )
+        bound.arguments["hidden_states"] = packed.hidden_states
+        bound.arguments["encoder_hidden_states_mask"] = packed.encoder_hidden_states_mask
+        return PackedInputs(
+            args=tuple(bound.args),
+            kwargs=dict(bound.kwargs),
+            plan=packed.plan,
+            # The rope boundary hands ``forward`` the root-computed packed
+            # triple (hidden_states, vid_freqs, txt_freqs) instead of
+            # recomputing it on the packed batch.
+            boundary_outputs={"rope": (packed.hidden_states, *packed.image_rotary_emb)},
+            cache_key=packed.key,
+            adapter_state={"prepare_inputs": packed},
+        )
+
+    def restore_output(self, module, output, plan: PackedExecutionPlan) -> list[torch.Tensor]:
+        return reassemble_chunk_rows(output.sample, plan.request_chunk_ranges, plan.image_row_counts)
+
+
 # Note: inheriting from CachedTransformer only when we support caching
 class QwenImageTransformer2DModel(CachedTransformer):
     """
@@ -1248,10 +1302,10 @@ class QwenImageTransformer2DModel(CachedTransformer):
     # forward context per packed denoise step; these boundary hooks then run
     # the chunk-stacked layout without any MixFusion branching in forward().
     _mixfusion_plan = {
-        "": MixFusionRoot(pack_method="prepare_mixfusion_inputs"),
-        "image_rope_prepare": MixFusionRopePrepare(),
+        "": MixFusionRoot(),
+        "image_rope_prepare": MixFusionReplaceOutput(boundary="rope"),
         "transformer_blocks.*.img_mod": MixFusionExpandRows(),
-        "norm_out": MixFusionExpandArg(arg_index=1),
+        "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
     }
 
     def __init__(
@@ -1357,6 +1411,10 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # This ensures modulate_index dimensions align with hidden_states after sharding
         # Only active when zero_cond_t=True (image editing models)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
+
+        # Model-side MixFusion adapter (see _mixfusion_plan above): the common
+        # hooks delegate all model-specific packing to it.
+        self.mixfusion_adapter = QwenImageMixFusionAdapter()
 
     @staticmethod
     def _mixfusion_chunk_size(hidden_states: list[torch.Tensor]) -> int:
@@ -1536,6 +1594,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 seq_len_txt=seq_len_txt,
                 chunk_size=chunk_size,
                 request_chunk_ranges=request_chunk_ranges,
+                image_row_counts=image_row_counts,
                 real_txt_lens=real_txt_lens,
                 chunk_to_request=torch.tensor(chunk_to_request, dtype=torch.long, device=packed_hidden_states.device),
                 device=packed_hidden_states.device,
