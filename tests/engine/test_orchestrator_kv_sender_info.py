@@ -218,6 +218,22 @@ def test_stage_engine_core_client_falls_back_to_detected_ip_for_loopback(monkeyp
     }
 
 
+@pytest.mark.parametrize("replica_host", ["127.0.0.1", "localhost", "::1"])
+def test_resolve_contact_host_replaces_loopback_replica_host(monkeypatch, replica_host):
+    client = object.__new__(StageEngineCoreClient)
+    client.client_addresses = {"replica_host": replica_host}
+    monkeypatch.setattr(client, "_detect_local_ip", lambda: "10.19.83.77")
+
+    assert client._resolve_contact_host() == "10.19.83.77"
+
+
+def test_resolve_contact_host_preserves_routable_replica_host():
+    client = object.__new__(StageEngineCoreClient)
+    client.client_addresses = {"replica_host": "10.19.83.77"}
+
+    assert client._resolve_contact_host() == "10.19.83.77"
+
+
 def test_stage_engine_core_client_uses_connector_config_for_sender_port():
     client = object.__new__(StageEngineCoreClient)
     client.stage_id = 3

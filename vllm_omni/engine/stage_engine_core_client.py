@@ -282,7 +282,7 @@ class StageEngineCoreClientBase(StageClientBase):
         the KV connector binds — prefer it when available.
         """
         replica_host = self.client_addresses.get("replica_host")
-        if replica_host:
+        if replica_host and replica_host not in {"localhost", "127.0.0.1", "::1"}:
             return replica_host
         for key in ("input_address", "output_address", "stats_update_address"):
             address = self.client_addresses.get(key)
@@ -291,7 +291,7 @@ class StageEngineCoreClientBase(StageClientBase):
             host = urlparse(address).hostname
             if host in {None, "", "*", "0.0.0.0", "::"}:
                 continue
-            if host in {"localhost", "127.0.0.1"}:
+            if host in {"localhost", "127.0.0.1", "::1"}:
                 detected = self._detect_local_ip()
                 if detected:
                     return detected
