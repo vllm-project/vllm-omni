@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Runner-side adapters for payload metadata that affects scheduling."""
 
 from __future__ import annotations
 
 import importlib
 import inspect
+from collections.abc import Mapping
 from typing import Any, Protocol, cast
 
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload
@@ -37,7 +39,17 @@ class SchedulingMetadataAdapter(Protocol):
 
 
 class DefaultSchedulingMetadataAdapter:
-    """Adapter for the established ``meta`` and ``codes.audio`` payload schema."""
+    """Adapter for the established ``meta`` and ``codes.audio`` payload schema.
+
+    With ``window_codes_as_placeholder``, a ``codes.audio`` window sent as a
+    tensor of two or more dimensions (``[codebooks, frames]``) is scheduled as
+    one placeholder token, and the consumer reads the codes from its runtime
+    information, as the V1 chunk transfer adapter does for async chunks. Flat
+    codes, and every window without the flag, become one prompt token per code.
+    """
+
+    def __init__(self, *, window_codes_as_placeholder: bool = False) -> None:
+        self._window_codes_as_placeholder = window_codes_as_placeholder
 
     def extract(
         self,
@@ -49,7 +61,11 @@ class DefaultSchedulingMetadataAdapter:
         meta = meta if isinstance(meta, dict) else {}
 
         resize_prompt_to = self._extract_prompt_length(payload, meta)
-        prompt_token_ids = self._extract_prompt_token_ids(payload) if model_mode != "ar" else None
+        prompt_token_ids = None
+        if model_mode != "ar":
+            prompt_token_ids = self._extract_prompt_token_ids(
+                payload, window_codes_as_placeholder=self._window_codes_as_placeholder
+            )
         if resize_prompt_to is None and prompt_token_ids is None:
             return None
         return SchedulingMetadataUpdate(
@@ -58,21 +74,25 @@ class DefaultSchedulingMetadataAdapter:
         )
 
     @staticmethod
-    def _extract_prompt_length(payload: OmniPayload, meta: dict[str, Any]) -> int | None:
+    def _extract_prompt_length(payload: OmniPayload, meta: Mapping[str, object]) -> int | None:
         value = meta.get("next_stage_prompt_len")
         if value is None and "next_stage_prompt_len" in payload:
             logger.warning_once(
                 "legacy flat 'next_stage_prompt_len' key in payload; expected 'meta.next_stage_prompt_len'"
             )
-            value = payload["next_stage_prompt_len"]
+            value = cast(dict[str, Any], payload)["next_stage_prompt_len"]
         return value if isinstance(value, int) and value > 0 else None
 
     @classmethod
-    def _extract_prompt_token_ids(cls, payload: OmniPayload) -> tuple[int, ...] | None:
+    def _extract_prompt_token_ids(
+        cls, payload: OmniPayload, *, window_codes_as_placeholder: bool = False
+    ) -> tuple[int, ...] | None:
         codes = payload.get("codes") if isinstance(payload, dict) else None
         value = codes.get("audio") if isinstance(codes, dict) else None
         if value is None:
             return None
+        if window_codes_as_placeholder and isinstance(value, torch.Tensor) and value.dim() >= 2:
+            return (0,) if value.numel() > 0 else ()
         # An explicit empty snapshot clears the old prompt; missing codes do not.
         return tuple(cls._flatten(value))
 

@@ -3212,6 +3212,47 @@ class TestPlatformOverrides:
         assert deploy.stages[0].engine_extras["block_size"] == 128
 
     @pytest.mark.parametrize(
+        "platform,runs_v2",
+        [("cuda", [True, True]), ("npu", [True, False]), ("rocm", [True, False]), ("musa", [True, False])],
+    )
+    def test_fish_omni_dac_stage_runs_v2_on_cuda_only(self, platform, runs_v2):
+        deploy = load_deploy_config(Path(get_deploy_config_path("fish_omni.yaml")))
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+
+        stages = merge_pipeline_deploy(resolve_pipeline_config("fish_omni"), deploy)
+
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == runs_v2
+        # The pipeline lets the DAC stage take the native data plane whenever it runs on V2.
+        assert stages[1].yaml_engine_args["supports_native_mrv2_data_plane"]
+
+    def test_fish_omni_is_rejected_on_xpu(self):
+        # Stage 0 already runs on V2, which XPU does not support; the DAC change adds nothing here.
+        deploy = load_deploy_config(Path(get_deploy_config_path("fish_omni.yaml")))
+
+        with pytest.raises(NotImplementedError, match="XPU"):
+            _apply_platform_overrides(deploy, platform="xpu")
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "fish_qwen3_omni.yaml",
+            "fish_qwen3_omni_2gpu.yaml",
+            "fish_qwen3_omni_high_concurrency_single_gpu.yaml",
+            "fish_qwen3_omni_high_concurrency_dual_gpu.yaml",
+        ],
+    )
+    @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
+    def test_fish_speech_dac_stage_runs_v2_on_cuda_only(self, platform, filename):
+        deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
+        deploy = _apply_platform_overrides(deploy, platform=platform)
+
+        stages = merge_pipeline_deploy(resolve_pipeline_config("fish_qwen3_omni"), deploy)
+
+        # The Slow AR stays on V1 everywhere; only the DAC stage moves, and only on CUDA.
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [False, platform == "cuda"]
+        assert stages[1].yaml_engine_args["supports_native_mrv2_data_plane"]
+
+    @pytest.mark.parametrize(
         "filename,pipeline_key",
         [
             ("qwen3_tts_mrv2.yaml", "qwen3_tts"),

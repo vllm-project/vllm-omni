@@ -8,6 +8,11 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+from vllm_omni.data_entry_keys import to_dict
+from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+    _OmniConnectorPayloadTransportMixin as Transport,
+)
 from vllm_omni.model_executor.stage_input_processors.fish_omni import (
     SEMANTIC_BEGIN_ID,
     fish_omni_to_dac_decoder_async_chunk,
@@ -63,6 +68,54 @@ def test_windows_follow_the_ramp_with_left_context():
     assert _window(final) == ([7, 8, 9, 10, 11], 2)
     assert bool(final.meta.finished)
     assert fish_omni_to_dac_decoder_async_chunk(manager, None, request, is_finished=True) is None
+
+
+def _native_prompt(payload) -> tuple[list[int], bool]:
+    """(DAC stage prompt, input terminal) after one handoff on the native MRV2 data plane."""
+    transport = Transport.__new__(Transport)
+    transport._async_chunk = True
+    transport._model_mode = "generation"
+    update = transport._extract_scheduling_metadata_update(payload if isinstance(payload, dict) else to_dict(payload))
+    # Not a possible result, so a handoff that sends no update cannot pass as a window.
+    previous = [7, 7]
+    receiver = SimpleNamespace(
+        request_id="r",
+        prompt_token_ids=list(previous),
+        num_prompt_tokens=len(previous),
+        _all_token_ids=list(previous),
+        _output_token_ids=[],
+        num_computed_tokens=1,
+    )
+    coordinator = OmniSchedulingCoordinator(stage_id=1)
+    coordinator.update_request_metadata({"r": receiver}, {"r": update} if update is not None else {})
+    return receiver.prompt_token_ids, "r" in coordinator.input_terminal_req_ids
+
+
+def test_native_mrv2_schedules_one_placeholder_token_per_window():
+    manager, request = _manager(), _request()
+    prompts = []
+    for index in range(12):
+        payload = fish_omni_to_dac_decoder_async_chunk(manager, _frame(index), request)
+        if payload is not None:
+            prompts.append(_native_prompt(payload))
+    final = fish_omni_to_dac_decoder_async_chunk(manager, _frame(12, main=EOS), request, is_finished=True)
+    prompts.append(_native_prompt(final))
+    # The DAC reads the window's codes from runtime info, not from 10 x frames prompt tokens.
+    assert prompts == [([0], False)] * 3 + [([0], True)]
+
+
+def test_native_mrv2_window_placeholder_overrides_next_stage_prompt_len():
+    # The coordinator applies the resize first and the prompt ids last, so a window sent with
+    # meta.next_stage_prompt_len is still one token. Fish producers do not set that field.
+    payload = {"codes": {"audio": torch.zeros((10, 96), dtype=torch.long)}, "meta": {"next_stage_prompt_len": 960}}
+    assert _native_prompt(payload) == ([0], False)
+
+
+def test_native_mrv2_empty_final_window_clears_the_prompt():
+    manager, request = _manager(ramp="1"), _request()
+    assert fish_omni_to_dac_decoder_async_chunk(manager, _frame(0, main=EOS), request) is None
+    final = fish_omni_to_dac_decoder_async_chunk(manager, None, request, is_finished=True)
+    assert _native_prompt(final) == ([], True)
 
 
 def test_end_of_speech_frame_carries_no_audio():

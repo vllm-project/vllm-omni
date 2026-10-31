@@ -65,3 +65,11 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  cuda:
+    stages:
+      # The DAC stage runs on Model Runner V2 on CUDA; stage 0 stays on V1 for
+      # now. Set model_runner: v1 here to opt out.
+      - stage_id: 1
+        model_runner: v2
