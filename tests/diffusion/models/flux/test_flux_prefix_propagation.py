@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that FLUX transformer blocks correctly propagate `quant_config` and
 `prefix` through all sub-layers.
 
@@ -23,12 +23,13 @@ _HEAD_DIM = _DIM // _HEADS
 def _init_distributed():
     """Initialize the minimal distributed environment required by
     vLLM parallel linear layers (tensor-parallel group must exist)."""
-    from tests.helpers.runtime import assign_ephemeral_master_port
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
         initialize_model_parallel,
     )
+
+    from tests.helpers.runtime import assign_ephemeral_master_port
 
     assign_ephemeral_master_port()
     init_distributed_environment(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """SP unit tests for SANA-Video: balanced frame split sizes, linear-attention
 state reduction and the uneven frame gather.
@@ -32,12 +32,13 @@ _MODULE = "vllm_omni.diffusion.models.sana_video.transformer_sana_video"
 def tp1_group():
     """Real single-process TP group so the parallel linear layers construct and
     run on CPU at tensor_parallel_size=1."""
-    from tests.helpers.runtime import assign_ephemeral_master_port
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
         initialize_model_parallel,
     )
+
+    from tests.helpers.runtime import assign_ephemeral_master_port
 
     assign_ephemeral_master_port()
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://", backend="gloo")

@@ -15,8 +15,8 @@ import pytest
 import torch
 
 from tests.helpers.distributed import configure_cpu_collective_worker, start_collective_workers
-from tests.helpers.runtime import get_open_port
 from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,

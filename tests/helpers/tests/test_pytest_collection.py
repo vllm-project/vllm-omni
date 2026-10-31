@@ -16,7 +16,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class _Item:
     def __init__(self, path: Path, marks: set[str]):
         self.path = path
-        self._marks = {name: True for name in marks}
+        self._marks: dict[str, object] = {name: True for name in marks}
 
     def get_closest_marker(self, name: str):
         return self._marks.get(name)
@@ -29,7 +29,11 @@ class _Item:
         mark = self._marks.get("xdist_group")
         if mark is True or mark is None:
             return None
-        return mark.kwargs["name"]
+        kwargs = getattr(mark, "kwargs", None)
+        if not isinstance(kwargs, dict):
+            return None
+        name = kwargs.get("name")
+        return name if isinstance(name, str) else None
 
 
 def _config(*, xdist: bool):

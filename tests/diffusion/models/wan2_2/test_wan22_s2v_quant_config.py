@@ -210,12 +210,13 @@ def test_s2v_init_auto_detected_quant_defers_to_checkpoint(monkeypatch, layout):
 @pytest.fixture
 def tp1_group():
     """Real single-process TP group so the parallel linear layers construct on CPU."""
-    from tests.helpers.runtime import assign_ephemeral_master_port
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
         initialize_model_parallel,
     )
+
+    from tests.helpers.runtime import assign_ephemeral_master_port
 
     assign_ephemeral_master_port()
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")

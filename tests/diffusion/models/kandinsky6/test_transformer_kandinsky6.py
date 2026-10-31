@@ -14,13 +14,14 @@ def _init_distributed(monkeypatch):
     """The native transformer uses vLLM parallel linear layers, which require a
     tensor-parallel group; initialize a single-process group for CPU tests
     (mirrors tests/diffusion/models/sana_video/test_transformer_sana_video.py)."""
-    from tests.helpers.runtime import assign_ephemeral_master_port
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
         initialize_model_parallel,
     )
     from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    from tests.helpers.runtime import assign_ephemeral_master_port
 
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
