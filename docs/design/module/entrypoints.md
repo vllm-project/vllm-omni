@@ -108,6 +108,14 @@ stage-client channel configuration and does not launch or retire backend
 processes. CLI validation rejects unsupported distributed, diffusion,
 fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
 
+The opt-in CosyVoice3 shared-reference path elects an encoder host within the
+server's shared directory; only that host owns the spawned reference worker.
+Its byte-bounded cache is keyed by reference-audio content and contains no
+request text. Frontends await readiness before serving, pass precomputed
+conditioning into the model processor, and do not load local fallback encoders
+on shared-path failures. Adapter shutdown releases owned encoder resources;
+stage-engine lifecycle remains with the parent runtime.
+
 It does not own configuration precedence, cross-stage routing, stage
 placement, payload implementation, or semantic error classification.
 `entrypoints/openai/errors.py` is an explicit primary-path exception owned by
