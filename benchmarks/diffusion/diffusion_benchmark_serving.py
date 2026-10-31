@@ -1334,6 +1334,7 @@ async def benchmark(args):
     print(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
     for req in requests_list:
         req.video_job_timeout = args.video_job_timeout
+        req.request_timeout = args.request_timeout
 
     if args.return_stage_metrics and args.endpoint in _STAGE_METRICS_ENDPOINTS:
         for req in requests_list:
@@ -1398,6 +1399,7 @@ async def benchmark(args):
     metrics["model"] = args.model
     metrics["dataset"] = args.dataset
     metrics["task"] = args.task
+    metrics["request_timeout"] = args.request_timeout
     if args.endpoint == "/v1/videos":
         metrics["video_job_timeout"] = args.video_job_timeout
     if args.endpoint == "/v1/images/edits":
@@ -1410,6 +1412,7 @@ async def benchmark(args):
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
     print("{:<40} {:<15}".format("Task:", args.task))
+    print("{:<40} {:<15}".format("HTTP request timeout (s):", args.request_timeout))
 
     # Section 2: Execution & Traffic
     print(f"{'-' * 50}")
@@ -1466,6 +1469,13 @@ async def benchmark(args):
         print(f"Metrics saved to {args.output_file}")
 
 
+def _nonnegative_finite_timeout(value: str) -> float:
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative finite number of seconds")
+    return timeout
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Benchmark serving for diffusion models.")
     parser.add_argument(
@@ -1510,6 +1520,12 @@ def build_parser():
         help="Path to local dataset file (optional).",
     )
     parser.add_argument("--num-prompts", type=int, default=10, help="Number of prompts to benchmark.")
+    parser.add_argument(
+        "--request-timeout",
+        type=_nonnegative_finite_timeout,
+        default=300.0,
+        help="Total timeout in seconds for each HTTP request (default: 300). Set to 0 to disable the total timeout.",
+    )
     parser.add_argument(
         "--video-job-timeout",
         type=float,
