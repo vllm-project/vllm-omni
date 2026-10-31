@@ -18,6 +18,7 @@ import websockets
 from aiohttp import web
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
+from tests.helpers.duplex_artifacts import assert_duplex_artifact_publication
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_serving as adapter
 from vllm_omni.benchmarks.patch import patch
@@ -148,6 +149,56 @@ def test_repeated_sweep_runs_keep_artifacts_isolated(tmp_path, prepared):
     assert all(root.parent == parent for root in roots)
     for concurrency, root in enumerate(roots, start=1):
         assert json.loads((root / "PR_correction/0.json").read_text())["sentences"] == [{"sentence": str(concurrency)}]
+
+
+@pytest.mark.parametrize("count", [1, 2, 4])
+def test_sample_pool_replays_inputs_with_distinct_metrics_and_artifacts(tmp_path, prepared, count):
+    args = _args(tmp_path, "--num-prompts", str(count), "--duplex-sample-pool-size", "2")
+    preprocess_serve_args(args)
+    samples = patch.get_samples(args, None)
+    assert len(samples) == args.num_prompts == count
+    assert len({sample.request_id for sample in samples}) == count
+    assert len({sample.sample.id for sample in samples}) == count
+    if count == 4:
+        assert [sample.sample.id for sample in samples] == ["0", "1", "0__repeat_1", "1__repeat_1"]
+        assert samples[2].sample.video == samples[0].sample.video
+        assert samples[2].sample.raw is samples[0].sample.raw
+    outputs = []
+    for index, sample in enumerate(samples):
+        output = patch.MixRequestFuncOutput(success=True)
+        output.duplex_eval_result = replace(_result(sample), timed_sentences=[{"sentence": str(index)}])
+        outputs.append(output)
+    summary = adapter.finalize_duplex_eval(samples, outputs)
+    assert summary["published"] == count and not summary["artifact_errors"]
+    for index, sample in enumerate(samples):
+        path = sample.response_root / sample.sample.split / f"{sample.sample.id}.json"
+        assert json.loads(path.read_text())["sentences"] == [{"sentence": str(index)}]
+
+
+@pytest.mark.parametrize(
+    "extra, message",
+    [
+        (["--duplex-eval-evaluate"], "without answer evaluation"),
+        (["--no-oversample"], "conflicts with --no-oversample"),
+        (["--duplex-sample-pool-size", "3"], "Requested 3 distinct duplex samples, but selected 2"),
+        (["--dataset-name", "random"], "requires OmniInteract or Omni-DuplexEval"),
+    ],
+)
+def test_sample_pool_rejects_incompatible_or_incomplete_workloads(tmp_path, extra, message):
+    args = _args(tmp_path, "--num-prompts", "4", "--duplex-sample-pool-size", "2", *extra)
+    with pytest.raises(ValueError, match=message):
+        patch.get_samples(args, None)
+
+
+@pytest.mark.parametrize("second_id", ["0__repeat_1", "0__repeat_1.meta"])
+def test_sample_pool_rejects_repeated_response_or_metadata_collisions(tmp_path, second_id):
+    args = _args(tmp_path, "--num-prompts", "4", "--duplex-sample-pool-size", "2")
+    manifest = Path(args.dataset_path)
+    rows = json.loads(manifest.read_text())
+    rows[1]["id"] = second_id
+    manifest.write_text(json.dumps(rows))
+    with pytest.raises(ValueError, match="Repeated duplex output identity would collide"):
+        patch.get_samples(args, None)
 
 
 @pytest.mark.asyncio
@@ -854,12 +905,19 @@ def test_artifact_io_failure_preserves_service_results(tmp_path, prepared, monke
     assert summary["published"] == 0 and len(summary["artifact_errors"]) == 3
     assert all(output.success for output in outputs)
 
+    with pytest.raises(AssertionError, match="Omni-DuplexEval artifacts are incomplete"):
+        assert_duplex_artifact_publication(
+            {"omni_duplex_eval": summary}, {"dataset_name": "omni-duplex-eval"}, len(outputs)
+        )
+
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("judge_status", [None, 200, 503])
+@pytest.mark.parametrize(
+    "judge_status,pool_size,count", [(None, None, 2), (200, None, 2), (503, None, 2), (None, 2, 4)]
+)
 @pytest.mark.parametrize("turn_detection", ["none", "server_vad"])
 async def test_benchmark_socket_lifecycle_excludes_warmups(
-    tmp_path, prepared, monkeypatch, capsys, judge_status, turn_detection
+    tmp_path, prepared, monkeypatch, capsys, judge_status, pool_size, count, turn_detection
 ):
     args = _args(
         tmp_path,
@@ -867,6 +925,9 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
         turn_detection,
         "--duplex-eval-instructions",
         "Reply briefly.",
+        "--num-prompts",
+        str(count),
+        *(["--duplex-sample-pool-size", str(pool_size)] if pool_size else []),
         ref_audio=turn_detection == "none",
     )
     preprocess_serve_args(args)
@@ -892,7 +953,7 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
 
     async def judge_handler(request):
         # Every readiness, warmup and measured session has finished before judging.
-        assert len(configured) == 5
+        assert len(configured) == count + 3
         assert request.headers["Authorization"] == "Bearer judge-key"
         body = await request.json()
         assert body["model"] == "judge"
@@ -993,7 +1054,7 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
             )
         finally:
             await judge_server.cleanup()
-    assert len(configured) == 5  # one readiness, two warmups, two measured sessions
+    assert len(configured) == count + 3  # one readiness, two warmups, measured sessions
     assert all(session["extra_body"]["custom"] == "test" for session in configured)
     assert all(session["instructions"] == "Reply briefly." for session in configured)
     if turn_detection == "server_vad":
@@ -1002,20 +1063,21 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
             "ref_audio" not in session and session["extra_body"]["auto_response"] is False for session in configured
         )
         assert "input_audio_buffer.commit" not in received_types
-        assert received_types.count("conversation.item.create") == 5
-    assert result["completed"] == 2
-    assert len(result["duplex_session_metrics"]) == 2
-    assert len(result["duplex_request_metrics"]) == 2
-    assert result["omni_duplex_eval"]["published"] == 2
+        assert received_types.count("conversation.item.create") == count + 3
+    assert result["completed"] == count
+    assert len(result["duplex_session_metrics"]) == count
+    assert len(result["duplex_request_metrics"]) == count
+    assert result["omni_duplex_eval"]["published"] == count
     root = samples[0].response_root
-    assert len(list(root.glob("*/*.meta.json"))) == 2
+    assert len(list(root.glob("*/*.meta.json"))) == count
+    assert all((root / sample.sample.split / f"{sample.sample.id}.json").exists() for sample in samples)
     response = json.loads((root / "PR_correction/0.json").read_text())
     sentence = response["sentences"][0]
     assert sentence["sentence"] == "Done."
     assert sentence["start"] == sentence["end"] == pytest.approx(0.03 if turn_detection == "server_vad" else 0.01)
     assert response["chunks"] == [{"text": "Done.", "current_time": sentence["start"]}]
     report = json.loads((root / "duplex_metrics.json").read_text())
-    assert len(report["duplex_session_metrics"]) == 2
+    assert len(report["duplex_session_metrics"]) == count
     assert 0 <= result["duration"] < 3600
     if judge_status is None:
         assert not judge_calls and "accuracy" not in result["omni_duplex_eval"]

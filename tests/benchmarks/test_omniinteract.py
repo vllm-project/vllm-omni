@@ -20,6 +20,7 @@ import pytest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 from vllm.benchmarks.serve import TaskType
 
+from tests.helpers.duplex_artifacts import assert_duplex_artifact_publication
 from vllm_omni.benchmarks import omniinteract as oi
 from vllm_omni.benchmarks import serve as benchmark_serve
 from vllm_omni.benchmarks.data_modules import omniinteract_dataset as data
@@ -394,7 +395,10 @@ def test_load_cases_from_video_list_requires_existing_video(tmp_path: Path) -> N
         data.load_omniinteract_cases_from_video_list(video_list, num_prompts=0)
 
 
-def test_get_samples_from_video_list_without_dataset_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("pool_size, count", [(None, 2), (2, 4), (2, 1)])
+def test_get_samples_from_video_list_without_dataset_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pool_size, count
+) -> None:
     root = _write_dataset(tmp_path)
     cases = data.discover_omniinteract_cases(root, data.OMNIINTERACT_SUBSETS, num_prompts=0, disable_shuffle=True)
     video_list = tmp_path / "sampled_cases.jsonl"
@@ -414,7 +418,8 @@ def test_get_samples_from_video_list_without_dataset_path(tmp_path: Path, monkey
             "--endpoint",
             "/v1/realtime",
             "--num-prompts",
-            "2",
+            str(count),
+            *(["--duplex-sample-pool-size", str(pool_size)] if pool_size else []),
             "--omniinteract-ref-audio",
             str(ref),
             "--omniinteract-video-list",
@@ -426,10 +431,27 @@ def test_get_samples_from_video_list_without_dataset_path(tmp_path: Path, monkey
         "vllm_omni.clients.duplex.reference_audio_data_url",
         lambda _: "data:audio/wav;base64,ref",
     )
-    monkeypatch.setattr(benchmark_patch, "prepare_media", lambda *a, **k: (1.0, b"pcm", ["frame"]))
+    prepared_paths = []
+
+    def prepare_media(path, *args, **kwargs):
+        prepared_paths.append(path)
+        return 1.0, b"pcm", ["frame"]
+
+    monkeypatch.setattr(benchmark_patch, "prepare_media", prepare_media)
     samples = benchmark_patch.get_samples(args, None)
-    assert len(samples) == 2
-    assert [sample.omniinteract_case.video_path for sample in samples] == [case.video_path for case in cases[:2]]
+    distinct = min(count, pool_size or count)
+    assert len(samples) == args.num_prompts == count
+    assert prepared_paths == [case.video_path for case in cases[:distinct]]
+    assert len({sample.request_id for sample in samples}) == count
+    assert (
+        len({oi._output_dir(sample.omniinteract_options.output_root, sample.omniinteract_case) for sample in samples})
+        == count
+    )
+    for index, sample in enumerate(samples):
+        source = cases[index % distinct]
+        assert sample.omniinteract_case.video_path == source.video_path
+        assert sample.omniinteract_case.annotation_path == source.annotation_path
+        assert sample.omniinteract_prepared_input is samples[index % distinct].omniinteract_prepared_input
 
 
 def _write_overlapping_cover_dataset(root: Path) -> Path:
@@ -1382,6 +1404,9 @@ def test_batch_artifact_failure_removes_partial_batch_files(tmp_path: Path, monk
     assert summary["artifact_errors"] == ["Batch artifact publication failed: batch disk full"]
     assert output.success
     assert not (options.output_root / "batch_summary.json").exists()
+
+    with pytest.raises(AssertionError, match="OmniInteract artifacts are incomplete"):
+        assert_duplex_artifact_publication({"omniinteract": summary}, {"dataset_name": "omniinteract"}, 1)
 
 
 @pytest.mark.parametrize(

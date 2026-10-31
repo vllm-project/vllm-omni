@@ -1,0 +1,4 @@
+# Nightly performance sweep: 1, 8, and 16 concurrent VAD-driven sessions.
+base_config: ../../../../vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  max_sessions: 16
