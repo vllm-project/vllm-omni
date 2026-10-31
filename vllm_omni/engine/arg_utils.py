@@ -413,6 +413,7 @@ class OmniEngineArgs(EngineArgs):
     hsdp_replicate_size: int | None = None
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None
+    vae_encode_parallel_size: int | None = None
     vae_parallel_mode: str | None = None
 
     @classmethod
@@ -817,6 +818,7 @@ class OrchestratorArgs:
     diffusion_kv_cache_skip_layers: str | None = None
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
+    vae_encode_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
@@ -905,6 +907,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "hsdp_replicate_size",
         "cfg_parallel_size",
         "vae_patch_parallel_size",
+        "vae_encode_parallel_size",
         "vae_parallel_mode",
     }
 )
