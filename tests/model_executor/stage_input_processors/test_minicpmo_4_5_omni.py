@@ -78,6 +78,46 @@ def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
     assert info["meta"]["next_stage_prompt_len"] == 4
 
 
+def _ledger_output(prompt_ids, output_ids, forwarded):
+    """Thinker output whose latent rows follow ``forwarded``: (token, position) per row."""
+    latent = torch.stack([torch.full((4,), float(position * 100 + token)) for token, position in forwarded])
+    multimodal_output = {
+        "latent_input_ids": torch.tensor([token for token, _ in forwarded]).reshape(-1, 1),
+        "latent_positions": torch.tensor([position for _, position in forwarded]).reshape(-1, 1),
+    }
+    return _output(prompt_ids=prompt_ids, output_ids=output_ids, latent=latent, multimodal_output=multimodal_output)
+
+
+def _row(token: int, position: int) -> torch.Tensor:
+    return torch.full((4,), float(position * 100 + token))
+
+
+def test_plain_chat_handoff_reads_rows_from_ledger_when_steps_repeat() -> None:
+    """MRv2 full-payload outputs report every step's rows twice."""
+    prompt_ids, output_ids = [101, 102], [11, 12, 13]
+    steps = [[(101, 0), (102, 1)], [(11, 2)], [(12, 3)]]
+    forwarded = [row for step in steps for row in step * 2]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    # The last sampled token is never forwarded, so it has no row.
+    assert info["ids"]["tts"] == [11, 12]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 2), _row(12, 3)]))
+
+
+def test_plain_chat_handoff_skips_rejected_draft_rows() -> None:
+    """A rejected draft's row is replaced by the row forwarded at its position later."""
+    prompt_ids, output_ids = [101, 102], [11, 12, 13, 14, 15]
+    forwarded = [(101, 0), (102, 1), (11, 2), (12, 3), (99, 4), (13, 4), (14, 5)]
+
+    info = llm2tts([_ledger_output(prompt_ids, output_ids, forwarded)], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [11, 12, 13, 14]
+    hidden = torch.as_tensor(unpack_handoff_tensor(info["hidden_states"]["tts"]))
+    torch.testing.assert_close(hidden, torch.stack([_row(11, 2), _row(12, 3), _row(13, 4), _row(14, 5)]))
+
+
 def test_llm2tts_carries_request_ref_audio() -> None:
     latent = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     source = _output(

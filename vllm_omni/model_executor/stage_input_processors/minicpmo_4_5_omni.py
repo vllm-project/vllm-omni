@@ -859,6 +859,45 @@ def _native_duplex_forwarded_hidden_rows(
     )
 
 
+def _turn_hidden_rows(
+    mm_output: Mapping[str, object],
+    thinker_hidden_states: torch.Tensor,
+    full_token_ids: Sequence[int],
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    """Return one Thinker row per token of ``full_token_ids[start:end]``.
+
+    The accumulated latent is not one row per token in order: the MRv2
+    full-payload output reports each step's rows on both output channels, and
+    a step that verified draft tokens also forwarded the rejected ones. The
+    row ledger (``latent_input_ids`` / ``latent_positions``) names the token
+    and position of every row, so take the latest row forwarded at each
+    position. The slice ends at the first token with no row, e.g. the last
+    sampled token, which is never forwarded. Without a ledger the rows are
+    taken by position.
+    """
+    row_ids = mm_output.get("latent_input_ids")
+    row_positions = mm_output.get("latent_positions")
+    num_rows = int(thinker_hidden_states.shape[0])
+    if (
+        not isinstance(row_ids, torch.Tensor)
+        or not isinstance(row_positions, torch.Tensor)
+        or row_ids.numel() != num_rows
+        or row_positions.numel() != num_rows
+    ):
+        return thinker_hidden_states[start:end].to(torch.float32).contiguous()
+    ids = row_ids.reshape(-1).tolist()
+    latest_row = {int(position): row for row, position in enumerate(row_positions.reshape(-1).tolist())}
+    rows: list[int] = []
+    for position in range(start, end):
+        row = latest_row.get(position)
+        if row is None or int(ids[row]) != int(full_token_ids[position]):
+            break
+        rows.append(row)
+    return thinker_hidden_states[rows].to(torch.float32).contiguous()
+
+
 def _native_duplex_data_plane_metadata(streaming_context) -> dict[str, object] | None:
     bridge_states = getattr(streaming_context, "bridge_states", None)
     if not isinstance(bridge_states, dict):
@@ -1037,9 +1076,13 @@ def llm2tts(
         native_segment_end = False
         if not is_native_duplex_handoff:
             if tts_bos_idx is not None and thinker_hidden_states.shape[0] > tts_bos_idx:
-                end_idx = tts_eos_idx if tts_eos_idx is not None else thinker_hidden_states.shape[0]
-                tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
-                tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
+                end_idx = tts_eos_idx if tts_eos_idx is not None else len(full_token_ids)
+                tts_hidden_slice = _turn_hidden_rows(
+                    mm_output, thinker_hidden_states, full_token_ids, tts_bos_idx, end_idx
+                )
+                tts_token_ids_slice = torch.tensor(
+                    full_token_ids[tts_bos_idx : tts_bos_idx + tts_hidden_slice.shape[0]], dtype=torch.long
+                )
         else:
             # Mirror the official streaming_generate unit loop. A segment delta
             # can start with SEVERAL unit decisions (forced/model listens from
