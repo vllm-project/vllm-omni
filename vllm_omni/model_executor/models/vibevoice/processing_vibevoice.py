@@ -29,7 +29,7 @@ from vllm.multimodal.processing import (
 )
 from vllm.multimodal.processing.processor import MultiModalProcessingResult, PlaceholderFeaturesInfo
 
-from .prompt import AUDIO_BOS, AUDIO_EOS, AUDIO_TOKEN
+from .prompt import AUDIO_BOS, AUDIO_EOS, AUDIO_TOKEN, MAX_SPEAKERS
 
 SAMPLE_RATE = 24000
 SAMPLES_PER_TOKEN = 3200
@@ -63,7 +63,7 @@ class VibeVoiceProcessingInfo(BaseProcessingInfo):
         return VibeVoiceDataParser(target_sr=SAMPLE_RATE, target_channels=1)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"audio": 1}
+        return {"audio": MAX_SPEAKERS}
 
     def get_mm_max_tokens_per_item(self, seq_len: int, mm_counts: Mapping[str, int]) -> Mapping[str, int]:
         return {"audio": MAX_REFERENCE_SAMPLES // SAMPLES_PER_TOKEN}
@@ -145,8 +145,9 @@ class VibeVoiceMultiModalProcessor(BaseMultiModalProcessor[VibeVoiceProcessingIn
     ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
         num_audio = mm_items.get_all_counts().get("audio", 0)
         num_placeholders = mm_res.prompt_ids.count(self.info.get_hf_config().audio_token_id)
-        if num_audio != 1 or num_placeholders != num_audio:
+        if not 1 <= num_audio <= MAX_SPEAKERS or num_placeholders != num_audio:
             raise ValueError(
-                "VibeVoice accepts at most one reference audio, matched by exactly one unexpanded placeholder."
+                f"VibeVoice accepts 1 to {MAX_SPEAKERS} reference audios, "
+                "each matched by exactly one unexpanded placeholder."
             )
         return super()._maybe_apply_prompt_updates(mm_items, mm_res)
