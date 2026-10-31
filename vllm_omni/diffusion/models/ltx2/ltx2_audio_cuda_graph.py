@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch._dynamo.exc import BackendCompilerFailed
 from vllm.distributed.parallel_state import get_tp_group, graph_capture, model_parallel_is_initialized
 from vllm.logger import init_logger
 
@@ -177,6 +178,7 @@ class LTX2AudioCUDAGraphRunner:
         if type(max_graphs) is not int or max_graphs < 1:
             raise ValueError("max_graphs must be a positive integer")
         self.transformer = transformer
+        self.restore_eager: Callable[[], None] | None = None
         self.max_graphs = max_graphs
         if device is None:
             try:
@@ -392,6 +394,15 @@ class LTX2AudioCUDAGraphRunner:
             **transformer_kwargs,
         )
 
+    def _recover_compile_failure(self, error: Exception) -> bool:
+        """Restore original forwards once when a lazy compilation fails."""
+        if not isinstance(error, BackendCompilerFailed) or self.restore_eager is None:
+            return False
+        self.restore_eager()
+        self.restore_eager = None
+        logger.warning("LTX2 audio lazy compilation failed; restored eager Transformer forwards: %s", error)
+        return True
+
     def _eager_forward(self, reason: str, *, hidden_batch_repeats: int = 1, **kwargs: Any) -> torch.Tensor:
         self._stats["eager"] += 1
         reason_counter = f"eager_{reason}"
@@ -400,7 +411,12 @@ class LTX2AudioCUDAGraphRunner:
         if hidden_batch_repeats != 1:
             hidden_states = kwargs["hidden_states"]
             kwargs["hidden_states"] = hidden_states.repeat((hidden_batch_repeats,) + (1,) * (hidden_states.ndim - 1))
-        return self._call_transformer(**kwargs)
+        try:
+            return self._call_transformer(**kwargs)
+        except BackendCompilerFailed as exc:
+            if not self._recover_compile_failure(exc):
+                raise
+            return self._call_transformer(**kwargs)
 
     def _capture(self, *, hidden_batch_repeats: int = 1, **inputs: Any) -> tuple[LTX2AudioGraphEntry, torch.Tensor]:
         static_inputs = {
@@ -642,8 +658,12 @@ class LTX2AudioCUDAGraphRunner:
             # Captured graph outputs are not populated until their first
             # replay, so use the warmup result to avoid that redundant replay.
             return initial_output
-        except Exception:
+        except Exception as exc:
             captured = None
+            # Capture has unwound before changing Python forwards. Ordinary
+            # graph failures retain compilation; backend failures must not
+            # retry the same broken compiled callable in the eager fallback.
+            self._recover_compile_failure(exc)
             self._stats["capture_failures"] += 1
             self._failed_keys[key] = None
             self._failed_keys.move_to_end(key)
