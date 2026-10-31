@@ -101,28 +101,35 @@ def packed_qkv(attn: nn.Module) -> tuple[torch.Tensor, torch.Tensor | None]:
 
 
 def attention(attn, x, att_cache, attn_mask, kv, *, min_cache_frames: int):
-    """One QKV GEMM, preserving contiguous attention for short histories."""
+    """One QKV GEMM, preserving contiguous attention for short histories.
+
+    ``kv`` and ``att_cache`` are ``(2, N, H, frames, D)``: the leading half is
+    K and the trailing half is V, so attention never slices the packed width.
+    """
     batch, frames, _ = x.shape
     weight, bias = packed_qkv(attn)
     q, k, v = F.linear(x, weight, bias).chunk(3, dim=-1)
     q, k, v = attn.q_norm(attn.to_heads(q)), attn.k_norm(attn.to_heads(k)), attn.to_heads(v)
-    cached = 0 if att_cache is None else int(att_cache.shape[2])
-    dest = kv[:, :, : frames + cached]
+    keys, values = kv[0], kv[1]
+    cached = 0 if att_cache is None else int(att_cache.shape[-2])
     if cached >= min_cache_frames:
-        behind = dest[:, :, frames:]
-        if att_cache.data_ptr() != behind.data_ptr() or att_cache.stride() != behind.stride():
-            behind.copy_(att_cache)
-        dim = k.shape[-1]
-        dest[:, :, :frames, :dim].copy_(k)
-        dest[:, :, :frames, dim:].copy_(v)
-        k, v = dest.chunk(2, dim=-1)
+        behind_keys = keys[:, :, frames:]
+        behind_values = values[:, :, frames:]
+        if att_cache[0].data_ptr() != behind_keys.data_ptr() or att_cache[0].stride() != behind_keys.stride():
+            behind_keys[:, :, :cached].copy_(att_cache[0])
+            behind_values[:, :, :cached].copy_(att_cache[1])
+        keys[:, :, :frames].copy_(k)
+        values[:, :, :frames].copy_(v)
     else:
         if att_cache is not None:
-            old_k, old_v = att_cache.chunk(2, dim=-1)
-            k, v = torch.cat((k, old_k), dim=2), torch.cat((v, old_v), dim=2)
-        dest.copy_(torch.cat((k, v), dim=-1))
-    mask = _expand_attn_mask_for_npu(attn_mask, frames, frames + cached)
-    out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            k = torch.cat((k, att_cache[0]), dim=2)
+            v = torch.cat((v, att_cache[1]), dim=2)
+        span = int(k.shape[2])
+        keys[:, :, :span].copy_(k)
+        values[:, :, :span].copy_(v)
+    # ``keys`` already carries exactly the live span here, so no mask split.
+    mask = _expand_attn_mask_for_npu(attn_mask, frames, int(keys.shape[-2]))
+    out = F.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
     return attn.proj(out.transpose(1, 2).reshape(batch, frames, -1))
 
 
@@ -225,7 +232,13 @@ def _attach_history(old: torch.Tensor | None, current: torch.Tensor, width: int)
 
 
 def attention_npu(attn, hidden, att_cache, attn_mask, kv, slots=None):
-    """Packed-QKV attention using the shared ``[K | V]`` cache layout."""
+    """Packed-QKV attention over a split ``(2, N, H, capacity, D)`` K/V cache.
+
+    ``kv``/``att_cache`` keep K and V in separate leading halves, so attention
+    gets two fully contiguous tensors and never slices a packed ``[K | V]``
+    width. The capacity tail is masked out rather than sliced away, which keeps
+    the halves contiguous on every graph replay.
+    """
     if slots is not None:
         raise RuntimeError("MiniCPM NPU fused body does not support the CFM attention slot pool")
     batch, frames, _ = hidden.shape
@@ -234,42 +247,45 @@ def attention_npu(attn, hidden, att_cache, attn_mask, kv, slots=None):
         qkv = F.linear(hidden.reshape(batch * frames, -1), weight, bias).view(batch, frames, -1)
     else:
         qkv = torch.cat([attn.to_q(hidden), attn.to_k(hidden), attn.to_v(hidden)], dim=-1)
-    cached = 0 if att_cache is None else int(att_cache.shape[2])
-    cache_capacity = int(kv.shape[2]) - frames
+    keys, values = kv[0], kv[1]
+    capacity = int(keys.shape[-2])
+    cached = 0 if att_cache is None else int(att_cache.shape[-2])
+    cache_capacity = capacity - frames
     logical_cache = cached if attn_mask is None else int(attn_mask.shape[-1]) - frames
     if logical_cache < cached or logical_cache > cache_capacity:
         raise ValueError(
             f"NPU fused attention cache/mask exceeds output capacity: "
             f"cache={cached}, mask_cache={logical_cache}, capacity={cache_capacity}"
         )
-    # Whole-Euler reserves query padding between the live queries and cache.
-    # Keep this capacity in the attention sequence so the capture mask remains
-    # aligned with the static cache buffer on every replay.
-    kv = kv[:, :, : frames + logical_cache]
-    behind = kv[:, :, frames:]
-    if cached and (att_cache.data_ptr() != behind.data_ptr() or att_cache.stride() != behind.stride()):
-        behind[:, :, :cached].copy_(att_cache)
+    behind_keys = keys[:, :, frames:]
+    behind_values = values[:, :, frames:]
+    if cached and (att_cache[0].data_ptr() != behind_keys.data_ptr() or att_cache[0].stride() != behind_keys.stride()):
+        behind_keys[:, :, :cached].copy_(att_cache[0])
+        behind_values[:, :, :cached].copy_(att_cache[1])
     packed = qkv.view(batch, frames, 3, int(attn.num_heads), int(attn.head_dim))
     query = attn.q_norm(packed[:, :, 0].transpose(1, 2))
     current_keys = attn.k_norm(packed[:, :, 1].transpose(1, 2))
     current_values = packed[:, :, 2].transpose(1, 2)
-    head_dim = int(query.shape[-1])
-    # The shared cache format stores K in the first half and V in the second.
     # A masked gap past the real cache must stay finite: an uninitialized key
     # poisons real rows through ``0 * NaN`` in the attention epilogue.
     if logical_cache > cached:
-        behind[:, :, cached:].zero_()
-    current = kv[:, :, :frames]
-    if current.is_contiguous():
-        torch.cat((current_keys, current_values), dim=-1, out=current)
-    else:
-        current[..., :head_dim].copy_(current_keys)
-        current[..., head_dim:].copy_(current_values)
-    keys, values = kv[..., :head_dim], kv[..., head_dim:]
-    mask = _expand_attn_mask_for_npu(attn_mask, frames, int(keys.shape[-2]))
-    if mask is not None and int(mask.shape[-1]) != int(keys.shape[-2]):
+        behind_keys[:, :, cached:].zero_()
+        behind_values[:, :, cached:].zero_()
+    keys[:, :, :frames].copy_(current_keys)
+    values[:, :, :frames].copy_(current_values)
+    mask = _expand_attn_mask_for_npu(attn_mask, frames, capacity)
+    if mask is not None and int(mask.shape[-1]) != capacity:
+        tail = capacity - int(mask.shape[-1])
+        tail_shape = (*mask.shape[:-1], tail)
+        filler = (
+            torch.full(tail_shape, -float("inf"), dtype=mask.dtype, device=mask.device)
+            if mask.dtype.is_floating_point
+            else torch.zeros(tail_shape, dtype=mask.dtype, device=mask.device)
+        )
+        mask = torch.cat([mask, filler], dim=-1)
+    if mask is not None and int(mask.shape[-1]) != capacity:
         raise ValueError(
-            f"NPU fused attention mask/cache mismatch: mask has {mask.shape[-1]} keys, cache has {keys.shape[-2]}"
+            f"NPU fused attention mask/cache mismatch: mask has {mask.shape[-1]} keys, cache has {capacity}"
         )
     out = F.scaled_dot_product_attention(query, keys, values, attn_mask=mask)
     out = out.transpose(1, 2).reshape(batch * frames, -1)
