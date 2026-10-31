@@ -403,7 +403,7 @@ def _leaf_steps(steps: list) -> list[dict]:
 
 
 def test_nightly_yaml_infers_h100_l4_and_b200(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Nightly inferred jobs share card counts across H100/L4 and B200 mirrors."""
+    """Shared jobs preserve card counts; B200-only jobs stay on the B200 mirror."""
     src = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
     pytest_leaves = [step for step in _leaf_steps(src["steps"]) if "pytest" in str(step.get("commands"))]
     inferred_leaves = [step for step in pytest_leaves if "mirror_hardwares" not in step]
@@ -422,12 +422,22 @@ def test_nightly_yaml_infers_h100_l4_and_b200(monkeypatch: pytest.MonkeyPatch) -
     }
 
     pytest_labels = {step["label"] for step in inferred_leaves}
+    b200_only_labels = {
+        step["label"]
+        for step in inferred_leaves
+        if step.get("key") == "nightly-diffusion-qwen-vae-spatial-shard-correctness"
+    }
+    assert len(b200_only_labels) == 1
+    assert b200_only_labels.isdisjoint(default_by_label)
+    for label in b200_only_labels:
+        assert b200_by_label[label]["agents"]["queue"] == "b200-k8s"
+        assert _gpu_limit(b200_by_label[label]) == 2
     pinned_labels = {step["label"] for step in pinned_leaves}
     assert pinned_labels <= set(default_by_label)
     assert pinned_labels.isdisjoint(b200_by_label)
-    assert pytest_labels <= set(default_by_label)
+    assert pytest_labels - b200_only_labels <= set(default_by_label)
     assert pytest_labels <= set(b200_by_label)
-    for label in pytest_labels:
+    for label in pytest_labels - b200_only_labels:
         default_step = default_by_label[label]
         b200_step = b200_by_label[label]
         assert default_step["agents"]["queue"] in {"mithril-h100-pool", "l4-k8s"}

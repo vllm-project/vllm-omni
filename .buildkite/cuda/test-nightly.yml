@@ -509,6 +509,13 @@ steps:
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
     steps:
+      - label: ":full_moon: Diffusion · Qwen VAE Spatial Shard Correctness with B200 · 2-GPU"
+        key: nightly-diffusion-qwen-vae-spatial-shard-correctness
+        source_file_dependencies: diffusion_distributed_attention
+        timeout_in_minutes: 60
+        commands:
+          - pytest -sv tests/diffusion/distributed/test_qwen_spatial_shard_correctness.py -m 'full_model and cuda and B200 and cards_2' --run-level "full_model"
+
       - label: ":full_moon: Diffusion · Distributed Test with L4 · 2-GPU"
         source_file_dependencies: diffusion_distributed_attention
         timeout_in_minutes: 60
