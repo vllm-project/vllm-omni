@@ -107,6 +107,29 @@ Common optional flags:
 - `--output-file`: Write metrics to a JSON file.
 - `--disable-tqdm`: Disable the progress bar.
 
+### Collect a profiler trace
+
+Start the server with a profiler configuration, for example:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --port 8099 \
+ --profiler-config '{"profiler":"torch","torch_profiler_dir":"./perf/qwen_image"}'
+```
+
+Add `--enable-profiler` to the benchmark command to call the server's
+`/start_profile` after warmup and `/stop_profile` after measured requests.
+Use `--profiler-stages 0 1` to select stage IDs; omitting it profiles all stages.
+The profiler is disabled by default. Stage IDs must be non-negative and
+`--profiler-stages` requires `--enable-profiler`.
+
+Profiler control calls are outside the reported benchmark duration. Once the
+profiler has started successfully, the benchmark also attempts to stop it if
+measurement raises an error or is cancelled. A failed profiler control request
+aborts the run with an error rather than reporting successful profiling.
+Trace artifacts are written by the server to its configured directory. See the
+[profiling guide](../../docs/contributing/profiling.md#4-profiling-online-serving)
+for server configuration and supported profilers.
+
 ### Resolution / frames / steps: CLI defaults vs dataset fields
 
 Related flags: `--width`, `--height`, `--num-frames`, `--fps`, `--num-inference-steps`.
