@@ -1,6 +1,6 @@
 # Opt-in single-H200 native full-duplex codec profile (V1).
 # Inherits the native session/stage capacities, sampling and chunk sizes.
-# Enables all Stage 0 (multimodal duplex prefill) and Stage 2 (code2wav DiT) optimizations.
+# Enables Stage 0 (multimodal duplex prefill) and Stage 2 (code2wav DiT) optimizations.
 # Ordinary TF32 for CFM DiT GEMMs (cuBLAS allow_tf32 + Triton tf32 dots).
 # HiFT stays IEEE FP32. Validate audio quality for your workload.
 base_config: minicpmo_4_5.yaml
@@ -26,6 +26,8 @@ stages:
       # Stage 0: Incremental sliding window Fbank feature extraction
       duplex_incremental_fbank: true
       # Stage 0: Fused packed SigLIP encoder layers
+      # Skipped with the default CUDA BF16 duplex reference vision attention.
+      # Packed encoding, vision CUDA graphs and fused scaled softmax stay enabled.
       vision_fused_layers: true
       # Stage 0: Packed SigLIP tower & resampler CUDA graph
       vision_cuda_graph: true

@@ -237,12 +237,12 @@ As a result, the downstream request already exists when the first chunk lands. S
 
 A stage can also receive data derived from the original request together with its placeholder, and use its idle steps to prepare for chunk 0. MiniCPM-o's Code2Wav uses this to prepare the reference audio (see the MiniCPM-o recipe). The contract spans four layers:
 
-| Layer | Touchpoint | Behavior |
-| --- | --- | --- |
-| Pipeline config | `StagePipelineConfig.async_chunk_prewarm_payload_func` | Dotted path to `fn(prompt) -> dict[str, Tensor \| scalar] \| None`. It is resolved in `stage_init_utils` and exposed on the stage client. |
-| Orchestrator | `_attach_async_chunk_prewarm_payload` | Runs on the initial add only. It is skipped on a streaming re-prewarm and for session-owned or resumable requests. It calls the function with the original prompt and adds the result to the placeholder's `additional_information` under flat keys `f"{ASYNC_CHUNK_PREWARM_NS}.{name}"`. If the function fails or returns nothing, the placeholder is submitted unchanged. |
-| Scheduler | `OmniSchedulerMixin._take_async_chunk_prewarm` | In `add_request`, it pops those keys off a new request, so they never reach the runner's per-request buffer. The payload is delivered once, as an `OmniRequestPrewarm` in `OmniSchedulerOutput.pending_request_prewarms`. Finish and abort drop payloads that were never delivered. |
-| Runner and model | `on_requests_added(prewarms)`, `run_idle_prefetch()` | Optional model hooks in the GPU and NPU generation runners. `on_requests_added` runs right after `on_requests_finished`. `run_idle_prefetch` runs only on a zero-token step that follows another zero-token step, and the runner ignores its return value. A hook exception is logged and never reaches the EngineCore. |
+| Layer            | Touchpoint                                             | Behavior                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------- | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pipeline config  | `StagePipelineConfig.async_chunk_prewarm_payload_func` | Dotted path to a function taking `prompt` and returning a flat dict of tensors/scalars or `None`. It is resolved in `stage_init_utils` and exposed on the stage client.                                                                                                                                                                                                     |
+| Orchestrator     | `_attach_async_chunk_prewarm_payload`                  | Runs on the initial add only. It is skipped on a streaming re-prewarm and for session-owned or resumable requests. It calls the function with the original prompt and adds the result to the placeholder's `additional_information` under flat keys `f"{ASYNC_CHUNK_PREWARM_NS}.{name}"`. If the function fails or returns nothing, the placeholder is submitted unchanged. |
+| Scheduler        | `OmniSchedulerMixin._take_async_chunk_prewarm`         | In `add_request`, it pops those keys off a new request, so they never reach the runner's per-request buffer. The payload is delivered once, as an `OmniRequestPrewarm` in `OmniSchedulerOutput.pending_request_prewarms`. Finish and abort drop payloads that were never delivered.                                                                                         |
+| Runner and model | `on_requests_added(prewarms)`, `run_idle_prefetch()`   | Optional model hooks in the GPU and NPU generation runners. `on_requests_added` runs right after `on_requests_finished`. `run_idle_prefetch` runs only on a zero-token step that follows another zero-token step, and the runner ignores its return value. A hook exception is logged and never reaches the EngineCore.                                                     |
 
 Constraints for a new integration:
 
@@ -304,6 +304,10 @@ connectors:
 ```
 
 - `ar_prefill_admission_min_batch` / `ar_prefill_admission_max_wait_ms` / `ar_prefill_admission_min_running`: arrivals share one prefill / mixed step instead of each turning a decode step into one. Off unless `ar_prefill_admission_min_batch` > 1, which requires a positive `ar_prefill_admission_max_wait_ms`; below `ar_prefill_admission_min_running` running requests, arrivals are admitted at once. The wait counts against time to first audio, so keep it well under the first chunk's latency (Fish Audio Drama 3 at 128 streams: RTF 0.578 -> 0.513 with the values above).
+
+Single-stage pipelines without a connector set the same three keys in the
+stage's `additional_config`. When both sources are present, connector `extra`
+overrides `additional_config` per key. The policy remains disabled by default.
 
 ### Code2Wav Batch Configuration
 

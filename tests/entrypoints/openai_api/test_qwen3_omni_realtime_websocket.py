@@ -103,6 +103,13 @@ realtime_async_chunk_server_params = [
     ),
 ]
 
+# Stage-log lines the cold-start replay test checks.
+REALTIME_CONNECTION_LOG_MARKER = "[realtime] connection opened"
+# vLLM's JIT monitor logs a kernel compiled after startup warmup with this
+# text, once per kernel and process (``warning_once``).
+RUNTIME_JIT_LOG_MARKER = "JIT compilation during inference"
+MOE_PREFILL_WARMUP_LOG_MARKER = "MoE prefill warmup ran"
+
 realtime_server_vad_server_params = [
     pytest.param(
         OmniServerParams(
@@ -402,6 +409,7 @@ async def _run_client_vad_replay(
     *,
     wait_s: float = 10.0,
     answer_timeout_s: float = 60.0,
+    stall_s: list[float] | None = None,
 ) -> list[str]:
     """Replay a captured LiveKit client-VAD session at its original speed.
 
@@ -414,6 +422,10 @@ async def _run_client_vad_replay(
     answers are collected, so the checks below compare model output rather than
     the recording's teardown. The cancels that precede a ``response.create`` are
     part of the interaction and still go out on time.
+
+    When ``stall_s`` is given, it receives one entry per response: seconds from
+    ``response.created`` to its first transcript delta (or to ``response.done``
+    if no delta arrived).
     """
     with replay_path.open() as replay_file:
         records = [json.loads(line) for line in replay_file]
@@ -424,6 +436,8 @@ async def _run_client_vad_replay(
     completed_answers: dict[str, str] = {}
     pending_responses: dict[str, asyncio.Future] = {}
     errors: list[dict] = []
+    created_at: dict[str, float] = {}
+    first_output_at: dict[str, float] = {}
 
     last_create = max(
         (index for index, record in enumerate(records) if record["data"].get("type") == "response.create"),
@@ -465,6 +479,7 @@ async def _run_client_vad_replay(
                     response_order.append(response_id)
                     answers_by_response_id[response_id] = ""
                     pending_responses[response_id] = asyncio.get_running_loop().create_future()
+                    created_at[response_id] = asyncio.get_running_loop().time()
                 elif event_type in {
                     "response.audio_transcript.delta",
                     "response.output_audio_transcript.delta",
@@ -474,11 +489,14 @@ async def _run_client_vad_replay(
                     response_id = event.get("response_id")
                     if response_id in answers_by_response_id:
                         answers_by_response_id[response_id] += event.get("delta", "")
+                        if event.get("delta"):
+                            first_output_at.setdefault(response_id, asyncio.get_running_loop().time())
                 elif event_type == "response.done":
                     response = event["response"]
                     response_id = response["id"]
                     text = answers_by_response_id.get(response_id, "")
                     completed_answers[response_id] = text or _output_text(response)
+                    first_output_at.setdefault(response_id, asyncio.get_running_loop().time())
                     future = pending_responses.get(response_id)
                     if future is not None and not future.done():
                         future.set_result(None)
@@ -513,6 +531,12 @@ async def _run_client_vad_replay(
             await asyncio.gather(receiver, return_exceptions=True)
 
     assert not [error for error in errors if error.get("error", {}).get("type") == "server_error"]
+    if stall_s is not None:
+        stall_s.extend(
+            first_output_at[response_id] - created_at[response_id]
+            for response_id in response_order
+            if response_id in first_output_at
+        )
     return [completed_answers[response_id] for response_id in response_order if response_id in completed_answers]
 
 
@@ -837,6 +861,68 @@ _DUPLEX_REPEATS_FULL = 20
 _DUPLEX_LONG_INSTRUCTIONS = "Answer the user's question in English using at least eight complete sentences."
 _DUPLEX_SHORT_INSTRUCTIONS = "Answer the user's question in one short English sentence."
 _SEMANTIC_VAD_ASSETS = Path(__file__).resolve().parents[2] / "assets" / "semantic_vad"
+
+
+class TestQwen3OmniRealtimeColdStart:
+    """Replay on a server that is started for this test alone."""
+
+    @pytest.fixture(scope="function")
+    def cold_omni_server(self, request, run_level):
+        # Function scope and its own class on purpose: pytest reuses a
+        # class-scoped server for value-equal params even under a different
+        # test id, and the class boundary tears down the server above before
+        # this one starts on the same GPUs.
+        from tests.helpers.fixtures.runtime import omni_fixture_lock
+        from tests.helpers.runtime import iter_omni_server
+
+        yield from iter_omni_server(request, run_level, omni_fixture_lock)
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100"}, num_cards=2)
+    @pytest.mark.parametrize("cold_omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_livekit_client_vad_replay_without_runtime_jit(self, cold_omni_server) -> None:
+        """A fresh server answers all three replay turns without compiling kernels mid-request.
+
+        Without the MoE prefill warmup, the thinker and talker JIT-compile
+        ``fused_moe_kernel`` configs on every turn of this replay (#9069 follow-up).
+        The JIT monitor logs only the first compile per kernel, so a green run
+        means this replay hit no un-warmed kernel; the warmup log check below is
+        what shows the warmup itself ran.
+        """
+        stalls: list[float] = []
+        answers = asyncio.run(
+            _run_client_vad_replay(
+                cold_omni_server.host,
+                cold_omni_server.port,
+                cold_omni_server.model,
+                CLIENT_VAD_REPLAY_PATH,
+                stall_s=stalls,
+            )
+        )
+        print(f"client_vad_replay first-output stall per turn (s): {[round(s, 3) for s in stalls]}")
+
+        assert len(answers) == 3, answers
+        assert "qwen" in answers[0].lower(), answers
+        assert "paris" in answers[1].lower(), answers
+        assert "paris" in answers[2].lower(), answers
+
+        logs = cold_omni_server.read_stage_logs()
+        connections = sum(log.count(REALTIME_CONNECTION_LOG_MARKER) for log in logs.values())
+        assert connections == 1, (
+            f"expected a fresh server whose only realtime session is this replay, saw {connections}"
+        )
+
+        runtime_jit = [
+            f"stage {stage_id}: {line.strip()}"
+            for stage_id, log in sorted(logs.items())
+            for line in log.splitlines()
+            if RUNTIME_JIT_LOG_MARKER in line
+        ]
+        assert not runtime_jit, "kernels JIT-compiled mid-request:\n" + "\n".join(runtime_jit)
+
+        warmed = sorted(stage_id for stage_id, log in logs.items() if MOE_PREFILL_WARMUP_LOG_MARKER in log)
+        assert warmed == [0, 1], f"MoE prefill warmup should run in the thinker (0) and talker (1), ran in {warmed}"
 
 
 class _DuplexTestRuntime(NamedTuple):

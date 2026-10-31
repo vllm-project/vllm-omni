@@ -33,17 +33,24 @@ def init_omni_model_state(
 
     Returns an ``OmniModelState`` when the model declares Omni lifecycle
     capabilities, and an ``OmniMambaHybridModelState`` for hybrid models of an
-    Omni stage. Otherwise delegates to the upstream v2 factory, wrapping its
-    default state for auxiliary Omni stages.
+    Omni stage that do not supply their own state. Otherwise delegates to the
+    upstream v2 factory, wrapping its default state for auxiliary Omni stages.
     """
     factory = getattr(model, "create_omni_model_state", None)
     if factory is not None:
         return factory(vllm_config, encoder_cache, device)
     model_config = getattr(vllm_config, "model_config", None)
+    # get_model_state_cls and create_mrv2_model_state already name the state.
+    # Drama 3's factory returns NPUFishOmniModelState on NPU; replacing it with
+    # the generic hybrid state drops Ascend attention metadata and the NPU
+    # runner refuses to start.
+    owns_state = hasattr(model, "get_model_state_cls") or callable(
+        getattr(type(model), "create_mrv2_model_state", None)
+    )
     if (
         isinstance(model_config, OmniModelConfig)
         and getattr(model_config, "is_hybrid", False) is True
-        and not hasattr(model, "get_model_state_cls")
+        and not owns_state
     ):
         # Upstream picks MambaHybridModelState for hybrid recurrent layers
         # (e.g. KDA); the Omni runner needs OmniModelState's lifecycle too.

@@ -62,6 +62,7 @@ def _make_scheduler(scheduler_cls, *, requests, running, waiting, counter, skipp
     scheduler.kv_holding_waiting = skipped if skipped is not None else []
     scheduler.deferred_waiting = set()
     scheduler.num_waiting_for_streaming_input = counter
+    scheduler._outputs_awaiting_stage_payload = {}
     return scheduler
 
 
