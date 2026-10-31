@@ -26,6 +26,7 @@ separate from the decoder's.
 from .decode import decode_frames
 from .encode import can_encode_frames, encode_frames
 from .families import WanVaeFamily, find_family, register_family
+from .forwards import probe_stats, reset_probe_stats
 from .install import (
     ENCODER_REPORT_ATTR,
     REPORT_ATTR,
@@ -54,6 +55,8 @@ __all__ = [
     "install_wan_vae_fastpath",
     "is_installed",
     "is_encoder_installed",
+    "probe_stats",
+    "reset_probe_stats",
     "uninstall_wan_vae_encoder_fastpath",
     "uninstall_wan_vae_fastpath",
 ]

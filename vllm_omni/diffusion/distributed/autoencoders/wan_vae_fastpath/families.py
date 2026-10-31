@@ -163,9 +163,13 @@ def _load_lazy_families() -> None:
     _LAZY_LOADED = True
     for build in _LAZY_FAMILIES:
         try:
-            register_family(build())
+            family = build()
         except (ImportError, AttributeError) as exc:
             logger.debug("Wan VAE fast path: family %s unavailable: %s", build.__name__, exc)
+            continue
+        if any(f.name == family.name for f in _FAMILIES):
+            continue  # registered earlier (by the user): keep it
+        register_family(family)
 
 
 def register_family(family: WanVaeFamily) -> None:
@@ -180,10 +184,12 @@ def families() -> tuple[WanVaeFamily, ...]:
 
 
 def find_family(vae: nn.Module) -> WanVaeFamily | None:
-    """The registered family whose VAE class ``vae`` is an instance of, or ``None``."""
-    for family in families():
-        if isinstance(vae, family.vaes):
-            return family
+    """The registered family for ``vae``'s most specific VAE class (nearest in its MRO), or ``None``."""
+    registered = families()
+    for cls in type(vae).__mro__:
+        for family in reversed(registered):  # the latest registration wins for the same class
+            if cls in family.vaes:
+                return family
     return None
 
 

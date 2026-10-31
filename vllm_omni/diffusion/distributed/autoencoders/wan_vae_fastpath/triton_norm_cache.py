@@ -24,6 +24,7 @@ import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+from vllm_omni.diffusion.layers import vae_rms_norm as vrn
 
 from . import triton_data_movement as dm
 from . import triton_rms_norm_cl as cl
@@ -247,7 +248,7 @@ def norm_act_cat_time(
                 enable_fp_fusion=False,
             )
         else:
-            denom = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32).clamp_min_(1e-12)
+            denom = vrn.fp32_channel_norm(x).clamp_min_(1e-12)
             if not denom.is_contiguous():
                 denom = denom.contiguous()
             _norm_scale_cat_time_kernel[(b * c * out_t, tiles)](
