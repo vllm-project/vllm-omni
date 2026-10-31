@@ -2105,6 +2105,8 @@ class BatchedToken2Wav(nn.Module):
         )
         speech, source, next_mel = self._hift_from_parts(old_mel, chunk_mel, old_source)
         if old_speech.shape[-1] > 0:
+            # _fade_in_out writes in place: speech must be owned storage,
+            # never a graph's static output buffer (see _fade_in_out).
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)
         next_hift = {

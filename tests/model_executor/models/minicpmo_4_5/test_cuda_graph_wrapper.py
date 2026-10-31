@@ -127,6 +127,66 @@ def test_hift_capture_primes_every_replay_batch_before_live_requests():
     torch.testing.assert_close(actual_source, expected_source, rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_hift_cudagraph_replay_from_parts_matches_concatenated_replay() -> None:
+    """CUDA counterpart of the NPU replay_from_parts test.
+
+    amy-why-3459 review follow-up: replay_from_parts lives in the shared
+    cuda_graph_wrapper, so both platforms must pin the same contract --
+    segmented writes equal the concatenated replay, outputs stay owned,
+    and an uncaptured batch is a clean miss.
+    """
+    torch.manual_seed(0)
+    hift = _small_hift()
+    token2wav = SimpleNamespace(
+        hift=hift,
+        flow=SimpleNamespace(encoder=nn.Identity(), token_mel_ratio=2),
+        mel_cache_len=2,
+        source_cache_len=960,
+    )
+    wrapper = HiFTGraphWrapper(
+        token2wav,
+        connector_config={"codec_chunk_frames": 2, "codec_left_context_frames": 3},
+        capture_batch_sizes=[1, 2],
+    )
+    wrapper.capture()
+
+    old_mel = torch.randn(2, 80, 2, device="cuda")
+    chunk_mel = torch.randn(2, 80, 4, device="cuda")
+    cache_source = torch.randn(2, 1, 960, device="cuda")
+    expected = wrapper.replay(torch.cat((old_mel, chunk_mel), dim=2), cache_source)
+    actual = wrapper.replay_from_parts(old_mel, chunk_mel, cache_source)
+    assert actual is not None
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference, rtol=1e-4, atol=1e-5)
+
+    key = (2, 6, 960)
+    assert actual[1].data_ptr() != wrapper.static_cache_source_outputs[key].data_ptr()
+    actual[0].fill_(0.0)
+    replayed = wrapper.replay_from_parts(old_mel, chunk_mel, cache_source)
+    for value, reference in zip(replayed, expected, strict=True):
+        torch.testing.assert_close(value, reference, rtol=1e-4, atol=1e-5)
+
+    first_mel = torch.randn(1, 80, 4, device="cuda")
+    empty_old = torch.zeros(1, 80, 0, device="cuda")
+    empty_cache = torch.zeros(1, 1, 0, device="cuda")
+    expected_first = wrapper.replay(first_mel, empty_cache)
+    actual_first = wrapper.replay_from_parts(empty_old, first_mel, empty_cache)
+    assert actual_first is not None
+    for value, reference in zip(actual_first, expected_first, strict=True):
+        torch.testing.assert_close(value, reference, rtol=1e-4, atol=1e-5)
+
+    assert (
+        wrapper.replay_from_parts(
+            torch.randn(3, 80, 2, device="cuda"),
+            torch.randn(3, 80, 4, device="cuda"),
+            torch.randn(3, 1, 960, device="cuda"),
+        )
+        is None
+    )
+
+
 class _FakeGraph:
     def replay(self) -> None:
         return None
