@@ -9,6 +9,7 @@ connector; stage 1's connector, built from stage 1's config, reads what
 arrives. Requests are the engine's own request objects.
 """
 
+import inspect
 import time
 import uuid
 from collections.abc import Iterator
@@ -19,7 +20,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.request import RequestStatus
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from tests.model_executor.models.chatterbox.helpers import (
     DEPLOY,
@@ -49,6 +50,8 @@ pytestmark = [pytest.mark.core_model]
 
 STOP = ChatterboxConfig().stop_speech_token
 PLANES = ["scheduler-side", "runner-side"]
+# The GPU the decoding tests run on.
+L4 = {"cuda": "L4"}
 # Long enough for every utterance below to end on its stop token or its own cap.
 MAX_TOKENS = 1000
 # How long the scheduler-side transport's sender thread may take for one chunk.
@@ -192,7 +195,7 @@ def receive_through_final(receiver: SharedMemoryConnector, external_id: str) -> 
     return payloads
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res=L4, num_cards=1)
 def test_the_whole_utterance_decodes_through_stage_1(decoder: S3GenDecoder) -> None:
     """With ``async_chunk: false`` stage 1 decodes the processor's prompt as a stream of one final chunk."""
     torch.manual_seed(15)
@@ -317,7 +320,7 @@ def decoded_samples(side: str, decoder: S3GenDecoder, payloads: list[OmniPayload
     return samples
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res=L4, num_cards=1)
 @pytest.mark.parametrize("side", PLANES)
 def test_streamed_chunks_decode_to_the_whole_utterance(
     side: str,
@@ -437,7 +440,7 @@ def test_every_utterance_length_is_sent_once_and_finished_once(
     assert ended_on_a_boundary == {"scheduler-side": [] if capped else boundaries, "runner-side": boundaries}
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res=L4, num_cards=1)
 @pytest.mark.parametrize("side", PLANES)
 @pytest.mark.parametrize(("prompt_tokens", "length"), [(250, 53), (202, 56)])
 def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length(
@@ -696,10 +699,16 @@ def test_two_requests_interleaved_keep_their_own_schedule_and_voice(
 
 @pytest.mark.cpu
 def test_every_test_here_runs_in_a_ci_job() -> None:
-    """A test with neither the cpu mark nor the L4 helper's marks would be selected by no job."""
-    unmarked = [
-        name
-        for name, test in globals().items()
-        if name.startswith("test_") and not {"cpu", "cuda"} & {mark.name for mark in getattr(test, "pytestmark", [])}
-    ]
+    """A test with neither the cpu mark nor every mark of the L4 helper would be selected by no job.
+
+    The L4 marks are the helper's own, so the check follows the helper. Only
+    this module's functions are tests here; the module has no test classes.
+    """
+    l4 = {mark.name for mark in hardware_marks(res=L4, num_cards=1)}
+    unmarked = []
+    for name, test in globals().items():
+        if name.startswith("test_") and inspect.isfunction(test) and test.__module__ == __name__:
+            marks = {mark.name for mark in getattr(test, "pytestmark", [])}
+            if "cpu" not in marks and not l4 <= marks:
+                unmarked.append(name)
     assert unmarked == []
