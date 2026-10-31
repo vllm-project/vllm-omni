@@ -30,7 +30,7 @@ async def test_disconnect_during_backpressured_error_terminates_owner(mocker):
             await super().put(value)
 
     mocker.patch.object(module.asyncio, "Queue", ObservedQueue)
-    closed = []
+    closed, client_closed = [], []
 
     class Response:
         def raise_for_status(self):
@@ -42,6 +42,13 @@ async def test_disconnect_during_backpressured_error_terminates_owner(mocker):
             raise RuntimeError("backend failed with a full event queue")
 
     class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            await asyncio.sleep(0)
+            client_closed.append(True)
+
         @asynccontextmanager
         async def stream(self, *args, **kwargs):
             try:
@@ -49,7 +56,17 @@ async def test_disconnect_during_backpressured_error_terminates_owner(mocker):
             finally:
                 closed.append(True)
 
-    source = module.stream_reply(Client(), "http://local", {}, False)
+    from fastapi import FastAPI
+    from starlette.requests import Request
+
+    from vllm_omni.entrypoints.openai import drvexo_routes as routes
+
+    mocker.patch.object(routes.httpx, "AsyncClient", return_value=Client())
+    request = Request({"type": "http", "app": FastAPI(), "headers": [], "server": ("127.0.0.1", 8000)})
+    response = await routes.chat_stream(
+        routes.StreamChat(request={"messages": [{"role": "user", "content": "hi"}]}, audio_output=False), request
+    )
+    source = response.body_iterator
     assert json.loads(await anext(source))["type"] == "text"
     await asyncio.wait_for(blocked.wait(), 2)
     close = asyncio.create_task(source.aclose())
@@ -61,6 +78,7 @@ async def test_disconnect_during_backpressured_error_terminates_owner(mocker):
         queues[0].get_nowait()
     await asyncio.wait_for(close, 2)
     assert closed == [True]
+    assert client_closed == [True]
     assert terminated, "stream owner deadlocked while cancelling a full error queue"
 
 

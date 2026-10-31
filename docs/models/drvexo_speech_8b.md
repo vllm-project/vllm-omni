@@ -29,7 +29,7 @@ used on the Talker-to-Codec edge. A stored hidden-state bridge is retained for
 checkpoint compatibility and is not the validated generated-text speech path.
 
 For the tested hardware profile and verification commands, see the
-[DGX Spark GB10 recipe](../../recipes/DRVEXO/DRVEXO-Speech-8B-GB10.md).
+[DGX Spark GB10 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/DRVEXO/DRVEXO-Speech-8B-GB10.md).
 
 ## Development launch
 
@@ -129,8 +129,12 @@ hop-by-hop and proxy-forwarding headers, and re-enters the same middleware and
 logging stack. Direct TLS (`--ssl-keyfile`) and Unix socket (`--uds`) listeners
 are explicitly unsupported by this NDJSON wrapper and return 503; use a local
 HTTP listener for it. Standard chat/audio, sentence speech and decisions do
-not use this internal HTTP hop. Both speech routes reject whitespace-only text
-before starting synthesis. Sentence streaming accepts an omitted or null `n`
+not use this internal HTTP hop. Both speech routes validate caller text with
+the bundle's Talker tokenizer before starting synthesis. Empty text, control
+tokens and failed exact encode/decode round trips return 400 without submitting
+an engine request. The tokenizer is loaded once at API bootstrap; a deployment
+without all three stages returns 503 for sentence speech. Sentence streaming
+accepts an omitted or null `n`
 as one response, and rejects multiple choices.
 
 The raw-audio frontend follows the vLLM 0.32 API documented by this checkout's

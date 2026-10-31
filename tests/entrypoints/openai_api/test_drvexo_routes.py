@@ -204,6 +204,7 @@ async def test_sentence_stream_disconnect_closes_owned_engine_request(mocker):
     app.state.openai_serving_chat = Mock(engine_client=engine)
     app.state.drvexo_speech_tokenizer = Mock(
         all_special_ids=[],
+        added_tokens_decoder={},
         encode=lambda text, **kw: list(text.encode()),
         decode=lambda ids, **kw: bytes(ids).decode(),
     )
@@ -228,7 +229,7 @@ def test_invalid_speech_is_rejected_before_engine_and_valid_request_recovers(moc
 
     from vllm_omni.entrypoints.openai import drvexo_routes as routes
 
-    tokenizer = Mock(all_special_ids=[1])
+    tokenizer = Mock(all_special_ids=[1], added_tokens_decoder={})
 
     def encode(text, **kwargs):
         return [1] if "<|im_start|>" in text else [ord(c) + 100 for c in text]
@@ -297,3 +298,20 @@ def test_admission_uses_real_local_talker_tokenizer(tmp_path):
         fixed_text_ids("hello <|im_start|>", loaded)
     with pytest.raises(ValueError, match="changed"):
         fixed_text_ids("hello   world", loaded)
+
+
+def test_added_special_flag_is_enforced_even_if_hf_special_map_omits_token():
+    from dataclasses import dataclass
+    from unittest.mock import Mock
+
+    from vllm_omni.model_executor.models.drvexo_speech_8b.lexical import fixed_text_ids
+
+    @dataclass
+    class AddedToken:
+        special: bool
+
+    tokenizer = Mock(all_special_ids=[], added_tokens_decoder={7: AddedToken(special=True)})
+    tokenizer.encode.return_value = [7]
+    with pytest.raises(ValueError, match="control tokens"):
+        fixed_text_ids("<|im_start|>", tokenizer)
+    tokenizer.decode.assert_not_called()

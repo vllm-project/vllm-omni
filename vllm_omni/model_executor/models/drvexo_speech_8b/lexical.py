@@ -9,12 +9,20 @@ Thinker's segmentation. Control tokens must never be pronounced as words.
 """
 
 
+def control_token_ids(tokenizer):
+    """Include added-token flags omitted from some HF special-token maps."""
+    return set(tokenizer.all_special_ids) | {
+        index for index, token in getattr(tokenizer, "added_tokens_decoder", {}).items() if token.special
+    }
+
+
 def fixed_text_ids(text, tokenizer):
     """Share caller-text validation between HTTP admission and Talker."""
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Fixed speech requires nonempty text")
     ids = tokenizer.encode(text, add_special_tokens=False)
-    if not ids or any(i in tokenizer.all_special_ids for i in ids):
+    controls = control_token_ids(tokenizer)
+    if not ids or any(i in controls for i in ids):
         raise ValueError("Fixed speech cannot contain control tokens")
     if tokenizer.decode(ids, skip_special_tokens=False) != text:
         raise ValueError("Fixed speech tokenization changed the reply")
@@ -26,8 +34,8 @@ class GeneratedTokenRouter:
         self.source = source_tokenizer
         self.target = target_tokenizer
         target_vocab = target_tokenizer.get_vocab()
-        source_special = set(source_tokenizer.all_special_ids)
-        target_special = set(target_tokenizer.all_special_ids)
+        source_special = control_token_ids(source_tokenizer)
+        target_special = control_token_ids(target_tokenizer)
         self.mapping = {
             source_id: target_vocab[token]
             for token, source_id in source_tokenizer.get_vocab().items()
