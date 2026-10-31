@@ -138,8 +138,8 @@ def test_default_num_inference_steps_is_sample_sigmas_length():
     assert _toy_pipeline(SAMPLE_SIGMAS).default_num_inference_steps == len(SAMPLE_SIGMAS)
 
 
-def test_default_num_inference_steps_is_none_without_sample_sigmas():
-    assert _toy_pipeline(None).default_num_inference_steps is None
+def test_default_num_inference_steps_is_50_without_sample_sigmas():
+    assert _toy_pipeline(None).default_num_inference_steps == 50
 
 
 # ---------------------------------------------------------------------------

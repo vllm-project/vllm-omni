@@ -310,6 +310,40 @@ numerical reproduction against a no-cache reference (e.g. the diffusers
 pipeline) requires matching the cache setting on both sides. The prefix KV
 cache is orthogonal to weight quantization and works unchanged under FP8.
 
+### Cache-DiT
+
+`cache_dit` accelerates only the decode phase. Prefill still computes every
+transformer block, while the conditional and unconditional CFG passes keep
+separate cache contexts that are refreshed at each request boundary. Enabling
+Cache-DiT disables whole-decode CUDA Graph; eager decode and the model's
+built-in prefix KV cache remain available.
+
+```bash
+vllm serve Qwen/Qwen-Image-2.1 --omni --port 8091 \
+  --cache-backend cache_dit \
+  --cache-config '{"Fn_compute_blocks":1,"Bn_compute_blocks":0,"max_warmup_steps":4,"max_continuous_cached_steps":3,"residual_diff_threshold":0.12}'
+```
+
+The following screening used one H20, BF16, 1024×1024, batch 1, 30 steps,
+CFG 1, one prompt/seed, and two measured requests per setting. End-to-end time
+includes image postprocessing and PNG/base64 encoding but excludes model
+initialization. RGB SSIM is relative to the graph-off full-compute output.
+
+| Setting | E2E latency | Speedup | RGB SSIM |
+| --- | ---: | ---: | ---: |
+| No Cache-DiT, graph off | 17.09 s | 1.00× | — |
+| Threshold 0.12 | 8.74 s | 1.95× | 0.980 |
+| Threshold 0.24 | 7.18 s | 2.38× | 0.967 |
+
+Peak allocated memory was about 34.0 GiB in every setting. Repeated requests
+produced identical outputs, and threshold 0 matched full computation exactly.
+These are approximate-cache screening results for text-to-image, not a broad
+image-quality claim. Image-conditioned generation, batch greater than one,
+CFG performance, TP/SP, LoRA, and offload combinations have not been qualified.
+
+SCM masks and TeaCache are not supported. Cache-DiT is also unavailable with
+step execution; use the complete-request path.
+
 ### FP8 quantization
 
 Online FP8 quantization of the transformer is supported; the fused
@@ -504,8 +538,9 @@ unless noted; 4× NVIDIA H200):
 
 ## Known Limitations
 
-- Cache acceleration backends (`cache_dit`, `tea_cache`) are not supported;
-  `QwenImage21Pipeline` is registered in `_NO_CACHE_ACCELERATION`.
+- Cache-DiT is decode-only and cannot be combined with step execution or SCM
+  masks. It disables whole-decode CUDA Graph while enabled. TeaCache is not
+  supported. See [Cache-DiT](#cache-dit) for the validated scope.
 - Ulysses sequence parallelism is wired; ring attention is not a supported path.
   A short H200 smoke (1024×1024, 8 steps, seed 42, true CFG 1.0, eager) finished:
   Ulysses SP=2 vs SP=1 is **46.5 dB**. That size's target length is divisible by 4,
