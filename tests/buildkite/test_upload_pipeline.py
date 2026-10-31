@@ -667,6 +667,16 @@ def test_source_file_dependencies_key_expands_from_registry() -> None:
     assert "Diffusion · Qwen Image Test" not in _surviving_labels(doc, ["vllm_omni/unrelated.py"])
 
 
+def test_npu_platform_change_does_not_select_shared_minimax_h3_jobs() -> None:
+    doc = {
+        "steps": [
+            {"label": key, "source_file_dependencies": key, "commands": ["pytest"]}
+            for key in ("diffusion_minimax_h3_function", "diffusion_minimax_h3_accuracy", "diffusion_minimax_h3_perf")
+        ]
+    }
+    assert not _surviving_labels(doc, ["vllm_omni/platforms/npu/platform.py"])
+
+
 @pytest.mark.parametrize("pipeline", ["test-ready.yml", "test-merge.yml", "test-nightly.yml"])
 def test_sensenova_accuracy_is_not_in_daily_pipelines(pipeline: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MIRROR_HW", raising=False)
