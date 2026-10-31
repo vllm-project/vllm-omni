@@ -326,6 +326,22 @@ def test_consumed_bad_payload_removes_lock_file(connector, monkeypatch):
     assert key not in connector._pending_keys
 
 
+def test_put_returns_failure_when_segment_name_raises(connector, monkeypatch):
+    from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
+
+    def fail_segment_name(_key):
+        raise UnicodeEncodeError("utf-8", "x", 0, 1, "bad key")
+
+    errors = []
+    monkeypatch.setattr(module, "_segment_name", fail_segment_name)
+    monkeypatch.setattr(module.logger, "error", lambda *args, **kwargs: errors.append(args))
+    key = f"bad_name_{uuid.uuid4().hex}"
+    assert connector.put("0", "1", key, "payload") == (False, 0, None)
+    assert key not in connector._pending_keys
+    assert len(errors) == 1
+    assert errors[0][2] == "<not computed>"
+
+
 @pytest.mark.parametrize("suffix", ["_1_2", "_1", "_0", "_suffix"])
 def test_cleanup_prefix_only_matches_own_chunk_keys(connector, suffix):
     request_id = f"prefix_{uuid.uuid4().hex}"
@@ -342,6 +358,92 @@ def test_cleanup_prefix_only_matches_own_chunk_keys(connector, suffix):
         assert key not in connector._pending_keys
         assert connector.get("0", "1", key) is None
     assert connector.get("0", "1", sibling_key)[0] == "sibling"
+
+
+# ── Keys built from client request ids ───────────────────────────────
+
+_UNSAFE_REQUEST_KEYS = [
+    pytest.param("chatcmpl-tenant/trace-{u}_0_0", id="slash"),
+    pytest.param("chatcmpl-" + "r" * 240 + "-{u}_0_0", id="too-long"),
+]
+
+
+def _segment_files(metadata):
+    name = metadata["shm"]["name"]
+    return f"/dev/shm/{name}", f"/dev/shm/shm_{name}_lockfile.lock"
+
+
+@pytest.mark.parametrize("key_template", _UNSAFE_REQUEST_KEYS)
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_unsafe_request_id_key_round_trips(connector, key_template, with_metadata):
+    key = key_template.format(u=uuid.uuid4().hex[:8])
+    ok, size, metadata = connector.put("0", "1", key, {"key": key})
+    assert ok
+    assert key in connector._pending_keys
+
+    result = connector.get("0", "1", key, metadata=metadata if with_metadata else None)
+    assert result == ({"key": key}, size)
+    assert key not in connector._pending_keys
+    assert not any(os.path.exists(path) for path in _segment_files(metadata))
+
+
+def test_unsafe_request_id_keys_do_not_collide(connector):
+    request_id = uuid.uuid4().hex[:8]
+    keys = [f"chatcmpl-a/{request_id}_0_0", f"chatcmpl-a:{request_id}_0_0"]
+    metadata = [connector.put("0", "1", key, key)[2] for key in keys]
+    assert all(metadata)
+    assert metadata[0]["shm"]["name"] != metadata[1]["shm"]["name"]
+    for key in reversed(keys):
+        assert connector.get("0", "1", key)[0] == key
+
+
+def test_safe_key_cannot_alias_hashed_segment_name(connector):
+    unsafe_key = f"chatcmpl-a/{uuid.uuid4().hex[:8]}_0_0"
+    _, _, metadata = connector.put("0", "1", unsafe_key, "unsafe")
+    hashed_name = metadata["shm"]["name"]
+    assert hashed_name != unsafe_key
+
+    # A key spelled like a hashed name is hashed again instead of reused.
+    _, _, alias_metadata = connector.put("0", "1", hashed_name, "alias")
+    assert alias_metadata["shm"]["name"] != hashed_name
+    assert connector.get("0", "1", unsafe_key)[0] == "unsafe"
+    assert connector.get("0", "1", hashed_name)[0] == "alias"
+
+
+def test_lone_surrogate_key_round_trips_and_cleans_up(connector):
+    key = f"chatcmpl-\ud800-{uuid.uuid4().hex[:8]}_0_0"
+    ok, _, metadata = connector.put("0", "1", key, "payload")
+    assert ok
+    assert connector.cleanup(key) is True
+    assert not any(os.path.exists(path) for path in _segment_files(metadata))
+
+
+@pytest.mark.parametrize("key_template", _UNSAFE_REQUEST_KEYS)
+def test_unsafe_request_id_unread_segments_are_reclaimed(key_template):
+    sender = SharedMemoryConnector({})
+    receiver = SharedMemoryConnector({})
+    suffix = uuid.uuid4().hex[:8]
+    keys = [key_template.format(u=f"{suffix}{i}") for i in range(3)]
+    try:
+        metadata = {key: sender.put("0", "1", key, key)[2] for key in keys}
+        assert all(metadata.values())
+
+        # Reaping keeps unread keys and drops keys another process consumed.
+        sender.reap_consumed()
+        assert set(sender._pending_keys) == set(keys)
+        assert receiver.get("0", "1", keys[0])[0] == keys[0]
+        sender.reap_consumed()
+        assert set(sender._pending_keys) == set(keys[1:])
+
+        assert sender.cleanup(keys[1]) is True
+        assert not any(os.path.exists(path) for path in _segment_files(metadata[keys[1]]))
+        sender.close()
+        assert not sender._pending_keys
+        for key in keys:
+            assert not any(os.path.exists(path) for path in _segment_files(metadata[key]))
+    finally:
+        sender.close()
+        receiver.close()
 
 
 # ── Arrival wakeups ───────────────────────────────────────────────────
