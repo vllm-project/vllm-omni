@@ -702,7 +702,7 @@ steps:
   agent_pool: mi300_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
-  grade: NonBlocking
+  grade: Blocking
   # Not part of R2-01. The step is 30 minutes; the command leaves five minutes
   # for the runner preflight, matching the R2-02 budget split.
   timeout_in_minutes: 30
@@ -710,10 +710,11 @@ steps:
     - "artifacts/rocm-worker-one-card/**/*"
   commands:
     - |
-      timeout --signal=TERM --kill-after=1m 25m bash <<'WORKER_READY'
       set -euo pipefail
       export WORKER_READY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-worker-one-card"
       mkdir -p "$$WORKER_READY_ARTIFACT_DIR"
+      bash <<'WORKER_READY'
+      set -euo pipefail
       nodes=(
             "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[1]"
             "tests/worker/test_batched_omni_output.py::test_async_packed_snapshot_survives_source_reuse[3]"
@@ -762,20 +763,32 @@ steps:
         echo "One-card worker READY collection drifted from the 32 MI325 nodes" >&2
         exit 1
       fi
-      pytest -s -v \
+      WORKER_READY
+    - |
+      status=0
+      timeout --signal=TERM --kill-after=1m 25m \
+        pytest -s -v \
         tests/worker/test_batched_omni_output.py \
         tests/worker/test_gpu_generation_async_output.py \
         tests/worker_v2/test_eager_frame_kernels.py \
         -m "core_model and rocm and MI325 and cards_1" \
         --run-level "core_model" \
-        --junitxml="$$WORKER_READY_ARTIFACT_DIR/pytest.xml"
-      WORKER_READY
+        --junitxml="$$WORKER_READY_ARTIFACT_DIR/pytest.xml" || status=$$?
+      if [[ "$$status" -eq 0 ]]; then
+        if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 32 and skipped == 0; print(f"Expected exactly 32 executed one-card worker GPU tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$WORKER_READY_ARTIFACT_DIR/pytest.xml"
+        then
+          status=0
+        else
+          status=$$?
+        fi
+      fi
+      (exit "$$status")
 
 - label: "ROCm · One-Card Worker Copy Test"
   agent_pool: mi300_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
-  grade: NonBlocking
+  grade: Blocking
   # Not part of R2-01, and disjoint from the one-card worker GPU job above.
   # The step is 25 minutes; the command leaves five minutes for preflight.
   timeout_in_minutes: 25
@@ -783,10 +796,11 @@ steps:
     - "artifacts/rocm-worker-copy/**/*"
   commands:
     - |
-      timeout --signal=TERM --kill-after=1m 20m bash <<'WORKER_COPY_READY'
       set -euo pipefail
       export WORKER_COPY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-worker-copy"
       mkdir -p "$$WORKER_COPY_ARTIFACT_DIR"
+      bash <<'WORKER_COPY_READY'
+      set -euo pipefail
       nodes=(
             "tests/worker/test_device_copy.py::test_tensor_copy_cuda_handles_pageable_and_pinned_sources"
             "tests/worker/test_device_copy.py::test_device_stager_views_survive_until_their_readers_finish"
@@ -809,14 +823,26 @@ steps:
         echo "One-card worker copy READY collection drifted from the 6 MI325 nodes" >&2
         exit 1
       fi
-      pytest -s -v \
+      WORKER_COPY_READY
+    - |
+      status=0
+      timeout --signal=TERM --kill-after=1m 20m \
+        pytest -s -v \
         tests/worker/test_device_copy.py \
         tests/worker_v2/test_intermediate_buffer_cuda_residency.py \
         tests/worker_v2/test_omni_ar_model_runner_cuda.py \
         -m "core_model and rocm and MI325 and cards_1" \
         --run-level "core_model" \
-        --junitxml="$$WORKER_COPY_ARTIFACT_DIR/pytest.xml"
-      WORKER_COPY_READY
+        --junitxml="$$WORKER_COPY_ARTIFACT_DIR/pytest.xml" || status=$$?
+      if [[ "$$status" -eq 0 ]]; then
+        if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 6 and skipped == 0; print(f"Expected exactly 6 executed one-card worker copy tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$WORKER_COPY_ARTIFACT_DIR/pytest.xml"
+        then
+          status=0
+        else
+          status=$$?
+        fi
+      fi
+      (exit "$$status")
 
 - label: "ROCm · Entrypoints GPU Coverage (R2-02)"
   agent_pool: mi300_1

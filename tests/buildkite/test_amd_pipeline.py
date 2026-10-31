@@ -3176,7 +3176,7 @@ _WORKER_ONE_CARD_NODES = (
 
 
 def test_worker_one_card_ready_stays_outside_r2_01() -> None:
-    """READY adds one NonBlocking MI300 job for the collected one-card nodes.
+    """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
     32 ids. R2-01 still collects 1416 model-executor nodes and does not run them.
@@ -3188,7 +3188,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 30
     assert step["artifact_paths"] == ["artifacts/rocm-worker-one-card/**/*"]
     assert "timeout --signal=TERM --kill-after=1m 25m" in command
@@ -3208,6 +3208,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         assert "MI325" not in Path(path).read_text(encoding="utf-8")
     assert "diff -u /tmp/worker-ready-expected.txt" in command
     assert "--junitxml=" in command
+    assert "Expected exactly 32 executed one-card worker GPU tests" in command
     assert "pytest.log" not in command
     assert "pytest-summary.txt" not in command
     assert "PIPESTATUS" not in command
@@ -3379,7 +3380,7 @@ _WORKER_COPY_NODES = (
 
 
 def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
-    """READY adds one NonBlocking MI300 job for the remaining copy cases.
+    """READY blocks on the remaining one-card copy cases.
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
@@ -3392,7 +3393,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 25
     assert step["artifact_paths"] == ["artifacts/rocm-worker-copy/**/*"]
     assert "timeout --signal=TERM --kill-after=1m 20m" in command
@@ -3420,6 +3421,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
     assert "test_device_stager_cpu_falls_back_to_a_copy" not in command
     assert "diff -u /tmp/worker-copy-ready-expected.txt" in command
     assert "--junitxml=" in command
+    assert "Expected exactly 6 executed one-card worker copy tests" in command
 
     device_copy = Path(_WORKER_COPY_FILES[0]).read_text(encoding="utf-8")
     assert device_copy.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 3
@@ -3777,6 +3779,33 @@ def test_device_reduction_ready_renders_blocking() -> None:
 
 
 @pytest.mark.parametrize(
+    ("label", "expected_message"),
+    [
+        (
+            "ROCm · One-Card Worker GPU Test",
+            "Expected exactly 32 executed one-card worker GPU tests",
+        ),
+        (
+            "ROCm · One-Card Worker Copy Test",
+            "Expected exactly 6 executed one-card worker copy tests",
+        ),
+    ],
+    ids=("worker", "copy"),
+)
+def test_worker_ready_jobs_render_blocking(label: str, expected_message: str) -> None:
+    """Both one-card worker jobs render as hard failures on amd_mi300_1."""
+    step = _find_step(label, AMD_READY_PIPELINE)
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert expected_message in "\n".join(step["commands"])
+    rendered = _rendered_ready_step(label)
+    assert rendered["agents"]["queue"] == "amd_mi300_1"
+    assert rendered["depends_on"] == "amd-build"
+    assert rendered["soft_fail"] is False
+    assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
+
+
+@pytest.mark.parametrize(
     ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
     [
         (0, 17, 0, None, 0),
@@ -3806,6 +3835,67 @@ def test_device_reduction_ready_executes_junit_guard_before_exit(
         job_id_prefix="device-reduction-ready-guard",
         pytest_status=pytest_status,
         tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "expected_tests", "expected_message", "artifact_env", "job_id_prefix"),
+    [
+        (
+            "ROCm · One-Card Worker GPU Test",
+            32,
+            "Expected exactly 32 executed one-card worker GPU tests",
+            "WORKER_READY_ARTIFACT_DIR",
+            "worker-ready-guard",
+        ),
+        (
+            "ROCm · One-Card Worker Copy Test",
+            6,
+            "Expected exactly 6 executed one-card worker copy tests",
+            "WORKER_COPY_ARTIFACT_DIR",
+            "worker-copy-ready-guard",
+        ),
+    ],
+    ids=("worker", "copy"),
+)
+@pytest.mark.parametrize(
+    ("pytest_status", "tests_override", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, None, 0, None, 0),
+        (0, None, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, None, 0, None, 1),
+        (0, None, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_worker_ready_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    label: str,
+    expected_tests: int,
+    expected_message: str,
+    artifact_env: str,
+    job_id_prefix: str,
+    pytest_status: int,
+    tests_override: int | None,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    """Worker READY jobs fail closed unless every pinned node executed."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label=label,
+        command_fragment="pytest -s -v",
+        expected_message=expected_message,
+        artifact_env=artifact_env,
+        job_id_prefix=job_id_prefix,
+        pytest_status=pytest_status,
+        tests=expected_tests if tests_override is None else tests_override,
         skipped=skipped,
         timeout_status=timeout_status,
         expected_status=expected_status,
