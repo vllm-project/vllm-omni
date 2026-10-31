@@ -144,6 +144,21 @@ and is applied while draining outputs, including cancelled requests. Ordinary
 request failures retain retryable classification; duplex session termination
 keeps its existing semantics.
 
+### Correlated control RPC timeouts
+
+`CorrelatedRpcClient.execute` uses a single monotonic timeout budget for
+blocking request submission and waiting for the correlated result. A full
+request queue that exhausts this budget raises the caller's `TimeoutError`;
+successful submission leaves only the remaining budget for the result.
+`timeout=None` keeps both waits unbounded. Negative timeouts are rejected
+before submission, while zero permits only immediately available operations.
+Non-blocking submission still raises `queue.Full` immediately when full.
+
+A local timeout unregisters the result waiter; it does not cancel work already
+submitted to the orchestrator. Late results are still discarded by correlation
+ID. This deadline does not change data-request admission, CFG companion
+grouping, or the orchestrator's queue ownership.
+
 ## Promotion gate
 
 - Reconcile current names and boundaries after #5441 merges, closes, or is

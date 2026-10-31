@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import queue
 import threading
+from time import monotonic
 from typing import TypeAlias
 
 from vllm.logger import init_logger
@@ -133,14 +134,26 @@ class CorrelatedRpcClient:
         timeout_message: str,
         block_on_submit: bool = False,
     ) -> EngineQueueMessage:
+        """Share one timeout budget across submission and result waiting.
+
+        A timeout does not cancel a request that was already submitted.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("'timeout' must be a non-negative number")
+        deadline = None if timeout is None else monotonic() + timeout
         waiter = self._router.register(key)
         try:
             if block_on_submit:
-                self._request_queue.put(message)
+                submit_timeout = None if deadline is None else max(0.0, deadline - monotonic())
+                try:
+                    self._request_queue.put(message, timeout=submit_timeout)
+                except queue.Full as exc:
+                    raise TimeoutError(timeout_message) from exc
             else:
                 self._request_queue.put_nowait(message)
+            result_timeout = None if deadline is None else max(0.0, deadline - monotonic())
             try:
-                result = waiter.get(timeout=timeout)
+                result = waiter.get(timeout=result_timeout)
             except queue.Empty as exc:
                 raise TimeoutError(timeout_message) from exc
             if isinstance(result, ErrorMessage):
