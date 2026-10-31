@@ -1,0 +1,56 @@
+Comparison-image patch for SGLang-Omni 22d4ace88f9547777b819a69d7691204bb9ce847.
+Forward ignore_eos from Chat Completions to the Qwen3-Omni Thinker sampler.
+The Talker retains its normal EOS handling.
+
+diff --git a/sglang_omni/client/types.py b/sglang_omni/client/types.py
+--- a/sglang_omni/client/types.py
++++ b/sglang_omni/client/types.py
+@@ -83,6 +83,7 @@ class SamplingParams:
+     stop_token_ids: list[int] = field(default_factory=list)
+     seed: int | None = None
+     max_new_tokens: int | None = None
++    ignore_eos: bool | None = None
+
+     def to_dict(self) -> dict[str, object]:
+         # note (ratish): a field the caller left unset stays out, so the stage
+@@ -96,6 +97,7 @@ class SamplingParams:
+             "repetition_penalty": self.repetition_penalty,
+             "seed": self.seed,
+             "max_new_tokens": self.max_new_tokens,
++            "ignore_eos": self.ignore_eos,
+         }
+         return {
+             **{name: value for name, value in values.items() if value is not None},
+diff --git a/sglang_omni/serve/protocol.py b/sglang_omni/serve/protocol.py
+--- a/sglang_omni/serve/protocol.py
++++ b/sglang_omni/serve/protocol.py
+@@ -62,6 +62,7 @@ class ChatCompletionRequest(BaseModel):
+     repetition_penalty: float | None = None
+     max_tokens: int | None = Field(default=None, ge=1)
+     max_completion_tokens: int | None = Field(default=None, ge=1)
++    ignore_eos: bool = False
+     stop: str | list[str] | None = None
+     seed: int | None = None
+
+diff --git a/sglang_omni/serve/openai_api.py b/sglang_omni/serve/openai_api.py
+--- a/sglang_omni/serve/openai_api.py
++++ b/sglang_omni/serve/openai_api.py
+@@ -1079,6 +1079,7 @@ def build_chat_generate_request(req: ChatCompletionRequest) -> GenerateRequest:
+         stop=stop,
+         seed=req.seed,
+         max_new_tokens=req.effective_max_tokens,
++        ignore_eos=req.ignore_eos,
+     )
+
+     # Convert messages
+diff --git a/sglang_omni/models/qwen3_omni/request_builders.py b/sglang_omni/models/qwen3_omni/request_builders.py
+--- a/sglang_omni/models/qwen3_omni/request_builders.py
++++ b/sglang_omni/models/qwen3_omni/request_builders.py
+@@ -770,6 +770,7 @@ def build_sglang_thinker_request(
+         stop=stop,
+         stop_token_ids=stop_token_ids,
+         sampling_seed=seed,
++        ignore_eos=params.get("ignore_eos", False),
+     )
+     sampling_params.normalize(tokenizer)
+     sampling_params.verify(vocab_size)

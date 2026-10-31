@@ -74,6 +74,148 @@ def test_bootstrap_steps_loaded_from_file() -> None:
     assert "placeholder:" not in steps
 
 
+def test_backend_comparison_entry_excludes_regular_cuda_pipeline() -> None:
+    entry = yaml.safe_load(Path(".buildkite/cuda/pipeline.yml").read_text())
+    steps = {step["key"]: step for step in entry["steps"]}
+    assert set(steps) == {"upload-ci-pipeline", "upload-backend-comparison"}
+    regular = steps["upload-ci-pipeline"]
+    comparison = steps["upload-backend-comparison"]
+    # Complementary gates: other PR labels cannot enable both routes, and main
+    # keeps its regular scheduled/post-merge pipeline even with the label present.
+    assert regular["if"] == (
+        'build.branch == "main" || !(build.pull_request.labels includes "backend-comparison-test")'
+    )
+    assert comparison["if"] == (
+        'build.branch != "main" && build.pull_request.labels includes "backend-comparison-test"'
+    )
+    assert regular["commands"] == [
+        "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/cuda/bootstrap-upload-steps.yml"
+    ]
+    assert comparison["commands"] == ["buildkite-agent pipeline upload .buildkite/cuda/test-sglang-omni.yml"]
+    assert "depends_on" not in comparison
+    assert comparison["agents"] == {"queue": "medium_cpu_queue_premerge"}
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    [".buildkite/cuda/test-nightly.yml", "tests/dfx/perf/scripts/run_benchmark.py", "docs/foo.md"],
+)
+def test_regular_cuda_uploads_do_not_include_backend_comparison(changed_file: str) -> None:
+    rendered = _render_bootstrap_pipeline(
+        _load_bootstrap_steps(CUDA_BOOTSTRAP_STEPS),
+        decision=resolve_ci_decision([changed_file]),
+        path=CUDA_BOOTSTRAP_STEPS,
+    )
+    assert "backend-comparison-test" not in rendered
+    assert "test-sglang-omni.yml" not in NIGHTLY_YAML.read_text()
+
+
+def test_backend_comparison_pipeline_has_only_required_jobs() -> None:
+    comparison = yaml.safe_load(Path(".buildkite/cuda/test-sglang-omni.yml").read_text())
+    assert len(comparison["steps"]) == 2
+    build, benchmark = comparison["steps"]
+    assert "depends_on" not in build
+    assert benchmark["depends_on"] == build["key"] == "image-build-sglang-omni"
+    assert benchmark["key"] == "nightly-sglang-omni-qwen3-omni"
+    assert "--test-config-file tests/dfx/perf/tests/test_qwen3_omni_sglang.json" in benchmark["commands"][-1]
+    assert benchmark["artifact_paths"] == ["tests/dfx/perf/results/*.json"]
+    container = benchmark["plugins"][0]["kubernetes"]["podSpec"]["containers"][0]
+    assert container["image"].endswith("${BUILDKITE_COMMIT}-sglang-omni")
+    assert container["resources"]["limits"]["nvidia.com/gpu"] == 2
+
+
+def test_backend_comparison_client_matches_cuda_runtime_pin() -> None:
+    standard = Path("docker/Dockerfile.ci").read_text()
+    comparison = Path("docker/Dockerfile.other").read_text()
+    for name in ("VLLM_VERSION", "VLLM_PRECOMPILED_WHEEL_COMMIT"):
+        pin = next(line for line in standard.splitlines() if line.startswith(f"ARG {name}="))
+        assert pin in comparison.splitlines()
+    assert (
+        '"vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/'
+        'vllm-${VLLM_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl"'
+    ) in comparison
+
+
+def test_backend_comparison_deploy_uses_both_requested_gpus() -> None:
+    configs = yaml.safe_load(Path("tests/dfx/perf/tests/test_qwen3_tts_sglang.json").read_text())
+    assert len(configs) == 1
+    config = configs[0]
+    hardware = next(mark["hardware_marks"] for mark in config["mark"] if isinstance(mark, dict))
+    assert hardware == {"res": {"cuda": "H100"}, "num_cards": 2}
+    deploy = yaml.safe_load(Path(config["server_params"]["serve_args"]["config"]).read_text())
+    assert deploy["config_cls"] == "Qwen3TTSPipelineConfig"
+    assert deploy["model_path"] == config["server_params"]["model"]
+    assert deploy["stages"]["tts_engine"] == {"process": "pipeline", "gpu": 0}
+    assert deploy["stages"]["vocoder"] == {"process": "vocoder", "gpu": 1}
+
+
+def test_qwen3_omni_comparison_matches_random_audio_baseline() -> None:
+    configs = yaml.safe_load(Path("tests/dfx/perf/tests/test_qwen3_omni_sglang.json").read_text())
+    assert len(configs) == 1
+    config = configs[0]
+    assert config["server_type"] == "sglang-omni"
+    hardware = next(mark["hardware_marks"] for mark in config["mark"] if isinstance(mark, dict))
+    assert hardware == {"res": {"cuda": "H100"}, "num_cards": 2}
+    deploy = yaml.safe_load(Path(config["server_params"]["serve_args"]["config"]).read_text())
+    assert deploy["config_cls"] == "Qwen3OmniSpeechPipelineConfig"
+    assert deploy["model_path"] == config["server_params"]["model"] == "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    assert {name: stage["gpu"] for name, stage in deploy["stages"].items()} == {
+        "image_encoder": 0,
+        "audio_encoder": 0,
+        "thinker": 0,
+        "talker_ar": 1,
+        "code2wav": 1,
+    }
+    assert len(config["benchmark_params"]) == 1
+    workload = config["benchmark_params"][0]
+    baseline = yaml.safe_load(Path("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json").read_text())[0]
+    # Only the first, audio-in/text+audio-out workload; do not copy the sweep.
+    expected = {key: value for key, value in baseline["benchmark_params"][0].items() if key != "baseline"}
+    assert {key: workload[key] for key in expected} == expected
+    assert "max_concurrency" not in workload
+    assert workload["num_warmups"] == 2
+    assert workload["seed"] == 0
+    assert workload["extra_body"]["modalities"] == ["text", "audio"]
+    assert workload["extra_body"]["audio"]["format"] == "wav"
+    vllm_deploy = yaml.safe_load(Path("vllm_omni/deploy/qwen3_omni_moe.yaml").read_text())
+    talker_sampling = vllm_deploy["stages"][1]["default_sampling_params"]
+    assert workload["extra_body"]["seed"] == talker_sampling["seed"]
+    for parameter in ("temperature", "top_k", "repetition_penalty"):
+        assert workload["extra_body"][f"talker_{parameter}"] == talker_sampling[parameter]
+    assert workload["extra_body"]["talker_max_new_tokens"] == talker_sampling["max_tokens"]
+    assert deploy["stages"]["thinker"]["engine"]["disable_radix_cache"]
+    assert deploy["stages"]["talker_ar"]["engine"] == {
+        "max_running_requests": vllm_deploy["stages"][1]["max_num_seqs"],
+        "disable_radix_cache": True,
+    }
+    chunks = vllm_deploy["connectors"]["connector_of_shared_memory"]["extra"]
+    assert deploy["stages"]["code2wav"]["factory"] == {
+        "initial_codec_chunk_frames": chunks["initial_codec_chunk_frames"],
+        "stream_chunk_size": chunks["codec_chunk_frames"],
+        "left_context_size": chunks["codec_left_context_frames"],
+    }
+    assert deploy["stages"]["talker_ar"]["factory"] == {
+        "codec_coalesce_first_frames": chunks["initial_codec_chunk_frames"],
+        "codec_coalesce_early_frames": 0,
+        "codec_coalesce_frames": chunks["codec_chunk_frames"],
+    }
+
+
+def test_backend_comparison_labels_skip_npu_entry_only_for_prs() -> None:
+    entry = yaml.safe_load(Path(".buildkite/npu/pipeline-npu.yml").read_text())["steps"][0]
+    assert entry["if"] == (
+        'build.branch == "main" || !(build.pull_request.labels includes "backend-comparison-test" || '
+        'build.pull_request.labels includes "sglang-omni-test")'
+    )
+    rendered = _render_bootstrap_pipeline(
+        BOOTSTRAP_STEPS_TEMPLATE,
+        decision=resolve_ci_decision(["docker/Dockerfile.other"]),
+        path=Path(".buildkite/npu/bootstrap-upload-steps.yml"),
+    )
+    assert "sglang-omni-test" not in rendered
+    assert "backend-comparison-test" not in rendered
+
+
 def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
     """skip_all: no PR labels; main + NIGHTLY=1 / WEEKLY=1 / NON_CRITICAL=1 still gates scheduled CI."""
     rendered = _render(["docs/foo.md"])

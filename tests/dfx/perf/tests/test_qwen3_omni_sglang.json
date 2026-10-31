@@ -1,0 +1,57 @@
+[
+  {
+    "test_name": "test_sglang_qwen3_omni",
+    "server_type": "sglang-omni",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {"cuda": "H100"},
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+      "env": {
+        "SGLANG_OMNI_STARTUP_TIMEOUT": "1800",
+        "SGLANG_OMNI_WARMUP_TIMEOUT": "1800"
+      },
+      "serve_args": {
+        "config": "tests/dfx/perf/deploy/sgl_qwen3_omni.yaml"
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "random_audio",
+        "dataset_name": "random-mm",
+        "backend": "openai-chat-omni",
+        "endpoint": "/v1/chat/completions",
+        "num_prompts": [10],
+        "request_rate": [0.1],
+        "num_warmups": 2,
+        "seed": 0,
+        "random_input_len": 100,
+        "random_output_len": 100,
+        "random_range_ratio": 0.0,
+        "ignore_eos": true,
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0.5,
+        "random_mm_limit_mm_per_prompt": {"audio": 1},
+        "random_mm_bucket_config": {"(0, 60, 3)": 1.0},
+        "extra_body": {
+          "modalities": ["text", "audio"],
+          "audio": {"voice": "Chelsie", "format": "wav"},
+          "seed": 42,
+          "talker_temperature": 0.9,
+          "talker_top_p": 1.0,
+          "talker_top_k": 50,
+          "talker_repetition_penalty": 1.05,
+          "talker_max_new_tokens": 4096
+        },
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
+      }
+    ]
+  }
+]
