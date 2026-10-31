@@ -8,8 +8,8 @@ semantics are unvalidated: under layerwise offload the block-weight prefetch
 step size no longer matches the request count, and HSDP's ``fully_shard``
 registers native forward pre-hooks to all-gather weights against a batch
 dimension that no longer matches the request count. The packed path must
-refuse to run while blocks carry hooks -- ``prepare_mixfusion_inputs`` raises
-before any packing work -- and the driver must fall back to
+refuse to run while blocks carry hooks -- the adapter's ``prepare_inputs``
+raises before any packing work -- and the driver must fall back to
 the serial path, whose per-request loops route every block through the hooked
 module call.
 """
@@ -26,6 +26,7 @@ from vllm_omni.diffusion.forward_context import ForwardContext, override_forward
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook, module_has_active_hooks
 from vllm_omni.diffusion.hooks.mixfusion import plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
+from vllm_omni.diffusion.models.qwen_image.mixfusion_adapter import QwenImageMixFusionAdapter
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
@@ -63,7 +64,8 @@ def _transformer(blocks: list[nn.Module]) -> QwenImageTransformer2DModel:
     transformer = QwenImageTransformer2DModel.__new__(QwenImageTransformer2DModel)
     object.__setattr__(transformer, "zero_cond_t", False)
     object.__setattr__(transformer, "parallel_config", SimpleNamespace(sequence_parallel_size=1))
-    object.__setattr__(transformer, "transformer_blocks", blocks)
+    # ``plan_foreign_hooks`` expands ``*`` only over ``nn.ModuleList``.
+    object.__setattr__(transformer, "transformer_blocks", nn.ModuleList(blocks))
     return transformer
 
 
@@ -134,54 +136,50 @@ def test_module_has_active_hooks():
     assert module_has_active_hooks(_hooked_block())
 
 
-def test_has_active_block_hooks_reflects_block_hooks():
-    assert not _transformer([_PlainBlock()]).has_active_block_hooks()
-    assert _transformer([_PlainBlock(), _hooked_block()]).has_active_block_hooks()
+def test_plan_foreign_hooks_reports_block_hooks():
+    plan = QwenImageTransformer2DModel._mixfusion_plan
+    assert plan_foreign_hooks(_transformer([_PlainBlock()]), plan) == []
+    assert plan_foreign_hooks(_transformer([_PlainBlock(), _hooked_block()]), plan) == [
+        "transformer_blocks.*.img_mod:layerwise_offload"
+    ]
 
 
-def test_has_active_block_hooks_reflects_native_block_hooks():
+def test_plan_foreign_hooks_reports_native_block_hooks():
     # HSDP's fully_shard registers PyTorch-native hooks (invisible to the
     # Omni HookRegistry); the guard must fall back for those too.
-    assert not _transformer([_PlainBlock()]).has_active_block_hooks()
-    assert _transformer([_PlainBlock(), _hsdp_like_block()]).has_active_block_hooks()
+    plan = QwenImageTransformer2DModel._mixfusion_plan
+    assert plan_foreign_hooks(_transformer([_PlainBlock()]), plan) == []
+    assert plan_foreign_hooks(_transformer([_PlainBlock(), _hsdp_like_block()]), plan) == [
+        "transformer_blocks.*.img_mod:torch-native"
+    ]
+
+
+def _prepare(transformer, **overrides):
+    kwargs = dict(
+        hidden_states=[torch.zeros(1, 8, 16)],
+        encoder_hidden_states=torch.zeros(1, 4, 8),
+        img_shapes=[(16, 2, 2)],
+        txt_seq_lens=[4],
+    )
+    kwargs.update(overrides)
+    QwenImageMixFusionAdapter().prepare_inputs(transformer, **kwargs)
 
 
 def test_packed_prepare_rejects_hooked_blocks():
-    transformer = _transformer([_hooked_block()])
-
-    with pytest.raises(ValueError, match="hook semantics"):
-        transformer.prepare_mixfusion_inputs(
-            hidden_states=[torch.zeros(1, 8, 16)],
-            encoder_hidden_states=torch.zeros(1, 4, 8),
-            img_shapes=[(16, 2, 2)],
-            txt_seq_lens=[4],
-        )
+    with pytest.raises(ValueError, match="unvalidated semantics"):
+        _prepare(_transformer([_hooked_block()]))
 
 
 def test_packed_prepare_rejects_native_hooked_blocks():
-    transformer = _transformer([_hsdp_like_block()])
-
-    with pytest.raises(ValueError, match="hook semantics"):
-        transformer.prepare_mixfusion_inputs(
-            hidden_states=[torch.zeros(1, 8, 16)],
-            encoder_hidden_states=torch.zeros(1, 4, 8),
-            img_shapes=[(16, 2, 2)],
-            txt_seq_lens=[4],
-        )
+    with pytest.raises(ValueError, match="unvalidated semantics"):
+        _prepare(_transformer([_hsdp_like_block()]))
 
 
 def test_packed_prepare_passes_the_hook_guard_without_hooks():
     # Without hooks the guard must not fire; execution continues to the
     # regular input validation (empty hidden states).
-    transformer = _transformer([_PlainBlock()])
-
     with pytest.raises(ValueError, match="at least one hidden-state tensor"):
-        transformer.prepare_mixfusion_inputs(
-            hidden_states=[],
-            encoder_hidden_states=torch.zeros(1, 4, 8),
-            img_shapes=[(16, 2, 2)],
-            txt_seq_lens=[4],
-        )
+        _prepare(_transformer([_PlainBlock()]), hidden_states=[])
 
 
 def test_driver_falls_back_to_serial_when_blocks_are_hooked():

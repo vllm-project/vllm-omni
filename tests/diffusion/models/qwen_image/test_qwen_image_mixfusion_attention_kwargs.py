@@ -29,8 +29,8 @@ from vllm_omni.diffusion.forward_context import (
     override_forward_context,
 )
 from vllm_omni.diffusion.mixfusion.driver import MixFusionDriver
+from vllm_omni.diffusion.models.qwen_image.mixfusion_adapter import QwenImageMixFusionAdapter
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
-    QwenImageMixFusionAdapter,
     QwenImageTransformer2DModel,
 )
 
@@ -56,7 +56,7 @@ def _transformer() -> QwenImageTransformer2DModel:
     transformer = QwenImageTransformer2DModel.__new__(QwenImageTransformer2DModel)
     object.__setattr__(transformer, "zero_cond_t", False)
     object.__setattr__(transformer, "parallel_config", SimpleNamespace(sequence_parallel_size=1))
-    object.__setattr__(transformer, "transformer_blocks", [_PlainBlock()])
+    object.__setattr__(transformer, "transformer_blocks", nn.ModuleList([_PlainBlock()]))
     return transformer
 
 
@@ -118,7 +118,8 @@ def _dense_step(batch, **kwargs):
 
 def test_prepare_rejects_attention_kwargs_on_packed_input():
     with pytest.raises(ValueError, match="does not consume attention_kwargs"):
-        _transformer().prepare_mixfusion_inputs(
+        QwenImageMixFusionAdapter().prepare_inputs(
+            _transformer(),
             hidden_states=[torch.zeros(1, 8, 16)],
             encoder_hidden_states=torch.zeros(1, 4, 8),
             img_shapes=[(16, 2, 2)],
@@ -131,7 +132,8 @@ def test_prepare_accepts_empty_attention_kwargs_on_packed_input():
     # An empty dict carries no per-attention arguments, so the packed dispatch
     # must proceed (here: into the regular input validation).
     with pytest.raises(ValueError, match="at least one hidden-state tensor"):
-        _transformer().prepare_mixfusion_inputs(
+        QwenImageMixFusionAdapter().prepare_inputs(
+            _transformer(),
             hidden_states=[],
             encoder_hidden_states=torch.zeros(1, 4, 8),
             img_shapes=[(16, 2, 2)],

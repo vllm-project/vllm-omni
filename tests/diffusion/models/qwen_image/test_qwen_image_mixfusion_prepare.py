@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Tests for ``prepare_mixfusion_inputs`` and its step-invariant layout cache (CPU).
+"""Tests for the adapter's ``prepare_inputs`` and its step-invariant layout cache (CPU).
 
-``prepare_mixfusion_inputs`` owns all packed-layout preparation: row expansion,
-chunk split, RoPE tables and the block-agnostic packing plan. Within one
-generation's denoise loop only the latents change, so the bundle from the
-previous step can be handed back as ``cached``: the plan, RoPE tables and
-chunk size are reused verbatim while the fresh latents are re-split and
-re-projected.
+``QwenImageMixFusionAdapter.prepare_inputs`` owns all packed-layout
+preparation: row expansion, chunk split, RoPE tables and the block-agnostic
+packing plan. Within one generation's denoise loop only the latents change, so
+the bundle from the previous step can be handed back as ``cached``: the plan,
+RoPE tables and chunk size are reused verbatim while the fresh latents are
+re-split and re-projected.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.models.qwen_image.mixfusion_adapter import QwenImageMixFusionAdapter
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
-    QwenImageMixFusionAdapter,
     QwenImageTransformer2DModel,
 )
 
@@ -46,9 +46,8 @@ def _transformer() -> tuple[QwenImageTransformer2DModel, list]:
     transformer = QwenImageTransformer2DModel.__new__(QwenImageTransformer2DModel)
     object.__setattr__(transformer, "zero_cond_t", False)
     object.__setattr__(transformer, "parallel_config", SimpleNamespace(sequence_parallel_size=1))
-    object.__setattr__(transformer, "transformer_blocks", [_PlainBlock()])
+    object.__setattr__(transformer, "transformer_blocks", nn.ModuleList([_PlainBlock()]))
     object.__setattr__(transformer, "img_in", nn.Identity())
-    object.__setattr__(transformer, "mixfusion_adapter", QwenImageMixFusionAdapter())
     pos_embed_calls: list[int] = [0]
 
     def pos_embed(img_shapes, txt_seq_lens, device):
@@ -66,7 +65,8 @@ def _transformer() -> tuple[QwenImageTransformer2DModel, list]:
 def _prepare(transformer, latents, *, prompt_rows, seq_len_txt=4, cached=None, img_shapes=None):
     if img_shapes is None:
         img_shapes = [(int(latent.shape[1]), 2, 2) for latent in latents]
-    return transformer.prepare_mixfusion_inputs(
+    return QwenImageMixFusionAdapter().prepare_inputs(
+        transformer,
         hidden_states=latents,
         encoder_hidden_states=torch.zeros(prompt_rows, seq_len_txt, 8),
         encoder_hidden_states_mask=None,
@@ -97,7 +97,8 @@ def test_prepare_builds_packed_inputs():
 def test_prepare_normalizes_all_valid_mask():
     transformer, _ = _transformer()
     latents = [torch.zeros(1, 8, 2)]
-    prepared = transformer.prepare_mixfusion_inputs(
+    prepared = QwenImageMixFusionAdapter().prepare_inputs(
+        transformer,
         hidden_states=latents,
         encoder_hidden_states=torch.zeros(1, 4, 8),
         encoder_hidden_states_mask=torch.ones(1, 4),
