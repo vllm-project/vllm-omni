@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import numpy as np
 import pytest
@@ -605,6 +606,33 @@ def b64(data: bytes) -> str:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("audio_format", ["pcm_f32le", "pcm16", "g711_ulaw", "g711_alaw"])
+async def test_input_conversion_offload_only_for_encoded_formats(audio_format: str, monkeypatch) -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        offload = AsyncMock(wraps=h.runner.offload)
+        monkeypatch.setattr(h.runner, "offload", offload)
+        if audio_format == "pcm_f32le":
+            audio = pcm_f32(1600, value=0.125)
+        elif audio_format == "pcm16":
+            audio = np.full(1600, 4096, dtype="<i2").tobytes()
+        else:
+            audio = b"\x00" * 1600
+        events = await h.run(
+            commands.AppendAudio(audio=audio, format=audio_format, sample_rate_hz=16000, is_speech=True)
+        )
+        if audio_format == "pcm_f32le":
+            offload.assert_not_awaited()
+        else:
+            offload.assert_awaited_once()
+        events += await h.run(commands.Commit(create_response=True))
+        assert "error" not in types(events)
+        assert h.port.submissions
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("camera_update", [False, True])
 async def test_aura_asr_transcript_does_not_project_as_assistant_output(camera_update: bool) -> None:
     from io import BytesIO
@@ -1019,10 +1047,20 @@ async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch,
     monkeypatch.setattr(owner, method, blocked)
     monkeypatch.setattr(h.runner, "_on_command", track_command)
     try:
-        h.submit(append_audio(samples=8000))
+        command = append_audio(samples=8000)
+        if phase == "decode":
+            # Float32 PCM bypasses conversion; use PCM16 to exercise the offload.
+            command = commands.AppendAudio(
+                audio=np.full(8000, 4096, dtype="<i2").tobytes(),
+                format="pcm16",
+                sample_rate_hz=16000,
+                is_speech=True,
+            )
+        h.submit(command)
         await asyncio.wait_for(started.wait(), timeout=2.0)
-        assert h.session.pending_input_bytes == 32_000
-        h.submit(append_audio(samples=10_000, event_id="over-limit"))
+        assert h.session.pending_input_bytes == len(command.audio)
+        # This append fills the budget alone, so either wire format exceeds it.
+        h.submit(append_audio(samples=16_000, event_id="over-limit"))
         events = await h.settle()
         assert any(
             event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
