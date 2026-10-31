@@ -208,10 +208,12 @@ _DIFFUSION_APP_STATE_KEYS = {
     "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
+    "serving_render",
 }
 _DIFFUSION_MUST_BE_NONE = {
     "vllm_config",
     "serving_tokenization",
+    "serving_render",
     "openai_serving_duplex",
     "openai_streaming_speech",
     "openai_streaming_video",
@@ -240,6 +242,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
+    "serving_render",
 }
 # The OpenPI robot server is None unless the policy declares policy_server_config.
 _MULTISTAGE_MUST_BE_NONE = {
@@ -1448,6 +1451,7 @@ async def test_multistage_app_state_key_snapshot(
     monkeypatch.setattr(api_server, "process_lora_modules", lambda modules, _defaults: modules or [])
     monkeypatch.setattr(api_server, "OpenAIServingModels", _FakeModels)
     monkeypatch.setattr(api_server, "OnlineRenderer", _FakeCtor)
+    monkeypatch.setattr(api_server, "ServingRender", _FakeCtor)
     monkeypatch.setattr(api_server, "OpenAIServingResponses", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChat", _FakeCtor)
     monkeypatch.setattr(api_server, "OmniOpenAIServingChatBatch", _FakeCtor)
@@ -1496,7 +1500,7 @@ async def test_multistage_app_state_key_snapshot(
     disabled = (
         set()
         if "generate" in supported_tasks
-        else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
+        else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video", "serving_render"}
     )
     robot = {"openai_serving_realtime_robot"} if policy_server else set()
     _assert_app_state_snapshot(

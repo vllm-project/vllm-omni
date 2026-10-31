@@ -266,6 +266,21 @@ Which stages may set `enable_prefix_caching: true`:
 | Codec decoder / Code2Wav stages (Qwen3-Omni stage 2, Qwen3-TTS stage 1) | keep `false` | Nothing downstream consumes their hidden states; the cache would only add device→host copies. Not validated. |
 | Diffusion stages | n/a | No vLLM KV cache to mirror. |
 
+A stage with prefix caching on can additionally publish standard vLLM
+KV-cache events for prefix-aware routing. Set `kv_events_config` (upstream
+`KVEventsConfig` fields, with `enable_kv_cache_events: true`) via the global
+`--kv-events-config` flag, `--stage-overrides
+'{"<stage_id>": {"kv_events_config": {...}}}'`, or deploy
+`stages[].kv_events_config`. Diffusion stages cannot set it (no KV cache to
+mirror). The global flag fans the same value out to every owning stage;
+each stage's endpoint/replay port and topic are auto-offset by stage index
+so publishers never collide (an explicit per-stage value is left as-is).
+Each replica of a stage is further diversified the same way, automatically,
+regardless of whether its `kv_events_config` came from the global flag or
+an explicit per-stage value. vLLM's own per-data-parallel-rank port offset
+(inside `ZmqEventPublisher`) still applies within a single replica on top
+of both.
+
 Hit spans come from adapter-classified `STARTED` events for new requests:
 
 - A new request with a (partial) prefix hit is the normal path: the hit

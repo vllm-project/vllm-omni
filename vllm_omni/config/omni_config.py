@@ -389,7 +389,14 @@ def _stage_cli_overrides(
         ):
             continue
         if stage_specific or (key in global_stage_fields and (owned_fields is None or key in owned_fields)):
-            result[key] = _copy_value(value)
+            value = _copy_value(value)
+            if key == "kv_events_config" and not stage_specific and isinstance(value, Mapping):
+                # A bare --kv-events-config fans the same value out to every
+                # owning stage; diversify per stage so publishers don't bind
+                # the same endpoint/topic (an explicit per-stage value is
+                # left untouched -- the caller already differentiated it).
+                value = _offset_kv_events_config_for_stage(value, stage_id)
+            result[key] = value
 
     # step_execution is a diffusion execution protocol, not an LLM engine
     # argument. Keep global and stage-scoped CLI values off AR/generation stages.
@@ -408,6 +415,33 @@ def _stage_cli_overrides(
                         "it has no diffusion stage-config consumer."
                     )
                 result.setdefault(field_name, _copy_value(value))
+    return result
+
+
+# Headroom per stage so a replica's own per-DP-rank port offset (applied by
+# vLLM's ZmqEventPublisher) and StageRuntime._prepare_replica_vllm_config's
+# own per-replica offset never spill into the next stage's range.
+_KV_EVENTS_STAGE_PORT_STRIDE = 4096
+
+
+def _offset_kv_events_config_for_stage(kv_events_config: Mapping[str, Any], stage_id: int) -> dict[str, Any]:
+    """Diversify a globally fanned-out kv_events_config for one stage.
+
+    A bare --kv-events-config fans the same value out to every owning stage;
+    without this, every stage's publisher would bind the same endpoint and
+    topic. Reuses vLLM's own DP-rank port-offset helper so the parsing edge
+    cases (tcp port 0, inproc endpoints) match exactly.
+    """
+    from vllm.config.kv_events import KVEventsConfig
+    from vllm.distributed.kv_events import ZmqEventPublisher
+
+    result = dict(kv_events_config)
+    offset = stage_id * _KV_EVENTS_STAGE_PORT_STRIDE
+    result["endpoint"] = ZmqEventPublisher.offset_endpoint_port(result.get("endpoint", KVEventsConfig.endpoint), offset)
+    replay_endpoint = result.get("replay_endpoint", KVEventsConfig.replay_endpoint)
+    if replay_endpoint:
+        result["replay_endpoint"] = ZmqEventPublisher.offset_endpoint_port(replay_endpoint, offset)
+    result["topic"] = f"{result.get('topic', KVEventsConfig.topic)}-s{stage_id}"
     return result
 
 
@@ -595,6 +629,7 @@ class OmniStageSchedulerConfig(_TrackExplicitConfigFields, VllmSchedulerConfig):
     is_encoder_decoder: InitVar[bool] = False  # type: ignore[assignment]
     enable_chunked_prefill: bool | None = None
     async_scheduling: bool | None = None
+    kv_events_config: dict[str, Any] | None = None
 
     def __post_init__(self, is_encoder_decoder: bool = False) -> None:
         # Upstream initializes these derived fields in its terminal post-init.
@@ -1257,6 +1292,12 @@ _SCHEDULER_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
         }
     ),
 )
+# Top-level VllmConfig input upstream, invisible to the SchedulerConfig
+# auto-map: project explicitly so it reaches EngineArgs/stage VllmConfig.
+_SCHEDULER_CONFIG_ENGINE_FIELD_MAP = {
+    **_SCHEDULER_CONFIG_ENGINE_FIELD_MAP,
+    "kv_events_config": "kv_events_config",
+}
 _PARALLEL_CONFIG_ENGINE_FIELD_MAP = _upstream_engine_field_map(
     VllmParallelConfig,
     aliases={"data_parallel_master_ip": "data_parallel_address"},
@@ -1605,6 +1646,11 @@ def _stage_engine_values(
             else:
                 engine[key] = _copy_value(value)
     if topology.execution_type == StageExecutionType.DIFFUSION:
+        if engine.get("kv_events_config") is not None:
+            raise ValueError(
+                f"Stage {topology.stage_id} (diffusion) cannot set 'kv_events_config': "
+                "diffusion stages have no vLLM KV cache to publish events from."
+            )
         diffusion_kwargs = extract_diffusion_stage_config_kwargs(engine, stage_id=topology.stage_id)
     else:
         diffusion_kwargs = {}
