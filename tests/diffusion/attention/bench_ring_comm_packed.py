@@ -7,29 +7,33 @@
 single ``batch_isend_irecv``, so packing them trades two NCCL ops per hop for
 one, plus one copy to build the packed buffer.
 
-Result on 4x H100 (9450 tokens/rank, 40 heads, head_dim 128, bfloat16): packing
-is ~1.9x on an isolated rotation, and nearly all of that comes from the single
-larger transfer rather than from owning the receive buffer. Even so, packing
-was NOT adopted in ``ring_flash_attn_forward``: the full ring call measured
-slightly slower with it (12.28 -> 12.43 ms), because the forward issues the
-transfer, computes the current block's attention, and only then waits, so the
-transfer is already hidden behind compute. Making hidden work faster buys
-nothing, while the packing copy lands on the critical path. Keep this script as
-the evidence for that decision, and re-check it if the ring loop ever stops
-overlapping comm with compute.
+This measures the rotation ALONE, with no attention. That makes it an upper
+bound on what packing can buy, not a prediction of the full ring call:
+``ring_flash_attn_forward`` issues the hop's transfer, computes the current
+block's attention, and only then waits, so part of the transfer is already
+hidden behind compute. Making hidden work faster buys nothing, while the
+packing copy lands on the critical path either way. How much is hidden differs
+per backend, which is why the shipped gate enables packing for ``AttnType.FA``
+and ``AttnType.FA3`` and leaves every other backend on separate sends. Re-check
+this script if the ring loop ever stops overlapping comm with compute, and read
+the full-call numbers from ``bench_ring_attention.py`` rather than from here.
 
-Three strategies move the same bytes around the ring:
+The split arm allocates two fresh receive buffers per hop and is consistently
+the noisiest, yet it is the denominator for every ratio -- take several
+launches on an otherwise idle box before quoting any of them.
 
-  * split        -- what ships today: one ``send_recv`` for K and one for V,
+Four strategies move the same bytes around the ring:
+
+  * split        -- the pre-change path: one ``send_recv`` for K and one for V,
                     both committed together, each receiving into a fresh buffer.
   * split+buf    -- the same two ops, receiving into caller-owned buffers,
-                    which isolates allocation cost from op count.
+                    which separates allocation cost from transfer size.
   * packed+reuse -- one ``send_recv`` of a ``[2, ...]`` buffer into a
                     caller-owned ping-pong buffer, including the packing copy.
-                    Reusing a receive buffer across hops would also let a hop's
-                    NCCL write race the previous hop's compute read.
   * packed+alloc -- one ``send_recv`` of a ``[2, ...]`` buffer into a fresh
-                    buffer per hop, so nothing is reused.
+                    buffer per hop, so nothing is reused. This is what ships:
+                    reuse measures no faster, and would let one hop's NCCL
+                    write race the previous hop's compute read of the buffer.
 
     cd projs/learn/vllm-omni
     torchrun --standalone --nproc-per-node=4 \

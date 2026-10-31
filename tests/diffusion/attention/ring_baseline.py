@@ -8,10 +8,18 @@ benchmarks use it as their A/B baseline: ``bench_ring_flash_attn_opt.py``
 compares it in-process, and ``bench_wan_t2v_ring_opt.py`` injects it into
 spawned engine workers.
 
-It is a byte-for-byte copy of the upstream forward, so the only difference
+It reproduces the upstream forward's body, so the only behavioural difference
 against the shipped path is that it circulates K and V as two separate
-transfers instead of one packed transfer. Any output difference is therefore
-attributable to packing, not to a reimplementation artifact.
+transfers instead of one packed transfer; an output difference is therefore
+attributable to packing rather than to a reimplementation artifact.
+
+It is not a wrapper-for-wrapper copy, and two differences matter when reading
+results. It is called directly instead of through RingFlashAttnFunc, so it does
+not inherit that wrapper's `assert alibi_slopes is None`; ALiBi is therefore
+declared unsupported in the harness's capability table rather than compared
+here. And when packing is off (any backend but FA/FA3, or ring degree 1) the
+shipped forward runs this same body, so a comparison against it is vacuous --
+the harness reports that case and exits 3.
 """
 
 import torch
