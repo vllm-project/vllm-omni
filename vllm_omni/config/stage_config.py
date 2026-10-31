@@ -648,6 +648,7 @@ class StageDeployConfig:
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    light_vae_path: str | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
     boundary_ratio: float | None = None

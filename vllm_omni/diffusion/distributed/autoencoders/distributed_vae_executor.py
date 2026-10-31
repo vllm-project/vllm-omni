@@ -87,6 +87,10 @@ class DistributedVaeExecutor:
             detail = message if status == 1 else "another rank ran out of memory"
             raise torch.OutOfMemoryError(f"Distributed VAE {stage} failed: {detail}")
 
+    def sync_errors(self, stage: str):
+        """Wrap a local stage so all ranks agree before the next collective."""
+        return self._sync_errors(stage)
+
     def gather_tensors(self, tensor: torch.Tensor):
         """Gather tile data to WORLD rank zero with guarded receive allocations."""
         # torch_npu implements gather with hidden non-root allocations and
