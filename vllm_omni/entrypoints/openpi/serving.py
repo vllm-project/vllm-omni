@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
-from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -23,9 +23,9 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
     from vllm_omni.outputs import OmniRequestOutput
 
-logger = init_logger(__name__)
+from vllm_omni.entrypoints.openpi.action_contract import ActionOutput, validate_action_config, validate_action_output
 
-ActionOutput: TypeAlias = np.ndarray | dict[str, np.ndarray]
+logger = init_logger(__name__)
 
 
 def _to_builtin_container(value: Any) -> Any:
@@ -91,6 +91,7 @@ class ServingRealtimeRobotOpenPI:
         self.model_name = model_name
         policy_model_config = self._get_policy_model_config(engine_client)
         self.policy_server_config = PolicyServerConfig.from_model_config(policy_model_config)
+        validate_action_config(self.policy_server_config.values)
         self.prompt_builder = self._load_prompt_builder(engine_client, policy_model_config, self.policy_server_config)
         self._request_counter = count()
 
@@ -306,8 +307,15 @@ class ServingRealtimeRobotOpenPI:
         if actions is None:
             raise RuntimeError("Missing multimodal_output['actions'] in robot policy result")
         if isinstance(actions, Mapping):
-            return {str(key): np.asarray(value, dtype=np.float32) for key, value in actions.items()}
-        return np.asarray(actions, dtype=np.float32)
+            actions = {str(key): np.asarray(value, dtype=np.float32) for key, value in actions.items()}
+        else:
+            actions = np.asarray(actions, dtype=np.float32)
+        metadata = multimodal_output.get("metadata")
+        if metadata is not None and not isinstance(metadata, Mapping):
+            raise ValueError("Robot policy metadata must be a mapping")
+        action_metadata = metadata.get("actions") if metadata is not None else None
+        validate_action_output(actions, action_metadata, self.policy_server_config.values)
+        return actions
 
 
 def _has_actions(output: OmniRequestOutput) -> bool:
