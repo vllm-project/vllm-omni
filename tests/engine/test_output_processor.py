@@ -156,7 +156,7 @@ def test_native_text_metrics_include_segment_generation_token_count(monkeypatch)
     processor._native_text_metrics_by_request = {}
     processor.lora_states = {}
     state = _make_state(RequestOutputKind.DELTA)
-    state.is_prefilling = False
+    state.native_is_prefilling = False
     iteration_stats = MagicMock()
 
     def update_native_stats(_output, _timestamp, _was_prefilling, native_stats, *_args):
@@ -209,14 +209,12 @@ def test_native_text_metrics_exclude_cross_segment_gap(monkeypatch):
             arrival_time=10.01,
         )
     )
-    state.is_prefilling = True
     processor._update_stats_from_output(
         state,
         MagicMock(),
         10.02,
         iteration_stats,
     )
-    state.is_prefilling = False
     processor._update_stats_from_output(
         state,
         MagicMock(),
@@ -225,6 +223,8 @@ def test_native_text_metrics_exclude_cross_segment_gap(monkeypatch):
     )
     second_segment = processor.pop_native_text_metrics("r")
 
+    # The streaming update starts a new prefill for the second segment.
+    assert [call.args[2] for call in iteration_stats.update_from_output.call_args_list] == [True, True, False]
     assert second_segment["num_generation_tokens"] == 2
     assert second_segment["vllm_itls_ms"] == pytest.approx([10.0])
     assert second_segment["vllm_tpot_ms"] == pytest.approx(10.0)
@@ -245,9 +245,7 @@ def test_native_text_tpot_weights_multi_token_engine_output(monkeypatch):
         native_stats.first_token_latency = 0.01
 
     iteration_stats.update_from_output.side_effect = update_segment
-    state.is_prefilling = True
     processor._update_stats_from_output(state, MagicMock(), 10.0, iteration_stats)
-    state.is_prefilling = False
     processor._update_stats_from_output(state, MagicMock(), 10.03, iteration_stats)
     record = processor.pop_native_text_metrics("r")
 
@@ -275,7 +273,6 @@ def test_coalesced_outputs_skip_itl_but_preserve_token_and_finish_stats(is_coale
         output = OmniEngineCoreOutput(request_id="r", new_token_ids=tokens, is_coalesced=coalesced)
         output = MsgpackDecoder(OmniEngineCoreOutput).decode(MsgpackEncoder().encode(output))
         processor._update_stats_from_output(state, output, timestamp, stats)
-        state.is_prefilling = False
     processor._update_stats_from_finished(state, FinishReason.STOP, stats)
     record = processor.pop_native_text_metrics("r")
     expected_itls = [10.0] if is_coalesced else [160.0, 10.0]
@@ -1324,30 +1321,52 @@ def test_one_shot_generation_phase_split_reports_whole_run_as_prefill():
     )
 
 
-def test_first_output_without_stats_leaves_prefill_and_decode_out():
-    # The orchestrator flushes a codec stage's first audio frame without
-    # iteration stats, so the native first-token timestamp is never set.
-    processor = _stats_processor(_make_no_detok_state(RequestOutputKind.CUMULATIVE))
-    processor.process_outputs([_stats_output()], engine_core_timestamp=1.5, iteration_stats=None)
-    processor.process_outputs(
-        [
+@pytest.mark.parametrize(
+    "make_state",
+    [_make_text_stage_state, lambda: _make_no_detok_state(RequestOutputKind.CUMULATIVE)],
+    ids=["ar_text_path", "mm_only_path"],
+)
+def test_output_processed_without_stats_does_not_end_prefill(make_state):
+    # With talker first audio (async_chunk), the orchestrator feeds the
+    # upstream first-audio frame into the codec stage without IterationStats,
+    # before the codec's own first engine-core output. The frame clears
+    # ``is_prefilling`` but must not end the codec stage's prefill.
+    processor = _stats_processor(make_state())
+    processor.process_outputs([_stats_output(new_token_ids=())], engine_core_timestamp=0.0, iteration_stats=None)
+    steps = [
+        (
+            1.75,
             _stats_output(
                 events=[
                     EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
                     EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
-                ],
-                finish_reason=FinishReason.STOP,
-            )
-        ],
-        engine_core_timestamp=2.0,
-        iteration_stats=IterationStats(),
-    )
+                ]
+            ),
+        ),
+        (2.25, _stats_output()),
+        (3.0, _stats_output(finish_reason=FinishReason.STOP)),
+    ]
+    ttfts, itls = [], []
+    for timestamp, output in steps:
+        iteration_stats = IterationStats()
+        iteration_stats.iteration_timestamp = timestamp  # one clock, so TTFT is exact
+        processor.process_outputs([output], engine_core_timestamp=timestamp, iteration_stats=iteration_stats)
+        ttfts += iteration_stats.time_to_first_tokens_iter
+        itls += iteration_stats.inter_token_latencies_iter
 
     record = processor.pop_native_text_metrics("r")
 
-    assert {key: record[key] for key in _PHASE_KEYS if key in record} == pytest.approx(
-        {"vllm_queued_ms": 250.0, "vllm_num_preemptions": 0}
+    assert _phase_split(record) == pytest.approx(
+        {"vllm_queued_ms": 250.0, "vllm_prefill_ms": 500.0, "vllm_decode_ms": 1250.0, "vllm_num_preemptions": 0}
     )
+    assert record["vllm_ttft_ms"] == pytest.approx(1750.0)
+    # These IterationStats also feed the wrapped vLLM histograms: one TTFT
+    # sample, and no ITL measured from a last-token timestamp of 0.
+    assert ttfts == pytest.approx([1.75])
+    assert itls == pytest.approx([0.5, 0.75])
+    (finished,) = iteration_stats.finished_requests
+    assert finished.prefill_time == pytest.approx(0.5)
+    assert finished.decode_time == pytest.approx(1.25)
 
 
 @pytest.mark.parametrize(

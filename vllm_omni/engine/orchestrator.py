@@ -308,7 +308,8 @@ class OrchestratorRequestState:
     # First-frame delivery and final-stage outputs use different channels.
     upstream_first_audio: bool = False
     pending_upstream_first_audio: tuple[int, OmniEngineCoreOutput] | None = None
-    pending_first_audio_outputs: list[tuple[int, int, Any]] = field(default_factory=list)
+    # (stage_id, replica_id, output, engine-core timestamp of its batch)
+    pending_first_audio_outputs: list[tuple[int, int, Any, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -1117,7 +1118,7 @@ class OrchestratorBase:
                 and (requires_first or req_state.pending_first_audio_outputs)
                 and getattr(eco, "finish_reason", None) != FinishReason.ERROR
             ):
-                req_state.pending_first_audio_outputs.append((stage_id, replica_id, eco))
+                req_state.pending_first_audio_outputs.append((stage_id, replica_id, eco, raw_outputs.timestamp))
                 continue
             kept.append(eco)
         raw_outputs.outputs = kept
@@ -1159,12 +1160,17 @@ class OrchestratorBase:
         if self.request_states.get(req_state.request_id) is not req_state:
             return
         ready, req_state.pending_first_audio_outputs = req_state.pending_first_audio_outputs, []
-        for pending_stage, pending_replica, output in ready:
+        for pending_stage, pending_replica, output, timestamp in ready:
             if self.request_states.get(req_state.request_id) is not req_state:
                 break
             terminal: set[str] = set()
+            # Pass the timestamp of the batch the output arrived in; without
+            # one, the wrapper is stamped at replay time.
             processed = await self._process_llm_stage_outputs(
-                pending_stage, pending_replica, OmniEngineCoreOutputs(outputs=[output]), terminal
+                pending_stage,
+                pending_replica,
+                OmniEngineCoreOutputs(outputs=[output], timestamp=timestamp),
+                terminal,
             )
             await self._handle_processed_outputs(pending_stage, pending_replica, processed)
             await self._finish_raw_terminal_requests(pending_stage, pending_replica, terminal)
