@@ -393,6 +393,9 @@ class TTSModelAdapter(ABC):
     async def warmup(self) -> None:
         return
 
+    def shutdown(self) -> None:
+        """Release adapter-owned frontend resources when the server stops."""
+
     def validate_tts_embedding_dim(self, emb_dim: int) -> str | None:
         return None
 

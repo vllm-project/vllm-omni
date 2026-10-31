@@ -173,6 +173,28 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
+### Shared Reference Encoder
+
+CosyVoice3 can share one reference-audio encoder and its byte-bounded artifact cache across the API processes of one server. This is opt-in and requires the shared-reference framework from PR #8886. In a copy of `vllm_omni/deploy/cosyvoice3.yaml`, add the following to stage 0 (keep the other stage settings unchanged):
+
+```yaml
+additional_config:
+  shared_reference_encoder: true
+```
+
+Launch with the modified configuration:
+
+```bash
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 \
+    --trust-remote-code --api-server-count 2 --deploy-config /path/to/cosy-shared.yaml
+```
+
+One spawned worker owns the reference encoders and the cache; other API processes send decoded waveforms over a server-scoped Unix socket. Cache entries contain only reference speech tokens, mel features, and speaker embeddings. Target text and reference transcripts are still processed per request. Replacing an uploaded voice or supplying an inline override changes the audio-content key rather than reusing a stale voice-name entry.
+
+Multimodal budget discovery uses the existing 30-second dummy-reference token budget directly, and renderer warmup receives synthetic dummy conditioning instead of encoding dummy audio. This prevents startup checks from retaining unused local encoders before the shared path starts; it does not set a new request-duration limit or replace conditioning for real requests.
+
+The shared cache uses the existing `speaker_max_bytes` budget from the speech-cache configuration (512 MiB by default; zero disables caching). It is not replicated in each API process. Separate server directories do not share state. Startup and transport failures are reported instead of silently loading duplicate encoders. Without the setting, the existing process-local prefetch and cache behavior is unchanged. This resource-sharing option does not by itself guarantee better throughput or first-audio latency: cold references share one encoder worker, and cache hits still incur IPC.
+
 ### CLI client
 
 The client defaults to the official upstream zero-shot prompt, so it runs without extra flags:

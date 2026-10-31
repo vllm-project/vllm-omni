@@ -4,6 +4,7 @@
 
 import asyncio
 import os
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,7 @@ from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_standa
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.utils.shared_reference_encoder import ReferenceEncoderPool
 
 logger = init_logger(__name__)
 
@@ -41,6 +43,67 @@ class CosyVoice3Adapter(ARTTSAdapter):
         # workers, instead of serially inside the input processor.
         self._reference_executor: ThreadPoolExecutor | None = None
         self._reference_resampler = None
+        self._shared_reference_pool: ReferenceEncoderPool | None = None
+        self._closed = False
+        stage = getattr(ctx.server, "_tts_stage", None)
+        additional_config: Mapping[str, object] = {}
+        for owner in (getattr(stage, "runtime_config", None), getattr(stage, "engine_args", None)):
+            value = getattr(owner, "additional_config", None)
+            if isinstance(value, Mapping):
+                additional_config = value
+                break
+        self._shared_reference = additional_config.get("shared_reference_encoder", False)
+        if not isinstance(self._shared_reference, bool):
+            raise ValueError("Cosy shared_reference_encoder must be a boolean")
+
+    async def _start_shared_reference_encoder(self) -> "ReferenceEncoderPool":
+        from vllm_omni.utils.shared_reference_encoder import (
+            ReferenceEncoderPool,
+            ReferenceEncoderSpec,
+            socket_path_fits,
+        )
+
+        if self._closed:
+            raise RuntimeError("Cosy reference encoder adapter is closed")
+        # Construction has no await; the pool owns concurrent readiness waits.
+        if self._shared_reference_pool is None:
+            server = self.ctx.server
+            shared_dir = getattr(server, "api_server_shared_dir", None)
+            if shared_dir and not socket_path_fits(os.path.join(shared_dir, "cosyvoice3-ref")):
+                raise ValueError("Cosy shared reference directory is too long for a Unix socket")
+            module = "vllm_omni.model_executor.models.cosyvoice3.reference_encoder"
+            spec = ReferenceEncoderSpec(
+                name="cosyvoice3-ref",
+                factory=f"{module}:CosyVoice3ReferenceEncoder",
+                kwargs={
+                    "model_path": server.model_config.model,
+                    "config": server.model_config.hf_config.to_dict(),
+                    "cache_bytes": server.speech_cache_config.speaker_max_bytes,
+                },
+                wire=f"{module}:COSY_REFERENCE_WIRE",
+                namespace=f"cosyvoice3:{server.model_config.model}",
+                nbytes=lambda artifact: artifact.nbytes,
+                workers=1,
+                # Keep the authoritative artifact cache in the one encoder,
+                # not a duplicate cache in every frontend process.
+                cache_bytes=0,
+            )
+            self._shared_reference_pool = ReferenceEncoderPool(spec, shared_dir)
+        await self._shared_reference_pool.start()
+        return self._shared_reference_pool
+
+    async def warmup(self) -> None:
+        if self._shared_reference:
+            await self._start_shared_reference_encoder()
+
+    def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._shared_reference_pool is not None:
+            self._shared_reference_pool.close()
+        if self._reference_executor is not None:
+            self._reference_executor.shutdown(wait=False, cancel_futures=True)
 
     async def _prefetch_reference(self, wav: np.ndarray, sr: int) -> tuple[np.ndarray, int]:
         """Resample to the processor rate and warm its content-addressed cache.
@@ -90,7 +153,13 @@ class CosyVoice3Adapter(ARTTSAdapter):
                 mm_kwargs["voice_name"] = voice_lower
                 mm_kwargs["voice_created_at"] = server._voice_created_at(voice_lower)
         wav = np.array(wav_samples, dtype=np.float32, copy=True)
-        if "voice_name" not in mm_kwargs and os.environ.get("COSYVOICE3_REFERENCE_PREFETCH", "1") != "0":
+        if self._shared_reference:
+            from vllm_omni.model_executor.models.cosyvoice3.reference_encoder import REFERENCE_CONDITIONING_KEY
+
+            pool = await self._start_shared_reference_encoder()
+            artifact = await pool.get(wav, sr)
+            mm_kwargs[REFERENCE_CONDITIONING_KEY] = artifact.processor_kwargs()
+        elif "voice_name" not in mm_kwargs and os.environ.get("COSYVOICE3_REFERENCE_PREFETCH", "1") != "0":
             wav, sr = await self._prefetch_reference(wav, sr)
             mm_kwargs["sample_rate"] = sr
         return {

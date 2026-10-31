@@ -5,7 +5,7 @@ import os
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
-from functools import partial
+from functools import lru_cache, partial
 from math import gcd
 from threading import Lock
 from types import MethodType
@@ -26,7 +26,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
-from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
+from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseProcessingInfo,
     ProcessorInputs,
@@ -99,6 +99,14 @@ def _validate_speech_token_ids(input_ids: torch.Tensor, num_speech_tokens: int) 
 # feat_extractor, campplus session/engine). The mm processor is re-created per
 # request (mm_processor_cache_gb: 0), so this avoids rebuilding them every time.
 _RUNTIME_COMPONENTS_CACHE: dict[str, dict] = {}
+
+
+@lru_cache(maxsize=4)
+def _text_only_runtime_tokenizer(model_dir: str, pretrain_path: str, skip_special_tokens: bool, version: str):
+    """Text assembly must not initialize reference encoders in API clients."""
+    if not os.path.isdir(model_dir):
+        model_dir = hf_api().snapshot_download(model_dir)
+    return get_qwen_tokenizer(os.path.join(model_dir, pretrain_path), skip_special_tokens, version)
 
 
 def _normalize_request_conditioning(payload: dict) -> dict:
@@ -422,6 +430,15 @@ class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
         """
         return {"audio": None}
 
+    def get_mm_max_tokens_per_item(self, seq_len: int, mm_counts: Mapping[str, int]) -> Mapping[str, int]:
+        # Match the existing 30-second dummy reference plus SOS and task ID.
+        # Budget discovery must not run S3Tokenizer and retain a local encoder
+        # before the serving adapter can supply shared reference artifacts.
+        if not mm_counts.get("audio", 0):
+            return {}
+        config = self.get_hf_config()
+        return {"audio": 30 * config.token_frame_rate + 2}
+
     def get_data_parser(self):
         return MultiModalDataParser(
             target_sr=self.ctx.get_hf_config().target_sr,
@@ -431,11 +448,19 @@ class CosyVoice3MultiModalProcessingInfo(BaseProcessingInfo):
 
 class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModalProcessingInfo]):
     def apply(self, inputs: ProcessorInputs, timing_ctx):
+        from vllm_omni.model_executor.models.cosyvoice3.reference_encoder import REFERENCE_CONDITIONING_KEY
+
         tokenizer = self.info.get_tokenizer()
         prompt_text = tokenizer.decode(inputs.prompt, skip_special_tokens=False)
         config = self.info.ctx.get_hf_config()
         model_dir = self.info.ctx.model_config.model
-        self._ensure_cached_runtime_components(model_dir, config)
+        reference_conditioning = inputs.hf_processor_mm_kwargs.get(REFERENCE_CONDITIONING_KEY)
+        if reference_conditioning is None:
+            self._ensure_cached_runtime_components(model_dir, config)
+        else:
+            self.tokenizer = _text_only_runtime_tokenizer(
+                model_dir, config.qwen_pretrain_path, config.skip_special_tokens, config.version
+            )
 
         text_token, text_token_len = extract_text_token(
             prompt_text,
@@ -636,9 +661,20 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
         _call_hf_processor takes input prompt and mm_data and returns
         token ids and tensors
         """
+        from vllm_omni.model_executor.models.cosyvoice3.reference_encoder import (
+            REFERENCE_CONDITIONING_KEY,
+            CosyReferenceArtifacts,
+        )
+
         config = self.info.ctx.get_hf_config()
         model_dir = self.info.ctx.model_config.model
-        self._ensure_cached_runtime_components(model_dir, config)
+        reference_conditioning = mm_kwargs.get(REFERENCE_CONDITIONING_KEY)
+        if reference_conditioning is None:
+            self._ensure_cached_runtime_components(model_dir, config)
+        else:
+            self.tokenizer = _text_only_runtime_tokenizer(
+                model_dir, config.qwen_pretrain_path, config.skip_special_tokens, config.version
+            )
 
         audio = mm_data.get("audio", None)
 
@@ -677,7 +713,12 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
             int(text_token_len),
             int(input_len),
         )
-        conditioning = _audio_conditioning(self, audio, model_dir, config, mm_kwargs)
+        if reference_conditioning is None:
+            conditioning = _audio_conditioning(self, audio, model_dir, config, mm_kwargs)
+        else:
+            if not isinstance(reference_conditioning, Mapping):
+                raise ValueError("Cosy reference_conditioning must be a tensor mapping")
+            conditioning = CosyReferenceArtifacts.from_mapping(reference_conditioning).processor_kwargs()
         return BatchFeature(
             {
                 "input_ids": input_ids,
@@ -753,6 +794,23 @@ class CosyVoice3DummyInputsBuilder(OmniDummyInputsBuilder[CosyVoice3MultiModalPr
     ) -> ProcessorInputs:
         inputs = super().get_dummy_processor_inputs(seq_len, mm_counts, mm_options)
         inputs.hf_processor_mm_kwargs = {"prompt_text": "Testing my voices. Why should I not?"}
+        from vllm_omni.model_executor.models.cosyvoice3.reference_encoder import REFERENCE_CONDITIONING_KEY
+
+        # Renderer warmup also processes dummy audio even when encoder memory
+        # profiling is skipped. Supply synthetic conditioning for this dummy
+        # path only, so it cannot load reference weights into every process.
+        config = self.info.get_hf_config()
+        audio = inputs.mm_data_items.get_items("audio", AudioProcessorItems)
+        samples = audio.get_audio_length(0)
+        frames = max(1, (samples * config.token_frame_rate + config.target_sr - 1) // config.target_sr)
+        inputs.hf_processor_mm_kwargs[REFERENCE_CONDITIONING_KEY] = {
+            "speech_feat": torch.zeros(
+                1, frames * config.token_mel_ratio, config.feat_extractor["num_mels"], dtype=torch.float32, device="cpu"
+            ),
+            "speech_token": torch.zeros(1, frames, dtype=torch.int32, device="cpu"),
+            "speech_token_len": torch.tensor([frames], dtype=torch.int32, device="cpu"),
+            "embedding": torch.zeros(1, config.spk_embed_dim, dtype=torch.float32, device="cpu"),
+        }
         return inputs
 
 
