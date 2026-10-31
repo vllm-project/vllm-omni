@@ -112,6 +112,7 @@ class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingIn
 
         raw_audios = []
         num_tokens_list = []
+        bucket_frames_list = []
         for item in audios:
             if isinstance(item, tuple):
                 audio_array, _sr = item
@@ -121,6 +122,9 @@ class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingIn
             # MultiModalDataParser resamples to target_sr=16000, so always
             # compute token count at 16 kHz regardless of the original sr.
             num_tokens_list.append(_calc_audio_num_tokens(len(audio_array), 16000))
+            # Per-item mel-frame count for the bucketed-encoder wrapper
+            # (Whisper extractor pads to 30s = 3000 frames => 100 frames/s).
+            bucket_frames_list.append(max(1, len(audio_array) * 100 // 16000))
 
         features = feature_extractor(
             raw_audios,
@@ -133,6 +137,7 @@ class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingIn
                 "input_ids": torch.tensor([prompt_ids], dtype=torch.int64),
                 "audio_features": features["input_features"],
                 "audio_num_tokens": torch.tensor(num_tokens_list, dtype=torch.int64),
+                "encoder_bucket_frames": torch.tensor(bucket_frames_list, dtype=torch.int64),
             },
             tensor_type=None,
         )
@@ -145,6 +150,7 @@ class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingIn
         return {
             "audio_features": MultiModalFieldConfig.batched("audio"),
             "audio_num_tokens": MultiModalFieldConfig.batched("audio"),
+            "encoder_bucket_frames": MultiModalFieldConfig.batched("audio"),
         }
 
     def _get_prompt_updates(
