@@ -299,6 +299,7 @@ class AsyncOmniEngine(OmniEngineBase):
                     copy.copy(prompt),
                     effective_sampling_params_list,
                 )
+                params = effective_sampling_params_list[0]
                 if isinstance(prompt, dict):
                     raw_dirs = prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
                     if isinstance(raw_dirs, list) and all(isinstance(path, str) for path in raw_dirs):

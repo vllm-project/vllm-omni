@@ -2045,10 +2045,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
     # Explicit M-RoPE support flag (also inherited from SupportsMRoPE)
     supports_mrope = True
 
-    # GLM-Image pre-computes M-RoPE positions for both prefill and decode
-    # phases (2D spatial grid encoding for generated image tokens).  This
-    # flag tells the runner to use those positions instead of the default
-    # linear increments during decode.
+    # GLM-Image pre-computes spatial M-RoPE positions for decode grids.
     precomputed_mrope_decode = True
 
     # The downstream GLM-Image diffusion stage consumes generated token ids and
@@ -2560,7 +2557,6 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 else:
                     # Fallback: estimate from token count
                     h = w = int(actual_image_tokens**0.5)
-                    t = 1
 
                 # Text tokens before this image (from prev_image_end to start)
                 # Note: start points to first image token, so text is [prev_image_end, start)
@@ -2649,7 +2645,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
                 # GLM-Image generates small image first (e.g., 16x16), then large (32x32)
                 for i in range(1, num_decode_grids + 1):
                     grid_idx = len(image_grid_thw) - i  # -1, -2, ... from end
-                    t, h, w = image_grid_thw[grid_idx]
+                    _, h, w = image_grid_thw[grid_idx]
                     total_tokens = h * w
 
                     # Build 2D positions following reference implementation
@@ -2690,7 +2686,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             # Process in reverse order for GLM-Image generation pattern
             for i in range(1, len(image_grid_thw) + 1):
                 grid_idx = -i  # -1, -2, ... (last grid first)
-                t, h, w = image_grid_thw[grid_idx]
+                _, h, w = image_grid_thw[grid_idx]
                 total_tokens = h * w
 
                 # Build 2D positions following reference implementation
@@ -2712,7 +2708,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
             # Pure text - all dimensions same
             llm_positions = torch.arange(seq_len).view(1, -1).expand(3, -1)
 
-        mrope_position_delta = (llm_positions.max() + 1 - seq_len).item()
+        mrope_position_delta = 0
 
         # Debug logging for M-RoPE position calculation
         logger.debug(

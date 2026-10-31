@@ -8,6 +8,9 @@ from typing import Any, Literal, Protocol
 
 from PIL import Image
 
+from vllm_omni.model_executor.stage_input_processors.glm_image import (
+    compute_max_tokens as glm_image_ar_max_tokens,
+)
 from vllm_omni.model_extras.bagel import (
     BAGEL_EXTRA_BODY_PARAMS,
     BAGEL_EXTRA_OUTPUT_PARAMS,
@@ -347,6 +350,18 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
         "image_to_image_prompt_builder": build_qwen_image_21_image_to_image_prompt,
     },
+    # GLM-Image keys on the diffusion pipeline class name that od_config (or
+    # the image-output stage fallback) reports; the AR wrapper architecture
+    # name is aliased below for AR-only deploys.
+    "GlmImagePipeline": {
+        # AR generation budget: preview + target + 1 tokens (i2i: target + 1),
+        # the count the reference implementation truncates at. ar2diffusion
+        # slices the same counts, and _grid_token_layout keeps the two in
+        # sync. Under the linear decode positions (#9305) EOS arrives late or
+        # never, so serving caps each request with this builder instead of
+        # letting every request run to the deploy-YAML max_tokens ceiling.
+        "ar_max_tokens_builder": glm_image_ar_max_tokens,
+    },
 }
 _EXTRA_SPECS["MingImageLayeredDiffusionPipeline"] = _EXTRA_SPECS["MingImageDiffusionPipeline"]
 
@@ -362,6 +377,10 @@ _EXTRA_SPECS["HunyuanImage3Pipeline"] = _EXTRA_SPECS["HunyuanImage3ForCausalMM"]
 # submodule, so both names must resolve to the same request builders.
 _EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 _EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
+
+# GLM-Image AR-only deploys surface the wrapper architecture name instead of
+# the diffusion pipeline class; point both at the same spec.
+_EXTRA_SPECS["GlmImageForConditionalGeneration"] = _EXTRA_SPECS["GlmImagePipeline"]
 
 
 def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:
@@ -477,6 +496,20 @@ def get_ar_tokenizer_validator(model_class_name: str | None) -> Callable[[Any], 
     """
     spec = _get_spec(model_class_name)
     return spec.get("ar_tokenizer_validator") if spec is not None else None
+
+
+def get_ar_max_tokens_builder(model_class_name: str | None) -> Callable[..., int] | None:
+    """Return a model's per-request AR ``max_tokens`` budget builder, if declared.
+
+    Models whose AR stage must emit a size-dependent token count declare an
+    ``ar_max_tokens_builder``. GLM-Image's is preview + target + 1 tokens
+    (image-to-image: target + 1), the exact count the reference
+    implementation truncates at; serving calls it with the request's target
+    height/width so generation stops at the grid's budget instead of the
+    deploy-YAML ceiling. Models without one keep their configured default.
+    """
+    spec = _get_spec(model_class_name)
+    return spec.get("ar_max_tokens_builder") if spec is not None else None
 
 
 def build_text_to_image_prompt(
