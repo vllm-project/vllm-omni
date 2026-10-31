@@ -11,16 +11,16 @@ import os
 
 import pytest
 
+from tests.helpers.fixtures import voxcpm2
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
-from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.slow, pytest.mark.tts]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-MODEL = os.environ.get("VOXCPM2_MODEL", "openbmb/VoxCPM2")
+omni_server = voxcpm2.omni_server
+tts_server_params = voxcpm2.tts_server_params
 DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 300.0
 _MIN_AUDIO_BYTES = 40_000
 MAX_CONCURRENT = 4
@@ -33,18 +33,6 @@ def get_prompt(prompt_type="text"):
         "text": "The weather is nice today, perfect for a walk in the park.",
     }
     return prompts.get(prompt_type, prompts["text"])
-
-
-tts_server_params = [
-    pytest.param(
-        OmniServerParams(
-            model=MODEL,
-            stage_config_path=get_deploy_config_path("voxcpm2.yaml"),
-            server_args=["--trust-remote-code", "--disable-log-stats"],
-        ),
-        id="voxcpm2",
-    )
-]
 
 
 @hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
