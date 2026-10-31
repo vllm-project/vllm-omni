@@ -2531,8 +2531,20 @@ class MiniMaxH3Pipeline(
             ):
                 video = self.video_vae.decode_latent(video_latent)
         video = video[..., :height, :width].contiguous()
-        with self._component_on_device(self.audio_vae):
-            audio = self.audio_vae.decode_latent(audio_latent)
+        # Audio decoding has no model-parallel collectives. Decode once and
+        # share the waveform instead of compiling and running the same VAE
+        # on every rank. Agree on owner failures before the tensor broadcast.
+        _, rank, _ = _dit_rank_world()
+        audio = None
+        decode_error: Exception | None = None
+        if rank == 0:
+            try:
+                with self._component_on_device(self.audio_vae):
+                    audio = self.audio_vae.decode_latent(audio_latent)
+            except Exception as exc:
+                decode_error = exc
+        _broadcast_rank0_exception(decode_error)
+        audio = _broadcast_tensor(audio, dtype=torch.float32, device=self.device)
         audio = self._offload_model_cpu_stage_output(audio)
         return video, audio
 
