@@ -1951,12 +1951,16 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vit_pixel_attention_mask = pixel_values["vit_pixel_attention_mask"]
         vit_spatial_shapes = pixel_values["vit_spatial_shapes"]
         vae_pixel_values = pixel_values["vae_pixel_values"]
-        vae_generator_seed = pixel_values.get("vae_generator_seed")
-        vae_generator = None
-        if vae_generator_seed is not None and vae_generator_seed.numel() > 0:
-            vae_generator = torch.Generator(device=vae_pixel_values[0].device).manual_seed(
-                int(vae_generator_seed.reshape(-1)[0].item())
-            )
+        vae_generator_seeds = pixel_values.get("vae_generator_seed")
+        if vae_generator_seeds is not None:
+            vae_generator_seeds = vae_generator_seeds.reshape(-1)
+            num_vae_images = len(vae_pixel_values)
+            num_vae_seeds = vae_generator_seeds.numel()
+            if num_vae_seeds != num_vae_images:
+                raise ValueError(
+                    f"Number of VAE generator seeds ({num_vae_seeds}) does not match "
+                    f"number of VAE images ({num_vae_images})."
+                )
 
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
@@ -1964,7 +1968,15 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # VAE encode + patch_embed per image — each cond image is at its own
         # `reso_group` bucket so shapes are ragged across the image-batch dim.
         vae_token_embeddings = []
-        for vae_image_i in vae_pixel_values:
+        for image_i, vae_image_i in enumerate(vae_pixel_values):
+            # One fresh generator per image, seeded with that image's request
+            # seed. A single generator shared across the loop leaks the first
+            # image's seed to the rest of the batch and advances its RNG state
+            # across images, so latents depend on batch composition and order.
+            vae_generator = None
+            if vae_generator_seeds is not None:
+                seed_i = vae_generator_seeds[image_i].item()
+                vae_generator = torch.Generator(device=vae_image_i.device).manual_seed(int(seed_i))
             t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor, generator=vae_generator)
             t_emb = self.time_embed(t_i[0])
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
