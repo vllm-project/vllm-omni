@@ -56,6 +56,22 @@ class MixFusionInputs:
     key: tuple
 
 
+@dataclass(frozen=True)
+class PositionPlan:
+    """Model-private input bundle for :meth:`prepare_position_embeddings`.
+
+    The framework never inspects or constructs it; it exists so the Qwen
+    adapter can separate the step-invariant layout inputs from the per-step
+    latents and expose the position-embedding preparation on its own.
+    """
+
+    image_rows: list[torch.Tensor]
+    image_row_states: list[int]
+    img_shapes: list[tuple[int, int, int]]
+    seq_len_txt: int
+    key: tuple
+
+
 class QwenImageMixFusionAdapter:
     """Model-side half of MixFusion for the Qwen image transformer.
 
@@ -125,6 +141,36 @@ class QwenImageMixFusionAdapter:
             cache_key=packed.key,
             adapter_state={"prepare_inputs": packed},
         )
+
+    def prepare_position_embeddings(
+        self,
+        module,
+        plan: PositionPlan,
+        cache: MixFusionInputs | None = None,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], int]:
+        """Build the per-image RoPE tables and chunk size for a packed step.
+
+        Called by :meth:`prepare_inputs` (and therefore by ``pack_inputs``);
+        the framework never calls it. Tables are computed per image row on the
+        full sequence so absolute positions are preserved. Everything returned
+        depends only on the request shapes recorded in ``plan.key``, so the
+        bundle from the previous denoise step can be passed as ``cache`` and
+        reused verbatim.
+        """
+        if cache is not None and cache.key == plan.key:
+            return cache.row_vid_freqs, cache.text_freqs, cache.chunk_size
+
+        chunk_size = gcd_chunk_size(plan.image_rows)
+        row_vid_freqs: list[torch.Tensor] = []
+        text_freqs: list[torch.Tensor] = []
+        for row_idx, sample in enumerate(plan.image_rows):
+            state_idx = plan.image_row_states[row_idx]
+            req_vid_freqs, req_txt_freqs = module.pos_embed(
+                plan.img_shapes[state_idx], [plan.seq_len_txt], device=sample.device
+            )
+            row_vid_freqs.append(req_vid_freqs)
+            text_freqs.append(req_txt_freqs[: plan.seq_len_txt])
+        return row_vid_freqs, text_freqs, chunk_size
 
     def restore_output(self, module, output, plan: PackedExecutionPlan) -> list[torch.Tensor]:
         return reassemble_chunk_rows(output.sample, plan.request_chunk_ranges, plan.image_row_counts)
@@ -210,13 +256,11 @@ class QwenImageMixFusionAdapter:
         # Keep the per-request image counts for the final reassembly.
         image_row_counts = [int(sample.shape[0]) for sample in hidden_states]
 
-        # RoPE frequency tables are computed per image row on the FULL sequence
-        # (absolute positions preserved); img_shapes / txt_seq_lens are
-        # per-state, images of the same request share the same resolution and
-        # prompt. The hidden states and their freqs are then chunked under the
-        # same partition. All of this is step-invariant, so it is keyed on the
-        # request shapes and reused verbatim from ``cached`` within a
-        # generation's denoise loop.
+        # img_shapes / txt_seq_lens are per-state, and images of the same
+        # request share the same resolution and prompt. The position tables
+        # and chunk size are step-invariant, so they are keyed on the request
+        # shapes and reused verbatim from ``cached`` within a generation's
+        # denoise loop.
         layout_key = (
             tuple(sample.shape for sample in hidden_states),
             tuple(encoder_hidden_states.shape),
@@ -224,22 +268,15 @@ class QwenImageMixFusionAdapter:
             tuple(img_shapes),
             tuple(txt_seq_lens),
         )
+        position_plan = PositionPlan(
+            image_rows=image_rows,
+            image_row_states=image_row_states,
+            img_shapes=img_shapes,
+            seq_len_txt=seq_len_txt,
+            key=layout_key,
+        )
+        row_vid_freqs, text_freqs, chunk_size = self.prepare_position_embeddings(module, position_plan, cached)
         reuse_layout = cached is not None and cached.key == layout_key
-        if reuse_layout:
-            row_vid_freqs = cached.row_vid_freqs
-            text_freqs = cached.text_freqs
-            chunk_size = cached.chunk_size
-        else:
-            chunk_size = gcd_chunk_size(image_rows)
-            row_vid_freqs = []
-            text_freqs = []
-            for row_idx, sample in enumerate(image_rows):
-                state_idx = image_row_states[row_idx]
-                req_vid_freqs, req_txt_freqs = module.pos_embed(
-                    img_shapes[state_idx], [seq_len_txt], device=sample.device
-                )
-                row_vid_freqs.append(req_vid_freqs)
-                text_freqs.append(req_txt_freqs[:seq_len_txt])
 
         image_chunks, image_freq_chunks, request_chunk_ranges, chunk_to_request = split_sequence_chunks(
             image_rows, row_vid_freqs, chunk_size

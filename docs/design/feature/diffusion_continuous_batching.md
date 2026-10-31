@@ -283,18 +283,26 @@ Framework responsibilities:
 Model responsibilities:
 
 - Implement the `MixFusionAdapter` protocol: `build_packed_call`,
-  `can_pack`, `build_attention_layout`, `pack_inputs`, `restore_output`.
-  The protocol is structural (`runtime_checkable`): an adapter only needs
-  the methods, not a base class.
+  `can_pack`, `build_attention_layout`, `pack_inputs`,
+  `prepare_position_embeddings`, `restore_output`. The protocol is
+  structural (`runtime_checkable`): an adapter only needs the methods, not
+  a base class.
 - Declare `_mixfusion_plan` on the transformer and register the adapter as
   `mixfusion_adapter`.
+- Prepare the step-invariant position embeddings in
+  `prepare_position_embeddings` and call it from `pack_inputs`; the
+  framework never interprets that payload.
 - Keep mixed-resolution attention in the model's attention leaf, which reads
   the stream layout from the armed step instead of a forward argument.
 
 `QwenImageMixFusionAdapter` is the reference implementation. Porting a model
 therefore means adding `models/<model>/mixfusion_adapter.py`, registering the
-adapter and `_mixfusion_plan` in `transformer.py`, and adding a model test;
-the driver, hooks and execution plan stay unchanged.
+adapter and `_mixfusion_plan` in `transformer.py`, adding a model test under
+`tests/diffusion/models/<model>/`, and declaring
+`supports_mixfusion: ClassVar[bool] = True` on the pipeline (the engine and
+scheduler resolve that capability before the model is loaded; it carries no
+runtime logic). The driver, hooks, execution plan and runner stay unchanged:
+the per-request ragged/chunk-policy opt-in is stamped from the runner.
 
 #### Layout abstraction
 

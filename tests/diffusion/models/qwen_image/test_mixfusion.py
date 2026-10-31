@@ -49,7 +49,10 @@ from vllm_omni.diffusion.mixfusion.packed_attention import (
     MIXFUSION_PLAN_KEY,
     run_mixfusion_packed_attention,
 )
-from vllm_omni.diffusion.models.qwen_image.mixfusion_adapter import QwenImageMixFusionAdapter
+from vllm_omni.diffusion.models.qwen_image.mixfusion_adapter import (
+    PositionPlan,
+    QwenImageMixFusionAdapter,
+)
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageCrossAttention,
     QwenImageTransformer2DModel,
@@ -476,6 +479,63 @@ def test_prepare_rebuilds_layout_when_shapes_change():
     assert second.key != first.key
     assert second.image_row_counts == [1, 1]
     assert second.hidden_states.shape == (2, 8, 2)
+
+
+# ---------------------------------------------------------------------------
+# prepare_position_embeddings: the model-side position-table step.
+# ---------------------------------------------------------------------------
+
+
+def _position_plan(*, image_row_lengths, image_row_states, img_shapes, seq_len_txt=4, key=("k",)):
+    return PositionPlan(
+        image_rows=[torch.zeros(1, length, 2) for length in image_row_lengths],
+        image_row_states=image_row_states,
+        img_shapes=img_shapes,
+        seq_len_txt=seq_len_txt,
+        key=key,
+    )
+
+
+def test_prepare_position_embeddings_builds_per_image_tables():
+    transformer, pos_embed_calls = _prepare_transformer()
+    plan = _position_plan(
+        image_row_lengths=[8, 8],
+        image_row_states=[0, 1],
+        img_shapes=[(8, 2, 2), (8, 2, 2)],
+    )
+
+    row_vid_freqs, text_freqs, chunk_size = QwenImageMixFusionAdapter().prepare_position_embeddings(transformer, plan)
+
+    # One table build per image row, sized on the full sequence, with the
+    # text table sliced to the prompt's real length.
+    assert pos_embed_calls[0] == 2
+    assert len(row_vid_freqs) == len(text_freqs) == 2
+    assert all(freq.shape == (8, ROPE_DIM) for freq in row_vid_freqs)
+    assert all(freq.shape == (4, ROPE_DIM) for freq in text_freqs)
+    assert chunk_size == 8
+
+
+def test_prepare_position_embeddings_reuses_cached_tables():
+    transformer, pos_embed_calls = _prepare_transformer()
+    first = _prepare(transformer, [torch.ones(1, 8, 2), torch.ones(1, 8, 2)], prompt_rows=2)
+    assert pos_embed_calls[0] == 2
+
+    # Same request shapes (same key) but fresh per-step image rows: the
+    # bundle from the previous denoise step is reused verbatim.
+    plan = _position_plan(
+        image_row_lengths=[8, 8],
+        image_row_states=[0, 1],
+        img_shapes=[(8, 2, 2)],
+        key=first.key,
+    )
+    row_vid_freqs, text_freqs, chunk_size = QwenImageMixFusionAdapter().prepare_position_embeddings(
+        transformer, plan, first
+    )
+
+    assert pos_embed_calls[0] == 2
+    assert row_vid_freqs is first.row_vid_freqs
+    assert text_freqs is first.text_freqs
+    assert chunk_size == first.chunk_size
 
 
 def test_prepare_splits_mixed_lengths_into_equal_chunks():

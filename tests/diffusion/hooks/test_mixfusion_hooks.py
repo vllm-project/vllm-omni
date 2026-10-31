@@ -385,6 +385,9 @@ class _RecordingAdapter:
         bound.arguments["hidden_states"] = bound.arguments["hidden_states"] * 10
         return PackedInputs(args=tuple(bound.args), kwargs=dict(bound.kwargs), plan="PLAN")
 
+    def prepare_position_embeddings(self, module, plan, cache=None):
+        return None
+
     def restore_output(self, module, output, plan):
         self.calls.append(("restore_output", plan))
         return ["restored"]

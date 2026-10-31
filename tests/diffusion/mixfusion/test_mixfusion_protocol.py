@@ -41,6 +41,9 @@ class _FakeAdapter:
     def pack_inputs(self, module, bound, *, step, cache):
         return None
 
+    def prepare_position_embeddings(self, module, plan, cache=None):
+        return None
+
     def restore_output(self, module, output, plan) -> list:
         return list(output)
 

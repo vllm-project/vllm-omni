@@ -497,6 +497,39 @@ def test_update_states_carries_prepared_layout() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_update_states_stamps_mixfusion_request_extras() -> None:
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline.supports_mixfusion = True
+    runner.od_config.enable_mixfusion = True
+    runner.od_config.mixfusion_min_chunk_tokens = 64
+    runner.od_config.mixfusion_max_chunks = 16
+    request = _make_request()
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        finished_req_ids=set(),
+        scheduled_new_reqs=[NewRequestData(request_id=request.request_id, req=request)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+    states, _ = DiffusionModelRunner._update_states(runner, scheduler_output)
+
+    assert states[0].extra["use_ragged_latents"] is True
+    assert states[0].extra["mixfusion_min_chunk_tokens"] == 64
+    assert states[0].extra["mixfusion_max_chunks"] == 16
+
+    # A pipeline without the capability never gets the ragged opt-in, even
+    # when the server-level default is on.
+    unsupported = _make_runner(cache_backend=None, cache_backend_name=None)
+    unsupported.od_config.enable_mixfusion = True
+    states, _ = DiffusionModelRunner._update_states(unsupported, scheduler_output)
+
+    assert "use_ragged_latents" not in states[0].extra
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_update_states_after_list_latents_releases_finished_step_requests():
     """Ragged (list-latent) batches must retire finished requests through
     ``release_step_requests`` so the pipeline sees ``release_step_request``

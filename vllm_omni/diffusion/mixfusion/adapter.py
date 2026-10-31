@@ -147,6 +147,21 @@ class MixFusionAdapter(Protocol):
         """
         ...
 
+    def prepare_position_embeddings(self, module: nn.Module, plan: Any, cache: Any = None) -> Any:
+        """Build the step-invariant position embeddings for a packed step.
+
+        The adapter's own ``pack_inputs`` path calls this (through its input
+        preparation), because only the root boundary sees every stream at
+        once; the framework (driver, hooks, execution plan) never calls it.
+        Keeping it on the protocol makes the model-side responsibility
+        explicit and testable instead of burying it in a hook or the driver.
+
+        ``plan``, ``cache`` and the return value are adapter-defined opaque
+        payloads: the framework only carries them and never inspects their
+        contents.
+        """
+        ...
+
     def restore_output(self, module: nn.Module, output: Any, plan: PackedExecutionPlan) -> list[Any]:
         """Turn the packed forward output back into one output per request."""
         ...

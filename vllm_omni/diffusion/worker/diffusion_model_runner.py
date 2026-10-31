@@ -46,6 +46,7 @@ from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_g
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
+from vllm_omni.diffusion.mixfusion.request import mixfusion_request_extras
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
@@ -1154,6 +1155,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                     external_req_id=getattr(sched_new_req.req, "external_req_id", None),
+                )
+                # Stamp the per-request MixFusion opt-in here so pipelines
+                # never carry it; unsupported pipelines get an empty dict.
+                new_state.extra.update(
+                    mixfusion_request_extras(
+                        new_state.sampling,
+                        self.od_config,
+                        supported=getattr(self.pipeline, "supports_mixfusion", False),
+                    )
                 )
                 if (
                     sched_new_req.diffusion_kv_metadata is not None

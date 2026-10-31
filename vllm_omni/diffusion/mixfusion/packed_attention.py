@@ -145,19 +145,19 @@ def run_mixfusion_packed_attention(
         flat_keys.append(req_key)
         flat_values.append(req_value)
 
-    joint_query = torch.cat(flat_queries, dim=0)
-    joint_key = torch.cat(flat_keys, dim=0)
-    joint_value = torch.cat(flat_values, dim=0)
+    packed_query = torch.cat(flat_queries, dim=0)
+    packed_key = torch.cat(flat_keys, dim=0)
+    packed_value = torch.cat(flat_values, dim=0)
     del flat_queries, flat_keys, flat_values
 
     # One packed forward: the attention layer routes varlen-capable backends
     # to a single varlen kernel and serves every other backend with
     # equal-length bucketed dense attention that keeps the same document
-    # isolation. Either way the result is the flat joint layout.
-    joint_hidden_states = attn.forward_packed(
-        joint_query,
-        joint_key,
-        joint_value,
+    # isolation. Either way the result is the flat packed layout.
+    packed_hidden_states = attn.forward_packed(
+        packed_query,
+        packed_key,
+        packed_value,
         cu_seqlens=plan.cu_seqlens_tensor,
         max_seqlen=plan.max_seq_len,
     )
@@ -167,7 +167,7 @@ def run_mixfusion_packed_attention(
     outputs: dict[str, torch.Tensor] = {}
     for spec in layout.streams:
         gather, scatter = plan.output_indices[spec.name]
-        rows = joint_hidden_states.index_select(0, gather)
+        rows = packed_hidden_states.index_select(0, gather)
         if spec.kind == "chunked":
             outputs[spec.name] = rows.view(plan.num_chunks, plan.chunk_size, num_query_heads, head_dim)
             continue

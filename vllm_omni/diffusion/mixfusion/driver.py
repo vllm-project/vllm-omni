@@ -27,13 +27,10 @@ from vllm_omni.diffusion.forward_context import MixFusionStep, get_forward_conte
 from vllm_omni.diffusion.hooks.mixfusion import plan_foreign_hooks
 from vllm_omni.diffusion.mixfusion.adapter import MixFusionAdapter
 from vllm_omni.diffusion.mixfusion.execution_plan import plan_chunk_size
+from vllm_omni.diffusion.mixfusion.request import DEFAULT_MAX_CHUNKS, DEFAULT_MIN_CHUNK_TOKENS
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 
 logger = init_logger(__name__)
-
-# Defaults for requests that do not carry per-request MixFusion extras.
-DEFAULT_MIN_CHUNK_TOKENS = 256
-DEFAULT_MAX_CHUNKS = 128
 
 
 class MixFusionDriver:
