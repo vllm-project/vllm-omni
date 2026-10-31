@@ -512,24 +512,27 @@ def thinker2talker_async_chunk(
 
     # Prefer tensors from TransferPayload when both arrive — they carry
     # explicit dotted keys that mirror the historic multimodal_output shape.
-    if transfer_payload is not None and isinstance(getattr(transfer_payload, "tensors", None), dict):
-        # TransferPayload.tensors flattens nested dicts with dotted keys, so
-        # rebuild a mini-multimodal_output from those keys.  Keep the
-        # original as fallback for any extra fields the producer added.
-        rebuilt: dict[str, Any] = dict(multimodal_output) if isinstance(multimodal_output, Mapping) else {}
-        for dotted_key, t in transfer_payload.tensors.items():
-            if t is None:
-                continue
-            if dotted_key == "embed.prefill":
-                rebuilt.setdefault("embed", {})["prefill"] = t
-            elif dotted_key == "embed.decode":
-                rebuilt.setdefault("embed", {})["decode"] = t
-            elif dotted_key == "hidden_states.output":
-                rebuilt.setdefault("hidden_states", {})["output"] = t
-            elif dotted_key.startswith("hidden_states.layers."):
-                layer_key = dotted_key[len("hidden_states.layers.") :]
-                layers = rebuilt.setdefault("hidden_states", {}).setdefault("layers", {})
-                layers[layer_key] = t
+    #
+    # Fix (amy-why-3459): use ``transfer_payload.as_dict()`` which properly
+    # rebuilds a fresh nested structure (including int layer keys) without
+    # mutating the producer's original multimodal_output via shallow-copy
+    # ``setdefault`` writes.
+    if transfer_payload is not None:
+        # Use the TransferPayload's serialised dict — it already has the
+        # correct nested shape and contains the same tensors that the
+        # producer stashed into multimodal_output.  as_dict handles int
+        # layer keys correctly (``"hidden_states.layers.3"`` → {"3": ...}
+        # rebuilt via the isdigit branch, which matches how downstream
+        # layers look them up).
+        rebuilt = transfer_payload.as_dict()
+        # Merge any extra top-level fields that the producer may have
+        # added outside the TransferPayload contract (future-proofing —
+        # today the payload is built from the same multimodal_output so
+        # this is a no-op).
+        if isinstance(multimodal_output, Mapping):
+            for extra_key, extra_val in multimodal_output.items():
+                if extra_key not in rebuilt:
+                    rebuilt[extra_key] = extra_val
         multimodal_output = rebuilt
 
     if not isinstance(multimodal_output, Mapping):

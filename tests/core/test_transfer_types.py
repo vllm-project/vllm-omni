@@ -55,8 +55,6 @@ class TestChunkMeta:
         assert meta.is_terminal()
 
     def test_decode_rejects_zero_index(self):
-        import pytest
-
         with pytest.raises(AssertionError, match="decode ChunkMeta requires chunk_index > 0"):
             ChunkMeta.decode(0)
 
@@ -128,7 +126,8 @@ class TestTransferPayload:
         assert out["config"]["num_layers"] == 12
         assert out["config"]["hidden_size"] == 1024
 
-    def test_enforce_device_policy_cpu_moves_gpu_tensors(self):
+    def test_enforce_device_policy_cpu_tensors_stay_cpu(self):
+        """CPU-policy leaves already-CPU tensors on CPU and returns self."""
         t_cpu = torch.randn(2, 8, device="cpu")
         payload = TransferPayload(tensors={"t": t_cpu}, device_policy="cpu")
         result = payload.enforce_device_policy()

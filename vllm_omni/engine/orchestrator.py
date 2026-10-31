@@ -2639,8 +2639,11 @@ class OrchestratorBase:
 
         If :attr:`OrchestratorRequestState.streaming.enabled` is ``False``
         then the transfer is a single-shot prefill and we return
-        ``ChunkMeta.prefill(is_final=is_final_update)``.  Otherwise we leave
-        the phase to the runtime but still tag ``is_final``.
+        ``ChunkMeta.prefill(is_final=is_final_update)``.  For streaming
+        requests we **return None** — the orchestrator cannot distinguish
+        PREFILL from DECODE in that case, and fabricating PREFILL with
+        ``chunk_index=0`` on every streaming update would cause consumers
+        to re-run prefill handling repeatedly.
         """
         req_state = self.request_states.get(req_id)
         if req_state is None:
@@ -2648,14 +2651,9 @@ class OrchestratorBase:
         streaming = getattr(req_state.streaming, "enabled", False)
         if not streaming:
             return ChunkMeta.prefill(is_final=is_final_update)
-        # Streaming — check for a runtime-stashed chunk hint first.
-        hint_key = f"_orch_chunk_meta_{src_stage_id}"
-        hint = getattr(req_state, hint_key, None) if hasattr(req_state, hint_key) else None
-        if hint is not None and isinstance(hint, ChunkMeta):
-            return hint
-        if is_final_update:
-            return ChunkMeta.final(sequence_id=0, chunk_index=0)
-        return ChunkMeta.from_chunk_index(0, sequence_id=0, is_final=False)
+        # Streaming — orchestrator cannot authoritatively infer phase.
+        # Downstream consumers will fall back to the legacy chunk counter.
+        return None
 
     def _build_transfer_payload(
         self,
@@ -2827,27 +2825,33 @@ class OrchestratorBase:
                 _t_ar2d = _time.perf_counter()
                 _fn = next_client.custom_process_input_func
                 _extra_kwargs: dict[str, Any] = {}
-                # Build a typed TransferPayload for any custom processor that
-                # opts in (Issue #2336).  Older processors that do not accept
-                # ``transfer_payload`` continue to work via the positional
-                # args below — this is fully backward-compatible.
-                _typed_payload = self._build_transfer_payload(
-                    req_id,
-                    src_stage_id,
-                    output,
-                    target_stage_id=next_logical,
-                    is_final_update=is_final_update,
-                )
+                # Issue #2336: inject typed ``transfer_payload`` / ``chunk_meta``
+                # only when the processor signature opts in.
+                #
+                # Fix (amy-why-3459): probe the signature **first**, then build
+                # the TransferPayload lazily — the recursive flatten + from_dict
+                # walk is non-trivial and was running on every forward even when
+                # no consumer accepted the new kwargs.
                 try:
                     import inspect as _inspect
 
                     _sig = _inspect.signature(_fn)
+                    _has_transfer_payload = "transfer_payload" in _sig.parameters
+                    _has_chunk_meta = "chunk_meta" in _sig.parameters
+                    if _has_transfer_payload or _has_chunk_meta:
+                        _typed_payload = self._build_transfer_payload(
+                            req_id,
+                            src_stage_id,
+                            output,
+                            target_stage_id=next_logical,
+                            is_final_update=is_final_update,
+                        )
+                        if _has_transfer_payload:
+                            _extra_kwargs["transfer_payload"] = _typed_payload
+                        if _has_chunk_meta:
+                            _extra_kwargs["chunk_meta"] = _typed_payload.chunk
                     if "sampling_params" in _sig.parameters:
                         _extra_kwargs["sampling_params"] = params
-                    if "transfer_payload" in _sig.parameters:
-                        _extra_kwargs["transfer_payload"] = _typed_payload
-                    if "chunk_meta" in _sig.parameters:
-                        _extra_kwargs["chunk_meta"] = _typed_payload.chunk
                 except (TypeError, ValueError):
                     pass
                 diffusion_prompt = _fn(
@@ -3032,26 +3036,31 @@ class OrchestratorBase:
         try:
             assert next_client is not None
             process_inputs = getattr(next_client, "process_engine_inputs")
-            # Build a typed TransferPayload here too (Issue #2336).  As with
-            # the custom_process_input_func probe above, this is purely
-            # additive — functions that do not declare ``transfer_payload``
-            # or ``chunk_meta`` in their signature keep working unchanged.
-            _typed_payload = self._build_transfer_payload(
-                req_id,
-                src_stage_id,
-                output,
-                target_stage_id=next_logical,
-                is_final_update=is_final_update,
-            )
             _engine_extra_kwargs: dict[str, Any] = {}
+            # Issue #2336: inject typed ``transfer_payload`` / ``chunk_meta``
+            # only when the ``process_engine_inputs`` signature opts in.
+            #
+            # Fix (amy-why-3459): build lazily — the current ``process_engine_inputs``
+            # signature does not declare either kwarg, so we were doing the
+            # recursive flatten + from_dict work for free on every non-diffusion forward.
             try:
                 import inspect as _inspect
 
                 _sig = _inspect.signature(process_inputs)
-                if "transfer_payload" in _sig.parameters:
-                    _engine_extra_kwargs["transfer_payload"] = _typed_payload
-                if "chunk_meta" in _sig.parameters:
-                    _engine_extra_kwargs["chunk_meta"] = _typed_payload.chunk
+                _has_transfer_payload = "transfer_payload" in _sig.parameters
+                _has_chunk_meta = "chunk_meta" in _sig.parameters
+                if _has_transfer_payload or _has_chunk_meta:
+                    _typed_payload = self._build_transfer_payload(
+                        req_id,
+                        src_stage_id,
+                        output,
+                        target_stage_id=next_logical,
+                        is_final_update=is_final_update,
+                    )
+                    if _has_transfer_payload:
+                        _engine_extra_kwargs["transfer_payload"] = _typed_payload
+                    if _has_chunk_meta:
+                        _engine_extra_kwargs["chunk_meta"] = _typed_payload.chunk
             except (TypeError, ValueError):
                 pass
             next_inputs = process_inputs(
