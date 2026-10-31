@@ -411,6 +411,11 @@ class SegmentedFFmpegEncoder:
                 )
             # Route directly, keep no frame copies.
             self._route_chunk_to_segments(chunk)
+            # _route_chunk_to_segments may set _failure on a partial route
+            # (queue timeout, etc.) and return without raising. Re-check so
+            # we do NOT advance the frame count or release the lease for
+            # frames that never entered any queue.
+            self._raise_if_failed()
         else:
             # Fallback -- we don't yet know total_frames, so buffer until
             # finish() builds the plan.
@@ -429,15 +434,18 @@ class SegmentedFFmpegEncoder:
         if self._plan is not None:
             # Streaming path -- verify frame count matches, then send EOS.
             if self._total_frames_seen != self._plan.total_frames:
-                # Send EOS BEFORE setting _failure — _send_eos_all bails
-                # out when _failure is already set, so setting it first
-                # would leave workers hanging on their queues until timeout.
-                self._send_eos_all()
-                self._failure = RuntimeError(
+                # Frame-count mismatch: abort workers immediately and surface
+                # the original error.  Do NOT try to assemble incomplete
+                # segments or concat/mux -- both would raise misleading errors
+                # that hide this one.  abort() drains queues, injects EOS, and
+                # terminates subprocesses so nothing hangs.
+                count_error = RuntimeError(
                     f"promised total_frames={self._plan.total_frames} but received {self._total_frames_seen}"
                 )
-            else:
-                self._send_eos_all()
+                self._failure = count_error
+                self.abort()
+                raise count_error
+            self._send_eos_all()
         else:
             # Fallback path -- build the plan and start workers now.
             if self._total_frames_seen == 0:
@@ -896,6 +904,9 @@ def _mux_audio_once(video_bytes: bytes, *, waveform: np.ndarray | None, sample_r
         pcm_int16 = np.ascontiguousarray(pcm_int16.T)  # (N, channels) → interleaved
         pcm_int16.tofile(audio_path)
 
+        # NOTE: intentionally omit `-shortest` so a shorter audio waveform
+        # does not truncate the video track.  The PyAV path preserves the full
+        # video regardless of audio length, so we match that contract here.
         cmd = [
             _default_ffmpeg_path(),
             "-hide_banner",
@@ -916,7 +927,6 @@ def _mux_audio_once(video_bytes: bytes, *, waveform: np.ndarray | None, sample_r
             "copy",
             "-c:a",
             "aac",
-            "-shortest",
             "-movflags",
             "+faststart",
             out_path,

@@ -35,6 +35,13 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.models.interface import supports_chunked_vae_decode
 from vllm_omni.diffusion.utils.media_utils import ChunkedMP4Encoder
 
+# Optional backend: SegmentedFFmpegEncoder uses parallel FFmpeg subprocesses
+# instead of PyAV for video encoding.  ffmpeg must be on PATH for this path.
+try:
+    from vllm_omni.diffusion.utils.segmented_ffmpeg import SegmentedFFmpegEncoder  # noqa: F401
+except Exception:  # ffmpeg not available or module has import errors
+    SegmentedFFmpegEncoder = None  # type: ignore[assignment,misc]
+
 logger = init_logger(__name__)
 
 # Re-checked while waiting for a slot so an abort recorded without a notify
@@ -365,11 +372,17 @@ class ChunkedVideoMP4Session:
         crop: tuple[int, int] | None = None,
         transfer_slots: int = 2,
         max_pending_bytes: int | None = _DEFAULT_MAX_PENDING_BYTES,
+        use_segmented_encoder: bool = False,
+        segmented_process_count: int = 4,
     ) -> None:
         if batch_frames <= 0:
             raise ValueError("batch_frames must be positive")
         if max_pending_bytes is not None and (type(max_pending_bytes) is not int or max_pending_bytes <= 0):
             raise ValueError("max_pending_bytes must be a positive integer or None")
+        if use_segmented_encoder and SegmentedFFmpegEncoder is None:
+            raise RuntimeError(
+                "SegmentedFFmpegEncoder backend not available; ffmpeg must be on PATH to use segmented encoding"
+            )
         self._value_range = value_range
         self._fps = fps
         self._audio_waveforms = audio_waveforms
@@ -380,7 +393,9 @@ class ChunkedVideoMP4Session:
         self._crop = crop
         self._transfer_slots = transfer_slots
         self._max_pending_bytes = max_pending_bytes
-        self._encoders: list[ChunkedMP4Encoder] = []
+        self._use_segmented_encoder = use_segmented_encoder
+        self._segmented_process_count = segmented_process_count
+        self._encoders: list[ChunkedMP4Encoder | SegmentedFFmpegEncoder] = []
         self._pending: list[torch.Tensor] = []
         self._pending_frames = 0
         self._ring: PinnedChunkRing | None = None
@@ -463,18 +478,34 @@ class ChunkedVideoMP4Session:
     def _ensure_encoders(self, frames: torch.Tensor) -> None:
         if self._encoders:
             return
-        self._encoders = [
-            ChunkedMP4Encoder(
-                width=int(frames.shape[3]),
-                height=int(frames.shape[2]),
-                fps=self._fps,
-                audio_waveform=self._waveform_for(index, int(frames.shape[0])),
-                audio_sample_rate=self._audio_sample_rate,
-                max_pending=self._max_pending,
-                video_codec_options=self._video_codec_options,
-            )
-            for index in range(int(frames.shape[0]))
-        ]
+        encoder_cls = SegmentedFFmpegEncoder if self._use_segmented_encoder else ChunkedMP4Encoder
+        kwargs_base = dict(
+            width=int(frames.shape[3]),
+            height=int(frames.shape[2]),
+            fps=self._fps,
+            max_pending=self._max_pending,
+            video_codec_options=self._video_codec_options,
+        )
+        self._encoders = []
+        for index in range(int(frames.shape[0])):
+            waveform = self._waveform_for(index, int(frames.shape[0]))
+            if encoder_cls is SegmentedFFmpegEncoder:
+                self._encoders.append(
+                    SegmentedFFmpegEncoder(
+                        **kwargs_base,
+                        audio_waveform=waveform,
+                        audio_sample_rate=self._audio_sample_rate,
+                        process_count=self._segmented_process_count,
+                    )
+                )
+            else:
+                self._encoders.append(
+                    ChunkedMP4Encoder(
+                        **kwargs_base,
+                        audio_waveform=waveform,
+                        audio_sample_rate=self._audio_sample_rate,
+                    )
+                )
 
     def _resolve_ring(self, device: torch.device) -> PinnedChunkRing | None:
         if self._ring_resolved:
