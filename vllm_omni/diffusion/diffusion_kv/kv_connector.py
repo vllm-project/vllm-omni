@@ -330,7 +330,7 @@ def validate_kv_transfer_boundaries(requests: tuple[DiffusionKVRequest, ...], ma
     """Validate every CFG row before reserving or registering destination pages."""
     for request, num_tokens in zip(requests, matched_tokens, strict=True):
         params = request.kv_transfer_params
-        if num_tokens <= 0 or params is None:
+        if params is None:
             continue
         transfer_tokens = params.get("num_transfer_tokens")
         if type(transfer_tokens) is not int or not num_tokens <= transfer_tokens <= request.num_tokens:
@@ -361,7 +361,7 @@ def commit_kv_load(
         # different logical prefix lengths. Bytes beyond ``num_tokens`` are
         # not marked computed and are overwritten by the DiT prefill.
         transfer_tokens = num_tokens
-        if num_tokens > 0 and request.kv_transfer_params is not None:
+        if request.kv_transfer_params is not None:
             transfer_tokens = request.kv_transfer_params["num_transfer_tokens"]
         prefix_blocks = KVCacheBlocks(
             tuple(
@@ -380,10 +380,12 @@ def commit_kv_load(
         from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector import MooncakeConnector
         from vllm.v1.request import RequestStatus
 
-        if not isinstance(connector, MooncakeConnector):
+        from vllm_omni.distributed.omni_connectors.connectors.nixl_kv_connector import OmniNixlKVConnector
+
+        if not isinstance(connector, (MooncakeConnector, OmniNixlKVConnector)):
             # Unknown connectors may have started I/O during registration.
             raise
-        # Mooncake only queues metadata here; no Worker has seen addresses yet.
+        # These connectors only queue metadata; no Worker has seen addresses yet.
         # Re-arm its pre-scheduling abort hook to replace even partially
         # registered CFG receives with empty-block notifications to the producer.
         for request in requests:
