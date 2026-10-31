@@ -42,6 +42,39 @@ def test_replay_padding_keeps_tail_sequence_capacity():
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("shape_lengths", [(2, 2), (1, 3), (3, 2), (2**32 + 2, 2)])
+def test_replay_buffers_validate_each_images_patch_count(mocker, shape_lengths):
+    from vllm_omni.model_executor.models.hunyuan_image3.encoder_cudagraph import _VisionEncoder
+
+    embeddings = Siglip2VisionEmbeddings(Config(dict(hidden_size=8, patch_size=2, num_channels=3, num_patches=4)))
+    model = SimpleNamespace(
+        config=SimpleNamespace(vit_processor={"max_num_patches": 4}),
+        vision_model=SimpleNamespace(embeddings=embeddings),
+    )
+    encoder = _VisionEncoder(model)
+    inputs = {
+        "pixels": torch.arange(96, dtype=torch.float32).reshape(2, 4, 12),
+        "mask": torch.tensor([[1, 1, 0, 0], [1, 1, 0, 0]]),
+        "shapes": torch.tensor([[1, length] for length in shape_lengths]),
+    }
+    if shape_lengths != (2, 2):
+        # (1, 3) has the right total but would mix the two images' segments.
+        # Reject before interpolation, including values that wrap in int32.
+        interpolate = mocker.patch.object(
+            embeddings, "interpolate_pos_encoding", side_effect=AssertionError("Must reject invalid shapes first")
+        )
+        with pytest.raises(ValueError, match="patch count.*spatial shape"):
+            encoder.prepare_encoder_cudagraph_replay_buffers(inputs, 2, 0)
+        interpolate.assert_not_called()
+    else:
+        buffers = encoder.prepare_encoder_cudagraph_replay_buffers(inputs, 2, 0).values
+        assert buffers["cu_seqlens"].tolist() == [0, 2, 4]
+        assert buffers["indices"].tolist() == [[1, 2, 0, 0], [3, 4, 0, 0]]
+        torch.testing.assert_close(buffers["pixels"], inputs["pixels"][:, :2].reshape(4, 12))
+        torch.testing.assert_close(buffers["positions"], embeddings.interpolate_pos_encoding(inputs["shapes"]))
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("enabled,cuda", [(False, True), (True, False)])
 def test_stage_does_not_create_manager_when_disabled_or_non_cuda(monkeypatch, mocker, enabled, cuda):
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -565,6 +598,11 @@ def test_stage_graph_replay_matches_eager_and_preserves_rng(cuda_model, mocker, 
     assert torch.equal(state, torch.cuda.get_rng_state()), "capture must not sample VAE latents"
     assert manager.get_num_graphs_to_capture() == 1
     assert set(manager.vision.budget_graphs["default"]) == {4 if sparse_budgets else 256}
+    invalid = _inputs([(32, 32)], dtype=model.vae.dtype)
+    invalid["vit_pixel_attention_mask"][0, 0] = False
+    with pytest.raises(ValueError, match="patch count.*spatial shape"):
+        _run_stage(model, manager, invalid)
+    # The following valid requests must still replay successfully after rejection.
     vae_encode = mocker.spy(model, "_vae_encode")
     replay = mocker.spy(manager.vision, "_run_budget_graph")
     cases = [
@@ -598,6 +636,28 @@ def test_stage_graph_replay_matches_eager_and_preserves_rng(cuda_model, mocker, 
     assert manager.vision.graph_hits > 0
     if sparse_budgets:
         assert all(len(call.args[0]["pixels"]) == 1 for call in replay.call_args_list)
+
+    # The total is still seven patches, but the per-image counts are swapped.
+    invalid = _inputs([(32, 32), (16, 64)], seed=None, dtype=model.vae.dtype)
+    invalid["vit_spatial_shapes"] = invalid["vit_spatial_shapes"].flip(0)
+    metadata = next(iter(manager.vision.budget_graphs["default"].values()))
+    saved_buffers = {key: value.clone() for key, value in metadata.input_buffers.items()}
+    saved_output = metadata.output_buffer.clone()
+    state = torch.cuda.get_rng_state()
+    hits = manager.vision.graph_hits
+    vae_encode.reset_mock()
+    with pytest.raises(ValueError, match="patch count.*spatial shape"):
+        _run_stage(model, manager, invalid)
+    vae_encode.assert_not_called()
+    assert manager.vision.graph_hits == hits
+    assert torch.equal(state, torch.cuda.get_rng_state())
+    for key, value in metadata.input_buffers.items():
+        torch.testing.assert_close(value, saved_buffers[key], rtol=0, atol=0)
+    torch.testing.assert_close(metadata.output_buffer, saved_output, rtol=0, atol=0)
+    recovered = _run_stage(model, manager, inputs)
+    assert len(recovered) == len(graph)
+    for previous, current in zip(graph, recovered):
+        torch.testing.assert_close(current, previous, rtol=0, atol=0)
 
 
 @pytest.mark.nvidia_only

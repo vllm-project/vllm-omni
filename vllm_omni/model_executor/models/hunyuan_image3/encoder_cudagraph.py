@@ -72,7 +72,12 @@ class _VisionEncoder(SupportsEncoderCudaGraph):
     def prepare_encoder_cudagraph_replay_buffers(self, mm_kwargs, max_batch_size, max_frames_per_batch, path="default"):
         pixels, mask, shapes = (mm_kwargs[key] for key in ("pixels", "mask", "shapes"))
         mask = mask.bool()
-        lengths = shapes.prod(-1).to(device=pixels.device, dtype=torch.int32)
+        lengths = mask.sum(-1)
+        # Packing uses the mask, while positional embeddings use spatial shapes.
+        # Check each image before replay; a matching batch total is insufficient.
+        if not torch.equal(lengths, shapes.prod(-1).to(device=lengths.device)):
+            raise ValueError("SigLIP2 valid patch count must match the spatial shape for each image.")
+        lengths = lengths.to(device=pixels.device, dtype=torch.int32)
         cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(0, dtype=torch.int32)])
         indices = mask.flatten().long().cumsum(0).reshape_as(mask) * mask
         return EncoderCudaGraphReplayBuffers(
