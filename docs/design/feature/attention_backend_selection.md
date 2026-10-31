@@ -113,6 +113,18 @@ provider consumes tile64 or tile128 directly; selecting it does not change
 the model's top-k policy. Startup checks and execution use the same provider
 resolution path.
 
+Denoising-step precision selectors are consumed by the shared `Attention`
+layer from `ForwardContext.denoise_step_idx`. A pipeline that exposes step
+selectors must publish the zero-based index before both CFG branches and
+clear it after execution. Qwen-Image-2.1 does this in both request and step
+execution; when step selectors control an enabled `diffusion_kv_cache_dtype`
+quantization policy, heterogeneous step batches are split so one request cannot
+inherit another request's precision policy. With `None`, `auto`, or `float`,
+retaining a step selector does not introduce step-based splitting. Existing
+prefix-length compatibility grouping still applies. Explicit backend quant
+specs are not controlled by this step selector.
+This does not change backend selection or relax unsupported mask checks.
+
 The explicit Triton provider accepts H3 tile64/128 on SM80+ in BF16.
 For tile128 it expands the selected mask into 64-token compute blocks
 without recomputing top-k or splitting the softmax reduction. Ada tile128
