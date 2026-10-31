@@ -41,3 +41,10 @@ def test_config_without_class_name_is_an_error(tmp_path):
     _write_config(tmp_path, {"in_channels": 3})
     with pytest.raises(ValueError, match="_class_name"):
         benchmark._vae_class_name(str(tmp_path))
+
+
+def test_explicit_module_class_overrides_config_class() -> None:
+    from vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage import AutoencoderKLQwenImage
+
+    name = "vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage:AutoencoderKLQwenImage"
+    assert benchmark._vae_class(name) is AutoencoderKLQwenImage

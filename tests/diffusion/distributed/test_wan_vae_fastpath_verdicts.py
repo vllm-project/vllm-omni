@@ -266,7 +266,6 @@ def test_replaced_cache_is_released_before_convolution(cpu_assembly, monkeypatch
 
 
 @torch.no_grad()
-@torch.no_grad()
 @pytest.mark.parametrize("shortage", ["no_room", "out_of_memory"])
 def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_assembly, monkeypatch, shortage) -> None:
     """A probe that does not fit leaves the shape unverified: reference formulation now, a probe once memory allows."""
@@ -286,7 +285,10 @@ def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_asse
     random_like = fp._random_like
     room = False
 
-    def probe_fits(x, weight):
+    fit_checks = []
+
+    def probe_fits(x, weight, frames=None, padding=()):
+        fit_checks.append(frames)
         return room or shortage != "no_room"
 
     def maybe_oom(t, generator, std=1.0):
@@ -296,6 +298,15 @@ def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_asse
 
     monkeypatch.setattr(fp, "_probe_fits", probe_fits)
     monkeypatch.setattr(fp, "_random_like", maybe_oom)
+    cat_time = fp.dm.cat_time_5d
+    time_assemblies = []
+
+    def counting_cat_time(*args, **kwargs):
+        time_assemblies.append(True)
+        return cat_time(*args, **kwargs)
+
+    monkeypatch.setattr(fp.dm, "cat_time_5d", counting_cat_time)
+    fp.reset_probe_stats()
 
     def run():
         x = torch.full((1, 2, 1, 3, 4), 2.0)
@@ -313,20 +324,29 @@ def test_probe_without_memory_runs_reference_and_retries(verdict_cache, cpu_asse
         assert torch.equal(output, expected)
     assert not cache.get(conv)  # nothing recorded: the shape stays unverified
     assert not any(fast_calls)  # the real input only went through the reference formulation
+    if spatial_padding and shortage == "no_room":
+        assert not time_assemblies  # declined before the time-assembled copy was built
+    declined = "declined_memory" if shortage == "no_room" else "declined_oom"
+    assert fp.probe_stats() == {"equal": 0, "not_equal": 0, "declined_memory": 0, "declined_oom": 0, declined: 1}
 
     room = True
     fast_calls.clear()
+    fit_checks.clear()
     output, expected = run()
+    # One memory check, made for the assembled input before it exists: a probe never declines after assembly.
+    assert fit_checks == [conv._padding[4] + 1]
     assert torch.equal(output, expected)
     assert list(cache[conv].values()) == [True]
     assert fast_calls[-1]  # verified, so the fast formulation ran
+    assert fp.probe_stats()["equal"] == 1
 
 
 def test_probe_fits_counts_free_and_reserved_unallocated_memory(monkeypatch) -> None:
     x = torch.empty(1, 4, 3, 8, 8)  # 3 KiB
     weight = torch.empty(8, 4, 3, 3, 3)  # twice the channels out: 6 KiB of output
     need = weight.nbytes + int(1.1 * (2 * x.nbytes + 2 * 2 * x.nbytes))
-    memory = {"free": need, "reserved": 0, "allocated": 0}
+    need *= fp._PROBE_HEADROOM  # no probe (and so no cached verdict) near the memory limit
+    memory = {"free": int(need), "reserved": 0, "allocated": 0}
     device_module = type(
         "DeviceModule",
         (),
@@ -338,10 +358,13 @@ def test_probe_fits_counts_free_and_reserved_unallocated_memory(monkeypatch) -> 
     )
     monkeypatch.setattr(fp.torch, "get_device_module", lambda device: device_module)
     assert fp._probe_fits(x, weight)
-    memory["free"] = need - 1
+    memory["free"] = int(need) - 1
     assert not fp._probe_fits(x, weight)
     memory.update(reserved=10, allocated=9)  # cached allocator blocks not handed out count as free
     assert fp._probe_fits(x, weight)
+    # Sized for the time-assembled input: 2 frames of padding on 3 frames needs 5/3 of the memory.
+    memory.update(free=int(need), reserved=0, allocated=0)
+    assert not fp._probe_fits(x, weight, frames=5)
     monkeypatch.setattr(fp.torch, "get_device_module", lambda device: object())  # no memory queries
     assert fp._probe_fits(x, weight)
 
@@ -353,7 +376,7 @@ def test_spatial_probe_policy_preserves_exact_paths(monkeypatch, channels_last: 
     assembled = torch.ones(1, 2, 4, 3, 4)
     probes = []
 
-    def reject(*args):
+    def reject(*args, **kwargs):
         probes.append(True)
         return False
 
@@ -387,7 +410,7 @@ def test_fused_paths_release_replaced_history_before_probe(
     expected = conv(x, slots[0])
     probes = []
 
-    def probe(*args):
+    def probe(*args, **kwargs):
         assert old_cache() is None, "replaced history must be released before padding/layout probes"
         probes.append(True)
         return probe_matches

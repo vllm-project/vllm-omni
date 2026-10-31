@@ -297,3 +297,54 @@ def test_registry_installs_on_qwen_vaes(monkeypatch) -> None:
         )
         assert getattr(model.vae, REPORT_ATTR).family == name
         assert getattr(model.vae, ENCODER_REPORT_ATTR).level == "channels_last"
+
+
+def test_most_specific_family_wins_and_lazy_families_keep_earlier_registrations(monkeypatch) -> None:
+    class MyQwenVae(AutoencoderKLQwenImage):
+        pass
+
+    builtin = next(f for f in fam.families() if f.name == "qwen_image")
+    mine = replace(builtin, name="my_qwen", vaes=(MyQwenVae,))
+    monkeypatch.setattr(fam, "_FAMILIES", list(fam._FAMILIES))
+    register_family(mine)
+    # Registered after `qwen_image` but for a subclass: an instance of the subclass gets it either way.
+    assert fam.find_family(MyQwenVae(**TINY_QWEN_IMAGE)) is mine
+    assert fam.find_family(AutoencoderKLQwenImage(**TINY_QWEN_IMAGE)) is builtin
+    monkeypatch.setattr(fam, "_FAMILIES", [mine, *(f for f in fam._FAMILIES if f is not mine)])
+    assert fam.find_family(MyQwenVae(**TINY_QWEN_IMAGE)) is mine  # registration order does not matter
+
+    # A family registered before the lazy built-ins load is not replaced by the built-in of the same name.
+    users = replace(builtin, vaes=(MyQwenVae,))
+    monkeypatch.setattr(fam, "_FAMILIES", [f for f in fam._FAMILIES if f.name in ("wan",)])
+    monkeypatch.setattr(fam, "_LAZY_LOADED", False)
+    register_family(users)
+    assert [f for f in fam.families() if f.name == "qwen_image"] == [users]
+    fam._role_types.cache_clear()
+
+
+def test_fp32_channel_norm_is_the_upcast_reduction_and_probes_once(monkeypatch) -> None:
+    from vllm_omni.diffusion.layers import vae_rms_norm as vrn
+
+    monkeypatch.setattr(vrn, "_FP32_NORM_VERDICTS", {})
+    x = torch.randn(1, 96, 2, 5, 7).to(torch.bfloat16)
+    expected = x.float().norm(2, 1, keepdim=True)
+    probes = []
+    probe = vrn._fp32_norm_probe
+
+    def counting_probe(t):
+        probes.append(True)
+        return probe(t)
+
+    monkeypatch.setattr(vrn, "_fp32_norm_probe", counting_probe)
+    for _ in range(2):
+        assert torch.equal(vrn.fp32_channel_norm(x).view(torch.int32), expected.view(torch.int32))
+    assert len(probes) == 1  # one verdict per (device, dtype, shape, layout)
+
+    # A backend whose direct reduction differs keeps the upcast; a probe that does not fit records nothing.
+    monkeypatch.setattr(vrn, "_FP32_NORM_VERDICTS", {})
+    monkeypatch.setattr(vrn, "_fp32_norm_probe", lambda t: False)
+    assert torch.equal(vrn.fp32_channel_norm(x).view(torch.int32), expected.view(torch.int32))
+    monkeypatch.setattr(vrn, "_FP32_NORM_VERDICTS", {})
+    monkeypatch.setattr(vrn, "_fp32_norm_probe", lambda t: None)
+    assert torch.equal(vrn.fp32_channel_norm(x).view(torch.int32), expected.view(torch.int32))
+    assert not vrn._FP32_NORM_VERDICTS

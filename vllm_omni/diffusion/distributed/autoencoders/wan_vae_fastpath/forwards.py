@@ -32,6 +32,7 @@ Whenever a kernel declines an input, the reference expression is used.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -210,7 +211,7 @@ def causal_conv_forward(self: WanCausalConv3d, x: torch.Tensor, cache_x: torch.T
         # cached call sites' verdicts, so hooked convolutions keep it too.
         verdicts = _SPATIAL_PAD_VERDICTS.setdefault(self, {})
         key = _conv_verdict_key(self, x, 0 if history is None else history.shape[2])
-        if verdicts.get(key, True):
+        if verdicts.get(key, True) and not _spatial_probe_declined(self, x, verdicts, key):
             assembled = dm.cat_time_5d(x, history, padding[4])
             if assembled is not None:
                 return _conv_with_spatial_padding(self, assembled, self.bias, verdicts, key)
@@ -285,6 +286,23 @@ def _random_like(t: torch.Tensor, generator: torch.Generator, std: float = 1.0) 
     return torch.empty_like(t).normal_(0.0, std, generator=generator)
 
 
+# First-use probe outcomes since the last reset_probe_stats(): "equal" / "not_equal" verdicts recorded,
+# "declined_memory" (not run: too little free memory) and "declined_oom" (ran out of memory while probing).
+_PROBE_STATS: Counter[str] = Counter()
+# A probe runs only if its scratch needs at most 1 / _PROBE_HEADROOM of the free memory: a verdict is cached for
+# the process, so none is taken near the limit, where backends may pick lower-workspace algorithms.
+_PROBE_HEADROOM = 2.0
+
+
+def probe_stats() -> dict[str, int]:
+    """Counts of first-use probe outcomes (see ``_PROBE_STATS``), e.g. to check how often probes were declined."""
+    return {key: _PROBE_STATS[key] for key in ("equal", "not_equal", "declined_memory", "declined_oom")}
+
+
+def reset_probe_stats() -> None:
+    _PROBE_STATS.clear()
+
+
 def _log_probe_skipped(conv: nn.Module, x: torch.Tensor) -> None:
     logger.info_once(
         "Not enough free device memory to verify the fast path for %s %s; using the reference formulation for "
@@ -294,24 +312,54 @@ def _log_probe_skipped(conv: nn.Module, x: torch.Tensor) -> None:
     )
 
 
-def _probe_fits(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether a probe's scratch tensors fit in the device memory that is free now.
+def _probe_fits(x: torch.Tensor, weight: torch.Tensor, frames: int | None = None, padding: tuple = ()) -> bool:
+    """Whether a probe's scratch tensors fit, with headroom, in the device memory that is free now.
 
     A probe holds a random weight, a random input, the reference's prepared
     copy of it (at most a padded copy) and both outputs, on top of the live
     decode state; at large shapes that is what would push the first call past
-    the reference's peak. Counts memory the caching allocator has reserved but
-    not handed out; 10% headroom covers the padding and allocator rounding.
+    the reference's peak. With ``frames`` (and spatial ``padding``, as
+    ``(height, width)``), ``x`` is the raw input and the probe is for the input
+    assembled from it, which does not exist yet: it is sized for that many
+    frames and padded planes, and its own allocation is counted as well.
+    Counts memory the caching allocator has reserved but not handed out; 10%
+    covers the padding and allocator rounding, and the probe must fit
+    ``_PROBE_HEADROOM`` times over.
     """
-    out_bytes = x.nbytes * weight.shape[0] // x.shape[1]  # same spatial size, at most as many frames
-    need = weight.nbytes + int(1.1 * (2 * x.nbytes + 2 * out_bytes))
+    x_bytes = x.nbytes
+    assembled_bytes = 0
+    if frames is not None:
+        height, width = x.shape[3], x.shape[4]
+        pad_h, pad_w = padding or (0, 0)
+        plane = (height + 2 * pad_h) * (width + 2 * pad_w) / (height * width)
+        x_bytes = assembled_bytes = int(x.nbytes / max(x.shape[2], 1) * frames * plane)
+    out_bytes = x_bytes * weight.shape[0] // x.shape[1]  # same spatial size, at most as many frames
+    need = weight.nbytes + int(1.1 * (2 * x_bytes + 2 * out_bytes))
     device_module = torch.get_device_module(x.device)
     try:
         free, _ = device_module.mem_get_info(x.device)
         free += device_module.memory_reserved(x.device) - device_module.memory_allocated(x.device)
     except Exception:  # backend without memory queries: rely on the OutOfMemoryError fallback
         return True
-    return need <= free
+    return need * _PROBE_HEADROOM + assembled_bytes <= free
+
+
+def _spatial_probe_declined(conv: nn.Module, x: torch.Tensor, verdicts: dict[tuple, bool], key: tuple) -> bool:
+    """Whether ``conv`` needs a spatial-padding probe for ``key`` that does not fit now.
+
+    Checked before the time-assembled input is built, so a declined shape takes
+    the pre-padded assembly (one tensor, the reference's conv input) and never
+    holds more memory than the reference path. The probe that follows does not
+    check memory again: this check already counted the assembled input.
+    """
+    cfg = getattr(conv, CFG_ATTR, None)
+    if key in verdicts or (cfg is not None and cfg.channels_last and not cfg.verify_spatial_padding):
+        return False
+    if _probe_fits(x, conv.weight, frames=conv._padding[4] + x.shape[2]):
+        return False
+    _PROBE_STATS["declined_memory"] += 1
+    _log_probe_skipped(conv, x)
+    return True
 
 
 def _equal_on_random_operands(
@@ -320,6 +368,8 @@ def _equal_on_random_operands(
     candidate: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     reference: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     reference_input: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    memory_checked: bool = False,
 ) -> bool | None:
     """Compare two convolution formulations on seeded random stand-ins for ``x`` and ``weight``.
 
@@ -342,8 +392,11 @@ def _equal_on_random_operands(
     formulation for this call and records nothing, so the shape is probed
     again once memory allows. The first call therefore never needs more
     memory than the reference path, and devices with room keep the fast path.
+    ``memory_checked`` skips the check for callers that made it before
+    assembling ``x`` (an out-of-memory error is still caught).
     """
-    if not _probe_fits(x, weight):
+    if not memory_checked and not _probe_fits(x, weight):
+        _PROBE_STATS["declined_memory"] += 1
         return None
     try:
         generator = torch.Generator(device=x.device).manual_seed(_PROBE_SEED)
@@ -351,9 +404,12 @@ def _equal_on_random_operands(
         state = generator.get_state()
         reference_out = reference(reference_input(_random_like(x, generator)), probe_weight)
         generator.set_state(state)
-        return _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
+        equal = _bitwise_equal(candidate(_random_like(x, generator), probe_weight), reference_out)
     except torch.OutOfMemoryError:
+        _PROBE_STATS["declined_oom"] += 1
         return None
+    _PROBE_STATS["equal" if equal else "not_equal"] += 1
+    return equal
 
 
 def _conv_with_spatial_padding(
@@ -395,8 +451,9 @@ def _conv_with_spatial_padding(
 
     verdict = verdicts.get(key)
     if verdict is None:
-        verdict = _equal_on_random_operands(assembled, conv.weight, candidate, padded, pad)
-        if verdict is None:
+        # Both callers checked memory before assembling (``_spatial_probe_declined``).
+        verdict = _equal_on_random_operands(assembled, conv.weight, candidate, padded, pad, memory_checked=True)
+        if verdict is None:  # ran out of memory while probing
             _log_probe_skipped(conv, assembled)
             return padded(pad(assembled), conv.weight)
         _record_verdict(verdicts, key, verdict)
@@ -526,7 +583,7 @@ def _run_cached_causal_conv(
         # use the tolerance-based policy in _conv_with_spatial_padding.
         verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
         key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
-        if verdicts.get(key, True):
+        if verdicts.get(key, True) and not _spatial_probe_declined(conv, x, verdicts, key):
             pair = dm.cat_time_5d(x, payload, conv._padding[4], keep_cache_frames=CACHE_T)
             if pair is not None:
                 assembled, cache_list[index] = pair
@@ -671,7 +728,9 @@ def _run_conv_out_channels_last(
     key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
     if not verdicts.get(key, True):
         return None
-    if key not in verdicts and not _probe_fits(x, conv.weight):
+    spatial = (conv._padding[2], conv._padding[0])
+    if key not in verdicts and not _probe_fits(x, conv.weight, frames=conv._padding[4] + x.shape[2], padding=spatial):
+        _PROBE_STATS["declined_memory"] += 1
         _log_probe_skipped(conv, x)
         return None  # the standard path, before the channels-last copy is assembled
     pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T, channels_last_output=True)
@@ -688,10 +747,14 @@ def _run_conv_out_channels_last(
         return F.conv3d(x_contiguous, weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups)
 
     if key not in verdicts:
-        verdict = _equal_on_random_operands(assembled, conv.weight, candidate, channels_first, lambda t: t.contiguous())
-        if verdict is None:
+        verdict = _equal_on_random_operands(
+            assembled, conv.weight, candidate, channels_first, lambda t: t.contiguous(), memory_checked=True
+        )
+        if verdict is None:  # ran out of memory while probing, despite the check above
             _log_probe_skipped(conv, assembled)
-            return channels_first(assembled.contiguous(), conv.weight)
+            contiguous = assembled.contiguous()
+            del assembled  # hold only the channels-first copy during the convolution
+            return channels_first(contiguous, conv.weight)
         _record_verdict(verdicts, key, verdict)
         if not verdict:
             logger.info(
@@ -1139,6 +1202,9 @@ ATTENTION_CHUNK_ROWS = 2048
 def _chunked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rows: int) -> torch.Tensor:
     """Single-head attention as low-precision matmuls (fp32 accumulation) with an fp32 softmax, ``rows`` at a time.
 
+    The score matmul rounds its output to ``q.dtype`` before the softmax upcasts it, which is where most of the
+    difference from fp32 attention comes from.
+
     ``q`` is scaled before the score matmul, as SDPA's math path does: the matmul writes its output in ``q.dtype``,
     and unscaled fp16 scores overflow for a head dim of 384+ (e.g. 384 * 20 * 20 > 65504).
     """
@@ -1152,11 +1218,13 @@ def _chunked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rows: 
 
 
 def attention_block_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """The VAE's single-head attention block without SDPA.
+    """The VAE's single-head attention block as chunked low-precision matmuls instead of SDPA.
 
-    Its head dim is the channel count (384-1152), which no fused SDPA kernel
-    takes, so SDPA falls back to fp32 math. Bound at the channels_last level
-    only (not bit-exact).
+    Its head dim is the channel count (384-1152). On XPU, SDPA runs these head
+    dims in fp32 math; on CUDA (SM120) it takes the memory-efficient kernel.
+    The chunked matmuls are faster on both, but the scores are rounded to
+    ``q.dtype`` before the fp32 softmax, so the error against fp32 is a few
+    times SDPA's. Bound at the channels_last level only (not bit-exact).
     """
     if (
         not _kernels_allowed(x)

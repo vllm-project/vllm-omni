@@ -230,7 +230,7 @@ of them:
 | `wan` | diffusers `AutoencoderKLWan` | Wan2.1/2.2, Cosmos3, LingBot, Helios, ... | Everything above; the Cosmos3 encoder path is Wan-only. |
 | `qwen_image` | diffusers `AutoencoderKLQwenImage` | Qwen-Image, Qwen-Image-Edit, Anima, Krea2 | The decoder's up blocks take no `first_chunk`. |
 | `qwen_image_layered` | vLLM-Omni `AutoencoderKLQwenImage` (`models/qwen_image/`) | Qwen-Image-Layered | Its RMS norm skips the fp32 upcast, so it keeps its own forward. |
-| `qwen_image_21` | vLLM-Omni `AutoencoderKLQwenImage21` | Qwen-Image-2.1 | Causal convs are `Conv2d` on a single frame; `channels_last` also replaces the fp32-math SDPA in the mid-block attention with chunked bf16 matmuls. |
+| `qwen_image_21` | vLLM-Omni `AutoencoderKLQwenImage21` | Qwen-Image-2.1 | Causal convs are `Conv2d` on a single frame; `channels_last` also replaces SDPA in the mid-block attention (head dim 768/1152; fp32 math on XPU, the memory-efficient kernel on CUDA) with faster chunked bf16 matmuls whose scores are rounded to bf16 before the fp32 softmax. |
 
 For the non-Wan families the encoder fast path binds the causal convolutions,
 residual blocks and RMS norms; the Cosmos3-specific encoder forwards are not
@@ -266,6 +266,21 @@ Module types are matched exactly, and a family's classes must have the Wan
 forwards' behavior up to names: add a bitwise `lossless` test, as
 `tests/diffusion/distributed/test_wan_vae_fastpath_families.py` does for the
 built-in families.
+
+A VAE gets the family registered for its most specific class (a family for a
+subclass of `AutoencoderKLWan` wins over `wan`), and the built-in families do
+not replace a family of the same name registered before them. Wan-style VAEs
+that are not registered, and so run their own forwards, include
+`models/lance/wan_vae.py` and `models/magi2/turbo_vae.py`.
+
+The first-use bitwise probes allocate full-size scratch tensors. A probe runs
+only when its scratch fits twice over in the free device memory (counting
+memory the allocator has reserved but not handed out); otherwise, or if it
+runs out of memory, that call uses the reference formulation, nothing is
+recorded, and the shape is probed again on a later call. A declined
+spatial-padding probe is decided before the time-assembled input is built, so
+the call never holds more memory than `off`. `probe_stats()` (from
+`wan_vae_fastpath`) counts recorded verdicts and declined probes.
 
 Measured on one Intel Arc Pro B70 (bf16, real weights, a natural image encoded
 at each size and its latent decoded; median of 5 after warmup;

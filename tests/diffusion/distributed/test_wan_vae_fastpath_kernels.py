@@ -1351,7 +1351,8 @@ def test_channels_last_decoder_keeps_layout_and_stays_close(
 
 
 @torch.no_grad()
-def test_qwen_image_cold_first_lossless_decode_fits_where_reference_fits() -> None:
+@pytest.mark.parametrize("warm_allocator", [False, True])
+def test_qwen_image_cold_first_lossless_decode_fits_where_reference_fits(warm_allocator: bool) -> None:
     """The default ``lossless`` level must not OOM on a cold first decode that ``off`` fits (PR #9553).
 
     Both cost the reference extra memory on that call: the feature cache used to keep the zero front padding
@@ -1379,7 +1380,8 @@ def test_qwen_image_cold_first_lossless_decode_fits_where_reference_fits() -> No
     assert install_wan_vae_fastpath(candidate, level="lossless").installed
 
     total = device_module.get_device_properties(DEVICE).total_memory
-    device_module.empty_cache()
+    if not warm_allocator:  # warm: keep the reference decode's cached blocks, as a serving process would
+        device_module.empty_cache()
     device_module.set_per_process_memory_fraction(min(1.0, 1.15 * reference_peak / total))
     try:
         actual = candidate.decode(latents, return_dict=False)[0]

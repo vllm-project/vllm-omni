@@ -36,6 +36,11 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def _vae_class(name: str):
+    if ":" in name:  # an explicit "module:Class", e.g. the vLLM-Omni Qwen-Image-Layered copy
+        import importlib
+
+        module, _, attr = name.partition(":")
+        return getattr(importlib.import_module(module), attr)
     if name == "AutoencoderKLQwenImage21":
         from vllm_omni.diffusion.models.qwen_image_21.autoencoder_kl_qwenimage21 import AutoencoderKLQwenImage21
 
@@ -106,6 +111,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, help="Checkpoint directory or repo id (the VAE is read from vae/)")
     parser.add_argument("--image", required=True, help="Input image; resized to each --size")
+    parser.add_argument(
+        "--vae-class",
+        help="VAE class as module:Class instead of vae/config.json's _class_name, e.g. "
+        "vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage:AutoencoderKLQwenImage (Qwen-Image-Layered)",
+    )
     parser.add_argument("--size", type=int, action="append", help="Square image size, repeatable")
     parser.add_argument("--frames", type=int, default=1, help="Video frames (the image repeated); 1 for images")
     parser.add_argument(
@@ -122,7 +132,7 @@ def main() -> None:
         levels.insert(0, "off")  # the reference every other level is compared with; repeat it to check repeatability
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     device = torch.device(current_omni_platform.device_type, 0)
-    class_name = _vae_class_name(args.model)
+    class_name = args.vae_class or _vae_class_name(args.model)
     vae = _vae_class(class_name).from_pretrained(args.model, subfolder="vae", torch_dtype=dtype).to(device).eval()
     family = find_family(vae)
     config = vae.config
