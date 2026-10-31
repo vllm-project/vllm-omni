@@ -172,6 +172,20 @@ their earlier evidence remains separate. The two-chunk runner regression also
 exercises cached scheduler offsets and batch reordering in both async-flag
 modes on CPU; async GPU scheduling and speculative decoding remain unvalidated.
 
+The second review follow-up passed 1335 CPU tests and 24 subtests
+(7 skipped, 29 warnings). On runtime
+`235fb0dda54277df6e1258a4062485d95c4492e1`, the retained 22 BF16 serving
+cases and four immediate valid-speech recovery cases passed. Four control-token
+requests returned HTTP 400 as intended; the client fixture then incorrectly
+looked for `detail` instead of the global OpenAI `error.message` envelope,
+so that original suite remains recorded as 26/30 with exit 2. A separate CPU
+audit verified the four saved error envelopes and four saved recovery responses;
+it does not replace that suite result. That run overlapped an unrelated GPU
+job and was interrupted during cleanup. A subsequent isolated rerun was stopped
+by its GPU-ownership guard before submitting test requests when another job
+started. A complete zero-exit rerun of the corrected 30-case fixture remains
+pending resource isolation. FP8/NVFP4 were not rerun in this round.
+
 The environment used Torch 2.13.0+cu130, Transformers 5.16.1, FlashInfer
 0.7.0.post1, Humming-kernels 0.1.17 and CUTLASS DSL 4.8.0. Installed Omni dev
 metadata still produces a version warning; identify code by its source commit.
