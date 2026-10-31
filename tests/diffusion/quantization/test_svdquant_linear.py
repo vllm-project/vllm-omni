@@ -45,11 +45,11 @@ def _register_parameter(
     )
 
 
-def test_supports_only_validated_datacenter_blackwell() -> None:
-    assert not svdquant._supports_capability(SimpleNamespace(major=10, minor=0))
+def test_supports_blackwell_nvfp4_targets() -> None:
+    assert svdquant._supports_capability(SimpleNamespace(major=10, minor=0))
     assert svdquant._supports_capability(SimpleNamespace(major=10, minor=3))
     assert not svdquant._supports_capability(SimpleNamespace(major=11, minor=0))
-    assert not svdquant._supports_capability(SimpleNamespace(major=12, minor=0))
+    assert svdquant._supports_capability(SimpleNamespace(major=12, minor=0))
     assert not svdquant._supports_capability(None)
 
 
