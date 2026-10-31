@@ -546,6 +546,7 @@ async def generate_sample(
     drain_timeout_event_count = 0
     close_timeout = None
     stream_start: float | None = None
+    session_stats: dict[str, object] | None = None
     async with client:
         await client.configure(
             model,
@@ -645,6 +646,13 @@ async def generate_sample(
             except asyncio.CancelledError:
                 pass
         await client.acknowledge_playback()
+        session_stats: dict[str, object] | None = None
+        if _session_capabilities(client).get("supports_session_stats") is True:
+            try:
+                fetched = await client.get_session_stats(timeout_s=5.0)
+            except (TimeoutError, ConnectionError):
+                fetched = None
+            session_stats = fetched or None
         try:
             await client.close_session(timeout_s=20.0)
         except TimeoutError as exc:
@@ -683,6 +691,7 @@ async def generate_sample(
         collector,
         stream_start=stream_start if stream_start is not None else 0.0,
         session_id=sample.id,
+        session_stats=session_stats,
     )
     errors = []
     for event in client.events.errors():
