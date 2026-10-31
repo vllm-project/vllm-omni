@@ -313,6 +313,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             factory = getattr(raw_model, "create_encoder_cudagraph_manager", None)
             if factory is not None:
                 if not current_omni_platform.is_cuda():
+                    logger.warning("Model-specific encoder CUDA graphs require CUDA; using eager encoding.")
                     return None
                 return factory(self.vllm_config, self.device, self.dtype)
         if not getattr(raw_model, "encoder_cudagraph_single_replay", False):

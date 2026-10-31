@@ -75,8 +75,8 @@ def test_replay_buffers_validate_each_images_patch_count(mocker, shape_lengths):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("enabled,cuda", [(False, True), (True, False)])
-def test_stage_does_not_create_manager_when_disabled_or_non_cuda(monkeypatch, mocker, enabled, cuda):
+@pytest.mark.parametrize("enabled,cuda", [(False, True), (False, False), (True, False), (True, True)])
+def test_stage_custom_manager_platform_fallback(monkeypatch, mocker, enabled, cuda):
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     from vllm_omni.worker import gpu_model_runner
@@ -89,8 +89,20 @@ def test_stage_does_not_create_manager_when_disabled_or_non_cuda(monkeypatch, mo
     monkeypatch.setattr(runner, "get_model", lambda: model)
     monkeypatch.setattr(gpu_model_runner.current_omni_platform, "is_cuda", lambda: cuda)
     monkeypatch.setattr(GPUModelRunner, "_create_encoder_cudagraph_manager", lambda self: None)
-    assert runner._create_encoder_cudagraph_manager() is None
-    factory.assert_not_called()
+    log = mocker.patch.object(gpu_model_runner.logger, "warning")
+    runner.vllm_config, runner.device, runner.dtype = object(), torch.device("cpu"), torch.float32
+    result = runner._create_encoder_cudagraph_manager()
+    if enabled and cuda:
+        assert result is factory.return_value
+        factory.assert_called_once_with(runner.vllm_config, runner.device, runner.dtype)
+    else:
+        assert result is None
+        factory.assert_not_called()
+    if enabled and not cuda:
+        log.assert_called_once()
+        assert "CUDA" in log.call_args.args[0] and "eager" in log.call_args.args[0]
+    else:
+        log.assert_not_called()
 
 
 @pytest.mark.cpu
