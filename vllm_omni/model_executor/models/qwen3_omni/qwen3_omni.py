@@ -1365,7 +1365,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self._next_thinker_decode_text_step(
                 cached_thinker_decode_embeds, thinker_decode_embed, meta, device, update_dict
             )
-        start_index = meta.get("num_processed_tokens", 0)
+        if meta.get("resumable", False):
+            start_index = meta.get("num_processed_tokens", 0)
+        else:
+            # Decode rows start at the first text token the prefill did not
+            # consume, one per generated frame, and rows that arrived during a
+            # chunked prefill are cached first. The row for this position is
+            # therefore the number of frames before it, not the text index.
+            start_index = payload["_omni_num_computed_tokens"] - payload["_omni_prompt_len"]
+            if start_index < 0:
+                raise ValueError(f"Talker decode requires a non-negative generation offset, got {start_index}")
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
             cached_thinker_decode_embeds = to_device_nonblocking(cached_thinker_decode_embeds, device)
@@ -1431,10 +1440,10 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         last_talker_hidden = None
         text_step = None
+        if self.vllm_config.model_config.async_chunk:
+            text_step = self._thinker_decode_to_talker_decode(payload, input_ids.device, update_dict)
         try:
-            if self.vllm_config.model_config.async_chunk:
-                text_step = self._thinker_decode_to_talker_decode(payload, input_ids.device, update_dict)
-            else:
+            if not self.vllm_config.model_config.async_chunk:
                 q_tail = hs.get("trailing_text", None)
                 if isinstance(q_tail, torch.Tensor) and q_tail.numel() > 0:
                     use_vec = q_tail[0:1, :]
