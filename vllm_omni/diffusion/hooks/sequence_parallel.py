@@ -719,34 +719,76 @@ def apply_sequence_parallel(
         f"ring={config.ring_degree}, plan keys: {list(plan.keys())}"
     )
 
-    for module_id, sp_model_plan in plan.items():
-        submodule = _get_submodule_by_name(module, module_id)
-        if not isinstance(submodule, list):
-            submodule = [submodule]
+    registered_hooks: list[dict[str, Any]] = []
+    try:
+        for module_id, sp_model_plan in plan.items():
+            submodule = _get_submodule_by_name(module, module_id)
+            if not isinstance(submodule, list):
+                submodule = [submodule]
 
-        logger.debug(f"Applying SP hooks to '{module_id}' ({len(submodule)} module(s))")
+            logger.debug(f"Applying SP hooks to '{module_id}' ({len(submodule)} module(s))")
 
-        for m in submodule:
-            hook: SequenceParallelSplitHook | SequenceParallelGatherHook
-            if isinstance(sp_model_plan, dict):
-                # Input specification
-                hook = SequenceParallelSplitHook(sp_model_plan, config)
-                hook_name = _SP_INPUT_HOOK_TEMPLATE.format(module_id)
-            elif isinstance(sp_model_plan, (SequenceParallelOutput, list, tuple)):
-                # Output specification
-                if isinstance(sp_model_plan, SequenceParallelOutput):
-                    sp_model_plan = [sp_model_plan]
-                elif isinstance(sp_model_plan, tuple):
-                    sp_model_plan = list(sp_model_plan)
-                if not all(isinstance(x, SequenceParallelOutput) or x is None for x in sp_model_plan):
-                    raise ValueError(f"Expected SequenceParallelOutput elements, got {sp_model_plan}")
-                hook = SequenceParallelGatherHook(sp_model_plan, config)
-                hook_name = _SP_OUTPUT_HOOK_TEMPLATE.format(module_id)
-            else:
-                raise ValueError(f"Unsupported plan type: {type(sp_model_plan).__name__}")
+            for m in submodule:
+                hook: SequenceParallelSplitHook | SequenceParallelGatherHook
+                if isinstance(sp_model_plan, dict):
+                    # Input specification
+                    hook = SequenceParallelSplitHook(sp_model_plan, config)
+                    hook_name = _SP_INPUT_HOOK_TEMPLATE.format(module_id)
+                elif isinstance(sp_model_plan, (SequenceParallelOutput, list, tuple)):
+                    # Output specification
+                    if isinstance(sp_model_plan, SequenceParallelOutput):
+                        sp_model_plan = [sp_model_plan]
+                    elif isinstance(sp_model_plan, tuple):
+                        sp_model_plan = list(sp_model_plan)
+                    if not all(isinstance(x, SequenceParallelOutput) or x is None for x in sp_model_plan):
+                        raise ValueError(f"Expected SequenceParallelOutput elements, got {sp_model_plan}")
+                    hook = SequenceParallelGatherHook(sp_model_plan, config)
+                    hook_name = _SP_OUTPUT_HOOK_TEMPLATE.format(module_id)
+                else:
+                    raise ValueError(f"Unsupported plan type: {type(sp_model_plan).__name__}")
 
-            registry = HookRegistry.get_or_create(m)
-            registry.register_hook(hook_name, hook)
+                registry = getattr(m, "_hook_registry", None)
+                had_registry = registry is not None
+                had_original_forward = hasattr(m, "_omni_original_forward")
+                previous_forward = m.forward
+                previous_hook = registry._hooks.get(hook_name) if registry is not None else None
+                previous_forward_hook = registry._new_fwd_impl_hook if registry is not None else None
+                registration = {
+                    "module": m,
+                    "registry": registry,
+                    "hook_name": hook_name,
+                    "previous_hook": previous_hook,
+                    "previous_forward_hook": previous_forward_hook,
+                    "had_registry": had_registry,
+                    "had_original_forward": had_original_forward,
+                    "previous_forward": previous_forward,
+                }
+                registered_hooks.append(registration)
+                registry = HookRegistry.get_or_create(m)
+                registration["registry"] = registry
+                registry.register_hook(hook_name, hook)
+    except Exception:
+        for registration in reversed(registered_hooks):
+            try:
+                module = registration["module"]
+                registry = registration["registry"] or getattr(module, "_hook_registry", None)
+                hook_name = registration["hook_name"]
+                if registry is not None:
+                    if hook_name in registry._hooks:
+                        registry.remove_hook(hook_name)
+                    if registration["previous_hook"] is not None:
+                        registry._hooks[hook_name] = registration["previous_hook"]
+                    registry._new_fwd_impl_hook = registration["previous_forward_hook"]
+                    registry.update_sorted_hooks()
+                if not registration["had_registry"]:
+                    if getattr(module, "_hook_registry", None) is registry:
+                        delattr(module, "_hook_registry")
+                    if not registration["had_original_forward"] and hasattr(module, "_omni_original_forward"):
+                        delattr(module, "_omni_original_forward")
+                    module.forward = registration["previous_forward"]
+            except Exception:
+                logger.exception("Failed to roll back SP hook '%s'", hook_name)
+        raise
 
 
 def remove_sequence_parallel(
