@@ -218,6 +218,27 @@ For additional features and advanced configurations, refer to the:
 vLLM-Omni uses `pytest` to test the codebase.
 Please refer to the [test instructions](./ci/test_execution_guide.md) for detailed testing information.
 
+The `Python CPU Smoke Tests` GitHub Actions workflow runs on Python 3.11,
+3.12, and 3.13, matching the supported interpreter range in `pyproject.toml`.
+It compiles the package sources and runs the existing CLI documentation parser
+and duplex window-planner unit tests without installing vLLM or model weights.
+These tests load leaf modules directly; they do not validate full package
+startup, accelerator dependencies, or model inference.
+
+To reproduce the smoke tests from the repository root in a clean environment:
+
+```bash
+python -m pip install pytest==9.1.1 pytest-asyncio==1.4.0 pydantic-core
+python -m compileall -q vllm_omni
+python -m pytest --noconftest -o addopts= --strict-markers --strict-config -q \
+  tests/docs/test_generate_argparse.py \
+  tests/model_executor/models/minicpmo_4_5/duplex/test_window_plan.py
+```
+
+`--noconftest` is specific to this dependency-light selection: it avoids loading
+the shared accelerator fixtures. Use the regular test instructions for other
+test selections.
+
 !!! warning
     Currently, not all unit tests pass when run on CPU platforms. If you don't have access to a GPU platform to run unit tests locally, rely on the continuous integration system to run the tests for now.
 
