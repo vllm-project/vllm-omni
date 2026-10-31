@@ -210,9 +210,14 @@ def test_successful_retry_counts_valid_zero_and_refreshes_trace(sample_paths, ju
 @pytest.mark.parametrize(
     ("replies", "missing_field"),
     [
-        ([{"temporal_score": 2}], "is_relevant"),
-        ([{"is_relevant": 1}], "temporal_score"),
-        ([{"temporal_score": 2, "is_relevant": 1}, {"success_score": 1}], "content_score"),
+        # Invalid replies now get one format-correction retry, so each failure
+        # scenario needs a second invalid reply before the sample can fail.
+        ([{"temporal_score": 2}, {"temporal_score": 2}], "is_relevant"),
+        ([{"is_relevant": 1}, {"is_relevant": 1}], "temporal_score"),
+        (
+            [{"temporal_score": 2, "is_relevant": 1}, {"success_score": 1}, {"success_score": 1}],
+            "content_score",
+        ),
         ([{"temporal_score": 0, "is_relevant": 0}, {"content_score": 0}], None),
     ],
 )
