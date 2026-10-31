@@ -36,6 +36,8 @@ def parse_args():
     parser.add_argument("--input-json", default=None, help="Official LongCat Avatar JSON case for AI2V.")
     parser.add_argument("--output", default="longcat_avatar_output.mp4")
     parser.add_argument("--resolution", choices=["480p", "720p"], default="480p")
+    parser.add_argument("--height", type=int, default=None)
+    parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--num-frames", type=int, default=93)
     parser.add_argument("--num-segments", default="1", help="Number of AVC segments, or 'auto' to cover full audio.")
     parser.add_argument("--num-cond-frames", type=int, default=13)
@@ -46,6 +48,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-distill", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--use-int8", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--enable-bsa",
+        action="store_true",
+        default=False,
+        help="Enable LongCat Avatar block-sparse self-attention where tensor shapes are compatible.",
+    )
     parser.add_argument(
         "--build-components-on-gpu",
         action="store_true",
@@ -224,6 +232,7 @@ def main():
         "resolution": args.resolution,
         "use_distill": args.use_distill,
         "use_int8": args.use_int8,
+        "enable_bsa": args.enable_bsa,
         "build_components_on_gpu": args.build_components_on_gpu,
     }
     if args.base_model_dir:
@@ -270,6 +279,8 @@ def main():
             OmniDiffusionSamplingParams(
                 generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed),
                 seed=args.seed,
+                height=args.height,
+                width=args.width,
                 guidance_scale=1.0 if args.use_distill else 4.0,
                 guidance_scale_2=1.0 if args.use_distill else 4.0,
                 num_inference_steps=args.num_inference_steps,
