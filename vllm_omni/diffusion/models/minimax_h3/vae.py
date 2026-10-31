@@ -19,6 +19,7 @@ import torch.nn as nn
 from PIL import Image
 from safetensors import safe_open
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -56,6 +57,29 @@ logger = init_logger(__name__)
 # FP8 GEMM requires a fused bias to match the output dtype, so construct the
 # replacement linears (and therefore their biases) in that compute dtype.
 _VIDEO_VAE_DECODE_DTYPE = torch.float16
+
+
+@contextmanager
+def _fused_fp8_activation_quant() -> Iterator[None]:
+    """Build VAE FP8 linears with vLLM's fused activation-quant kernel.
+
+    The diffusion VllmConfig resolves to Inductor mode, where ``custom_ops``
+    defaults to ``none`` and QuantFP8 falls back to a torch.compile-wrapped
+    native implementation. VAE decode runs eagerly, so every per-token quant
+    pays Dynamo dispatch on the CPU and leaves the GPU idle. CustomOps pick
+    their forward at construction, so enabling the kernel only while the VAE
+    linears are built leaves every other module's dispatch unchanged.
+    """
+    vllm_config = get_current_vllm_config_or_none()
+    custom_ops = None if vllm_config is None else vllm_config.compilation_config.custom_ops
+    if custom_ops is None or "+quant_fp8" in custom_ops or "-quant_fp8" in custom_ops:
+        yield
+        return
+    vllm_config.compilation_config.custom_ops = [*custom_ops, "+quant_fp8"]
+    try:
+        yield
+    finally:
+        vllm_config.compilation_config.custom_ops = custom_ops
 
 
 def _validate_video_vae_quant_config(
@@ -147,23 +171,24 @@ def _quantize_video_vae_transformer_linears(
     linear_paths = _discover_video_vae_transformer_linear_paths(blocks)
 
     replaced = 0
-    for block_index, block in enumerate(blocks):
-        for relative_path in linear_paths:
-            linear = block.get_submodule(relative_path)
-            prefix = f"video_vae.model.decoder.transformer_blocks.{block_index}.{relative_path}"
-            if is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=quant_config.ignored_layers,
-                fused_mapping=quant_config.packed_modules_mapping,
-                match_mode=getattr(quant_config, "ignored_layers_match_mode", "exact"),
-            ):
-                continue
+    with _fused_fp8_activation_quant():
+        for block_index, block in enumerate(blocks):
+            for relative_path in linear_paths:
+                linear = block.get_submodule(relative_path)
+                prefix = f"video_vae.model.decoder.transformer_blocks.{block_index}.{relative_path}"
+                if is_layer_skipped(
+                    prefix=prefix,
+                    ignored_layers=quant_config.ignored_layers,
+                    fused_mapping=quant_config.packed_modules_mapping,
+                    match_mode=getattr(quant_config, "ignored_layers_match_mode", "exact"),
+                ):
+                    continue
 
-            block.set_submodule(
-                relative_path,
-                _make_online_fp8_linear(linear, quant_config, prefix),
-            )
-            replaced += 1
+                block.set_submodule(
+                    relative_path,
+                    _make_online_fp8_linear(linear, quant_config, prefix),
+                )
+                replaced += 1
 
     logger.info(
         "MiniMax H3 video VAE online FP8 enabled for %d decoder TransformerBlock linears at paths %s.",

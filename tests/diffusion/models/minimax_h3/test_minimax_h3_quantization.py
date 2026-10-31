@@ -139,6 +139,26 @@ def test_video_vae_keeps_ignored_linears_unquantized(monkeypatch):
     assert ignored_prefix not in replaced_prefixes
 
 
+@pytest.mark.parametrize(
+    ("custom_ops", "quant_enabled"),
+    [(["none"], True), (["none", "-quant_fp8"], False)],
+)
+def test_video_vae_fp8_linears_scope_fused_activation_quant(custom_ops, quant_enabled):
+    from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+
+    from vllm_omni.diffusion.models.minimax_h3.vae import _fused_fp8_activation_quant
+
+    vllm_config = VllmConfig(compilation_config=CompilationConfig(custom_ops=custom_ops))
+    with set_current_vllm_config(vllm_config):
+        original_custom_ops = list(vllm_config.compilation_config.custom_ops)
+        assert not QuantFP8.enabled()
+        with _fused_fp8_activation_quant():
+            assert QuantFP8.enabled() is quant_enabled
+        assert not QuantFP8.enabled()
+        assert vllm_config.compilation_config.custom_ops == original_custom_ops
+
+
 def test_fp8_scope_and_prefix_propagation(monkeypatch):
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
