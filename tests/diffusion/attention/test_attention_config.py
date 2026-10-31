@@ -1038,6 +1038,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             attention=Mock(),
             _has_custom_attention=False,
             _explicit_cross_contract=False,
+            is_paged_kv_active=lambda: False,
         )
         fake_attention.sdpa_fallback.forward.return_value = sentinel
         fake_attention.attention.forward.side_effect = AssertionError("selected backend must not run")
@@ -1045,7 +1046,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         metadata = AttentionMetadata(attn_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool))
 
         if backend_explicit:
-            with pytest.raises(NotImplementedError, match="dense .* attention mask"):
+            with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
                 Attention._run_local_attention(fake_attention, query, query, query, metadata)
             fake_attention.sdpa_fallback.forward.assert_not_called()
         else:
