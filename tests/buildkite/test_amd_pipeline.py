@@ -3347,6 +3347,28 @@ def test_drama3_ready_adds_one_nonblocking_text_to_audio_node() -> None:
     assert source.count('"rocm": "MI325"') == 1
 
 
+def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
+    """MERGE gates the one ROCm text-to-audio case. READY keeps its own job."""
+    ready = _find_step("Drama 3 E2E Test", AMD_READY_PIPELINE)
+    step = _find_step("MERGE · Drama 3 Text-to-Audio", AMD_MERGE_PIPELINE)
+    command = "\n".join(step["commands"])
+
+    assert ready["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == ["artifacts/rocm-drama3-merge/**/*"]
+    assert "timeout 30m" in command
+    assert _marker_expressions(step) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
+    assert command.count('--run-level "core_model"') == 2
+    assert command.count(_DRAMA3_READY_NODE) == 1
+    assert "diff -u /tmp/drama3-merge-expected.txt" in command
+    assert "Expected exactly one executed Drama 3 MERGE test" in command
+    for name in _DRAMA3_EXCLUDED:
+        assert name not in command
+
+
 _DEVICE_REDUCTION_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
 _DEVICE_REDUCTION_READY_NODES = (
     "tests/diffusion/test_device_reduction.py::test_device_reduction_matches_a_float32_reference[dtype0]",
