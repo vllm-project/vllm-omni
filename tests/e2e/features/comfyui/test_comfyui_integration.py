@@ -701,7 +701,9 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
         except Exception:
             traceback.print_exc()
 
-    server_process = multiprocessing.Process(target=run_server)
+    # The server target is a local closure that depends on parent-side
+    # pytest-mock patches, so this subprocess requires fork semantics.
+    server_process = multiprocessing.get_context("fork").Process(target=run_server)
     server_process.start()
 
     # Wait for the server to be ready by polling the health endpoint.

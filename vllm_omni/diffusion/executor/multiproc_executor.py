@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.logger import init_logger
+from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 
@@ -67,6 +68,23 @@ def _dropped_output_error(async_output_id: str) -> RuntimeError:
         f"async output {async_output_id} was dropped: the request was aborted "
         "before its output was claimed; retry with a new request."
     )
+
+
+def _terminate_startup_processes(processes: list[mp.Process]) -> None:
+    for process in processes:
+        if process.is_alive():
+            try:
+                process.terminate()
+            except OSError:
+                pass
+    for process in processes:
+        process.join(_WORKER_TERMINATE_GRACE_S)
+        if process.is_alive():
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.join(_WORKER_KILL_GRACE_S)
 
 
 def _is_empty_dp_prompt(prompt: object) -> bool:
@@ -184,7 +202,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._rpc_wave_id: int = 0
 
         num_workers = cast(int, self.od_config.num_gpus)
-        self.wake_events = [mp.Event() for _ in range(num_workers)]
+        ctx = get_mp_context()
+        self.wake_events = [ctx.Event() for _ in range(num_workers)]
 
         self._broadcast_mq = self._init_broadcast_queue(num_workers)
         broadcast_handle = self._broadcast_mq.export_handle()
@@ -383,7 +402,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # N-GPU run oversubscribes the host by N x core_count. Honours a
         # user-provided OMP_NUM_THREADS.
         set_multiprocessing_worker_envs()
-        mp.set_start_method("spawn", force=True)
+        ctx = get_mp_context()
         processes = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
@@ -392,54 +411,57 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         # Launch all worker processes
         scheduler_pipe_readers = []
-        scheduler_pipe_writers = []
 
-        for i in range(num_gpus):
-            reader, writer = mp.Pipe(duplex=False)
-            scheduler_pipe_writers.append(writer)
-            process = mp.Process(
-                target=WorkerProc.worker_main,
-                args=(
-                    i,  # rank
-                    od_config,
-                    writer,
-                    broadcast_handle,
-                    wake_events[i],
-                    worker_extension_cls,
-                    custom_pipeline_args,
-                ),
-                name=f"DiffusionWorker-{i}",
-                daemon=True,
-            )
-            scheduler_pipe_readers.append(reader)
-            process.start()
-            processes.append(process)
+        try:
+            for i in range(num_gpus):
+                reader, writer = ctx.Pipe(duplex=False)
+                process = ctx.Process(
+                    target=WorkerProc.worker_main,
+                    args=(
+                        i,  # rank
+                        od_config,
+                        writer,
+                        broadcast_handle,
+                        wake_events[i],
+                        worker_extension_cls,
+                        custom_pipeline_args,
+                    ),
+                    name=f"DiffusionWorker-{i}",
+                    daemon=True,
+                )
+                scheduler_pipe_readers.append(reader)
+                try:
+                    process.start()
+                finally:
+                    writer.close()
+                processes.append(process)
 
-        # Wait for all workers to be ready
-        result_handles: list[Handle] = []
-        for writer in scheduler_pipe_writers:
-            writer.close()
+            # Wait for all workers to be ready
+            result_handles: list[Handle] = []
+            for i, reader in enumerate(scheduler_pipe_readers):
+                try:
+                    data = reader.recv()
+                except EOFError:
+                    logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
+                    processes[i].join()
+                    logger.error(f"Exit code: {processes[i].exitcode}")
+                    raise
 
-        for i, reader in enumerate(scheduler_pipe_readers):
-            try:
-                data = reader.recv()
-            except EOFError:
-                logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
-                processes[i].join()
-                logger.error(f"Exit code: {processes[i].exitcode}")
-                raise
+                if data["status"] != "ready":
+                    raise RuntimeError("Initialization failed. Please see the error messages above.")
 
-            if data["status"] != "ready":
-                raise RuntimeError("Initialization failed. Please see the error messages above.")
+                result_handle = data.get("result_handle")
+                if result_handle is None:
+                    raise RuntimeError(f"Rank {i} did not provide a result queue handle")
+                result_handles.append(result_handle)
 
-            result_handle = data.get("result_handle")
-            if result_handle is None:
-                raise RuntimeError(f"Rank {i} did not provide a result queue handle")
-            result_handles.append(result_handle)
-
-            reader.close()
-
-        logger.debug("All workers are ready")
+            logger.debug("All workers are ready")
+        except BaseException:
+            _terminate_startup_processes(processes)
+            raise
+        finally:
+            for reader in scheduler_pipe_readers:
+                reader.close()
 
         return processes, result_handles
 
