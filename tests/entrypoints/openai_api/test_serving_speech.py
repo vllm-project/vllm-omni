@@ -5733,6 +5733,35 @@ class TestCosyVoice3Serving:
         assert tts_params == {}
         cosyvoice3_server._adapter._build_prompt.assert_awaited_once()
 
+    def test_prepare_speech_generation_cosyvoice3_forwards_initial_codec_chunk_frames(
+        self,
+        cosyvoice3_server,
+        mocker: MockerFixture,
+    ):
+        prompt = {
+            "prompt": "Hello",
+            "multi_modal_data": {"audio": (np.zeros(24000), 24000)},
+            "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
+        }
+        cosyvoice3_server._adapter._build_prompt = mocker.AsyncMock(return_value=prompt)
+        cosyvoice3_server.model_config.hf_config = SimpleNamespace(
+            min_token_text_ratio=1, max_token_text_ratio=200, allowed_special=True
+        )
+        cosyvoice3_server._adapter._tokenizer = mocker.MagicMock()
+        mocker.patch("vllm_omni.model_executor.models.cosyvoice3.utils.extract_text_token", return_value=[None, 10])
+
+        request = OpenAICreateSpeechRequest(
+            input="Hello",
+            ref_audio="data:audio/wav;base64,abc",
+            ref_text="Reference text",
+            initial_codec_chunk_frames=5,
+        )
+        _request_id, _generator, tts_params = asyncio.run(cosyvoice3_server._prepare_speech_generation(request))
+        sent_prompt = cosyvoice3_server.engine_client.generate.call_args.kwargs["prompt"]
+
+        assert tts_params == {"initial_codec_chunk_frames": [5]}
+        assert sent_prompt["additional_information"]["initial_codec_chunk_frames"] == [5]
+
 
 # ---- GLM-TTS Serving Tests ----
 
