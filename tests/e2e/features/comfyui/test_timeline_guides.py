@@ -47,6 +47,7 @@ SCHEMA_COMPLETE_WORKFLOWS = {
     GUIDE_WORKFLOW,
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 All-in-One.json",
     PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Music Video.json",
+    PLUGIN_DIR / "example_workflows" / "vLLM-Omni MiniMax-H3 Multiframe Reference.json",
 }
 H3 = "MiniMaxAI/MiniMax-H3"
 WIDTH, HEIGHT = 64, 32
