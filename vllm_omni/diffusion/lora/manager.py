@@ -28,7 +28,9 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVPar
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
+    detach_moe_lora_context,
     from_layer_diffusion,
+    moe_lora_kernel_requires_context,
 )
 from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -1153,13 +1155,31 @@ class DiffusionLoRAManager:
 
         Republish after buffer reallocation so kernels reference the current tensors.
         Refresh the punica token mapping so baseline (no adapter) and adapted
-        forwards select the matching TRTLLM path.
+        forwards select the matching TRTLLM path, or detach the context entirely
+        while idle on runners that treat its presence as the LoRA switch.
         """
         from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
 
         moe_wrappers = [ll for ll in self._lora_modules.values() if isinstance(ll, FusedMoEWithLoRA)]
         if not moe_wrappers:
             return
+        if self._active_adapter_id is None:
+            # Decide per wrapper, since one process can mix kernels. Kernels
+            # that branch on "a context is published" rather than on the punica
+            # no-adapter flag (Triton, Ascend) must have it detached while
+            # idle, or every baseline step pays the LoRA path for a zero delta.
+            # Only TRT-LLM requires the slot-0 mapping, and takes its own fast
+            # path from it. Anything we cannot detach keeps the mapping too.
+            needs_context = []
+            for lora_layer in moe_wrappers:
+                if moe_lora_kernel_requires_context(lora_layer) or not detach_moe_lora_context(lora_layer):
+                    needs_context.append(lora_layer)
+            detached = len(moe_wrappers) - len(needs_context)
+            if detached:
+                logger.debug("Detached idle MoE LoRA context on %d wrapper(s)", detached)
+            if not needs_context:
+                return
+            moe_wrappers = needs_context
         punica = self._get_moe_punica_wrapper()
         mapping, lora_index_to_id = self._moe_token_lora_mapping()
         punica.update_metadata(mapping, lora_index_to_id, 1, 0)
