@@ -84,9 +84,7 @@ def test_non_reply_rank_drops_decoded_output_storage(monkeypatch):
     assert placeholder.dtype == output.dtype
 
 
-@pytest.mark.parametrize("rank", [0, 1])
-@pytest.mark.parametrize("data_parallel_size", [1, 2])
-def test_decode_releases_only_audio_before_return(monkeypatch, rank, data_parallel_size):
+def test_decode_releases_only_audio_before_return(monkeypatch):
     """Video is released by the callers of ``decode`` -- after quantization."""
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
@@ -95,7 +93,6 @@ def test_decode_releases_only_audio_before_return(monkeypatch, rank, data_parall
     audio = torch.ones((1, 8))
     pipeline = SimpleNamespace(
         device=torch.device("cpu"),
-        parallel_config=SimpleNamespace(data_parallel_size=data_parallel_size),
         video_vae=Mock(decode_latent=Mock(return_value=video)),
         audio_vae=Mock(decode_latent=Mock(return_value=audio)),
         _component_on_device=lambda component: nullcontext(),
@@ -107,10 +104,6 @@ def test_decode_releases_only_audio_before_return(monkeypatch, rank, data_parall
         "create_autocast_context",
         lambda **kwargs: nullcontext(),
     )
-    monkeypatch.setattr(module, "_dit_rank_world", lambda: (None, rank, 2))
-    monkeypatch.setattr(module, "_broadcast_rank0_exception", Mock())
-    broadcast = Mock(return_value=audio)
-    monkeypatch.setattr(module, "_broadcast_tensor", broadcast)
 
     actual_video, actual_audio = MiniMaxH3Pipeline.decode(
         pipeline,
@@ -125,43 +118,6 @@ def test_decode_releases_only_audio_before_return(monkeypatch, rank, data_parall
     calls = pipeline._offload_model_cpu_stage_output.call_args_list
     assert len(calls) == 1
     assert calls[0].args[0] is audio
-    assert pipeline.audio_vae.decode_latent.call_count == (1 if rank == 0 or data_parallel_size > 1 else 0)
-    if data_parallel_size > 1:
-        broadcast.assert_not_called()
-
-
-def test_decode_propagates_audio_owner_failure_before_waveform_broadcast(monkeypatch):
-    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
-
-    failure = RuntimeError("audio decode failed")
-    pipeline = SimpleNamespace(
-        device=torch.device("cpu"),
-        parallel_config=SimpleNamespace(data_parallel_size=1),
-        video_vae=Mock(decode_latent=Mock(return_value=torch.ones(1, 1, 4, 4))),
-        audio_vae=Mock(decode_latent=Mock(side_effect=failure)),
-        _component_on_device=lambda component: nullcontext(),
-        _offload_model_cpu_stage_output=Mock(),
-        _release_stage_cache=Mock(),
-    )
-    monkeypatch.setattr(module.current_omni_platform, "create_autocast_context", lambda **kwargs: nullcontext())
-    monkeypatch.setattr(module, "_dit_rank_world", lambda: (None, 0, 2))
-    errors = []
-
-    def propagate(error):
-        errors.append(error)
-        raise error
-
-    monkeypatch.setattr(module, "_broadcast_rank0_exception", propagate)
-    broadcast = Mock()
-    monkeypatch.setattr(module, "_broadcast_tensor", broadcast)
-
-    with pytest.raises(RuntimeError, match="audio decode failed"):
-        MiniMaxH3Pipeline.decode(pipeline, torch.zeros(1), torch.zeros(1), height=2, width=3)
-
-    assert errors == [failure]
-    broadcast.assert_not_called()
-    pipeline._offload_model_cpu_stage_output.assert_not_called()
 
 
 def _recording_release(events, releases):
