@@ -35,10 +35,6 @@ connectors:
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
       enable_hift_graph: true
-      # Capture batch-1 continuation/tail shapes without padding: with the
-      # 8-frame mel cache these codec widths cover 16-64 mel frames.
-      hift_graph_continuation_frames: [4, 28]
-      hift_graph_exact_batch_sizes: [1]
       enable_cfm_graph: true
       # Fused CFM DiT body: CUDA via TF32, NPU via packed QKV + ACLNN
       # AddLayerNorm + im2col-GEMM convolutions and a single cache transpose.

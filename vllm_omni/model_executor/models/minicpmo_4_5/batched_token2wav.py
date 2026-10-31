@@ -649,6 +649,31 @@ class BatchedToken2Wav(nn.Module):
             return self.hift.inference(mel, source_cache)
         return self.hift_graph_wrapper.replay(mel, source_cache)
 
+    @staticmethod
+    def _hift_cache_batch(states: list[BatchedToken2WavState], name: str) -> torch.Tensor:
+        if len(states) == 1:
+            return states[0].hift_cache[name]
+        return torch.cat([state.hift_cache[name] for state in states], dim=0)
+
+    def _hift_from_parts(
+        self, old_mel: torch.Tensor, chunk_mel: torch.Tensor, source_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        outputs = None
+        if self.hift_graph_wrapper is not None:
+            outputs = self.hift_graph_wrapper.replay_from_parts(old_mel, chunk_mel, source_cache)
+        if outputs is None:
+            mel = torch.cat((old_mel, chunk_mel), dim=2)
+            speech, source = self._hift_inference(mel, source_cache)
+            return speech, source, mel[..., -self.mel_cache_len :].detach()
+        speech, source = outputs
+        total_frames = int(old_mel.shape[2] + chunk_mel.shape[2])
+        keep = min(self.mel_cache_len, total_frames) if self.mel_cache_len else total_frames
+        if keep <= chunk_mel.shape[2]:
+            next_mel = chunk_mel[..., chunk_mel.shape[2] - keep :]
+        else:
+            next_mel = torch.cat((old_mel[..., -(keep - chunk_mel.shape[2]) :], chunk_mel), dim=2)
+        return speech, source, next_mel.detach()
+
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
         cached = self._prompt_features.get(cache_key)
@@ -987,14 +1012,16 @@ class BatchedToken2Wav(nn.Module):
         depth = len(blocks)
         batch_size = int(x.shape[0])
         chunk_size = int(x.shape[2])
-        old_att_len = int(old_att.shape[3]) if old_att is not None else 0
+        old_att_len = int(old_att.shape[4]) if old_att is not None else 0
         block0 = blocks[0]
         cnn_channels = int(block0.conv.in_channels + block0.conv.out_channels)
         cnn_width = int(block0.conv.block[1].causal_padding[0])
         heads = int(block0.attn.num_heads)
-        att_width = int(block0.attn.head_dim * 2)
+        head_dim = int(block0.attn.head_dim)
         cnn = x.new_empty((depth, batch_size, cnn_channels, cnn_width))
-        att = x.new_empty((depth, batch_size, heads, old_att_len + chunk_size, att_width))
+        # ``(depth, 2, N, H, frames, D)``: the leading 2 is the K/V half so
+        # ``att[block_index]`` is a contiguous ``(2, N, H, frames, D)`` pair.
+        att = x.new_empty((depth, 2, batch_size, heads, old_att_len + chunk_size, head_dim))
         return cnn, att
 
     def _time_embedding(self, estimator: nn.Module, time: torch.Tensor) -> torch.Tensor:
@@ -1066,7 +1093,7 @@ class BatchedToken2Wav(nn.Module):
         if self._cfm_graph_wrapper is not None and valid_lengths is None:
             graph_cnn = torch.zeros_like(cnn_out) if cnn_cache is None else cnn_cache
             graph_att = (
-                estimator_input.new_zeros(att_out.shape[:3] + (0,) + att_out.shape[4:])
+                estimator_input.new_zeros(att_out.shape[:4] + (0,) + att_out.shape[5:])
                 if att_cache is None
                 else old_att
             )
@@ -1207,35 +1234,41 @@ class BatchedToken2Wav(nn.Module):
             or attn.training
             or (
                 x.device.type == "npu"
-                and (att_cache is None or att_cache.shape[2] < _NPU_IN_PLACE_ATTENTION_MIN_CACHE_FRAMES)
+                and (att_cache is None or att_cache.shape[-2] < _NPU_IN_PLACE_ATTENTION_MIN_CACHE_FRAMES)
             )
         ):
             # A reduced-precision cache attends in the activation dtype.
             x_att, new_att = attn.forward_chunk(x, att_cache, attn_mask)
-            kv[:, :, : int(new_att.shape[2])].copy_(new_att)
+            span = int(new_att.shape[2])
+            split = int(new_att.shape[-1]) // 2
+            kv[0][:, :, :span].copy_(new_att[..., :split])
+            kv[1][:, :, :span].copy_(new_att[..., split:])
             return x_att
         batch, frames, _ = x.shape
         q = attn.q_norm(attn.to_heads(attn.to_q(x)))
         k = attn.k_norm(attn.to_heads(attn.to_k(x)))
         v = attn.to_heads(attn.to_v(x))
-        cached = 0 if att_cache is None else int(att_cache.shape[2])
-        kv = kv[:, :, : frames + cached]
-        behind = kv[:, :, frames:]
-        if cached and (att_cache.data_ptr() != behind.data_ptr() or att_cache.stride() != behind.stride()):
-            behind.copy_(att_cache)
-        head_dim = int(k.shape[3])
-        kv[..., :frames, :head_dim].copy_(k)
-        kv[..., :frames, head_dim:].copy_(v)
+        keys, values = kv[0], kv[1]
+        cached = 0 if att_cache is None else int(att_cache.shape[-2])
+        behind_keys, behind_values = keys[:, :, frames:], values[:, :, frames:]
+        if cached and (
+            att_cache[0].data_ptr() != behind_keys.data_ptr() or att_cache[0].stride() != behind_keys.stride()
+        ):
+            behind_keys[:, :, :cached].copy_(att_cache[0])
+            behind_values[:, :, :cached].copy_(att_cache[1])
+        span = frames + cached
+        keys[:, :, :frames].copy_(k)
+        values[:, :, :frames].copy_(v)
         if x.device.type == "npu":
             from vllm_omni.platforms.npu.models.cosyvoice2_dit_attn import _expand_attn_mask_for_npu
 
-            mask = _expand_attn_mask_for_npu(attn_mask, frames, frames + cached)
+            mask = _expand_attn_mask_for_npu(attn_mask, frames, span)
         else:
             mask = None if attn_mask is None else attn_mask.unsqueeze(1)
         out = F.scaled_dot_product_attention(
             q,
-            kv[..., :head_dim],
-            kv[..., head_dim:],
+            keys[:, :, :span],
+            values[:, :, :span],
             attn_mask=mask,
         )
         return attn.proj(out.transpose(1, 2).reshape(batch, frames, -1))
@@ -1379,14 +1412,14 @@ class BatchedToken2Wav(nn.Module):
         batch_size = int(mu.shape[0])
         att_rows = att_cache if isinstance(att_cache, list) else None
         if att_rows is not None:
-            offset = int(att_rows[0].shape[4])
+            offset = int(att_rows[0].shape[5])
         else:
-            offset = int(att_cache.shape[4]) if att_cache is not None else 0
+            offset = int(att_cache.shape[5]) if att_cache is not None else 0
         # ``row_offset_merge``: ragged rows whose caches differ in length each
         # start from the noise at their own offset and attend their own cache.
         row_offsets = None
         if att_rows is not None and valid_lengths is not None:
-            lengths = [int(row.shape[4]) for row in att_rows]
+            lengths = [int(row.shape[5]) for row in att_rows]
             if len(set(lengths)) > 1 or self._row_offset_merge:
                 row_offsets = lengths
                 if len(set(row_offsets)) == 1 and not self._row_offset_merge:
@@ -1512,7 +1545,7 @@ class BatchedToken2Wav(nn.Module):
             # The graph can decline a shape. Retain the batch in the eager
             # fallback: old_keys above masks the right-padded history per row.
             offset = max(row_offsets)
-            att_rows = [F.pad(row, (0, 0, 0, offset - int(row.shape[4]))) for row in _materialize_att_rows(att_rows)]
+            att_rows = [F.pad(row, (0, 0, 0, offset - int(row.shape[5]))) for row in _materialize_att_rows(att_rows)]
         if att_rows is not None:
             att_cache = self._stack_estimator_att(att_rows)
 
@@ -1553,9 +1586,10 @@ class BatchedToken2Wav(nn.Module):
                                     self.n_timesteps,
                                     int(step_att.shape[0]),
                                     2,
-                                    int(step_att.shape[2]),
-                                    valid_length + (offset if row_offsets is None else row_offsets[row]),
+                                    2,
                                     int(step_att.shape[4]),
+                                    valid_length + (offset if row_offsets is None else row_offsets[row]),
+                                    int(step_att.shape[5]),
                                 ),
                                 device=step_att.device,
                                 dtype=self._estimator_att_cache_dtype,
@@ -1565,13 +1599,13 @@ class BatchedToken2Wav(nn.Module):
                     current_width = int(mu.shape[2])
                     for row, (valid_length, row_cache) in enumerate(zip(valid_lengths, ragged_att_cache, strict=True)):
                         for cfg_row, source_row in enumerate((row, batch_size + row)):
-                            row_cache[step, :, cfg_row, :, :valid_length].copy_(
-                                step_att[:, source_row, :, :valid_length]
+                            row_cache[step, :, :, cfg_row, :, :valid_length].copy_(
+                                step_att[:, :, source_row, :, :valid_length]
                             )
                             row_offset = offset if row_offsets is None else row_offsets[row]
                             if row_offset:
-                                row_cache[step, :, cfg_row, :, valid_length:].copy_(
-                                    step_att[:, source_row, :, current_width : current_width + row_offset]
+                                row_cache[step, :, :, cfg_row, :, valid_length:].copy_(
+                                    step_att[:, :, source_row, :, current_width : current_width + row_offset]
                                 )
                     del step_att
                     continue
@@ -1641,11 +1675,11 @@ class BatchedToken2Wav(nn.Module):
         estimator_att = cache["estimator_att_cache"]
         stacked_att = isinstance(estimator_att, torch.Tensor)
         if stacked_att:
-            keep_ranges = _att_keep_ranges(int(estimator_att.shape[4]), estimator_att_keep)
+            keep_ranges = _att_keep_ranges(int(estimator_att.shape[5]), estimator_att_keep)
             request_shape = list(estimator_att.shape)
-            request_shape[2] = 2
-            request_shape[4] = sum(length for _, length in keep_ranges)
-            att_rows = estimator_att.unflatten(2, (2, batch_size))
+            request_shape[3] = 2
+            request_shape[5] = sum(length for _, length in keep_ranges)
+            att_rows = estimator_att.unflatten(3, (2, batch_size))
         dev = estimator_att.device if stacked_att else cache["conformer_cnn_cache"].device
         order_2n = self._split_order_2n.get(batch_size)
         if order_2n is None or order_2n.device != dev:
@@ -1666,7 +1700,7 @@ class BatchedToken2Wav(nn.Module):
                     device=estimator_att.device,
                     dtype=self._estimator_att_cache_dtype,
                 )
-                _copy_frame_segments(request_att, att_rows[:, :, :, row], keep_ranges)
+                _copy_frame_segments(request_att, att_rows[:, :, :, :, row], keep_ranges)
             else:
                 request_att = estimator_att[row]
             result.append(
@@ -1683,7 +1717,7 @@ class BatchedToken2Wav(nn.Module):
     def _stack_estimator_att(rows: list[torch.Tensor]) -> torch.Tensor:
         """Stack per-request ``(n_t, depth, 2, ...)`` caches into CFG order ``[cond x B | uncond x B]``."""
         rows = _materialize_att_rows(rows)
-        return torch.cat((*[row[:, :, 0:1] for row in rows], *[row[:, :, 1:2] for row in rows]), dim=2)
+        return torch.cat((*[row[:, :, :, 0:1] for row in rows], *[row[:, :, :, 1:2] for row in rows]), dim=3)
 
     def _stack_flow_cache(
         self,
@@ -1905,17 +1939,23 @@ class BatchedToken2Wav(nn.Module):
         previous: torch.Tensor,
         window: torch.Tensor,
     ) -> torch.Tensor:
+        """Blend the overlap into ``speech`` in place and return its storage.
+
+        The write is in place, so every producer of ``speech`` must hand over
+        owned storage -- never a graph's static output buffer. The graph
+        replay path satisfies this via ``replay_from_parts`` returning fresh
+        tensors; a new HiFT backend must do the same or copy first.
+        """
         overlap = min(
             int(window.shape[0] // 2),
             int(speech.shape[-1]),
             int(previous.shape[-1]),
         )
-        result = speech.clone()
         if overlap > 0:
-            result[..., :overlap] = (
-                result[..., :overlap] * window[:overlap] + previous[..., -overlap:] * window[-overlap:]
+            speech[..., :overlap] = (
+                speech[..., :overlap] * window[:overlap] + previous[..., -overlap:] * window[-overlap:]
             )
-        return result
+        return speech
 
     def decode_batch(
         self,
@@ -2065,20 +2105,21 @@ class BatchedToken2Wav(nn.Module):
         for cache, row_prompt_len in zip(new_flow, prompt_lengths, strict=True):
             for name in ("conformer_att_cache", "estimator_att_cache"):
                 cache[name] = _trim_streaming_cache(cache[name], row_prompt_len)
-        old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
-        old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
-        old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
-        mel = torch.cat((old_mel, chunk_mel), dim=2)
+        old_mel = self._hift_cache_batch(states, "mel")
+        old_source = self._hift_cache_batch(states, "source")
+        old_speech = self._hift_cache_batch(states, "speech")
         self._watchdog.phase(
             "decode/hift",
-            {"batch_size": batch_size, "mel_frames": int(mel.shape[2])},
+            {"batch_size": batch_size, "mel_frames": int(old_mel.shape[2] + chunk_mel.shape[2])},
         )
-        speech, source = self._hift_inference(mel, old_source)
+        speech, source, next_mel = self._hift_from_parts(old_mel, chunk_mel, old_source)
         if old_speech.shape[-1] > 0:
+            # _fade_in_out writes in place: speech must be owned storage,
+            # never a graph's static output buffer (see _fade_in_out).
             window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
             speech = self._fade_in_out(speech, old_speech, window)
         next_hift = {
-            "mel": mel[..., -self.mel_cache_len :].detach(),
+            "mel": next_mel,
             "source": source[..., -self.source_cache_len :].detach(),
             "speech": speech[..., -self.source_cache_len :].detach(),
         }
@@ -2231,7 +2272,7 @@ class BatchedToken2Wav(nn.Module):
         # Row-offset merges hold caches of different lengths, which never stack: the solve takes them
         # per row, and the encoder groups above already read the conformer caches.
         per_row_att = per_request_att or (
-            len({int(state.flow_cache["estimator_att_cache"].shape[4]) for state in states}) > 1
+            len({int(state.flow_cache["estimator_att_cache"].shape[5]) for state in states}) > 1
         )
         flow_cache = self._stack_flow_cache(states, include_estimator_att=not per_row_att, include_conformer=False)
         prompt_lengths, projected_speakers = self._batch_conditioning(features, batch_size)
@@ -2300,28 +2341,35 @@ class BatchedToken2Wav(nn.Module):
             )
             vocoder_groups.setdefault(key, []).append(row)
         for (hidden_length, last_chunk, *_), rows in vocoder_groups.items():
-            old_mel = torch.cat([states[row].hift_cache["mel"] for row in rows], dim=0)
-            old_source = torch.cat([states[row].hift_cache["source"] for row in rows], dim=0)
-            old_speech = torch.cat([states[row].hift_cache["speech"] for row in rows], dim=0)
-            group_mel = torch.cat(
-                [chunk_mel[row : row + 1, :, :hidden_length] for row in rows],
-                dim=0,
-            )
-            mel = torch.cat((old_mel, group_mel), dim=2)
+            group_states = [states[row] for row in rows]
+            old_mel = self._hift_cache_batch(group_states, "mel")
+            old_source = self._hift_cache_batch(group_states, "source")
+            old_speech = self._hift_cache_batch(group_states, "speech")
+            if len(rows) == 1:
+                # A single-row group reuses the per-row view instead of
+                # materializing a one-element concatenation.
+                group_mel = chunk_mel[rows[0] : rows[0] + 1, :, :hidden_length]
+            else:
+                group_mel = torch.cat(
+                    [chunk_mel[row : row + 1, :, :hidden_length] for row in rows],
+                    dim=0,
+                )
             self._watchdog.phase(
                 "decode/hift",
                 {
                     "batch_size": len(rows),
-                    "mel_frames": int(mel.shape[2]),
+                    "mel_frames": int(old_mel.shape[2] + group_mel.shape[2]),
                     "ragged_rows": rows,
                 },
             )
-            speech, source = self._hift_inference(mel, old_source)
+            speech, source, next_mel = self._hift_from_parts(old_mel, group_mel, old_source)
             if old_speech.shape[-1] > 0:
                 window = self.speech_window.to(device=speech.device, dtype=speech.dtype)
+                # _fade_in_out writes in place: speech must be owned storage,
+                # never a graph's static output buffer (see _fade_in_out).
                 speech = self._fade_in_out(speech, old_speech, window)
             next_hift = {
-                "mel": mel[..., -self.mel_cache_len :].detach(),
+                "mel": next_mel,
                 "source": source[..., -self.source_cache_len :].detach(),
                 "speech": speech[..., -self.source_cache_len :].detach(),
             }

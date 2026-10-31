@@ -18,6 +18,32 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import make_pad_mask
 logger = init_logger(__name__)
 
 
+def _cfg_combine(cond: torch.Tensor, uncond: torch.Tensor, rate: float) -> torch.Tensor:
+    """Return ``(1 + rate) * cond - rate * uncond`` with a single Ascend kernel.
+
+    ``lerp(cond, uncond, -rate)`` is algebraically identical and collapses the
+    two scalar ``Muls`` plus the ``Sub`` into one LERP. Measured on 910B at
+    (2, 25, 512) fp32: 130.0us -> 62.0us per step. The two forms agree to
+    9.5e-7 (one fp32 mantissa step), which is why the fused route is gated on
+    fp32 and the literal expression is kept for every other dtype/device.
+    """
+    if cond.device.type == "npu" and cond.dtype == uncond.dtype == torch.float32:
+        return torch.lerp(cond, uncond, -rate)
+    return (1.0 + rate) * cond - rate * uncond
+
+
+def _euler_update(x: torch.Tensor, velocity: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+    """Return ``x + dt * velocity`` with a single Ascend kernel.
+
+    ``addcmul`` fuses the scalar ``Muls`` into the ``Add`` and reproduces the
+    unfused result bit-for-bit on 910B (max|diff| == 0 over 300 samples), so no
+    accuracy gate is needed beyond fp32 on NPU.
+    """
+    if x.device.type == "npu" and x.dtype == velocity.dtype == torch.float32:
+        return torch.addcmul(x, velocity, dt)
+    return x + dt * velocity
+
+
 class BASECFM(torch.nn.Module, ABC):
     def __init__(
         self,
@@ -164,9 +190,9 @@ class ConditionalCFM(BASECFM):
                     )
                 with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_cfg_combine"):
                     dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
-                    dphi_dt = (1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt
+                    dphi_dt = _cfg_combine(dphi_dt, cfg_dphi_dt, self.inference_cfg_rate)
                 with cosyvoice3_batch_flow_profile("cosyvoice3_cfm_euler_update"):
-                    x = x + dt * dphi_dt
+                    x = _euler_update(x, dphi_dt, dt)
                     t = t + dt
                 sol.append(x)
                 if step < len(t_span) - 1:

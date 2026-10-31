@@ -439,8 +439,17 @@ class MiniCPMO45Code2Wav(nn.Module):
             "hift_max_lazy_graphs": int(extra.get("hift_max_lazy_graphs", 8)),
             "hift_graph_codec_chunk_frames": list(extra.get("hift_graph_codec_chunk_frames") or ()),
             "hift_graph_first_chunk_frames": list(extra.get("hift_graph_first_chunk_frames") or ()),
-            "hift_graph_continuation_frames": list(extra.get("hift_graph_continuation_frames") or ()),
-            "hift_graph_exact_batch_sizes": list(extra.get("hift_graph_exact_batch_sizes") or (1,)),
+            # Graph policy defaults, shared by every platform: the
+            # continuation span 3-33 covers short tail chunks and small
+            # backlogs (with the 8-frame mel cache these map to 14-74 mel
+            # frames), and batch sizes {1, 2} close the last eager residue.
+            # Expect ~31 continuation widths x 2 batches of extra HiFT
+            # graphs -- extra capture time at warmup and extra graph
+            # memory on every platform, CUDA included.
+            "hift_graph_continuation_frames": list(extra.get("hift_graph_continuation_frames", (3, 33)) or ()),
+            # Same shape as continuation_frames: an explicit [] disables
+            # the batch-size graphs, a missing key keeps the default.
+            "hift_graph_exact_batch_sizes": list(extra.get("hift_graph_exact_batch_sizes", (1, 2)) or ()),
         }
         if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
