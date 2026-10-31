@@ -505,7 +505,7 @@ def run_videomme(ns: argparse.Namespace, vllm: str) -> Path:
     if ns.videomme_inline_local_video:
         argv.append("--videomme-inline-local-video")
     if ns.videomme_save_eval_items:
-        argv.append("--videomme-save-eval-items")
+        argv.append("--save-eval-items")
     if ns.videomme_video_dir is not None:
         argv.extend(["--videomme-video-dir", str(Path(ns.videomme_video_dir).expanduser().resolve())])
     if ns.videomme_parquet is not None:
