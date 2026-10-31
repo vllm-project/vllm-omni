@@ -92,7 +92,7 @@ def _metadata_from_legacy_payload(payload: dict[str, DiffusionPayloadValue]) -> 
 
 
 # Structured (non-media) payloads travel in ``multimodal_output`` under their own key.
-STRUCTURED_PAYLOAD_KEYS = frozenset({"actions", "trajectory", "segmentation"})
+STRUCTURED_PAYLOAD_KEYS = frozenset({"actions", "trajectory", "segmentation", "video_segmentation"})
 
 
 def _infer_primary_payload_key(payload: DiffusionPayload) -> str | None:
