@@ -46,6 +46,19 @@ steps:
           - timeout 15m pytest -s -v tests/diffusion/attention/ tests/diffusion/utils/test_chunked_transfer.py -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
 
+      - label: "Diffusion · FA4 Ring Compilation · B200 · 4-GPU"
+        timeout_in_minutes: 30
+        source_file_dependencies:
+          - tests/diffusion/attention/test_fa4_ring_compile.py
+          - vllm_omni/diffusion/attention/
+          - vllm_omni/diffusion/distributed/
+        commands:
+          - uv pip install --system -e '.[fa4]'
+          - python .buildkite/cuda/scripts/check_vllm_runtime.py
+          # Native P2P coverage skips until the CI image provides PyTorch 2.14+.
+          - timeout 20m pytest -sv tests/diffusion/attention/test_fa4_ring_compile.py -m 'core_model and cuda and B200 and (cards_1 or cards_4)' --run-level "core_model" -rs
+        mirror_hardwares: b200_4
+
       - label: "Diffusion · Offloader Test"
         commands:
           - timeout 40m pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
