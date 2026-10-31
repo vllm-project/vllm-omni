@@ -40,6 +40,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -296,6 +297,8 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             revision=od_config.revision,
         ).to(self._execution_device)
 
+        if transformer_quant_config is not None:
+            configure_quant_config(transformer_quant_config, BooguImageTransformer2DModel)
         self.transformer = BooguImageTransformer2DModel(
             od_config=od_config,
             quant_config=transformer_quant_config,
