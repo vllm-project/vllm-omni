@@ -2991,9 +2991,10 @@ class TestDistributedComponentSelection:
         with pytest.raises(RuntimeError, match="recreate the backend and reload the pipeline"):
             backend.enable(nn.Module())
 
-    def test_worker_shutdown_skips_allgather_restore(self, patched_offload_runtime, mocker):
-        # Restoring AllGather blocks rebuilds the full DiT on every rank's host,
-        # which outlived the executor's shutdown grace period (issue 8081).
+    @pytest.mark.parametrize("dit_dp_size", [1, 2])
+    def test_worker_shutdown_discards_weights(self, patched_offload_runtime, mocker, dit_dp_size):
+        # Terminal teardown must not rebuild either the DiT or the rank-local
+        # text encoder. Both can outlive the worker shutdown grace period.
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
                 strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
@@ -3004,9 +3005,13 @@ class TestDistributedComponentSelection:
             ),
             torch.device("cpu"),
         )
-        allgather_hook = Mock(dp_size=2, next_block=nn.Linear(1, 1))
+        allgather_hook = Mock(dp_size=dit_dp_size, next_block=nn.Linear(1, 1))
         rank_local_hook = Mock(dp_size=1, next_block=nn.Linear(1, 1))
         backend._all_hook_groups = [[allgather_hook], [rank_local_hook]]
+        resident = nn.Linear(1, 1)
+        resident_group = Mock()
+        backend._resident_blocks = [resident]
+        backend._resident_layer_group = resident_group
         backend.enabled = True
         mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
         worker = DiffusionWorker.__new__(DiffusionWorker)
@@ -3015,9 +3020,43 @@ class TestDistributedComponentSelection:
         worker.shutdown()
 
         allgather_hook.restore_next_block_to_cpu.assert_not_called()
-        rank_local_hook.restore_next_block_to_cpu.assert_called_once_with()
+        rank_local_hook.restore_next_block_to_cpu.assert_not_called()
+        resident_group.restore_to_cpu.assert_not_called()
+        for block in (allgather_hook.next_block, rank_local_hook.next_block, resident):
+            assert all(param.numel() == 0 for param in block.parameters())
         assert not backend.enabled
         assert not backend._all_hook_groups
+        assert backend._resident_layer_group is None
+        with pytest.raises(RuntimeError, match="recreate the backend and reload the pipeline"):
+            backend.enable(nn.Module())
+
+    def test_shutdown_retains_storage_until_transfers_drain(self, patched_offload_runtime, monkeypatch):
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE, pin_cpu_memory=False),
+            torch.device("cpu"),
+        )
+        block = nn.Linear(2, 2)
+        original = block.weight.detach().clone()
+        hook = Mock(dp_size=1, next_block=block)
+        backend._all_hook_groups = [[hook]]
+        backend.enabled = True
+        synchronize = Mock(side_effect=RuntimeError("pending transfer"))
+        monkeypatch.setattr(dist_backend_module.current_omni_platform, "synchronize", synchronize)
+        release = Mock()
+        monkeypatch.setattr(backend, "_release_mmap_handles", release)
+
+        with pytest.raises(RuntimeError, match="pending transfer"):
+            backend.shutdown()
+        torch.testing.assert_close(block.weight, original)
+        release.assert_not_called()
+        assert backend.enabled
+
+        synchronize.side_effect = None
+        backend.shutdown()
+        assert block.weight.numel() == 0
+        hook.restore_next_block_to_cpu.assert_not_called()
+        release.assert_called_once_with()
+        assert not backend.enabled
 
     def test_disable_runs_collectives_before_best_effort_local_cleanup(
         self,
