@@ -705,6 +705,8 @@ def test_every_test_here_runs_in_a_ci_job() -> None:
     this module's functions are tests here; the module has no test classes.
     """
     l4 = {mark.name for mark in hardware_marks(res=L4, num_cards=1)}
+    # An empty set would be a subset of every test's marks and pass them all.
+    assert l4
     unmarked = []
     for name, test in globals().items():
         if name.startswith("test_") and inspect.isfunction(test) and test.__module__ == __name__:
