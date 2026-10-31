@@ -297,6 +297,34 @@ def test_turn_based_interrupt_response_is_deferred_to_engine_capabilities():
     assert command.patch["turn_detection"]["interrupt_response"] is False
 
 
+@pytest.mark.parametrize("overlap_policy", ["listen_only", "barge_in_on_speech"])
+def test_session_update_defers_omitted_vad_interrupt_default(overlap_policy: str):
+    patch = {"turn_detection": {"type": "server_vad"}, "overlap_policy": overlap_policy}
+
+    command = translate_realtime_command({"type": "session.update", "session": patch})
+
+    assert isinstance(command, UpdateSession)
+    assert command.patch == patch
+
+
+@pytest.mark.parametrize(
+    ("turn_detection", "overlap_policy"),
+    [
+        ({"type": "server_vad", "interrupt_response": True}, "listen_only"),
+        ({"type": "server_vad", "interrupt_response": False}, "barge_in_on_speech"),
+        ({"type": "server_vad", "interrupt_response": None}, "listen_only"),
+        (None, "barge_in_on_speech"),
+    ],
+)
+def test_session_update_rejects_explicit_vad_overlap_conflicts(turn_detection, overlap_policy):
+    with pytest.raises(DuplexCommandError) as excinfo:
+        translate_realtime_command(
+            {"type": "session.update", "session": {"turn_detection": turn_detection, "overlap_policy": overlap_policy}}
+        )
+
+    assert excinfo.value.code == "unsupported_turn_detection"
+
+
 # ---- payload() rendering ----
 
 

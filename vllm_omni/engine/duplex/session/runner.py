@@ -1192,7 +1192,13 @@ class DuplexSessionRunner:
     # Append path (was the audio-append branch + start_native_append)    #
     # ------------------------------------------------------------------ #
 
-    async def _barge_in_for_overlap(self, event: dict[str, object], decision: dict[str, object]) -> bool:
+    async def _barge_in_for_overlap(
+        self,
+        event: dict[str, object],
+        decision: dict[str, object],
+        *,
+        vad_result: TurnDetectionResult | None = None,
+    ) -> bool:
         """Interrupt the model so the user's overlapping speech becomes the turn.
 
         Cancels the active response and the data-plane stream, advances the
@@ -1203,7 +1209,10 @@ class DuplexSessionRunner:
         session = self.session
         model_state = self.model_state
         event["force_barge_in"] = True
-        self.control.reset_vad()
+        # The retained packet was already scored. Preserve its active VAD
+        # turn so the following silence can finish and commit the utterance.
+        if vad_result is None or not vad_result.speech_active:
+            self.control.reset_vad()
         cancelled_fence = session.fence
         playback_was_active = helpers.assistant_playback_active(self.session)
         model_state.audio_buffer.clear_force_listen()
@@ -1414,7 +1423,7 @@ class DuplexSessionRunner:
                 if decision.get("force_listen", True) is True:
                     payload["force_listen"] = True
             else:
-                if not await self._barge_in_for_overlap(event, decision):
+                if not await self._barge_in_for_overlap(event, decision, vad_result=vad_result):
                     return
                 buffer_overlap_audio = True
                 defer_append = False

@@ -40,6 +40,7 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionFallbackStartedMessage,
     OpenDuplexSessionMessage,
 )
+from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
 from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult
@@ -1115,6 +1116,70 @@ async def test_qwen_server_vad_stop_commits_the_buffered_fallback_turn() -> None
         assert "input_audio_buffer.committed" in [event.type for event in events]
         assert "response.created" in [event.type for event in events]
         assert len(harness.fallback_requests) == 1
+    finally:
+        await close_harness(harness)
+
+
+@pytest.mark.asyncio
+async def test_vad_barge_in_retains_endpoint_state_for_the_interrupting_turn() -> None:
+    harness = await open_harness()
+    try:
+        first = await harness.start_fallback_turn()
+        await harness.send_fallback_started(first)
+        await harness.run(
+            commands.UpdateSession(
+                patch={
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "interrupt_response": True,
+                        "min_speech_duration_ms": 32,
+                        "silence_duration_ms": 64,
+                    }
+                }
+            )
+        )
+        detector = harness.runner.control._detector
+        assert detector is not None
+        detector.vad._frame_scorer = lambda frame: 0.9 if np.any(frame) else 0.0
+
+        speech = _pcm_f32(value=0.125, samples=512)
+        speech_events = await harness.run(
+            commands.AppendAudio(audio=speech, format="pcm_f32le", sample_rate_hz=16_000)
+        )
+        assert _event(speech_events, "input_audio_buffer.speech_started")
+        assert [cancel.request_id for cancel in harness.fallback_cancels] == [first.request.request_id]
+
+        silence = _pcm_f32(value=0.0, samples=1024)
+        silence_events = await harness.run(
+            commands.AppendAudio(audio=silence, format="pcm_f32le", sample_rate_hz=16_000)
+        )
+        assert _event(silence_events, "input_audio_buffer.speech_stopped")
+        assert _event(silence_events, "input_audio_buffer.committed")
+        assert _event(silence_events, "response.created")
+        [second] = harness.fallback_requests
+        assert base64.b64decode(second.request.input_payload["audio"]) == speech + silence
+    finally:
+        await close_harness(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
+async def test_realtime_vad_update_uses_the_fallback_default_after_transport(nested: bool) -> None:
+    harness = await open_harness()
+    try:
+        vad = {"type": "server_vad"}
+        patch = (
+            {"audio": {"input": {"turn_detection": vad}}, "overlap_policy": "listen_only"}
+            if nested
+            else {"turn_detection": vad, "overlap_policy": "listen_only"}
+        )
+        command = translate_realtime_command({"type": "session.update", "session": patch})
+
+        events = await harness.run(command)
+
+        assert _event(events, "session.updated")
+        assert harness.session.config.overlap_policy == "listen_only"
+        assert harness.session.config.extra_body["realtime_turn_detection"]["interrupt_response"] is False
     finally:
         await close_harness(harness)
 

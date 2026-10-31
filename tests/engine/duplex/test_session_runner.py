@@ -48,6 +48,7 @@ from vllm_omni.engine.duplex.messages import (
     OpenDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
+from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
@@ -1885,6 +1886,29 @@ async def test_session_update_replaces_config_and_runtime_config_together() -> N
         assert h.session.config.temperature == 0.3
         assert h.session.runtime_config["duplex_stage_sampling_params"]["0"]["temperature"] == 0.3
         assert h.session.config_generation == generation + 2
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("overlap_policy", "accepted"), [("listen_only", False), ("barge_in_on_speech", True)])
+async def test_native_session_update_validates_omitted_vad_default_in_engine(overlap_policy: str, accepted: bool) -> None:
+    h = await open_harness()
+    try:
+        command = translate_realtime_command(
+            {
+                "type": "session.update",
+                "session": {"turn_detection": {"type": "server_vad"}, "overlap_policy": overlap_policy},
+            }
+        )
+        events = await h.run(command)
+
+        if accepted:
+            assert "session.updated" in types(events)
+            assert h.session.config.extra_body["realtime_turn_detection"]["interrupt_response"] is True
+        else:
+            assert find(events, "error").code == "unsupported_turn_detection"
+            assert "session.updated" not in types(events)
     finally:
         await close_harness(h)
 

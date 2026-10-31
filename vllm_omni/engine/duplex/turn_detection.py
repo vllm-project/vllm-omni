@@ -83,9 +83,9 @@ def validate_realtime_turn_detection(
     session_payload: Mapping[str, object],
     *,
     allow_interrupt_response_false: bool = False,
-    default_interrupt_response: bool = True,
+    default_interrupt_response: bool | None = True,
 ) -> str | None:
-    """Validate the ``turn_detection`` object of a Realtime session payload (None when valid)."""
+    """Validate turn detection; defer an omitted interrupt default when it is ``None``."""
     field, turn_detection = configured_realtime_turn_detection(session_payload)
     if field is None:
         if session_payload.get("overlap_policy") == "barge_in_on_speech":
@@ -109,6 +109,9 @@ def validate_realtime_turn_detection(
             if value is not None and not _valid_vad_number(value, minimum=0):
                 return f"{field}.{name} must be a non-negative number"
         interrupt_response = turn_detection.get("interrupt_response", default_interrupt_response)
+        if interrupt_response is None and "interrupt_response" not in turn_detection:
+            # The transport does not yet know which model default applies.
+            return None
         if not isinstance(interrupt_response, bool):
             return f"{field}.interrupt_response must be a boolean"
         if not interrupt_response and not allow_interrupt_response_false:

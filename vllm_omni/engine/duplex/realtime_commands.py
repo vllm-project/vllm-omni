@@ -170,6 +170,7 @@ def translate_realtime_command(
         turn_detection_error = validate_realtime_turn_detection(
             session_payload,
             allow_interrupt_response_false=True,
+            default_interrupt_response=None,
         )
         if turn_detection_error is not None:
             raise DuplexCommandError(turn_detection_error, code="unsupported_turn_detection", event_id=event_id)
