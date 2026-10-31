@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import (
     ConnectorSpec,
@@ -55,6 +56,13 @@ def _should_create_payload_connector(model_config: Any) -> bool:
     Sender edges may instead be owned solely by KV transfer. Receivers still
     need a connector even though they do not declare a downstream payload hook.
     """
+    if getattr(model_config, "async_chunk", False) and not uses_native_mrv2_data_plane(
+        model_config, use_v2_model_runner=bool(getattr(model_config, "use_v2_model_runner", False))
+    ):
+        # The legacy async-chunk scheduler owns both directions through its
+        # transfer adapter. A runner connector would bind the same endpoint
+        # again; native MRv2 and full-payload paths own transport in the runner.
+        return False
     if get_stage_connector_role(model_config) != "sender":
         return True
 

@@ -2010,13 +2010,16 @@ def get_stage_connector_spec(
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
     for cfg in stage_connectors_cfg.values():
         connector_spec = dict(cfg.get("spec", {}))
-        if connector_spec.get("name") == "NixlConnector":
+        connector_name = connector_spec.get("name")
+        if connector_name in {"NixlConnector", "MooncakeTransferEngineConnector"}:
             # A middle worker uses one connector for both directions. Preserve
             # the incoming edge and carry the outgoing bind config separately.
             for (source, target), outgoing in getattr(omni_transfer_config, "connectors", {}).items():
                 if source == str(stage_id):
-                    if outgoing.name != "NixlConnector":
-                        raise ValueError("A NIXL middle stage requires NIXL on its outgoing edge")
+                    if outgoing.name != connector_name:
+                        raise ValueError(
+                            f"A {connector_name} middle stage requires {connector_name} on its outgoing edge"
+                        )
                     extra = dict(connector_spec.get("extra", {}))
                     extra["outgoing"] = {**(outgoing.extra or {}), "from_stage": int(source), "to_stage": int(target)}
                     connector_spec["extra"] = extra
