@@ -740,6 +740,10 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Opt-in L1 history view for plugins that consume ``conversation_view``
+    # (Qwen3-Omni): user turns before the N most recent user runs drop their
+    # audio and image parts there. ``None`` leaves every prompt unchanged.
+    context_keep_media_turns: int | None = None
     # Record per-turn stage work and emitted audio and answer the client's
     # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
     # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
@@ -756,6 +760,12 @@ class DuplexSessionRuntimeConfig:
             or self.max_sessions_per_replica < 1
         ):
             raise ValueError("duplex_session.max_sessions_per_replica must be an integer >= 1 or null")
+        if self.context_keep_media_turns is not None and (
+            isinstance(self.context_keep_media_turns, bool)
+            or not isinstance(self.context_keep_media_turns, int)
+            or self.context_keep_media_turns < 0
+        ):
+            raise ValueError("duplex_session.context_keep_media_turns must be an integer >= 0 or null")
         if self.replica_policy == "least_sessions" and self.max_sessions_per_replica is None:
             raise ValueError("duplex_session.max_sessions_per_replica is required for replica_policy='least_sessions'")
         if self.replica_groups is not None:
