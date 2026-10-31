@@ -177,14 +177,11 @@ class DiffusionKVModelRunnerBackend:
         parallel_config = getattr(self.od_config, "parallel_config", None)
         ulysses_degree = int(getattr(parallel_config, "ulysses_degree", 1))
         ring_degree = int(getattr(parallel_config, "ring_degree", 1))
-        allgather_degree = int(getattr(parallel_config, "allgather_degree", 1))
         ulysses_mode = str(getattr(parallel_config, "ulysses_mode", "strict"))
         if ring_degree > 1:
             raise NotImplementedError(
                 "Diffusion paged attention does not support Ring or hybrid Ulysses+Ring attention"
             )
-        if allgather_degree > 1:
-            raise NotImplementedError("Diffusion paged attention does not support AllGather-KV sequence parallelism")
         if ulysses_degree > 1 and ulysses_mode != "strict":
             raise NotImplementedError(
                 f"Diffusion paged attention currently supports only strict Ulysses; got ulysses_mode={ulysses_mode!r}"

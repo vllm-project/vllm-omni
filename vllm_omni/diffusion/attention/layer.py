@@ -566,6 +566,7 @@ class Attention(nn.Module):
                 "Only the startup KV memory profile may execute before paged KV initialization."
             )
         use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
             backend_name = (
                 self.attn_backend.get_name() if self.attn_backend is not None else type(self.attention).__name__
@@ -579,13 +580,26 @@ class Attention(nn.Module):
                 raise NotImplementedError(
                     "paged Scheduler KV is not supported with Ring attention; use strict Ulysses or no SP"
                 )
-            if strategy_name in ("allgather_kv", "ulysses_allgather_kv"):
-                raise NotImplementedError(
-                    f"paged Scheduler KV is not supported with the {strategy_name!r} sequence-parallel strategy"
-                )
-            if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
+            if strategy_name in ("ulysses", "ulysses_allgather_kv") and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
+            if strategy_name == "ulysses_allgather_kv":
+                forward_ctx = get_forward_context() if is_forward_context_available() else None
+                sp_padding_size = int(getattr(forward_ctx, "sp_padding_size", 0))
+                if sp_padding_size:
+                    raise NotImplementedError(
+                        "Paged Ulysses + AllGather-KV currently requires the "
+                        "sequence length to be divisible by "
+                        "ulysses_degree * allgather_degree; "
+                        f"got sp_padding_size={sp_padding_size}"
+                    )
 
+        if (
+            use_paged_attention
+            and strategy is not self._no_parallel_strategy
+            and strategy.name in ("allgather_kv", "ulysses_allgather_kv")
+            and attn_metadata is None
+        ):
+            attn_metadata = AttentionMetadata()
         # 1. Prepare inputs (Communication / Resharding)
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q

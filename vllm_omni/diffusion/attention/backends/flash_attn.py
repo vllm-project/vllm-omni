@@ -622,7 +622,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         native_impl = getattr(layer, "impl", None)
         if native_impl is None:
             raise RuntimeError(f"Native attention implementation is not bound for diffusion layer {layer.layer_name!r}")
-        prewrite_kv = current_omni_platform.requires_diffusion_paged_kv_prewrite()
+        prewrite_kv = (
+            current_omni_platform.requires_diffusion_paged_kv_prewrite() or paged_kv_context.requires_separate_kv_write
+        )
         forward_updates_cache = layer.attn_backend.forward_includes_kv_cache_update
         # Match vLLM's split update/attention contract. Once K/V has been
         # written by do_kv_cache_update(), decoder attention consumes the

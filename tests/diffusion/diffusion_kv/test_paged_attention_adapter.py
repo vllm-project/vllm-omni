@@ -16,6 +16,7 @@ from torch import nn
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from tests.helpers.kv_layout import layout_for_backend
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, QueryRange
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.diffusion_kv import paged_attention_adapter as adapter_module
@@ -48,6 +49,7 @@ class _FakeBlockTables:
         self.num_blocks = SimpleNamespace(np=np.full((1, self.max_num_reqs), 4, dtype=np.int32))
         self.gather_calls: list[tuple[torch.Tensor, int]] = []
         self.slot_calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
+        self.slot_out_calls: list[bool] = []
 
     def gather_block_tables(
         self,
@@ -63,7 +65,9 @@ class _FakeBlockTables:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
         num_tokens_padded: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self.slot_out_calls.append(out is not None)
         self.slot_calls.append(
             (
                 idx_mapping.clone(),
@@ -72,7 +76,11 @@ class _FakeBlockTables:
                 num_tokens_padded,
             )
         )
-        return positions[:num_tokens_padded].to(torch.int64).unsqueeze(0)
+        result = positions[:num_tokens_padded].to(torch.int64).unsqueeze(0)
+        if out is not None:
+            out[:, :num_tokens_padded].copy_(result)
+            return out[:, :num_tokens_padded]
+        return result
 
 
 class _FakeSpec:
@@ -372,6 +380,59 @@ def test_omni_paged_backend_defers_backend_owned_cache_update(monkeypatch: pytes
     assert torch.equal(output, qkv)
     assert layer.native_events == ["forward"]
     assert layer.updates == []
+
+
+def test_allgather_paged_context_separates_local_query_from_global_kv_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, block_tables, layer, events = _make_adapter(monkeypatch, capacity=16)
+    # Exercise the important CUDA case: the native backend normally owns the
+    # fused cache update, but asymmetric AllGather-KV must force a separate
+    # global K/V prewrite before running the local query.
+    layer.attn_backend.forward_includes_kv_cache_update = True
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=8, seq_len=8)]
+    )
+    query = torch.randn(1, 4, 2, 4)
+    key = torch.randn(1, 8, 2, 4)
+    value = torch.randn_like(key)
+    metadata = AttentionMetadata(query_ranges=(QueryRange(0, 4, 4),))
+
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(
+            "layer-0",
+            query,
+            key,
+            value,
+            omni_attn_metadata=metadata,
+        )
+
+        assert context.requires_separate_kv_write is True
+        assert context.query.shape == (4, 2, 4)
+        assert context.key_write.shape == (8, 2, 4)
+        assert context.value_write.shape == (8, 2, 4)
+        assert context.slot_mapping.tolist() == list(range(8))
+        assert context.native_metadata is events[1][2]
+        assert context.native_metadata.query_start_loc_cpu.tolist() == [0, 4]
+        assert context.native_metadata.positions.tolist() == [4, 5, 6, 7]
+        assert context.native_metadata.seq_lens.tolist() == [8]
+
+        output = _run_omni_paged_backend(context)
+
+    assert torch.equal(output, query)
+    assert block_tables.slot_calls[0][2].tolist() == list(range(8))
+    assert block_tables.slot_calls[1][2].tolist() == [4, 5, 6, 7]
+    assert block_tables.slot_out_calls == [False, True]
+    assert layer.native_events == ["update", "forward"]
+    written_key, written_value, written_slots = layer.updates[0]
+    assert torch.equal(written_key, key.reshape(8, 2, 4))
+    assert torch.equal(written_value, value.reshape(8, 2, 4))
+    assert written_slots.tolist() == list(range(8))
+    forwarded_query, forwarded_key, forwarded_value, forwarded_metadata = layer.calls[0]
+    assert torch.equal(forwarded_query, query.reshape(4, 2, 4))
+    assert forwarded_key is None
+    assert forwarded_value is None
+    assert forwarded_metadata is context.native_metadata
 
 
 def test_omni_piecewise_backend_defers_backend_owned_cache_update(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -800,7 +861,7 @@ def test_forward_rejects_non_4d_mask_with_piecewise_spans_before_cache_write(
     assert layer.native_events == []
 
 
-def test_forward_rejects_piecewise_query_ranges_before_cache_write(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_forward_rejects_malformed_query_ranges_before_cache_write(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter, _, layer, _ = _make_adapter(monkeypatch)
     batch = adapter.prepare_batch(
         [DiffusionPagedAttentionRow(request_id="req-0", sequence_id=0, query_len=4, seq_len=4)]
@@ -813,7 +874,7 @@ def test_forward_rejects_piecewise_query_ranges_before_cache_write(monkeypatch: 
         extra={},
     )
 
-    with adapter.activate(batch), pytest.raises(NotImplementedError, match="query_ranges"):
+    with adapter.activate(batch), pytest.raises(TypeError, match="must contain QueryRange"):
         adapter.prepare_layer_context(
             "layer-0",
             qkv,
@@ -1372,6 +1433,83 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
 
     assert events == ["pre", "prepare", "kernel", "post"]
     assert torch.equal(output, torch.full_like(original, 6))
+
+
+def test_omni_attention_paged_ulysses_allgather_creates_missing_metadata() -> None:
+    events: list[str] = []
+
+    class Strategy:
+        name = "ulysses_allgather_kv"
+
+        def pre_attention(self, query, key, value, metadata):
+            events.append("pre")
+            assert isinstance(metadata, AttentionMetadata)
+            metadata.query_ranges = (QueryRange(0, 2, 0),)
+            return query, key, value, metadata, object()
+
+        def post_attention(self, output, _ctx):
+            events.append("post")
+            return output
+
+    class Adapter:
+        def prepare_layer_context(self, _layer_name, query, key, value, *, omni_attn_metadata):
+            events.append("prepare")
+            assert omni_attn_metadata.query_ranges == (QueryRange(0, 2, 0),)
+            return SimpleNamespace(query=query)
+
+    class Backend:
+        def forward_paged(self, context):
+            events.append("kernel")
+            return context.query
+
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
+    layer.prefix = "layer-0"
+    layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
+    layer.attention = Backend()
+    layer.use_ring = False
+    layer._no_parallel_strategy = object()
+    layer._get_active_parallel_strategy = lambda: Strategy()
+    tensor = torch.zeros(1, 2, 2, 4)
+
+    with set_forward_context(), override_paged_kv_adapter(Adapter()):
+        output = layer._forward_impl(tensor, tensor, tensor, attn_metadata=None)
+
+    assert events == ["pre", "prepare", "kernel", "post"]
+    assert torch.equal(output, tensor)
+
+
+def test_omni_attention_rejects_paged_ulysses_allgather_padding_before_collectives() -> None:
+    class Strategy:
+        name = "ulysses_allgather_kv"
+
+        def pre_attention(self, *_args, **_kwargs):
+            raise AssertionError("padding must fail before sequence-parallel collectives")
+
+    class Adapter:
+        def prepare_layer_context(self, *_args, **_kwargs):
+            raise AssertionError("padding must fail before adapter preparation")
+
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer._explicit_cross_contract = False
+    layer.prefix = "layer-0"
+    layer.paged_kv_cache_role = "primary"
+    layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
+    layer.use_ring = False
+    layer._no_parallel_strategy = object()
+    layer._get_active_parallel_strategy = lambda: Strategy()
+    tensor = torch.zeros(1, 2, 2, 4)
+
+    with (
+        set_forward_context(),
+        override_paged_kv_adapter(Adapter()),
+        pytest.raises(NotImplementedError, match="divisible.*ulysses_degree \\* allgather_degree"),
+    ):
+        get_forward_context().sp_padding_size = 1
+        layer._forward_impl(tensor, tensor, tensor)
 
 
 def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
