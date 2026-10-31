@@ -86,6 +86,13 @@ class ImageGenerationRequest(BaseModel):
         description="Number of output layers for layered image models. Supported range: 2-10.",
     )
 
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("prompt must be a non-empty string")
+        return v
+
     @field_validator("size")
     @classmethod
     def validate_size(cls, v):
@@ -114,6 +121,13 @@ class ImageGenerationRequest(BaseModel):
     def validate_layers(cls, v):
         """Validate the layers parameter for layered image models."""
         return validate_layered_layers(v)
+
+    @field_validator("system_prompt")
+    @classmethod
+    def validate_system_prompt(cls, v: str | None) -> str | None:
+        if v is not None and not v.strip():
+            raise ValueError("field must be a non-empty string or null")
+        return v
 
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
@@ -185,7 +199,7 @@ class ImageGenerationRequest(BaseModel):
     # Output format for generated images
     output_format: str | None = Field(
         default=None,
-        description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
+        description="Output image format: 'png', 'jpg', 'jpeg', or 'webp'. Defaults to 'png'.",
     )
     output_compression: int = Field(
         default=100,
@@ -202,6 +216,17 @@ class ImageGenerationRequest(BaseModel):
         default=None,
         description="Return stage metrics for benchmark clients.",
     )
+
+    @field_validator("output_format")
+    @classmethod
+    def validate_output_format(cls, v: str | None) -> str | None:
+        valid = {"png", "jpg", "jpeg", "webp"}
+        if v is None:
+            return None
+        normalized = v.lower()
+        if normalized not in valid:
+            raise ValueError(f"output_format must be one of {sorted(valid)}, got: '{v}'")
+        return normalized
 
 
 class ImageData(BaseModel):
@@ -222,7 +247,7 @@ class ImageGenerationResponse(BaseModel):
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
     output_format: str | None = Field(None, description="The output format of the image generation")
-    size: str = Field(None, description="The size of the image generated")
+    size: str | None = Field(None, description="The size of the image generated")
     cot_output: str | None = Field(
         None,
         description="Chain-of-thought text output from the AR stage. "
