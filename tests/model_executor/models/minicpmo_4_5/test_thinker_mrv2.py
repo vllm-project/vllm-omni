@@ -245,3 +245,35 @@ def test_only_the_mrv2_duplex_thinker_keeps_native_multimodal_inputs(mocker, v2,
 @pytest.mark.parametrize("v2,session", [(True, "turn"), (False, "duplex")])
 def test_mrv2_batch_preprocess_hook_is_duplex_mrv2_only(mocker, v2, session):
     assert not hasattr(_model(mocker, v2=v2, session=session), "preprocess_batch_mrv2")
+
+
+def test_mrv2_thinker_returns_drafter_layers_with_hidden_states(mocker):
+    from vllm.model_executor.models.interfaces import SupportsEagle3, supports_eagle3
+
+    model = _model(mocker)
+    language_model = torch.nn.Module()
+    model.thinker.get_language_model = lambda: language_model
+    assert supports_eagle3(model)
+    # Drafters share the Thinker decoder's embedding and lm_head.
+    assert model.get_language_model() is language_model
+    # The turn Thinker keeps the runner's samplers, so drafts get verified.
+    assert model.mrv2_custom_sampler(object()) is None
+
+    hidden, aux = torch.randn(3, 4), [torch.randn(3, 4), torch.randn(3, 4)]
+    model.thinker.forward = mocker.Mock(return_value=hidden)
+    assert model(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2])) is hidden
+
+    set_layers = mocker.patch.object(SupportsEagle3, "set_aux_hidden_state_layers")
+    model.set_aux_hidden_state_layers((1, 9, 17))
+    set_layers.assert_called_once_with((1, 9, 17))
+    model.thinker.forward = mocker.Mock(return_value=(hidden, aux))
+    out_hidden, out_aux = model(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]))
+    assert out_hidden is hidden
+    assert out_aux is aux
+
+
+def test_v1_thinker_refuses_drafter_layers(mocker):
+    model = _model(mocker, v2=False)
+    with pytest.raises(NotImplementedError, match="model_runner: v2"):
+        model.set_aux_hidden_state_layers((1, 9, 17))
+    assert model._returns_aux_hidden_states is False

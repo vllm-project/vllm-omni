@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP
+from vllm.model_executor.models.interfaces import SupportsEagle3, SupportsMRoPE, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sampling_params import SamplingParams
@@ -124,7 +124,7 @@ def _generator_rewind(generator: torch.Generator) -> Callable[[], None]:
     info=MiniCPMO45OmniLLMProcessingInfo,
     dummy_inputs=MiniCPMO45OmniLLMDummyInputsBuilder,
 )
-class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
+class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE, SupportsEagle3):
     """MiniCPM-o 4.5 Omni model for conditional generation.
 
     Three-stage pipeline:
@@ -135,6 +135,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     """
 
     requires_raw_input_tokens = True
+    # Set when a drafter (EAGLE-3, DFlash, DSpark) reads Thinker layers.
+    _returns_aux_hidden_states = False
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -751,6 +753,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self._minicpmo45_duplex_data_plane_helper = helper
         return helper
 
+    def get_language_model(self) -> torch.nn.Module:
+        """The Thinker's text decoder; drafters share its embedding and lm_head."""
+        if self.thinker is not None:
+            return self.thinker.get_language_model()
+        return self.model
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Only the MRv2 Thinker forward hands target layers to the drafter.
+        if self.model_stage != "llm" or not self._use_v2_model_runner:
+            raise NotImplementedError(
+                "MiniCPM-o 4.5 drafters that read target hidden layers (EAGLE-3, DFlash, DSpark) "
+                "need the Thinker stage on model_runner: v2"
+            )
+        super().set_aux_hidden_state_layers(layers)
+        self._returns_aux_hidden_states = True
+
     def get_multimodal_embeddings(self, **kwargs):
         # Delegate to the active stage submodule when it implements MM encoding.
         mm_fn = getattr(self.model, "get_multimodal_embeddings", None)
@@ -833,7 +851,10 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 **kwargs,
             )
 
-            if isinstance(thinker_output, tuple):
+            aux_hidden_states = None
+            if self._returns_aux_hidden_states:
+                text_hidden_states, aux_hidden_states = thinker_output
+            elif isinstance(thinker_output, tuple):
                 _, text_hidden_states = thinker_output
             else:
                 text_hidden_states = thinker_output
@@ -847,6 +868,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 # FULL graphs return tensors. The row ledger is reconstructed
                 # from this step's live input batch after replay, never from
                 # Python values or token buffers captured during warmup.
+                if aux_hidden_states is not None:
+                    return text_hidden_states, aux_hidden_states
                 return text_hidden_states
 
             # Return hidden states with latent in multimodal_outputs for stage_input_processors
@@ -917,7 +940,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         """MRv2 Talker outputs are allocated per step by ``make_omni_output_mrv2``."""
         return self.model_stage == "tts" and self._use_v2_model_runner
 
-    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None]:
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None] | None:
         if self.model_stage == "tts":
             return self.talker.mrv2_custom_sampler(sampler)
         if self.model_stage == "llm" and getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
@@ -926,7 +949,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
 
             return MiniCPMO45DuplexSampler(sampler, self), None
-        return sampler, None
+        # Keep the runner's defaults, including the rejection sampler that
+        # verifies draft tokens.
+        return None
 
     def make_omni_output(self, model_outputs, **kwargs):
         if self.model_stage != "tts":
