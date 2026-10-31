@@ -33,6 +33,11 @@ turn-based stack free of duplex code, and exposes the same session to three
 consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
 the model plugins.
 
+## Runtime process placement
+
+The optional process runtime isolates the orchestrator from the frontend GIL
+and serves sessions only. See [process runtime usage, ownership, and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
+
 ## Playback completion ownership
 
 `DuplexEngineSession` owns response snapshots and playback cursors. Output

@@ -57,3 +57,21 @@ class _DiffusionServingModels:
                 for base_model in self._base_model_paths
             ]
         )
+
+
+class SessionServingModels:
+    """Model listing for session-only serving, without LLM renderer setup."""
+
+    def __init__(self, base_model_paths: list[BaseModelPath]) -> None:
+        self.base_model_paths = base_model_paths
+
+    def is_base_model(self, model_name: str) -> bool:
+        return any(model.name == model_name for model in self.base_model_paths)
+
+    async def show_available_models(self) -> ModelList:
+        return ModelList(
+            data=[
+                ModelCard(id=model.name, root=model.model_path, permission=[ModelPermission()])
+                for model in self.base_model_paths
+            ]
+        )

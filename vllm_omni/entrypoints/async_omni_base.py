@@ -107,11 +107,7 @@ class AsyncOmniBase(OmniBase):
 
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
-        self.final_output_task: asyncio.Task | None = None
-        self.event_resolver = AsyncEventResolver(orchestrator=self)
-        self.config_path = self.engine.config_path
-        self.input_processor = self.engine.input_processor
-        self.endpoint_restrictions = self.engine.endpoint_restrictions
+        self._initialize_async_frontend()
 
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
@@ -125,6 +121,15 @@ class AsyncOmniBase(OmniBase):
 
                 renderer = renderer_from_config(vllm_config)
             self.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
+
+    def _initialize_async_frontend(self) -> None:
+        """Attach engine metadata and the shared output pump without renderers."""
+        self.final_output_task: asyncio.Task | None = None
+        self.event_resolver = AsyncEventResolver(orchestrator=self)
+        self.config_path = self.engine.config_path
+        self.input_processor = self.engine.input_processor
+        self.endpoint_restrictions = self.engine.endpoint_restrictions
+        self.io_processor = None
 
     # ==================== Subclass seam ====================
 
@@ -187,7 +192,10 @@ class AsyncOmniBase(OmniBase):
 
     @property
     def vllm_config(self):
-        """Return the vLLM config for the comprehension stage when present."""
+        """Return engine-provided frontend config, or select a local stage's config."""
+        get_config = getattr(self.engine, "get_frontend_vllm_config", None)
+        if get_config is not None:
+            return get_config()
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
             return None
@@ -198,7 +206,10 @@ class AsyncOmniBase(OmniBase):
         return self.vllm_config
 
     def get_diffusion_od_config(self) -> Any | None:
-        """Return the diffusion-stage config when the pipeline has one."""
+        """Return engine-provided frontend config, or inspect local diffusion clients."""
+        get_config = getattr(self.engine, "get_frontend_diffusion_od_config", None)
+        if get_config is not None:
+            return get_config()
         saw_diffusion_stage = any(stage_config.stage_type == "diffusion" for stage_config in self.engine.stage_configs)
         for stage_client in self.engine.stage_clients:
             if getattr(stage_client, "stage_type", None) != "diffusion":
@@ -603,8 +614,12 @@ class AsyncOmniBase(OmniBase):
 
     # The async entrypoints expose the synchronous base health check as an awaitable.
     async def check_health(self) -> None:  # type: ignore[override]
-        """Check engine health by verifying the Orchestrator process is alive."""
-        OmniBase.check_health(self)
+        """Use an engine's async health check, or inspect its local stage pools."""
+        check_health = getattr(self.engine, "check_health_async", None)
+        if check_health is not None:
+            await check_health()
+        else:
+            OmniBase.check_health(self)
 
     # ==================== Shutdown ====================
 
