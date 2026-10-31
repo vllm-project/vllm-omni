@@ -766,6 +766,7 @@ def prepare_encode_pipeline(monkeypatch):
     pipe._tm_output_rank = True
     pipe._tm_audio_kv_reset_requests = 12
     pipe._tm_pad_text_tokens = 0
+    pipe._tm_vae_cuda_graph = False
     pipe.transformer = SimpleNamespace(
         arch=SimpleNamespace(num_layers=1, attention_head_dim=4), streaming_local_heads=1
     )
@@ -1048,7 +1049,8 @@ def test_prepare_ahead_layout_matches_a_fresh_one_and_noise_is_reused(ahead_sess
     # Across the request boundary: the noise draws of request 1 are made ahead and consumed.
     session.begin_phase(3, transformer=transformer, device=device)
     session.prepare_ahead(completed_phase_index=3)
-    assert session.noise_ahead is not None and session.noise_ahead[0] == 1
+    assert session.noise_ahead is not None
+    assert session.noise_ahead.result()[0] == 1
     expected_audio, expected_video = session._request_noise(1)
     session.finish_request()
     request = session.begin_request(
@@ -1072,6 +1074,174 @@ def test_prepare_ahead_layout_matches_a_fresh_one_and_noise_is_reused(ahead_sess
     )
     phase_state = session.begin_phase(0, transformer=transformer, device=device)
     assert phase_state.branch.text_len == 50 and session.layout_ahead is None
+
+
+def test_student_forward_kwargs_matches_branch_forward_kwargs(ahead_session) -> None:
+    from vllm_omni.diffusion.models.taomate_h3.student_inputs import student_forward_kwargs
+
+    session, transformer = ahead_session
+    device = torch.device("cpu")
+    session.begin_request(
+        text_embeddings=torch.zeros(40, 5120), text_tags=torch.ones(40, dtype=torch.long), device=device
+    )
+    branch = session.begin_phase(0, transformer=transformer, device=device).branch
+    gen = torch.Generator().manual_seed(3)
+    video_rows = torch.rand((branch.img_pos.numel(), branch.x_base.shape[-1]), generator=gen)
+    audio_rows = torch.rand((branch.audio_pos.numel(), branch.audio_x_base.shape[-1]), generator=gen)
+    # The two production call sites: the student step (moving timesteps) and
+    # the clean commit (all ones); the parity must hold under the documented
+    # conditioning invariant (imgvid_cond_timestep == t_video, audio_ref == 1.0).
+    for t_video, t_audio in ((0.75, 0.25), (1.0, 1.0)):
+        got = student_forward_kwargs(
+            branch, video_rows=video_rows, audio_rows=audio_rows, t_video=t_video, t_audio=t_audio
+        )
+        ref = branch.forward_kwargs(
+            video_rows=video_rows,
+            audio_rows=audio_rows,
+            t_video=t_video,
+            t_audio=t_audio,
+            imgvid_cond_timestep=t_video,
+            audio_ref_cond_timestep=1.0,
+        )
+        assert set(got) == set(ref)
+        for key in ("x", "audio_x", "unique_timesteps", "inverse_indices"):
+            assert torch.equal(got[key], ref[key]), key
+
+
+def test_session_close_with_pending_noise_future_is_clean(ahead_session) -> None:
+    from types import SimpleNamespace
+
+    session, transformer = ahead_session
+    # The bare _session() helper has no decoders; close() resets them.
+    session.video_decoder = SimpleNamespace(reset=lambda: None)
+    session.audio_decoder = SimpleNamespace(reset=lambda: None)
+    device = torch.device("cpu")
+    session.begin_request(
+        text_embeddings=torch.zeros(40, 5120), text_tags=torch.ones(40, dtype=torch.long), device=device
+    )
+    session.begin_phase(3, transformer=transformer, device=device)
+    session.prepare_ahead(completed_phase_index=3)
+    assert session.noise_ahead is not None
+    session.close()
+    assert session.noise_ahead is None and session._noise_executor is None
+    session.close()  # idempotent
+
+
+class _FakeVideoModel:
+    # The temporal-window contract StreamingVideoDecoder pins at construction.
+    tokens_chunk_size = 5
+    token_overlap = 2
+    frame_pre_padding = 3
+    frame_overlap = 5
+    isolated_first_frame = False
+    isolated_last_frame = False
+
+    def _adaptive_decode(self, clip: torch.Tensor) -> torch.Tensor:
+        # [1, 24, n, H, W] -> [1, 3, 4n, 2H, 2W]; frame f carries clip[0, 0, f // 4].
+        per_frame = clip[0, 0].repeat_interleave(4, dim=0)
+        per_frame = per_frame.repeat_interleave(2, dim=1).repeat_interleave(2, dim=2)
+        return per_frame[None, None].expand(1, 3, *per_frame.shape).contiguous()
+
+    def blend(self, overlap: torch.Tensor, primary: torch.Tensor, frames: int, dim: int) -> torch.Tensor:
+        # Linear ramp over the first ``frames`` frames on the temporal axis.
+        shape = [frames if d == (dim % primary.ndim) else 1 for d in range(primary.ndim)]
+        ramp = torch.linspace(0.0, 1.0, frames + 2, dtype=primary.dtype)[1:-1].view(shape)
+        out = primary.clone()
+        out[:, :, :frames] = overlap[:, :, :frames] * (1.0 - ramp) + primary[:, :, :frames] * ramp
+        return out
+
+
+class _FakeVideoVAE:
+    def __init__(self) -> None:
+        self.model = _FakeVideoModel()
+
+    def _denormalize_latent(self, latents: torch.Tensor) -> torch.Tensor:
+        return latents.to(torch.float32)
+
+    def _decode_tiling_context(self, clip: torch.Tensor):
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+    def _revert_decoded_inplace(self, frames: torch.Tensor) -> torch.Tensor:
+        return frames
+
+
+def test_flush_device_overlap_path_matches_eager_flush_path() -> None:
+    import numpy as np
+
+    from vllm_omni.diffusion.models.taomate_h3.stream_decode import StreamingVideoDecoder
+
+    gen = torch.Generator().manual_seed(11)
+    chunks = [torch.rand((1, 24, 7, 1, 2), generator=gen) for _ in range(2)]
+
+    def overlap_path() -> list[tuple[int, np.ndarray | None]]:
+        decoder = StreamingVideoDecoder(_FakeVideoVAE(), device=torch.device("cpu"), height=2, width=4)
+        results = []
+        for index, chunk in enumerate(chunks):
+            # post_decode's decode-overlap branch: flush_device on the final
+            # chunk, concatenated in the device domain, fetched once at the end.
+            frame_start, frames = decoder.push_device(chunk)
+            if index == len(chunks) - 1:
+                flush_start, flushed = decoder.flush_device()
+                if flushed is not None:
+                    if frames is None:
+                        frames, frame_start = flushed, flush_start
+                    elif isinstance(frames, torch.Tensor):
+                        frames = torch.cat((frames, flushed), dim=0)
+                    else:
+                        frames = np.concatenate((frames, flushed), axis=0)
+            results.append((frame_start, StreamingVideoDecoder.to_host(frames)))
+        return results
+
+    def eager_path() -> list[tuple[int, np.ndarray | None]]:
+        decoder = StreamingVideoDecoder(_FakeVideoVAE(), device=torch.device("cpu"), height=2, width=4)
+        results = []
+        for index, chunk in enumerate(chunks):
+            # post_decode's eager branch: fetch first, then flush on the host.
+            frame_start, frames_device = decoder.push_device(chunk)
+            frames = StreamingVideoDecoder.to_host(frames_device)
+            if index == len(chunks) - 1:
+                flush_start, flushed = decoder.flush()
+                if flushed is not None:
+                    frames = flushed if frames is None else np.concatenate((frames, flushed), axis=0)
+                    if frames is flushed:
+                        frame_start = flush_start
+            results.append((frame_start, frames))
+        return results
+
+    overlap, eager = overlap_path(), eager_path()
+    assert len(overlap) == len(eager)
+    for (start_overlap, frames_overlap), (start_eager, frames_eager) in zip(overlap, eager, strict=True):
+        assert start_overlap == start_eager
+        assert frames_overlap is not None and frames_eager is not None
+        assert frames_overlap.shape == frames_eager.shape
+        assert np.array_equal(frames_overlap, frames_eager)
+    # The final chunk must carry the held overlap: one 17-frame window per
+    # push, plus the five-frame tail concatenated on the final one.
+    assert [frames.shape[0] for _, frames in eager] == [17, 17 + 5]
+
+
+def test_decode_range_device_matches_host_decode_range() -> None:
+    import numpy as np
+
+    from vllm_omni.diffusion.models.taomate_h3.stream_decode import StreamingAudioDecoder
+
+    def latents() -> torch.Tensor:
+        tensor = torch.zeros(2, 32, 603)
+        tensor[0, 0] = torch.arange(603, dtype=torch.float32)
+        return tensor
+
+    spans = ((0, 800), (800, 1600), (453_333, 482_666))
+    host_decoder = StreamingAudioDecoder(_FakeAudioVAE(), device=torch.device("cpu"))
+    host_decoder.append(latents())
+    device_decoder = StreamingAudioDecoder(_FakeAudioVAE(), device=torch.device("cpu"))
+    device_decoder.append(latents())
+    for s0, s1 in spans:
+        host = host_decoder.decode_range(s0, s1)
+        device = device_decoder.decode_range_device(s0, s1).cpu().numpy()
+        assert host.shape == device.shape, (s0, s1)
+        assert np.array_equal(host, device), (s0, s1)
 
 
 @pytest.mark.parametrize("scale", [0.5, 1.0, 1.5])
