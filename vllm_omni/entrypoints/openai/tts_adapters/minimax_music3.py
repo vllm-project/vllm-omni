@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax Music 3 serving adapter for ``/v1/audio/speech``.
 
 This is a text-to-music model on a speech endpoint, so most of the speech
@@ -50,6 +50,8 @@ class MiniMaxMusic3Adapter(ARTTSAdapter):
 
     name = "minimax_music3"
     stage_keys = frozenset({"minimax_music3_ar"})
+    # Sampling is fixed by the checkpoint (see _UNSUPPORTED_SAMPLING_PARAMS).
+    supports_temperature = False
     # 9,000 frames at 25 fps is six minutes, the checkpoint's own ceiling.
     max_new_tokens_min = 1
     max_new_tokens_max = MAX_AUDIO_FRAMES
