@@ -915,10 +915,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 logger.debug("prompt-embed cache: %s", prompt_embed_cache.stats())
 
             runner_cache_dit_enabled = self.cache_backend is not None and self.cache_backend.is_enabled()
-            if (
-                od_config.cache_backend == "cache_dit"
-                and od_config.enable_cache_dit_summary
-                and (runner_cache_dit_enabled or is_request_scoped_cache_dit_enabled(self.pipeline))
+            if od_config.enable_cache_dit_summary and (
+                (od_config.cache_backend == "cache_dit" and runner_cache_dit_enabled)
+                or is_request_scoped_cache_dit_enabled(self.pipeline)
             ):
                 cache_summary(self.pipeline, details=True)
 

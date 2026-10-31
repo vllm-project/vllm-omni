@@ -793,8 +793,14 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
 @pytest.mark.core_model
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("cache_dit_enabled", [False, True])
-def test_execute_model_cache_summary_follows_pipeline_owned_cache_dit_state(monkeypatch, cache_dit_enabled):
-    runner = _make_runner(cache_backend=None, cache_backend_name="cache_dit")
+@pytest.mark.parametrize("cache_backend_name", [None, "cache_dit"])
+@pytest.mark.parametrize("enable_summary", [False, True])
+def test_execute_model_cache_summary_follows_pipeline_owned_cache_dit_state(
+    monkeypatch, cache_dit_enabled, cache_backend_name, enable_summary
+):
+    runner = _make_runner(
+        cache_backend=None, cache_backend_name=cache_backend_name, enable_cache_dit_summary=enable_summary
+    )
     runner.pipeline.adopt_cache_dit_backend = lambda backend: None
     runner.pipeline.is_cache_dit_enabled = lambda: cache_dit_enabled
     req = _make_request()
@@ -814,7 +820,7 @@ def test_execute_model_cache_summary_follows_pipeline_owned_cache_dit_state(monk
     output = DiffusionModelRunner.execute_model(runner, req)
 
     assert output.output == "ok"
-    assert cache_summary_calls == ([(runner.pipeline, True)] if cache_dit_enabled else [])
+    assert cache_summary_calls == ([(runner.pipeline, True)] if cache_dit_enabled and enable_summary else [])
 
 
 @pytest.mark.core_model
