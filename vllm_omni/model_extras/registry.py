@@ -100,6 +100,11 @@ from vllm_omni.model_extras.qwen_image_21 import (
     build_image_to_image_prompt as build_qwen_image_21_image_to_image_prompt,
 )
 from vllm_omni.model_extras.sana_video import SANA_VIDEO_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.self_forcing import (
+    SELF_FORCING_EXTRA_BODY_PARAMS,
+    SELF_FORCING_EXTRA_OUTPUT_PARAMS,
+    get_self_forcing_video_generation_defaults,
+)
 from vllm_omni.model_extras.sensenova_u1 import (
     SENSENOVA_U1_EXTRA_BODY_PARAMS,
     SENSENOVA_U1_EXTRA_OUTPUT_PARAMS,
@@ -243,6 +248,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "Cosmos3OmniPipeline": {
         "extra_body_params": COSMOS3_EXTRA_BODY_PARAMS,
         "extra_output_params": COSMOS3_EXTRA_OUTPUT_PARAMS,
+    },
+    "SelfForcingPipeline": {
+        "extra_body_params": SELF_FORCING_EXTRA_BODY_PARAMS,
+        "extra_output_params": SELF_FORCING_EXTRA_OUTPUT_PARAMS,
+        "video_generation_defaults_builder": get_self_forcing_video_generation_defaults,
     },
     "Magi2Pipeline": {
         "extra_body_params": MAGI2_EXTRA_BODY_PARAMS,

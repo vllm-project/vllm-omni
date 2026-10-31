@@ -127,6 +127,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
     resolve_qwen3_omni_pipeline,
 )
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
+from vllm_omni.model_executor.models.self_forcing.pipeline import SELF_FORCING_PIPELINE
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -231,6 +232,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_omni_moe_thinker_only": QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,
+    "self_forcing": SELF_FORCING_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
     "taomate_h3": TAOMATE_H3_PIPELINE,
