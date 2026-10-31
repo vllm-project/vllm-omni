@@ -97,8 +97,8 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tracing_enabled", [False, True])
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracing_enabled):
+@pytest.mark.parametrize("tracing_mode", ["enabled", "disabled", "no-engine", "no-provider"])
+async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracing_mode):
     import httpx
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -106,6 +106,7 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
 
     from vllm_omni.tracing import capture_trace_headers
 
+    tracing_enabled = tracing_mode == "enabled"
     if tracing_enabled:
         pytest.importorskip("opentelemetry.instrumentation.fastapi")
     provider = TracerProvider()
@@ -126,7 +127,12 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracin
     async def fake_build_async_omni(*_args, **kwargs):
         captured.update(kwargs)
         engine = _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
-        engine.engine.tracer_provider = provider if tracing_enabled else None
+        if tracing_mode == "no-engine":
+            del engine.engine
+        elif tracing_mode == "no-provider":
+            del engine.engine.tracer_provider
+        else:
+            engine.engine.tracer_provider = provider if tracing_enabled else None
         yield engine
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)

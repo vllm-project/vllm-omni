@@ -148,9 +148,7 @@ def _make_connection(
     *,
     semantic_vad_backend_provider: SmartTurnBackendProvider | None = None,
 ) -> _ResponseRecordingConnection:
-    engine = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=100), engine=SimpleNamespace(tracer_provider=None)
-    )
+    engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=100))
     chat_handler = SimpleNamespace(renderer=SimpleNamespace(get_tokenizer=lambda: object()))
     connection = _ResponseRecordingConnection(
         websocket=websocket,
@@ -263,7 +261,12 @@ async def test_semantic_vad_build_detector_receives_smart_turn_provider(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_server_vad_extra_field_is_ignored_before_consecutive_session_updates() -> None:
+@pytest.mark.parametrize(
+    "tracing_engine",
+    [None, SimpleNamespace(), SimpleNamespace(tracer_provider=None)],
+    ids=["no-engine", "no-provider", "disabled"],
+)
+async def test_server_vad_extra_field_is_ignored_before_consecutive_session_updates(tracing_engine) -> None:
     first_update = {
         "type": "session.update",
         "session": {
@@ -282,6 +285,8 @@ async def test_server_vad_extra_field_is_ignored_before_consecutive_session_upda
     }
     websocket = _InboundFakeWebSocket([json.dumps(first_update), json.dumps(second_update)])
     connection = _make_connection(websocket)
+    if tracing_engine is not None:
+        connection.engine.engine = tracing_engine
 
     await connection.handle_connection()
 

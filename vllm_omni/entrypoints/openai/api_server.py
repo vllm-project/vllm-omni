@@ -413,7 +413,8 @@ async def omni_run_server_worker(
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
-        if engine_client.engine.tracer_provider is not None:
+        provider = getattr(getattr(engine_client, "engine", None), "tracer_provider", None)
+        if provider is not None:
             from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
             from vllm_omni.tracing import TraceContextMiddleware
@@ -422,7 +423,7 @@ async def omni_run_server_worker(
             app.middleware_stack = None
             FastAPIInstrumentor.instrument_app(
                 app,
-                tracer_provider=engine_client.engine.tracer_provider,
+                tracer_provider=provider,
                 exclude_spans=["send", "receive"],
                 excluded_urls="health,healthz,metrics",
             )
@@ -537,9 +538,7 @@ async def omni_run_server_worker(
 
             def __init__(self, inner: ASGIApp) -> None:
                 self._inner = inner
-                self._asgi = (
-                    TraceContextMiddleware(inner) if engine_client.engine.tracer_provider is not None else inner
-                )
+                self._asgi = TraceContextMiddleware(inner) if provider is not None else inner
 
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._inner, name)

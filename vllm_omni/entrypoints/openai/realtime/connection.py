@@ -140,7 +140,7 @@ class OpenAIFullDuplexConnection:
     # ------------------------------------------------------------------ #
 
     async def handle_connection(self):
-        provider = self.engine.engine.tracer_provider
+        provider = getattr(getattr(self.engine, "engine", None), "tracer_provider", None)
         token = None
         outcome = "disconnect"
         error_type = None
