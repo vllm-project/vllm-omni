@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -853,14 +854,12 @@ class CharAwareSubwordEncoder(nn.Module):
         # Map each subword ID to its sequence of character IDs
         char_id_list = [list(self.subword_id_to_char_ids.get(x, ())) for x in subword_id_list]
 
-        char_lengths = torch.tensor([len(x) for x in char_id_list], dtype=torch.long, device=device)
-        batch_size = char_lengths.size(0)
-        max_len = int(char_lengths.max().item()) if batch_size > 0 else 0
-
-        # Create a padded tensor for the character IDs
-        char_ids = torch.full((batch_size, max_len), self.char_padding_idx, dtype=torch.long, device=device)
-        for i, char_seq in enumerate(char_id_list):
-            char_ids[i, : len(char_seq)] = torch.tensor(char_seq, dtype=torch.long, device=device)
+        lengths = [len(chars) for chars in char_id_list]
+        max_len = max(lengths, default=0)
+        # Character metadata is already on the host; pack it before transfer.
+        padded_chars = [chars + [self.char_padding_idx] * (max_len - len(chars)) for chars in char_id_list]
+        char_ids = torch.tensor(padded_chars, dtype=torch.long, device=device).reshape(len(lengths), max_len)
+        char_lengths = torch.tensor(lengths, dtype=torch.long, device=device)
 
         return char_ids, char_lengths
 
@@ -881,8 +880,7 @@ class CharAwareSubwordEncoder(nn.Module):
         # 1. Convert subword IDs to character IDs
         char_ids, char_lengths = self.prepare_inputs(subword_ids, subword_mask)
 
-        # char_mask = sequence_mask(char_lengths).float()
-        char_mask = sequence_mask(char_lengths)
+        char_mask = sequence_mask(char_lengths, max_length=char_ids.shape[1])
 
         # 2. Get character embeddings and pass them through the backbone
         char_embeds = self.embed_tokens(char_ids)
