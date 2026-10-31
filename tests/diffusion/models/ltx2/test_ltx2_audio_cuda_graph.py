@@ -545,6 +545,8 @@ def test_request_scope_copies_static_conditioning_once_per_request(monkeypatch):
 @pytest.mark.cpu
 def test_capture_failure_is_bounded_and_not_retried(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), max_graphs=1, device="cuda")
+    restore_eager = Mock()
+    runner.restore_eager = restore_eager
     monkeypatch.setattr(runner, "_inputs_are_compatible", lambda **_kwargs: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attempts = 0
@@ -566,6 +568,7 @@ def test_capture_failure_is_bounded_and_not_retried(monkeypatch):
     assert stats["eager_capture_failure"] == 2
     assert stats["eager_previous_capture_failure"] == 1
     assert stats["failed_key_count"] == 1
+    restore_eager.assert_not_called()
 
 
 @pytest.mark.cpu
@@ -957,3 +960,76 @@ def test_cuda_graph_can_capture_and_replay_from_sequential_python_threads():
     assert runner.stats_snapshot()["captures"] == 1
     assert runner.stats_snapshot()["hits"] == 1
     assert runner.stats_snapshot()["eager"] == 0
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("compatible_inputs", [True, False])
+def test_lazy_compile_failure_restores_eager_forward(monkeypatch, compatible_inputs):
+    from vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime import LTXAudioRuntime
+
+    class Block(nn.Module):
+        def forward(self, x):
+            return x.sin() + 1
+
+    class Transformer(nn.Module):
+        _repeated_blocks = ["Block"]
+
+        def __init__(self):
+            super().__init__()
+            self.block = Block()
+
+        def prepare_audio_cuda_graph_compile(self):
+            pass
+
+        def forward(self, audio_hidden_states, **kwargs):
+            return self.block(audio_hidden_states)
+
+    backend_calls = []
+
+    def failing_backend(gm, example_inputs, **kwargs):
+        backend_calls.append(1)
+        raise RuntimeError("injected lazy compilation failure")
+
+    real_compile = torch.compile
+
+    def compile_with_failure(model, *args, **kwargs):
+        return real_compile(model, *args, backend=failing_backend, **kwargs)
+
+    transformer = Transformer().eval()
+    runner = LTX2AudioCUDAGraphRunner(
+        transformer, device=torch.device("cuda", torch.accelerator.current_device_index())
+    )
+    pipeline = SimpleNamespace(
+        transformer=transformer,
+        audio_graph_runner=runner,
+        od_config=SimpleNamespace(diffusion_compile_dynamic=True),
+        _audio_cuda_graph_config=LTX2AudioCUDAGraphConfig(enabled=True),
+    )
+    inputs = _cuda_inputs()
+    if not compatible_inputs:
+        inputs["audio_hidden_states"] = inputs["audio_hidden_states"].float()
+    original_forward = transformer.block.forward
+    monkeypatch.setattr(torch, "compile", compile_with_failure)
+    with torch.inference_mode(), torch._dynamo.config.patch(suppress_errors=False):
+        expected = transformer(**inputs)
+        LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
+        assert not backend_calls  # torch.compile only installed lazy wrappers.
+        first = runner(**inputs).clone()
+        second = runner(**inputs).clone()
+        torch.testing.assert_close(first, expected, rtol=0, atol=0)
+        torch.testing.assert_close(second, expected, rtol=0, atol=0)
+        assert transformer.block.forward == original_forward
+        assert len(backend_calls) == 1
+        if compatible_inputs:
+            assert runner.stats_snapshot()["capture_failures"] == 1
+            assert runner.stats_snapshot()["eager_previous_capture_failure"] == 1
+        runner.clear()
+        runner(**inputs)
+        actual = runner(**inputs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert len(backend_calls) == 1
+        if compatible_inputs:
+            assert runner.stats_snapshot()["captures"] == 1
+            assert runner.stats_snapshot()["hits"] == 1
+        runner.clear()

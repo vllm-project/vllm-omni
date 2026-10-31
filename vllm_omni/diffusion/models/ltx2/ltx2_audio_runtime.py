@@ -332,6 +332,9 @@ class LTXAudioRuntime(
 
         try:
             self.transformer.prepare_audio_cuda_graph_compile()
+            # Regional compilation replaces forwards in place, but backend
+            # errors can be deferred until the first invocation of a block.
+            eager_forwards = [(module, module.forward) for module in self.transformer.modules()]
             self.transformer = regionally_compile(
                 self.transformer,
                 dynamic=self.od_config.diffusion_compile_dynamic,
@@ -347,6 +350,11 @@ class LTXAudioRuntime(
         finally:
             runner.transformer = self.transformer
 
+        def restore_eager() -> None:
+            for module, forward in eager_forwards:
+                module.forward = forward
+
+        runner.restore_eager = restore_eager
         logger.info(
             "LTX2 audio CUDA Graph enabled (compiled, max_entries=%d)",
             self._audio_cuda_graph_config.max_entries,

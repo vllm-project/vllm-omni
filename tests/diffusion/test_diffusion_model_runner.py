@@ -174,15 +174,20 @@ def _make_ltx2_graph_pipeline(**overrides):
 @pytest.mark.cpu
 def test_ltx2_audio_graph_compile_preserves_bf16_precision_boundaries(monkeypatch):
     prepare_compile = Mock()
-    original = SimpleNamespace(prepare_audio_cuda_graph_compile=prepare_compile)
+    original = torch.nn.Module()
+    original.prepare_audio_cuda_graph_compile = prepare_compile
     pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
     pipeline.transformer = original
     compiled = object()
     compile_calls = []
 
+    def compile_transformer(transformer, **kwargs):
+        compile_calls.append((transformer, kwargs))
+        return compiled
+
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime.regionally_compile",
-        lambda transformer, **kwargs: compile_calls.append((transformer, kwargs)) or compiled,
+        compile_transformer,
     )
 
     LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
@@ -208,7 +213,8 @@ def test_ltx2_audio_graph_compile_preserves_bf16_precision_boundaries(monkeypatc
 @pytest.mark.core_model
 @pytest.mark.cpu
 def test_ltx2_audio_graph_compile_failure_keeps_eager_transformer(monkeypatch, caplog):
-    original = SimpleNamespace(prepare_audio_cuda_graph_compile=Mock())
+    original = torch.nn.Module()
+    original.prepare_audio_cuda_graph_compile = Mock()
     pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
     pipeline.transformer = original
     pipeline.audio_graph_runner.transformer = original
