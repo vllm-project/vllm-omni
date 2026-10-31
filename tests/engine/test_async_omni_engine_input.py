@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
+import janus
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -13,20 +15,97 @@ from vllm.inputs.engine import tokens_input
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import renderer_from_config
 from vllm.sampling_params import SamplingParams
+from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from tests.model_executor.models.chatterbox.helpers import DEPLOY, random_voice, stage_vllm_config, write_model_dir
 from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.stage_init_utils import build_stage0_input_processor
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.models.chatterbox.conditioning import build_prompt
+from vllm_omni.model_executor.models.chatterbox.pipeline import CHATTERBOX_ORIGINAL_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture
+def original_admission_engine(tmp_path: Path) -> Iterator[AsyncOmniEngine]:
+    """Admission as the engine runs it, short of the engine's processes.
+
+    ``AsyncOmniEngine.__init__`` launches the orchestrator and every stage, so
+    the engine gets what that sets up for admission instead: the input
+    processor built from the deploy file's stage 0 config, the deploy file's
+    default budget, the pipeline's admission hooks, and the request queue.
+    """
+    engine = object.__new__(AsyncOmniEngine)
+    engine.default_sampling_params_list = [SamplingParams(max_tokens=1000)]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = build_stage0_input_processor(
+        stage_vllm_config(write_model_dir(tmp_path), DEPLOY["original"], 0)
+    )
+    engine.request_queue = janus.Queue()
+    for name in ("prompt_transform_func", "prompt_expand_func"):
+        setattr(engine, name, resolve_obj_by_qualname(getattr(CHATTERBOX_ORIGINAL_PIPELINE.stages[0], name)))
+    yield engine
+    engine.request_queue.close()
+
+
+def original_admission_prompt(weight: float) -> dict:
+    voice = random_voice(2, 2)
+    return build_prompt([12, 13, 14], voice, ChatterboxConfig("original"), exaggeration=0.5, cfg_weight=weight)
+
+
+# A guided request gets its companion whatever stage it ends at: the atomic
+# CFG scheduler admits a cfg_group member only together with its twin.
+@pytest.mark.parametrize("weight,final_stage_id", [(0.0, 0), (0.0, 1), (0.5, 0), (0.5, 1)])
+@pytest.mark.parametrize("max_tokens", [None, 64])
+def test_original_offline_admission_preserves_the_requests_budget(
+    original_admission_engine, weight, final_stage_id, max_tokens
+):
+    engine = original_admission_engine
+    params = None if max_tokens is None else [SamplingParams(max_tokens=max_tokens, min_tokens=max_tokens)]
+    engine.add_request(
+        "original", original_admission_prompt(weight), sampling_params_list=params, final_stage_id=final_stage_id
+    )
+    message = engine.request_queue.sync_q.get_nowait()
+    assert message.sampling_params_list[0].max_tokens == (1000 if params is None else 64)
+    assert message.sampling_params_list[0].min_tokens == (0 if params is None else 64)
+    assert engine.request_queue.sync_q.qsize() == int(weight != 0)
+    parent_info = deserialize_additional_information(message.prompt.additional_information)
+    assert parent_info["omni_final_stage_id"] == final_stage_id
+    if weight != 0:
+        companion = engine.request_queue.sync_q.get_nowait()
+        companion_info = deserialize_additional_information(companion.prompt.additional_information)
+        assert parent_info["cfg_group"]["role"] == "cond"
+        assert companion_info["cfg_group"]["role"] == "uncond"
+        assert companion_info["omni_final_stage_id"] == 0
+        assert companion.parent_id == "original"
+        assert companion.companion_id == "original__cfg_uncond"
+
+
+def test_unguided_stage0_only_request_is_not_expanded(original_admission_engine):
+    """Without a cfg_group the stage-0-only gate keeps the expansion hook idle.
+
+    The prompt carries a guidance weight, so the pipeline's expansion hook
+    would add a companion if it were called.
+    """
+    engine = original_admission_engine
+    prompt = original_admission_prompt(0.5)
+    del prompt["additional_information"]["cfg_group"]
+    engine.add_request("plain", prompt, final_stage_id=0)
+    message = engine.request_queue.sync_q.get_nowait()
+    assert message.request_id == "plain"
+    assert engine.request_queue.sync_q.empty()
 
 
 class _SyntheticSyncQueueShutDownError(Exception):
