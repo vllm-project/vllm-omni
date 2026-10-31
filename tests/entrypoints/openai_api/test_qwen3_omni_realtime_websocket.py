@@ -26,6 +26,17 @@ import numpy as np
 import pytest
 import websockets
 import yaml
+from openai.types.realtime import (
+    ConversationItemCreateEvent,
+    RealtimeConversationItemFunctionCallOutput,
+    RealtimeConversationItemUserMessage,
+    RealtimeFunctionTool,
+    RealtimeSessionCreateRequest,
+    ResponseCreateEvent,
+    SessionUpdateEvent,
+)
+from openai.types.realtime.realtime_client_event import RealtimeClientEvent
+from openai.types.realtime.realtime_conversation_item_user_message import Content
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav, validated_soft_interrupt_wav
 from tests.helpers.mark import hardware_test
@@ -33,6 +44,12 @@ from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
     generate_synthetic_audio,
+)
+from tests.helpers.realtime import (
+    WEATHER_TOOL_ANSWER,
+    WEATHER_TOOL_OUTPUT,
+    WEATHER_TOOL_PROMPT,
+    WEATHER_TOOL_SPEC,
 )
 from tests.helpers.runtime import OmniServer, OmniServerParams, get_model_prefix
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
@@ -63,7 +80,6 @@ ISSUE_6474_SYNTH_PHRASE_TEXT = (
     "Can you tell me the current temperature and weather conditions in New York City? "
     "What about Los Angeles? Please compare them in detail using at least eight complete sentences."
 )
-
 # Simulate realtime upload pacing (``openai_realtime_client.py --send-delay-ms``).
 SEND_DELAY_MS = 200
 CLIENT_VAD_REPLAY_PATH = Path(__file__).resolve().parents[2] / "assets" / "livekit" / "client_vad_replay.jsonl"
@@ -97,7 +113,12 @@ realtime_async_chunk_server_params = [
             model=MODEL,
             stage_config_path=default_stage_config,
             use_stage_cli=True,
-            server_args=["--async-chunk"],
+            server_args=[
+                "--async-chunk",
+                "--tool-call-parser",
+                "hermes",
+                "--enable-auto-tool-choice",
+            ],
         ),
         id="async_chunk",
     ),
@@ -247,6 +268,110 @@ async def _run_realtime_audio_roundtrip(
         "delta_events": delta_events,
         "audio_done": audio_done,
     }
+
+
+async def _send_client_event(ws: Any, event: RealtimeClientEvent) -> None:
+    """Serialize a client event the same way the OpenAI SDK does."""
+    await ws.send(event.to_json(exclude_defaults=True, exclude_unset=True))
+
+
+async def _run_realtime_audio_tool_call(
+    host: str,
+    port: int,
+    model: str,
+    *,
+    timeout_s: float = 600,
+) -> dict:
+    """Ask for an audio response that must call a tool, then feed the result back."""
+
+    def summarize(events: list[dict]) -> dict:
+        transcript = "".join(
+            event.get("delta", "")
+            for event in events
+            if event.get("type") in ("response.output_audio_transcript.delta", "response.output_text.delta")
+        )
+        tool_calls = [
+            event["item"]
+            for event in events
+            if event.get("type") == "response.output_item.done" and event.get("item", {}).get("type") == "function_call"
+        ]
+        first_control = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.get("type") == "response.output_item.added"
+                and event.get("item", {}).get("type") == "function_call"
+            ),
+            len(events),
+        )
+        return {
+            "transcript": transcript,
+            "tool_calls": tool_calls,
+            "audio_deltas": sum(1 for event in events if event.get("type") == "response.output_audio.delta"),
+            "audio_after_tool_call": sum(
+                1 for event in events[first_control:] if event.get("type") == "response.output_audio.delta"
+            ),
+        }
+
+    async def recv_response(ws) -> list[dict]:
+        events: list[dict] = []
+        while True:
+            message = await asyncio.wait_for(ws.recv(), timeout=timeout_s)
+            if isinstance(message, bytes):
+                continue
+            event = json.loads(message)
+            events.append(event)
+            if event.get("type") == "error":
+                raise AssertionError(f"WebSocket error: {event}")
+            if event.get("type") == "response.done":
+                return events
+
+    async with websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024) as ws:
+        await _send_client_event(
+            ws,
+            SessionUpdateEvent(
+                type="session.update",
+                session=RealtimeSessionCreateRequest(
+                    type="realtime",
+                    model=model,
+                    output_modalities=["audio"],
+                    tools=[RealtimeFunctionTool(**WEATHER_TOOL_SPEC)],
+                    tool_choice="auto",
+                ),
+            ),
+        )
+        await _send_client_event(
+            ws,
+            ConversationItemCreateEvent(
+                type="conversation.item.create",
+                item=RealtimeConversationItemUserMessage(
+                    type="message",
+                    role="user",
+                    content=[Content(type="input_text", text=WEATHER_TOOL_PROMPT)],
+                ),
+            ),
+        )
+        await _send_client_event(ws, ResponseCreateEvent(type="response.create"))
+        tool_turn = summarize(await recv_response(ws))
+
+        answer_turn = None
+        if tool_turn["tool_calls"]:
+            call = tool_turn["tool_calls"][0]
+            await _send_client_event(
+                ws,
+                ConversationItemCreateEvent(
+                    type="conversation.item.create",
+                    item=RealtimeConversationItemFunctionCallOutput(
+                        type="function_call_output",
+                        call_id=call["call_id"],
+                        output=WEATHER_TOOL_OUTPUT,
+                    ),
+                ),
+            )
+            await _send_client_event(ws, ResponseCreateEvent(type="response.create"))
+            answer_turn = summarize(await recv_response(ws))
+
+    return {"tool_turn": tool_turn, "answer_turn": answer_turn}
 
 
 async def _append_pcm16_chunks(ws, pcm16: bytes, chunk_bytes: int) -> None:
@@ -738,6 +863,30 @@ class TestQwen3OmniRealtimeWebSocket:
         assert output_duration_s > 5, (
             f"Expected an issue-like audio response longer than 5 seconds, got {output_duration_s:.2f}s"
         )
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_audio_response_parses_tool_call(self, omni_server) -> None:
+        """Audio turns must surface function calls, hide their markup, and speak the tool result."""
+        result = asyncio.run(_run_realtime_audio_tool_call(omni_server.host, omni_server.port, omni_server.model))
+
+        tool_turn = result["tool_turn"]
+        assert len(tool_turn["tool_calls"]) == 1, tool_turn["transcript"]
+        call = tool_turn["tool_calls"][0]
+        assert call["name"] == "get_weather"
+        assert "paris" in (call["arguments"] or "").lower()
+        for marker in ("<tool_call>", "</tool_call>"):
+            assert marker not in tool_turn["transcript"]
+        assert tool_turn["audio_after_tool_call"] == 0, tool_turn
+
+        answer_turn = result["answer_turn"]
+        assert answer_turn is not None
+        assert answer_turn["audio_deltas"] > 0, "the tool result turn produced no audio"
+        assert WEATHER_TOOL_ANSWER in answer_turn["transcript"]
+        for marker in ("<tool_call>", "</tool_call>"):
+            assert marker not in answer_turn["transcript"]
 
     @pytest.mark.advanced_model
     @pytest.mark.omni
