@@ -98,6 +98,10 @@ from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjecto
 logger = init_logger(__name__)
 
 
+def _is_scalar_quant_scale(name: str, tensor: torch.Tensor) -> bool:
+    return tensor.numel() == 1 and name.endswith((".input_scale", ".weight_scale", ".weight_scale_2"))
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -285,11 +289,16 @@ class HunyuanModel(HunYuanModel):
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                assert loaded_weight.shape[0] % den == 0
-                units = loaded_weight.shape[0] // den
-
                 param = params_dict[name]
                 weight_loader = param.weight_loader
+                if _is_scalar_quant_scale(name, loaded_weight):
+                    for shard_id, _ in split_param:
+                        weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(name)
+                    break
+
+                assert loaded_weight.shape[0] % den == 0
+                units = loaded_weight.shape[0] // den
                 offset = 0
                 for shard_id, num in split_param:
                     new_offset = offset + num * units
@@ -342,12 +351,16 @@ class HunyuanModel(HunYuanModel):
                     # here since otherwise we may skip experts with other
                     # available replicas.
                     weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
-                    assert loaded_weight.shape[0] % den == 0
-                    units = loaded_weight.shape[0] // den
+                    if _is_scalar_quant_scale(name, loaded_weight):
+                        shard = loaded_weight
+                    else:
+                        assert loaded_weight.shape[0] % den == 0
+                        units = loaded_weight.shape[0] // den
+                        shard = loaded_weight[offset * units : offset * units + units]
 
                     success = weight_loader(
                         param,
-                        loaded_weight[offset * units : offset * units + units],
+                        shard,
                         name_mapped,
                         shard_id=shard_id,
                         expert_id=expert_id,
