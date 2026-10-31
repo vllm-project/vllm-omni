@@ -21,6 +21,7 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
+    SupportsEagle3,
     SupportsMRoPE,
     SupportsMultiModal,
     SupportsPP,
@@ -145,6 +146,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
     SupportsPP,
+    SupportsEagle3,
     Qwen3OmniMoeConditionalGenerationMixin,
     CustomProcessMixin,
     SupportsMRoPE,
@@ -439,7 +441,24 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     def _thinker_capture_layer_indices(self) -> list[int]:
         accept_layer = getattr(self.talker_config, "accept_hidden_layer", None)
-        return [0, int(accept_layer)] if self.is_staged_run and accept_layer is not None else []
+        if not self.is_staged_run:
+            return []
+
+        indices = [0]
+        if accept_layer is not None:
+            indices.append(int(accept_layer))
+
+        # DFlash consumes a concatenation of target hidden states from the
+        # layers listed in its checkpoint.  The checkpoint ids refer to the
+        # post-layer states, while the Thinker capture API uses the same
+        # one-based convention as the upstream EAGLE interface.
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is not None and spec_config.use_dflash():
+            draft_config = spec_config.draft_model_config
+            dflash_config = getattr(draft_config.hf_config, "dflash_config", {})
+            indices.extend(int(layer_id) + 1 for layer_id in dflash_config.get("target_layer_ids", ()))
+
+        return sorted(set(indices))
 
     @classmethod
     async def buffer_realtime_audio(
@@ -528,6 +547,28 @@ class Qwen3OmniMoeForConditionalGeneration(
         return self.model.embed_input_ids(
             input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
         )
+
+    @torch.inference_mode()
+    def materialize_thinker_token_embeddings(self, token_ids: Iterable[int]) -> torch.Tensor:
+        """Materialize embeddings for verifier-committed Thinker tokens.
+        """
+        if self.model_stage != "thinker":
+            raise RuntimeError("Thinker token embeddings are only available on the Thinker stage")
+
+        # ``-1`` is the upstream sampler's empty-row sentinel.  It is not a
+        # Thinker token and must not be passed to PyTorch indexing, where it
+        # would otherwise alias the final embedding row.
+        ids = [int(token_id) for token_id in token_ids if int(token_id) >= 0]
+        device = self._module_device(self.thinker)
+        hidden_size = int(self.thinker_config.text_config.hidden_size)
+        if not ids:
+            return torch.empty((0, hidden_size), device=device, dtype=torch.bfloat16)
+
+        input_ids = torch.tensor(ids, dtype=torch.long, device=device).view(1, -1)
+        values = self.thinker.embed_input_ids(input_ids=input_ids)
+        if values.ndim == 3:
+            values = values[0]
+        return values.reshape(-1, values.shape[-1])
 
     def embed_multimodal(self, **kwargs):
         """Delegate to active model for multimodal processing."""
