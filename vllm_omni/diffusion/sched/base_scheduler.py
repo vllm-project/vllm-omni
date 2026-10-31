@@ -438,32 +438,36 @@ class BaseScheduler(ABC):
             running_units += self._request_units(head)
             candidates = candidates[1:]
 
-        index = 0
-        while index < len(candidates) and len(self._running) < self.max_num_running_reqs:
-            head = candidates[index]
-            head_cost = self._request_units(head)
-            if running_units + head_cost <= budget:
-                if not self._can_schedule_waiting(head):
-                    # Incompatible with the running batch key: it cannot be
-                    # admitted this cycle, so skip it rather than blocking
-                    # the rest of the queue.
-                    index += 1
-                    continue
-                if self._admit_state(head, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
-                    break
-                running_units += head_cost
-                index += 1
-                continue
+        # Anti-starvation: an aged waiting request gets the head slot even when
+        # it is not the score head. The waiting score is cost normalized, so
+        # with beta > 0 an old large request can sit behind younger cheap ones
+        # indefinitely; keying the reservation on the score head then never
+        # keeps a slot for it. Pick the oldest request that has aged past the
+        # threshold: admit it directly if it both fits the remaining budget and
+        # is compatible with the running batch, otherwise hold its gap so later
+        # admissions cannot eat it.  Compatibility is deliberately not part of
+        # the selection: an aged request that cannot join the current batch
+        # still needs the gap kept, or filling it would only prolong the batch.
+        remaining = budget - running_units
+        reserve_state = None
+        for state in candidates:
+            age = max(0.0, now - state.queued_at) if state.queued_at else 0.0
+            if age > reserve_time and (
+                reserve_state is None
+                or (state.queued_at or 0.0) < (reserve_state.queued_at or 0.0)
+            ):
+                reserve_state = state
 
-            # The highest-scored head does not fit; aging decides whether the
-            # remaining budget may be spent on lower-scored requests.
-            age = max(0.0, now - head.queued_at) if head.queued_at else 0.0
-            if age > reserve_time:
-                # Reservation mode: keep a gap for the aged head and admit only
-                # requests that fit into it, then stop admission so the gap
-                # survives until the head can be scheduled.
-                gap = budget - running_units - head_cost
-                for state in candidates[index + 1 :]:
+        if reserve_state is not None:
+            reserved_cost = self._request_units(reserve_state)
+            if reserved_cost > remaining or not self._can_schedule_waiting(reserve_state):
+                # Reservation mode: keep a gap for the aged request and admit
+                # only requests that fit into it, then stop admission so the
+                # gap survives until the reserved request can be scheduled.
+                gap = remaining - reserved_cost
+                for state in candidates:
+                    if state is reserve_state:
+                        continue
                     if len(self._running) >= self.max_num_running_reqs:
                         break
                     if not self._can_schedule_waiting(state):
@@ -475,22 +479,26 @@ class BaseScheduler(ABC):
                         break
                     gap -= cost
                 return
+            # The aged request fits: give it the head slot first, then admit in
+            # score order for whatever budget is left. Without this, cheaper
+            # younger requests in score order would consume the freed slot and
+            # the aged request would miss it again.
+            if self._admit_state(reserve_state, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
+                return
+            running_units += reserved_cost
+            candidates = [state for state in candidates if state is not reserve_state]
 
-            # Young head: skip-to-fit so it does not block cheaper requests
-            # from filling the remaining budget.
-            remaining = budget - running_units
-            for state in candidates[index + 1 :]:
-                if len(self._running) >= self.max_num_running_reqs:
+        # No aged request is blocked: admit in score order, skipping requests
+        # that do not fit so cheaper ones can fill the remaining budget.
+        index = 0
+        while index < len(candidates) and len(self._running) < self.max_num_running_reqs:
+            head = candidates[index]
+            head_cost = self._request_units(head)
+            if running_units + head_cost <= budget and self._can_schedule_waiting(head):
+                if self._admit_state(head, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
                     break
-                if not self._can_schedule_waiting(state):
-                    continue
-                cost = self._request_units(state)
-                if cost > remaining:
-                    continue
-                if self._admit_state(state, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
-                    break
-                remaining -= cost
-            return
+                running_units += head_cost
+            index += 1
 
     def _sorted_waiting_states(self) -> list[SchedulerRequestState]:
         """Order waiting requests by iDRR score, descending.
