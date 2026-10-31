@@ -2689,3 +2689,31 @@ def test_is_image_generation_stage_matrix():
     assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type="text"))
     assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=False))
     assert not is_image_generation_stage(SimpleNamespace(stage_type="llm", final_output=True, final_output_type=None))
+
+
+@pytest.mark.parametrize(
+    "overrides", [{}, {"guidance_scale": 0.0, "num_inference_steps": 7, "seed": 0, "flow_shift": 2.0, "n": 1}]
+)
+def test_generate_images_inherits_server_defaults(test_client, mock_async_diffusion, overrides):
+    defaults = {
+        "num_inference_steps": 50,
+        "num_outputs_per_prompt": 2,
+        "guidance_scale": 3.0,
+        "seed": 42,
+        "generator_device": "cpu",
+        "extra_args": {"flow_shift": 5.0, "keep": True},
+    }
+    test_client.app.state.args.default_sampling_params = json.dumps({"0": defaults})
+    response = test_client.post("/v1/images/generations", json={"prompt": "a cat", **overrides})
+    assert response.status_code == 200
+    params = mock_async_diffusion.captured_sampling_params_list[0]
+    assert params.num_inference_steps == overrides.get("num_inference_steps", 50)
+    assert params.guidance_scale == overrides.get("guidance_scale", 3.0)
+    assert params.seed == overrides.get("seed", 42)
+    assert params.num_outputs_per_prompt == overrides.get("n", 2)
+    assert params.generator_device == "cpu"
+    assert params.extra_args == {"flow_shift": overrides.get("flow_shift", 5.0), "keep": True}
+    params.extra_args["keep"] = False
+    response = test_client.post("/v1/images/generations", json={"prompt": "another cat"})
+    assert response.status_code == 200
+    assert mock_async_diffusion.captured_sampling_params_list[0].extra_args == {"flow_shift": 5.0, "keep": True}
