@@ -66,7 +66,9 @@ def _batch(rows: list[dict], *, pad_to: int | None = None):
         expanded_idx_mapping=torch.tensor(expanded_slots),
         expanded_local_pos=torch.tensor(local_pos, dtype=torch.int32),
         cu_num_logits=torch.tensor(cu_num_logits, dtype=torch.int32),
+        cu_num_logits_np=np.array(cu_num_logits),
         seq_lens=torch.tensor(seq_lens + [0] * 2, dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
     ), padded
 
 
@@ -557,6 +559,79 @@ def test_draft_verification_forces_codec_eos_per_row(mocker):
     for row in (1, 2):
         assert seen["logits"][row, 7] == 0 and torch.isinf(seen["logits"][row, :7]).all()
     assert out.sampled_token_ids.tolist() == [[3, 7], [7, 0]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the rejection kernels need CUDA")
+def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
+    from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45TalkerRejectionSampler
+
+    talker = _talker()
+    cap_prompt = 4096 - 100
+    limit = min(_OFFLINE_CODEC_MAX_NEW_TOKENS, 100) - 1
+    prompt_lens = {3: cap_prompt, 1: 4}
+    rows = [
+        # Input 5 then drafts 6 and 7; the second draft row reaches the length cap.
+        dict(slot=3, prompt_len=cap_prompt, computed=cap_prompt + limit - 2, span=[5, 6, 7], prefill=False, drafts=2),
+        # Empty condition at its prefill: forced EOS that min_tokens blanks below.
+        dict(slot=1, prompt_len=4, computed=0, span=[0] * 4, prefill=True),
+    ]
+    batch, padded = _batch(rows)
+    out = talker.make_omni_output_mrv2(
+        torch.zeros((padded, 4)),
+        input_batch=batch,
+        req_states=_req_states(prompt_lens),
+        model_intermediate_buffer=[{}, {"audio_state": {"finished": True}}],
+    )
+    valid = out.multimodal_outputs["meta"]["codec_frame_valid"]
+    assert talker._mrv2_forced_eos.tolist() == [False, True, True, True]
+
+    dev = torch.device("cuda")
+    for name, value in vars(batch).items():
+        if isinstance(value, torch.Tensor) and name != "seq_lens_cpu_upper_bound":
+            setattr(batch, name, value.to(dev))
+    talker._mrv2_forced_eos = talker._mrv2_forced_eos.to(dev)
+    prefill_len = torch.zeros(8, dtype=torch.int32, device=dev)
+    for slot, value in prompt_lens.items():
+        prefill_len[slot] = value
+
+    def apply_sampling_params(logits, *args):
+        logits = logits.float().clone()
+        logits[3, _EOS] = float("-inf")  # min_tokens on the prefill row
+        return logits
+
+    sampler = SimpleNamespace(
+        req_states=SimpleNamespace(prefill_len=SimpleNamespace(gpu=prefill_len), device=dev),
+        sampling_states=SimpleNamespace(
+            # Greedy target: a draft is accepted only if it is the row's argmax.
+            temperature=SimpleNamespace(gpu=torch.zeros(8, device=dev)),
+            seeds=SimpleNamespace(gpu=torch.zeros(8, dtype=torch.int64, device=dev)),
+            max_num_logprobs=lambda idx: NO_LOGPROBS,
+        ),
+        apply_sampling_params=apply_sampling_params,
+        logprobs_mode="raw_logprobs",
+        compute_nans=False,
+        use_fp64_gumbel=False,
+        return_sampling_mask=False,
+    )
+    spec_config = SimpleNamespace(
+        num_speculative_tokens=2, enable_adaptive_verification=False, rejection_sample_method="standard"
+    )
+    logits = torch.zeros(4, _EOS + 1, device=dev)
+    # Without the cap, the target would accept both drafts (6, then 7) and add 9.
+    for row, best in enumerate([6, 7, 9, 11]):
+        logits[row, best] = 10.0
+    output = MiniCPMO45TalkerRejectionSampler(sampler, spec_config, talker)(logits, batch)
+    num_sampled = output.num_sampled.tolist()
+    assert num_sampled == [2, 1]
+    assert output.num_rejected.tolist() == [1, 0]
+    assert output.sampled_token_ids[0, :2].tolist() == [6, _EOS]
+    assert output.sampled_token_ids[1, 0].item() == _EOS
+    # The runner hands Code2Wav each request's leading scheduled - rejected rows:
+    # input 5 and the accepted draft 6, both valid codes; the rejected draft 7 stays out.
+    kept = 3 - output.num_rejected[0].item()
+    assert batch.input_ids[:kept].tolist() == [5, 6] and valid[:kept].tolist() == [True, True]
 
 
 def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
