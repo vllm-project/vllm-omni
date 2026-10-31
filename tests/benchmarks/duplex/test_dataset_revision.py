@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,7 +74,8 @@ def test_existing_local_directory_with_at_preserves_literal_name(monkeypatch, tm
 def test_home_relative_local_directory_preserves_at_and_split_fallback(monkeypatch, tmp_path, collapsed):
     dataset = tmp_path / "dataset@revision"
     dataset.mkdir()
-    home_relative = "~/" + os.path.relpath(dataset, Path.home())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    home_relative = "~/dataset@revision"
     calls = []
 
     def fake_load_dataset(name, **kwargs):

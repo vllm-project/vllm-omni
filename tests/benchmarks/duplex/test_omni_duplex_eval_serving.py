@@ -18,6 +18,7 @@ import websockets
 from aiohttp import web
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
+from tests.helpers.duplex_artifacts import assert_duplex_artifact_publication
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_serving as adapter
 from vllm_omni.benchmarks.patch import patch
@@ -891,8 +892,6 @@ async def test_benchmark_bounds_decoded_media_and_shares_reference(tmp_path, pre
 
 
 def test_artifact_io_failure_preserves_service_results(tmp_path, prepared, monkeypatch):
-    from tests.dfx.perf.scripts.run_benchmark import assert_result
-
     samples = _samples(tmp_path)
     outputs = [patch.MixRequestFuncOutput(success=True) for _ in samples]
     for sample, output in zip(samples, outputs, strict=True):
@@ -907,14 +906,10 @@ def test_artifact_io_failure_preserves_service_results(tmp_path, prepared, monke
     assert summary["published"] == 0 and len(summary["artifact_errors"]) == 3
     assert all(output.success for output in outputs)
 
-    result = {"completed": len(outputs), "duplex_metric_aggregation": "response", "omni_duplex_eval": summary}
-    for metric in ("ttft", "audio_ttfp", "audio_rtf"):
-        result[f"num_{metric}_samples"] = len(outputs)
-        suffix = "" if metric == "audio_rtf" else "_ms"
-        for percentile in (50, 95):
-            result[f"p{percentile}_{metric}{suffix}"] = 1.0
     with pytest.raises(AssertionError, match="Omni-DuplexEval artifacts are incomplete"):
-        assert_result(result, {"dataset_name": "omni-duplex-eval", "duplex_performance_only": True}, len(outputs))
+        assert_duplex_artifact_publication(
+            {"omni_duplex_eval": summary}, {"dataset_name": "omni-duplex-eval"}, len(outputs)
+        )
 
 
 @pytest.mark.asyncio

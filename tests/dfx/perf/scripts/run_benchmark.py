@@ -22,6 +22,7 @@ from tests.dfx.conftest import (
     load_benchmark_configs,
     run_benchmark,
 )
+from tests.helpers.duplex_artifacts import assert_duplex_artifact_publication
 from tests.helpers.runtime import OmniServer
 
 # Optional JSON field ``mark`` is applied as pytest marks via
@@ -500,23 +501,6 @@ def _duplex_eval_score_floors_enforced(params: dict, hardware: object) -> bool:
     return hardware in calibrated
 
 
-def _assert_duplex_artifact_publication(result: dict, params: dict, num_prompt: int) -> None:
-    if params.get("dataset_name") == "omni-duplex-eval":
-        summary = result.get("omni_duplex_eval")
-        assert isinstance(summary, dict), "Omni-DuplexEval summary is missing"
-        assert summary.get("published") == num_prompt, "Omni-DuplexEval artifacts are incomplete"
-        assert summary.get("artifact_errors") == [], "Omni-DuplexEval artifact publication failed"
-    elif params.get("dataset_name") == "omniinteract":
-        summary = result.get("omniinteract")
-        assert isinstance(summary, dict), "OmniInteract summary is missing"
-        assert (summary.get("total"), summary.get("success"), summary.get("failed")) == (
-            num_prompt,
-            num_prompt,
-            0,
-        ), "OmniInteract requests did not all succeed"
-        assert summary.get("artifacts_complete") is True, "OmniInteract artifacts are incomplete"
-
-
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
     summary = result["omni_duplex_eval"]
     sessions = result.get("duplex_session_metrics")
@@ -561,7 +545,7 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
-    _assert_duplex_artifact_publication(result, params, num_prompt)
+    assert_duplex_artifact_publication(result, params, num_prompt)
     if params.get("duplex_performance_only"):
         assert result.get("duplex_metric_aggregation") == "response", "Wrong duplex measurement unit"
         for metric in ("ttft", "audio_ttfp", "audio_rtf"):
