@@ -16,7 +16,7 @@ A previous API prompt can be a baseline when its topology matches the new plan. 
 
 ## 3. Inspect and plan
 
-Probe source resolution, duration, frame count and nominal/average FPS. Start with timestamped contact sheets (for example, 1 FPS), then inspect more densely around entrances, occlusion, interactions and cuts. Scene-change detection can suggest candidates; thresholds such as 0.3 or 0.15 are adjustable starting points, not required settings.
+Probe source resolution, duration, frame count and nominal/average FPS. Before inspecting and planning, normalize a working copy to 24-FPS CFR unless the user explicitly chose another FPS; preserve the original, playback timing and soundtrack. Verify the working copy's duration and frame rate, and use that timeline for all segment calculations. Start with timestamped contact sheets (for example, 1 FPS), then inspect more densely around entrances, occlusion, interactions and cuts. Scene-change detection can suggest candidates; thresholds such as 0.3 or 0.15 are adjustable starting points, not required settings.
 
 Complete the shot/person timelines and segment plan in [video-segment.md](video-segment.md). Derive generated and retained frame ranges from actual FPS, model alignment, overlap and generation direction. Check complete source coverage, including the tail. Use independent anchors across real cuts when appropriate; derive continuation guide indices from the specific raw or trimmed frame batch connected as input, excluding unwanted alignment tails.
 

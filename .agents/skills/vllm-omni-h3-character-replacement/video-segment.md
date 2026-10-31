@@ -4,6 +4,8 @@ Use this guide when dividing source video into character-replacement clips or re
 
 ## Visual inspection comes first
 
+First probe the source and create a 24-FPS constant-frame-rate working copy unless the user explicitly requests another FPS. Use frame-rate conversion (for example, FFmpeg `fps=24`), not playback-speed changes. Preserve the original media and soundtrack; verify duration and audio alignment. Inspect this working copy and use its frame timeline consistently for source cuts, segment boundaries and guide/trim arithmetic. If already confirmed 24-FPS CFR, reuse it without another conversion.
+
 Use a vision-capable model to examine the source footage before choosing segments. Inspect the reference images too, then distinguish their target appearances from the source people. If direct video viewing is unavailable, extract timestamped frames or contact sheets with a local media tool and inspect the images visually. Metadata and scene-change scores help navigation; they do not establish person identity or action continuity.
 
 Survey the full video, not only the first frame. Inspect more densely around shot changes, entrances, exits, crossings, heavy occlusion and interactions involving multiple people. Play or inspect consecutive frames around a proposed boundary; sparse thumbnails alone can miss a person entering briefly or exchanging positions. Record uncertain observations and inspect additional frames instead of guessing. If visual inspection is unavailable, report the blocked planning step rather than presenting a visually verified plan.
@@ -16,6 +18,8 @@ Create two linked records before selecting boundaries:
 Inspect duration, FPS and frame count. For variable-frame-rate media, use timestamps or explicitly normalize the working clip; do not assume frame index equals time multiplied by nominal FPS. Reference numbering follows actual input order; source-track IDs are independent of reference numbering and screen position.
 
 ## Choose segments for multiple replacements
+
+Observed character-replacement runs have been more stable with segments around 5 seconds; longer segments are more prone to identity drift and visual breakdown. Use roughly 5 seconds as an initial planning target, then adjust boundaries to preserve coherent actions and source cuts. This is a quality heuristic, not a model duration limit or a reason to split every clip into equal lengths. Validate longer segments explicitly before retaining them.
 
 Choose boundaries using the shot timeline and the changing set of selected people. Prefer the fewest segments that preserve coherent action, distinguishable identities and backend duration limits. Equal-duration slicing and splitting at every entrance or exit are not defaults.
 
