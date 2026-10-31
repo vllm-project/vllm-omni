@@ -791,6 +791,15 @@ class VoxCPM2ModelState(OmniModelState):
                 for cache in self.vae_feature_cache.values():
                     cache[req_index].zero_()
             fresh = VoxCPM2RequestState(request_id="")
+            # An in-flight stop-mask D2H may still be writing into this
+            # state's pinned buffer (the talker retains only the GPU source,
+            # not the pinned pages). Synchronize before the fresh-dataclass
+            # copy clears pending_stop_mask_cpu/event, or the side-stream DMA
+            # lands in freed pages on an abort between precompute and
+            # compute_logits.
+            event = getattr(state, "pending_stop_mask_event", None)
+            if event is not None:
+                event.synchronize()
             for field in dataclasses.fields(state):
                 setattr(state, field.name, getattr(fresh, field.name))
         super().remove_request(req_index_or_id)

@@ -246,10 +246,77 @@ class TestStateEvictionContract:
 
         talker._precompute_stop_flags_for_audio_collect(states)
 
+        # Async contract: the comparison result is staged in pinned memory
+        # and resolved lazily through the event-synchronized latch; nothing
+        # is latched until a consumer reads it.
+        assert states[0].pending_stop_mask_cpu is not None
+        assert states[0].pending_stop_mask_event is not None
+        assert states[0].precomputed_is_stopping is None
+        assert states[1].precomputed_is_stopping is None
+
+        # Pin the synchronization semantics: wrap the recorded event in a
+        # counting proxy. If the read path ever skips event.synchronize(),
+        # the assertions below fail.
+        class _RecordingEvent:
+            def __init__(self, inner):
+                self._inner = inner
+                self.sync_calls = 0
+
+            def synchronize(self):
+                self.sync_calls += 1
+                self._inner.synchronize()
+
+        recorder = _RecordingEvent(states[0].pending_stop_mask_event)
+        states[0].pending_stop_mask_event = recorder
+        recorder_keep = states[1].pending_stop_mask_event
+        states[1].pending_stop_mask_event = _RecordingEvent(recorder_keep)
+
+        # Resolving must latch the pinned bit, which after
+        # event.synchronize() matches stop_logits[:, 1] > stop_logits[:, 0]
+        # for each request.
+        assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert recorder.sync_calls >= 1, "the pinned read must synchronize the copy event first"
         assert states[0].precomputed_is_stopping is True
         assert states[0].is_stopping is True
+        assert talker._should_stop_from_cached_logits(states[1]) is False
         assert states[1].precomputed_is_stopping is False
         assert states[1].is_stopping is False
+
+    def test_length_limit_discard_synchronizes_and_clears_pending(self) -> None:
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required to exercise the stop-mask discard path")
+
+        _, RState, _ = _voxcpm2_talker_mod()
+        talker = _make_bare_talker()
+        talker._audio_emit_every = 2
+        states = [
+            RState(request_id="limit", precomputed_stop_logits=torch.tensor([[0.0, 1.0]], device="cuda")),
+        ]
+
+        talker._precompute_stop_flags_for_audio_collect(states)
+        assert states[0].pending_stop_mask_event is not None
+
+        class _RecordingEvent:
+            def __init__(self, inner):
+                self._inner = inner
+                self.sync_calls = 0
+
+            def synchronize(self):
+                self.sync_calls += 1
+                self._inner.synchronize()
+
+        recorder = _RecordingEvent(states[0].pending_stop_mask_event)
+        states[0].pending_stop_mask_event = recorder
+
+        # The length-limit short-circuit must DISCARD (synchronize + clear)
+        # instead of resolving the pending copy: no in-flight DMA may
+        # outlive its buffer on this path either.
+        states[0].audio_length_limit_reached = True
+        assert talker._should_stop_from_cached_logits(states[0]) is True
+        assert recorder.sync_calls >= 1, "the discard must synchronize the in-flight copy first"
+        assert states[0].pending_stop_mask_cpu is None
+        assert states[0].pending_stop_mask_event is None
+        assert states[0].precomputed_is_stopping is None, "the discard path must not latch a stop decision"
 
     def test_on_requests_finished_defers_cleanup(self) -> None:
         talker = _make_bare_talker()
