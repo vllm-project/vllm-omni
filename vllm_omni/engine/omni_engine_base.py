@@ -74,7 +74,12 @@ _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
 # Output messages one serving-loop wakeup takes before yielding the event loop.
 _OUTPUT_DRAIN_MAX_BATCH = 256
+
 _ConfigResolutionResult = OmniConfigResolution | tuple[str | None, list[Any], str | None]
+
+
+def _orchestrator_dead_error() -> RuntimeError:
+    return RuntimeError("Orchestrator died unexpectedly. See logs above.")
 
 
 def load_and_resolve_stage_configs(
@@ -531,6 +536,15 @@ class OmniEngineBase:
             finally:
                 asyncio.set_event_loop(None)
                 loop.close()
+                # A serving loop waiting in ``get_outputs_async`` cannot see
+                # this thread exit on its own and would wait out its liveness
+                # timeout, so signal death through the queue on ANY exit:
+                # Exception, BaseException, or a clean return. This runs after
+                # the loop cleanup so output written by cancelled tasks still
+                # drains ahead of the shutdown, as does the fatal message
+                # enqueued above on a crash.
+                if self._output_sink is not None:
+                    self._output_sink.shutdown()
 
     def _validate_deployment(self) -> None:
         """Seam: check ``pipeline_config`` / ``deploy_config`` before stages start (default: nothing)."""
@@ -720,8 +734,12 @@ class OmniEngineBase:
             return msg
         except queue.Empty:
             if not self.is_alive():
-                raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
+                raise _orchestrator_dead_error()
             return None
+        except Exception as exc:
+            if is_janus_sync_queue_shutdown(exc):
+                raise _orchestrator_dead_error() from None
+            raise
 
     def _invalidate_mm_cache_on_error(self, msg: EngineQueueMessage) -> None:
         if not isinstance(msg, ErrorMessage) or msg.stage_id != 0 or not msg.mm_cache_miss_hashes:
@@ -734,7 +752,13 @@ class OmniEngineBase:
 
     def _drain_output_messages(self, max_messages: int) -> list[EngineQueueMessage]:
         assert self._output_sink is not None
-        messages = self._output_sink.drain(max_messages)
+        try:
+            messages = self._output_sink.drain(max_messages)
+        except Exception as exc:
+            # A queue shut down by the exiting orchestrator thread is engine death.
+            if is_janus_sync_queue_shutdown(exc):
+                raise _orchestrator_dead_error() from None
+            raise
         # Invalidate before the frontend routes (or drops) request-scoped errors.
         for msg in messages:
             self._invalidate_mm_cache_on_error(msg)
@@ -750,7 +774,10 @@ class OmniEngineBase:
         Returns the messages queued so far (up to ``max_messages``), waiting
         for the orchestrator's next put when none are queued. Returns an empty
         list after ``timeout`` with the orchestrator alive, so the caller keeps
-        its liveness check.
+        its liveness check. An exiting orchestrator thread shuts the sink down
+        (see ``_bootstrap_orchestrator``): queued output, including a crash's
+        fatal ``ErrorMessage``, is still returned, after which this raises
+        ``RuntimeError`` at once rather than at the next timeout.
         """
         sink = self._output_sink
         assert sink is not None
@@ -768,7 +795,7 @@ class OmniEngineBase:
             # orchestrator thread died) is still delivered before giving up.
             msgs = self._drain_output_messages(max_messages)
             if not msgs and not self.is_alive():
-                raise RuntimeError("Orchestrator died unexpectedly. See logs above.") from None
+                raise _orchestrator_dead_error() from None
             return msgs
         return self._drain_output_messages(max_messages)
 
