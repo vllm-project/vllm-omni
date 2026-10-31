@@ -16,9 +16,8 @@ def test_rows_map_to_batch_positions_and_copy_once():
     codes = torch.arange(6, dtype=torch.long).reshape(2, 3)
     snapshot = _CodeRowsSnapshot(codes, [2, 0], 4)
     assert isinstance(snapshot, PackedOutputSnapshot) and snapshot.producer_event is None
-    rows = snapshot["codes"]["audio"]
-    assert [tuple(row.shape) for row in rows] == [(1, 3), (0, 3), (1, 3), (0, 3)]
-    assert torch.equal(rows[2], codes[:1]) and torch.equal(rows[0], codes[1:])
+    # No per-request device views: the runner only reads the host copy.
+    assert snapshot["codes"]["audio"] is codes
 
     copies = []
 
@@ -28,6 +27,7 @@ def test_rows_map_to_batch_positions_and_copy_once():
 
     host = snapshot.copy_to_cpu(copy)["codes"]["audio"]
     assert len(copies) == 1 and copies[0] is codes
+    assert [tuple(row.shape) for row in host] == [(1, 3), (0, 3), (1, 3), (0, 3)]
     codes.zero_()
     assert host[2].tolist() == [[0, 1, 2]] and host[0].tolist() == [[3, 4, 5]]
     assert host[1].numel() == 0 and host[1].dtype == torch.long
@@ -56,10 +56,12 @@ def test_partitioned_copy_matches_runner_partition_of_generic_rows(with_first_au
     assert client is None
     assert [list(p) for p in host.inter_stage] == [list(p) for p in expected]
     for got, want in zip(host.inter_stage, expected):
-        assert got["codes.audio"].dtype == want["codes.audio"].dtype
-        assert torch.equal(got["codes.audio"], want["codes.audio"])
+        # NumPy views of the one owned host copy; the raw processor reads NumPy.
+        assert isinstance(got["codes.audio"], np.ndarray)
+        assert got["codes.audio"].dtype == want["codes.audio"].numpy().dtype
+        assert got["codes.audio"].shape == tuple(want["codes.audio"].shape)
+        assert np.array_equal(got["codes.audio"], want["codes.audio"].numpy())
         if with_first_audio:
             assert torch.equal(got["meta.first_audio"], want["meta.first_audio"])
-    if with_first_audio:
-        flags.zero_()
-        assert bool(host.inter_stage[2]["meta.first_audio"])
+    shared = [row.base for row in (p["codes.audio"] for p in host.inter_stage) if row.size]
+    assert len({id(base) for base in shared}) == 1

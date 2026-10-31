@@ -43,12 +43,13 @@ def _plain(value):
     return value
 
 
-def _output(rng, host):
+def _output(rng, host, as_numpy=False):
     kind = rng.random()
     if kind < 0.08:
         return None
     if kind < 0.14:
-        return {"codes": {"audio": torch.empty((0, _NQ), dtype=torch.long)}}
+        empty = torch.empty((0, _NQ), dtype=torch.long)
+        return {"codes": {"audio": empty.numpy() if as_numpy else empty}}
     rows = 2 if kind < 0.2 else 1
     frames = torch.randint(0, 1024, (rows, _NQ))
     for row in range(rows):
@@ -56,9 +57,10 @@ def _output(rng, host):
             frames[row] = _PAD
     if kind < 0.24:
         frames = frames[0]  # 1-D frame
-    # Like the runner's request snapshot: views of one per-step host tensor.
+    # Like the runner's request snapshot: views of one per-step host tensor
+    # (NumPy views when the MRV2 Local snapshot partitions the host copy).
     host.append(frames)
-    return {"codes": {"audio": frames}}
+    return {"codes": {"audio": frames.numpy() if as_numpy else frames}}
 
 
 def _publish(tm, req_id, payload):
@@ -78,7 +80,8 @@ def _publish(tm, req_id, payload):
     ],
 )
 @pytest.mark.parametrize("direct_first", [False, True])
-def test_batch_matches_scalar(extra, direct_first):
+@pytest.mark.parametrize("as_numpy", [False, True])
+def test_batch_matches_scalar(extra, direct_first, as_numpy):
     rng = random.Random(0)
     torch.manual_seed(0)
     scalar_tm, batch_tm = _tm(dict(extra)), _tm(dict(extra))
@@ -87,7 +90,7 @@ def test_batch_matches_scalar(extra, direct_first):
     for _ in range(120):
         host: list[torch.Tensor] = []
         requests = [SimpleNamespace(external_req_id=req_id, request_id=f"internal-{req_id}") for req_id in live]
-        outputs = [_output(rng, host) for _ in live]
+        outputs = [_output(rng, host, as_numpy) for _ in live]
         if direct_first:
             for output in outputs:
                 if output is not None and rng.random() < 0.15:

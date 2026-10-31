@@ -15,6 +15,7 @@ from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
+from vllm_omni.core.sched.duplex_stage_work import parse_perf_chunk, request_perf_chunk, set_request_perf_chunk
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
@@ -396,6 +397,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         confirmed_num_computed_tokens: int | None = None,
         segment_generation: int | None = None,
         force_request_finished: bool = False,
+        duplex_perf_chunk: tuple[int, int] | None = None,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -425,6 +427,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 the terminal has to be enqueued before ``finish_requests``,
                 because ``finish_requests`` skips requests that already report
                 ``is_finished()``. See ``_finish_parked_streaming_session``.
+            duplex_perf_chunk: the duplex chunk the producing step worked on
+                (RFC #8325), captured before a queued update can replace it;
+                defaults to the request's current chunk.
         """
         task = self._admit_save(
             multimodal_output,
@@ -435,6 +440,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             segment_generation,
             force_request_finished,
             snapshot=self.custom_process_next_stage_input_func is not None,
+            duplex_perf_chunk=duplex_perf_chunk,
         )
         if task is not None:
             self._pending_save_reqs.append(task)
@@ -469,6 +475,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         force_request_finished: bool = False,
         *,
         snapshot: bool,
+        duplex_perf_chunk: tuple[int, int] | None = None,
     ) -> dict[str, Any] | None:
         """Per-request admission of a chunk; returns the task to queue, or None."""
         is_finished = force_request_finished or (request.is_finished() and not request.resumable)
@@ -504,6 +511,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_segment_finished": is_segment_finished,
             "new_token_ids": tuple(int(token_id) for token_id in (new_token_ids or ())),
             "segment_generation": generation,
+            # Captured on the scheduler thread: the save loop may run after the next chunk's update.
+            "duplex_perf_chunk": duplex_perf_chunk if duplex_perf_chunk is not None else request_perf_chunk(request),
         }
 
         reject_reason = None
@@ -627,6 +636,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 payload_data["meta"] = meta
             payload_finished = self._is_truthy_scalar(meta.get("finished"))
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
+            set_request_perf_chunk(request, parse_perf_chunk(meta.get("duplex_perf_chunk")))
             if self.model_mode == "ar":
                 was_resumable = bool(getattr(request, "resumable", False))
                 meta["streaming_prompt_recompute"] = False
@@ -961,6 +971,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         if payload_data.meta.is_segment_finished is None:
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+        perf_chunk = task.get("duplex_perf_chunk")
+        if perf_chunk is not None:
+            payload_data.meta.duplex_perf_chunk = list(perf_chunk)
 
         if sender_token is not None and not self._sender_generation_is_active(
             external_req_id, sender_token, is_terminal=is_finished
@@ -1171,6 +1184,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """Clear sender state while ``_sender_state_lock`` is held."""
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
+        getattr(self, "_ming3_chunk_state", {}).pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
         getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)
@@ -1661,6 +1675,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self,
         scheduler_output: Any,
         requests: dict[str, Request] | None = None,
+        *,
+        consume_chunks: bool = True,
     ) -> None:
         """
         Add additional info for cached requests and
@@ -1675,7 +1691,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
-        self._clear_chunk_ready(scheduler_output)
+        if consume_chunks:
+            self._clear_chunk_ready(scheduler_output)
+
+    def mark_chunk_consumed(self, request_id: str) -> None:
+        """Release an input only after its generation output is complete."""
+        self.requests_with_ready_chunks.discard(request_id)
 
     @staticmethod
     def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:

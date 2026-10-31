@@ -1,18 +1,18 @@
 [
     {
-        "test_name": "test_minicpmo_4_5_stability_ready",
-        "description": "MiniCPM-o-4.5 ready deploy + seed-tts chat/audio stability (from perf test_minicpmo_4_5_ready)",
+        "test_name": "test_minicpmo_4_5_stability",
+        "description": "MiniCPM-o-4.5 deploy + seed-tts chat/audio stability (from perf test_minicpmo_4_5_ready)",
         "mark": [
             {
                 "hardware_marks": {
                     "res": {
-                        "cuda": "H800"
+                        "cuda": "H800",
+                        "npu": "A3"
                     },
                     "num_cards": 1
                 }
             },
             "local_model",
-            "slow",
             "omni"
         ],
         "server_params": {

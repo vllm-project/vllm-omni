@@ -10,12 +10,68 @@ import torch
 from vllm_omni.model_executor.models.minicpmo_4_5 import vision_fused
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import MiniCPMO45Stage0DuplexRuntime
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
+    MiniCPMO45OmniLLMForConditionalGeneration,
+    MiniCPMOConfig,
+    SiglipAttention,
+    SiglipSdpaAttention,
     SiglipVisionConfig,
     SiglipVisionTransformer,
     _vision_encode_paths,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    "is_cuda,session_mode,dtype,default_attention",
+    [
+        (True, "duplex", torch.bfloat16, "eager"),
+        (True, "duplex", torch.float16, "sdpa"),
+        (True, "turn", torch.bfloat16, "sdpa"),
+        (False, "duplex", torch.bfloat16, "sdpa"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("engine_attention", "vision_attention", "expected"),
+    [
+        (None, None, None),
+        (None, "sdpa", SiglipSdpaAttention),
+        (None, "eager", SiglipAttention),
+        ("eager", "sdpa", SiglipAttention),
+        ("sdpa", "eager", SiglipSdpaAttention),
+    ],
+)
+def test_thinker_vision_attention_defaults_and_overrides(
+    monkeypatch, engine_attention, vision_attention, expected, is_cuda, session_mode, dtype, default_attention
+):
+    from vllm_omni import platforms
+    from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni_llm as module
+
+    monkeypatch.setattr(platforms.current_omni_platform, "is_cuda", lambda: is_cuda)
+    vision = SiglipVisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=4, image_size=28, patch_size=2
+    )
+    config = MiniCPMOConfig(
+        hidden_size=128, query_num=4, init_audio=False, drop_vision_last_layer=False, vision_config=vision.to_dict()
+    )
+    config.vision_config._attn_implementation = vision_attention
+    llm = torch.nn.Module()
+    llm.config = SimpleNamespace(hidden_size=128)
+    llm.make_empty_intermediate_tensors = lambda *args, **kwargs: None
+    monkeypatch.setattr(module, "init_vllm_registered_model", lambda **kwargs: llm)
+    model_config = SimpleNamespace(
+        hf_config=config,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda modality: 1),
+        enforce_eager=True,
+        session_mode=session_mode,
+        dtype=dtype,
+        _attn_implementation=engine_attention,
+    )
+    model = MiniCPMO45OmniLLMForConditionalGeneration(vllm_config=SimpleNamespace(model_config=model_config))
+    if expected is None:
+        expected = SiglipAttention if default_attention == "eager" else SiglipSdpaAttention
+    assert type(model.vpm.encoder.layers[0].self_attn) is expected
+    assert model.resampler.attn_implementation == (engine_attention or vision_attention or default_attention)
 
 
 def test_fused_layers_match_eager_packed_layers() -> None:

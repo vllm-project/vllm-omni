@@ -70,6 +70,7 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
                 model_config=self.model_config,
                 is_pooling_model=self.is_pooling_model,
                 speculative_config=self.speculative_config,
+                model_cache_policy=self._omni_cache_policy,
             )
             if cfg is not None:
                 self._omni_prefix_cache_cfg = cfg
@@ -462,7 +463,9 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
             self._finalize_dump_data(dump=False)
             return hidden_states, hidden_states
 
-    def _model_forward(
+    # Ascend passes the padded token count positionally; keep its native
+    # signature when overriding the GPU helper in this multiple-inheritance adapter.
+    def _model_forward(  # type: ignore[override]
         self,
         num_tokens_padded: int,
         input_ids: torch.Tensor | None = None,
@@ -485,6 +488,12 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
 
         forward_context = get_forward_context()
         assert forward_context is not None
+
+        # Match Ascend's runner: FULL replay needs the attention backend to
+        # select the updatable-graph path and refresh dynamic attention tasks.
+        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            if hasattr(self.model, "set_attn_backend"):
+                self.model.set_attn_backend(self.attn_backend)
 
         model_inputs: dict[str, Any] = {
             "input_ids": input_ids,
