@@ -97,6 +97,7 @@ class CausVidWanPipeline(nn.Module):
     supports_request_batch = True
     # Skip engine dummy: num_inference_steps=2 breaks vertical S=D+1.
     dummy_run_num_frames: ClassVar[int] = 0
+    _transformer_cls: ClassVar[type[StageWanTransformer]] = StageWanTransformer
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
@@ -137,7 +138,7 @@ class CausVidWanPipeline(nn.Module):
             transformer_config = loaded or None
         except Exception as exc:  # noqa: BLE001
             logger.warning("CausVidWan: could not load transformer config from %s: %s", model_path, exc)
-        self.transformer = StageWanTransformer(
+        self.transformer = self._transformer_cls(
             num_layers=int(geo["num_layers"]),
             dim=int(geo["dim"]),
             num_heads=int(geo["num_heads"]),

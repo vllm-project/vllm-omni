@@ -13,6 +13,8 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     group_of_block,
     is_group_boundary,
     max_local_blocks,
+    rank_of_block,
+    replica_of,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -416,3 +418,50 @@ def test_same_step_clean_sink_plan(steps, groups, blocks, history, chunks):
         if chunk and rank // groups != steps - 1:
             sink = (0, steps, block)
             assert sum(x.version == sink and x.dst == rank for x in transfers) == 1
+
+
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_four_step_same_step_has_local_history(groups):
+    schedule = CellSchedule(
+        chunks=24,
+        num_denoise_steps=4,
+        step_replicas=4,
+        layer_groups=groups,
+        ordering=Ordering.SAME_STEP,
+        kv_history_chunks=18,
+        blocks=groups * 2,
+    )
+    plan = build_cell_plan(schedule)
+    tasks = set()
+    sink_transfers = set()
+    for tick in range(plan.num_ticks):
+        for transfer in plan.transfers(tick):
+            assert transfer.version[0:2] == (0, 4)
+            assert transfer.src == rank_of_block(4, transfer.version[2], schedule)
+            sink_transfers.add((transfer.version, transfer.dst))
+        for rank in range(plan.world):
+            assert all(cell[0:2] == (0, 4) for cell in plan.wait_ready(tick, rank))
+            task = plan.task(tick, rank)
+            if task is None:
+                continue
+            assert task not in tasks
+            tasks.add(task)
+            chunk, step, block = task
+            assert 0 <= step <= 4
+            if step == 4:
+                assert chunk == 0
+            assert replica_of(step, schedule) == rank // groups
+            assert rank_of_block(step, block, schedule) == rank
+            expected = {(prev, step, block) for prev in range(max(1, chunk - 18), chunk)}
+            if chunk:
+                expected.add((0, 4, block))
+            sources = plan.sources(task, rank)
+            assert {source.version for source in sources} == expected
+            for source in sources:
+                if source.version[0:2] == (0, 4):
+                    assert source.owner == rank_of_block(4, block, schedule)
+                else:
+                    assert source.owner == rank
+                assert plan.completion_tick(source.version) < tick
+    assert len(sink_transfers) == 3 * schedule.num_blocks
+    assert len(tasks) == 24 * 4 * schedule.num_blocks + schedule.num_blocks
