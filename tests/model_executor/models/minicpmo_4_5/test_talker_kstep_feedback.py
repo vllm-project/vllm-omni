@@ -1478,8 +1478,8 @@ def test_host_pipeline_lg_dev_matches_eager_greedy():
     hidden = torch.ones(1, 8)
     _bias_head_to(model, 42)
     eager = model._sample_audio_code_host(hidden, torch.tensor([10, 11]), "eager", {}, 0, 0, 100, False)
-    # The frame loop submits an already-flattened row; match that contract.
-    lg_dev = model.head_code[0](hidden).detach().reshape(-1)
+    # Mirror the frame loop's submission order (float, flatten, detach).
+    lg_dev = model.head_code[0](hidden).float().reshape(-1).detach()
     piped = model._sample_audio_code_host(hidden, torch.tensor([10, 11]), "piped", {}, 0, 0, 100, False, lg_dev=lg_dev)
     assert piped == eager == (42, False, True)
 
