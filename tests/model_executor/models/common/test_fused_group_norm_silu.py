@@ -7,6 +7,8 @@ Tests numeric correctness against PyTorch native implementation:
     F.silu(F.group_norm(x, num_groups, weight, bias, eps))
 """
 
+import importlib
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -509,6 +511,114 @@ def test_split_reduction_is_deterministic(monkeypatch):
     assert torch.equal(first, reference), "autotune warm-up should have settled by the second call"
     for _ in range(4):
         assert torch.equal(fused_group_norm_silu(x, weight, bias, 32, 1e-6), reference)
+
+
+# ---------------------------------------------------------------------------
+# Per-frame statistics
+# ---------------------------------------------------------------------------
+# ``per_frame=True`` normalizes every frame of an (N, C, T, *spatial) input on its
+# own, which is the GroupNorm causal video VAEs apply through
+# ``rearrange(x, "n c t h w -> (n t) c h w")``.
+
+
+def _per_frame_reference(x, weight, bias, num_groups=32, eps=1e-6):
+    """fp32 eager GroupNorm + SiLU over the ``(n t) c ...`` transposed frames."""
+    n, c, t = x.shape[:3]
+    frames = x.float().transpose(1, 2).reshape(n * t, c, *x.shape[3:])
+    out = F.silu(F.group_norm(frames, num_groups, weight.float(), bias.float(), eps))
+    return out.reshape(n, t, c, *x.shape[3:]).transpose(1, 2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(1, 128, 5, 30, 53), (2, 64, 3, 16, 16), (1, 32, 2, 7, 9)])
+def test_per_frame_matches_eager(dtype, shape):
+    """Each frame is normalized with its own statistics."""
+    torch.manual_seed(0)
+    C, T = shape[1], shape[2]
+    x = torch.randn(*shape, device="cuda", dtype=torch.float32)
+    # A different scale and offset per frame: statistics taken across frames, or
+    # from a neighbouring frame, are then far outside tolerance.
+    x = x * torch.linspace(0.5, 3.0, T, device="cuda").view(1, 1, T, 1, 1)
+    x = (x + torch.linspace(-1.0, 1.0, T, device="cuda").view(1, 1, T, 1, 1)).to(dtype)
+    weight = torch.randn(C, device="cuda", dtype=dtype)
+    bias = torch.randn(C, device="cuda", dtype=dtype)
+
+    fused_out = fused_group_norm_silu(x, weight, bias, 32, 1e-6, per_frame=True)
+    ref_out = _per_frame_reference(x, weight, bias).to(dtype)
+
+    assert fused_out.shape == x.shape
+    assert fused_out.is_contiguous()
+    rtol, atol = _tolerance(dtype)
+    torch.testing.assert_close(fused_out, ref_out, rtol=rtol, atol=atol)
+
+
+def test_per_frame_single_frame_is_plain_layout():
+    """T = 1 is the plain (N, C, spatial) layout, so both paths are bit-identical."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 64, 1, 16, 16, device="cuda", dtype=torch.float16)
+    weight = torch.randn(64, device="cuda", dtype=torch.float16)
+    bias = torch.randn(64, device="cuda", dtype=torch.float16)
+
+    per_frame = fused_group_norm_silu(x, weight, bias, 32, 1e-6, per_frame=True)
+    plain = fused_group_norm_silu(x, weight, bias, 32, 1e-6)
+    assert torch.equal(per_frame, plain)
+
+
+def test_per_frame_split_reduction(monkeypatch):
+    """Per-frame rows on the split path, with B > 1 and a ragged spatial tail.
+
+    Workspace rows are indexed by (sample, frame, group); every row gets its own
+    scale so a row read with another row's statistics fails the comparison.
+    """
+    monkeypatch.setenv(_SPLIT_WAVES_ENV, "8")
+    torch.manual_seed(0)
+    B, C, T, H, W = 2, 64, 3, 96, 130
+    x = torch.randn(B, C, T, H, W, device="cuda", dtype=torch.float32)
+    x = x * torch.linspace(0.5, 2.0, B * T, device="cuda").view(B, 1, T, 1, 1)
+    weight = torch.randn(C, device="cuda")
+    bias = torch.randn(C, device="cuda")
+
+    assert pick_split(H * W, B * T, 32, x.device)[0] > 1, "test premise: this shape should take the split path"
+
+    fused_out = fused_group_norm_silu(x, weight, bias, 32, 1e-6, per_frame=True)
+    torch.testing.assert_close(fused_out, _per_frame_reference(x, weight, bias), rtol=1e-5, atol=1e-6)
+
+
+def test_round_norm_output_follows_eager_fp16_boundary():
+    """``round_norm_output`` feeds SiLU the fp16 GroupNorm output, as eager does.
+
+    Eager fp16 ``F.silu(F.group_norm(x))`` stores the normalized value in fp16
+    before SiLU reads it. Rounding at the same point must not match eager worse
+    than skipping it does.
+    """
+    torch.manual_seed(0)
+    n, c, t, h, w = 1, 128, 4, 32, 32
+    x = torch.randn(n, c, t, h, w, device="cuda", dtype=torch.float16)
+    weight = torch.randn(c, device="cuda", dtype=torch.float16)
+    bias = torch.randn(c, device="cuda", dtype=torch.float16)
+
+    frames = x.transpose(1, 2).reshape(n * t, c, h, w)
+    eager = F.silu(F.group_norm(frames, 32, weight, bias, 1e-6)).reshape(n, t, c, h, w).transpose(1, 2)
+    rounded = fused_group_norm_silu(x, weight, bias, 32, 1e-6, per_frame=True, round_norm_output=True)
+    unrounded = fused_group_norm_silu(x, weight, bias, 32, 1e-6, per_frame=True)
+
+    torch.testing.assert_close(rounded, eager, rtol=2e-3, atol=2e-3)
+    assert (rounded != eager).sum() <= (unrounded != eager).sum()
+
+
+def test_per_frame_fallback_is_contiguous(monkeypatch):
+    """Without Triton the per-frame path returns contiguous NCTHW, like the kernel."""
+    module = importlib.import_module("vllm_omni.model_executor.models.common.ops.fused_group_norm_silu")
+    monkeypatch.setattr(module, "HAS_TRITON", False)
+    torch.manual_seed(0)
+    x = torch.randn(1, 64, 3, 8, 8)
+    weight = torch.randn(64)
+    bias = torch.randn(64)
+
+    out = fused_group_norm_silu(x, weight, bias, 32, 1e-6, per_frame=True)
+
+    assert out.is_contiguous()
+    torch.testing.assert_close(out, _per_frame_reference(x, weight, bias), rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":
