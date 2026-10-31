@@ -919,6 +919,36 @@ class DuplexClientBase(ABC):
             event["item_id"] = item_id
         await self.send(event)
 
+    # -- server-side stats -----------------------------------------------------
+
+    async def get_session_stats(self, *, timeout_s: float = 10.0) -> dict[str, object]:
+        """Fetch the server's per-turn stage work and audio (``session.stats``, RFC #8325).
+
+        Needs ``capabilities.supports_session_stats`` (``duplex_session.collect_stats``
+        on the server). Busy RTF and stall ratio are derived from the returned raw
+        document by ``vllm_omni.benchmarks.duplex_session_metrics``.
+        """
+        event_id = f"evt_{uuid4().hex}"
+        # Subscribe before sending: the reply can arrive before send() returns.
+        queue = self._add_subscriber()
+        try:
+            await self.send({"type": "session.stats.get", "event_id": event_id})
+            deadline = time.monotonic() + timeout_s
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError("timed out waiting for session.stats")
+                item = await asyncio.wait_for(queue.get(), remaining)
+                if isinstance(item, _ClosedMarker):
+                    raise DuplexSessionClosedError(item.reason)
+                if isinstance(item, ErrorEvent) and item.related_event_id == event_id:
+                    raise item.to_exception()
+                if item.type == "session.stats" and item.raw.get("request_event_id") == event_id:
+                    stats = item.raw.get("stats")
+                    return stats if isinstance(stats, dict) else {}
+        finally:
+            self._remove_subscriber(queue)
+
     # -- output ----------------------------------------------------------------
 
     def __aiter__(self) -> AsyncIterator[DuplexEvent]:
@@ -2016,6 +2046,15 @@ def summarize_session_request_metrics(
         summary["client_ttfp_ms"] = client_ttfp
     if (client_rtf := distribution_summary(_finite_metric_values(request_metrics, "client_rtf"), digits=6)) is not None:
         summary["client_rtf"] = client_rtf
+    # Server-side session stats (RFC #8325), present when the server collects them.
+    for name in ("busy_rtf", "stall_ratio"):
+        if (distribution := distribution_summary(_finite_metric_values(request_metrics, name), digits=6)) is not None:
+            summary[name] = distribution
+    if any("server_stats_final" in metrics for metrics in request_metrics):
+        # Those means cover final turns only; report how many of the audio turns that is.
+        summary["server_stats_final_count"] = sum(
+            1 for metrics in request_metrics if metrics.get("server_stats_final") is True
+        )
     if (tpot := distribution_summary(_finite_metric_values(request_metrics, "tpot_ms", positive=True))) is not None:
         summary["tpot_ms"] = tpot
     if (stages := summarize_stage_metrics(request_metrics)) is not None:

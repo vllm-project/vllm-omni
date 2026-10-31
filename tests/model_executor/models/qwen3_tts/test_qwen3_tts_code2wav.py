@@ -3,7 +3,7 @@
 
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -777,7 +777,7 @@ def _rho_meta(*, request_id: str = "rid", **meta: object) -> list[dict[str, obje
     return [{"meta": payload}]
 
 
-def _mock_logged_messages(mock_logger: object) -> list[str]:
+def _mock_logged_messages(mock_logger: Mock) -> list[str]:
     """Re-apply %-style formatting to the messages a patched logger recorded."""
     messages: list[str] = []
     for call in mock_logger.info.call_args_list:
@@ -1138,3 +1138,9 @@ def test_decode_autotune_restores_process_flags(mocker, monkeypatch, capture_fai
     assert observed == [(True, 10, *original)]
     assert torch.backends.cudnn.benchmark is False
     assert torch.backends.cudnn.benchmark_limit == 5
+
+
+def test_stage_post_warmup_memory_stats_omits_missing_snapshot():
+    model = _make_model()
+
+    assert model.get_stage_post_warmup_memory_stats() is None

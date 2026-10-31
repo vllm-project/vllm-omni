@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from collections.abc import Callable
@@ -37,16 +37,24 @@ if current_omni_platform.is_xpu():
     try:
         import inspect
 
-        from auto_round_kernel import ARK
+        try:
+            # auto-round-lib <= 0.14: singleton class
+            from auto_round_kernel import ARK
 
-        _ark = ARK()
-        xpu_sageattn = _ark.sagev1
+            xpu_sageattn = ARK().sagev1
+        except ImportError:
+            # auto-round-lib >= 0.15: ARK removed, kernels are module-level
+            import auto_round_kernel as _ark_mod
+
+            if getattr(_ark_mod, "xpu_lib", None) is None:
+                raise ImportError("auto_round_kernel XPU extension failed to load")
+            xpu_sageattn = _ark_mod.sagev1
         _sagev1_params = inspect.signature(xpu_sageattn).parameters
         _sagev1_has_tensor_layout = "tensor_layout" in _sagev1_params
         _sagev1_scale_param = "sm_scale" if "sm_scale" in _sagev1_params else "scale"
     except ImportError:
         logger.warning(
-            "XPU SageAttention (auto_round_kernel.ARK.sagev1) is not available. "
+            "XPU SageAttention (auto_round_kernel sagev1) is not available. "
             "Install auto-round-lib for XPU sage attention support."
         )
         xpu_sageattn = None

@@ -41,13 +41,13 @@ async def _wait_until(predicate, timeout=1):
 class FakePool:
     def __init__(self, stage_id: int):
         self.stage_id = stage_id
-        self.clients = []
-        self.added = []
-        self.removed = []
-        self.invalidated = []
+        self.clients: list[object] = []
+        self.added: list[tuple[str, object, int | None]] = []
+        self.removed: list[str] = []
+        self.invalidated: list[str] = []
         self.hub = None
         self.lb = None
-        self.replica_ids = {}
+        self.replica_ids: dict[str, int] = {}
 
     def attach_hub(self, hub):
         self.hub = hub
@@ -223,7 +223,7 @@ async def test_unregister_then_register_restores_coordinator_replica_slot(monkey
     async def cleanup(_request_ids):
         return None
 
-    controller.install_unregister_handlers(
+    controller.install_membership_handlers(
         output_queue=asyncio.Queue(),
         cleanup_callback=cleanup,
         replica_removed_callback=lambda stage_id, replica_id: removed_replicas.append((stage_id, replica_id)),
@@ -502,7 +502,7 @@ async def test_up_observed_before_attach_does_not_qualify_attachment(monkeypatch
         ]
     )
     shutdown_calls = []
-    sleep_gates = asyncio.Queue()
+    sleep_gates: asyncio.Queue[asyncio.Event] = asyncio.Queue()
 
     async def _controlled_sleep(_delay):
         gate = asyncio.Event()

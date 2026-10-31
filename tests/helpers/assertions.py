@@ -388,6 +388,23 @@ def assert_video_first_frames_differ(
     )
 
 
+def video_mean_absolute_error(video: bytes, reference: bytes) -> float:
+    """Mean per-pixel absolute error over every decoded frame, normalized to [0, 1]."""
+    absolute_error = 0.0
+    pixel_count = 0
+    with av.open(BytesIO(video)) as actual, av.open(BytesIO(reference)) as expected:
+        for frame, reference_frame in zip(actual.decode(video=0), expected.decode(video=0), strict=True):
+            pixels = frame.to_ndarray(format="rgb24")
+            reference_pixels = reference_frame.to_ndarray(format="rgb24")
+            assert pixels.shape == reference_pixels.shape
+            absolute_error += np.abs(pixels.astype(np.float32) - reference_pixels.astype(np.float32)).sum(
+                dtype=np.float64
+            )
+            pixel_count += pixels.size
+    assert pixel_count > 0
+    return absolute_error / pixel_count / 255.0
+
+
 def assert_audio_diffusion_response(
     response: "DiffusionResponse",
     request_config: dict[str, Any],

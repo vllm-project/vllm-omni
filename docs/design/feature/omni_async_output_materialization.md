@@ -106,7 +106,7 @@ materialization on top of CUDA Graph and async chunk produced the following
 results at concurrency 64:
 
 | Configuration | Request throughput | Mean audio TTFP | Mean audio RTF |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | CUDA Graph + async chunk | 9.3 req/s | 655 ms | 0.63 |
 | + async output materialization | 11.3 req/s | 631 ms | 0.47 |
 | Change | **+22%** | **-4%** | **-25%** |
@@ -144,11 +144,11 @@ The output lifecycle is:
    can be overwritten.
 4. The cloned payload is copied to pinned CPU memory on a dedicated CUDA
    stream. A CUDA event records when the copy is ready.
-5. `OmniAsyncGPUModelRunnerOutput` starts a background thread that waits for
-   the payload event and builds `OmniModelRunnerOutput`.
+5. `OmniAsyncGPUModelRunnerOutput` submits to a runner-owned single-worker executor
+   that waits for the payload event and builds `OmniModelRunnerOutput`.
 6. The AR runner immediately registers the sampled-token CPU copy with the
    input batch and returns, allowing async scheduling to advance.
-7. When the engine calls `get_output()`, it joins the background builder,
+7. When the engine calls `get_output()`, it waits for the builder future,
    propagates any builder exception, and finalizes sampled tokens and logprobs
    through the upstream output implementation.
 
@@ -168,6 +168,22 @@ next decode step                                +-- partition streaming payloads
                                                 +-- build OmniModelRunnerOutput
 ```
 
+The executor reuses its thread across decode steps and processes builders in
+submission order. Builder failures propagate through each output future without
+stopping subsequent tasks. Runner shutdown drains pending builders before
+releasing connector state, CUDA graphs, or tensor buffers. The existing engine
+output queue bounds in-flight work; this change does not introduce a new
+admission path.
+
+Unlike the previous daemon thread, `ThreadPoolExecutor` workers are joined at
+Python interpreter exit. Embedders must call `GPUARModelRunner.shutdown()`
+while the runner and device resources are still valid; interpreter exit is not
+a substitute for draining output work. The stage engine calls shutdown from
+its `finally` block, and upstream worker shutdown delegates to the runner.
+If an output builder or device event never completes, graceful shutdown can
+still block; a supervisor must forcibly terminate an unresponsive process.
+`shutdown(wait=False)` would not remove the interpreter's join requirement.
+
 ### Safe State Snapshots
 
 The next scheduler step can mutate runner state while the background builder is
@@ -186,6 +202,16 @@ be reused by the next forward pass. The dedicated copy stream and pinned host
 buffers make the D2H transfer asynchronous; the snapshot retains its cloned
 CUDA sources until the transfer event completes.
 
+Small lists of multiple compatible CUDA tensors are packed for one snapshot
+copy. A singleton list or tuple uses the ordinary tensor clone/copy path,
+preserving the container without an unnecessary pack and unpack.
+
+MiniCPM-o 4.5's Talker opts out of hidden-state payloads: Code2Wav consumes
+codec codes and metadata only. Its hidden states remain available for logits
+and sampling but are not cloned, copied to the host, or transported in the
+output payload. The Thinker retains its hidden-state handoff for TTS
+conditioning.
+
 ### Live Runner State and Ownership
 
 The complete builder input is not a detached snapshot. Connector output state
@@ -194,7 +220,7 @@ connector signals after the streaming payload is built. Correctness therefore
 depends on that builder being the only consumer that drains connector signals
 for its output cycle. Receive-side connector state written by the background
 receiver is coordinated by the connector mixin's `_lock`.
-`OmniAsyncGPUModelRunnerOutput.get_output()` joins the builder and is the
+`OmniAsyncGPUModelRunnerOutput.get_output()` waits for the builder future and is the
 completion and exception boundary before the materialized output is consumed.
 
 The shared output builder also contains a full-payload accumulation branch
@@ -223,7 +249,7 @@ outputs are not deferred because they affect scheduler-visible request state.
 ### Qwen3-Omni Stage Behavior
 
 | Stage | Async output behavior | Reason |
-|---|---|---|
+| --- | --- | --- |
 | Thinker | Snapshots hidden states and multimodal outputs; builds the downstream payload in the background | The Talker needs the payload, but the next Thinker decode step only needs sampled-token feedback |
 | Talker | Runs lightweight postprocess eagerly; snapshots codec outputs; omits hidden states from the downstream payload | `hidden_states.last` is needed by the next Talker step, while Code2Wav only needs codec codes |
 | Code2Wav | Uses the normal generation-stage output path | Code2Wav is not executed by `GPUARModelRunner` |
@@ -337,7 +363,7 @@ because they use the same Talker implementation.
 runtime conditions hold:
 
 | Requirement | Reason |
-|---|---|
+| --- | --- |
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
@@ -385,6 +411,36 @@ so Omni payload materialization remains synchronous.
   Optimization context and controlled performance results.
 - [PR #4476](https://github.com/vllm-project/vllm-omni/pull/4476): Feature
   implementation, validation, and review history.
+
+## Idle generation steps
+
+Async-chunk generation stages can poll for downstream input many times between
+model forwards. After the first idle step has cleared the persistent batch,
+subsequent zero-token steps with no request or encoder-cache updates skip the
+input-preparation event and batch-state refresh. The first idle step, request
+transitions, block zeroing or copying, encoder work, speculative decoding, and KV/EC
+transfer retain the normal path. This shortcut is restricted to DP=1 and PP=1.
+Connector receive/flush, model lifecycle hooks, and idle prefetch still execute;
+the optimization does not skip polling or change the engine's idle sleep.
+This input-update shortcut applies to `GPUGenerationModelRunner`; the separate
+Ascend `NPUGenerationModelRunner` retains its existing input-update path.
+
+MRv2 AR output also honors the model's `omni_pooler_payload_include_hidden`
+contract, in conjunction with the sampler's `include_hidden_states` flag.
+Opting out omits hidden-state output copies, while logits and sampling continue
+to receive the original hidden states. Models without the flag retain the
+existing hidden-state payload behavior.
+
+The MRv2 generation runner has its own control-only fast path. Both its
+control-only and cached-request zero-token paths deliver pending request
+prewarms after finished-request cleanup and run optional idle prefetch only on
+consecutive idle steps. Dummy/profile runs do not enqueue or execute prewarms,
+but a dummy run with scheduled tokens clears the idle flag so the next real
+idle step cannot prefetch while that work may still be in flight.
+Warmup uses the forward thread, stream and inference mode; failures log once
+per hook at warning level (subsequent failures at debug) and leave the inline
+reference preparation path available. Connector and auxiliary-output work
+still runs on every idle step.
 
 ## NPU generation output copies
 

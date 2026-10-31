@@ -20,7 +20,7 @@ def vae():
 
 
 def test_urgent_wakes_for_first_audio_and_final_flush_only(vae):
-    job = MingBatchedStreamJob(vae, torch.device("cpu"), low_latency_streaming=True)
+    job = MingBatchedStreamJob(vae, torch.device("cpu"))
     assert not job.urgent()
     job.publish(torch.ones(1, 1, 1), False)
     assert job.urgent()

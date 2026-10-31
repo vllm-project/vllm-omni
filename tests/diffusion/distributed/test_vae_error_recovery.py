@@ -39,7 +39,7 @@ def run_recovery_worker(rank, init_file):
         executor.set_parallel_size(2)
         tensor = torch.arange(12, dtype=torch.float32).reshape(4, 3)
         operator = TileOperator()
-        for stage, failing_rank in [("decode", 1), ("packing", 1), ("merge", 0), ("gather", 1)]:
+        for stage, failing_rank in [("decode", 1), ("packing", 1), ("merge", 0), ("gather", 0)]:
             with pytest.MonkeyPatch.context() as patch:
                 if rank == failing_rank:
 
