@@ -16,7 +16,7 @@ pytestmark = [
 
 class Decoder:
     def forward_streaming(self, token, finalize, **kwargs):
-        # Distinguishable PCM and finalization, without loading a speech model.
+        # Distinguishable PCM and finalization, without loading a token_mask model.
         return token.float().reshape(1, 1, -1) + (100 if finalize else 0), None
 
 
@@ -24,7 +24,6 @@ class Decoder:
 def test_codec_progresses_and_flushes_eos_without_another_ar_step(monkeypatch):
     monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", "0")
     worker = AsyncCodec(Decoder(), torch.device("cuda", 0), 32, 4, chunk_size=2, lookahead=0)
-    generation = worker.register("r")
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long, device="cuda"),
         "speech_feat": torch.empty(1, 0, 80, device="cuda"),
@@ -32,7 +31,7 @@ def test_codec_progresses_and_flushes_eos_without_another_ar_step(monkeypatch):
     }
     try:
         for position, token in enumerate((7, 8, 100)):
-            entry = SampleEntry("r", position, False, conditioning, generation)
+            entry = SampleEntry("r", position, False, conditioning)
             worker.submit([entry], torch.tensor([token], device="cuda"), torch.tensor([token < 100], device="cuda"))
         # No engine/runner query drives either decode or D2H publication.
         first = worker.outputs.get(timeout=10)
@@ -65,7 +64,6 @@ def test_ar_can_append_on_another_stream_while_codec_is_busy(monkeypatch):
             return super().forward_streaming(token, finalize, **kwargs)
 
     worker = AsyncCodec(SlowDecoder(), torch.device("cuda", 0), 64, 1, chunk_size=2, lookahead=0)
-    generation = worker.register("r")
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long, device="cuda"),
         "speech_feat": torch.empty(1, 0, 80, device="cuda"),
@@ -80,7 +78,7 @@ def test_ar_can_append_on_another_stream_while_codec_is_busy(monkeypatch):
 
     def push(position, token):
         worker.submit(
-            [SampleEntry("r", position, False, conditioning, generation)],
+            [SampleEntry("r", position, False, conditioning)],
             torch.tensor([token], device="cuda"),
             torch.tensor([token < 100], device="cuda"),
         )
@@ -127,28 +125,27 @@ def test_ar_can_append_on_another_stream_while_codec_is_busy(monkeypatch):
 def test_source_row_selection_does_not_upload_indices_or_synchronize():
     """Check CUDA API events inside producer submission, not profiler teardown."""
     worker = AsyncCodec(Decoder(), torch.device("cuda", 0), 32, 1, chunk_size=64, lookahead=0)
-    generations = [worker.register(req_id) for req_id in ("a", "b")]
     conditioning = {
         "speech_token": torch.empty(1, 0, dtype=torch.long, device="cuda"),
         "speech_feat": torch.empty(1, 0, 80, device="cuda"),
         "embedding": torch.ones(1, 192, device="cuda"),
     }
     tokens = torch.tensor([13, 77, 29], device="cuda")
-    speech = torch.tensor([True, False, True], device="cuda")
+    token_mask = torch.tensor([True, False, True], device="cuda")
 
     def entries(position):
-        return [SampleEntry(req_id, position, False, conditioning, gen) for req_id, gen in zip(("a", "b"), generations)]
+        return [SampleEntry(req_id, position, False, conditioning) for req_id in ("a", "b")]
 
     try:
         # Allocate request buffers before profiling so allocator cold start is
         # separate from the two per-step index uploads that caused the trace stall.
-        worker.submit(entries(0), tokens, speech, rows=[2, 0])
+        worker.submit(entries(0), tokens, token_mask, rows=[2, 0])
         next_entries = entries(1)
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
         ) as p:
             with torch.profiler.record_function("cosyvoice3_submit_rows"):
-                worker.submit(next_entries, tokens, speech, rows=[2, 0])
+                worker.submit(next_entries, tokens, token_mask, rows=[2, 0])
         names = []
         for event in p.events():
             parent = event.cpu_parent
@@ -162,7 +159,7 @@ def test_source_row_selection_does_not_upload_indices_or_synchronize():
         assert "cudaStreamSynchronize" not in names
         assert "cudaDeviceSynchronize" not in names
         tokens.fill_(999)  # Reusing graph output storage must not overwrite owned tokens.
-        assert worker.buffers[("a", generations[0])].tokens[:, :2].cpu().tolist() == [[29, 29]]
-        assert worker.buffers[("b", generations[1])].tokens[:, :2].cpu().tolist() == [[13, 13]]
+        assert worker.buffers["a"].tokens[:, :2].cpu().tolist() == [[29, 29]]
+        assert worker.buffers["b"].tokens[:, :2].cpu().tolist() == [[13, 13]]
     finally:
         worker.close()

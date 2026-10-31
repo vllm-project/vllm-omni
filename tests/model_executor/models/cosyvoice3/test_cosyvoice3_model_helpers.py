@@ -1402,7 +1402,7 @@ def test_ras_accepts_upstream_call_and_preserves_bias_context(monkeypatch):
     assert torch.equal(logits, torch.zeros_like(logits))
 
 
-def _incremental_decoder(monkeypatch):
+def _decoder(monkeypatch):
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
@@ -1447,7 +1447,7 @@ def _incremental_items(count, finals=()):
 def test_streaming_iterator_pauses_between_hift_and_flow_groups(monkeypatch):
     from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import iter_decode_streaming_batch
 
-    model = _incremental_decoder(monkeypatch)
+    model = _decoder(monkeypatch)
     iterator = iter_decode_streaming_batch(model, _incremental_items(3, finals=(0,)))
     assert model.calls == []
     first = next(iterator)
@@ -1467,7 +1467,7 @@ def test_streaming_iterator_pauses_between_hift_and_flow_groups(monkeypatch):
 
 @pytest.mark.parametrize("count", [1, 8, 11])
 def test_list_api_restores_request_order_across_incremental_groups(monkeypatch, count):
-    model = _incremental_decoder(monkeypatch)
+    model = _decoder(monkeypatch)
     outputs = model.forward_streaming_batch(_incremental_items(count, finals=(0, 2)))
     assert [int(speech[0, 0, 0]) for speech, _ in outputs] == list(range(count))
     assert [cache is None for _, cache in outputs] == [i in (0, 2) for i in range(count)]

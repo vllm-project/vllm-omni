@@ -38,6 +38,9 @@ class CosyVoice3ModelState(OmniModelState):
             chunk_size=int(getattr(self.model.config, "codec_chunk_frames", 25)),
             lookahead=int(self.model.config.flow["pre_lookahead_len"]),
         )
+        # Share the existing request table; it remains live through codec
+        # tails and is removed on final delivery/cancellation.
+        self.audio_requests = scheduler.audio_requests
         scheduler.codec = self.codec
         scheduler.audio_sample_rate = int(self.model.config.sample_rate)
 
@@ -72,7 +75,7 @@ class CosyVoice3ModelState(OmniModelState):
         positions = end - self.req_states.prompt_len.np[input_batch.idx_mapping_np[:count]]
         length_finished = end + 1 >= limits
         tokens = sampled_token_ids[:count, 0]
-        speech_mask = (tokens >= 0) & (tokens < self.vocab_size)
+        token_mask = (tokens >= 0) & (tokens < self.vocab_size)
         step_embed = multimodal_outputs.get("embed", {})
         entries, rows = [], []
         for row, payload in enumerate(payloads):
@@ -88,9 +91,8 @@ class CosyVoice3ModelState(OmniModelState):
                 continue
             if self.codec is None:
                 raise RuntimeError("CosyVoice3 codec worker is not bound to the engine")
-            generation = self.codec.generations.get(req_id)
-            if generation is None:
-                # An already retired generation can have an in-flight AR row.
+            if req_id not in self.audio_requests:
+                # An already retired request can have an in-flight AR row.
                 continue
             entries.append(
                 SampleEntry(
@@ -98,7 +100,6 @@ class CosyVoice3ModelState(OmniModelState):
                     int(positions[row]),
                     bool(length_finished[row]),
                     dict(embed),
-                    generation,
                 )
             )
             rows.append(row)
@@ -106,7 +107,7 @@ class CosyVoice3ModelState(OmniModelState):
             # Copy basic row slices into owned buffers on this stream before
             # graph replay. A Python index list on CUDA tensors would upload
             # indices synchronously, twice per step.
-            self.codec.submit(entries, tokens, speech_mask, rows)
+            self.codec.submit(entries, tokens, token_mask, rows)
         # PCM is published separately, never through this step's AR future.
         multimodal_outputs.clear()
 

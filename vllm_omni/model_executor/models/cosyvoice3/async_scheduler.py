@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import queue
+from dataclasses import dataclass
 
 import torch
 from vllm.v1.engine import FinishReason
@@ -14,22 +15,26 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 
 
+@dataclass
+class AudioRequestState:
+    client_index: int
+    terminal: OmniEngineCoreOutput | None = None
+    done: bool = False
+    cancelled: bool = False
+
+
 class CosyVoice3AsyncScheduler(OmniARAsyncScheduler):
     """Keep client completion until both AR termination and final PCM arrive.
 
-    Routes/generations outlive AR slots. Terminals and audio completion are
+    Audio routes outlive AR slots. Terminals and audio completion are
     tracked separately because either may arrive first; cancellation fences
     already queued PCM until the base scheduler produces its terminal output.
     """
 
     def __init__(self, *args, **kwargs):
         self.codec = None
-        self.audio_routes: dict[str, int] = {}
-        self.audio_generations: dict[str, int] = {}
+        self.audio_requests: dict[str, AudioRequestState] = {}
         self.abort_outputs = []
-        self.audio_terminals: dict[str, OmniEngineCoreOutput] = {}
-        self.audio_done: set[str] = set()
-        self.audio_cancelled: set[str] = set()
         super().__init__(*args, **kwargs)
 
     def schedule(self, throttle_prefills=False):
@@ -40,64 +45,60 @@ class CosyVoice3AsyncScheduler(OmniARAsyncScheduler):
         # consumed. Preserve capacity for active streams instead of admitting
         # an unbounded succession of detached tails.
         original = self.max_num_active_reqs
-        running = {r.request_id for r in self.running}
-        detached = len(self.audio_routes.keys() - running)
+        detached = sum(state.terminal is not None for state in self.audio_requests.values())
         self.max_num_active_reqs = max(0, original - detached)
         try:
             output = super().schedule(throttle_prefills)
         finally:
             self.max_num_active_reqs = original
-        for request in output.scheduled_new_reqs:
-            req_id = request.req_id
-            self.audio_generations[req_id] = self.codec.register(req_id)
-            self.audio_routes[req_id] = self.requests[req_id].client_index
-            self.audio_cancelled.discard(req_id)
         # Restarting a partially emitted waveform on KV preemption is unsafe.
         if output.preempted_req_ids:
             self.finish_requests(output.preempted_req_ids, RequestStatus.FINISHED_ERROR)
         return output
 
-    def retire_audio(self, req_id):
-        self.audio_routes.pop(req_id, None)
-        self.audio_generations.pop(req_id, None)
-        self.audio_terminals.pop(req_id, None)
-        self.audio_done.discard(req_id)
-        self.audio_cancelled.discard(req_id)
+    def retire_request(self, req_id):
+        """Finish client/codec bookkeeping; AR resources are owned by the base scheduler."""
+        self.audio_requests.pop(req_id, None)
         self.codec.release(req_id)
 
     def finish_requests(self, request_ids, finished_status):
         if request_ids is not None and not isinstance(request_ids, str):
             request_ids = list(request_ids)
         ids = (
-            set(self.audio_routes)
+            set(self.audio_requests)
             if request_ids is None
             else ({request_ids} if isinstance(request_ids, str) else set(request_ids))
         )
-        for req_id in ids & self.audio_routes.keys():
+        for req_id in ids & self.audio_requests.keys():
             self.codec.cancel(req_id)
-            self.audio_cancelled.add(req_id)
-            if req_id in self.audio_terminals:
-                output = self.audio_terminals[req_id]
+            state = self.audio_requests[req_id]
+            state.cancelled = True
+            if state.terminal is not None:
+                output = state.terminal
                 output.finish_reason = (
                     FinishReason.ABORT if finished_status == RequestStatus.FINISHED_ABORTED else FinishReason.ERROR
                 )
-                self.abort_outputs.append((self.audio_routes[req_id], output))
-                self.retire_audio(req_id)
+                self.abort_outputs.append((state.client_index, output))
+                self.retire_request(req_id)
         return super().finish_requests(request_ids, finished_status)
 
     def get_num_unfinished_requests(self):
-        return super().get_num_unfinished_requests() + len(self.audio_terminals)
+        return super().get_num_unfinished_requests() + sum(
+            state.terminal is not None for state in self.audio_requests.values()
+        )
 
     def add_request(self, request):
-        if request.request_id in self.audio_routes:
+        if request.request_id in self.audio_requests:
             raise ValueError("Request ID is still draining codec audio")
-        return super().add_request(request)
+        super().add_request(request)
+        if request.request_id in self.requests:
+            self.audio_requests[request.request_id] = AudioRequestState(request.client_index)
 
     def has_requests(self):
-        return bool(self.audio_routes or self.abort_outputs) or super().has_requests()
+        return bool(self.audio_requests or self.abort_outputs) or super().has_requests()
 
     def has_unfinished_requests(self):
-        return bool(self.audio_routes or self.abort_outputs) or super().has_unfinished_requests()
+        return bool(self.audio_requests or self.abort_outputs) or super().has_unfinished_requests()
 
     def update_from_output(self, scheduler_output, model_runner_output):
         result = super().update_from_output(scheduler_output, model_runner_output)
@@ -108,19 +109,18 @@ class CosyVoice3AsyncScheduler(OmniARAsyncScheduler):
             kept = []
             for output in client_output.outputs:
                 req_id = output.request_id
-                if req_id in self.audio_routes and output.finish_reason is not None:
+                if req_id in self.audio_requests and output.finish_reason is not None:
                     if output.finish_reason in (FinishReason.ABORT, FinishReason.ERROR):
                         self.codec.cancel(req_id)
-                        self.audio_cancelled.add(req_id)
-                        self.retire_audio(req_id)
+                        self.retire_request(req_id)
                         kept.append(output)
                     else:
-                        self.audio_terminals[req_id] = output
+                        self.audio_requests[req_id].terminal = output
                 else:
                     kept.append(output)
             client_output.outputs = kept
             if client_output.finished_requests:
-                client_output.finished_requests.difference_update(self.audio_routes)
+                client_output.finished_requests.difference_update(self.audio_requests)
         for client, output in self.abort_outputs:
             batch = result.setdefault(client, OmniEngineCoreOutputs(outputs=[]))
             batch.outputs.append(output)
@@ -135,19 +135,20 @@ class CosyVoice3AsyncScheduler(OmniARAsyncScheduler):
             except queue.Empty:
                 break
             req_id = audio.request_id
-            if self.audio_generations.get(req_id) != audio.generation or req_id in self.audio_cancelled:
+            state = self.audio_requests.get(req_id)
+            if state is None or state.cancelled:
                 continue
             if audio.pcm is not None and audio.pcm.numel():
                 ready.setdefault(req_id, []).append(audio.pcm)
             if audio.final:
-                self.audio_done.add(req_id)
-        for req_id in ready.keys() | (self.audio_done & self.audio_terminals.keys()):
-            client = self.audio_routes[req_id]
+                state.done = True
+        completed = {key for key, state in self.audio_requests.items() if state.done and state.terminal is not None}
+        for req_id in ready.keys() | completed:
+            state = self.audio_requests[req_id]
+            client = state.client_index
             batch = result.setdefault(client, OmniEngineCoreOutputs(outputs=[]))
-            final = req_id in self.audio_done and req_id in self.audio_terminals
-            output = (
-                self.audio_terminals[req_id] if final else OmniEngineCoreOutput(request_id=req_id, new_token_ids=[])
-            )
+            final = state.done and state.terminal is not None
+            output = state.terminal if final else OmniEngineCoreOutput(request_id=req_id, new_token_ids=[])
             pieces = ready.get(req_id)
             if pieces:
                 output.multimodal_output = {
@@ -163,5 +164,5 @@ class CosyVoice3AsyncScheduler(OmniARAsyncScheduler):
                 if batch.finished_requests is None:
                     batch.finished_requests = set()
                 batch.finished_requests.add(req_id)
-                self.retire_audio(req_id)
+                self.retire_request(req_id)
         return result

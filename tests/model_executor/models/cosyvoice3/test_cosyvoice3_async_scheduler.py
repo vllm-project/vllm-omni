@@ -33,6 +33,9 @@ def modules(monkeypatch):
     monkeypatch.setattr(OmniARAsyncScheduler, "__init__", initialize)
     monkeypatch.setattr(OmniARAsyncScheduler, "update_from_output", lambda s, batch, result: result)
     monkeypatch.setattr(OmniARAsyncScheduler, "schedule", schedule)
+    monkeypatch.setattr(
+        OmniARAsyncScheduler, "add_request", lambda s, request: s.requests.update({request.request_id: request})
+    )
     monkeypatch.setattr(OmniARAsyncScheduler, "has_requests", lambda s: False)
     monkeypatch.setattr(OmniARAsyncScheduler, "has_unfinished_requests", lambda s: False)
     monkeypatch.setattr(OmniARAsyncScheduler, "finish_requests", lambda s, ids, status: [])
@@ -52,15 +55,10 @@ def _scheduler(m):
     class Codec:
         def __init__(self):
             self.outputs = queue.SimpleQueue()
-            self.generations = {"r": 1}
             self.released, self.cancelled = [], []
 
         def check_error(self):
             pass
-
-        def register(self, req_id):
-            self.generations[req_id] = self.generations.get(req_id, 0) + 1
-            return self.generations[req_id]
 
         def release(self, req_id):
             self.released.append(req_id)
@@ -70,8 +68,7 @@ def _scheduler(m):
 
     s.codec = Codec()
     s.audio_sample_rate = 24000
-    s.audio_routes["r"] = 7
-    s.audio_generations["r"] = 1
+    s.audio_requests["r"] = m.scheduler.AudioRequestState(7)
     return s
 
 
@@ -90,7 +87,7 @@ def test_eos_frees_ar_but_defers_client_finish_until_host_audio(modules):
     s = _scheduler(m)
     terminal = _terminal(m, s)
     assert s.has_requests()  # Engine must continue without an AR batch.
-    s.codec.outputs.put(m.codec.ReadyAudio("r", torch.tensor([1.0, 2.0]), True, 1))
+    s.codec.outputs.put(m.codec.ReadyAudio("r", torch.tensor([1.0, 2.0]), True))
     out = s.update_from_output(None, {})[7]
     assert out.outputs == [terminal]
     assert terminal.multimodal_output["audio"].tolist() == [1.0, 2.0]
@@ -102,7 +99,7 @@ def test_eos_frees_ar_but_defers_client_finish_until_host_audio(modules):
 def test_audio_can_finish_before_engine_consumes_eos(modules):
     m = modules
     s = _scheduler(m)
-    s.codec.outputs.put(m.codec.ReadyAudio("r", torch.ones(2), True, 1))
+    s.codec.outputs.put(m.codec.ReadyAudio("r", torch.ones(2), True))
     first = s.update_from_output(None, {})[7].outputs[0]
     assert first.finish_reason is None
     assert not s.codec.released
@@ -116,7 +113,7 @@ def test_multiple_ready_chunks_coalesce_without_duplicate_request_outputs(module
     m = modules
     s = _scheduler(m)
     for n in (1.0, 2.0):
-        s.codec.outputs.put(m.codec.ReadyAudio("r", torch.tensor([n]), False, 1))
+        s.codec.outputs.put(m.codec.ReadyAudio("r", torch.tensor([n]), False))
     tokens = m.Output(request_id="r", new_token_ids=[12])
     batch = s.update_from_output(None, {7: m.Outputs(outputs=[tokens])})[7]
     assert len(batch.outputs) == 1
@@ -124,13 +121,13 @@ def test_multiple_ready_chunks_coalesce_without_duplicate_request_outputs(module
     assert batch.outputs[0].multimodal_output["audio"].tolist() == [1.0, 2.0]
 
 
-def test_stale_audio_cannot_reach_reused_request_id(modules):
+def test_audio_for_retired_request_is_discarded(modules):
     m = modules
     s = _scheduler(m)
-    s.audio_generations["r"] = 2
-    s.codec.outputs.put(m.codec.ReadyAudio("r", torch.ones(1), True, 1))
+    s.retire_request("r")
+    s.codec.outputs.put(m.codec.ReadyAudio("r", torch.ones(1), True))
     assert s.update_from_output(None, {}) == {}
-    assert not s.audio_done
+    assert not s.audio_requests
 
 
 def test_cancel_detached_tail_does_not_hang_or_emit_pcm(modules):
@@ -138,7 +135,7 @@ def test_cancel_detached_tail_does_not_hang_or_emit_pcm(modules):
     s = _scheduler(m)
     _terminal(m, s)
     s.finish_requests(["r"], m.Status.FINISHED_ABORTED)
-    s.codec.outputs.put(m.codec.ReadyAudio("r", torch.ones(1), True, 1))
+    s.codec.outputs.put(m.codec.ReadyAudio("r", torch.ones(1), True))
     output = s.update_from_output(None, {})[7].outputs[0]
     assert output.finish_reason == m.Reason.ABORT
     assert output.multimodal_output is None
@@ -147,6 +144,34 @@ def test_cancel_detached_tail_does_not_hang_or_emit_pcm(modules):
 
 def test_detached_tail_reserves_admission_capacity(modules):
     s = _scheduler(modules)
+    _terminal(modules, s)
     s.schedule()
     assert s.observed_limit == 1
     assert s.max_num_active_reqs == 2
+
+
+def test_queued_requests_have_routes_without_reserving_tail_capacity(modules):
+    s = _scheduler(modules)
+    for i in range(4):
+        s.add_request(SimpleNamespace(request_id=f"queued-{i}", client_index=i))
+    assert all(s.audio_requests[f"queued-{i}"].client_index == i for i in range(4))
+    s.schedule()
+    assert s.observed_limit == s.max_num_active_reqs == 2
+    assert all(state.terminal is None for state in s.audio_requests.values())
+
+
+def test_cancel_before_first_schedule_releases_route_on_terminal_output(modules):
+    m = modules
+    s = _scheduler(m)
+    s.add_request(SimpleNamespace(request_id="queued", client_index=3))
+    s.finish_requests(["queued"], m.Status.FINISHED_ABORTED)
+    # Cancellation must fence queued PCM before the base terminal arrives.
+    s.codec.outputs.put(m.codec.ReadyAudio("queued", torch.ones(1), True))
+    assert s.update_from_output(None, {}) == {}
+    assert s.audio_requests["queued"].cancelled
+    terminal = m.Output(request_id="queued", new_token_ids=[], finish_reason=m.Reason.ABORT)
+    result = s.update_from_output(None, {3: m.Outputs(outputs=[terminal], finished_requests={"queued"})})
+    assert result[3].outputs == [terminal]
+    assert result[3].finished_requests == {"queued"}
+    assert "queued" not in s.audio_requests
+    assert "queued" in s.codec.released
