@@ -3207,8 +3207,9 @@ class TestPlatformOverrides:
         XPU rejects any v2 stage at deploy load, NPU generation workers
         (Higgs stage 1) reject v2 at init, and ROCm/MUSA v2 is Phase 3
         (#9387). The platforms section pins v1 and restores the shipped V1
-        stage-0 shape (eager, no async scheduling, prefix caching), so the
-        fallback stays valid when this file's base flips to model_runner: v2.
+        stage-0 shape (eager, no async scheduling, prefix caching) and the
+        shipped V1 connector streaming geometry, so the fallback stays
+        valid when this file's base flips to model_runner: v2.
         """
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
@@ -3220,6 +3221,25 @@ class TestPlatformOverrides:
             assert stage0.enforce_eager is True, platform
             assert stage0.async_scheduling is False, platform
             assert stage0.engine_extras["enable_prefix_caching"] is True, platform
+            # The connector restore keeps the shipped V1 streaming geometry:
+            # the v2 chunk shape exists only for the codec CUDA-graph windows.
+            extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+            assert extra["codec_left_context_frames"] == 25, platform
+            assert extra["codec_right_holdback_frames"] == 4, platform
+            assert extra["initial_codec_chunk_frames"] == 1, platform
+
+        # The v2 default path keeps the graph-coupled chunk shape.
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        extra = cuda.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["codec_left_context_frames"] == 8
+        assert extra["codec_right_holdback_frames"] == 0
+        assert extra["initial_codec_chunk_frames"] == 8
+
+        # A platform connector override must name a defined connector.
+        deploy = load_deploy_config(deploy_path)
+        deploy.platforms["rocm"]["connectors"] = {"no_such_connector": {"extra": {}}}
+        with pytest.raises(ValueError, match="no_such_connector"):
+            _apply_platform_overrides(deploy, platform="rocm")
 
         rocm = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
         assert rocm.stages[0].attention_backend == "TRITON_ATTN"

@@ -1243,6 +1243,15 @@ def _apply_platform_overrides(
             for stage in deploy.stages:
                 if stage.model_runner == "v2":
                     stage.model_runner = None
+    platform_connectors = platform_section.get("connectors") if platform_section else None
+    if platform_connectors:
+        if not isinstance(platform_connectors, dict):
+            raise ValueError("platform connectors must be a mapping of connector name to overrides")
+        conns = deploy.connectors
+        for conn_name, override in platform_connectors.items():
+            if not conns or conn_name not in conns:
+                raise ValueError(f"platform connectors override references unknown connector {conn_name!r}")
+            conns[conn_name] = _get_recursively_merged_dict(conns[conn_name], override)
     platform_stages = platform_section.get("stages", []) if platform_section else []
     base_by_id = {s.stage_id: s for s in deploy.stages}
 
