@@ -94,7 +94,8 @@ import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any
 
@@ -1277,9 +1278,44 @@ def _default_endpoint_for_task(task: str) -> str:
     raise ValueError(f"Unsupported task for endpoint resolution: {task}")
 
 
+@asynccontextmanager
+async def _profile_measurement(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    enabled: bool,
+    stages: list[int] | None,
+) -> AsyncIterator[None]:
+    if not enabled:
+        yield
+        return
+
+    async def control(action: str) -> None:
+        payload = {"stages": stages} if stages is not None else {}
+        try:
+            async with session.post(f"{base_url.rstrip('/')}/{action}_profile", json=payload) as response:
+                if response.status >= 400:
+                    raise RuntimeError(
+                        f"Failed to {action} profiler: HTTP {response.status}. "
+                        "Check the server --profiler-config and selected stage IDs."
+                    )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            raise RuntimeError(f"Failed to {action} profiler; check server connectivity.") from error
+
+    await control("start")
+    try:
+        yield
+    finally:
+        await control("stop")
+
+
 async def benchmark(args):
     if not math.isfinite(args.video_job_timeout) or args.video_job_timeout <= 0:
         raise ValueError("--video-job-timeout must be a positive finite number of seconds.")
+    if args.profiler_stages is not None:
+        if not args.enable_profiler:
+            raise ValueError("--profiler-stages requires --enable-profiler.")
+        if any(stage < 0 for stage in args.profiler_stages):
+            raise ValueError("--profiler-stages must contain non-negative stage IDs.")
 
     # Construct base_url if not provided
     if args.base_url is None:
@@ -1363,32 +1399,41 @@ async def benchmark(args):
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
-    async with aiohttp.ClientSession() as session:
-        warmup_pairs = await _run_warmups(
-            requests_list=requests_list,
-            args=args,
-            session=session,
-            request_func=request_func,
-        )
-
-        if args.slo:
-            # Prefer trace-provided per-request slo_ms. Only populate when missing.
-            requests_list = _populate_slo_ms_from_warmups(
+    try:
+        async with aiohttp.ClientSession() as session:
+            warmup_pairs = await _run_warmups(
                 requests_list=requests_list,
-                warmup_pairs=warmup_pairs,
                 args=args,
+                session=session,
+                request_func=request_func,
             )
 
-        start_time = time.perf_counter()
-        tasks = []
-        async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
-            task = asyncio.create_task(limited_request_func(req, session, pbar))
-            tasks.append(task)
+            if args.slo:
+                # Prefer trace-provided per-request slo_ms. Only populate when missing.
+                requests_list = _populate_slo_ms_from_warmups(
+                    requests_list=requests_list,
+                    warmup_pairs=warmup_pairs,
+                    args=args,
+                )
 
-        outputs = await asyncio.gather(*tasks)
-        total_duration = time.perf_counter() - start_time
+            async with _profile_measurement(session, args.base_url, args.enable_profiler, args.profiler_stages):
+                start_time = time.perf_counter()
+                tasks = []
+                try:
+                    async for req in iter_requests(requests_list=requests_list, request_rate=args.request_rate):
+                        task = asyncio.create_task(limited_request_func(req, session, pbar))
+                        tasks.append(task)
 
-    pbar.close()
+                    outputs = await asyncio.gather(*tasks)
+                    total_duration = time.perf_counter() - start_time
+                finally:
+                    # Settle outstanding client tasks before stopping the profiler/session.
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        pbar.close()
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
@@ -1510,6 +1555,18 @@ def build_parser():
         help="Path to local dataset file (optional).",
     )
     parser.add_argument("--num-prompts", type=int, default=10, help="Number of prompts to benchmark.")
+    parser.add_argument(
+        "--enable-profiler",
+        action="store_true",
+        help="Start the server profiler after warmup and stop it after measured requests.",
+    )
+    parser.add_argument(
+        "--profiler-stages",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Non-negative stage IDs to profile (default: all stages). Requires --enable-profiler.",
+    )
     parser.add_argument(
         "--video-job-timeout",
         type=float,
