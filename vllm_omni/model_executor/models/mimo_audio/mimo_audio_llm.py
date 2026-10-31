@@ -663,6 +663,8 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             persistent=False,
         )
 
+        self.local_transformer.eval()
+        self.input_local_transformer.eval()
         # CUDA Graph cache for local_forward (includes self.local_transformer inside base_local_forward).
         self.local_forward_cg_by_bs: dict[int, MiMoLocalDecodeCudaGraph] = {}
         self.local_forward_buf_by_bs: dict[int, MiMoLocalDecodeBuffer] = {}
