@@ -129,6 +129,7 @@ nav:
     - contributing/model/adding_omni_model.md
     - contributing/model/adding_tts_model.md
     - contributing/model/adding_diffusion_model.md
+    - contributing/model/adding_rl_rollout_model.md
   - CI: contributing/ci
   - Design Documents:
     - design/index.md
