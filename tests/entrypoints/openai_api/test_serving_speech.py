@@ -1241,6 +1241,23 @@ class TestSpeechAPI:
         assert b"Invalid voice" in response.body
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("word_timestamps", [False, True])
+    async def test_diffusion_speech_does_not_silently_drop_word_timestamps(
+        self, mocker, monkeypatch, tmp_path, word_timestamps
+    ):
+        monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
+        generation = mocker.patch.object(server, "_create_diffusion_speech", new_callable=mocker.AsyncMock)
+        response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", word_timestamps=word_timestamps))
+        if word_timestamps:
+            assert response.status_code == 400
+            assert b"word_timestamps" in response.body
+            generation.assert_not_awaited()
+        else:
+            assert response is generation.return_value
+            generation.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_diffusion_speech_reports_audio_format_and_duration_na(self, mocker: MockerFixture):
         """Diffusion servers report the same audio headers as the AR path."""
         mock_engine = mocker.MagicMock()
