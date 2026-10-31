@@ -41,7 +41,7 @@ from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_TTA_PIPELINE,
     AUDEX_TTS_PIPELINE,
 )
-from vllm_omni.model_executor.models.audio8_tts.pipeline import AUDIO8_TTS_PIPELINE
+from vllm_omni.model_executor.models.audio8_tts.pipeline import resolve_audio8_pipeline
 from vllm_omni.model_executor.models.auk.pipeline import AUK_PIPELINE
 from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
 from vllm_omni.model_executor.models.bagel.pipeline import (
@@ -149,7 +149,9 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
-    "arktts": AUDIO8_TTS_PIPELINE,
+    # Both Audio8 checkpoints share ``model_type = "arktts"``; the resolver picks the
+    # dense (0.6b) or hybrid-Mamba2 (0.1b) topology from ``slow_backbone``.
+    "arktts": resolve_audio8_pipeline,
     "audex_s2s": AUDEX_S2S_PIPELINE,
     "audex_thinker_only": AUDEX_THINKER_ONLY_PIPELINE,
     "audex_tta": AUDEX_TTA_PIPELINE,
