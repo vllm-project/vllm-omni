@@ -212,6 +212,8 @@ The following tables show which models support each feature:
 | **MiniMax-H3** ([FastH3 single-card guide](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3%20RefOmni%20Single%20Card.md)) | ✅ (FL2VA) | ✅ | ✅ | ❌ | ✅ (DiT/TE) | ❌ | ✅ | ✅ | ✅ (tile) | ✅ (DiT) | ❌ |
 | **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
+| **Self-Forcing**             |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |     ✅ (request mode)      |          ❌           |       ❓        |        ✅*        |
+| **minWM Action2V**           |     ❌     |     ❌      |          ❌<sup>6</sup> |       ❌        |         ❌         |         ❌         |   ❌    |             ❓             |          ❌           |       ❓        |        ✅*        |
 
 > Notes:
 > 5. SANA-WM cannot support sequence parallelism: its bidirectional gated delta
@@ -219,13 +221,19 @@ The following tables show which models support each feature:
 > the token sequence in isolation. Doing so would need a distributed scan or
 > an all-gather before every GDN block. The remaining ❌ columns are simply
 > unvalidated on this model, not known-broken.
+> 6. minWM Action2V's PRoPE self-attention rejects Ulysses sequence
+> parallelism when the model loads, so `--usp` above 1 fails at startup even if
+> no request carries a trajectory.
 
 > **Step execution note:** Helios supports single-request step execution only;
-> use `max_num_seqs=1`.
+> use `max_num_seqs=1`. Self-Forcing streams one AR block per chunk only with
+> `self_forcing_stepwise.yaml` (ARDiffusionEngine, `max_num_seqs=1`); its four
+> fixed DMD steps leave nothing for TeaCache or Cache-DiT to skip. minWM Action2V
+> streams the same way with `minwm_action2v_stepwise.yaml`.
 **Frame Interpolation Support**
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines; SANA-Video-2B native text-to-video and image-to-video pipelines
-- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM; SANA-Video-2B Diffusers-adapter text-to-video and image-to-video pipelines
+- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, LTX-2.5, Helios, HunyuanVideo-1.5, DreamID-Omni, SANA-WM, Self-Forcing, minWM Action2V; SANA-Video-2B Diffusers-adapter text-to-video and image-to-video pipelines
 
 ### AudioGen
 
