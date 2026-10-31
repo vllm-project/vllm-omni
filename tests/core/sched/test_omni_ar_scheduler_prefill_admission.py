@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Prefill admission batching of OmniARScheduler (stage connector extra knobs)."""
+"""Prefill admission batching of OmniARScheduler (stage connector extra or additional_config knobs)."""
 
 import time
 from types import SimpleNamespace
@@ -50,3 +50,46 @@ def test_a_batch_size_needs_a_wait_bound():
     scheduler = SimpleNamespace(vllm_config=config)
     with pytest.raises(ValueError, match="max_wait_ms"):
         OmniARScheduler._init_prefill_admission_policy(scheduler)
+
+
+def test_a_stage_without_connector_knobs_reads_additional_config():
+    knobs = {
+        "ar_prefill_admission_min_batch": 8,
+        "ar_prefill_admission_max_wait_ms": 100,
+        "ar_prefill_admission_min_running": 4,
+    }
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_connector_config={"extra": {"stage_id": 0}}),
+        additional_config=knobs,
+    )
+    scheduler = SimpleNamespace(vllm_config=config)
+    OmniARScheduler._init_prefill_admission_policy(scheduler)
+    assert scheduler._prefill_admission_min_batch == 8
+    assert scheduler._prefill_admission_max_wait_s == pytest.approx(0.1)
+    assert scheduler._prefill_admission_min_running == 4
+
+    config.model_config.stage_connector_config["extra"]["ar_prefill_admission_min_batch"] = 6
+    OmniARScheduler._init_prefill_admission_policy(scheduler)
+    assert scheduler._prefill_admission_min_batch == 6
+
+
+@pytest.mark.parametrize("connector_batch", [None, 3])
+def test_single_stage_admission_settings_and_connector_precedence(connector_batch):
+    scheduler = _scheduler(waiting=3, running=32)
+    scheduler.vllm_config = SimpleNamespace(
+        additional_config={
+            "ar_prefill_admission_min_batch": 8,
+            "ar_prefill_admission_max_wait_ms": 150,
+            "ar_prefill_admission_min_running": 32,
+        },
+        model_config=SimpleNamespace(
+            stage_connector_config=(
+                None if connector_batch is None else {"extra": {"ar_prefill_admission_min_batch": connector_batch}}
+            )
+        ),
+    )
+    OmniARScheduler._init_prefill_admission_policy(scheduler)
+    assert defer(scheduler) is (connector_batch is None)
+    # The wait bound applies even if the single-stage batch has not filled.
+    scheduler.waiting[0].arrival_time = time.time() - 1.0
+    assert not defer(scheduler)

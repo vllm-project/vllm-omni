@@ -33,6 +33,7 @@ from .batched_token2wav import (
     row_offset_signature,
     state_shape_signature,
 )
+from .code2wav_watchdog import Code2WavWatchdog
 from .config_flags import read_bool_flag
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
 
@@ -395,6 +396,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.model_path = str(vllm_config.model_config.model)
         self._model_revision = getattr(vllm_config.model_config, "revision", None)
         self.backend: BatchedToken2Wav | None = None
+        self._watchdog = Code2WavWatchdog.from_environment()
         self._states: dict[str, _RequestState] = {}
         self._runtime_prompts: OrderedDict[str, _RuntimePrompt] = OrderedDict()
         self._request_prompt_keys: dict[str, str] = {}
@@ -530,6 +532,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._default_prompt_normalized: tuple[str, str] | None = None
         self._onset_merge = read_bool_flag(extra, "cfm_onset_merge", False)
         self._cross_turn_buckets = read_bool_flag(extra, "cfm_cross_turn_buckets", False)
+        self._npu_cross_reference_batching = read_bool_flag(extra, "cfm_npu_cross_reference_batching", False)
+        if self._npu_cross_reference_batching and self._min_batch_size != 1:
+            logger.warning(
+                "cfm_npu_cross_reference_batching requires code2wav_min_batch_size=1, but got %d; "
+                "NPU cross-reference batching will remain inactive and existing dispatch will be used",
+                self._min_batch_size,
+            )
         self._row_offset_merge = self._cfm_graph_config["row_offset_merge"]
         self._precapture_empty_cache = read_bool_flag(extra, "cfm_precapture_empty_cache", False)
 
@@ -880,11 +889,18 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     @staticmethod
     def _bucket_key(
-        item: _WorkItem, *, cross_turn: bool = False, row_offsets: bool = False, cross_reference: bool = False
+        item: _WorkItem,
+        *,
+        cross_turn: bool = False,
+        row_offsets: bool = False,
+        cross_reference: bool = False,
+        npu_same_shape: bool = False,
     ) -> tuple[Any, ...]:
         cache_signature: Any
         if item.previous is None:
             cache_signature = ("uninitialized",)
+        elif npu_same_shape:
+            cache_signature = state_shape_signature(item.previous.token2wav)
         elif row_offsets and _slot_resident(item):
             # A slot-pool row keeps its cache lengths per row (``cfm_row_offset_merge``).
             cache_signature = ("row_offsets", row_offset_signature(item.previous.token2wav))
@@ -894,10 +910,76 @@ class MiniCPMO45Code2Wav(nn.Module):
             cache_signature = row_offset_signature(item.previous.token2wav)
         else:
             cache_signature = state_shape_signature(item.previous.token2wav)
-        prompt = (None, None) if cross_reference else (item.prompt_cache_id, item.prompt_wav)
+        if npu_same_shape:
+            # Fresh references are prepared independently before a second,
+            # authoritative shape grouping. Do not infer their cache lengths
+            # from reference identity or from normalized audio duration.
+            cache_signature = (
+                "npu_same_shape",
+                cache_signature,
+                tuple(item.tokens.shape),
+                str(item.tokens.dtype),
+                str(item.tokens.device),
+                item.last_chunk,
+            )
+        prompt = (None, None) if cross_reference or npu_same_shape else (item.prompt_cache_id, item.prompt_wav)
         if cross_turn:
             return (*prompt, cache_signature)
         return (*prompt, cache_signature, item.cache_epoch)
+
+    def _npu_cross_reference_active(self) -> bool:
+        """Admit only the already-supported FP32 fused Whole-Euler arena."""
+        if not getattr(self, "_npu_cross_reference_batching", False) or self.backend is None:
+            return False
+        if getattr(self, "_min_batch_size", 1) != 1:
+            # Post-setup shape splitting can create singleton groups. Preserve
+            # the existing strict minimum-bucket contract for such profiles.
+            return False
+        if not self.backend._whole_euler_ragged_active():
+            return False
+        wrapper = self.backend._whole_euler_graph_wrapper
+        return (
+            wrapper.device.type == "npu"
+            and getattr(wrapper, "dtype", None) == torch.float32
+            and getattr(wrapper, "att_slots", 0) == 0
+            and getattr(self.backend, "_ragged_fused_body", False)
+            and getattr(self.backend, "_estimator_att_cache_dtype", None) == torch.float32
+        )
+
+    @staticmethod
+    def _npu_same_shape_groups(
+        items: list[_WorkItem],
+        states: list[BatchedToken2WavState],
+        features: PromptFeatures | list[PromptFeatures],
+        *,
+        cross_turn: bool,
+    ) -> list[list[int]]:
+        """Partition prepared rows without reading tensor values or mixing histories."""
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for row, (item, state) in enumerate(zip(items, states, strict=True)):
+            feature = features[row] if isinstance(features, list) else features
+            # Full shapes include prompt/history lengths. Full device strings
+            # additionally prevent combining rows from different NPU indices.
+            caches = tuple(
+                (kind, name, tuple(value.shape), str(value.dtype), str(value.device))
+                for kind, cache in (("flow", state.flow_cache), ("hift", state.hift_cache))
+                for name, value in sorted(cache.items())
+            )
+            conditioning = tuple(
+                (tuple(value.shape), str(value.dtype), str(value.device))
+                for value in (feature.speech_tokens, feature.speaker_embedding, feature.mels)
+            )
+            signature = (
+                caches,
+                conditioning,
+                tuple(item.tokens.shape),
+                str(item.tokens.dtype),
+                str(item.tokens.device),
+                item.last_chunk,
+                None if cross_turn else item.cache_epoch,
+            )
+            groups.setdefault(signature, []).append(row)
+        return list(groups.values())
 
     def _prepare_decode_batch(
         self, items: list[_WorkItem]
@@ -910,11 +992,29 @@ class MiniCPMO45Code2Wav(nn.Module):
         for row, item in enumerate(items):
             key = (item.prompt_cache_id, item.prompt_wav)
             if key not in prompts:
+                self._watchdog.phase(
+                    "prepare/prompt",
+                    {
+                        "request_ids": [
+                            candidate.request_id
+                            for candidate in items
+                            if (candidate.prompt_cache_id, candidate.prompt_wav) == key
+                        ],
+                        "batch_size": len(items),
+                    },
+                )
                 prompts[key] = self.backend.prepare_prompt(*key)
             features.append(prompts[key])
             if states[row] is None:
                 fresh.setdefault(key, []).append(row)
         for key, rows in fresh.items():
+            self._watchdog.phase(
+                "setup/cfm",
+                {
+                    "request_ids": [items[row].request_id for row in rows],
+                    "batch_size": len(rows),
+                },
+            )
             for row, state in zip(rows, self.backend.setup_batch(prompts[key], len(rows)), strict=True):
                 states[row] = state
         if any(state is None for state in states):
@@ -955,6 +1055,15 @@ class MiniCPMO45Code2Wav(nn.Module):
         """Decode ``items`` together: ragged when asked to, or when their token counts or last-chunk flags differ."""
         tokens = [item.tokens for item in items]
         last_chunks = [item.last_chunk for item in items]
+        if len(items) > 1 and self._npu_cross_reference_active():
+            groups = self._npu_same_shape_groups(
+                items, states, features, cross_turn=getattr(self, "_cross_turn_buckets", False)
+            )
+            if len(groups) != 1:
+                raise _batch_error("npu_cross_reference_shape_mismatch")
+            # Keep uniform padding and fallback policy; conditions and caches
+            # remain per request. Mixed-history NPU guards are unchanged.
+            return self.backend.decode_batch(torch.stack(tokens, dim=0), features, states, last_chunk=last_chunks[0])
         if (
             ragged
             or (isinstance(features, list) and self.backend._whole_euler_ragged_active())
@@ -1035,7 +1144,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        with _stage_matmul_policy(self._tf32_mode):
+        details = {"batch_size": len(runtime_additional_information or ())}
+        with self._watchdog.watch("forward/start", details), _stage_matmul_policy(self._tf32_mode):
             return self._forward_impl(
                 input_ids,
                 positions,
@@ -1056,6 +1166,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         del positions, intermediate_tensors, inputs_embeds
+        self._watchdog.phase("forward/input_preparation")
         if getattr(self, "_precapture_pending", False) and self.backend is not None:
             try:
                 self._precapture_default_prompt()
@@ -1092,6 +1203,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "(load_format=%s); loading Token2wav assets now.",
                 getattr(getattr(self.vllm_config, "load_config", None), "load_format", "unknown"),
             )
+            self._watchdog.phase("forward/backend_build")
             with torch.inference_mode(False), torch.no_grad():
                 self._build_backend()
 
@@ -1131,6 +1243,14 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._trim_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
+        self._watchdog.phase(
+            "forward/bucket_preparation",
+            {
+                "request_ids": [item.request_id for item in items],
+                "batch_size": len(items),
+                "codec_frames": [int(item.tokens.numel()) for item in items],
+            },
+        )
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
         segment_markers = [
             item for item in items if not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
@@ -1154,10 +1274,17 @@ class MiniCPMO45Code2Wav(nn.Module):
             and self.backend._whole_euler_ragged_active()
             and self.backend._whole_euler_graph_wrapper.device.type == "cuda"
         )
+        # A single ready request cannot share CFM work. Keep its
+        # original keys and dispatch without inspecting NPU capability.
+        npu_same_shape = len(compute_items) > 1 and self._npu_cross_reference_active()
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
         for item in compute_items:
             key = self._bucket_key(
-                item, cross_turn=cross_turn, row_offsets=row_offsets, cross_reference=cross_reference
+                item,
+                cross_turn=cross_turn,
+                row_offsets=row_offsets,
+                cross_reference=cross_reference,
+                npu_same_shape=npu_same_shape,
             )
             buckets.setdefault(key, []).append(item)
         undersized = [
@@ -1203,9 +1330,23 @@ class MiniCPMO45Code2Wav(nn.Module):
             maximum=self._initial_batch_size,
         ):
             try:
+                self._watchdog.phase(
+                    "prepare/prompt",
+                    {
+                        "request_ids": [item.request_id for item in bucket],
+                        "batch_size": len(bucket),
+                    },
+                )
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
+                )
+                self._watchdog.phase(
+                    "setup/cfm",
+                    {
+                        "request_ids": [item.request_id for item in bucket],
+                        "batch_size": len(bucket),
+                    },
                 )
                 states = self.backend.setup_batch(features, len(bucket))
             except Exception as exc:
@@ -1251,6 +1392,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         for bucket in self._iter_decode_batches(decode_buckets):
             batch_size = len(bucket)
             try:
+                self._watchdog.phase(
+                    "decode/dispatch",
+                    {
+                        "request_ids": [item.request_id for item in bucket],
+                        "batch_size": batch_size,
+                        "codec_frames": [int(item.tokens.numel()) for item in bucket],
+                    },
+                )
                 states, features = self._prepare_decode_batch(bucket)
                 fresh = [item for item in bucket if item.previous is None]
                 onset_mix = self._onset_merge and 0 < len(fresh) < batch_size
@@ -1259,7 +1408,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
                 row_groups: list[list[int]] | None = None
                 offset_mix = False
-                if isinstance(features, list):
+                if npu_same_shape and batch_size > 1:
+                    row_groups = self._npu_same_shape_groups(bucket, states, features, cross_turn=cross_turn)
+                elif isinstance(features, list):
                     # Each reference has its own cache lengths and conditioning.
                     # The ragged path handles them in one solve.
                     pass
@@ -1279,8 +1430,16 @@ class MiniCPMO45Code2Wav(nn.Module):
                     audios, next_states = [None] * batch_size, [None] * batch_size
                     for rows in row_groups:
                         group_states = [states[row] for row in rows]
+                        group_features = features
+                        if isinstance(features, list):
+                            selected = [features[row] for row in rows]
+                            group_features = (
+                                selected[0] if len({feature.cache_key for feature in selected}) == 1 else selected
+                            )
                         mixed = row_offsets and len({state_shape_signature(state) for state in group_states}) > 1
-                        decoded = self._decode_rows([bucket[row] for row in rows], group_states, features, ragged=mixed)
+                        decoded = self._decode_rows(
+                            [bucket[row] for row in rows], group_states, group_features, ragged=mixed
+                        )
                         for row, audio, next_state in zip(rows, *decoded, strict=True):
                             audios[row], next_states[row] = audio, next_state
             except Exception as exc:
@@ -1315,6 +1474,14 @@ class MiniCPMO45Code2Wav(nn.Module):
                     )
                 )
 
+        self._watchdog.phase(
+            "forward/output_materialization",
+            {
+                "request_ids": [item.request_id for item in items],
+                "batch_size": len(items),
+                "audio_samples": [int(output.numel()) for output in outputs],
+            },
+        )
         self._commit_runtime_prompt_owners(items)
         # Only after the request committed its own reference can the prefetch
         # pin go; placeholder steps carry no reference and keep it.
@@ -1356,10 +1523,10 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         Only validates and enqueues; :meth:`run_idle_prefetch` does the work
         (the prompt, plus the setup with ``token2wav_ref_prefetch_setup``).
-        A bad payload is logged and skipped, never raised. Only the V1 GPU and
-        NPU generation runners call this hook and :meth:`run_idle_prefetch`;
-        under any other runner (e.g. the MRv2 generation runner) nothing is
-        queued and chunk 0 prepares its reference inline.
+        A bad payload is logged and skipped, never raised. The V1 GPU, MRv2
+        GPU and NPU generation runners call this hook and
+        :meth:`run_idle_prefetch`; runners without these optional hooks prepare
+        the reference inline at chunk 0.
         """
         if not self._ref_prefetch_enabled or self.backend is None:
             return
@@ -1436,7 +1603,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         if len(self._prefetch_queue) > self._ref_prefetch_max_waiters:
             return False
         state_id, record = next(iter(self._prefetch_queue.items()))
-        with _stage_matmul_policy(self._tf32_mode):
+        with (
+            self._watchdog.watch(
+                "prefetch/start",
+                {"request_ids": [state_id], "sample_rate": record.sample_rate},
+            ),
+            _stage_matmul_policy(self._tf32_mode),
+        ):
             return self._run_prefetch_phase(state_id, record)
 
     def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
@@ -1452,10 +1625,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                     return False
                 # Phase A. The pin keeps the entry (and with it the backend's
                 # prompt features) alive until chunk 0 or finish releases it.
+                self._watchdog.phase("prefetch/materialize_reference")
                 cache_key, entry = self._materialize_runtime_prompt(record.ref_audio, record.sample_rate)
                 entry.pins.add(state_id)
                 self._prefetch_pins[state_id] = cache_key
                 self._trim_runtime_prompts()
+                self._watchdog.phase("prefetch/prepare_prompt")
                 self.backend.prepare_prompt(entry.cache_id, entry.path)
                 record.entry = entry
                 if not self._ref_prefetch_setup:
@@ -1471,7 +1646,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._release_evicted_setup_holder()
             if self._setup_cache_size <= 0 or self._prefetch_setup_holder is not None:
                 return False
+            self._watchdog.phase("prefetch/prepare_prompt")
             features = self.backend.prepare_prompt(entry.cache_id, entry.path)
+            self._watchdog.phase("prefetch/setup_cfm")
             self.backend.setup_batch(features, 1)
             self._prefetch_setup_holder = state_id
             self._prefetch_setup_features = features
@@ -1677,6 +1854,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
+            watchdog=self._watchdog,
         )
         # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
         self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)
@@ -1685,7 +1863,33 @@ class MiniCPMO45Code2Wav(nn.Module):
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).
 
         Live tensors, the slot pool and graph pools stay, so no later solve changes.
+
+        Ascend needs ``torch.npu.empty_cache``: ``torch.accelerator.empty_cache``
+        asserts "Allocator for npu is not a DeviceAllocator" on torch_npu, so
+        reusing the CUDA path here would crash the stage instead of releasing
+        memory. The CUDA branch keeps its own gate because ``torch.cuda`` is
+        unavailable on hosts that never initialized it.
         """
+        from vllm_omni.platforms import current_omni_platform
+
+        if current_omni_platform.is_npu():
+            # The log-only memory delta is a nicety, so it must not decide
+            # whether the cache is released: a CPU-only torch build (CI runs
+            # the CPU test suite) has no "npu" device type registered, and
+            # ``torch.device("npu", ...)`` raises there. ``_memory_snapshot``
+            # already returns None for anything it cannot read, so hand it the
+            # device only when one can be constructed.
+            try:
+                npu_device = torch.device("npu", torch.npu.current_device())
+            except (RuntimeError, TypeError):
+                npu_device = None
+            torch.npu.synchronize()
+            before = _memory_snapshot(npu_device) if npu_device is not None else None
+            torch.npu.empty_cache()
+            after = _memory_snapshot(npu_device) if npu_device is not None else None
+            delta = _format_memory_delta(before, after)
+            logger.info("MiniCPM-o Code2Wav: emptied the allocator cache after precapture%s", delta)
+            return
         if torch.cuda.is_available() and torch.cuda.is_initialized():
             device = torch.device("cuda", torch.accelerator.current_device_index())
             torch.accelerator.synchronize(device)

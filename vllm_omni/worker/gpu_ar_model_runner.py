@@ -10,8 +10,8 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
-import threading
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -64,6 +64,7 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import (
+    SamplingFeedback,
     call_model_sampler,
     clamp_prompt_ids_to_penalty_padding,
     sanitize_min_tokens_stop_ids,
@@ -97,7 +98,9 @@ def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
         return {k: _clone_cuda_tensor_payload(v, sources) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         if (
-            value
+            # A single tensor needs only a clone/copy. Packing it adds cat,
+            # flattening, and CPU view construction without batching any work.
+            len(value) > 1
             and all(
                 isinstance(v, torch.Tensor)
                 and v.is_cuda
@@ -201,11 +204,26 @@ class _OmniOutputTensorSnapshot(NamedTuple):
     async_payload: _AsyncCPUPayloadSnapshot | None = None
 
 
+class _SamplingFeedbackOutput(AsyncModelRunnerOutput):
+    """Commit conditional RNG at the existing async output completion boundary."""
+
+    def __init__(self, output: AsyncModelRunnerOutput, feedback: SamplingFeedback):
+        self.output = output
+        self.feedback = feedback
+
+    def get_output(self) -> OmniModelRunnerOutput:
+        output = self.output.get_output()
+        self.feedback.commit(ready=True)
+        output.invalid_logits_req_ids = {output.req_ids[row] for row in self.feedback.invalid_rows()}
+        return output
+
+
 class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
     def __init__(
         self,
         *,
         model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
+        output_executor: Executor,
         cuda_device: torch.device | int | str | None = None,
         **kwargs: Any,
     ) -> None:
@@ -250,15 +268,8 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             self.async_copy_ready_event.record()
 
         self._model_runner_output_builder: Callable[[], OmniModelRunnerOutput] | None = model_runner_output_builder
-        self._background_exception: BaseException | None = None
-        self._background_thread: threading.Thread | None = None
         self._cuda_device = cuda_device
-        self._background_thread = threading.Thread(
-            target=self._build_output_in_background,
-            daemon=True,
-            name="omni-async-output-builder",
-        )
-        self._background_thread.start()
+        self._background_future: Future[None] = output_executor.submit(self._build_output_in_background)
 
     def _build_model_runner_output_once(self) -> None:
         if self._model_runner_output is not None:
@@ -269,21 +280,15 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self._model_runner_output_builder = None
 
     def _build_output_in_background(self) -> None:
-        try:
-            if self._cuda_device is not None:
-                torch.cuda.set_device(self._cuda_device)
-            self._build_model_runner_output_once()
-        except BaseException as exc:  # noqa: BLE001 - re-raised by get_output().
-            self._background_exception = exc
+        if self._cuda_device is not None:
+            torch.cuda.set_device(self._cuda_device)
+        self._build_model_runner_output_once()
 
     def get_output(self) -> OmniModelRunnerOutput:
-        background_thread = getattr(self, "_background_thread", None)
-        if background_thread is not None:
-            background_thread.join()
-            self._background_thread = None
-            background_exception = getattr(self, "_background_exception", None)
-            if background_exception is not None:
-                raise background_exception
+        background_future = getattr(self, "_background_future", None)
+        if background_future is not None:
+            # Future.result preserves the builder exception for repeated reads.
+            background_future.result()
         self._build_model_runner_output_once()
         # Upstream AsyncGPUModelRunnerOutput.get_output() accesses
         # self._has_fault for EP all2all fault tolerance (PR #43637).
@@ -375,6 +380,7 @@ class GPUARModelRunner(
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._omni_output_executor: ThreadPoolExecutor | None = None
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
@@ -659,6 +665,13 @@ class GPUARModelRunner(
         exit that can trigger GPU OOM signals when the parent process
         concurrently cleans up its own GPU state.
         """
+        # Builders retain runner-owned connector state and GPU snapshots.
+        # Drain them before tearing down either resource.
+        output_executor = getattr(self, "_omni_output_executor", None)
+        if output_executor is not None:
+            output_executor.shutdown(wait=True)
+            self._omni_output_executor = None
+
         # 1. Unfreeze GC so model weights and GPU tensors are collected
         #    immediately when references are dropped (upstream Worker.shutdown
         #    also does this before any teardown).
@@ -1500,6 +1513,9 @@ class GPUARModelRunner(
         fallthrough is load-bearing, not an error path; it is logged once per
         model for visibility.
         """
+        commit_sampling = getattr(self.model, "commit_deferred_sampling", None)
+        if callable(commit_sampling):
+            commit_sampling()
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
@@ -1523,7 +1539,8 @@ class GPUARModelRunner(
                     logits,
                     prepared_sampling_metadata,
                     input_batch=self.input_batch,
-                    requests=getattr(self, "requests", None),
+                    requests=self.requests,
+                    defer_rng=True,
                 )
                 if sampler_output is not None:
                     return sampler_output
@@ -2202,6 +2219,11 @@ class GPUARModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # Commit conditional RNG before bookkeeping can roll back discarded draws.
+        finalize_sampling = getattr(self.model, "finalize_deferred_sampling", None)
+        sampling_feedback = None
+        if not self.use_async_scheduling and callable(finalize_sampling):
+            sampling_feedback = finalize_sampling(sampler_output.sampled_token_ids)
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
         if self.use_async_scheduling:
             pp = get_pp_group()
@@ -2435,6 +2457,8 @@ class GPUARModelRunner(
                     restored_mm=restored_mm_snapshot,
                 )
             output.omni_connector_output = omni_connector_output
+            if sampling_feedback is not None:
+                output.invalid_logits_req_ids = {req_ids_output_copy[row] for row in sampling_feedback.invalid_rows()}
             return output
 
         if not use_async_omni_output:
@@ -2453,8 +2477,15 @@ class GPUARModelRunner(
                 num_nans=num_nans,
             )
             if use_async_omni_output:
+                if self._omni_output_executor is None:
+                    # One worker preserves step submission order and avoids
+                    # creating a Python thread for every decode step.
+                    self._omni_output_executor = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="omni-async-output-builder"
+                    )
                 async_output = async_output_cls(
                     model_runner_output_builder=output_builder,
+                    output_executor=self._omni_output_executor,
                     cuda_device=self.device,
                     **async_output_kwargs,
                 )
@@ -2471,6 +2502,11 @@ class GPUARModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        stage_sampling = getattr(self.model, "stage_deferred_sampling", None)
+        if callable(stage_sampling):
+            feedback = stage_sampling(self.async_output_copy_stream, async_output.async_copy_ready_event)
+            if feedback is not None:
+                return _SamplingFeedbackOutput(async_output, feedback)
         return async_output
 
     def _resolve_global_request_id(self, req_id: str) -> str:

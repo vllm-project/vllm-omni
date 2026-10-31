@@ -296,7 +296,7 @@ async def _run_seeded_text_to_audio(
 
 
 @pytest.mark.core_model
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
 def test_duplex_websocket_protocol_smoke(omni_server) -> None:
     ref_audio = resolve_ref_audio()

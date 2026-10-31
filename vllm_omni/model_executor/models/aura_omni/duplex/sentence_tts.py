@@ -99,6 +99,27 @@ def stage1_tts_text(orchestrator: Any, output: Any, *, cache: dict[str, object] 
     return _extract_text(output)
 
 
+def _note_talker_handoff(orchestrator: Any, req_state: Any) -> None:
+    """Set the concurrent-turn release flag before the Talker submit await.
+
+    The output stage is not bound yet, and intercept has not set the release
+    flag. Main's append path already opens the next turn when Stage0 is busy
+    and this flag is true. Streaming stays on so a later codec segment stop
+    is not the duplex turn end.
+    """
+    streaming = getattr(req_state, "streaming", None)
+    if streaming is not None:
+        streaming.enabled = True
+    request_id = getattr(req_state, "request_id", None)
+    manager = getattr(orchestrator, "session_manager", None)
+    if manager is None or not isinstance(request_id, str):
+        return
+    runner = manager.runner_for_request_id(request_id)
+    if runner is None or not runner.session.capabilities.supports_concurrent_turn_requests:
+        return
+    runner.run.concurrent_turn_requests_released = True
+
+
 def plan_partial_stage_output(
     orchestrator: Any,
     stage_id: int,
@@ -171,6 +192,7 @@ def plan_partial_stage_output(
     # text and sets streaming_input=False on the in-flight sentence, so
     # Code2Wav sees a short codec and the user hears a blip.
     queue_close_after = bool(chunk) and finished and not close_only and prior_emits > 0
+    _note_talker_handoff(orchestrator, req_state)
     logger.info(
         "[AURA] sentence TTS req=%s finished=%s close_only=%s text_len=%d queue_close_after=%s",
         req_state.request_id,

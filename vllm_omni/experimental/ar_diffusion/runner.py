@@ -557,10 +557,14 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
 
         Only on the realtime AR path, for a lone streaming request of a
         pipeline that declares ``supports_chunk_step_grouping``. The session's
-        KV is bound for the whole call and the scheduler regains control at
-        every chunk boundary, which is where this path's interactions are
-        applied anyway; what it gives up is the chance to act between two
-        steps of one chunk.
+        KV is bound for the whole call, but the step that reaches the chunk
+        boundary is left for a fresh call. This lets the scheduler process an
+        interaction that arrived during the grouped work before the pipeline
+        applies interactions and prepares the next chunk.
+
+        This can only reduce interaction latency for chunks with at least two
+        denoise steps. A one-step chunk has no pre-boundary step at which to
+        yield, so it retains the baseline one-call interaction latency.
         """
         return (
             bool(self.od_config.streaming_output)
@@ -575,22 +579,33 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         record_output_peak_memory: bool,
         in_diffusion_kv_memory_profile: bool = False,
     ) -> BatchRunnerOutput:
-        """Run the shared single-step core once, or repeatedly until the chunk boundary.
+        """Run the shared single-step core once, or repeatedly up to the step before the chunk boundary.
 
         The shared runner keeps its one-step-per-call semantics. When the
-        grouping policy applies, the remaining steps of the request's current
+        grouping policy applies, further steps of the request's current
         chunk are driven from here with a continuation of the scheduler
         output: the request is presented as a cached request, with nothing
         new to admit, nothing to retire and no connector work, so every
         further step is exactly what the next scheduler cycle would have
-        asked for. Grouping the probes and the commit of one block this way
-        drops the scheduler/executor round trips between them.
+        asked for. Grouping steps this way drops the scheduler/executor
+        round trips between them.
+
+        The final step is deliberately not grouped. Returning at the
+        penultimate step gives the scheduler an opportunity to process RPCs
+        before the next call reaches the chunk boundary.
+        One-step chunks have no penultimate step, so their boundary remains
+        part of the first call.
 
         The loop stops at the first call that emits a result (a chunk or an
         error), finishes the request, or leaves it without state; the base
         core already handles a mid-chunk failure or interrupt by finishing
         the request with an error and dropping its state.
         """
+        request_ids = scheduler_output.scheduled_request_ids
+        request_id = request_ids[0] if len(request_ids) == 1 else None
+        initial_state = self.state_cache.get(request_id) if request_id is not None else None
+        previous_step_in_chunk = initial_state.step_in_chunk if initial_state is not None else None
+
         output = super()._execute_stepwise_core(
             scheduler_output,
             record_output_peak_memory=record_output_peak_memory,
@@ -598,7 +613,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         )
         if not self._groups_chunk_steps(scheduler_output):
             return output
-        request_id = scheduler_output.scheduled_request_ids[0]
+        assert request_id is not None
         continuation = dataclasses.replace(
             scheduler_output,
             scheduled_new_reqs=[],
@@ -614,6 +629,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             return output
         steps = 1
         while self._chunk_step_pending(output, request_id):
+            state = self.state_cache[request_id]
+            if (
+                state.step_in_chunk > 0
+                and state.step_in_chunk == max_steps - 1
+                and state.step_in_chunk != previous_step_in_chunk
+            ):
+                break
             if steps >= max_steps:
                 self.state_cache.pop(request_id)
                 runner_output = output.get_request_output(request_id)
@@ -621,6 +643,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 runner_output.finished = True
                 runner_output.result = DiffusionOutput(error=f"Chunk did not complete within {max_steps} denoise steps")
                 break
+            previous_step_in_chunk = state.step_in_chunk
             steps += 1
             output = super()._execute_stepwise_core(
                 continuation,
