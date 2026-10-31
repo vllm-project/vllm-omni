@@ -20,25 +20,38 @@ requires_cuda = pytest.mark.skipif(
 
 
 class _FakeComm:
-    """Simulate fresh receives for native Ring merge dispatch checks."""
+    """Simulate fresh receives for native Ring merge dispatch checks.
 
-    def __init__(self, rank: int, shards: tuple[list[torch.Tensor], list[torch.Tensor]]):
+    FA and FA3 circulate K and V packed into one ``[2, ...]`` transfer per
+    hop; every other backend keeps the two separate sends. ``packed`` selects
+    which contract to enforce.
+    """
+
+    def __init__(self, rank: int, shards: tuple[list[torch.Tensor], list[torch.Tensor]], packed: bool):
         self.rank = rank
         self.world_size = len(shards[0])
         self.shards = shards
+        self.packed = packed
         self.step = 0
         self.channel = 0
         self.merge_flags: list[bool] = []
         self.fused_results: list[bool] = []
 
     def send_recv(self, tensor: torch.Tensor) -> torch.Tensor:
+        sent = (self.rank - self.step) % self.world_size
+        nxt = (self.rank - self.step - 1) % self.world_size
+        if self.packed:
+            for half, shards in enumerate(self.shards):
+                torch.testing.assert_close(tensor[half], shards[sent], rtol=0, atol=0)
+            self.channel += 1
+            return torch.stack([shards[nxt] for shards in self.shards]).clone()
         shards = self.shards[self.channel]
-        torch.testing.assert_close(tensor, shards[(self.rank - self.step) % self.world_size], rtol=0, atol=0)
+        torch.testing.assert_close(tensor, shards[sent], rtol=0, atol=0)
         self.channel += 1
-        return shards[(self.rank - self.step - 1) % self.world_size].clone()
+        return shards[nxt].clone()
 
     def commit(self) -> None:
-        assert self.channel == 2
+        assert self.channel == (1 if self.packed else 2)
         self.step += 1
 
     def wait(self) -> None:
@@ -46,7 +59,7 @@ class _FakeComm:
 
 
 def _install_fake_ring(
-    monkeypatch: pytest.MonkeyPatch, device: str, world: int, rank: int
+    monkeypatch: pytest.MonkeyPatch, device: str, world: int, rank: int, packed: bool = False
 ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], list[_FakeComm], list[int]]:
     shape = (1, 2, 2, 8)
     keys = [torch.full(shape, index, dtype=torch.bfloat16, device=device) for index in range(world)]
@@ -55,7 +68,7 @@ def _install_fake_ring(
     attended: list[int] = []
 
     def make_comm(_group: object) -> _FakeComm:
-        comm = _FakeComm(rank, (keys, values))
+        comm = _FakeComm(rank, (keys, values), packed)
         instances.append(comm)
         return comm
 
@@ -118,7 +131,7 @@ def test_native_ring_merge_dispatch(monkeypatch, world, rank, causal, backend, h
     # Mocking HIP checks dispatch only, not execution on ROCm hardware.
     if hip:
         monkeypatch.setattr(torch.version, "hip", "test-rocm")
-    inputs, instances, attended = _install_fake_ring(monkeypatch, "cuda", world, rank)
+    inputs, instances, attended = _install_fake_ring(monkeypatch, "cuda", world, rank, packed=opt_in)
     snapshots = [tensor.clone() for tensor in inputs]
     expected_visits = [(rank - step) % world for step in range(rank + 1 if causal else world)]
     options = dict(softmax_scale=8**-0.5, causal=causal, attn_type=backend)
@@ -142,7 +155,7 @@ def test_native_ring_merge_dispatch(monkeypatch, world, rank, causal, backend, h
 @pytest.mark.parametrize("fallback", ["grad", "compile", "device"])
 @torch.inference_mode()
 def test_native_ring_merge_fallbacks(monkeypatch, fallback):
-    inputs, instances, _ = _install_fake_ring(monkeypatch, "cuda", world=5, rank=4)
+    inputs, instances, _ = _install_fake_ring(monkeypatch, "cuda", world=5, rank=4, packed=True)
     device_index = inputs[0].device.index
     assert device_index is not None
     overrides: dict[str, tuple[object, str, Callable[[], object]]] = {
@@ -164,7 +177,7 @@ def test_native_ring_merge_fallbacks(monkeypatch, fallback):
 @pytest.mark.cpu
 @torch.inference_mode()
 def test_native_ring_cpu_skips_fused_merge(monkeypatch):
-    inputs, instances, _ = _install_fake_ring(monkeypatch, "cpu", world=5, rank=4)
+    inputs, instances, _ = _install_fake_ring(monkeypatch, "cpu", world=5, rank=4, packed=True)
 
     def unexpected_cuda_query() -> bool:
         raise AssertionError("CPU Ring must not query CUDA capture state")

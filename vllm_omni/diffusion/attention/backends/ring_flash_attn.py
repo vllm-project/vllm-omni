@@ -79,10 +79,37 @@ def ring_flash_attn_forward(
     if not v.is_contiguous():
         v = v.contiguous()
 
+    # Circulate K and V as a single packed transfer. RingComm already batches
+    # the two send_recv calls into one batch_isend_irecv, but two P2P ops of
+    # half the size reach well under the bandwidth of one full-size op:
+    # tests/diffusion/attention/bench_ring_comm_packed.py measures 1.9x on an
+    # isolated rotation.
+    #
+    # The packing copy below is paid once per call while the bandwidth saving
+    # accrues per hop, so the net gain grows with the ring degree: 1.08x at
+    # degree 4, 1.01x at degree 2. It also depends on how much of the transfer
+    # the hop's own attention already hides, which differs per backend, so
+    # this is enabled for the same backends as the fused merge. VLLM_FA hides
+    # more of the transfer and only pays the copy (~1% slower), so it keeps
+    # the separate sends.
+    #
+    # The receive buffer stays freshly allocated per hop. A reused ping-pong
+    # pair measured no faster and would let one hop's NCCL write race the
+    # previous hop's compute read of the same buffer.
+    pack_kv = attn_type in (AttnType.FA, AttnType.FA3) and comm.world_size > 1 and k.shape == v.shape
+    kv_send = None
+    if pack_kv:
+        kv_send = torch.empty((2, *k.shape), dtype=k.dtype, device=k.device)
+        kv_send[0].copy_(k)
+        kv_send[1].copy_(v)
+
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
-            next_k = comm.send_recv(k)
-            next_v = comm.send_recv(v)
+            if pack_kv:
+                kv_recv = comm.send_recv(kv_send)
+            else:
+                next_k = comm.send_recv(k)
+                next_v = comm.send_recv(v)
             comm.commit()
 
         if not causal or step <= comm.rank:
@@ -130,8 +157,14 @@ def ring_flash_attn_forward(
 
         if step + 1 != comm.world_size:
             comm.wait()
-            k = next_k
-            v = next_v
+            if pack_kv:
+                # The received block is already packed, so the next hop sends
+                # it on without repacking. Both halves stay contiguous.
+                kv_send = kv_recv
+                k, v = kv_recv[0], kv_recv[1]
+            else:
+                k = next_k
+                v = next_v
 
     assert out is not None
     out = out.to(q.dtype)

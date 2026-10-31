@@ -295,3 +295,10 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
+
+# Ring-attention benchmark artifacts (tests/diffusion/attention/bench_wan_t2v_*)
+# Default --workdir is a system temp dir; these catch runs that point
+# --workdir/--npy inside the repo. Timing JSON is already covered by *.json.
+wan_t2v_ring_opt/
+wan_opt*.mp4
+wan_opt*.npy
