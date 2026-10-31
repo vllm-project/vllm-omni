@@ -354,6 +354,15 @@ detached, mutable copies for plugin compatibility. Text, bytes and opaque
 media payloads are shared, rather than cloned. Consumers must treat opaque
 payloads as read-only. Session mutation methods own authoritative writes.
 
+Every non-placeholder history insertion must call `_track_history_message`,
+and removal must call `_forget_history_message`, keeping the source map complete
+for snapshot capture and hard-cutoff updates. Hidden placeholders are untracked.
+
+The prompt path uses `session.history` for Qwen retained-PCM identity. Unlike
+`snapshot.messages`, it copies only top-level message dictionaries; nested
+protocol/media containers and payloads remain shared with authoritative history
+and must be treated as read-only by prompt consumers.
+
 A source ID is allocated monotonically when a message becomes visible and
 is never reused within that session. Replacing a public item's contents
 preserves its source ID. Deleting it retires the source; recreating the same

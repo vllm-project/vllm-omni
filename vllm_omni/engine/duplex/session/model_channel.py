@@ -425,6 +425,8 @@ class ModelChannel:
                 # Keep the prompt accessor's nested content identity: Qwen
                 # binds retained PCM to those containers. Both history reads
                 # are synchronous on the owner loop, so item IDs stay aligned.
+                # Consumers must treat the shared nested protocol/media
+                # containers and payloads as read-only; only the session writes authority.
                 "conversation": list(session.history),
                 "conversation_item_ids": snapshot.item_ids,
                 "modalities": list(session.response_config.modalities),
