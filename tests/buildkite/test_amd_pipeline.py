@@ -167,19 +167,34 @@ def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
 
 
 def test_qwen_image_has_one_amd_official_weight_nightly_owner() -> None:
-    owners = [
-        (pipeline_path, step)
-        for pipeline_path in (
-            AMD_READY_PIPELINE,
-            AMD_MERGE_PIPELINE,
-            AMD_NIGHTLY_PIPELINE,
-        )
-        for step in _steps_selecting_node(pipeline_path, QWEN_IMAGE_SMOKE_NODE)
-    ]
+    nightly = _steps_selecting_node(AMD_NIGHTLY_PIPELINE, QWEN_IMAGE_SMOKE_NODE)
+    ready = _steps_selecting_node(AMD_READY_PIPELINE, QWEN_IMAGE_SMOKE_NODE)
 
-    assert len(owners) == 1
-    assert owners[0][0] == AMD_NIGHTLY_PIPELINE
-    assert owners[0][1]["label"] == QWEN_IMAGE_SMOKE_LABEL
+    assert len(nightly) == 1
+    assert nightly[0]["label"] == QWEN_IMAGE_SMOKE_LABEL
+    assert ready == []
+
+
+def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
+    """MERGE runs the default node with SDPA. Nightly keeps the AITER smoke."""
+    step = _find_step("MERGE · Qwen-Image Online Smoke", AMD_MERGE_PIPELINE)
+    command = "\n".join(step["commands"])
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 60
+    assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-merge/**/*"]
+    assert "source_file_dependencies" not in step
+    assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in step["commands"]
+    assert "VLLM_ROCM_USE_AITER=1" not in command
+    assert "AITER_JIT_DIR" not in command
+    assert QWEN_IMAGE_SMOKE_NODE in command
+    assert "advanced_model and diffusion and rocm and MI325 and cards_1" in command
+    assert "--run-level advanced_model" in command
+    assert "full_model" not in command
+    assert "Expected exactly one executed Qwen-Image MERGE test" in command
+    assert "timeout --signal=TERM --kill-after=2m 45m" in command
 
 
 def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> None:
