@@ -22,8 +22,10 @@ from benchmarks.diffusion.backends import (
 
 
 @pytest_asyncio.fixture
-async def delayed_generation_server(unused_tcp_port: int) -> AsyncIterator[str]:
+async def delayed_generation_server(unused_tcp_port: int, video_poll_requests: list[str]) -> AsyncIterator[str]:
     async def respond(request: web.Request) -> web.Response:
+        if request.method == "GET" and request.path == "/v1/videos/job":
+            video_poll_requests.append(request.path)
         video_status = "completed"
         if request.method == "POST" and request.path == "/v1/videos":
             form = await request.post()
@@ -49,6 +51,11 @@ async def delayed_generation_server(unused_tcp_port: int) -> AsyncIterator[str]:
         yield f"http://127.0.0.1:{unused_tcp_port}"
     finally:
         await runner.cleanup()
+
+
+@pytest.fixture
+def video_poll_requests() -> list[str]:
+    return []
 
 
 @pytest.mark.core_model
@@ -116,17 +123,19 @@ async def test_disabling_total_timeout_preserves_socket_read_limit(delayed_gener
 @pytest.mark.benchmark
 @pytest.mark.cpu
 @pytest.mark.asyncio
-async def test_request_timeout_reaches_video_polling(delayed_generation_server):
+async def test_request_timeout_reaches_video_polling(delayed_generation_server, video_poll_requests):
     request = RequestFuncInput(
         prompt="hello",
         api_url=delayed_generation_server + "/v1/videos",
         model="queued",
+        extra_body={"model": "queued"},
         request_timeout=0.0,
         video_job_timeout=10.0,
     )
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=0.01)) as session:
         output = await async_request_v1_videos(request, session)
     assert output.success
+    assert video_poll_requests == ["/v1/videos/job"]
 
 
 class _MockResponse:
