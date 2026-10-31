@@ -15,6 +15,7 @@ import dataclasses
 import hashlib
 import logging
 import math
+import os
 import time
 from collections.abc import Callable, Iterable, Sequence
 from functools import lru_cache
@@ -1094,7 +1095,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         torch.accelerator.empty_cache()
 
         self._inference_timesteps = self._runtime_config.inference_timesteps
-        self._cfg_value = self._runtime_config.cfg_value
+        # cfg_value precedence: env (VLLM_OMNI_SPEECH_CFG_VALUE) > deploy yaml
+        # (voxcpm2_runtime_config.cfg_value) > the dataclass default (2.0, the
+        # upstream-native value). The env var is the deployment escape valve
+        # for the singing/run-away class OpenBMB/VoxCPM#136/#216 point at:
+        # measured on Ascend 910B3, raising 2.0 -> 3.0 took the concurrent
+        # serial-content error rate from 17% to 0% (n=22) with no RTF cost,
+        # and 3.5 regressed (monotone prosody), so the sweet spot ships at
+        # the native default and the operator tunes upward when needed.
+        self._cfg_value = float(os.environ.get("VLLM_OMNI_SPEECH_CFG_VALUE", str(self._runtime_config.cfg_value)))
+        if not math.isfinite(self._cfg_value) or self._cfg_value <= 0:
+            raise ValueError(f"VLLM_OMNI_SPEECH_CFG_VALUE must be a positive finite float, got {self._cfg_value}")
         self._cfg_cutoff_ratio = self._runtime_config.cfg_cutoff_ratio
         # Number of trailing latent frames to keep as VAE receptive-field context
         # for sliding-window streaming decode. 12 matches the nanovllm reference
