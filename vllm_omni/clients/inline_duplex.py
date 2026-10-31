@@ -50,10 +50,15 @@ class InlineDuplexClient(DuplexClientBase):
         *,
         model: str,
         config: SessionConfig | None = None,
-        handshake_timeout_s: float = 30.0,
+        handshake_timeout_s: float | None = None,
     ) -> None:
-        super().__init__(model=model, config=config, handshake_timeout_s=handshake_timeout_s)
+        if handshake_timeout_s is None:
+            super().__init__(model=model, config=config)
+        else:
+            super().__init__(model=model, config=config, handshake_timeout_s=handshake_timeout_s)
         self.omni = omni
+        #: Caller-supplied open budget; ``None`` leaves the engine default in force.
+        self._open_timeout_s = handshake_timeout_s
         self._handle: DuplexSessionHandle | None = None
         self._pump_task: asyncio.Task[None] | None = None
         self._handshake_pending = False
@@ -63,7 +68,11 @@ class InlineDuplexClient(DuplexClientBase):
     async def _open(self) -> None:
         # The handle's first event is ``session.created``; the pump delivers
         # it through ``_dispatch`` where the base handshake is waiting.
-        self._handle = await self.omni.open_session(self.config.to_session_payload(model=self.model))
+        session_payload = self.config.to_session_payload(model=self.model)
+        if self._open_timeout_s is None:
+            self._handle = await self.omni.open_session(session_payload)
+        else:
+            self._handle = await self.omni.open_session(session_payload, timeout=self._open_timeout_s)
         # The base class follows up with the ``session.update`` handshake; the
         # open above already carried that session object, so it is not resent.
         self._handshake_pending = True
