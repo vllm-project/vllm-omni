@@ -95,6 +95,80 @@ def request(params, request_id="req"):
     return OmniDiffusionRequest(prompt="positive", sampling_params=params, request_id=request_id)
 
 
+def step_state(request_id, params, prompt="positive"):
+    """Build a StepRequestState the way the engine does.
+
+    The request layer (OmniDiffusionRequest.__post_init__) is what sets
+    guidance_scale_provided; states built from a bare
+    OmniDiffusionSamplingParams would present the flag as False even when
+    guidance_scale was passed explicitly, which is a shape the engine never
+    produces (see boogu_image test_pipeline_boogu_image.py:868 for the same
+    emulation).
+    """
+    req = request(params, request_id=request_id)
+    req.prompt = prompt
+    return StepRequestState(request_id=request_id, sampling=req.sampling_params, prompt=prompt)
+
+
+def execute(model, stepwise, **sampling_kwargs):
+    """Run one fresh request through full-forward or step execution.
+
+    Params are built per call: the request layer mutates them in
+    ``__post_init__``, so reusing an object across runs would turn a later
+    omit-shaped run into an explicit-value run.
+    """
+    if not stepwise:
+        return model(DiffusionRequestBatch([request(sampling(**sampling_kwargs))])).output
+    state = step_state("req", sampling(**sampling_kwargs))
+    model.prepare_encode(state)
+    batch = None
+    while state.step_index < len(state.timesteps):
+        batch = InputBatch.make_batch([state], cached_batch=batch)
+        model.step_scheduler(state, model.denoise_step(batch, states=[state]))
+    return model.post_decode(state).output
+
+
+@pytest.mark.parametrize("stepwise", [False, True])
+@torch.no_grad()
+def test_omitted_guidance_scale_matches_explicit_default(stepwise):
+    model = pipeline()
+    omitted = sampling(cfg=None)
+    probe = request(copy.deepcopy(omitted))
+    # The request layer autofills the omitted value, but leaves provided unset:
+    # the pipeline must fall back to _DEFAULT_GUIDANCE_SCALE, not to 1.0.
+    assert not probe.sampling_params.guidance_scale_provided
+    assert probe.sampling_params.guidance_scale == 1.0
+    torch.testing.assert_close(
+        execute(model, stepwise, cfg=None), execute(pipeline(), stepwise, cfg=3.0), atol=0, rtol=0
+    )
+    assert not torch.equal(execute(model, stepwise, cfg=None), execute(pipeline(), stepwise, cfg=1.0))
+
+
+@torch.no_grad()
+def test_explicit_zero_guidance_scale_is_preserved():
+    model = pipeline()
+    zero = sampling(cfg=0.0)
+    probe = request(copy.deepcopy(zero))
+    assert probe.sampling_params.guidance_scale_provided and probe.sampling_params.guidance_scale == 0.0
+    state = step_state("req", copy.deepcopy(zero))
+    model.prepare_encode(state)
+    # A pipeline-internal fallback must not rewrite the caller's explicit 0.0.
+    assert state.sampling.true_cfg_scale == 0.0
+
+
+@pytest.mark.parametrize("stepwise", [False, True])
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+def test_invalid_guidance_scale_is_rejected(bad, stepwise):
+    model = pipeline()
+    if stepwise:
+        state = step_state("req", sampling(cfg=bad))
+        with pytest.raises(ValueError, match="Invalid guidance scale"):
+            model.prepare_encode(state)
+    else:
+        with pytest.raises(ValueError, match="Invalid guidance scale"):
+            model(DiffusionRequestBatch([request(sampling(cfg=bad))]))
+
+
 @pytest.mark.parametrize("cfg", [1.0, 4.0])
 @pytest.mark.parametrize("rescale", [0.0, 0.7])
 @pytest.mark.parametrize("outputs", [1, 2])
@@ -104,7 +178,7 @@ def test_full_forward_and_step_execution_match(cfg, rescale, outputs, mode):
     full, step = pipeline(), pipeline()
     params = sampling(cfg=cfg, rescale=rescale, outputs=outputs, mode=mode)
     expected = full(DiffusionRequestBatch([request(copy.deepcopy(params))])).output
-    state = StepRequestState(request_id="req", sampling=copy.deepcopy(params), prompt="positive")
+    state = step_state("req", copy.deepcopy(params))
     step.prepare_encode(state)
     batch = None
     while state.step_index < len(state.timesteps):
@@ -149,7 +223,7 @@ def test_mixed_step_activity_matches_isolated_requests_and_selected_order(cfg, m
     for i, step_index in enumerate((0, 2, 49)):
         params = sampling(cfg=cfg, rescale=0.7, interval=(0.01, 0.15), seed=i, mode=mode)
         params.num_inference_steps = 50
-        state = StepRequestState(request_id=str(i), sampling=params, prompt="positive")
+        state = step_state(str(i), params)
         model.prepare_encode(state)
         state.step_index = step_index
         states.append(state)
@@ -197,7 +271,7 @@ def test_incompatible_slg_configs_are_rejected_even_without_preprocessing(stepwi
     params = [sampling(scale=3), sampling(scale=2)]
     with pytest.raises(ValueError, match="identical SLG"):
         if stepwise:
-            states = [StepRequestState(request_id=str(i), sampling=p, prompt="positive") for i, p in enumerate(params)]
+            states = [step_state(str(i), p) for i, p in enumerate(params)]
             for state in states:
                 model.prepare_encode(state)
             model.denoise_step(InputBatch.make_batch(states))
