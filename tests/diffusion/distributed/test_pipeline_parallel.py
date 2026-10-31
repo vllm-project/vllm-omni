@@ -192,6 +192,7 @@ def test_pp_predict_noise_sets_transformer_do_true_cfg(monkeypatch: pytest.Monke
         def __init__(self) -> None:
             super().__init__()
             self.seen_at_predict: list[bool | None] = []
+            self.seen_branches: list[str | None] = []
 
     class _MiniPPPipeline(PipelineParallelMixin, CFGParallelMixin):
         def __init__(self) -> None:
@@ -199,6 +200,7 @@ def test_pp_predict_noise_sets_transformer_do_true_cfg(monkeypatch: pytest.Monke
 
         def predict_noise(self, **kwargs) -> torch.Tensor:
             self.transformer.seen_at_predict.append(getattr(self.transformer, "do_true_cfg", None))
+            self.transformer.seen_branches.append(getattr(self.transformer, "cfg_branch", None))
             return torch.ones(2, 4)
 
     monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: 2)
@@ -230,6 +232,8 @@ def test_pp_predict_noise_sets_transformer_do_true_cfg(monkeypatch: pytest.Monke
 
     assert pipeline.transformer.seen_at_predict[-1] is False
     assert pipeline.transformer.do_true_cfg is False
+    assert pipeline.transformer.seen_branches == ["positive", "negative", "positive"]
+    assert pipeline.transformer.cfg_branch is None
 
 
 # ---------------------------------------------------------------------------

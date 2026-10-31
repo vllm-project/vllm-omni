@@ -38,7 +38,7 @@ def test_data_collection_hook_resolves_extractor_at_init():
     """The estimator hook binds its extractor in __init__, so an unknown type fails before any forward."""
     hook = DataCollectionHook("ZImageTransformer2DModel")
     assert hook.extractor_fn is extract_zimage_context
-    assert hook.current_trajectory == []
+    assert hook.current_trajectories == {}
 
     with pytest.raises(ValueError, match="Unknown model type"):
         DataCollectionHook("NotARegisteredTransformer")
