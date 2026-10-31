@@ -321,6 +321,7 @@ async def test_streaming_speech_does_not_finalize_continuity_on_validation_error
         validates_generation=True,
         validate_generation=reject_generation,
         validate_stream_audio=lambda **_kwargs: None,
+        validate_stream_output=lambda _output: None,
     )
     serving = _serving(metrics, adapter=adapter)
     monkeypatch.setattr("vllm_omni.entrypoints.openai.serving_speech.time.time", lambda: 100.25)
@@ -466,3 +467,23 @@ async def test_resampled_speech_without_pcm_does_not_emit_metrics(monkeypatch, e
     assert metrics.ttfp_calls == []
     assert metrics.underrun_calls == []
     assert metrics.continuity_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first", [True, False])
+async def test_stream_chunk_validation_prevents_clean_success(mocker, fail_first):
+    from vllm_omni.entrypoints.openai.tts_adapters.base import TTSGenerationError, TTSModelAdapter
+
+    adapter = mocker.Mock(spec=TTSModelAdapter)
+    adapter.validates_generation = False
+    failure = TTSGenerationError("decoder reported a bad tail")
+    adapter.validate_stream_output.side_effect = [failure] if fail_first else [None, failure]
+    metrics = _MetricsStub()
+    serving = _serving(metrics, adapter=adapter)
+    chunks = []
+    with pytest.raises(TTSGenerationError, match="bad tail"):
+        async for chunk in serving._generate_audio_chunks(_generate(_result(), _result()), request_id="bad-chunk"):
+            chunks.append(chunk)
+    assert len(chunks) == (0 if fail_first else 1)
+    assert metrics.completed == 0
+    assert metrics.abort_calls == ["error"]

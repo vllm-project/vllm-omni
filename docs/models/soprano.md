@@ -112,6 +112,58 @@ the engine; it is never returned as a successful empty WAV. A normal request can
 follow that failure on the same server.
 
 Check HTTP status, media type and the WAV container before treating a downloaded
-body as audio. Streamed audio, batching/concurrency, voice cloning, subjective
-audio quality and performance claims remain outside this baseline. This
-document does not add Soprano to the supported-model table.
+body as audio. The complete-response baseline does not establish streaming,
+GPU batching, voice cloning, subjective quality or performance. Streaming has
+its own deployment and checks below. This document does not add Soprano to the
+supported-model table.
+
+## Streaming PCM and SSE
+
+The explicit `soprano_streaming.yaml` deployment enables native inter-stage
+streaming. It retains eager FP32 execution, TP1 and the same two-stage memory
+budget. `soprano.yaml` remains the complete-response deployment.
+
+```bash
+TRITON_F32_DEFAULT=ieee VLLM_USE_V2_MODEL_RUNNER=0 \
+  vllm serve "$SOPRANO_MODEL_DIR" --omni \
+  --deploy-config vllm_omni/deploy/soprano_streaming.yaml \
+  --served-model-name soprano --host 127.0.0.1 --port 8000
+```
+
+Request raw mono signed 16-bit little-endian PCM at 32000 Hz:
+
+```bash
+curl --fail-with-body --no-buffer http://127.0.0.1:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  --data-raw '{"model":"soprano","input":"Hello, this is a simple speech synthesis test.","voice":"default","response_format":"pcm","stream":true,"stream_format":"audio","seed":44}' \
+  --output soprano-stream.pcm
+```
+
+This file is model-generated speech. Raw PCM has no WAV header; interpret it
+with the response's `X-Audio-Sample-Rate` and `X-Audio-Channels` headers. Set
+`stream_format` to `sse` for the existing `speech.audio.delta` / `speech.audio.done`
+protocol, whose `audio` fields contain base64 audio deltas. Complete WAV responses
+also work on the streaming deployment and concatenate the same emitted samples.
+
+The connector's `soprano_chunk_size` controls hidden-vector chunks (default 4,
+allowed range 1–64). Decoder state retains at most `8 + chunk_size` hidden rows
+per request. The first scheduled decode needs `4 + chunk_size` valid predictors;
+termination flushes exactly through sample `2048 * (T - 1)`. A short request may
+finish before any regular chunk is available. Fewer than two valid predictors
+produce an explicit synthesis error; no silent padding is applied.
+
+Streaming uses the same predictor sequence as native offline inference, starting
+with the prompt's last hidden state. It excludes the predictor of sampled EOS
+and retains the last non-EOS predictor on a length stop. The official HF streaming
+backend uses a different vector sequence; natural sampled waveforms from those
+paths are not expected to match. Windowed and full decoding can also differ
+numerically even for the same hidden states and must be compared separately.
+
+Each synthesis unit owns its decoder state through finish, cancellation and
+worker-slot reuse. The HTTP adapter still accepts one official synthesis unit per
+request. For text split by the official cleaner/splitter, submit each unit as a
+separate request and concatenate deltas in sentence order. This is not single
+request multi-sentence fanout. CUDA graphs and speculative decoding are outside
+this streaming baseline; overlapping HTTP requests do not establish C4 GPU
+batching support. Human listening and browser playback remain separate acceptance
+steps.

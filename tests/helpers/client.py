@@ -103,6 +103,8 @@ class OmniResponse:
     audio_content: str | None = None
     audio_format: str | None = None
     audio_bytes: bytes | None = None
+    audio_chunk_arrivals_s: list[float] | None = None
+    audio_chunk_sizes: list[int] | None = None
     word_timestamps: list[dict[str, str | int]] | None = None
     #: End-to-end wall time in **seconds** (``perf_counter`` delta), from just before the
     #: OpenAI client call through response parsing and local post-process (e.g. audio decode).
@@ -1427,12 +1429,50 @@ class OnlineOmniClient:
         try:
             # Aggregate all audio bytes from the streaming response.
             data = bytearray()
+            arrivals: list[float] = []
+            sizes: list[int] = []
+            result.audio_chunk_arrivals_s = arrivals
+            result.audio_chunk_sizes = sizes
+            http_response = getattr(response, "http_response", None)
+            if http_response is None:
+                http_response = getattr(response, "response", None)
+            content_type = http_response.headers.get("content-type", "") if http_response is not None else ""
+            is_sse = content_type.startswith("text/event-stream")
+            pending = bytearray()
+            saw_done = False
+
+            def consume(chunk: bytes) -> None:
+                nonlocal saw_done
+                if not chunk:
+                    return
+                if is_sse:
+                    pending.extend(chunk)
+                    while b"\n\n" in pending:
+                        entry, _, tail = pending.partition(b"\n\n")
+                        pending[:] = tail
+                        lines = [line[6:] for line in entry.splitlines() if line.startswith(b"data: ")]
+                        if not lines:
+                            continue
+                        event = json.loads(b"\n".join(lines))
+                        if event.get("type") == "speech.audio.delta":
+                            append_audio(base64.b64decode(event["audio"], validate=True))
+                        elif event.get("type") == "speech.audio.done":
+                            saw_done = True
+                        elif event.get("type") == "error" or "error" in event:
+                            raise ValueError(f"Speech SSE failed: {event}")
+                else:
+                    append_audio(chunk)
+
+            def append_audio(chunk: bytes) -> None:
+                if chunk:
+                    data.extend(chunk)
+                    arrivals.append(time.perf_counter() - wall_start)
+                    sizes.append(len(chunk))
 
             # Preferred OpenAI helper.
             if hasattr(response, "iter_bytes") and callable(getattr(response, "iter_bytes")):
                 for chunk in response.iter_bytes():
-                    if chunk:
-                        data.extend(chunk)
+                    consume(chunk)
             else:
                 # Generic iterable-of-bytes fallback (e.g., generator or list of chunks).
                 try:
@@ -1445,15 +1485,18 @@ class OnlineOmniClient:
                         if not chunk:
                             continue
                         if isinstance(chunk, (bytes, bytearray)):
-                            data.extend(chunk)
+                            consume(chunk)
                         elif hasattr(chunk, "data"):
-                            data.extend(chunk.data)  # type: ignore[arg-type]
+                            consume(chunk.data)
                         elif hasattr(chunk, "content"):
-                            data.extend(chunk.content)  # type: ignore[arg-type]
+                            consume(chunk.content)
                         else:
                             raise TypeError(f"Unsupported stream chunk type: {type(chunk)}")
                 else:
                     raise TypeError(f"Unsupported audio speech streaming response type: {type(response)}")
+
+            if is_sse and (pending.strip() or not saw_done):
+                raise ValueError("Speech SSE ended without a complete speech.audio.done event")
 
             raw_bytes = bytes(data)
 
@@ -1461,9 +1504,9 @@ class OnlineOmniClient:
             result.audio_bytes = raw_bytes
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
-            result.audio_format = getattr(response, "response", None)
-            if result.audio_format is not None:
-                result.audio_format = result.audio_format.headers.get("content-type", "")
+            result.audio_format = content_type or None
+            if is_sse:
+                result.audio_format = f"audio/{response_format or 'pcm'}"
 
         except Exception as e:
             msg = f"Audio speech stream processing error: {str(e)}"

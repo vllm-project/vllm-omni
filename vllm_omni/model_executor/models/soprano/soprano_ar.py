@@ -19,8 +19,10 @@ class SopranoForCausalLM(Qwen3ForCausalLM):
         cfg = vllm_config.model_config.hf_config
         if (cfg.hidden_size, cfg.vocab_size, cfg.eos_token_id) != (512, 8192, 3):
             raise ValueError("Explicit Soprano pipeline requires the Soprano Qwen3 checkpoint")
-        if vllm_config.model_config.async_chunk:
-            raise ValueError("Soprano currently supports eager offline full-payload inference only")
+        if vllm_config.model_config.async_chunk and not vllm_config.model_config.enforce_eager:
+            raise ValueError("Soprano streaming requires eager execution and owned CPU hidden-state handoff")
+        if vllm_config.model_config.async_chunk and vllm_config.speculative_config is not None:
+            raise ValueError("Soprano streaming does not support speculative multi-token steps")
         if vllm_config.model_config.dtype != torch.float32:
             raise ValueError("Soprano's validated offline AR baseline requires dtype=float32; BF16 is not validated")
         if os.environ.get("TRITON_F32_DEFAULT") != "ieee":

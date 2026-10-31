@@ -18,6 +18,7 @@ SOPRANO_PIPELINE = PipelineConfig(
             recompute_preemption="fail",
             prompt_transform_func="vllm_omni.model_executor.models.soprano.contracts.transform_prompt",
             custom_process_next_stage_input_func=f"{_PROC}.ar_to_decoder_full_payload",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.ar_to_decoder_async_chunk",
             sampling_constraints={"detokenize": False},
         ),
         StagePipelineConfig(

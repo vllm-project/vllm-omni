@@ -14,7 +14,11 @@ from vllm import SamplingParams
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters import detect_tts_model_type, resolve_adapter
-from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext, validate_tts_request
+from vllm_omni.entrypoints.openai.tts_adapters.base import (
+    SpeechServingContext,
+    TTSGenerationError,
+    validate_tts_request,
+)
 from vllm_omni.entrypoints.openai.tts_adapters.soprano import SopranoAdapter
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -207,3 +211,24 @@ def test_shared_encoding_and_error_mapping_leave_next_request_usable(server):
         assert sr == 32000 and wave.ndim == 1 and wave.size == 4096
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("stream_format", ["audio", "sse"])
+@pytest.mark.parametrize("response_format", ["pcm", "wav"])
+def test_streaming_protocols_require_native_async_deployment(mocker, stream_format, response_format):
+    a = adapter()
+    request = OpenAICreateSpeechRequest(
+        input="Hello.", stream=True, stream_format=stream_format, response_format=response_format
+    )
+    assert "soprano_streaming.yaml" in a.validate(request)
+    a.ctx.engine_client.model_config = mocker.Mock(async_chunk=True)
+    assert validate_tts_request(a, request) is None
+
+
+def test_stream_failures_cannot_be_encoded_as_successful_pcm():
+    a = adapter()
+    with pytest.raises(TTSGenerationError, match="streaming synthesis failed"):
+        a.validate_stream_output({"audio_synthesis_error": [torch.tensor([True])]})
+    a.validate_stream_output({"audio_synthesis_error": [torch.tensor([False])]})
+    with pytest.raises(TTSGenerationError, match="no playable audio"):
+        a.validate_stream_audio(has_audio=False)

@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 from pathlib import Path
+from time import perf_counter_ns
 
 import torch
 from torch import nn
@@ -13,6 +14,7 @@ from vllm.model_executor.model_loader.weight_utils import download_weights_from_
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.soprano.contracts import SAMPLE_RATE
+from vllm_omni.model_executor.models.soprano.streaming import DecoderWindow
 from vllm_omni.model_executor.models.soprano.vocos import SopranoDecoder
 
 logger = init_logger(__name__)
@@ -32,6 +34,18 @@ class SopranoDecoderForGeneration(nn.Module):
         if vllm_config.model_config.dtype != torch.float32:
             raise ValueError("Soprano decoder requires dtype=float32")
         self.decoder = SopranoDecoder()
+        self._streams: dict[str, DecoderWindow] = {}
+
+    def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
+        """Runner IDs (not batch rows) own state; finish and abort both reclaim it."""
+        for request_id in finished_req_ids:
+            removed = self._streams.pop(request_id, None)
+            logger.debug(
+                "Soprano decoder cleanup req=%s active=%s remaining=%d",
+                request_id,
+                removed is not None,
+                len(self._streams),
+            )
 
     def compute_logits(self, hidden_states, sampling_metadata=None) -> None:
         # GenerationModelRunner emits waveform payloads without AR sampling;
@@ -82,7 +96,12 @@ class SopranoDecoderForGeneration(nn.Module):
         request_ids=None,
         **runner_metadata,
     ):
-        """Delta contract: each complete request yields exactly one waveform."""
+        """Delta contract: each call returns only newly committed samples.
+
+        Full-payload deployments still yield one complete waveform. Async
+        deployments use bounded windows keyed by the generation runner's
+        request IDs, with terminal flush and on_requests_finished abort cleanup.
+        """
         infos = runtime_additional_information or []
         if not infos:
             raise ValueError("Soprano decoder has no request payload")
@@ -90,9 +109,54 @@ class SopranoDecoderForGeneration(nn.Module):
         truncated = []
         synthesis_errors = []
         device = self.decoder.head.out.weight.device
-        for info in infos:
-            error = info.get("additional_information", {}).get("soprano_error")
+        for row, info in enumerate(infos):
+            extra = info.get("additional_information", {})
+            error = extra.get("soprano_error")
             hidden = info.get("hidden_states", {}).get("output")
+            if extra.get("soprano_stream"):
+                if request_ids is None or len(request_ids) != len(infos):
+                    raise ValueError("Soprano stream needs one generation request ID per batch row")
+                request_id = request_ids[row]
+                finished = bool(info.get("meta", {}).get("stream_finished", False))
+                failed = False
+                committed = False
+                try:
+                    if error or hidden is None:
+                        raise ValueError(error or "Missing Soprano streaming hidden payload")
+                    chunk_size = int(extra["soprano_chunk_size"])
+                    state = self._streams.setdefault(request_id, DecoderWindow(chunk_size))
+                    if chunk_size != state.chunk_size:
+                        raise ValueError("Soprano chunk_size changed within a synthesis unit")
+                    audio.append(
+                        state.push(self.decoder, hidden.to(device=device, dtype=torch.float32), finished=finished)
+                    )
+                    committed = True
+                    logger.debug(
+                        "Soprano audio delta req=%s samples=%d total_hidden=%d "
+                        "context_rows=%d finished=%s monotonic_ns=%d",
+                        request_id,
+                        audio[-1].numel(),
+                        state.total,
+                        0 if state.hidden is None else state.hidden.shape[0],
+                        finished,
+                        perf_counter_ns(),
+                    )
+                except (ValueError, KeyError) as exc:
+                    logger.error("Soprano stream req=%s: %s", request_id, exc)
+                    audio.append(torch.empty(0, device=device, dtype=torch.float32))
+                    failed = True
+                finally:
+                    if finished or not committed:
+                        self._streams.pop(request_id, None)
+                        logger.debug(
+                            "Soprano decoder release req=%s finished=%s remaining=%d",
+                            request_id,
+                            finished,
+                            len(self._streams),
+                        )
+                synthesis_errors.append(torch.tensor([failed]))
+                truncated.append(torch.tensor([bool(extra.get("soprano_truncated", False))]))
+                continue
             invalid = error or hidden is None or hidden.ndim != 2 or hidden.shape[1] != 512 or hidden.shape[0] < 2
             if invalid:
                 # A terminal request error must not escape the worker loop.

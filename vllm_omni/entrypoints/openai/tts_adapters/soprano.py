@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Soprano's fixed-voice, English, complete-response Speech API adapter."""
+"""Soprano's fixed-voice English Speech API, including native audio deltas."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     ARTTSAdapter,
     PreparedRequest,
+    TTSGenerationError,
     apply_max_new_tokens,
     resolve_stage_model_path,
 )
@@ -74,9 +75,13 @@ class SopranoAdapter(ARTTSAdapter):
         for field in _UNSUPPORTED_FIELDS:
             if getattr(request, field) is not None:
                 return f"Soprano does not support '{field}'"
-        if request.is_streaming():
-            return "Soprano Speech API currently supports complete responses only; streaming is not supported"
-        if request.response_format != "wav":
+        if request.is_streaming() and not getattr(
+            getattr(self.ctx.engine_client, "model_config", None), "async_chunk", False
+        ):
+            return "This Soprano deployment supports complete responses; use soprano_streaming.yaml for streaming"
+        if request.is_streaming() and request.response_format not in {"pcm", "wav"}:
+            return "Soprano streaming supports pcm or wav only"
+        if not request.is_streaming() and request.response_format != "wav":
             return "Soprano Speech API initially supports response_format='wav' only"
         if request.speed is not None and request.speed != 1.0:
             return "Soprano does not support speed adjustment; use speed=1.0 or omit it"
@@ -138,3 +143,13 @@ class SopranoAdapter(ARTTSAdapter):
             if value is not None:
                 values = value if isinstance(value, list) else [value]
                 collect[key] = any(bool(item) for item in values)
+
+    def validate_stream_output(self, audio_output: Mapping[str, Any]) -> None:
+        status: dict[str, bool] = {}
+        self.collect_response_metadata(audio_output, status)
+        if status.get("audio_synthesis_error"):
+            raise TTSGenerationError("Soprano streaming synthesis failed; no successful audio tail was produced")
+
+    def validate_stream_audio(self, *, has_audio: bool) -> None:
+        if not has_audio:
+            raise TTSGenerationError("Soprano produced no playable audio")

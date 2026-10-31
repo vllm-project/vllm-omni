@@ -19,3 +19,8 @@ https://github.com/neonbjb/tortoise-tts (tortoise/utils/tokenizer.py and text.py
 The frontend retains upstream cleaning order, sentence lengths and short-unit
 merging; regex replaces the stdlib re import to follow repository policy.
 Optional text dependencies are loaded when normalization is requested.
+
+Bounded streaming windows are validated against SopranoTTS.infer_stream in
+soprano/tts.py at the revision above. The implementation emits sample deltas
+and deliberately keeps the native offline predictor-state sequence rather
+than adopting the reference HF backend's different consumed-token sequence.
