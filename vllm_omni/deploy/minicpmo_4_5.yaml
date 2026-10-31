@@ -21,6 +21,13 @@ connectors:
       # chain for accuracy triage (e.g. after a CANN/torch_npu upgrade). It is
       # a no-op off NPU or without Triton.
       # talker_codec_fused_prelude: false
+      # Host-side codec sampling of the K-step frame loop (talker-side).
+      # Defaults to on; set false to restore the device sampler chain. This
+      # yaml key is the opt-out that reaches engine subprocesses;
+      # VLLM_OMNI_HOST_CODEC_SAMPLE remains as a secondary override for
+      # direct engine launches. Note the sampled audio differs from the
+      # device path for non-greedy draws (different RNG stream).
+      # talker_codec_host_sample: false
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
@@ -40,6 +47,12 @@ connectors:
       # end (3) is a short tail chunk and the upper end (29-33) is a tail chunk
       # merged with a small backlog; both used to miss every bucket and run
       # eager HiFT (32 of 798 decode calls in the 2026-10-30 c8 round).
+      # hift_graph_continuation_frames / hift_graph_exact_batch_sizes widen
+      # the captured HiFT graph set on BOTH platforms (this deploy file is
+      # shared): expect roughly 31 continuation widths x batch {1,2} more
+      # graphs, i.e. extra capture time during warmup and extra graph
+      # memory. Validated on NPU 910B3; the CUDA path uses the same keys
+      # through the shared cuda_graph_wrapper.
       hift_graph_continuation_frames: [3, 33]
       # Batch 2 was the last eager residue: every batch-2 continuation shape
       # missed both the buckets (only 1/2/4/8 x 50/58 are captured) and the

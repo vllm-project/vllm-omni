@@ -12,14 +12,13 @@ Pipeline:
   5. Next decode embeds that id with emb_code and emits it to Code2Wav
 """
 
+import os
+import random
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import cached_property
 from types import SimpleNamespace
 from typing import Any
-
-import os
-import random
 
 import numpy as np
 import torch
@@ -43,6 +42,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
     parse_bool_flag as _bool_flag,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
+    read_bool_flag,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
@@ -83,13 +85,16 @@ _CODEC_REPETITION_PENALTY = 1.05
 # micro-kernels plus one packed.cpu() sync per frame -- collapses to a
 # head_code Linear on device plus a single 26KB logits D2H, with every
 # downstream filter / penalty / draw / transition on host scalars.
-# Enabled by default; set VLLM_OMNI_HOST_CODEC_SAMPLE=0 to restore the
-# device sampler. The host RNG stream is not bit-identical to the NPU
+# Enabled by default. The switch is an instance attribute resolved from the
+# stage connector ``extra`` config (``talker_codec_host_sample``) with
+# VLLM_OMNI_HOST_CODEC_SAMPLE as a secondary override: runtime.env does not
+# reach engine subprocesses, so the deployment yaml is the reachable opt-out.
+# The host RNG stream is not bit-identical to the NPU
 # multinomial sequence, so generated audio differs from the device
 # sampler, but quality is unchanged (seed-tts WER identical item by
 # item); greedy (temperature==0) stays bit-identical. See
-# _sample_audio_code_host.
-_HOST_CODEC_SAMPLE = os.environ.get("VLLM_OMNI_HOST_CODEC_SAMPLE", "1") == "1"
+# _sample_audio_code_host and the _talker_codec_host_sample setup in
+# __init__.
 # Optimization C gate: one-row-deep pipeline of boundary heads on the host
 # sampling path. Default on when host sampling is on; set
 # VLLM_OMNI_HOST_SAMPLE_PIPELINE=0 to settle each row eagerly (A/B arms).
@@ -768,6 +773,20 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._extra_config().get("talker_codec_fused_prelude", True),
             "talker_codec_fused_prelude",
         )
+        # Host-side codec sampling uses the same connector-extra surface:
+        # the yaml key is the opt-out a deployment can actually reach, and
+        # the env var stays as the secondary override for direct engine
+        # launches / A-B arms. Resolved eagerly so a bare test double that
+        # bypasses __init__ falls back to the device samplers instead of
+        # touching host-only attributes.
+        self._talker_codec_host_sample = read_bool_flag(
+            self._extra_config(),
+            "talker_codec_host_sample",
+            _bool_flag(
+                os.environ.get("VLLM_OMNI_HOST_CODEC_SAMPLE", "1"),
+                "VLLM_OMNI_HOST_CODEC_SAMPLE",
+            ),
+        )
 
         # Multi-frame decode: K codec frames per Talker decode step. A value
         # >= 2 engages the loop -- the scheduler hands each request K query
@@ -1229,6 +1248,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_inputs = getattr(self, "_request_codec_device_inputs", None)
                 if isinstance(codec_inputs, dict):
                     codec_inputs.pop(request_id, None)
+                host_states = getattr(self, "_request_host_codec_states", None)
+                if isinstance(host_states, dict):
+                    # Same reset for the host sampler: a stale "finished"
+                    # would keep every later frame of the new segment silent.
+                    host_states.pop(request_id, None)
             empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return (
                 input_ids,
@@ -1824,7 +1848,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # state inside it owns the eos/stop-id/limit transition (single
             # source).
             host_id: int | None = None
-            if _HOST_CODEC_SAMPLE and self._k_step_frames > 0:
+            if getattr(self, "_talker_codec_host_sample", False) and self._k_step_frames > 0:
                 # Plan B: host-side sampling replaces the device eager
                 # chain for both greedy and random; the three scalars come
                 # back without the per-frame packed.cpu() round trip.
@@ -2343,6 +2367,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         device_states[request_id] = result.state
         return result
+
     def _sample_audio_code_host(
         self,
         hidden_state: torch.Tensor,
@@ -2355,7 +2380,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         eos_window_masked: bool = False,
         lg_dev: torch.Tensor | None = None,
     ) -> tuple[int, bool, bool]:
-        """Host-side codec boundary sampling (VLLM_OMNI_HOST_CODEC_SAMPLE=1).
+        """Host-side codec boundary sampling (talker_codec_host_sample).
 
         Device work per frame: one head_code Linear plus a single D2H of the
         raw logits row (~26KB at the codec vocab). Stop censoring, repetition
@@ -2380,10 +2405,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         """
         if not getattr(self, "_host_codec_sample_logged", False):
             self._host_codec_sample_logged = True
-            logger.info(
-                "[host-sample] host-side codec sampling armed "
-                "(VLLM_OMNI_HOST_CODEC_SAMPLE=1)"
-            )
+            logger.info("[host-sample] host-side codec sampling armed (talker_codec_host_sample)")
         states = getattr(self, "_request_host_codec_states", None)
         if states is None:
             states = {}
@@ -2394,10 +2416,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             generator = random.Random(int(seed))
             window: list[int] = []
             if isinstance(history, torch.Tensor) and history.numel() > 0:
-                window = [
-                    int(t)
-                    for t in history.detach().to(torch.long).reshape(-1).cpu().tolist()
-                ]
+                window = [int(t) for t in history.detach().to(torch.long).reshape(-1).cpu().tolist()]
                 window = window[-HISTORY_WINDOW:]
             bins: dict[int, int] = {}
             initial_bins = _codec_full_bins_input(request_state, hidden_state.device)
@@ -2424,21 +2443,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             eos_token_id = int(self._codec_eos_id)
             min_tokens_stop_ids = _codec_stop_ids(request_state)
             stop_ids = tuple(dict.fromkeys((eos_token_id, *min_tokens_stop_ids)))
-            temperature = _codec_float_param(
-                request_state, "codec_temperature", self._codec_temperature
-            )
+            temperature = _codec_float_param(request_state, "codec_temperature", self._codec_temperature)
             top_k = _codec_int_param(request_state, "codec_top_k", self._codec_top_k)
             top_p = _codec_float_param(request_state, "codec_top_p", self._codec_top_p)
             min_p = _codec_float_param(request_state, "codec_min_p", 0.0)
             repetition_penalty = _codec_float_param(
                 request_state, "codec_repetition_penalty", self._codec_repetition_penalty
             )
-            frequency_penalty = _codec_float_param(
-                request_state, "codec_frequency_penalty", 0.0
-            )
-            presence_penalty = _codec_float_param(
-                request_state, "codec_presence_penalty", 0.0
-            )
+            frequency_penalty = _codec_float_param(request_state, "codec_frequency_penalty", 0.0)
+            presence_penalty = _codec_float_param(request_state, "codec_presence_penalty", 0.0)
             ignore_eos = _codec_bool_param(request_state, "codec_ignore_eos", False)
             params = (
                 stop_ids,
@@ -2477,10 +2490,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # C the projection arrived pre-submitted (lg_dev), so this D2H
         # returns immediately and the numpy chain overlaps the next head.
         lg = (
-            lg_dev
-            if lg_dev is not None
-            else self.head_code[0](hidden_state).float().reshape(-1).detach()
-        ).cpu().numpy()
+            (lg_dev if lg_dev is not None else self.head_code[0](hidden_state).float().reshape(-1).detach())
+            .cpu()
+            .numpy()
+        )
         # Engine step 3-4: stop censoring before any penalty.
         if eos_window_masked or hstate["step"] < int(min_tokens):
             lg[list(stop_ids)] = -np.inf
@@ -2560,7 +2573,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 bins[sampled_id] = bins.get(sampled_id, 0) + 1
         return sampled_id, finished, emit
 
-
     def _step_constants(self, hidden: torch.Tensor):
         """Constant per-step tensors, cached per (device, dtype).
 
@@ -2637,6 +2649,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         codec_device_inputs = getattr(self, "_request_codec_device_inputs", None)
         codec_histories = getattr(self, "_request_codec_history", None)
         request_generators = getattr(self, "_request_generators", None)
+        host_codec_states = getattr(self, "_request_host_codec_states", None)
         decode_codec_ids = getattr(self, "_decode_codec_ids", {})
         for request_id in self._deferred_cleanup_ids:
             request_audio_states.pop(request_id, None)
@@ -2649,6 +2662,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_histories.pop(request_id, None)
             if isinstance(request_generators, dict):
                 request_generators.pop(request_id, None)
+            if isinstance(host_codec_states, dict):
+                host_codec_states.pop(request_id, None)
             decode_codec_ids.pop(request_id, None)
             codec_state = getattr(self, "_device_codec_state", None)
             if codec_state is not None:
