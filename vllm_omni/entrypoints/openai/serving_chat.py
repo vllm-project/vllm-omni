@@ -609,6 +609,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return value.lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
+    @staticmethod
+    def _resolve_image_output_encoding(request: ChatCompletionRequest) -> tuple[str, int]:
+        """Resolve the requested output image format/compression from extra_body.
+
+        Defaults to lossless PNG, preserving previous behavior.
+        """
+        extra_body = getattr(request, "extra_body", None) or {}
+        fmt = str(extra_body.get("output_format") or "png").lower()
+        compression = extra_body.get("output_compression")
+        return ("jpeg" if fmt == "jpg" else fmt), (100 if compression is None else int(compression))
+
     @classmethod
     def _filter_stage_metrics_detail(cls, metrics: dict[str, Any] | None, request: Any) -> dict[str, Any] | None:
         if not metrics:
@@ -3164,17 +3175,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 images = final_res.images
 
         # Convert images to base64
+        image_format, image_compression = self._resolve_image_output_encoding(request)
         image_contents = []
         for img in images:
-            with BytesIO() as buffer:
-                img.save(buffer, format="PNG")
-                img_bytes = buffer.getvalue()
-            img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+            img_base64 = encode_image_base64_with_compression(
+                img, format=image_format, output_compression=image_compression
+            )
             image_contents.append(
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{img_base64}",
+                        "url": f"data:image/{image_format};base64,{img_base64}",
                     },
                     "stage_durations": stage_durations,
                     "peak_memory_mb": peak_memory_mb,
@@ -4116,15 +4127,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     else:
                         flat_images.append(item)
 
+                image_format, image_compression = self._resolve_image_output_encoding(request)
                 for img in flat_images:
-                    with BytesIO() as buffer:
-                        img.save(buffer, format="PNG")
-                        img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    img_base64 = encode_image_base64_with_compression(
+                        img, format=image_format, output_compression=image_compression
+                    )
                     image_contents.append(
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{img_base64}",
+                                "url": f"data:image/{image_format};base64,{img_base64}",
                             },
                             "stage_durations": stage_durations,
                             "peak_memory_mb": peak_memory_mb,
