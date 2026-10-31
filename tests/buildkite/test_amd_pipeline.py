@@ -3475,10 +3475,11 @@ def test_pause_keep_two_ranks_ready_pins_the_mi325_node() -> None:
 
 _VERL_GENERATE_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
 _VERL_GENERATE_READY_NODE = "tests/e2e/features/rlhf_test/test_verl_omni_e2e.py::test_generate"
+_VERL_GENERATE_JUNIT_MESSAGE = "Expected exactly one executed VeRL-Omni generate test"
 
 
 def test_verl_generate_ready_pins_the_mi325_node() -> None:
-    """READY fail-closes on the one-card VeRL-Omni generate case."""
+    """READY blocks on the one-card VeRL-Omni generate case."""
     step = _find_step("ROCm · VeRL-Omni Generate GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
     source = Path("tests/e2e/features/rlhf_test/test_verl_omni_e2e.py").read_text(encoding="utf-8")
@@ -3486,8 +3487,9 @@ def test_verl_generate_ready_pins_the_mi325_node() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == ["artifacts/rocm-verl-generate/**/*"]
     assert "timeout --signal=TERM --kill-after=1m 30m" in command
     assert _marker_expressions(step) == [
         _VERL_GENERATE_READY_MARKER,
@@ -3496,6 +3498,12 @@ def test_verl_generate_ready_pins_the_mi325_node() -> None:
     assert command.count('--run-level "core_model"') == 2
     assert command.count(_VERL_GENERATE_READY_NODE) == 1
     assert "diff -u /tmp/verl-generate-ready-expected.txt" in command
+    assert "--junitxml=" in command
+    assert _VERL_GENERATE_JUNIT_MESSAGE in command
+    assert "pytest.log" not in command
+    assert "pytest-summary.txt" not in command
+    assert "PIPESTATUS" not in command
+    assert "tee " not in command
     assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in command
     assert "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT" not in command
     assert "test_weight_transfer" not in command
@@ -3673,6 +3681,58 @@ def _rendered_ready_step(label: str) -> dict:
     matches = [step for step in _walk_rendered_steps(rendered["steps"]) if step["label"].endswith(label)]
     assert len(matches) == 1, [step["label"] for step in matches]
     return matches[0]
+
+
+def test_verl_generate_ready_renders_blocking() -> None:
+    """The VeRL generate job renders as a hard failure on amd_mi300_1."""
+    label = "ROCm · VeRL-Omni Generate GPU Test"
+    step = _find_step(label, AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert command.count(_VERL_GENERATE_READY_NODE) == 1
+    assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in command
+    rendered = _rendered_ready_step(label)
+    assert rendered["agents"]["queue"] == "amd_mi300_1"
+    assert rendered["depends_on"] == "amd-build"
+    assert rendered["soft_fail"] is False
+    assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_verl_generate_ready_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    """VeRL READY fails closed unless test_generate executed and was not skipped."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label="ROCm · VeRL-Omni Generate GPU Test",
+        command_fragment="pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py",
+        expected_message=_VERL_GENERATE_JUNIT_MESSAGE,
+        artifact_env="ROCM_VERL_GENERATE_ARTIFACT_DIR",
+        job_id_prefix="verl-generate-ready-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
 
 
 def test_distributed_buffer_ready_pins_two_gpu_smokes() -> None:

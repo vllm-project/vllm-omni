@@ -1262,18 +1262,23 @@ steps:
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
-      grade: NonBlocking
+      grade: Blocking
       # The step is 40 minutes. The command leaves ten minutes for preflight.
       # Cold AITER MHA JIT varied from 911s to 1211s in READY qualification,
       # consuming most of the command before VeRL generation began. Keep this
       # focused integration/cleanup smoke bounded; dedicated READY jobs cover
       # the AITER backend itself.
       timeout_in_minutes: 40
+      artifact_paths:
+        - "artifacts/rocm-verl-generate/**/*"
       commands:
         - |
-          timeout --signal=TERM --kill-after=1m 30m bash <<'VERL_GENERATE_READY'
           set -euo pipefail
           export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
+          export ROCM_VERL_GENERATE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-verl-generate"
+          mkdir -p "$$ROCM_VERL_GENERATE_ARTIFACT_DIR"
+          bash <<'VERL_GENERATE_READY'
+          set -euo pipefail
           nodes=(
             "tests/e2e/features/rlhf_test/test_verl_omni_e2e.py::test_generate"
           )
@@ -1288,10 +1293,23 @@ steps:
             echo "VeRL-Omni READY collection drifted from test_generate" >&2
             exit 1
           fi
-          pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py \
-            -m "core_model and diffusion and rocm and MI325 and cards_1" \
-            --run-level "core_model"
           VERL_GENERATE_READY
+        - |
+          status=0
+          timeout --signal=TERM --kill-after=1m 30m \
+            pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py \
+            -m "core_model and diffusion and rocm and MI325 and cards_1" \
+            --run-level "core_model" \
+            --junitxml="$$ROCM_VERL_GENERATE_ARTIFACT_DIR/pytest.xml" || status=$$?
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 1 and skipped == 0; print(f"Expected exactly one executed VeRL-Omni generate test; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_VERL_GENERATE_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
 
 # TODO: Bagel test on ROCm is very unstable. @tjtanaa
 # Need to debug before reneable numerical changes across large PRs
