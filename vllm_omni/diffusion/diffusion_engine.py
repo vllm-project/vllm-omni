@@ -1831,12 +1831,33 @@ class DiffusionEngine:
             num_inference_steps=2,
         )
         if req is None:
+            # A skipped warmup enqueues no dummy device work, so there is
+            # nothing to drain; startup proceeds without a barrier.
             logger.info("Skipping dummy warmup run (num_frames=0)")
             return
         logger.info("dummy run to warm up the model")
         output = self.add_req_and_wait_for_response(req)
         if output.error:
+            # Startup aborts and the engine closes; draining is pointless.
             raise RuntimeError(f"Dummy run failed: {output.error}")
+        self._drain_worker_devices()
+
+    def _drain_worker_devices(self) -> None:
+        """Wait until every worker finished the warmup's queued device work.
+
+        A completed dummy request does not imply its device work is done: the
+        last queued ops (e.g. VAE-decode convs) can still be pending, and on
+        NPU CANN compiles some ops at dequeue time on the runtime thread.
+        Leftover warmup work would collide with the first real request and
+        stall it for seconds. Synchronize through the workers themselves —
+        the pause barrier's mechanism — rather than in this process: under
+        the multiproc executor the workers own the device contexts, and an
+        engine-local synchronize never reaches their queues.
+        """
+        # No timeout, mirroring the unbounded device wait inside
+        # DiffusionWorker.synchronize_device: serving must not start before
+        # every worker is drained.
+        self.collective_rpc("synchronize_device", timeout=None, kwargs={"timeout": None})
 
     def _submit_rpc(
         self,
