@@ -342,6 +342,8 @@ def test_dense_worker_call_does_not_extend_model_runner_signature() -> None:
     calls: list[tuple] = []
 
     class DenseModelRunner:
+        pipeline = None
+
         def execute_model(self, req, kv_prefetch_job=None):
             calls.append((req, kv_prefetch_job))
             return DiffusionOutput(output=None)
@@ -361,6 +363,8 @@ def test_dlo_worker_selects_request_and_metadata_from_same_envelope(monkeypatch)
     calls: list[tuple] = []
 
     class ModelRunner:
+        pipeline = None
+
         def execute_model(self, req, **kwargs):
             calls.append((req, kwargs))
             return DiffusionOutput(output=None)

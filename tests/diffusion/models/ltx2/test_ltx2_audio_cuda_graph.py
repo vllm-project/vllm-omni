@@ -12,10 +12,13 @@ import pytest
 import torch
 import vllm.distributed.parallel_state as vllm_parallel_state
 from torch import nn
+from vllm.lora.request import LoRARequest
 
 import vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph as cuda_graph_module
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
+from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph import (
     LTX2AudioCUDAGraphConfig,
     LTX2AudioCUDAGraphRunner,
@@ -23,6 +26,11 @@ from vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph import (
     make_ltx2_audio_graph_key,
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import LTX2AudioStaticConditioning
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import NewRequestData
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -141,6 +149,48 @@ def test_graph_key_and_static_copy_expand_hidden_batch_without_repeat_tensor():
 class _EagerTransformer:
     def __call__(self, **kwargs):
         return kwargs["audio_hidden_states"] + 1
+
+
+def _audio_graph_worker(graph_runner, *, with_lora_manager=True):
+    worker = object.__new__(DiffusionWorker)
+    worker.od_config = Mock()
+    worker.model_runner = Mock(spec=DiffusionModelRunner)
+    worker.model_runner.pipeline = nn.Module()
+    worker.model_runner.pipeline.audio_graph_runner = graph_runner
+    worker.model_runner.execute_model.return_value = DiffusionOutput(output=None)
+    worker.lora_manager = Mock(spec=DiffusionLoRAManager) if with_lora_manager else None
+    return worker
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("graph_enabled", [False, True])
+@pytest.mark.parametrize("with_lora_manager", [False, True])
+@pytest.mark.parametrize("dp_envelope", [False, True])
+def test_worker_rejects_audio_graph_lora_before_activation(monkeypatch, graph_enabled, with_lora_manager, dp_envelope):
+    runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cpu") if graph_enabled else None
+    worker = _audio_graph_worker(runner, with_lora_manager=with_lora_manager)
+    request = OmniDiffusionRequest(
+        prompt="A piano melody",
+        sampling_params=OmniDiffusionSamplingParams(
+            lora_request=LoRARequest("audio", 1, "/unused/adapter"),
+        ),
+        request_id="audio-lora",
+    )
+    req = request
+    if dp_envelope:
+        monkeypatch.setattr("vllm_omni.diffusion.distributed.parallel_state.get_data_parallel_rank", lambda: 0)
+        req = [NewRequestData(request_id=request.request_id, req=request)]
+    if graph_enabled:
+        with pytest.raises(ValueError, match="LoRA.*LTX2 audio CUDA Graph"):
+            worker.execute_model(req, worker.od_config)
+        worker.model_runner.execute_model.assert_not_called()
+        if worker.lora_manager is not None:
+            worker.lora_manager.set_request_adapter.assert_not_called()
+    else:
+        worker.execute_model(req, worker.od_config)
+        worker.model_runner.execute_model.assert_called_once()
+        if worker.lora_manager is not None:
+            worker.lora_manager.set_request_adapter.assert_called_once_with(request.sampling_params.lora_request, 1.0)
 
 
 @pytest.mark.cpu
@@ -652,6 +702,37 @@ def _cuda_inputs(*, tokens=3, value=1.0, mask=True, perturb=True):
         ),
         "stg_blocks": [28] if perturb else None,
     }
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_worker_rejects_same_shape_lora_after_base_graph_warmup():
+    runner = LTX2AudioCUDAGraphRunner(_TinyAudioTransformer().eval())
+    inputs = _cuda_inputs(value=1)
+    worker = _audio_graph_worker(runner)
+    worker.model_runner.execute_model.side_effect = lambda req, **kwargs: DiffusionOutput(output=runner(**inputs))
+    request = OmniDiffusionRequest(
+        prompt="A piano melody",
+        sampling_params=OmniDiffusionSamplingParams(),
+        request_id="base-audio",
+    )
+
+    with torch.inference_mode():
+        base_output = worker.execute_model(request, worker.od_config).output.clone()
+        assert runner.stats_snapshot()["captures"] == 1
+        worker.lora_manager.set_request_adapter.reset_mock()
+        request.sampling_params.lora_request = LoRARequest("audio", 1, "/unused/adapter")
+        with pytest.raises(ValueError, match="LoRA.*LTX2 audio CUDA Graph"):
+            worker.execute_model(request, worker.od_config)
+        worker.lora_manager.set_request_adapter.assert_not_called()
+        assert runner.stats_snapshot()["calls"] == 1
+        assert runner.stats_snapshot()["hits"] == 0
+
+        request.sampling_params.lora_request = None
+        next_output = worker.execute_model(request, worker.od_config).output
+    torch.testing.assert_close(next_output, base_output, rtol=0, atol=0)
+    assert runner.stats_snapshot()["captures"] == 1
+    assert runner.stats_snapshot()["hits"] == 1
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
