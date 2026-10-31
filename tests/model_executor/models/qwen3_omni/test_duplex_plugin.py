@@ -98,6 +98,7 @@ def test_capabilities_advertise_image_items_not_append_frames():
 
 async def open_qwen(
     *,
+    initial_user_text=None,
     calibrate=None,
     calibration_timeout_ms=1000,
     history_max_bytes=8 * 1024 * 1024,
@@ -124,7 +125,12 @@ async def open_qwen(
         ),
         model_config=None,
     )
-    config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
+    config = DuplexSessionConfig(
+        model="qwen",
+        modalities=["text", "audio"],
+        overlap_policy="barge_in_on_speech",
+        initial_user_text=initial_user_text,
+    )
     for key, value in config_overrides.items():
         setattr(config, key, value)
     await manager.handle(
@@ -300,6 +306,36 @@ async def test_note_published_failure_closes_the_unpublished_call():
         assert _published_call(events, "call_paris") == []
         assert any(event.type == "session.closed" for event in events)
         assert h.runner.tool_calls.record("call_paris") is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed_on_update", [False, True])
+async def test_native_first_audio_prompt_includes_the_seed_once(seed_on_update):
+    h = await open_qwen(initial_user_text=None if seed_on_update else "opening question")
+    try:
+        if seed_on_update:
+            config = replace(h.session.config, initial_user_text="opening question")
+            h.session.replace_config(config)
+            h.session.replace_runtime_config(
+                h.runner.plugin.runtime_config_for_update(config, h.session.runtime_config)
+            )
+        await h.run(append_audio())
+        await h.run(Commit(create_response=True))
+
+        [submission] = h.port.submissions
+        messages = ast.literal_eval(submission.prompt["prompt"])
+        text = [
+            part["text"]
+            for message in messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if part.get("type") == "text"
+        ]
+        assert text.count("opening question") == 1
+        assert {"role": "user", "content": "opening question"} not in h.session.history
+        assert h.session.runtime_config["initial_user_text"] == "opening question"
     finally:
         await h.manager.shutdown()
 

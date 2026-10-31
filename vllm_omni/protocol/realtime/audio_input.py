@@ -10,7 +10,7 @@ optional camera frames, and a set of optional hints (``duration_ms``,
 are free to use or ignore.
 
 :func:`decode_audio_append` turns that into :class:`RealtimeAudioAppend`, a
-value object: bytes at 16 kHz ``pcm_f32le``, the surviving hints, and a speech
+value object: ``pcm_f32le`` bytes, the surviving hints, and a speech
 verdict. It is a pure function of the event plus the session's
 :class:`~vllm_omni.protocol.realtime.session.RealtimeInputDefaults`, so any
 consumer decodes an append the same way. Building a consumer's own command
@@ -34,7 +34,7 @@ from typing import cast
 
 import numpy as np
 
-from vllm_omni.protocol.realtime.audio import convert_input_audio_with_rate
+from vllm_omni.protocol.realtime.audio import convert_input_audio_with_rate, validate_input_sample_rate_hz
 from vllm_omni.protocol.realtime.errors import RealtimeProtocolError
 from vllm_omni.protocol.realtime.formats import (
     is_supported_realtime_input_format,
@@ -76,8 +76,8 @@ class RealtimeAudioAppend:
     """One decoded ``input_audio_buffer.append``.
 
     ``audio`` is raw bytes in ``format`` at ``sample_rate_hz`` --- after
-    :func:`decode_audio_append` that is 16 kHz ``pcm_f32le`` for every input
-    format the codec converts.
+    :func:`decode_audio_append` preserves float PCM's capture rate. Other wire
+    formats convert to 16 kHz ``pcm_f32le``; the runner selects the native rate.
     """
 
     audio: bytes
@@ -178,7 +178,8 @@ def decode_audio_append(
     """Validate and pack one input append (audio and/or video frames).
 
     Capability checks (required/optional modalities) run later on the session.
-    Audio path converts to 16 kHz ``pcm_f32le``.
+    Float PCM keeps its capture rate until the runner selects the plugin's
+    native rate. Other formats convert to 16 kHz ``pcm_f32le``.
 
     ``hints_source`` is the enclosing payload when the audio arrives inside
     something larger than a bare append --- a ``conversation.item.create``
@@ -239,10 +240,15 @@ def decode_audio_append(
             audio,
             fmt,
             sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int | float) else None,
+            target_sample_rate_hz=(
+                validate_input_sample_rate_hz(sample_rate_hz)
+                if fmt == "pcm_f32le" and isinstance(sample_rate_hz, int | float)
+                else 16_000
+            ),
         )
     except ValueError as exc:
         raise RealtimeProtocolError(str(exc), code="bad_event", event_id=event_id) from exc
-    hints: dict[str, object] = {}
+    hints = {}
     if hints_source is not None:
         copy_realtime_input_hints(hints_source, hints)
     copy_realtime_input_hints(event, hints)

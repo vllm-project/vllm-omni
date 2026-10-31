@@ -51,6 +51,7 @@ from vllm_omni.engine.duplex.messages import (
     OpenDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
+from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
@@ -977,12 +978,28 @@ async def test_text_append_is_not_supported_by_the_native_runtime() -> None:
 async def test_clear_input_drops_buffered_audio() -> None:
     h = await open_harness()
     try:
+        vad_resets: list[bool] = []
+        h.runner.control.reset_vad = lambda: vad_resets.append(True)
         await h.run(append_audio(samples=8000))
         assert h.runner.model_state.audio_buffer.has_pending()
         events = await h.run(commands.ClearInput())
         assert types(events) == ["input_audio_buffer.cleared"]
         assert not h.runner.model_state.audio_buffer.has_pending()
         assert h.session.pending_input_bytes == 0
+        assert vad_resets == [True]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_overlap_barge_in_resets_server_vad_state() -> None:
+    h = await open_harness()
+    try:
+        vad_resets: list[bool] = []
+        h.runner.control.reset_vad = lambda: vad_resets.append(True)
+
+        assert await h.runner._barge_in_for_overlap({}, {"cancel_reason": "barge_in"}) is True
+        assert vad_resets == [True]
     finally:
         await close_harness(h)
 
@@ -1469,6 +1486,8 @@ async def test_playback_ack_for_an_unknown_response_is_rejected() -> None:
 async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
     h = await open_harness()
     try:
+        vad_resets: list[bool] = []
+        h.runner.control.reset_vad = lambda: vad_resets.append(True)
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="he"))
@@ -1478,6 +1497,7 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
         assert h.session.active_response_id is None
         assert h.port.aborts == [[request_id]]
         assert h.port.cleanups == [([request_id], True)]
+        assert vad_resets == [True]
         done = find(events, "response.done")
         assert done.status == "cancelled"
         assert types(events)[: types(events).index("response.done")] == [
@@ -1716,6 +1736,8 @@ async def test_cancel_response_without_active_response_is_rejected() -> None:
 async def test_cancel_response_aborts_the_stage_request_and_reports_playback() -> None:
     h = await open_harness()
     try:
+        vad_resets: list[bool] = []
+        h.runner.control.reset_vad = lambda: vad_resets.append(True)
         await h.run(append_audio())
         request_id = h.stage0_request_id()
         await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
@@ -1727,6 +1749,7 @@ async def test_cancel_response_aborts_the_stage_request_and_reports_playback() -
         assert done.response["status_details"]["reason"] == "client_cancelled"
         assert h.port.aborts == [[request_id]]
         assert h.session.epoch == 1
+        assert vad_resets == [True]
         # Only the played prefix of the cancelled answer is kept in history.
         assert h.session.history == ({"role": "assistant", "content": "he"},)
     finally:
@@ -3022,8 +3045,10 @@ async def test_uncaught_session_update_error_names_that_update(monkeypatch: pyte
 
     staged = _StagedDetector()
 
-    def fake_prepare(cls, payload, *, backend_provider=None, semantic_backend_provider=None):
-        del cls, payload, backend_provider, semantic_backend_provider
+    def fake_prepare(
+        cls, payload, *, backend_provider=None, semantic_backend_provider=None, default_interrupt_response=True
+    ):
+        del cls, payload, backend_provider, semantic_backend_provider, default_interrupt_response
         from vllm_omni.engine.duplex.turn_detection import PendingTurnDetectionUpdate
 
         return PendingTurnDetectionUpdate(config=None, detector=staged)
@@ -3142,8 +3167,10 @@ def _stage_turn_detection(monkeypatch: pytest.MonkeyPatch):
 
     staged = _StagedDetector()
 
-    def fake_prepare(cls, payload, *, backend_provider=None, semantic_backend_provider=None):
-        del cls, payload, backend_provider, semantic_backend_provider
+    def fake_prepare(
+        cls, payload, *, backend_provider=None, semantic_backend_provider=None, default_interrupt_response=True
+    ):
+        del cls, payload, backend_provider, semantic_backend_provider, default_interrupt_response
         from vllm_omni.engine.duplex.turn_detection import PendingTurnDetectionUpdate
 
         return PendingTurnDetectionUpdate(config=None, detector=staged)
@@ -3312,9 +3339,13 @@ async def test_detector_reset_failure_still_adopts_the_staged_detector(monkeypat
     staged = _StagedDetector()
     old = _OldDetector()
 
-    def fake_prepare(cls, payload, *, backend_provider=None, semantic_backend_provider=None):
+    def fake_prepare(
+        cls, payload, *, backend_provider=None, semantic_backend_provider=None, default_interrupt_response=True
+    ):
         del cls, backend_provider, semantic_backend_provider
-        _configured, config = normalize_turn_detection_session_payload(payload)
+        _configured, config = normalize_turn_detection_session_payload(
+            payload, default_interrupt_response=default_interrupt_response
+        )
         return PendingTurnDetectionUpdate(config=config, detector=staged)
 
     monkeypatch.setattr(
@@ -3373,6 +3404,31 @@ async def test_session_update_replaces_config_and_runtime_config_together() -> N
         assert h.session.config.temperature == 0.3
         assert h.session.runtime_config["duplex_stage_sampling_params"]["0"]["temperature"] == 0.3
         assert h.session.config_generation == generation + 2
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("overlap_policy", "accepted"), [("listen_only", False), ("barge_in_on_speech", True)])
+async def test_native_session_update_validates_omitted_vad_default_in_engine(
+    overlap_policy: str, accepted: bool
+) -> None:
+    h = await open_harness()
+    try:
+        command = translate_realtime_command(
+            {
+                "type": "session.update",
+                "session": {"turn_detection": {"type": "server_vad"}, "overlap_policy": overlap_policy},
+            }
+        )
+        events = await h.run(command)
+
+        if accepted:
+            assert "session.updated" in types(events)
+            assert h.session.config.extra_body["realtime_turn_detection"]["interrupt_response"] is True
+        else:
+            assert find(events, "error").code == "unsupported_turn_detection"
+            assert "session.updated" not in types(events)
     finally:
         await close_harness(h)
 

@@ -41,6 +41,7 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
     TurnDetector,
     apply_turn_detection_result,
+    validate_realtime_turn_detection,
 )
 from vllm_omni.protocol.duplex.events import error_event
 
@@ -104,7 +105,8 @@ class SessionControl:
         """
         if config is None or config.type != "semantic_vad":
             return None
-        if session_auto_responds(self._ctx.session.capabilities, extra_body):
+        capabilities = self._ctx.session.capabilities
+        if not capabilities.supports_chat_fallback and session_auto_responds(capabilities, extra_body):
             return "turn_detection.type='semantic_vad' requires a turn-based (committing) session"
         return None
 
@@ -261,10 +263,20 @@ class SessionControl:
         # needs no cleanup. Upstream dropped PendingTurnDetectionUpdate.reject.
         pending_turn_detection: PendingTurnDetectionUpdate | None = None
 
+        supports_native_turn_policy = session.capabilities.supports_model_native_turn_policy
+        turn_detection_error = validate_realtime_turn_detection(
+            payload,
+            allow_interrupt_response_false=not supports_native_turn_policy,
+            default_interrupt_response=supports_native_turn_policy,
+        )
+        if turn_detection_error is not None:
+            self._out.emit_error("unsupported_turn_detection", turn_detection_error, event_id=realtime_event_id)
+            return
         try:
             pending_turn_detection = PendingTurnDetectionUpdate.prepare(
                 payload,
                 backend_provider=self._vad_backend_provider(),
+                default_interrupt_response=supports_native_turn_policy,
                 semantic_backend_provider=self._semantic_vad_backend_provider(),
             )
         except Exception as exc:

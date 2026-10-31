@@ -1,0 +1,3 @@
+# Opt-in incremental text/audio output through the ordinary chat pipeline.
+base_config: qwen3_omni_chat_fallback.yaml
+async_chunk: true

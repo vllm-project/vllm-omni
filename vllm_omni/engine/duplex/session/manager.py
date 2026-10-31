@@ -46,12 +46,18 @@ from vllm_omni.engine.duplex.events import (
     SessionExpired,
     error_event,
 )
+from vllm_omni.engine.duplex.fallback import DuplexFallbackRequest
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
     DuplexSessionCommandMessage,
     DuplexSessionError,
     DuplexSessionEventMessage,
+    DuplexSessionFallbackCancelMessage,
+    DuplexSessionFallbackFailedMessage,
+    DuplexSessionFallbackOutputMessage,
+    DuplexSessionFallbackRequestMessage,
+    DuplexSessionFallbackStartedMessage,
     OpenDuplexSessionMessage,
     ResumeDuplexSessionMessage,
     TouchDuplexSessionMessage,
@@ -102,7 +108,12 @@ class DuplexSessionManager:
         ResumeDuplexSessionMessage,
         TouchDuplexSessionMessage,
     )
-    _MESSAGE_TYPES = (*_CONTROL_TYPES, DuplexSessionCommandMessage)
+    _FALLBACK_TYPES = (
+        DuplexSessionFallbackStartedMessage,
+        DuplexSessionFallbackOutputMessage,
+        DuplexSessionFallbackFailedMessage,
+    )
+    _MESSAGE_TYPES = (*_CONTROL_TYPES, DuplexSessionCommandMessage, *_FALLBACK_TYPES)
 
     def __init__(
         self,
@@ -215,6 +226,9 @@ class DuplexSessionManager:
 
     def dispatch(self, message: object) -> None:
         """Route one engine request-queue message without blocking the request handler."""
+        if isinstance(message, self._FALLBACK_TYPES):
+            self._dispatch_fallback(message)
+            return
         if isinstance(message, DuplexSessionCommandMessage):
             self._dispatch_command(message)
             return
@@ -276,8 +290,22 @@ class DuplexSessionManager:
             await self.touch(message)
         elif isinstance(message, DuplexSessionCommandMessage):
             self._dispatch_command(message)
+        elif isinstance(message, self._FALLBACK_TYPES):
+            self._dispatch_fallback(message)
         else:
             raise TypeError(f"Unsupported duplex control message: {type(message).__name__}")
+
+    def _dispatch_fallback(
+        self,
+        message: DuplexSessionFallbackStartedMessage
+        | DuplexSessionFallbackOutputMessage
+        | DuplexSessionFallbackFailedMessage,
+    ) -> None:
+        """Queue an API-side fallback result on the owning session's mailbox."""
+        runner = self.runners.get(message.session_id)
+        if runner is None or runner.closing:
+            return
+        runner.submit_fallback_message(message)
 
     def _dispatch_command(self, message: DuplexSessionCommandMessage) -> None:
         """Admit one command: identity check, backpressure, then the runner's ordered mailbox.
@@ -368,6 +396,42 @@ class DuplexSessionManager:
         output = self._outputs.get(session_id)
         if output is not None and response_id is not None:
             output.invalidate(response_id, through_epoch=through_epoch)
+
+    def emit_fallback_request(self, request: DuplexFallbackRequest) -> None:
+        """Send an engine-internal fallback request to the API-side serving task."""
+        self._put_output_message(
+            DuplexSessionFallbackRequestMessage(
+                session_id=request.session_id,
+                request=request,
+            )
+        )
+
+    def emit_fallback_cancel(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        response_id: str,
+        epoch: int,
+        reason: str,
+    ) -> None:
+        """Tell the API-side serving task to stop one active fallback request."""
+        self._put_output_message(
+            DuplexSessionFallbackCancelMessage(
+                session_id=session_id,
+                request_id=request_id,
+                response_id=response_id,
+                epoch=epoch,
+                reason=reason,
+            )
+        )
+
+    def _put_output_message(self, message: EngineQueueMessage) -> None:
+        put_nowait = getattr(self._output_sink, "put_nowait", None)
+        if callable(put_nowait):
+            put_nowait(message)
+        else:  # pragma: no cover - sink without put_nowait
+            asyncio.ensure_future(self._output_sink.put(message))
 
     def _emit_raw(
         self,

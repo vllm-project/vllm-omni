@@ -23,11 +23,16 @@ class CommitSnapshot:
     overlap_speech_ms: int
     response_in_progress: bool
     playback_active: bool
+    defer_active_auto_response: bool = False
 
 
 def decide_commit_action(snapshot: CommitSnapshot) -> CommitAction:
     """Choose response scheduling from an immutable session snapshot."""
     if snapshot.auto_responds:
+        # A fallback must finish its engine-owned response before another
+        # committed response starts. Native auto-response stays model-owned.
+        if snapshot.defer_active_auto_response and snapshot.active_response_id is not None:
+            return CommitAction.DEFER_ACTIVE_RESPONSE
         if snapshot.speech_since_commit:
             return CommitAction.START_AUTO_RESPONSE
         return CommitAction.COMMIT_ONLY

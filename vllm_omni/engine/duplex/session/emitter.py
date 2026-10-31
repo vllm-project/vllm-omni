@@ -249,7 +249,11 @@ class SessionEmitter:
         if realtime_input_still_open:
             session.reset_overlap_speech()
             return True, None
-        if can_promote_overlap and session.overlap_speech_ms > 0:
+        if (
+            can_promote_overlap
+            and session.overlap_speech_ms > 0
+            and (not session.capabilities.supports_chat_fallback or model_state.deferred_response_create)
+        ):
             has_deferred_overlap = (
                 model_state.audio_buffer.has_pending() or model_state.committed_audio_payload is not None
             )
