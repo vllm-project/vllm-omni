@@ -2,7 +2,6 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/diffusers_pipeline_adapter>.
 
-
 vLLM-Omni supports running diffusion models with the diffusers backend, directly serving any 🤗 Diffusers pipeline online without implementing them natively.
 
 ## Limitations
@@ -14,7 +13,7 @@ implemented with clear Diffusers or vLLM-Omni behavior.
 
 - CFG parallel execution
 - Sequence parallel execution
-- TeaCache / Cache-DiT acceleration
+- TeaCache acceleration
 - Step-wise execution (continuous batching)
 - Component-selective `diffusion_offload_config` (the legacy whole-pipeline CPU-offload options remain supported)
 
@@ -133,3 +132,24 @@ vllm serve "Wan2.2-T2V-A14B-Diffusers" \
 
 These extra CLI args will be attempted to pass as-is to the `OmniDiffusionConfig` dataclass and being accessible during model loading time.
 Special routines inside the pipeline adapter ensures that they are set properly.
+
+### Cache-DiT
+
+Enable Cache-DiT for pipelines supported by the installed Cache-DiT registry:
+
+```bash
+vllm serve "Wan-AI/Wan2.2-TI2V-5B-Diffusers" \
+    --omni --diffusion-load-format diffusers --cache-backend cache_dit
+```
+
+The runner delegates the complete Diffusers pipeline to
+`cache_dit.enable_cache` once after loading. Cache-DiT owns the denoising hooks
+and creates fresh cache contexts for every pipeline call. The native
+transformer-only cache refresh path is not applied to these contexts.
+
+The existing cache configuration controls DBCache and optional TaylorSeer.
+SCM step-mask policies are rejected: they require request-specific masks that
+this full-pipeline delegation does not provide. Unsupported pipelines raise
+Cache-DiT's registry error; this option does not add support for every model
+that Diffusers can load. Cache-DiT is approximate, so validate output quality
+for the intended model and settings.
