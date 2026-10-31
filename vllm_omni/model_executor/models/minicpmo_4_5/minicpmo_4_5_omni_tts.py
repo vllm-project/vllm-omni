@@ -677,6 +677,51 @@ class MiniCPMO45TalkerSampler(OmniSampler):
         return output
 
 
+class _ForcedEosSampling:
+    """The stock sampler as draft verification sees it, with forced codec EOS applied last.
+
+    Forcing after the logits processors keeps a forced row's target codec EOS
+    alone even where ``min_tokens`` masks EOS, so acceptance counts follow it.
+    """
+
+    def __init__(self, sampler: Any, eos_id: int, forced: torch.Tensor) -> None:
+        self._sampler = sampler
+        self._eos_id = eos_id
+        # This step's forced rows by request slot and draft position.
+        self.forced = forced
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sampler, name)
+
+    def apply_sampling_params(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        processed = self._sampler.apply_sampling_params(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+            *args,
+            **kwargs,
+        )
+        forced = self.forced[expanded_idx_mapping.long(), expanded_local_pos.long()]
+        eos_only = torch.full_like(processed[:1], float("-inf"))
+        eos_only[:, self._eos_id] = 0.0
+        return torch.where(forced.unsqueeze(1), eos_only, processed)
+
+
 class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
     """Verifies draft codes with the Talker's codec EOS control.
 
@@ -687,8 +732,15 @@ class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
     """
 
     def __init__(self, sampler: Any, spec_config: Any, talker: "MiniCPMO45OmniTTSForConditionalGeneration") -> None:
-        super().__init__(sampler, spec_config, sampler.req_states.device)
+        req_states = sampler.req_states
+        super().__init__(sampler, spec_config, req_states.device)
         self.talker = talker
+        forced = torch.zeros(
+            (int(req_states.max_num_reqs), int(spec_config.num_speculative_tokens) + 1),
+            dtype=torch.bool,
+            device=req_states.device,
+        )
+        self.sampler = _ForcedEosSampling(sampler, int(talker._codec_eos_id), forced)
 
     def __call__(
         self,
@@ -697,28 +749,20 @@ class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
         draft_logits: torch.Tensor | None = None,
         invalid_drafts: torch.Tensor | None = None,
     ) -> Any:
-        eos = int(self.talker._codec_eos_id)
         num_logits = logits.shape[0]
         forced = self.talker.take_mrv2_forced_eos(input_batch, self.sampler.req_states, num_logits)
         masked = getattr(self.talker, "_mrv2_masked_eos", None)
         self.talker._mrv2_masked_eos = None
         if masked is not None and masked.shape[0] == num_logits:
-            logits[:, eos].masked_fill_(masked, float("-inf"))
+            logits[:, int(self.talker._codec_eos_id)].masked_fill_(masked, float("-inf"))
+        table = self.sampler.forced
+        table.zero_()
         if forced is not None:
-            eos_only = torch.full_like(logits[:1], float("-inf"))
-            eos_only[:, eos] = 0.0
-            logits = torch.where(forced.unsqueeze(1), eos_only, logits)
-        output = super().__call__(logits, input_batch, draft_logits, invalid_drafts)
-        if forced is not None:
-            # min_tokens can still blank a forced row (an empty condition at
-            # its prefill); its sample is EOS regardless.
-            num_reqs = int(input_batch.num_reqs)
-            rows = torch.arange(num_logits, device=forced.device)
-            reqs = torch.searchsorted(input_batch.cu_num_logits[1 : num_reqs + 1].long(), rows, right=True)
-            pinned = torch.zeros_like(output.sampled_token_ids, dtype=torch.bool)
-            pinned[reqs, input_batch.expanded_local_pos[:num_logits].long()] = forced
-            output.sampled_token_ids.masked_fill_(pinned, eos)
-        return output
+            table[
+                input_batch.expanded_idx_mapping[:num_logits].long(),
+                input_batch.expanded_local_pos[:num_logits].long(),
+            ] = forced
+        return super().__call__(logits, input_batch, draft_logits, invalid_drafts)
 
 
 class _MiniCPMTTSProjector(nn.Module):

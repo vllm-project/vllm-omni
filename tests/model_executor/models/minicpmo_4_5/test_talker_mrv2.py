@@ -526,7 +526,7 @@ def test_codec_penalty_window_includes_the_steps_earlier_drafts(device, output_c
     torch.testing.assert_close(state.apply(logits, ctx).cpu(), expected)
 
 
-def test_draft_verification_forces_codec_eos_per_row(mocker):
+def test_draft_verification_forces_codec_eos_after_processing(mocker):
     from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import MiniCPMO45TalkerRejectionSampler
@@ -537,28 +537,47 @@ def test_draft_verification_forces_codec_eos_per_row(mocker):
             dict(slot=1, prompt_len=4, computed=0, span=[0] * 4, prefill=True),
         ]
     )
-    seen = {}
 
-    def verify(logits, input_batch, draft_logits, invalid_drafts):
-        seen["logits"] = logits.clone()
-        # min_tokens blanked the prefill row's forced EOS: its sample is arbitrary.
-        return SimpleNamespace(sampled_token_ids=torch.tensor([[3, 4], [5, 0]]), num_sampled=torch.tensor([2, 1]))
+    def apply_sampling_params(logits, *args):
+        out = logits.clone()
+        out[:, 7] = float("-inf")  # min_tokens masks codec EOS on every row
+        return out
 
-    mocker.patch.object(RejectionSampler, "__call__", autospec=True, side_effect=lambda self, *args: verify(*args))
+    sampler = SimpleNamespace(
+        req_states=SimpleNamespace(device="cpu", max_num_reqs=4), apply_sampling_params=apply_sampling_params
+    )
+    spec_config = SimpleNamespace(
+        num_speculative_tokens=1, enable_adaptive_verification=False, rejection_sample_method="standard"
+    )
     forced = torch.tensor([False, True, True])
     talker = SimpleNamespace(
         _codec_eos_id=7, _mrv2_masked_eos=None, take_mrv2_forced_eos=mocker.Mock(return_value=forced)
     )
-    rejection = object.__new__(MiniCPMO45TalkerRejectionSampler)
-    rejection.sampler = SimpleNamespace(req_states=object())
-    rejection.talker = talker
-    out = rejection(torch.zeros(3, 8), batch)
-    talker.take_mrv2_forced_eos.assert_called_once_with(batch, rejection.sampler.req_states, 3)
-    # A forced row's target is codec EOS alone, so only an EOS draft is accepted there.
-    assert seen["logits"][0].tolist() == [0.0] * 8
+    rejection = MiniCPMO45TalkerRejectionSampler(sampler, spec_config, talker)
+    seen = {}
+
+    def verify(self, logits, input_batch, draft_logits, invalid_drafts):
+        seen["processed"] = self.sampler.apply_sampling_params(
+            logits,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
+            None,
+            None,
+            input_batch.expanded_local_pos,
+            None,
+        )
+        return "verified"
+
+    mocker.patch.object(RejectionSampler, "__call__", autospec=True, side_effect=verify)
+    assert rejection(torch.zeros(3, 8), batch) == "verified"
+    talker.take_mrv2_forced_eos.assert_called_once_with(batch, sampler.req_states, 3)
+    processed = seen["processed"]
+    # An unforced row keeps the processors' result; a forced row's target is codec EOS alone.
+    assert torch.isinf(processed[0, 7]) and processed[0, :7].eq(0).all()
     for row in (1, 2):
-        assert seen["logits"][row, 7] == 0 and torch.isinf(seen["logits"][row, :7]).all()
-    assert out.sampled_token_ids.tolist() == [[3, 7], [7, 0]]
+        assert processed[row, 7] == 0 and torch.isinf(processed[row, :7]).all()
+    assert rejection.sampler.req_states is sampler.req_states
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the rejection kernels need CUDA")
@@ -572,8 +591,8 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
     limit = min(_OFFLINE_CODEC_MAX_NEW_TOKENS, 100) - 1
     prompt_lens = {3: cap_prompt, 1: 4}
     rows = [
-        # Input 5 then drafts 6 and 7; the second draft row reaches the length cap.
-        dict(slot=3, prompt_len=cap_prompt, computed=cap_prompt + limit - 2, span=[5, 6, 7], prefill=False, drafts=2),
+        # Input 5 then drafts 6 and 0; the second draft row reaches the length cap.
+        dict(slot=3, prompt_len=cap_prompt, computed=cap_prompt + limit - 2, span=[5, 6, 0], prefill=False, drafts=2),
         # Empty condition at its prefill: forced EOS that min_tokens blanks below.
         dict(slot=1, prompt_len=4, computed=0, span=[0] * 4, prefill=True),
     ]
@@ -598,11 +617,12 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
 
     def apply_sampling_params(logits, *args):
         logits = logits.float().clone()
-        logits[3, _EOS] = float("-inf")  # min_tokens on the prefill row
+        # min_tokens above the length cap: codec EOS masked on the forced rows too.
+        logits[1:, _EOS] = float("-inf")
         return logits
 
     sampler = SimpleNamespace(
-        req_states=SimpleNamespace(prefill_len=SimpleNamespace(gpu=prefill_len), device=dev),
+        req_states=SimpleNamespace(prefill_len=SimpleNamespace(gpu=prefill_len), device=dev, max_num_reqs=8),
         sampling_states=SimpleNamespace(
             # Greedy target: a draft is accepted only if it is the row's argmax.
             temperature=SimpleNamespace(gpu=torch.zeros(8, device=dev)),
@@ -619,9 +639,9 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
         num_speculative_tokens=2, enable_adaptive_verification=False, rejection_sample_method="standard"
     )
     logits = torch.zeros(4, _EOS + 1, device=dev)
-    # Without the cap, the target would accept both drafts (6, then 7) and add 9.
-    for row, best in enumerate([6, 7, 9, 11]):
-        logits[row, best] = 10.0
+    # Row 0's greedy pick is draft 6. Row 1's is code 0 unless EOS stays forced
+    # through the masking above, which would accept draft 0.
+    logits[0, 6] = 10.0
     output = MiniCPMO45TalkerRejectionSampler(sampler, spec_config, talker)(logits, batch)
     num_sampled = output.num_sampled.tolist()
     assert num_sampled == [2, 1]
@@ -629,7 +649,7 @@ def test_draft_verification_at_forced_rows_with_the_rejection_kernels():
     assert output.sampled_token_ids[0, :2].tolist() == [6, _EOS]
     assert output.sampled_token_ids[1, 0].item() == _EOS
     # The runner hands Code2Wav each request's leading scheduled - rejected rows:
-    # input 5 and the accepted draft 6, both valid codes; the rejected draft 7 stays out.
+    # input 5 and the accepted draft 6, both valid codes; the rejected draft 0 stays out.
     kept = 3 - output.num_rejected[0].item()
     assert batch.input_ids[:kept].tolist() == [5, 6] and valid[:kept].tolist() == [True, True]
 
@@ -639,9 +659,10 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
 
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
     talker._k_step_frames = 0
+    talker._codec_eos_id = _EOS
     talker.vllm_config = SimpleNamespace(speculative_config=None)
     mocker.patch.object(module, "_install_mrv2_talker_sampler", return_value="talker-sampler")
-    sampler = SimpleNamespace(req_states=SimpleNamespace(device="cpu"))
+    sampler = SimpleNamespace(req_states=SimpleNamespace(device="cpu", max_num_reqs=4))
     assert talker.mrv2_custom_sampler(sampler) == ("talker-sampler", None)
     talker.vllm_config = SimpleNamespace(
         speculative_config=SimpleNamespace(
@@ -652,7 +673,7 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
     assert talker_sampler == "talker-sampler"
     assert isinstance(rejection, module.MiniCPMO45TalkerRejectionSampler)
     # The stock sampler carries the codec window penalty installed above.
-    assert rejection.sampler is sampler
+    assert rejection.sampler._sampler is sampler
     assert rejection.talker is talker
 
 
