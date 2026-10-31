@@ -122,6 +122,7 @@ platforms:
   # CUDA/v2-only and ignored on the fallbacks.
   rocm:
     model_runner: v1
+    # Shipped V1 geometry; takes precedence over top-level codec_* here.
     connectors: &v1_connector_geometry
       connector_of_shared_memory:
         extra:
