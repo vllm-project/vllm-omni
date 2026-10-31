@@ -173,7 +173,7 @@ def test_retain_failed_voice_isolation_writes_wav_and_json(tmp_path, monkeypatch
         full=full,
         first=first,
         audio=audio,
-        extra={"git_sha": "abc"},
+        extra={"git_sha": "abc", "voice_source": "registered"},
     )
     written = retain_failed_voice_isolation(report, tmp_path)
     names = sorted(p.name for p in written)
@@ -181,5 +181,8 @@ def test_retain_failed_voice_isolation_writes_wav_and_json(tmp_path, monkeypatch
     assert (tmp_path / "failed_voice_isolation_unit_1.wav").read_bytes() == b"RIFF-b"
     data = json.loads((tmp_path / "failed_voice_isolation_unit.json").read_text())
     assert data["full"][1]["label"] == LABEL_WRONG_BOTH_AGREE and data["git_sha"] == "abc"
+    # The reference-name-to-asset map must survive alongside the voice_source extra key.
+    assert data["voices"] == {"v0": "x.wav", "v1": "y.wav"}
+    assert data["voice_source"] == "registered"
     monkeypatch.delenv("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR", raising=False)
     assert retain_failed_voice_isolation(report, None) == []

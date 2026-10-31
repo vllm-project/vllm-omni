@@ -374,7 +374,12 @@ def _assert_no_leak(test: str, run: RunResult, scorers, *, gate_first_window: bo
                 first=run.first,
                 audio=run.audio,
                 reference_matrix=scorers["ref_matrix"],
-                extra={"git_sha": _git_sha(), "mode": run.mode, "voices": run.source, "concurrency": run.concurrency},
+                extra={
+                    "git_sha": _git_sha(),
+                    "mode": run.mode,
+                    "voice_source": run.source,
+                    "concurrency": run.concurrency,
+                },
             )
         )
 
