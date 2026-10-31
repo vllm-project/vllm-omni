@@ -42,6 +42,9 @@ from vllm_omni.request import OmniRequest
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
 
+# Each test carries its own hardware mark: an unmarked test runs in no job. The
+# tests that decode through S3Gen are on the L4 job on purpose (CPU decoding of
+# the full model is covered by test_chatterbox_s3gen.py); the rest are cpu.
 pytestmark = [pytest.mark.core_model]
 
 STOP = ChatterboxConfig().stop_speech_token
