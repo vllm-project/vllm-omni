@@ -348,6 +348,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2",
         "Flux2Pipeline",
     ),
+    "Flux3Pipeline": (
+        "flux3",
+        "pipeline_flux3",
+        "Flux3Pipeline",
+    ),
     "SenseNovaU1Pipeline": (
         "sensenova_u1",
         "pipeline_sensenova_u1",
@@ -450,7 +455,6 @@ _DIFFUSION_MODELS = {
     ),
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
-
 
 DiffusionModelRegistry = _ModelRegistry(
     {
@@ -783,6 +787,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
+    "Flux3Pipeline": "get_flux3_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
     "MOSSImagePipeline": "get_mossimage_post_process_func",
@@ -837,6 +842,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_pre_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_pre_process_func",
+    "Flux3Pipeline": "get_flux3_pre_process_func",
 }
 
 

@@ -43,6 +43,13 @@ from vllm_omni.model_executor.models.common.ops._group_norm_reduction import (
     welford_group_range,
 )
 
+# Fixed launch configuration for autotune=False: skips per-shape autotune
+# benchmarking (incompatible with CUDA graph capture) at the cost of not
+# picking the shape-optimal config.
+_FIXED_BLOCK_SIZE = 2048
+_FIXED_NUM_WARPS = 8
+_FIXED_NUM_STAGES = 2
+
 
 @triton.autotune(configs=SPLIT_REDUCTION_CONFIGS, key=SPLIT_REDUCTION_KEY, prune_configs_by=SPLIT_REDUCTION_PRUNE)
 @triton.jit
@@ -141,6 +148,8 @@ def fused_group_norm_silu(
     bias: torch.Tensor,
     num_groups: int = 32,
     eps: float = 1e-6,
+    *,
+    autotune: bool = True,
 ) -> torch.Tensor:
     """
     Fused GroupNorm + SiLU activation.
@@ -154,6 +163,9 @@ def fused_group_norm_silu(
     - weight, bias: per-channel parameters, shape (C,).
     - num_groups: GroupNorm group count, default 32.
     - eps: numerical stability epsilon, default 1e-6.
+    - autotune: benchmark launch configurations for new shapes. If disabled,
+      use a fixed launch configuration (autotune benchmarking is incompatible
+      with CUDA graph capture).
     Uses fp32 accumulation for numeric alignment with PyTorch.
     Returns the same shape and eager F.group_norm-compatible dtype.
     Spatial dimensions are flattened during computation and restored afterward;
@@ -204,7 +216,17 @@ def fused_group_norm_silu(
     if split > 1:
         ws = launch_partial_stats(x_flat, B, C, spatial_size, num_groups, split, split_chunk)
 
-    _group_norm_silu_kernel[(B * num_groups * split,)](
+    if autotune:
+        kernel = _group_norm_silu_kernel
+        launch_config: dict = {}
+    else:
+        kernel = _group_norm_silu_kernel.fn  # raw JITFunction, no autotuner
+        launch_config = {
+            "BLOCK_SIZE": _FIXED_BLOCK_SIZE,
+            "num_warps": _FIXED_NUM_WARPS,
+            "num_stages": _FIXED_NUM_STAGES,
+        }
+    kernel[(B * num_groups * split,)](
         x_flat,
         out_flat,
         weight,
@@ -217,6 +239,7 @@ def fused_group_norm_silu(
         eps=eps,
         SPLIT=split,
         SPLIT_POW2=1 << (split - 1).bit_length(),
+        **launch_config,
     )
 
     return out_flat.reshape(orig_shape)
