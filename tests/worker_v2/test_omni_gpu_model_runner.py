@@ -294,6 +294,43 @@ def test_mrv2_rejects_parallel_modes_at_startup(parallel_config, match):
         runner._validate_parallel_support()
 
 
+@pytest.mark.parametrize("upstream_hook", [True, False])
+def test_load_model_builds_omni_state_through_hook_or_factory_swap(monkeypatch, upstream_hook):
+    """With vLLM's runner hook the module factory stays untouched; older vLLM
+    gets the Omni state through a swap of that factory, restored afterwards."""
+    import vllm.v1.worker.gpu.model_runner as mr
+
+    import vllm_omni.worker_v2.omni_model_runner as omni_mr
+
+    upstream_factory = mr.init_model_state
+    model = SimpleNamespace(logits_vocab_size=7)
+    omni_state = object()
+    factory_seen_by_load = []
+
+    def upstream_load_model(self, *args, **kwargs):
+        self.model = model
+        factory_seen_by_load.append(mr.init_model_state)
+        if upstream_hook:
+            self.model_state = self._init_model_state()
+        else:
+            self.model_state = mr.init_model_state(self.vllm_config, self.model, self.encoder_cache, self.device)
+
+    monkeypatch.setattr(omni_mr, "_UPSTREAM_HAS_MODEL_STATE_HOOK", upstream_hook)
+    monkeypatch.setattr(GPUModelRunner, "load_model", upstream_load_model)
+    monkeypatch.setattr(omni_mr, "init_omni_model_state", lambda *args: omni_state)
+    runner = _make_runner()
+    runner.vllm_config, runner.encoder_cache, runner.device = object(), None, torch.device("cpu")
+    runner.vocab_size = runner.req_states.vocab_size = 10
+    runner.supports_mm_inputs = False
+
+    runner.load_model()
+
+    assert runner.model_state is omni_state
+    assert runner.vocab_size == runner.req_states.vocab_size == 7
+    assert (factory_seen_by_load[0] is upstream_factory) is upstream_hook
+    assert mr.init_model_state is upstream_factory
+
+
 @pytest.mark.parametrize(
     "flag,expect_omni",
     [(None, False), ("has_preprocess", True), ("has_postprocess", True), ("have_multimodal_outputs", True)],
