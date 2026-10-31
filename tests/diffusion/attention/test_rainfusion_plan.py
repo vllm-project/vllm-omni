@@ -342,3 +342,25 @@ def test_precision_non_bf16_passes_gate_when_supported():
             # The gate must pass; the fake mindiesd returns None so no crash.
             out = impl._forward_sparse_npu(q, q, q, plan)
             assert out is None
+
+
+def test_mix_with_single_video_span_reaches_mindiesd(monkeypatch):
+    """H3 publishes video_spans even for one target; mix must reach RFv3."""
+    calls = []
+
+    def sparse_attention(query, key, value, *, precision, video_spans, sparse_type, **kwargs):
+        calls.append((precision, video_spans, sparse_type))
+        return query
+
+    mindiesd = types.ModuleType("mindiesd")
+    mindiesd.sparse_attention = sparse_attention
+    monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    impl = make_impl(precision="mix")
+    q = torch.zeros(1, 8, 4, 128, dtype=torch.bfloat16)
+    spans = [{"start": 0, "latent_shape": [2, 2, 2]}]
+    plan = RainFusionPlan(used_len=8, video_spans=spans)
+
+    impl._forward_sparse_npu(q, q, q, plan)
+
+    assert calls == [("mix", spans, "rf_v3")]

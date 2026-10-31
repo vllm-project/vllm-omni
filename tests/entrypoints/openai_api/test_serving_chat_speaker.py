@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.openai.utils import (
+from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
     validate_requested_speaker,
 )

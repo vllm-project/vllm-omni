@@ -4,8 +4,8 @@
 """The event vocabulary one duplex session speaks, assembled from two layers.
 
 The classes themselves no longer live here. ``vllm_omni.protocol.duplex.events``
-carries the whole vocabulary --- 21 Tier 1 classes re-exported from
-``vllm_omni.protocol.realtime.events``, 9 Tier 2 ones and 14 Tier 3 ones --- so
+carries the whole vocabulary --- Tier 1 classes re-exported from
+``vllm_omni.protocol.realtime.events`` together with Tier 2 and Tier 3 events --- so
 a non-duplex Realtime consumer can take the Tier 1 half and its wire rendering
 without the duplex session control plane (RFC #6592 P0a). The engine imports
 the duplex module and never the Tier 1 one directly.
@@ -63,6 +63,7 @@ from vllm_omni.protocol.duplex.events import (
     SessionReplaced,
     SessionResumed,
     SessionResyncRequired,
+    SessionStats,
     SessionUpdated,
     Speak,
     SpeechStarted,
@@ -145,6 +146,7 @@ __all__ = [
     "SessionCreated",
     "SessionExpired",
     "SessionHeartbeatAck",
+    "SessionStats",
     "SessionReplaced",
     "SessionResumed",
     "SessionResyncRequired",

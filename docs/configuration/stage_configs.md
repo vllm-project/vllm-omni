@@ -758,10 +758,13 @@ It is disabled by default. The experimental
 alongside cached residual prediction, fused sampling, time-major codec
 convolutions, first-frame delivery, and larger graph batches.
 
-The runtime requires `nvidia-cuda-mps-control` on `PATH` and one explicit CUDA
-GPU per local EngineCore stage, with `parallel_stage_init: false`.
-Use numeric GPU ordinals for stage placement and visibility so initialization
-locks identify the physical GPU before MPS remaps it. It starts a private MPS daemon for each selected
+A missing `nvidia-cuda-mps-control` binary, an MPS daemon that fails to start
+or answer `get_server_list` (including an unreachable operator-managed
+`CUDA_MPS_PIPE_DIRECTORY`), a stage that is not one numeric
+CUDA GPU, `parallel_stage_init`, or a diffusion/remote stage disables MPS for
+that configuration and continues. Use numeric GPU ordinals for stage placement
+and visibility so initialization locks identify the physical GPU before MPS
+remaps it. When MPS does start, it uses a private daemon for each selected
 GPU and stops its own daemon after the stages exit. If
 `CUDA_MPS_PIPE_DIRECTORY` already names an operator-managed daemon, the runtime
 reuses it without stopping it. Diffusion and remote stages are unsupported.

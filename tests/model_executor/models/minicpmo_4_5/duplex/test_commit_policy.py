@@ -102,7 +102,11 @@ def test_decide_commit_action_covers_realtime_lifecycle_sequences(
     assert decide_commit_action(snapshot) is expected
 
 
-def test_auto_response_commit_defers_when_an_engine_response_is_active() -> None:
+@pytest.mark.parametrize(
+    ("fallback", "expected"),
+    [(False, CommitAction.START_AUTO_RESPONSE), (True, CommitAction.DEFER_ACTIVE_RESPONSE)],
+)
+def test_active_auto_response_uses_the_model_commit_policy(fallback: bool, expected: CommitAction) -> None:
     snapshot = CommitSnapshot(
         auto_responds=True,
         speech_since_commit=True,
@@ -110,6 +114,7 @@ def test_auto_response_commit_defers_when_an_engine_response_is_active() -> None
         overlap_speech_ms=800,
         response_in_progress=True,
         playback_active=True,
+        defer_active_auto_response=fallback,
     )
 
-    assert decide_commit_action(snapshot) is CommitAction.DEFER_ACTIVE_RESPONSE
+    assert decide_commit_action(snapshot) is expected

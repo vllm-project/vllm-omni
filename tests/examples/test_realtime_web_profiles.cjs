@@ -66,6 +66,7 @@ test('Qwen enables camera and playback ACK only for the duplex VAD profile', () 
     assert.equal(url.searchParams.has('native_duplex'), false);
     assert.equal(url.searchParams.has('minicpmo45_native_duplex'), false);
     assert.equal(p.append('PCM', 'JPEG').video_frames, undefined);
+    p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: true } } });
     assert.equal(plain(p.imageMessages('JPEG')).length, turnMode === 'vad' ? 1 : 0);
     assert.equal(p.ack('r', 100)?.type || null, turnMode === 'vad' ? 'playback.ack' : null);
     assert.equal(p.camera, turnMode === 'vad');
@@ -93,6 +94,22 @@ test('VAD uses nested format and interruptible endpoint detection', () => {
   assert.equal(vad.mapEvent({ type: 'input_audio_buffer.cleared' }).kind, 'backpressure');
   assert.match(vad.mapEvent({ type: 'error', code: 'unsupported', error: 'Unavailable' }).message, /session_mode: duplex/);
   assert.match(vad.mapEvent({ type: 'error', code: 'server_vad_initialization_failed' }).message, /Silero/);
+});
+
+test('Qwen semantic VAD is explicit and reports its extra dependency and latency', () => {
+  const semantic = profiles['qwen3-turn']({ ...config, turnMode: 'semantic_vad' });
+  const [update] = plain(semantic.initialMessages(config, 'help'));
+  assert.deepEqual(update.session.audio.input.turn_detection, {
+    type: 'semantic_vad', eagerness: 'auto', create_response: true, interrupt_response: true,
+  });
+  assert.equal(new URL(semantic.url(config, 'https://localhost/')).searchParams.get('duplex'), '1');
+  assert.match(semantic.description, /Smart Turn/);
+  assert.match(semantic.description, /1\.2/);
+  const error = semantic.mapEvent({ type: 'error', error: { code: 'semantic_vad_unavailable', message: 'Missing model' } });
+  assert.equal(error.kind, 'error');
+  assert.equal(error.fatal, true);
+  assert.match(error.message, /Smart Turn/);
+  assert.match(error.message, /--vad/);
 });
 
 function shell(profileName, turnMode = 'manual', options = {}) {
@@ -177,7 +194,7 @@ function shell(profileName, turnMode = 'manual', options = {}) {
   // Expose closure controls only in the test VM; production has no test API.
   const source = fs.readFileSync(path.join(root, 'app.js'), 'utf8').replace(/\}\)\(\);\s*$/, `
     globalThis.testUI = { startSession, stopSession, handleEvent, playbackDrained,
-      microphoneUploadEnabled, flushCapture, setPttHeld, awaitQueue: () => audioChain,
+      microphoneUploadEnabled, flushCapture, setPttHeld, toggleMute, awaitQueue: () => audioChain,
       capture(samples = [100, 200]) { pendingCapture.push(new Int16Array(samples)); },
       setPendingFrame(frame) { cameraPendingFrame = frame; if (profile.stickyCamera) cameraLastFrame = frame; },
       state() { return { running, connectionReady, assistantActive, pttHeld, turnSubmitted, visionTurnLocked }; }
@@ -559,6 +576,16 @@ test('VAD handshake errors remain visible after resource cleanup', async () => {
   assert.equal(app.sockets[0].readyState, 3);
 });
 
+test('missing Smart Turn stops the session and preserves actionable guidance', async () => {
+  const app = shell('qwen3-turn', 'semantic_vad');
+  await app.ui.startSession();
+  await app.ui.handleEvent({ type: 'error', error: { code: 'semantic_vad_unavailable', message: 'Missing model' } });
+  assert.equal(app.ui.state().running, false);
+  assert.equal(app.elements.get('connectionState').textContent, 'Error');
+  assert.match(app.elements.get('runtimeDetail').textContent, /Smart Turn/);
+  assert.match(app.elements.get('runtimeDetail').textContent, /--vad/);
+});
+
 test('missing session acknowledgement fails instead of leaving Start disabled forever', async () => {
   const app = shell('qwen3-turn', 'vad', { silent: true });
   const starting = app.ui.startSession();
@@ -699,6 +726,7 @@ test('late interruption cursor acknowledges old response without finishing the n
 
 test('Qwen camera frames ride the OpenAI image interface, not the audio append', () => {
   const p = profiles['qwen3-turn']({ ...config, turnMode: 'vad' });
+  p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: true } } });
   assert.deepEqual(plain(p.append('PCM', 'JPEG')), { type: 'input_audio_buffer.append', audio: 'PCM' });
 
   const [created] = plain(p.imageMessages('JPEG'));
@@ -711,6 +739,7 @@ test('Qwen camera frames ride the OpenAI image interface, not the audio append',
 
 test('the camera retires its oldest image instead of exhausting the session budget', () => {
   const p = profiles['qwen3-turn']({ ...config, turnMode: 'vad' });
+  p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: true } } });
   const ids = [];
   for (let i = 0; i < 8; i++) {
     const messages = plain(p.imageMessages('JPEG'));
@@ -725,7 +754,15 @@ test('the camera retires its oldest image instead of exhausting the session budg
 
   // A new call reopens the budget; stale ids from the old one must not linger.
   assert.equal(plain(p.initialMessages(config, 'x')).length > 0, true);
+  assert.deepEqual(plain(p.imageMessages('JPEG')), [], 'a new session waits for its own capabilities');
+  p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: true } } });
   assert.equal(plain(p.imageMessages('JPEG')).length, 1);
+});
+
+test('Qwen fallback does not send camera items without image capability', () => {
+  const p = profiles['qwen3-turn']({ ...config, turnMode: 'vad' });
+  p.mapEvent({ type: 'session.created', session: { capabilities: { supports_image_input: false } } });
+  assert.deepEqual(plain(p.imageMessages('JPEG')), []);
 });
 
 test('AURA PTT profile sets duplex, is_speech append, commit on release, and shell flags', () => {
@@ -834,6 +871,53 @@ test('AURA shell holds speech until PTT and opens one vision turn per two frames
   await app.ui.handleEvent({ type: 'response.listen', response_id: 'aura-r2' });
   app.ui.flushCapture();
   assert.deepEqual(visionAppends(app).at(-1).video_frames, ['SILENT1', 'SILENT2']);
+  await app.ui.stopSession({ terminal: false });
+});
+
+test('AURA shows one bubble per item and keeps repeated syllables', async () => {
+  const app = shell('aura-ptt');
+  await app.ui.startSession();
+  const said = '哎，你看到我吗？';
+  const reply = '看到了，我正盯着你呢。';
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: said, item_id: 'u3',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.completed', transcript: '哈哈', item_id: 'u2',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈', item_id: 'u4',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.input_audio_transcription.delta', delta: '哈哈', item_id: 'u4',
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.delta', delta: reply, response_id: 'a1',
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio_transcript.done', transcript: reply, response_id: 'a1',
+  });
+  await app.ui.handleEvent({
+    type: 'conversation.item.done',
+    item: { id: 'item_a1', role: 'assistant', content: [{ type: 'output_audio', transcript: reply }] },
+  });
+  await app.ui.handleEvent({
+    type: 'response.output_audio.delta', text: reply, audio: '', response_id: 'a1',
+  });
+  const turns = [...app.elements.get('conversation').children];
+  assert.deepEqual(turns.map(row => row.children[1].textContent), [said, said, '哈哈', '哈哈哈', reply]);
   await app.ui.stopSession({ terminal: false });
 });
 
@@ -1153,4 +1237,62 @@ test('JoyAI camera and PTT profiles keep their existing speech-start handling', 
   for (const config of [{}, { speechInput: true, turnMode: 'manual' }]) {
     assert.equal(profiles['joyai-turn'](config).mapEvent(speech).kind, 'ignore');
   }
+});
+
+
+test('MiniCPM muted microphone sends each fresh camera frame without audio or commit', async () => {
+  const app = shell('minicpm-native');
+  await app.ui.startSession();
+  app.ui.capture();
+  app.ui.flushCapture();
+  app.ui.capture();
+  app.ui.setPendingFrame('PRE_MUTE');
+  app.ui.toggleMute();
+  const audioSamples = app.sockets[0].sent
+    .filter(e => typeof e.audio === 'string')
+    .reduce((total, e) => total + Buffer.from(e.audio, 'base64').length / 2, 0);
+  assert.equal(audioSamples, 16000, 'mute closes the open 1 s unit with silence');
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['PRE_MUTE']);
+  app.ui.setPendingFrame('VISION1');
+  app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-1), {
+    type: 'input_audio_buffer.append', video_frames: ['VISION1'],
+  });
+  const count = app.sockets[0].sent.length;
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.length, count, 'no repeated frame or empty append');
+  app.ui.setPendingFrame('VISION2');
+  app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['VISION2']);
+  app.ui.toggleMute();
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.length, count + 1, 'old captured audio was discarded');
+  app.ui.capture();
+  app.ui.setPendingFrame('OMNI');
+  app.ui.flushCapture();
+  assert.equal(typeof app.sockets[0].sent.at(-1).audio, 'string');
+  assert.deepEqual(app.sockets[0].sent.at(-1).video_frames, ['OMNI']);
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.commit'), false);
+  const sentBeforeBoundaryMute = app.sockets[0].sent.length;
+  app.ui.toggleMute();
+  app.ui.toggleMute();
+  const unitSamples = app.sockets[0].sent
+    .filter(e => typeof e.audio === 'string')
+    .reduce((total, e) => total + Buffer.from(e.audio, 'base64').length / 2, 0);
+  assert.equal(unitSamples % 16000, 0, 'a second mute also lands on a unit boundary');
+  app.ui.toggleMute();
+  assert.equal(
+    app.sockets[0].sent.length,
+    sentBeforeBoundaryMute + 1,
+    'muting on a unit boundary sends no extra silence',
+  );
+});
+
+test('muted Qwen manual profile does not send MiniCPM frame-only input', async () => {
+  const app = shell('qwen3-turn');
+  await app.ui.startSession();
+  app.ui.toggleMute();
+  app.ui.setPendingFrame('FRAME');
+  app.ui.flushCapture();
+  assert.equal(app.sockets[0].sent.some(e => e.type === 'input_audio_buffer.append'), false);
 });

@@ -34,6 +34,13 @@ models:
       voice_clone:
         task_type: Base
 
+  inclusionAI/Ming-3.0-tts-tiny:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}
+
   IndexTeam/IndexTTS-2.5:
     supported_tasks: [voice_clone]
     backend: openai-audio-speech

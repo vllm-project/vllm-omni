@@ -108,14 +108,19 @@ EXCLUDED_MODELS = [
     # Experimental Noisy KV / cell path; covered by tests/diffusion/models/causvid_wan
     # and tests/diffusion/ar_diffusion instead of the tiny-model offline suite.
     "CausVidWanPipeline",
-    "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
+    "Pi05Pipeline",
     "SanaWmPipeline",
     # Audio pipeline conditioned by a separate Qwen2.5-Omni encoder stage;
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
     # the real-checkpoint E2E test instead of a tiny model.
     "AuKPipeline",
+    # Segmentation, not generation: the tiny-model suite checks generated
+    # images/videos. Covered by tests/diffusion/models/sam3 and the
+    # /v1/images/segmentations endpoint tests.
+    "Sam3Model",
+    "Sam3VideoModel",
 ]
 
 

@@ -41,7 +41,7 @@ def _cache(**kwargs) -> NoisyKVCache:
         device=torch.device("cpu"),
         layer_groups=kwargs.get("layer_groups", 2),
         max_batch_size=kwargs.get("max_batch_size", 1),
-        stages=kwargs.get("stages", 1),
+        step_replicas=kwargs.get("step_replicas", 1),
     )
 
 
@@ -52,7 +52,7 @@ def test_capacity_uses_k1():
 
 
 def test_capacity_covers_latest_stage_frontier():
-    cache = _cache(layer_groups=1, stages=5)
+    cache = _cache(layer_groups=1, step_replicas=5)
     # A Latest-KV plan with H=6 and S=5 needs up to 10 live versions on one rank.
     assert cache.capacity == 11
 
@@ -74,14 +74,14 @@ def test_capacity_rejects_undersized_memory_budget():
 
 @pytest.mark.parametrize("extra_bytes", [0, 8])
 def test_capacity_accepts_complete_schedule_budget(extra_bytes):
-    cache = _cache(layer_groups=1, stages=5)
+    cache = _cache(layer_groups=1, step_replicas=5)
     bounded = NoisyKVCache(
         cache.spec,
         dtype=torch.float32,
         device=torch.device("cpu"),
         layer_groups=1,
         max_batch_size=1,
-        stages=5,
+        step_replicas=5,
         available_bytes=cache.reserved_bytes + extra_bytes,
     )
     assert bounded.capacity == cache.capacity == 11
@@ -137,7 +137,7 @@ def test_prepare_evict_releases_last_use():
         CellSchedule(
             chunks=4,
             num_denoise_steps=2,
-            stages=3,
+            step_replicas=3,
             layer_groups=2,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
@@ -170,7 +170,7 @@ def _vertical_plan() -> CellPlan:
         CellSchedule(
             chunks=4,
             num_denoise_steps=2,
-            stages=3,
+            step_replicas=3,
             layer_groups=2,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
@@ -205,9 +205,9 @@ def test_wait_ready_is_empty_without_kv_history():
         CellSchedule(
             chunks=2,
             num_denoise_steps=1,
-            stages=1,
+            step_replicas=1,
             layer_groups=2,
-            ordering=Ordering.LATEST_KV,
+            ordering=Ordering.SAME_STEP,
             kv_history_chunks=0,
         )
     )
@@ -216,17 +216,20 @@ def test_wait_ready_is_empty_without_kv_history():
         assert union_wait_ready(inflight, slot, 0) == frozenset()
 
 
-@pytest.mark.parametrize("stages", [1, 3])
+@pytest.mark.parametrize(
+    ("stages", "ordering"),
+    [(1, Ordering.SELF_FORCING), (3, Ordering.LATEST_KV)],
+)
 @pytest.mark.parametrize("chunk", [1, 3])
 @pytest.mark.parametrize("chunk_tokens", [4, 8, 12])
-def test_attention_reads_only_valid_version_pages(stages, chunk, chunk_tokens):
+def test_attention_reads_only_valid_version_pages(stages, ordering, chunk, chunk_tokens):
     plan = build_cell_plan(
         CellSchedule(
             chunks=4,
             num_denoise_steps=2,
-            stages=stages,
+            step_replicas=stages,
             layer_groups=2,
-            ordering=Ordering.SELF_FORCING,
+            ordering=ordering,
             kv_history_chunks=6,
         )
     )
@@ -286,3 +289,68 @@ def test_begin_request_rejects_invalid_chunk_length(chunk_tokens):
     with pytest.raises(ValueError, match="chunk_tokens"):
         state.begin_request("A", _vertical_plan(), chunk_tokens=chunk_tokens)
     assert state.resident_versions == 0
+
+
+@pytest.mark.parametrize("history", [0, 1, 3])
+def test_same_step_sink_cache_lifetime_and_attention_window(history):
+    # Simulate all ranks and explicit P2P payload copies. This checks actual
+    # pool allocation, table width, last-use eviction and final cleanup.
+    steps, blocks, chunks = 2, 2, 12
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=chunks,
+            num_denoise_steps=steps,
+            step_replicas=steps,
+            layer_groups=1,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=history,
+            blocks=blocks,
+        )
+    )
+    states = []
+    for rank in range(plan.world):
+        spec = ARDiffusionNoisyKVSpec(
+            num_layers=blocks,
+            num_kv_heads=2,
+            head_size=4,
+            block_size=4,
+            max_chunk_tokens=4,
+            max_history_chunks=max(1, history),
+        )
+        cache = NoisyKVCache(
+            spec, dtype=torch.float32, device=torch.device("cpu"), layer_groups=1, max_batch_size=1, step_replicas=steps
+        )
+        state = NoisyKVState(cache)
+        state.bind_rank(rank, None)
+        state.begin_request("A", plan, chunk_tokens=4)
+        states.append(state)
+    for tick in range(plan.num_slots):
+        for rank, state in enumerate(states):
+            task = plan.task(tick, rank)
+            if task is None:
+                continue
+            context = state.prepare((("A", task),))[0][0]
+            pool = state.cache.pool
+            for src in plan.sources(task, rank):
+                key = ("A", *src.version)
+                k, v = pool.kv_block_views(key, 1)
+                expected = 1000 + 100 * src.version[0] + 10 * src.version[1] + src.version[2]
+                torch.testing.assert_close(k, torch.full_like(k, expected))
+                torch.testing.assert_close(v, torch.full_like(v, -expected))
+            assert context.seq_len == (len(plan.sources(task, rank)) + 1) * 4
+            key = ("A", *task)
+            k, v = pool.kv_block_views(key, 1)
+            value = 1000 + 100 * task[0] + 10 * task[1] + task[2]
+            k.fill_(value)
+            v.fill_(-value)
+        for xfer in plan.transfers(tick):
+            key = ("A", *xfer.version)
+            source = states[xfer.src].cache.pool
+            target = states[xfer.dst].cache.pool
+            target.alloc(key)
+            target.copy_into(key, source.tensor_dict(key, 1))
+        for state in states:
+            state.evict(tick)
+    for state in states:
+        state.end_request("A")
+        assert state.resident_versions == 0

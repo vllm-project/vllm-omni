@@ -18,8 +18,10 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
+from vllm_omni.core.sched.duplex_stage_work import set_request_perf_chunk
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
@@ -646,6 +648,7 @@ def test_scheduler_chunk_gate_preserves_kv_holding_queue(build_adapter, active_s
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.deferred_waiting = set()
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.running = []
     scheduler.chunk_transfer_adapter = adapter
     scheduler.input_coordinator = None
@@ -1382,6 +1385,28 @@ def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, 
 
     snapshot.assert_not_called()
     assert adapter._pending_save_reqs.popleft()["request"] is request
+
+
+def test_save_stamps_the_producing_steps_chunk_not_a_queued_update(build_adapter, monkeypatch):
+    """Session stats (RFC #8325): a resumable stop can apply the queued chunk-B update to
+    the Talker request before chunk A's final output is saved; the payload must still name A."""
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-talker", RequestStatus.RUNNING, external_req_id="ext-talker")
+    set_request_perf_chunk(request, (0, 2))
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)),
+    )
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter.save_async(multimodal_output=None, request=request, duplex_perf_chunk=(0, 1))
+    task = adapter._pending_save_reqs.popleft()
+    assert task["duplex_perf_chunk"] == (0, 1)
+    adapter._send_single_request_for_generation(task)
+    assert connector.put.call_args.kwargs["data"].meta.duplex_perf_chunk == [0, 1]
+
+    # Without an explicit chunk the request's current one is used.
+    adapter.save_async(multimodal_output=None, request=request)
+    assert adapter._pending_save_reqs.popleft()["duplex_perf_chunk"] == (0, 2)
 
 
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):
@@ -2706,6 +2731,7 @@ def test_finish_requests_reclaims_resumable_segment_and_reuses_capacity(
 
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.chunk_transfer_adapter = adapter
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
     scheduler.requests = {request.request_id: request}
     scheduler.running = [request] if placement == "running" else []
@@ -2754,6 +2780,7 @@ def test_finish_requests_does_not_reopen_off_queue_resumable_segment(build_adapt
 
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.chunk_transfer_adapter = adapter
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
     scheduler.requests = {request.request_id: request}
     scheduler.running = []
@@ -2844,6 +2871,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     scheduler.structured_output_manager = mocker.MagicMock()
     scheduler.structured_output_manager.accept_tokens.return_value = True
     scheduler.finished_req_ids_dict = {}
+    scheduler.finished_req_ids = set()
     scheduler.kv_cache_manager.take_events.return_value = None
     scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
@@ -2882,6 +2910,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         num_scheduled_tokens={"req-s1": 10},
         scheduled_spec_decode_tokens={},
         num_invalid_spec_tokens=0,
+        finished_req_ids=set(),
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=None,
@@ -3010,6 +3039,7 @@ def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
 
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched.chunk_transfer_adapter = adapter
+    sched._outputs_awaiting_stage_payload = {}
     sched.requests = {}
     sched.running = []
     sched.waiting = []
@@ -3026,6 +3056,7 @@ def _parked_sender_scheduler(adapter, session):
     """A minimal OmniARScheduler holding one parked streaming session."""
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.chunk_transfer_adapter = adapter
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
     scheduler.requests = {session.request_id: session}
     scheduler.running = []
@@ -3435,6 +3466,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     scheduler.structured_output_manager = mocker.MagicMock()
     scheduler.structured_output_manager.accept_tokens.return_value = True
     scheduler.finished_req_ids_dict = {}
+    scheduler.finished_req_ids = set()
     scheduler.kv_cache_manager.take_events.return_value = None
     scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
@@ -3453,6 +3485,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
         num_scheduled_tokens={},
         scheduled_spec_decode_tokens={},
         num_invalid_spec_tokens=0,
+        finished_req_ids=set(),
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=None,
@@ -3465,6 +3498,52 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
         req_id_to_index={},
     )
     return scheduler, scheduler_output, model_runner_output, cleanup_calls
+
+
+def test_generation_holds_sentence_until_final_output(build_adapter, mocker: MockerFixture):
+    adapter, _ = build_adapter(model_mode="generation")
+    request = Request("sentence-stream", [0], SamplingParams(max_tokens=8), pooling_params=None)
+    request.status = RequestStatus.RUNNING
+    request.additional_information = {"text": "first sentence"}
+    adapter.requests_with_ready_chunks.add(request.request_id)
+    scheduler, schedule, output, _ = _build_deferred_finish_scheduler(mocker, running=[request], pending_finish_reqs=[])
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler._supports_pending_generation = True
+    scheduler._native_data_plane = False
+    scheduler._express_min_slack_s = 0
+    scheduler._async_chunk_transport_enabled.return_value = True
+    scheduler._input_execution_is_terminal.return_value = False
+    schedule.num_scheduled_tokens = {request.request_id: 1}
+    schedule.scheduled_new_reqs = []
+    schedule.scheduled_cached_reqs = SimpleNamespace(req_ids=[request.request_id])
+    output.req_id_to_index = {request.request_id: 0}
+    output.routed_experts = None
+
+    def receive_next_sentence(req):
+        req.additional_information = {"text": "second sentence"}
+        req.num_computed_tokens = 0
+
+    adapter.load_async = mocker.Mock(side_effect=receive_next_sentence)
+    for pending in (True, True, False):
+        request.num_computed_tokens += 1
+        request.num_in_flight_tokens += 1
+        OmniSchedulerMixin._postprocess_omni_schedule_output(scheduler, schedule, consume_chunks=False)
+
+        # A scheduler tick may run before the previous GPU result is applied.
+        adapter.process_pending_chunks(DummyWaitingQueue(), scheduler.running)
+        adapter.load_async.assert_not_called()
+        assert request.additional_information == {"text": "first sentence"}
+
+        output.pending_generation_req_ids = {request.request_id} if pending else set()
+        OmniGenerationScheduler.update_from_output(scheduler, schedule, output)
+        assert request.num_in_flight_tokens == 0
+        assert request.num_computed_tokens == (0 if pending else 1)
+        assert (request.request_id in adapter.requests_with_ready_chunks) == pending
+
+    adapter.process_pending_chunks(DummyWaitingQueue(), scheduler.running)
+    adapter.load_async.assert_called_once_with(request)
+    assert request.additional_information == {"text": "second sentence"}
+    assert request.num_computed_tokens == 0
 
 
 def test_deferred_finish_emits_finished_output(mocker: MockerFixture):
