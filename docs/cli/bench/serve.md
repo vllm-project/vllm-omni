@@ -713,7 +713,9 @@ scored slot plus unmatched-chunk false positives. Plain `wav_transcript.json` ti
 timing. If transcript chunks include `aligned_words`, the evaluator splits boundary-crossing chunks and derives trigger
 timing from word alignment.
 
-Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
+Per-response TTFT and TTFP start at the server's latest accepted native append before the response's first output, not at
+the first append of the model turn: with 200 ms chunks every pre-response silence chunk moves the start forward, so
+user speech that overlaps the reply shortens both. RTF
 continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration.
 When the client recorded `input_audio_buffer.append` sends, `client_ttfp_ms` / `client_rtf` start at the last such send
 before this `response.created` (after the previous `response.created` or stream start). `client_ttft_ms` still starts at

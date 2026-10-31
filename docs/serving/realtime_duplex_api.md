@@ -871,7 +871,10 @@ await client.commit(create_response=False)
 summary = collector.timing_summary(after_s=commit_sent_at, input_committed_at_s=commit_sent_at)
 ```
 
-`timing_summary` reports client-observed first-text / first-audio latency,
+`timing_summary` prefers the server's per-response TTFT / TTFP from
+`response_request_metrics` when `response.created` or an audio delta carries
+them (`source: server_request_start_and_client_receive`); otherwise it falls
+back to client-observed first-text / first-audio latency. It also reports
 audio cadence, and, when the deployment attaches engine stage metrics to the
 response events (the benchmark requests them with
 `extra_body.return_stage_metrics=True`), the Stage 0 token metrics
@@ -1044,8 +1047,8 @@ A stock client ignores the extra keys; the extensions are additive.
 | Message | Extension |
 | --- | --- |
 | `session.created` / `session.updated` | top-level `attachment_generation`, `resume_token`; inside `session`: `state`, `turn_state`, `epoch`, `turn_id`, `active_request_id`, `active_response_id`, `active_response_turn_id`, `overlap_policy`, `overlap_*_ms/rms`, `playback_commit_policy`, `playback`, `capabilities`, `ref_audio`, `extra_body`, `idle_timeout_s`, `response_format` |
-| `response.created` / `response.done` / `response.listen` | `response_id` at top level; the raw duplex event under `response.metadata` (`duplex_event`); `status_details.reason` uses vLLM reasons (`barge_in`, `client_cancelled`, `new_response`, …) |
-| `response.output_audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback}` |
+| `response.created` / `response.done` / `response.listen` | `response_id` at top level; the raw duplex event under `response.metadata` (`duplex_event`), whose `response.created` carries `response_request_metrics` (`ttft_ms` / `ttfp_ms` once known, `measurement_origin`); `status_details.reason` uses vLLM reasons (`barge_in`, `client_cancelled`, `new_response`, …) |
+| `response.output_audio.delta` | `format`, `sample_rate_hz`, `metadata{session_id, epoch, model_speak, end_of_turn, audio_duration_ms, audio_text_marks, playback, vllm_omni.response_request_metrics}` |
 | `response.speak` (inserted before the first delta) | not an OpenAI event, but rides the OpenAI response envelope (`response_id`, `item_id`, `output_index`, `content_index`) |
 | `input_audio_buffer.append` | `is_speech`, `video_frames` (+ `max_slice_nums`), `duration_ms`, `audio_end_ms`, per-event `format` / `sample_rate_hz` |
 | `input_audio_buffer.commit` | `final`, `response_create`, `is_speech:false` (silence declaration) |
