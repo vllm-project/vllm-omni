@@ -19,6 +19,7 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 
 import pytest
+from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -30,6 +31,11 @@ STAGE_CONFIG = get_deploy_config_path("higgs_multimodal_qwen3.yaml")
 SERVER_ARGS = ["--trust-remote-code", "--disable-log-stats"]
 SERVER_ENV = {"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"}
 
+# The default yaml runs model_runner: v2 on CUDA (and the V1 fallback on
+# non-CUDA platforms via its platforms section), so the plain-text param
+# guards both. Two extra params keep the escape hatches alive: the V1
+# opt-out profiles (high_throughput stands in; both are FLASHINFER-shaped)
+# and the H200-tuned MRV2 profile.
 TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
@@ -39,7 +45,30 @@ TEST_PARAMS = [
             env_dict=SERVER_ENV,
         ),
         id="higgs_audio_v3_plain_text",
-    )
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("higgs_multimodal_qwen3_high_throughput.yaml"),
+            server_args=SERVER_ARGS,
+            env_dict=SERVER_ENV,
+        ),
+        id="higgs_audio_v3_v1_optout_high_throughput",
+        marks=pytest.mark.skipif(
+            not current_platform.is_cuda(),
+            reason="V1 opt-out profile is CUDA-tuned (FLASHINFER, no platforms section)",
+        ),
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("higgs_multimodal_qwen3_mrv2_h200.yaml"),
+            server_args=SERVER_ARGS,
+            env_dict=SERVER_ENV,
+        ),
+        id="higgs_audio_v3_mrv2_h200",
+        marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="MRV2 validation is CUDA-only"),
+    ),
 ]
 
 DEFAULT_SPEECH_TIMEOUT_S = 180.0
@@ -139,6 +168,73 @@ class TestHiggsAudioV3OnlineHappyPath:
                 "response_format": "pcm",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "min_hnr_db": 0.0,
+            }
+        )
+
+    @pytest.mark.slow
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_pcm_streaming_client_abort(self, omni_server, online_client) -> None:
+        """A client aborting mid-stream must not wedge the server.
+
+        Exiting the streaming context mid-iteration closes the connection
+        (client-side cancel). Guards request cleanup on both runner paths:
+        MRV2's owned-audio-output snapshots and the V1 connector's streaming
+        request recycling. A follow-up request proves the server survived.
+        """
+        long_text = (
+            "This sentence is intentionally long so the stream has plenty of chunks to outlive the reader. " * 20
+        )
+        with online_client.client.audio.speech.with_streaming_response.create(
+            model=omni_server.model,
+            input=long_text,
+            voice=None,
+            response_format="pcm",
+            extra_body={"stream_format": "audio"},
+            timeout=DEFAULT_SPEECH_TIMEOUT_S,
+        ) as resp:
+            chunks = resp.iter_bytes()
+            first = next(chunks)
+            assert first, "stream produced no audio before abort"
+        # Context exit closed the stream mid-generation; the server must
+        # recycle the request and keep serving.
+        online_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "Server still healthy after abort.",
+                "stream": False,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @pytest.mark.slow
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    def test_long_input_text(self, omni_server, online_client) -> None:
+        """A long prompt near the stage-0 context budget must synthesize fully.
+
+        Guards the MRV2 decode-state capacity paths (_ensure_slot_capacity /
+        _ensure_decode_state_capacity) across many steps, and the V1 path's
+        equivalent per-request state, under one long sequence.
+        """
+        long_input = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. " * 90
+        online_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": long_input,
+                "stream": False,
+                "response_format": "wav",
+                "timeout": 300.0,
+                # Normalize the generation cap below the Stage-0 max_tokens
+                # cap every profile ships (2048). The byte floor stays
+                # generous under dummy weights: audio-eos timing is
+                # weight-dependent, so only require ~20 s of synthesized
+                # audio to prove the long
+                # input completes rather than truncating.
+                "max_new_tokens": 1900,
+                "min_audio_bytes": 1_000_000,
             }
         )
 

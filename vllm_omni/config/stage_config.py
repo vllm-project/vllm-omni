@@ -389,6 +389,12 @@ class StagePipelineConfig:
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
     supports_duplex_mrv2: bool = False
+    # Sampling keys this stage's model_runner: v2 implementation does not
+    # support. Checked against ``default_sampling_params`` at deploy-merge time
+    # so an unsupported default fails at startup (with the v1 opt-out named)
+    # instead of on every request. Keys whose engine-default value is neutral
+    # (e.g. repetition_penalty=1.0) pass; any non-neutral value fails.
+    mrv2_unsupported_sampling_params: tuple[str, ...] = ()
     # Rewrites the Stage-0 view of a raw prompt before vLLM input processing.
     # The callable receives ``(prompt, sampling_params_list)``; downstream
     # stages continue to receive the original prompt.
@@ -1042,7 +1048,9 @@ def _merge_platforms(
     base: dict[str, Any] | None,
     overlay: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Deep-merge two ``platforms:`` blocks per-platform, per-stage_id."""
+    """Deep-merge two ``platforms:`` blocks per-platform, stages by stage_id,
+    connectors by name. An overlay cannot clear a platform's inherited
+    connectors; deep merge keeps the base restores."""
     if not base and not overlay:
         return None
     base = base or {}
@@ -1051,8 +1059,11 @@ def _merge_platforms(
     for plat in set(base) | set(overlay):
         bp = base.get(plat) or {}
         op = overlay.get(plat) or {}
-        merged_plat = {**bp, **{k: v for k, v in op.items() if k != "stages"}}
+        merged_plat = {**bp, **{k: v for k, v in op.items() if k not in ("stages", "connectors")}}
         merged_plat["stages"] = _merge_stage_lists(bp.get("stages"), op.get("stages"))
+        merged_conns = _merge_connectors(bp.get("connectors"), op.get("connectors"))
+        if merged_conns is not None:
+            merged_plat["connectors"] = merged_conns
         merged[plat] = merged_plat
     return merged
 
@@ -1175,6 +1186,39 @@ _MRV2_UNSUPPORTED_PLATFORMS = {
 }
 
 
+# Engine-default (neutral) values for sampling params a v2 stage may list as
+# unsupported: a default equal to the engine default is a no-op and passes.
+# Unlisted keys have no scalar neutral; an empty value (None, [], {}) passes.
+# logprobs/prompt_logprobs stay unlisted: 0 still requests the sampled
+# token's logprob, and the request path rejects any explicit value.
+_MRV2_NEUTRAL_SAMPLING_VALUES: dict[str, Any] = {
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "min_tokens": 0,
+    "min_p": 0.0,
+}
+
+
+def _validate_mrv2_default_sampling_params(
+    ps: StagePipelineConfig, ds: StageDeployConfig | None, stage_runner: str
+) -> None:
+    """Reject non-neutral unsupported ``default_sampling_params`` under v2 at startup."""
+    if stage_runner != "v2" or not ps.mrv2_unsupported_sampling_params:
+        return
+    params = (ds.default_sampling_params if ds is not None else None) or {}
+    bad = [
+        key
+        for key in sorted(set(params) & set(ps.mrv2_unsupported_sampling_params))
+        if params[key] not in (_MRV2_NEUTRAL_SAMPLING_VALUES.get(key), None, [], {})
+    ]
+    if bad:
+        raise ValueError(
+            f"stage {ps.stage_id}: default_sampling_params {bad} are not supported by this model's "
+            "model_runner: v2 path; remove them or run this stage with model_runner: v1"
+        )
+
+
 def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
@@ -1201,6 +1245,17 @@ def _apply_platform_overrides(
             for stage in deploy.stages:
                 if stage.model_runner == "v2":
                     stage.model_runner = None
+    platform_connectors = platform_section.get("connectors") if platform_section else None
+    if platform_connectors:
+        if not isinstance(platform_connectors, dict):
+            raise ValueError("platform connectors must be a mapping of connector name to overrides")
+        conns = deploy.connectors
+        for conn_name, override in platform_connectors.items():
+            if not conns or conn_name not in conns:
+                raise ValueError(f"platform connectors override references unknown connector {conn_name!r}")
+            if not isinstance(override, dict):
+                raise ValueError(f"platform connectors override for {conn_name!r} must be a mapping")
+            conns[conn_name] = _get_recursively_merged_dict(conns[conn_name], override)
     platform_stages = platform_section.get("stages", []) if platform_section else []
     base_by_id = {s.stage_id: s for s in deploy.stages}
 
@@ -1391,6 +1446,7 @@ def _build_engine_args(
                 )
     stage_runner = resolve_stage_model_runner(deploy, ds)
     validate_native_mrv2_session(deploy, ps, stage_runner)
+    _validate_mrv2_default_sampling_params(ps, ds, stage_runner)
     engine_args["use_v2_model_runner"] = stage_runner == "v2"
     engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
     if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
