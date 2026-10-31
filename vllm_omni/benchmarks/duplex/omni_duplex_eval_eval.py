@@ -50,6 +50,12 @@ def _write(path: Path, value: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
+# Judge frames are sent at source resolution unless bounded. Image tokens grow
+# with pixel count, so 4K frames overflow a 64K-token judge after ~10 frames
+# (#7375). 1920 keeps 1080p and smaller frames unchanged.
+DEFAULT_JUDGE_FRAME_MAX_SIDE = 1920
+
+
 def _text(items: list[dict[str, Any]]) -> str:
     return " ".join(str(item.get("sentence", item.get("text", ""))).strip() for item in items).strip()
 
@@ -80,6 +86,7 @@ def evaluate_sample(
     *,
     judge_fps: int = 2,
     judge_video_mode: str = "video_url",
+    judge_frame_max_side: int | None = DEFAULT_JUDGE_FRAME_MAX_SIDE,
     window_size: float = 10.0,
     allow_invalid_clock: bool = False,
 ) -> dict[str, Any]:
@@ -123,6 +130,7 @@ def evaluate_sample(
         "response_meta": meta,
         "judge_model": getattr(judge, "model", None),
         "judge_video_mode": judge_video_mode,
+        "judge_frame_max_side": judge_frame_max_side,
     }
     if sample.family == "rtd":
         items = normalize_response_items(raw)
@@ -144,7 +152,7 @@ def evaluate_sample(
                     }
                 )
                 continue
-            frames = _extract_frames(video_path, _times(*window, fps=judge_fps))
+            frames = _extract_frames(video_path, _times(*window, fps=judge_fps), max_side=judge_frame_max_side)
             parsed = judge_result(
                 lambda: judge.temporal(build_temporal_prompt(*window, item["sentence"], sample.question_text), frames),
                 ("temporal_score", "is_relevant"),
@@ -163,7 +171,7 @@ def evaluate_sample(
             )
         content_frames = None
         if judge_video_mode == "frame-sample":
-            content_frames = _extract_frames(video_path, _content_frame_times(duration))
+            content_frames = _extract_frames(video_path, _content_frame_times(duration), max_side=judge_frame_max_side)
         content_prompt = build_content_prompt(
             _text(items), sample.question_text, _gt_references([sample.answer1, sample.answer2])
         )
@@ -185,7 +193,7 @@ def evaluate_sample(
                 "retrying the content prompt in frame-sample mode",
                 sample.id,
             )
-            content_frames = _extract_frames(video_path, _content_frame_times(duration))
+            content_frames = _extract_frames(video_path, _content_frame_times(duration), max_side=judge_frame_max_side)
             if not content_frames:
                 # Nothing to fall back to: keep the original judge error.
                 raise
@@ -266,12 +274,12 @@ def _is_judge_context_length_error(exc: BaseException) -> bool:
     return "input length" in text and "exceed" in text
 
 
-def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
+def _extract_frames(path: str | Path, timestamps: list[float], *, max_side: int | None = None) -> list[bytes]:
     """Extract only decodable JPEG frames; clips can end on non-keyframes."""
     frames = []
     for timestamp in timestamps:
         try:
-            frame = extract_jpeg(path, timestamp=timestamp)
+            frame = extract_jpeg(path, timestamp=timestamp, max_side=max_side)
         except (OSError, ValueError):
             continue
         if frame.startswith(b"\xff\xd8"):
@@ -316,6 +324,15 @@ def summarize_scores(score_root: str | Path) -> dict[str, Any]:
             row = _read(path)
             row.setdefault("split", path.parent.name)
             rows.append(row)
+    # evaluate skips samples that already have a score, so a rerun with another
+    # cap would otherwise average different judge inputs. Scores from before the
+    # cap existed have no field and used source resolution, the same as None.
+    frame_max_sides = {row.get("judge_frame_max_side") for row in rows}
+    if len(frame_max_sides) > 1:
+        raise ValueError(
+            f"{score_root} mixes judge_frame_max_side values {sorted(frame_max_sides, key=str)}; "
+            "rerun evaluate with --overwrite and one value"
+        )
     rtd_temporal = [
         row["temporal"]["summary"] | {"content_score": row.get("content", {}).get("content_score", 0.0)}
         for row in rows
@@ -323,6 +340,8 @@ def summarize_scores(score_root: str | Path) -> dict[str, Any]:
     ]
     pr = [{"task_type": row.get("task_type"), **row.get("pr", {})} for row in rows if "pr" in row]
     result = {"protocol_pin": PROTOCOL_PIN, "samples": len(rows)}
+    if rows:
+        result["judge_frame_max_side"] = frame_max_sides.pop()
     if rtd_temporal:
         by_task: dict[str, list[dict[str, float]]] = {}
         for row in rows:
