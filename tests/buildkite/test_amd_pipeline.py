@@ -2962,6 +2962,57 @@ def test_minicpmo_ready_jobs_select_marked_core_model_nodes() -> None:
             assert command.count(node) == 2
 
 
+_MINICPMO_MERGE_JOBS = (
+    (
+        "MERGE · MiniCPM-o 4.5 Offline",
+        "artifacts/rocm-minicpmo-45-merge-offline",
+        (
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_text_to_text[omni_runner0]",
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_mix_to_audio[omni_runner0]",
+        ),
+    ),
+    (
+        "MERGE · MiniCPM-o 4.5 Online",
+        "artifacts/rocm-minicpmo-45-merge-online",
+        (
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[async_chunk]",
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[turn_async_chunk]",
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_mix_to_text_audio_001[async_chunk]",
+        ),
+    ),
+    (
+        "MERGE · MiniCPM-o 4.5 Duplex",
+        "artifacts/rocm-minicpmo-45-merge-duplex",
+        (
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::"
+            "test_duplex_websocket_protocol_smoke[three-stage-single-gpu]",
+            "tests/e2e/online_serving/test_duplex_client_live.py::"
+            "test_duplex_client_live_session[three-stage-single-gpu]",
+        ),
+    ),
+)
+
+
+def test_minicpmo_merge_jobs_repeat_the_ready_nodes() -> None:
+    """MERGE blocks on the same one-card nodes READY already gates."""
+    for label, artifact, nodes in _MINICPMO_MERGE_JOBS:
+        step = _find_step(label, AMD_MERGE_PIPELINE)
+        command = "\n".join(step["commands"])
+        assert step["agent_pool"] == "mi300_1"
+        assert step["grade"] == "Blocking"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["artifact_paths"] == [f"{artifact}/**/*"]
+        assert _MINICPMO_READY_MARKER in command
+        assert "--run-level core_model" in command
+        assert "test_minicpmo_4_5_duplex_mrv2.py" not in command
+        assert "--junitxml=" in command
+        for node in nodes:
+            assert command.count(node) == 2
+    ready_labels = {label for label, *_rest in _MINICPMO_READY_JOBS}
+    merge_labels = {label for label, *_rest in _MINICPMO_MERGE_JOBS}
+    assert ready_labels.isdisjoint(merge_labels)
+
+
 def test_minicpmo_ready_core_model_cases_declare_mi325() -> None:
     """The selected cases carry MI325 so a one-card CUDA mark is not the selector."""
     cases = {
