@@ -270,6 +270,11 @@ class TestOmniVoiceInstructions:
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
             "instructions": "female, young adult, australian accent",
+            # whisper-small mishears the accented "today" as "to date" on ~1% of
+            # seeds (sim 0.89 < 0.9); re-check failures with a stronger ASR so a
+            # real audio artifact still fails but a weak-ASR mishear does not.
+            "transcript_escalation_model": "large-v3",
+            "transcript_language": "en",
         }
         openai_client.send_audio_speech_request(request_config)
 
