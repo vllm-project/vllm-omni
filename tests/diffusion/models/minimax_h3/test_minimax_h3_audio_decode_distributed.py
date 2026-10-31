@@ -24,6 +24,7 @@ def _decode_worker(rank, init_method):
         decoder = Mock(return_value=expected) if rank == 0 else Mock(side_effect=AssertionError("peer decoded audio"))
         pipeline = SimpleNamespace(
             device=torch.device("cpu"),
+            parallel_config=SimpleNamespace(data_parallel_size=1),
             video_vae=Mock(decode_latent=Mock(return_value=torch.ones(1, 1, 4, 4))),
             audio_vae=Mock(decode_latent=decoder),
             _component_on_device=lambda component: nullcontext(),
@@ -43,6 +44,15 @@ def _decode_worker(rank, init_method):
             with pytest.raises(RuntimeError, match="audio decode failed"):
                 module.MiniMaxH3Pipeline.decode(pipeline, torch.zeros(1), torch.zeros(1), height=2, width=3)
             assert decoder.call_count == (2 if rank == 0 else 0)
+
+            # Different DP replicas own different requests and waveforms.
+            pipeline.parallel_config.data_parallel_size = 2
+            expected = torch.full((1, 2, 8), float(rank + 10))
+            decoder.reset_mock(side_effect=True)
+            decoder.return_value = expected
+            _, audio = module.MiniMaxH3Pipeline.decode(pipeline, torch.zeros(1), torch.zeros(1), height=2, width=3)
+            torch.testing.assert_close(audio, expected, rtol=0, atol=0)
+            decoder.assert_called_once()
     finally:
         dist.destroy_process_group()
 

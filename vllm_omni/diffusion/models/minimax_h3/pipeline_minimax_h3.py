@@ -2531,6 +2531,12 @@ class MiniMaxH3Pipeline(
             ):
                 video = self.video_vae.decode_latent(video_latent)
         video = video[..., :height, :width].contiguous()
+        if self.parallel_config.data_parallel_size != 1:
+            # DP replicas can decode different requests. The helpers below
+            # use the global DiT group, so they must not share these waveforms.
+            with self._component_on_device(self.audio_vae):
+                local_audio = self.audio_vae.decode_latent(audio_latent)
+            return video, self._offload_model_cpu_stage_output(local_audio)
         # Audio decoding has no model-parallel collectives. Decode once and
         # share the waveform instead of compiling and running the same VAE
         # on every rank. Agree on owner failures before the tensor broadcast.
