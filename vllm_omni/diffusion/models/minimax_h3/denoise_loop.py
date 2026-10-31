@@ -334,6 +334,7 @@ def minimax_h3_denoise_loop(
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
+    pdd_adapter_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -424,8 +425,10 @@ def minimax_h3_denoise_loop(
                     video_target_timesteps=video_target_timesteps,
                     audio_target_timesteps=audio_target_timesteps,
                 )
-                if getattr(getattr(model, "arch", None), "pdd_steps", None) is not None:
+                if getattr(getattr(model, "arch", None), "pdd_steps", None) is not None or pdd_adapter_id is not None:
                     fk["pdd_step"] = step
+                if pdd_adapter_id is not None:
+                    fk["pdd_adapter_id"] = pdd_adapter_id
                 with torch.inference_mode():
                     v_video, v_audio = model(**fk)
                 if reference_kv_state is not None:

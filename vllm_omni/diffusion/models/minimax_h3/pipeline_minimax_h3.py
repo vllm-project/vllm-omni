@@ -187,6 +187,8 @@ from .packed_tokens import (
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
+from .pdd_artifact import PDDAdapter, PDDConfig
+from .pdd_artifact_lifecycle import MiniMaxH3PDDLifecycleMixin
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .sampling import create_h3_sample_solver, normalize_h3_sampler
 from .scheduling_minimax_h3_euler_ancestral import (
@@ -350,6 +352,7 @@ _STEP_COND_ANCHOR = "minimax_h3_cond_anchor"
 _STEP_AUDIO_ANCHOR = "minimax_h3_audio_anchor"
 _STEP_SHAPE = "minimax_h3_shape"
 _STEP_TRANSFORMER = "minimax_h3_transformer"
+_STEP_PDD_ADAPTER = "minimax_h3_pdd_adapter"
 _STEP_VIDEO_EDIT = "minimax_h3_video_edit"
 _STEP_AUDIO_EDIT = "minimax_h3_audio_edit"
 
@@ -707,6 +710,7 @@ class _SingleRankEncoderGroup:
 
 
 class MiniMaxH3Pipeline(
+    MiniMaxH3PDDLifecycleMixin,
     nn.Module,
     DenoiseProgressMixin,
     ProgressBarMixin,
@@ -764,6 +768,7 @@ class MiniMaxH3Pipeline(
         lora_path: str | Path,
         dtype: torch.dtype,
     ) -> tuple[LoRAModel, PEFTHelper] | None:
+        self._ensure_pdd_bookkeeping()
         # A cache eviction may be followed by a different adapter reusing the
         # same client-supplied ID. Every real load replaces the classification.
         self._clear_adaln_caches()
@@ -779,12 +784,23 @@ class MiniMaxH3Pipeline(
                     offload_modes.append("model-level CPU offload")
                 elif resolved_offload.strategy is OffloadStrategy.LAYER_WISE:
                     offload_modes.append("layerwise offload")
+        offload_mode = " or ".join(offload_modes) or None
+        pdd_loaded = self._load_pdd_lora_adapter(
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=(
+                "DiT offload" if od_config is not None and resolved_offload.offloads(DIT_COMPONENT) else None
+            ),
+        )
+        if pdd_loaded is not None:
+            return pdd_loaded
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
             lora_path=lora_path,
             dtype=dtype,
-            unsupported_offload_mode=" or ".join(offload_modes) or None,
+            unsupported_offload_mode=offload_mode,
         )
         if loaded is not None:
             lora_model, peft_helper, turbo_spec = loaded
@@ -822,6 +838,8 @@ class MiniMaxH3Pipeline(
                     "MiniMax-H3 Turbo LoRA binding is incomplete: "
                     f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
                 )
+            return
+        if self._validate_pdd_lora_binding(lora_model=lora_model, bound_lora_names=bound_lora_names):
             return
         if lora_model.id not in self._native_lora_adapter_ids:
             return
@@ -1025,6 +1043,7 @@ class MiniMaxH3Pipeline(
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
+        self._ensure_pdd_bookkeeping()
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -2293,6 +2312,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        pdd_adapter: PDDAdapter | None = None,
         control_rows: torch.Tensor | None = None,
         control_context_scale: float = 1.0,
         guide_blocks: list[dict[str, Any]] | None = None,
@@ -2360,6 +2380,8 @@ class MiniMaxH3Pipeline(
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
+        if pdd_adapter is not None:
+            self._ensure_pdd_heads(pdd_adapter.lora_id)
         # Each pass (including each output and hi-res refine) owns its cache.
         # Refine can change both the packed shape and the schedule length.
         registry = getattr(transformer, "_hook_registry", None)
@@ -2386,6 +2408,7 @@ class MiniMaxH3Pipeline(
                     video_edit=inputs["video_edit"],
                     audio_edit=inputs["audio_edit"],
                     on_step=lambda step, video, audio: progress.update(),
+                    pdd_adapter_id=None if pdd_adapter is None else pdd_adapter.lora_id,
                 )
 
         return self._unpack_denoised_rows(
@@ -3173,6 +3196,9 @@ class MiniMaxH3Pipeline(
             )
         turbo_spec = self._active_turbo_spec(sampling)
         has_native_lora = self._has_active_native_lora(sampling)
+        has_pdd_lora = self._has_active_pdd_lora(sampling)
+        if turbo_spec is not None and has_pdd_lora:
+            raise OmniClientError("MiniMax-H3 Turbo and PDD acceleration adapters cannot be active simultaneously")
         task = self._resolve_task(
             conditioning.task,
             turbo_spec=turbo_spec,
@@ -3201,6 +3227,10 @@ class MiniMaxH3Pipeline(
             )
         if self._vdn is not None:
             self._vdn.check_request(sampling, task)
+        pdd_cfg: PDDConfig | None = None
+        if has_pdd_lora:
+            pdd_cfg = self._validate_pdd_sampling(sampling, task)
+            _ = self._ensure_pdd_heads(sampling.lora_request.lora_int_id)
 
         if conditioning.height % 32 or conditioning.width % 32:
             raise OmniClientError(
@@ -3332,7 +3362,11 @@ class MiniMaxH3Pipeline(
                 raise OmniClientError(f"Invalid H3 control media: {exc}") from exc
 
         self._prepare_adaln_adapter(sampling)
-        base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
+        if has_pdd_lora and pdd_cfg is not None:
+            base_schedule = None
+            num_steps = pdd_cfg.nfe
+        else:
+            base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         sampler = normalize_h3_sampler(extra.get("sampler"))
         if sampler != "euler" and base_schedule is not None:
             raise ValueError(
@@ -3371,6 +3405,8 @@ class MiniMaxH3Pipeline(
         )
         latent_refine = self._resolve_latent_refine(extra)
         if latent_refine is not None:
+            if has_pdd_lora:
+                raise OmniClientError("MiniMax H3 PDD does not support latent_refine; use the base model")
             if (
                 control_rows is not None
                 and upscale_target is not None
@@ -3469,6 +3505,9 @@ class MiniMaxH3Pipeline(
             "audio_shift": float(extra.get("audio_flow_shift", self.default_audio_shift)),
             "base_schedule": base_schedule,
             "num_outputs": num_outputs,
+            "pdd_adapter": self._pdd_active_adapters.get(sampling.lora_request.lora_int_id)
+            if has_pdd_lora and sampling.lora_request is not None
+            else None,
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
             "preencode_batch_frames": (
                 normalize_preencode_batch_frames(extra.get("preencode_batch_frames", 17))
@@ -3632,6 +3671,10 @@ class MiniMaxH3Pipeline(
         )
         check_request_cancellation()
         denoise_kwargs = self._denoise_kwargs(context)
+        # ``pdd_adapter`` is not a _build_denoise_inputs argument -- it only
+        # selects artifact head banks during denoising -- so it rides
+        # alongside the selected denoise kwargs rather than in them.
+        denoise_kwargs["pdd_adapter"] = context.get("pdd_adapter")
         num_outputs = context["num_outputs"]
         upscale_target = context.get("latent_upscale")
         latent_refine = context.get("latent_refine")
@@ -3945,6 +3988,7 @@ class MiniMaxH3Pipeline(
                     "latent_cache_key": context.get("latent_cache_key"),
                     "num_frames": context["num_frames"],
                 },
+                _STEP_PDD_ADAPTER: context.get("pdd_adapter"),
             }
         )
         return state
@@ -4012,10 +4056,15 @@ class MiniMaxH3Pipeline(
         minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None, None)))
 
         pdd = isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)
-        if pdd or (len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0]))):
-            if pdd:
+        artifact_pdd = any(state.extra.get(_STEP_PDD_ADAPTER) is not None for state in batch_states)
+        if (
+            pdd
+            or artifact_pdd
+            or (len(batch_states) > 1 and (mixed_transformers or not self._packed_batch_supported(transformers[0])))
+        ):
+            if pdd or artifact_pdd:
                 logger.debug(
-                    "FastH3 Omni PDD executes %d request(s) separately with request-local step indices.",
+                    "MiniMax H3 PDD executes %d request(s) separately with request-local step indices.",
                     len(batch_states),
                 )
             elif mixed_transformers:
@@ -4045,6 +4094,7 @@ class MiniMaxH3Pipeline(
             video_parts: list[torch.Tensor] = []
             audio_parts: list[torch.Tensor] = []
             for index, branch in enumerate(branches):
+                pdd_adapter = batch_states[index].extra.get(_STEP_PDD_ADAPTER)
                 forward_kwargs = branch.forward_kwargs(
                     video_rows=video_rows[index],
                     audio_rows=audio_rows[index],
@@ -4055,8 +4105,14 @@ class MiniMaxH3Pipeline(
                     video_target_timesteps=video_target_timesteps[index],
                     audio_target_timesteps=audio_target_timesteps[index],
                 )
-                if pdd:
+                if pdd or pdd_adapter is not None:
                     forward_kwargs["pdd_step"] = int(batch_states[index].step_index)
+                if pdd_adapter is not None:
+                    # Cached step requests can outlive LRU eviction. The
+                    # worker has reloaded this request's trunk by this point;
+                    # reinstall its model-owned banks too.
+                    self._ensure_pdd_heads(pdd_adapter.lora_id)
+                    forward_kwargs["pdd_adapter_id"] = pdd_adapter.lora_id
                 request_video, request_audio = transformers[index](**forward_kwargs)
                 video_parts.append(request_video)
                 audio_parts.append(request_audio)

@@ -110,6 +110,190 @@ outputs were byte-identical and full decode passed. This is evidence for host
 CPU response encoding. Actual gains depend on the CPU and runtime, and should
 not be interpreted as GPU, DiT, or stage 0 speedups.
 
+## Alibaba PDD artifact adapters (8 NFE)
+
+These Alibaba Ref2VA/FL2VA files are request-scoped adapters for the base H3
+checkpoint. They retain the original 1.0-fixed grid and are separate from the
+FastH3 Omni full-checkpoint path, which uses its own 0.999-fixed Grid32 schedule
+and rejects extra request LoRAs. The adapter ID and denoise step explicitly
+select a cached head bank; omitting the adapter always selects saved base heads.
+Cached artifact banks consume resident FP32 memory until adapter eviction or
+manager close. A scheduled batch still shares the worker's existing LoRA key;
+different trunk adapters are not combined into one batch.
+
+Use separate workers for PDD and generic PEFT adapters targeting the same
+DiT's `final_layer.video_out` or `audio_out`. Their output-layer wrappers are
+incompatible in either loading order, including after adapter eviction. Native
+and Turbo adapters do not target these projections and retain their normal path.
+
+The published `alibaba-pai/MiniMax-H3-Acc-LoRAs` adapters use 32 distilled
+heads fused into eight denoising evaluations. The API requires **8 denoiser evaluations** (`num_inference_steps=8`),
+which are bounded by 9 internal sigma points, video shift 12, audio shift 3, and
+`lora_scale=1.0`. Eight sigma points is not the eight-evaluation schedule.
+PDD requires the default Euler sampler (omit `sampler` or set it to `euler`).
+Requests selecting `res_multistep` are rejected because the fused heads were
+distilled for Euler updates.
+
+Use `MiniMax-H3-Ref2VA-Acc-8Step.safetensors` for `ref2va` and
+`MiniMax-H3-FL2VA-Acc-8Step.safetensors` for `t2va`/`fl2va`. These artifacts
+have separate task-specific DiT weights; the loader rejects a task mismatch.
+Download the desired published artifact into `PDD_DIR` and start the server
+with dynamic LoRA enabled (`--enable-lora --max-lora-rank 64`). The artifact
+path in a request is a path on the **server**, even when the client runs on
+another machine. Keep the published filename so the loader can identify the
+task-specific artifact.
+
+### Eight-GPU H20 Ref2VA server
+
+Install from a checkout containing `pdd_artifact.py`, `pdd_artifact_lifecycle.py`, and their
+pipeline integration, using the [CUDA source installation guide](../../docs/getting_started/installation/gpu.md#build-wheel-from-source).
+Record the checkout revision and installed package versions; installing a
+released wheel does not establish that it includes this PDD implementation.
+The historical H20 smoke below used vLLM 0.29.0 and PyTorch 2.13.0; it does
+not qualify newer dependency versions or the current checkout on H20.
+
+For **eight available H20 GPUs**, this starting configuration uses DiT
+TP2/Ulysses4, text-encoder TP8, and eight-way VAE tile parallelism. PDD's
+eight denoiser evaluations are independent of the number of GPUs. On four
+GPUs, use `--num-gpus 4 --tensor-parallel-size 4 --usp 1`, text-encoder TP4,
+and VAE parallel4, as in the historical smoke; select four visible devices.
+
+Use `FLASH_ATTN` with a compatible Hopper FlashAttention installation. The
+B300 `TRTLLM_ATTN` backend requires datacenter Blackwell and is unavailable
+on H20; see the [backend requirements](../../docs/user_guide/diffusion/attention_backends/trtllm.md#requirements).
+`TORCH_SDPA` is an alternative for an initial correctness check when
+FlashAttention is unavailable, with no performance equivalence implied.
+This example quantizes the DiT to FP8 while retaining the BF16 text encoder,
+and uses eager execution for the initial run.
+
+```bash
+export MODEL=MiniMaxAI/MiniMax-H3
+export PDD_DIR="${PWD}/pdd-adapters"
+hf download alibaba-pai/MiniMax-H3-Acc-LoRAs \
+  MiniMax-H3-Ref2VA-Acc-8Step.safetensors --local-dir "${PDD_DIR}"
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+VLLM_OMNI_VIDEO_SYNC_TIMEOUT=3600 \
+vllm serve "${MODEL}" --omni --host 127.0.0.1 --port 8000 \
+  --trust-remote-code --task-type ref2va \
+  --num-gpus 8 --tensor-parallel-size 2 --usp 4 --ring 1 \
+  --text-encoder-tp-size 8 \
+  --vae-patch-parallel-size 8 --vae-parallel-mode tile --vae-use-tiling \
+  --diffusion-quantization-config '{"transformer":{"method":"fp8"},"text_encoder":null}' \
+  --diffusion-attention-backend FLASH_ATTN --enforce-eager \
+  --lora-backend peft --enable-lora --max-lora-rank 64 \
+  --init-timeout 3600 --stage-init-timeout 3600
+```
+
+Keep the DiT resident: Alibaba PDD rejects every **DiT** offload strategy, including distributed layerwise offload.
+If the text encoder needs offload, select only that component with
+`--diffusion-offload-config '{"mode":"layer","components":["text_encoder"]}'`.
+Available GPU memory, reference sizes, and output duration still determine
+whether a request fits. Begin with a five-second 832x480 request and one
+reference, then qualify the intended resolution and reference workload.
+The eight-GPU configuration above is a deployment starting point, not a new
+H20 performance or visual-quality result.
+
+### Send a PDD request
+
+Run the following on the server, or use the server's artifact path in the
+`lora` field when sending from another machine. In a new shell, set `PDD_DIR`
+to the same absolute directory used for the download above.
+
+```bash
+export PDD_DIR=/absolute/path/to/pdd
+curl --fail-with-body http://localhost:8000/v1/videos/sync \
+  -F 'prompt=A person waves hello in a quiet room.' \
+  -F 'input_references=@reference.png' \
+  -F 'seconds=5' \
+  -F 'width=832' -F 'height=480' \
+  -F 'num_inference_steps=8' \
+  -F 'seed=42' -F 'generate_sound=true' \
+  -F 'extra_params={"task":"ref2va","aspect_ratio":"16:9","flow_shift":12.0,"audio_flow_shift":3.0}' \
+  -F "lora={\"name\":\"pdd-ref2va-8step\",\"path\":\"${PDD_DIR}/MiniMax-H3-Ref2VA-Acc-8Step.safetensors\",\"scale\":1.0}" \
+  --output pdd.mp4
+ffprobe -v error -show_streams -show_format pdd.mp4
+ffmpeg -v error -i pdd.mp4 -f null -
+```
+
+PDD and Turbo are distinct acceleration paths. Alibaba PDD step execution uses one
+forward per request because fused head plans are per-request state. Distilled
+outputs are not expected to be pixel-identical to the base model; check action,
+identity, audio, and temporal continuity for the intended workload.
+
+### GPU E2E smoke on measured revision b04bc33b3250
+
+A September 13, 2026 (UTC+8) run exercised `b04bc33b3250` through
+`/v1/videos/sync` in one server process: base -> PDD -> base -> PDD.
+[Videos, exact metadata, comparisons, and launch profile](https://github.com/LeslieWylie/vllm-omni/tree/17275fa3b16e4328b697c29ab9fb9d9d04041b4c/benchmark-results/minimax-h3-pdd-20260913)
+are retained with the measured revision.
+
+Configuration: four H20 GPUs, BF16, TP4/USP1, text-encoder TP4 with layer
+offload, VAE tile/patch parallel4, eager, vLLM 0.29.0, PyTorch 2.13.0+cu130.
+An older service remained resident. The same three references, prompt and
+seed 42 were used for every request, requesting 5 seconds at 832x480.
+Base used 28 sigma points (27 NFE); PDD used 9 (8 NFE), scale 1.0.
+Both used video/audio shifts 12/3.
+
+| Request, in order | HTTP E2E seconds |
+| --- | ---: |
+| Base before PDD | 510.443 |
+| First PDD, including adapter load | 227.266 |
+| Base after PDD | 505.037 |
+| Repeated PDD, cached adapter | 169.850 |
+
+The retained server counters provide the following E2E breakdown, in seconds:
+
+| Component | Base before | First PDD | Base after | Repeated PDD |
+| --- | ---: | ---: | ---: | ---: |
+| Diffusion engine execution | 509.699 | 226.565 | 504.380 | 169.127 |
+| MP4 response encoding | 0.339 | 0.335 | 0.318 | 0.334 |
+| Remaining HTTP time (by subtraction) | 0.404 | 0.366 | 0.339 | 0.389 |
+| **HTTP E2E total** | **510.443** | **227.266** | **505.037** | **169.850** |
+
+Within engine execution, the progress-bar elapsed times give approximately
+479 / 143 / 478 / 143 seconds for denoising (one-second resolution). The
+remaining engine time is approximately 30.7 / 83.6 / 26.4 / 26.1 seconds.
+These two parts are already included in the engine row above. Adapter loading,
+text encoding, VAE work and other pipeline work were not separately profiled;
+the first-PDD residual must not be interpreted as isolated adapter-load time.
+Remaining HTTP time includes server orchestration and response/client overhead.
+[Exact counters, derivation, and log excerpts](https://github.com/LeslieWylie/vllm-omni/tree/e04c24b3613f10c47ef84bbe22d443fd26d600bd/benchmark-results/minimax-h3-pdd-20260913)
+refer to the same measured revision `b04bc33b3250`; no new GPU run is implied.
+
+All four responses passed full video/audio decoding: 124 H.264 frames,
+832x480, 5.166667-second video and 5.175-second stereo 32 kHz AAC audio.
+The two base videos have byte-identical decoded frames, as do the two PDD
+videos. Repeated PDD audio is also byte-identical. Base audio differs
+(relative waveform L2 0.0912195); its cause was not isolated, so full baseline
+audio invariance is not established. Automatic transcription found the
+intended sentence and additional text in both initial outputs; exact speech
+compliance is not claimed.
+
+The last base/PDD pair is 2.973x for this sample. This is a request-mode
+integration smoke, not a general quality or dedicated-machine benchmark.
+GPU step-mode E2E, full-resolution performance, and broader task/quality
+coverage remain unverified. A 10-second 1344x768 attempt exceeded the memory
+available alongside the resident service.
+
+### Historical runtime evidence
+
+An H20 deployment recorded a 10-second, 1344x768 Ref2VA workload with three
+references, seed 42, FP8, TP2/USP4, and eight denoising evaluations. Its
+September 1, 2026 report recorded 195.8/195.9/198.1 seconds after warm-up,
+against a 575.7-second 28-step baseline. The retained evaluation log reports
+243 frames at 24 FPS, 10.12 seconds, stereo AAC at 32 kHz, and the intended
+spoken line without additional speech.
+
+These are historical deployment measurements, **not validation of this PR's
+current revision**. Subsequent fixes changed trunk binding and head lifecycle,
+and the original comparison media are no longer at the report's paths. The
+September 12 audit recovered logs and reports, not a fresh matched A/B. Do not
+use the historical 2.9x ratio as a current-version performance guarantee.
+The smaller September 13 smoke above has a different configuration and
+must not be substituted for this historical full-resolution workload.
+
 ## Start a server
 
 Pass the repository ID directly. The pipeline uses `FL2VA` for model discovery
