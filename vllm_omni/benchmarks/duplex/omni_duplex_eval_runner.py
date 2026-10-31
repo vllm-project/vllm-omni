@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,6 +71,15 @@ logger = init_logger(__name__)
 
 _SERVER_TURN_SETTLE_S = 2.0
 _COMPLETION_SETTLE_S = 2.0
+#: Slack added to the input duration when bounding a session drain. The reply can
+#: legitimately outlast the clip (a 37s soundtrack asked for a summary answers for
+#: close to a minute), and the drain used to be cut at input + 20s.
+_DRAIN_SLACK_S = float(os.environ.get("DUPLEX_EVAL_DRAIN_SLACK_S", "120") or 120)
+#: The server's step loop is driven by the input frames this client appends. Once
+#: the clip ends the client stops sending, so a reply still open at EOF can freeze
+#: mid-utterance: audio and transcript deltas stop together and ``response.done``
+#: never arrives. Keep silence flowing while the session drains.
+_DRAIN_SILENCE_ENABLED = os.environ.get("DUPLEX_EVAL_DRAIN_SILENCE", "1") not in ("", "0")
 # Bound the closing playback ack: it rides the session socket, so a stuck write
 # must not hold the sample open until the benchmark's per-request timeout.
 _FINAL_ACK_TIMEOUT_S = 20.0
@@ -561,6 +571,25 @@ async def _close_duplex_session(client: RealtimeDuplexClient, *, timeout_s: floa
     raise TimeoutError(f"Timed out closing the duplex session after {timeout_s:g}s")
 
 
+def _drain_timeout_s(prepared_duration: float) -> float:
+    return max(20.0, prepared_duration + _DRAIN_SLACK_S)
+
+
+async def _pad_silence_until_stopped(client, period_ms: int, stop: asyncio.Event) -> None:
+    """Keep appending silence so the server keeps stepping while the reply drains."""
+    period_ms = max(20, int(period_ms or 0))
+    silence = bytes(round(PCM16_SAMPLE_RATE * period_ms / 1000) * PCM16_BYTES_PER_SAMPLE)
+    while not stop.is_set():
+        try:
+            await client.append_audio(silence, is_speech=False)
+        except Exception:  # noqa: BLE001 - a closed socket ends the padding
+            return
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=period_ms / 1000)
+        except asyncio.TimeoutError:
+            continue
+
+
 async def generate_sample(
     sample: DuplexSample,
     *,
@@ -710,16 +739,21 @@ async def generate_sample(
                     settled_silence_is_terminal=settled_silence_is_terminal,
                 )
 
+            silence_stop = asyncio.Event()
+            silence_task: asyncio.Task[None] | None = None
+            if _DRAIN_SILENCE_ENABLED and not server_turns:
+                silence_task = asyncio.create_task(_pad_silence_until_stopped(client, period_ms, silence_stop))
+
             try:
                 if server_turns:
-                    await _wait_for_server_turns(client, timeout_s=max(20.0, prepared.duration + 20.0))
+                    await _wait_for_server_turns(client, timeout_s=_drain_timeout_s(prepared.duration))
                     response_done = client.events.count("response.done") > 0
                 else:
                     await client.commit()
                     input_committed = True
                     await wait_for(
                         responses_finished,
-                        timeout_s=max(20.0, prepared.duration + 20.0),
+                        timeout_s=_drain_timeout_s(prepared.duration),
                         label="response.done",
                     )
                     response_done = True
@@ -740,6 +774,22 @@ async def generate_sample(
                         stable_since=stable_since,
                     )
                     drain_timeout_event_count = len(client.events.events)
+                    # The sample keeps no artifacts on a drain timeout, so the
+                    # state trace has to reach the log to be inspectable at all.
+                    logger.warning(
+                        "duplex drain timeout state: %s",
+                        json.dumps(drain_timeout_state, default=str)[:4000],
+                    )
+            finally:
+                if silence_task is not None:
+                    silence_stop.set()
+                    silence_task.cancel()
+                    try:
+                        await silence_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:  # noqa: BLE001 - padding is best effort
+                        pass
         finally:
             ack_task.cancel()
             try:
