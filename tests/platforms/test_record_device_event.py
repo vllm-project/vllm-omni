@@ -110,25 +110,34 @@ class TestXPUOmniPlatformRecordDeviceEvent:
 
 
 class TestNPUOmniPlatformRecordDeviceEvent:
-    """Test NPUOmniPlatform.record_device_event with mocked torch.npu."""
+    """NPU records a generic ``torch.Event`` and never touches host stream state.
+
+    The recorded event is the only cross-stream ordering primitive: the async
+    output thread waits on it through the public ``torch.Stream`` wrapper before
+    its D2H copies. A ``current_stream().synchronize()`` would block the worker's
+    event loop for the whole device tail without ordering any other stream
+    (#7894), so the mocked cases assert it is never consulted.
+    """
 
     @pytest.mark.cpu
     def test_returns_none_on_failure(self, mocker):
-        """When torch.npu.current_stream().synchronize() fails, return None."""
+        """When event recording fails, return None."""
         try:
             from vllm_omni.platforms.npu.platform import NPUOmniPlatform
         except ModuleNotFoundError:
             pytest.skip("vllm_ascend not available")
 
+        mock_event = mocker.MagicMock()
+        mock_event.record.side_effect = RuntimeError("no NPU")
         mock_torch = mocker.MagicMock()
-        mock_torch.npu.current_stream.return_value.synchronize.side_effect = RuntimeError("no NPU")
+        mock_torch.Event.return_value = mock_event
         mocker.patch("vllm_omni.platforms.npu.platform.torch", mock_torch)
 
         result = NPUOmniPlatform.record_device_event()
         assert result is None
 
     @pytest.mark.cpu
-    def test_synchronizes_stream_then_records_generic_event(self, mocker):
+    def test_records_generic_event_without_host_sync(self, mocker):
         """NPU should return an event consumable by the generic torch.Stream."""
         try:
             from vllm_omni.platforms.npu.platform import NPUOmniPlatform
@@ -136,19 +145,49 @@ class TestNPUOmniPlatformRecordDeviceEvent:
             pytest.skip("vllm_ascend not available")
 
         mock_event = mocker.MagicMock()
-        mock_stream = mocker.MagicMock()
         mock_torch = mocker.MagicMock()
-        mock_torch.npu.current_stream.return_value = mock_stream
         mock_torch.Event.return_value = mock_event
         mocker.patch("vllm_omni.platforms.npu.platform.torch", mock_torch)
 
         result = NPUOmniPlatform.record_device_event()
 
-        # Stream should be synced first (HCCL ordering)
-        mock_stream.synchronize.assert_called_once()
-        # Then a backend-neutral event should be created and recorded.  The
-        # worker waits on it through the public torch.Stream wrapper.
         mock_torch.Event.assert_called_once()
         mock_torch.npu.Event.assert_not_called()
         mock_event.record.assert_called_once()
         assert result is mock_event
+        # The host-side stream must neither be synchronized nor even consulted.
+        mock_torch.npu.current_stream.assert_not_called()
+
+    @hardware_test(res={"npu": "A2"})
+    def test_recorded_event_orders_side_stream_d2h(self):
+        """On-device: the event must make a side-stream D2H wait for compute."""
+        import torch
+
+        if not torch.npu.is_available():
+            pytest.skip("NPU not available")
+
+        from vllm_omni.platforms.npu.platform import NPUOmniPlatform
+
+        device = torch.device("npu", 0)
+        base = torch.randn(4096, 4096, device=device) / 64.0
+        chained = base.clone()
+        for _ in range(40):
+            chained = chained @ base
+        tensor = torch.full_like(chained, 7.0) + chained * 0.0
+
+        event = NPUOmniPlatform.record_device_event()
+        assert event is not None
+
+        d2h_stream = torch.Stream(device=device)
+        d2h_stream.wait_event(event)
+        previous = torch.npu.current_stream()
+        torch.npu.set_stream(d2h_stream)
+        try:
+            host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+            host.copy_(tensor, non_blocking=True)
+        finally:
+            torch.npu.set_stream(previous)
+        d2h_stream.synchronize()
+
+        copied_early = int((host != 7.0).sum())
+        assert copied_early == 0, f"{copied_early} elements copied before compute finished"

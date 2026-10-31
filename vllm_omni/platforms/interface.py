@@ -297,15 +297,14 @@ class OmniPlatform(Platform):
     def record_device_event(cls):
         """Record a device event on the default stream to mark tensor readiness.
 
-        On platforms where distributed communication (e.g. HCCL) may use
-        internal streams not visible to the default stream, this method
-        should synchronize the default stream before recording the event
-        to ensure the event captures all completed work including
-        cross-device communication results.
+        Ordering comes from the event itself: record it on the stream that
+        produced the output, and the consumer waits on it through
+        ``torch.Stream.wait_event`` before its D2H copies. Do **not**
+        host-synchronize the stream first -- that only blocks the caller for the
+        whole device tail without ordering any other stream (see #7894).
 
-        Returns ``None`` by default so that platforms without a native
-        implementation (ROCm, XPU, MUSA) fall through to a safe no-op.
-        Override in platform subclasses to provide real event support.
+        Returns ``None`` by default; every platform that runs async diffusion
+        output (CUDA, ROCm, NPU, XPU, MUSA) overrides this with a real event.
         """
         return None
 
