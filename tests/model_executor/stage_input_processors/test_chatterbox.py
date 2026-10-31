@@ -19,6 +19,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.request import RequestStatus
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from tests.model_executor.models.chatterbox.helpers import (
     DEPLOY,
@@ -41,7 +42,7 @@ from vllm_omni.request import OmniRequest
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 STOP = ChatterboxConfig().stop_speech_token
 PLANES = ["scheduler-side", "runner-side"]
@@ -88,12 +89,14 @@ def stage0_request(prompt: dict, external_id: str, max_tokens: int = MAX_TOKENS)
     )
 
 
+@pytest.mark.cpu
 def test_codes_are_the_valid_speech_tokens() -> None:
     """The stop token, and any placeholder echoed from the prompt, never reach the decoder."""
     (stage_input,) = t3_to_s3gen([talker_output([6561, 6561, 10, 20, 6560, 6562])], request_prompt(250))
     assert stage_input["prompt_token_ids"] == [10, 20, 6560]
 
 
+@pytest.mark.cpu
 def test_payload_is_one_final_chunk_in_the_requests_own_voice() -> None:
     prompt = request_prompt(202)
     (stage_input,) = t3_to_s3gen([talker_output([10, 20, 6562])], prompt)
@@ -109,10 +112,12 @@ def test_payload_is_one_final_chunk_in_the_requests_own_voice() -> None:
     assert payload.embed.voice is None and payload.ids is None
 
 
+@pytest.mark.cpu
 def test_unfinished_outputs_are_skipped() -> None:
     assert t3_to_s3gen([talker_output([10, 20], finished=False)], request_prompt(250)) == []
 
 
+@pytest.mark.cpu
 def test_an_utterance_with_no_speech_tokens_gets_no_stage_1_request() -> None:
     """The orchestrator ends a request that has no next-stage input with empty audio.
 
@@ -135,7 +140,8 @@ def stage_configs(tmp_path_factory: pytest.TempPathFactory) -> list:
 
 @pytest.fixture(scope="module")
 def decoder() -> S3GenDecoder:
-    return S3GenDecoder(ChatterboxConfig(), 2048, SEED).eval()
+    # Full S3Gen decodes take minutes on a shared CPU runner, so the tests that decode run on the GPU.
+    return S3GenDecoder(ChatterboxConfig(), 2048, SEED).to("cuda").eval()
 
 
 @pytest.fixture
@@ -183,6 +189,7 @@ def receive_through_final(receiver: SharedMemoryConnector, external_id: str) -> 
     return payloads
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_the_whole_utterance_decodes_through_stage_1(decoder: S3GenDecoder) -> None:
     """With ``async_chunk: false`` stage 1 decodes the processor's prompt as a stream of one final chunk."""
     torch.manual_seed(15)
@@ -307,6 +314,7 @@ def decoded_samples(side: str, decoder: S3GenDecoder, payloads: list[OmniPayload
     return samples
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("side", PLANES)
 def test_streamed_chunks_decode_to_the_whole_utterance(
     side: str,
@@ -346,6 +354,7 @@ SCHEDULES = {
 }
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("capped", [False, True], ids=["stop token", "length cap"])
 @pytest.mark.parametrize("prompt_tokens", [250, 202])
 def test_every_utterance_length_is_sent_once_and_finished_once(
@@ -425,6 +434,7 @@ def test_every_utterance_length_is_sent_once_and_finished_once(
     assert ended_on_a_boundary == {"scheduler-side": [] if capped else boundaries, "runner-side": boundaries}
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("side", PLANES)
 @pytest.mark.parametrize(("prompt_tokens", "length"), [(250, 53), (202, 56)])
 def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length(
@@ -478,6 +488,7 @@ def receive_on_the_scheduler_side(
         stage1.shutdown()
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("receiving_side", PLANES)
 @pytest.mark.parametrize("side", PLANES)
 def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes(
@@ -514,6 +525,7 @@ def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes(
     assert stage1_request.prompt_token_ids == [] and stage1_request.num_prompt_tokens == 0
 
 
+@pytest.mark.cpu
 def test_a_stream_aborted_between_chunks_is_flushed_and_freed(
     plane: OmniRunnerDataPlane, receiver: SharedMemoryConnector
 ) -> None:
@@ -543,6 +555,7 @@ def test_a_stream_aborted_between_chunks_is_flushed_and_freed(
     assert plane.request_payload == {} and plane.code_prompt_token_ids == {}
 
 
+@pytest.mark.cpu
 def test_a_finished_request_is_sent_its_terminal_chunk_once(adapter: OmniChunkTransferAdapter) -> None:
     """Called again for a request it has finished, the processor sends nothing more.
 
@@ -568,6 +581,7 @@ def test_a_finished_request_is_sent_its_terminal_chunk_once(adapter: OmniChunkTr
     adapter.cleanup(request.request_id, external_id)
 
 
+@pytest.mark.cpu
 def test_tokens_sampled_but_never_shown_are_an_error(plane: OmniRunnerDataPlane) -> None:
     """The count ran ahead of the calls and the history is gone: their audio would be missing.
 
@@ -597,6 +611,7 @@ def test_tokens_sampled_but_never_shown_are_an_error(plane: OmniRunnerDataPlane)
         call([14, 15], history=False)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "key", ["codec_chunk_frames", "codec_max_chunk_frames", "codec_stream_scale_factor", "codec_left_context_frames"]
 )
@@ -621,6 +636,7 @@ def test_a_deploy_file_without_a_chunk_setting_is_an_error(stage_configs: list, 
         adapter.shutdown()
 
 
+@pytest.mark.cpu
 def test_two_requests_interleaved_keep_their_own_schedule_and_voice(
     adapter: OmniChunkTransferAdapter, receiver: SharedMemoryConnector
 ) -> None:

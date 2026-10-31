@@ -24,6 +24,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
 from vllm.v1.core.sched.output import CachedRequestData
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_runner import sort_batch_req_ids
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
@@ -77,6 +78,10 @@ def runners(model_dir: str) -> Iterator[Callable[[str], Runner]]:
                 record_kv_cache_layout(
                     config.cache_config, resolve_kv_cache_layout(config, [layouts], specs.values()).name
                 )
+                # The engine core registers vLLM's own KV cache specs before sizing the
+                # cache. The lazy registration is skipped once any spec is registered,
+                # as a model module's own spec is when another test imports it.
+                register_all_kvcache_specs(config)
                 (kv_cache_config,) = get_kv_cache_configs(config, [specs], [KV_CACHE_BYTES])
                 model_runner.initialize_kv_cache(kv_cache_config)
             built[variant] = model_runner, config
