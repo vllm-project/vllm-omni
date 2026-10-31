@@ -313,3 +313,16 @@ def test_additional_config_roundtrip():
     additional_config = {"torchair_graph_config": {"enabled": True}}
     od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
     assert od.additional_config == additional_config
+
+
+def test_vae_spatial_temporal_chunk_size_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_spatial_temporal_chunk_size is None
+    assert (
+        _roundtrip_diffusion_config(model="x", vae_spatial_temporal_chunk_size=2).vae_spatial_temporal_chunk_size == 2
+    )
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "4"])
+def test_invalid_vae_spatial_temporal_chunk_size(value):
+    with pytest.raises(ValueError, match="vae_spatial_temporal_chunk_size"):
+        OmniDiffusionConfig(model="x", vae_spatial_temporal_chunk_size=value)

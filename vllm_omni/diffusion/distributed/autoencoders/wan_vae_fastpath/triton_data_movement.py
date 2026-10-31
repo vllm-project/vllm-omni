@@ -538,6 +538,7 @@ def cat_pad_5d(
     keep_cache_frames: int = 0,
     *,
     channels_last_output: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Fuse temporal concat, constant padding, and optional cache refresh.
 
@@ -546,6 +547,8 @@ def cat_pad_5d(
     the same dense layout that the reference ``cat``/``pad`` path selects, or
     ``channels_last_3d`` when ``channels_last_output`` is set (a fused transpose
     for channels-first ``x``; the cache refresh still follows ``x``'s layout).
+    An optional dense ``out`` buffer selects the output layout and avoids an
+    allocation (used by spatial halo assembly).
     With ``keep_cache_frames > 0`` the last frames of the assembled input
     (without spatial padding) are also written to a second tensor that
     replaces the reference ``x[:, :, -CACHE_T:].clone()`` cache refresh.
@@ -591,12 +594,20 @@ def cat_pad_5d(
     out_height = height + 2 * pad_height_top
     out_width = width + 2 * pad_width_left
     keep_frames = min(keep_cache_frames, out_frames)
-    out = torch.empty(
-        (batch, channels, out_frames, out_height, out_width),
-        device=x.device,
-        dtype=x.dtype,
-        memory_format=torch.channels_last_3d if out_channels_inner else torch.contiguous_format,
-    )
+    shape = (batch, channels, out_frames, out_height, out_width)
+    if out is None:
+        out = torch.empty(
+            shape,
+            device=x.device,
+            dtype=x.dtype,
+            memory_format=torch.channels_last_3d if out_channels_inner else torch.contiguous_format,
+        )
+    else:
+        if out.shape != shape or out.device != x.device or out.dtype != x.dtype:
+            return None
+        out_channels_inner = out.is_contiguous(memory_format=torch.channels_last_3d)
+        if not out_channels_inner and not out.is_contiguous():
+            return None
     if out.numel() == 0:
         return None
 

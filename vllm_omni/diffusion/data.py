@@ -985,6 +985,9 @@ class OmniDiffusionConfig:
     # Independent encoder fast path for the residual, patchified Wan VAE used
     # by Cosmos3. Levels have the same numerical contract as the decoder.
     vae_encode_fast_path: str = "lossless"
+    # Latent frames per spatial-shard decode chunk after the first; None selects
+    # min(8, spatial group size) for installed channels_last, otherwise 1.
+    vae_spatial_temporal_chunk_size: int | None = None
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -1258,6 +1261,12 @@ class OmniDiffusionConfig:
         self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
         self.stage_input_optional_payload_keys = tuple(self.stage_input_optional_payload_keys)
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
+        if self.vae_spatial_temporal_chunk_size is not None and (
+            isinstance(self.vae_spatial_temporal_chunk_size, bool)
+            or not isinstance(self.vae_spatial_temporal_chunk_size, int)
+            or self.vae_spatial_temporal_chunk_size < 1
+        ):
+            raise ValueError("vae_spatial_temporal_chunk_size must be a positive integer")
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
         kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)

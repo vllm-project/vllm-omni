@@ -531,7 +531,9 @@ steps:
         source_file_dependencies: diffusion_distributed_attention
         timeout_in_minutes: 60
         commands:
-          - pytest -sv tests/diffusion/distributed/ -m 'full_model and cuda and H100 and B200 and cards_2' --run-level "full_model"
+          - pytest -sv tests/diffusion/distributed/ --ignore=tests/diffusion/distributed/test_wan_spatial_fastpath.py -m 'full_model and cuda and H100 and B200 and cards_2' --run-level "full_model"
+          # This file uses externally launched ranks; other tests spawn their own.
+          - torchrun --standalone --nnodes=1 --nproc-per-node=2 -m pytest -sv tests/diffusion/distributed/test_wan_spatial_fastpath.py -m 'full_model and cuda and H100 and B200 and cards_2' --run-level "full_model" -rs
 
       - label: ":full_moon: Diffusion · Distributed Test with H100 · 4-GPU"
         source_file_dependencies: diffusion_distributed_attention

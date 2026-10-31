@@ -449,6 +449,8 @@ def _run_cached_causal_conv(
     and returns it alongside the output so the consumer can fold it into its own
     kernel; the reference path returns ``(output, None)``.
     """
+    from ..wan_spatial_shard import WanDistCausalConv3d
+
     cache = cache_list[index]
     is_repeat_marker = isinstance(cache, str)
     payload = cache if isinstance(cache, torch.Tensor) else None
@@ -501,9 +503,21 @@ def _run_cached_causal_conv(
     elif cache_x.shape[2] < CACHE_T and is_repeat_marker:
         cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
 
-    out = conv(x) if payload is None else conv(x, payload)
+    if (
+        return_bias
+        and isinstance(conv, WanDistCausalConv3d)
+        and _kernels_allowed(x)
+        and not conv._forward_hooks
+        and not conv._forward_pre_hooks
+    ):
+        # Keep halo exchange and masking inside the distributed convolution;
+        # consume its bias in the existing local norm/residual fusion kernels.
+        out, bias = conv(x, payload, return_bias=True)
+    else:
+        out = conv(x) if payload is None else conv(x, payload)
+        bias = None
     cache_list[index] = cache_x
-    return (out, None) if return_bias else out
+    return (out, bias) if return_bias else out
 
 
 def _can_bypass_dropout(module: nn.Module | None) -> bool:
@@ -765,6 +779,8 @@ def resample_forward(
     The caller then receives ``(output, bias)`` and must fold ``bias`` into its
     consumer (or add it); ``(output, None)`` means the bias is already applied.
     """
+    from ..wan_spatial_shard import WanDistConv2d
+
     if feat_idx is None:
         feat_idx = [0]
     cfg = getattr(self, CFG_ATTR, None)
@@ -783,7 +799,21 @@ def resample_forward(
     frames = x.shape[2]
     x = _merge_batch_and_frames(x, channels_last=channels_last)
     pending_bias = None
+    fused = None
     if (
+        channels_last
+        and _kernels_allowed(x)
+        and type(self.resample) is nn.Sequential
+        and len(self.resample) == 2
+        and type(self.resample[0]) in (nn.Upsample, WanUpsample)
+        and _is_nearest_2x(self.resample[0])
+        and type(self.resample[1]) is WanDistConv2d
+        and not _has_forward_hooks(self.resample, *self.resample)
+    ):
+        fused = self.resample[1].forward_upsampled(x, return_bias=return_bias)
+    if fused is not None:
+        x, pending_bias = fused if return_bias else (fused, None)
+    elif (
         return_bias
         and _is_upsample_conv_pair(self.resample)
         and not _has_forward_hooks(self.resample, self.resample[1])
@@ -793,6 +823,20 @@ def resample_forward(
         upsample, conv = self.resample[0], self.resample[1]
         x = F.conv2d(upsample(x), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
         pending_bias = _deferred_conv_bias(conv, x)
+    elif (
+        return_bias
+        and _kernels_allowed(x)
+        and type(self.resample) is nn.Sequential
+        and len(self.resample) == 2
+        and isinstance(self.resample[0], nn.Upsample)
+        and isinstance(self.resample[1], WanDistConv2d)
+        and not self.resample._forward_hooks
+        and not self.resample._forward_pre_hooks
+        and not self.resample[1]._forward_hooks
+        and not self.resample[1]._forward_pre_hooks
+    ):
+        # Unlike F.conv2d, the wrapper retains the required spatial halo exchange.
+        x, pending_bias = self.resample[1](self.resample[0](x), return_bias=True)
     else:
         x = self.resample(x)
     x = _split_batch_and_frames(x, batch, frames, channels_last=channels_last)
@@ -843,6 +887,8 @@ def residual_block_forward(
     feat_cache: list[Any] | None = None,
     feat_idx: list[int] | None = None,
 ) -> torch.Tensor:
+    from ..wan_spatial_shard import WanDistCausalConv3d
+
     if feat_idx is None:
         feat_idx = [0]
     shortcut = self.conv_shortcut
@@ -857,6 +903,16 @@ def residual_block_forward(
     ):
         residual = _conv_without_bias(shortcut, x)
         residual_bias = _deferred_conv_bias(shortcut, residual)
+    elif (
+        type(shortcut) is WanDistCausalConv3d
+        and shortcut.kernel_size == (1, 1, 1)
+        and not any(shortcut._source_padding)
+        and shortcut.bias is not None
+        and not _has_forward_hooks(shortcut)
+        and _kernels_allowed(x)
+    ):
+        # The wrapper applies bias before masking invalid shard tails.
+        residual, residual_bias = shortcut(x, return_bias=True)
     else:
         residual = shortcut(x)
     cfg = getattr(self, CFG_ATTR, None)

@@ -41,6 +41,7 @@ REPORT_ATTR = "_vllm_omni_wan_fastpath_report"
 _UNDO_ATTR = "_vllm_omni_wan_fastpath_undo"
 ENCODER_REPORT_ATTR = "_vllm_omni_wan_encode_fastpath_report"
 _ENCODER_UNDO_ATTR = "_vllm_omni_wan_encode_fastpath_undo"
+SPATIAL_LEVEL_ATTR = "_vllm_omni_wan_spatial_fastpath_level"
 
 _REPLACEMENT_FORWARDS: dict[type[nn.Module], Callable[..., torch.Tensor]] = {
     WanDecoder3d: forwards.decoder_forward,
@@ -128,10 +129,9 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
       * ``"lossless"``: bind the bit-exact replacement forwards (Tier 1).
       * ``"channels_last"``: Tier 1 plus channels-last conv weights (not bit-exact).
 
-    The installer refuses (and reports why) when the VAE is not a diffusers Wan
-    VAE, or when spatially-sharded decode is configured or already installed:
-    ``wan_spatial_shard`` rebinds the same forwards and replaces the causal
-    convolutions with halo-exchanging variants.
+    Active multi-GPU spatial decode defers installation until its halo wrappers
+    exist. Local block forwards retain the distributed convolution calls; the decoder
+    wrapper that owns splitting and gathering is never replaced.
     """
     if level not in VAE_FAST_PATH_LEVELS:
         raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {level!r}")
@@ -145,17 +145,26 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
             )
         return existing
     if level == "off":
+        vae.__dict__.pop(SPATIAL_LEVEL_ATTR, None)
         return WanVaeFastPathReport(level=level, installed=False, reason="disabled")
     if not isinstance(vae, AutoencoderKLWan):
         return _skip(level, f"{type(vae).__name__} is not a diffusers AutoencoderKLWan")
     decoder = getattr(vae, "decoder", None)
     if type(decoder) is not WanDecoder3d:
         return _skip(level, f"decoder is {type(decoder).__name__}, not diffusers WanDecoder3d")
-    if getattr(vae, "_vllm_omni_wan_spatial_shard_installed", False):
-        return _skip(level, "spatial-shard decode is already installed on this VAE")
-    parallel_mode = getattr(getattr(vae, "distributed_executor", None), "parallel_mode", "tile")
-    if isinstance(parallel_mode, str) and parallel_mode.startswith("spatial_shard"):
-        return _skip(level, f"vae_parallel_mode={parallel_mode!r} is not supported")
+    spatial = getattr(vae, "_vllm_omni_wan_spatial_shard_installed", False)
+    executor = getattr(vae, "distributed_executor", None)
+    parallel_mode = getattr(executor, "parallel_mode", "tile")
+    distributed_enabled = getattr(vae, "is_distributed_enabled", None)
+    if (
+        not spatial
+        and isinstance(parallel_mode, str)
+        and parallel_mode.startswith("spatial_shard")
+        and getattr(executor, "parallel_size", 1) > 1
+        and (distributed_enabled is None or distributed_enabled())
+    ):
+        setattr(vae, SPATIAL_LEVEL_ATTR, level)
+        return _skip(level, "deferred until spatial-shard wrappers are installed")
 
     modules = [(f"decoder.{name}" if name else "decoder", module) for name, module in decoder.named_modules()]
     post_quant_conv = getattr(vae, "post_quant_conv", None)
@@ -166,6 +175,8 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
     bypassed: set[nn.Module] = set()
     for _, module in modules:
         replacement = _REPLACEMENT_FORWARDS.get(type(module))
+        if spatial and module is decoder:
+            replacement = None  # Preserve the split/halo/gather execution boundary.
         if forwards.is_diffusers_rms_norm(module):
             replacement = forwards.rms_norm_forward
             bypassed.add(module)
@@ -236,25 +247,40 @@ def _install_bindings(
         undo: list[Callable[[], None]] = []
         patched: dict[str, int] = {}
 
-        def bind(module: nn.Module, forward: Callable[..., Any]) -> None:
-            original = {
-                name: module.__dict__[name] for name in ("forward", forwards.CFG_ATTR) if name in module.__dict__
-            }
+        def bind(module: nn.Module, forward: Callable[..., Any] | None = None) -> None:
+            attributes = ("forward", forwards.CFG_ATTR, "input_memory_format")
+            original = {name: module.__dict__[name] for name in attributes if name in module.__dict__}
 
             def restore() -> None:
-                module.__dict__.pop("forward", None)
-                module.__dict__.pop(forwards.CFG_ATTR, None)
+                for name in attributes:
+                    module.__dict__.pop(name, None)
                 module.__dict__.update(original)
+                if hasattr(module, "_input_buf"):
+                    module._input_buf = None
 
             rollback.callback(restore)
             undo.append(restore)
-            module.forward = MethodType(forward, module)
+            if forward is not None:
+                module.forward = MethodType(forward, module)
             module_cfg = output_cfg if module is getattr(component, "conv_out", None) else cfg
             setattr(module, forwards.CFG_ATTR, module_cfg)
             patched[type(module).__name__] = patched.get(type(module).__name__, 0) + 1
 
         for module, replacement in bindings:
             bind(module, replacement)
+
+        if not encoder and getattr(vae, "_vllm_omni_wan_spatial_shard_installed", False):
+            from ..wan_spatial_shard import WanDistCausalConv3d, WanDistConv2d
+
+            for module in component.modules():
+                if isinstance(module, (WanDistCausalConv3d, WanDistConv2d)):
+                    bind(module)
+                    if cfg.channels_last:
+                        module.input_memory_format = (
+                            torch.channels_last_3d if isinstance(module, WanDistCausalConv3d) else torch.channels_last
+                        )
+                elif getattr(module, "_vllm_omni_spatial_shard_attention", False):
+                    bind(module)
 
         if cfg.channels_last:
             # Keep the original storage only until installation commits. An OOM
@@ -429,6 +455,7 @@ def uninstall_wan_vae_encoder_fastpath(vae: nn.Module) -> None:
 
 def uninstall_wan_vae_fastpath(vae: nn.Module) -> None:
     """Restore original forwards and tensor layouts, retaining current weight values."""
+    vae.__dict__.pop(SPATIAL_LEVEL_ATTR, None)
     undo = vae.__dict__.pop(_UNDO_ATTR, None)
     vae.__dict__.pop(REPORT_ATTR, None)
     for restore in reversed(undo or []):
