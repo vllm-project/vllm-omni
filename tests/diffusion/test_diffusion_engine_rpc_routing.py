@@ -67,6 +67,14 @@ class _ConcurrencyTrackingExecutor:
         self.gates: dict[str, threading.Event] = {}
         self.version = "v1"
 
+    def release_step_requests(self, request_ids):
+        """Mirror the real executor helper: route through collective_rpc.
+
+        The engine's STEP_BATCH abort path calls this directly; forwarding it
+        keeps the call visible in ``calls`` like any other RPC.
+        """
+        return self.collective_rpc("release_step_requests", args=(list(request_ids),))
+
     def collective_rpc(
         self,
         method: str,
