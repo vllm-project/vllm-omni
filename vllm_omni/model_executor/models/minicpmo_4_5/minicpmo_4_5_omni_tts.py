@@ -31,7 +31,10 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
+from vllm.v1.worker.gpu.sample.output import SamplerOutput as Mrv2SamplerOutput
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
@@ -58,6 +61,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
     talker_kstep_frames,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
@@ -605,11 +609,14 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
 def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForConditionalGeneration") -> Any:
     """Wrap the runner's MRv2 sampler with codec penalties and EOS control.
 
-    The upstream sampler already applies ``min_tokens`` (codec EOS is a stage
-    stop token), temperature, top-k/top-p and seeded sampling on the device.
-    The Talker adds its 16-frame codec penalty and overrides rows the model
-    terminates (``_mrv2_forced_eos``) with codec EOS after sampling, exactly
-    where V1's ``_force_eos_on_sampled_ids`` does.
+    The upstream sampler applies ``min_tokens`` (codec EOS is a stage stop
+    token), temperature and top-k/top-p. Its seeded draw is Triton Gumbel, which
+    is not the torch generator V1's sampler advances, so the same seed and
+    logits were producing a different codec stream (shorter audio, higher WER).
+    The wrapper keeps that logit pipeline and draws with V1's seeded exponential
+    sampler instead. Rows the model terminates (``_mrv2_forced_eos``) are
+    overwritten with codec EOS after sampling, exactly where V1's
+    ``_force_eos_on_sampled_ids`` does.
     """
 
     stock = sampler.penalties_state
@@ -632,7 +639,8 @@ def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForCond
     )
     talker._codec_classes(sampler.req_states.device)
     logger.info(
-        "MiniCPM-o Talker: MRv2 sampler with device-side %d-frame codec penalty and EOS control",
+        "MiniCPM-o Talker: MRv2 sampler with device-side %d-frame codec penalty, "
+        "EOS control, and the V1 seeded exponential draw",
         _CODEC_PENALTY_WINDOW,
     )
     return MiniCPMO45TalkerSampler(sampler, talker)
@@ -644,6 +652,18 @@ class MiniCPMO45TalkerSampler(OmniSampler):
     def __init__(self, base_sampler, talker):
         super().__init__(base_sampler)
         self.talker = talker
+        # Per request slot, the same torch generator V1 builds from sampling_params.seed.
+        self._v1_generators: dict[int, torch.Generator] = {}
+
+    def add_request(self, req_idx: int, sampling_params: Any) -> None:
+        seed = getattr(sampling_params, "seed", None)
+        if seed is None:
+            self._v1_generators.pop(int(req_idx), None)
+        else:
+            generator = torch.Generator(device=self.req_states.device)
+            generator.manual_seed(int(seed))
+            self._v1_generators[int(req_idx)] = generator
+        self.base_sampler.add_request(req_idx, sampling_params)
 
     def __call__(self, logits: torch.Tensor, input_batch: Any) -> Any:
         forced = self.talker.take_mrv2_forced_eos(input_batch, self.req_states, logits.shape[0])
@@ -651,11 +671,72 @@ class MiniCPMO45TalkerSampler(OmniSampler):
         self.talker._mrv2_masked_eos = None
         if masked is not None and masked.shape[0] == logits.shape[0]:
             logits[:, int(self.talker._codec_eos_id)].masked_fill_(masked, float("-inf"))
-        output = self.base_sampler(logits, input_batch)
+        output = self._sample_like_v1(logits, input_batch)
         if forced is not None:
             sampled = output.sampled_token_ids
             sampled.masked_fill_(forced.view(-1, *([1] * (sampled.ndim - 1))), int(self.talker._codec_eos_id))
         return output
+
+    def _sample_like_v1(self, logits: torch.Tensor, input_batch: Any) -> Any:
+        """Logit pipeline of the MRv2 sampler, then V1's seeded exponential draw."""
+        num_rows = logits.shape[0]
+        expanded = input_batch.expanded_idx_mapping
+        idx_np = input_batch.idx_mapping_np
+        if expanded.shape[0] != num_rows or idx_np.shape[0] != num_rows:
+            # Speculative rows are rejected for this Talker. Keep the stock
+            # sampler if a batch ever arrives with a different layout.
+            return self.base_sampler(logits, input_batch)
+        if self.base_sampler.returns_logprobs(idx_np):
+            return self.base_sampler(logits, input_batch)
+
+        num_nans = get_num_nans(logits) if self.base_sampler.compute_nans else None
+        sampler = self.base_sampler
+        if np.any(sampler.needs_logits_processing[idx_np]):
+            processed = sampler.apply_sampling_params(
+                logits,
+                expanded,
+                input_batch.idx_mapping,
+                idx_np,
+                input_batch.positions[input_batch.logits_indices],
+                input_batch.input_ids[input_batch.logits_indices],
+                input_batch.expanded_local_pos,
+                input_batch.seq_lens_cpu_upper_bound.numpy(),
+                skip_top_k_top_p=True,
+            )
+        else:
+            processed = logits if logits.dtype == torch.float32 else logits.float()
+            sampler.sampling_states.apply_temperature(processed, expanded, idx_np)
+            sampler.sampling_states.apply_min_p(processed, expanded, idx_np)
+        top_k, top_p = sampler.sampling_states.get_top_k_top_p(expanded, idx_np)
+        temperature = sampler.sampling_states.temperature.gpu.index_select(0, expanded.long())
+        slots = expanded.detach().to(device="cpu").tolist()
+        generators = {
+            row: self._v1_generators[int(slot)] for row, slot in enumerate(slots) if int(slot) in self._v1_generators
+        }
+        sampled = draw_v1_codec_ids(
+            processed,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            generators=generators,
+        )
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.req_states.prefill_len.gpu,
+        )
+        output_kwargs: dict[str, Any] = {
+            "sampled_token_ids": sampled.view(-1, 1),
+            "logprobs_tensors": None,
+            "num_nans": num_nans,
+            "num_sampled": num_sampled,
+            "num_rejected": num_rejected,
+        }
+        if "sampling_mask_tensors" in getattr(Mrv2SamplerOutput, "__dataclass_fields__", {}):
+            output_kwargs["sampling_mask_tensors"] = None
+        return Mrv2SamplerOutput(**output_kwargs)
 
 
 class _MiniCPMTTSProjector(nn.Module):
