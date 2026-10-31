@@ -1314,14 +1314,16 @@ def _real_boundary_talker(temperature: float):
     model = _make_talker(k_step_frames=8, scripted_samples=[])
     model._codec_temperature = temperature
     model._codec_repetition_penalty = 1.05
+    # The host sampler resolves these knobs unconditionally when it builds
+    # its lazy per-request state, so every flavor needs them.
+    model._codec_seed = 42
+    model._codec_top_k = 0
+    model._codec_top_p = 1.0
     model.head_code = nn.ModuleList([nn.Linear(8, _NUM_AUDIO_TOKENS, bias=False)])
     if temperature == 0.0:
         real_greedy = type(model)._sample_audio_code_greedy
         model._sample_audio_code_greedy = real_greedy.__get__(model, type(model))
     else:
-        model._codec_top_k = 0
-        model._codec_top_p = 1.0
-        model._codec_seed = 42
         real_sample = type(model)._sample_audio_code
         model._sample_audio_code = real_sample.__get__(model, type(model))
     return model
@@ -1354,6 +1356,132 @@ def test_host_boundary_default_emits_and_stops(token_id, limit, finished, emit):
     audio = output.multimodal_outputs["codes"]["audio"][0]
     assert audio.reshape(-1).tolist() == ([token_id] if emit else [])
     assert model._request_host_codec_states["r1"]["finished"] is finished
+
+
+def _real_host(model):
+    """Rebind the real host sampler over the double _make_talker installs."""
+    model._sample_audio_code_host = type(model)._sample_audio_code_host.__get__(model, type(model))
+    return model
+
+
+def _set_head_logits(model, logits: dict[int, float]) -> None:
+    """Give the head exact per-token logits (a ones hidden reads them back)."""
+    with torch.no_grad():
+        head = model.head_code[0]
+        head.weight.zero_()
+        for token_id, value in logits.items():
+            head.weight[token_id] = value
+
+
+def test_host_greedy_matches_device_greedy_frame_by_frame():
+    """Host sampling is bit-identical to the device greedy chain.
+
+    amy-why-3459 review follow-up: the numpy argmax chain must track the
+    device sampler -- same ids, same emit culling, same finished frame --
+    across a sequence that re-ranks the head and ends on EOS.
+    """
+    host_model = _real_boundary_talker(0.0)
+    _real_host(host_model)
+    device_model = _real_boundary_talker(0.0)
+    device_model._request_audio_states["r1"] = {"step": 0, "codes": torch.tensor([10, 11]), "max_tokens": 100}
+
+    def device_host(hidden, codes, request_id, step, min_tokens, max_tokens, eos_window_masked):
+        result = device_model._sample_audio_code_greedy(
+            hidden, codes, request_id, step, min_tokens, max_tokens, eos_window_masked
+        )
+        return int(result.sampled_token.item()), bool(result.state.finished.item()), bool(result.emit.item())
+
+    finished_host = False
+    for step, token in enumerate((42, 43, 42, _EOS_ID)):
+        _bias_head_to(host_model, token)
+        _bias_head_to(device_model, token)
+        hidden = torch.ones(1, 8)
+        got_host = host_model._sample_audio_code_host(hidden, torch.tensor([10, 11]), "r1", {}, step, 0, 100, False)
+        got_device = device_host(hidden, torch.tensor([10, 11]), "r1", step, 0, 100, False)
+        assert got_host == got_device
+        finished_host = got_host[1]
+        if finished_host:
+            break
+    assert finished_host
+
+
+def test_host_topk_ties_keep_all_members():
+    """top_k keeps every logit >= the k-th largest, ties included.
+
+    amy-why-3459 review follow-up: a strict > comparison would silently
+    drop one tied member; across seeds both tied ids must be reachable
+    and nothing outside the tie may be emitted.
+    """
+    model = _real_boundary_talker(1.0)
+    _real_host(model)
+    _set_head_logits(model, {42: 8.0, 43: 8.0})
+    hidden = torch.ones(1, 8)
+    emitted: set[int] = set()
+    for seed in range(40):
+        request_state = {
+            "codec_seed": seed,
+            "codec_temperature": 1.0,
+            "codec_top_k": 2,
+            "codec_top_p": 1.0,
+            "codec_repetition_penalty": 1.0,
+        }
+        got = model._sample_audio_code_host(
+            hidden, torch.tensor([10, 11]), f"tie{seed}", request_state, 0, 0, 100, False
+        )
+        assert got[0] in (42, 43)
+        emitted.add(got[0])
+    assert emitted == {42, 43}
+
+
+def test_host_topp_boundary_keeps_last_candidate():
+    """top_p keeps the minimal set whose cumsum exceeds 1-top_p.
+
+    amy-why-3459 review follow-up: the top candidate itself is never
+    removed (remove[-1] = False), so a dominant head yields exactly one
+    id under a tight top_p and the full support under a loose one.
+    """
+    model = _real_boundary_talker(1.0)
+    _real_host(model)
+    # The head is Linear(8, N) and the hidden is ones, so a row value v
+    # becomes logit 8*v: 3/2/1 give softmax probabilities ~0.67/0.24/0.09,
+    # wide enough that top_p=0.99 keeps all three (cum[0] > 1-top_p).
+    logits = {token: -30.0 for token in range(_NUM_AUDIO_TOKENS)}
+    logits.update({42: 0.375, 43: 0.25, 44: 0.125})
+    _set_head_logits(model, logits)
+    hidden = torch.ones(1, 8)
+
+    def draw(top_p: float, seed: int) -> int:
+        request_state = {
+            "codec_seed": seed,
+            "codec_temperature": 1.0,
+            "codec_top_k": 0,
+            "codec_top_p": top_p,
+            "codec_repetition_penalty": 1.0,
+        }
+        return model._sample_audio_code_host(
+            hidden, torch.tensor([10, 11]), f"p{top_p}-{seed}", request_state, 0, 0, 100, False
+        )[0]
+
+    assert all(draw(0.5, seed) == 42 for seed in range(40))
+    assert {draw(0.99, seed) for seed in range(60)} == {42, 43, 44}
+
+
+def test_host_pipeline_lg_dev_matches_eager_greedy():
+    """A pre-submitted head row and the eager head call agree bit-for-bit.
+
+    amy-why-3459 review follow-up: the frame loop passes lg_dev only when
+    its row binding matches; the sampler itself must not treat a
+    pipelined row differently from the eager head call it replaces.
+    """
+    model = _real_boundary_talker(0.0)
+    _real_host(model)
+    hidden = torch.ones(1, 8)
+    _bias_head_to(model, 42)
+    eager = model._sample_audio_code_host(hidden, torch.tensor([10, 11]), "eager", {}, 0, 0, 100, False)
+    # The frame loop submits an already-flattened row; match that contract.
+    lg_dev = model.head_code[0](hidden).detach().reshape(-1)
+    piped = model._sample_audio_code_host(hidden, torch.tensor([10, 11]), "piped", {}, 0, 0, 100, False, lg_dev=lg_dev)
+    assert piped == eager == (42, False, True)
 
 
 def test_stop_id_finishes_request_through_device_state_greedy():
