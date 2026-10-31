@@ -174,7 +174,8 @@ class StageEngineCoreProc(EngineCoreProc):
                 try:
                     self.model_executor.collective_rpc(_release_runner_shm_resources, args=(list(request_ids),))
                 except Exception as e:
-                    logger.debug("omni_release_request_resources(%s) failed: %s", request_ids, e)
+                    # A failed release leaks the requests' SHM segments.
+                    logger.warning("omni_release_request_resources(%s) failed: %s", request_ids, e)
             return
         for request_id in request_ids or ():
             try:

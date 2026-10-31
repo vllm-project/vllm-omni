@@ -36,7 +36,9 @@ class Qwen3OmniTalkerSampler(OmniSampler):
         self._generators: dict[int, torch.Generator] = {}
         self._sample_random = base_sampler._sample_random
         base_sampler._sample_random = self._sample_like_v1
-        self._logged_path = False
+        self._logged_v1 = False
+        self._logged_mixed = False
+        self._logged_fallback = False
         logger.info("Qwen3-Omni Talker: codebook 0 uses the V1 per-request generator")
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
@@ -73,26 +75,54 @@ class Qwen3OmniTalkerSampler(OmniSampler):
             generator = self._generators.get(int(slot))
             if generator is not None:
                 generators[row] = generator
-        if len(generators) != n_rows:
-            # An unseeded row has no V1 stream. Keep the whole step on the
-            # upstream sampler instead of mixing two noise sources.
-            if not self._logged_path:
+        mappable = expanded_idx_mapping.shape[0] >= n_rows and pos.shape[0] >= n_rows
+        if not generators or (len(generators) != n_rows and not mappable):
+            if generators and not self._logged_fallback:
                 logger.warning(
-                    "Qwen3-Omni Talker kept the MRv2 sampler: seeded %d/%d rows, fused=%s",
+                    "Qwen3-Omni Talker kept the MRv2 sampler: seeded %d/%d rows, %d mapped rows",
                     len(generators),
                     n_rows,
-                    use_fused_sampler,
+                    int(expanded_idx_mapping.shape[0]),
                 )
-                self._logged_path = True
+                self._logged_fallback = True
             return original(
                 processed_logits, expanded_idx_mapping, idx_mapping_np, pos, top_k, top_p, use_fused_sampler
             )
-        if not self._logged_path:
-            logger.info("Qwen3-Omni Talker sampled %d rows with the V1 generator", n_rows)
-            self._logged_path = True
         masked = apply_top_k_top_p(processed_logits, top_k, top_p)
-        probs = masked.softmax(dim=-1, dtype=torch.float32)
-        return random_sample(probs, generators), masked
+        if len(generators) == n_rows:
+            if not self._logged_v1:
+                logger.info("Qwen3-Omni Talker sampled %d rows with the V1 generator", n_rows)
+                self._logged_v1 = True
+            probs = masked.softmax(dim=-1, dtype=torch.float32)
+            return random_sample(probs, generators), masked
+        # Seeded rows keep their own V1 stream whatever they are batched with.
+        # Greedy and unseeded rows stay on the upstream sampler, which also
+        # owns the temperature-0 argmax.
+        if not self._logged_mixed:
+            logger.info("Qwen3-Omni Talker split a step: %d/%d rows on the V1 generator", len(generators), n_rows)
+            self._logged_mixed = True
+        seeded_rows = list(generators)
+        seeded_set = set(seeded_rows)
+        other_rows = [row for row in range(n_rows) if row not in seeded_set]
+        device = processed_logits.device
+        seeded_idx = torch.tensor(seeded_rows, dtype=torch.long, device=device)
+        other_idx = torch.tensor(other_rows, dtype=torch.long, device=device)
+        sampled = torch.empty(n_rows, dtype=torch.int64, device=device)
+        probs = masked.index_select(0, seeded_idx).softmax(dim=-1, dtype=torch.float32)
+        sampled[seeded_idx] = random_sample(probs, {i: generators[row] for i, row in enumerate(seeded_rows)})
+        # Rows are already top-k/top-p masked, and a fused sampler is never
+        # eligible once any row has an explicit seed.
+        other_sampled, _ = original(
+            masked.index_select(0, other_idx),
+            expanded_idx_mapping[:n_rows].index_select(0, other_idx),
+            idx_mapping_np,
+            pos[:n_rows].index_select(0, other_idx),
+            None,
+            None,
+            False,
+        )
+        sampled[other_idx] = other_sampled.to(torch.int64)
+        return sampled, masked
 
 
 def mrv2_talker_sampler(sampler: Any) -> tuple[Qwen3OmniTalkerSampler, None]:
