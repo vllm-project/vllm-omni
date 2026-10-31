@@ -628,13 +628,28 @@ vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va \
   --kv-offload-config '{"mode":"on","kv_refresh_interval":8,"kv_host_quantization":"int8"}'
 ```
 
-The JSON object accepts three keys:
+The JSON object accepts four keys:
 
 | Key | Values | Default | Meaning |
 | --- | --- | --- | --- |
-| `mode` | `on` | required | Cache reference K/V after Ulysses and prefetch layers into a fixed two-slot device ring. |
+| `mode` | `on` | required | Cache reference K/V after Ulysses using the selected residency. |
 | `kv_refresh_interval` | integer >= 0 | `2` | Refresh every N denoise steps. `0` populates only at step 0 and has the highest quality risk. |
 | `kv_host_quantization` | `none`, `fp8`, `int8` | `none` | Host-cache storage format; quantization may fall back at runtime. |
+| `kv_cache_residency` | `host`, `device` | `host` | Use a pinned host pool with a two-slot device ring, or keep the full unquantized reference pool on the execution device. |
+
+For device residency, pass the following JSON to `--kv-offload-config`:
+
+```json
+{"mode":"on","kv_refresh_interval":2,"kv_cache_residency":"device","kv_host_quantization":"none"}
+```
+
+Device residency avoids synchronous host capture and layerwise H2D staging.
+It requires space for the full reference pool on each rank:
+`2 * layers * reference_rows * local_heads * head_dim * dtype_bytes`.
+It requires `kv_host_quantization=none`; combining device residency with host
+quantization is rejected. The refresh schedule and its quality risks remain
+the same. Check memory headroom and matched output quality for each workload
+before choosing this experimental option.
 
 Reuse steps skip reference-token QKV projection and reference-query attention. This is lossy.
 The current implementation requires one request per forward and either no
@@ -645,8 +660,9 @@ are no longer used. The experimental RainFusion hybrid uses its validated BSA
 kernel and FP16 kernel input only on compact reference-KV reuse steps; the
 ordinary RainFusion path is unchanged when reference-KV offload is disabled.
 Warm up each configuration before comparing timings and inspect per-request
-reference row counts, refresh counts, and effective host quantization in worker
-logs. A successful HTTP response alone does not prove the cache was used.
+reference row counts, refresh counts, residency, device-resident bytes, transfer
+bytes, and effective host quantization in worker logs. A successful HTTP response
+alone does not prove the cache was used.
 
 ## Known limitations
 

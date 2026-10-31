@@ -25,6 +25,8 @@ class MiniMaxH3ReferenceKVStats:
     captured_layers: int = 0
     substituted_layers: int = 0
     h2d_bytes: int = 0
+    d2h_bytes: int = 0
+    device_reuse_steps: int = 0
     projection_skipped_layers: int = 0
     projection_skipped_rows: int = 0
     projection_total_rows: int = 0
@@ -68,6 +70,7 @@ class _MiniMaxH3ReferenceKVBase:
         self.stats = MiniMaxH3ReferenceKVStats()
 
         self._host_pool: torch.Tensor | None = None
+        self._resident_pool: torch.Tensor | None = None
         self._host_scale_pool: torch.Tensor | None = None
         self._local_sequence_rows: int | None = None
         self._global_sequence_rows: int | None = None
@@ -206,18 +209,20 @@ class _MiniMaxH3ReferenceKVBase:
         self.stats.projection_total_rows += total_rows
 
     def _is_refresh_step(self, step: int) -> bool:
-        if self._host_pool is None:
+        if self._host_pool is None and self._resident_pool is None:
             return True
         return self.refresh_interval > 0 and step % self.refresh_interval == 0
 
 
 class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
-    """Layerwise asynchronous H2D staging backed by a small device ring.
+    """Reference KV backed by a host pool or an opt-in resident device pool.
 
     Refresh steps capture the balanced K/V head shard after Ulysses All-to-All.
     Reuse steps prefetch one layer at a time from the pinned host pool. Layer
     ``i + 1`` is submitted immediately after layer ``i`` consumes its slot, so
     its H2D can overlap the current layer's attention and MLP work.
+    Device residency trades the full reference-pool allocation for avoiding
+    both host capture and H2D staging; it does not change the refresh schedule.
     """
 
     tier_name = "Tier2"
@@ -247,17 +252,20 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             device=device,
             refresh_interval=config.kv_refresh_interval,
             host_quantization=config.kv_host_quantization,
+            cache_residency=config.kv_cache_residency,
         )
         _log.info(
             "MiniMax-H3 reference-KV enabled: layers=%d, global_ref_rows=%d, "
             "refresh_interval=%d, device=%s, ring_size=%d, "
-            "host_quantization=%s, skip_reference_projection=True, cache_layout=post_ulysses",
+            "host_quantization=%s, cache_residency=%s, "
+            "skip_reference_projection=True, cache_layout=post_ulysses",
             num_layers,
             global_reference_rows,
             config.kv_refresh_interval,
             device,
             state.ring_size,
             state.host_quantization,
+            state.cache_residency,
         )
         return state
 
@@ -271,9 +279,14 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         ring_size: int = 2,
         pin_memory: bool = True,
         host_quantization: str = "none",
+        cache_residency: str = "host",
     ) -> None:
         if not 2 <= ring_size <= 3:
             raise ValueError(f"ring_size must be 2 or 3, got {ring_size}")
+        if cache_residency not in {"host", "device"}:
+            raise ValueError("cache_residency must be host or device")
+        if cache_residency == "device" and host_quantization != "none":
+            raise ValueError("device-resident reference KV requires host_quantization=none")
         super().__init__(
             num_layers=num_layers,
             global_reference_rows=global_reference_rows,
@@ -283,6 +296,7 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             host_quantization=host_quantization,
         )
         self.ring_size = int(ring_size)
+        self.cache_residency = cache_residency
         self.stats = MiniMaxH3ReferenceKVStats()
         self._device_ring: torch.Tensor | None = None
         self._device_scale_ring: torch.Tensor | None = None
@@ -290,6 +304,12 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         self._slot_layers: list[int | None] = [None] * self.ring_size
         self._ready_events: list[Any | None] = [None] * self.ring_size
         self._consumed_events: list[Any | None] = [None] * self.ring_size
+
+    @property
+    def device_resident_bytes(self) -> int:
+        if self._resident_pool is None:
+            return 0
+        return self._resident_pool.numel() * self._resident_pool.element_size()
 
     @property
     def device_staging_bytes(self) -> int:
@@ -455,21 +475,43 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         positions = self.global_reference_positions
         reference_k = key[0].index_select(0, positions)
         reference_v = value[0].index_select(0, positions)
-        if self._host_pool is None:
-            self._allocate_post_ulysses_host_pool(reference_k)
-        assert self._host_pool is not None
-        expected = tuple(self._host_pool.shape[2:])
+        if self.cache_residency == "device":
+            if self._resident_pool is None:
+                self._resident_pool = torch.empty(
+                    (self.num_layers, 2, *reference_k.shape),
+                    dtype=reference_k.dtype,
+                    device=self.device,
+                )
+                _log.info(
+                    "MiniMax-H3 reference-KV device pool allocated: shape=%s, dtype=%s, bytes=%d",
+                    tuple(self._resident_pool.shape),
+                    self._resident_pool.dtype,
+                    self.device_resident_bytes,
+                )
+            pool = self._resident_pool
+        else:
+            if self._host_pool is None:
+                self._allocate_post_ulysses_host_pool(reference_k)
+            assert self._host_pool is not None
+            pool = self._host_pool
+        expected = tuple(pool.shape[2:])
         if tuple(reference_k.shape) != expected:
             raise ValueError(
                 f"post-Ulysses reference K/V shape changed: expected {expected}, got {tuple(reference_k.shape)}"
             )
         encoded, scales = self._encode_reference_pair(reference_k, reference_v)
         with record_function("minimax_h3.ref_kv_tier2.populate_post_ulysses"):
-            self._host_pool[:, layer_index].copy_(encoded, non_blocking=False)
+            # Device storage is layer-major so each capture is contiguous.
+            layer_pool = pool[layer_index] if self.cache_residency == "device" else pool[:, layer_index]
+            layer_pool.copy_(encoded, non_blocking=self.cache_residency == "device")
             if scales is not None:
                 if self._host_scale_pool is None:
                     raise RuntimeError("INT8 host scale pool is missing")
                 self._host_scale_pool[:, layer_index].copy_(scales, non_blocking=False)
+        if self.cache_residency == "host":
+            self.stats.d2h_bytes += encoded.numel() * encoded.element_size()
+            if scales is not None:
+                self.stats.d2h_bytes += scales.numel() * scales.element_size()
         self.stats.captured_layers += 1
         self._layers_seen.add(layer_index)
 
@@ -634,6 +676,11 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         if self._refresh:
             self.stats.refresh_steps += 1
             return
+        if self.cache_residency == "device":
+            if self._resident_pool is None:
+                raise RuntimeError("device reference-KV reuse requested before populate")
+            self.stats.device_reuse_steps += 1
+            return
         if self._host_pool is None:
             raise RuntimeError("reference-KV Tier2 reuse requested before populate")
 
@@ -650,6 +697,8 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
 
     def mark_block_cache_skipped(self, layer_indices: list[int]) -> None:
         super().mark_block_cache_skipped(layer_indices)
+        if self.cache_residency == "device":
+            return
         next_layer = len(self._layers_seen)
         if next_layer < self.num_layers:
             slot = next_layer % self.ring_size
@@ -672,6 +721,15 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
                 "Tier2 layerwise prefetch requires sequential layer execution: "
                 f"expected {len(self._layers_seen)}, got {layer_index}"
             )
+        if self.cache_residency == "device":
+            if self._resident_pool is None:
+                raise RuntimeError("device reference-KV pool is missing on a reuse step")
+            # Preserve the existing ownership contract: callers may retain
+            # these tensors across a later reference refresh.
+            cached = self._resident_pool[layer_index].clone()
+            self.stats.substituted_layers += 1
+            self._layers_seen.add(layer_index)
+            return cached[0], cached[1]
         if self._device_ring is None:
             raise RuntimeError("Tier2 device ring is missing on a reuse step")
 
@@ -757,7 +815,8 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             "projection_skipped_layers=%d, projection_skipped_rows=%d, "
             "projection_total_rows=%d, cache_layout=post_ulysses, "
             "host_quantization=%s, effective_host_quantization=%s, "
-            "dequantized_layers=%d, quantization_fallbacks=%d",
+            "dequantized_layers=%d, quantization_fallbacks=%d, cache_residency=%s, "
+            "device_resident_bytes=%d, device_reuse_steps=%d, d2h_bytes=%d",
             self.host_bytes,
             self.device_staging_bytes,
             self.stats.refresh_steps,
@@ -775,6 +834,10 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             self.effective_host_quantization,
             self.stats.dequantized_layers,
             self.stats.quantization_fallbacks,
+            self.cache_residency,
+            self.device_resident_bytes,
+            self.stats.device_reuse_steps,
+            self.stats.d2h_bytes,
         )
         self._device_ring = None
         self._device_scale_ring = None
@@ -783,6 +846,7 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         self._ready_events = [None] * self.ring_size
         self._consumed_events = [None] * self.ring_size
         self._host_pool = None
+        self._resident_pool = None
         self._host_scale_pool = None
         self._local_sequence_rows = None
         self._global_non_reference_positions = None
