@@ -203,8 +203,48 @@ omni = Omni(model="<autoround-mxfp8-model>")
 | `method` | str | — | Must be `"mxfp8"` |
 | `is_checkpoint_mxfp8_serialized` | bool | `False` | `True` for offline pre-quantized checkpoints; auto-set from `config.json` when using the preprocessing script |
 | `ignored_layers` | list[str] | `[]` | Layer name substrings to keep in BF16 (e.g. `"to_out"` matches `blocks.0.attn1.to_out.0`) |
+| `prefix_bf16_steps` | int | `0` | Online NPU only; compute denoising indices `0 <= step < K` with the retained BF16 master, then resume MXFP8; `0` disables the fallback |
+| `prefix_bf16_master_mode` | `cpu`, `resident`, or `dlo` | `cpu` | Storage policy for the retained BF16 master; `dlo` reuses distributed layerwise offload buffers |
 
 ## Validation and Notes
+
+On Ascend NPU, `VLLM_OMNI_MXFP8_SCALE_ALG` selects the `scale_alg` passed to
+`torch_npu.npu_dynamic_mx_quant` for activations and online weights. It defaults
+to `0`; set it before starting the process:
+
+```bash
+export VLLM_OMNI_MXFP8_SCALE_ALG=1
+```
+
+The installed torch_npu/CANN version must support the selected algorithm and
+the `scale_alg` keyword. Offline checkpoint weights are not requantized.
+
+### NPU Online BF16 Prefix Fallback
+
+Use the prefix fallback when quantization error on early denoising steps is
+unacceptable. The policy is executed by MindIE-SD's `MXFP8BF16Fallback`; this
+repository owns the denoising-step context and optional DLO lifecycle.
+
+```bash
+vllm serve <model> --omni \
+  --diffusion-quantization-config '{"method":"mxfp8","prefix_bf16_steps":5,"prefix_bf16_master_mode":"cpu"}'
+```
+
+`prefix_bf16_steps` counts zero-based `ForwardContext.denoise_step_idx`
+indices, so every CFG pass at the same denoising step uses the same policy.
+If no denoising step is published, inference stays on MXFP8. A positive value
+requires online MXFP8 weights because serialized checkpoints do not contain
+the BF16 master.
+
+`cpu` keeps the master in host memory and transfers the current layer during
+fallback steps. `resident` keeps all local masters on the loading NPU and can
+significantly increase accelerator memory. `dlo` requires distributed
+layerwise offload and streams the BF16 master through its existing bounded
+double buffers; it retains separate host backing for the standard and BF16
+representations but keeps device residency bounded by the offload block size.
+The BF16 master is excluded from `state_dict` and is not moved by
+`module.to()`. Model migration, mixed-step batches, reload, and sleep/wake are
+not supported for `dlo`.
 
 1. Online mode quantizes BF16 weights at load time using
    `npu_dynamic_mx_quant`. This adds a one-time overhead on the first load
