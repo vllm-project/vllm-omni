@@ -199,6 +199,7 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
         ({}, [3, 33], [1, 2]),
         ({"hift_graph_continuation_frames": [], "hift_graph_exact_batch_sizes": [1]}, [], [1]),
         ({"hift_graph_continuation_frames": [4, 28], "hift_graph_exact_batch_sizes": [2]}, [4, 28], [2]),
+        ({"hift_graph_exact_batch_sizes": []}, [3, 33], []),
     ],
 )
 def test_hift_exact_graph_defaults_and_overrides(extra, frames, batches):

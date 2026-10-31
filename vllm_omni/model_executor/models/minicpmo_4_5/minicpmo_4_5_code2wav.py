@@ -447,7 +447,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             # graphs -- extra capture time at warmup and extra graph
             # memory on every platform, CUDA included.
             "hift_graph_continuation_frames": list(extra.get("hift_graph_continuation_frames", (3, 33)) or ()),
-            "hift_graph_exact_batch_sizes": list(extra.get("hift_graph_exact_batch_sizes") or (1, 2)),
+            # Same shape as continuation_frames: an explicit [] disables
+            # the batch-size graphs, a missing key keeps the default.
+            "hift_graph_exact_batch_sizes": list(extra.get("hift_graph_exact_batch_sizes", (1, 2)) or ()),
         }
         if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
