@@ -2861,9 +2861,28 @@ def test_stage_pool_metrics_use_resumable_segment_token_count() -> None:
             id="observed",
         ),
         pytest.param(
+            {
+                "vllm_queued_ms": 2.5,
+                "vllm_prefill_ms": 30.0,
+                "vllm_decode_ms": 0.0,
+                "vllm_num_preemptions": 0,
+                "vllm_input_wait_ms": 2.0,
+                "vllm_ready_queued_ms": 0.5,
+            },
+            {"vllm_queued_ms": 2.5, "vllm_input_wait_ms": 2.0, "vllm_ready_queued_ms": 0.5},
+            id="observed_input_wait",
+        ),
+        pytest.param(
             # An absent key is an unobserved phase and must not become 0.
             {"vllm_decode_ms": 12.0},
-            {"vllm_queued_ms": None, "vllm_prefill_ms": None, "vllm_decode_ms": 12.0, "vllm_num_preemptions": None},
+            {
+                "vllm_queued_ms": None,
+                "vllm_prefill_ms": None,
+                "vllm_decode_ms": 12.0,
+                "vllm_num_preemptions": None,
+                "vllm_input_wait_ms": None,
+                "vllm_ready_queued_ms": None,
+            },
             id="partly_unobserved",
         ),
     ],
@@ -2898,6 +2917,8 @@ def test_stage_pool_metrics_skip_native_phase_split_when_metrics_disabled() -> N
                 "vllm_prefill_ms": 30.0,
                 "vllm_decode_ms": 12.0,
                 "vllm_num_preemptions": 1,
+                "vllm_input_wait_ms": 2.0,
+                "vllm_ready_queued_ms": 0.5,
             }
 
     pool = StagePool(0, [FakeStageClient(stage_type="llm")], output_processor=PhaseMetricsOutputProcessor())
@@ -2915,6 +2936,7 @@ def test_stage_pool_metrics_skip_native_phase_split_when_metrics_disabled() -> N
     assert metrics.num_tokens_out == 2
     assert metrics.vllm_queued_ms is None and metrics.vllm_prefill_ms is None
     assert metrics.vllm_decode_ms is None and metrics.vllm_num_preemptions is None
+    assert metrics.vllm_input_wait_ms is None and metrics.vllm_ready_queued_ms is None
 
 
 def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
@@ -2940,6 +2962,7 @@ def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
     # A diffusion stage has no engine-core phase split.
     assert metrics.vllm_queued_ms is None and metrics.vllm_prefill_ms is None
     assert metrics.vllm_decode_ms is None and metrics.vllm_num_preemptions is None
+    assert metrics.vllm_input_wait_ms is None and metrics.vllm_ready_queued_ms is None
 
 
 @pytest.mark.asyncio
