@@ -299,6 +299,18 @@ def _is_vllm_flash_attn_varlen(attn_func: FlashAttnFn) -> bool:
     return attn_func is vllm_func
 
 
+@torch.compiler.assume_constant_result
+def _default_vllm_flash_attn_version() -> int:
+    """Resolve the device default for the compiled varlen attention path.
+
+    The default FA version is a process constant (device capability never
+    changes), so the compiled attention forward can treat it as a constant
+    instead of tracing through :func:`resolve_vllm_flash_attn_version`, whose
+    ``@cache`` wrapper Dynamo would otherwise warn about and ignore.
+    """
+    return resolve_vllm_flash_attn_version()
+
+
 def vllm_varlen_version_kwargs(attn_func: FlashAttnFn | None) -> dict[str, int]:
     """Return ``fa_version`` when calling vLLM's varlen dispatcher.
 
@@ -308,7 +320,7 @@ def vllm_varlen_version_kwargs(attn_func: FlashAttnFn | None) -> dict[str, int]:
     """
     if attn_func is None or not _is_vllm_flash_attn_varlen(attn_func):
         return {}
-    return {"fa_version": resolve_vllm_flash_attn_version()}
+    return {"fa_version": _default_vllm_flash_attn_version()}
 
 
 _FA3_MISSING = "A standalone FlashAttention-3 varlen interface (flash_attn_interface) is required"
