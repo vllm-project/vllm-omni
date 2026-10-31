@@ -38,7 +38,7 @@ def main() -> None:
     parser.add_argument("--sequence", type=positive_int, default=4095)
     parser.add_argument("--heads", type=positive_int, default=40)
     parser.add_argument("--head-dim", type=positive_int, default=128)
-    parser.add_argument("--backend", choices=["FA", "FA3"], default="FA3")
+    parser.add_argument("--backend", choices=["FA", "FA3", "FA4", "VLLM_FA"], default="FA3")
     parser.add_argument("--warmup", type=positive_int, default=5)
     parser.add_argument("--rounds", type=positive_int, default=10)
     parser.add_argument("--calls-per-round", type=positive_int, default=5)
