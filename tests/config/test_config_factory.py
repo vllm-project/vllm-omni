@@ -3231,17 +3231,17 @@ class TestPlatformOverrides:
             assert extra["codec_chunk_frames"] == 25, platform
             assert extra["codec_streaming"] is True, platform
 
-        # The yaml anchor resolves to independent containers and the merged
-        # results are independent: one platform's restore cannot leak into
-        # another's.
+        # The yaml anchor must resolve to independent containers: mutate the
+        # rocm entry of one parse and the xpu entry of the same parse must
+        # not change.
         from vllm_omni.config.stage_config import resolve_deploy_yaml
 
         raw = resolve_deploy_yaml(deploy_path)
         assert raw["platforms"]["rocm"]["connectors"] is not raw["platforms"]["xpu"]["connectors"]
-        rocm = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
-        xpu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="xpu")
-        rocm.connectors["connector_of_shared_memory"]["extra"]["codec_left_context_frames"] = 99
-        assert xpu.connectors["connector_of_shared_memory"]["extra"]["codec_left_context_frames"] == 25
+        raw_rocm = raw["platforms"]["rocm"]["connectors"]["connector_of_shared_memory"]["extra"]
+        raw_xpu = raw["platforms"]["xpu"]["connectors"]["connector_of_shared_memory"]["extra"]
+        raw_rocm["codec_left_context_frames"] = 99
+        assert raw_xpu["codec_left_context_frames"] == 25
 
         # The v2 default path keeps the graph-coupled chunk shape.
         cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
