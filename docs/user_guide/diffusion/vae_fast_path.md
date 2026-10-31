@@ -303,8 +303,10 @@ into the first 524288 output elements, while the fast path's bf16 upsample
 matches ground truth (`repeat_interleave`). The same call in isolation is
 correct, so this is a state-dependent XPU issue outside the fast path.
 
-`channels_last` decode reaches only 43.6 dB for Qwen-Image (58.7 dB for the Wan
-2.1 VAE on the same image and card; the cause is not investigated), so prefer
+`channels_last` decode reaches only 43.6 dB for Qwen-Image on this image (58.7 dB
+for the Wan 2.1 VAE on the same image and card). The figure depends on the
+image: on `tests/assets/qwen_image_edit/qwen_image_edit_2511_test1.png` the same
+benchmark and card give 60.8 dB at 1024x1024 and 61.4 dB at 1328x1328. Prefer
 `lossless` for Qwen-Image where fidelity matters. On this card `channels_last`
 gives Qwen-Image-2.1 no decode gain and a slower encode.
 
