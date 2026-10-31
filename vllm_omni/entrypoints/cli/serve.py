@@ -977,8 +977,9 @@ class OmniServeCommand(CLISubcommand):
             help="Diffusion CPU-offload config as JSON. "
             "Set mode to module or layer, list dit and/or text_encoder in "
             "components, and put layer-only tuning under layer_options. "
-            "Layer settings are weight_transfer (rank-local or allgather) and "
-            "resident_layers (DiT only).",
+            "Layer settings are weight_transfer (rank-local or allgather), "
+            "resident_layers (DiT only), and block_paths (block lists to stream "
+            "instead of the model-declared ones).",
         )
         omni_config_group.add_argument(
             "--kv-offload-config",

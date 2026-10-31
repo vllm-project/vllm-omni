@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 import torch
@@ -16,6 +16,7 @@ from .component_utils import encoder_component_type
 from .config import (
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
+    BlockPaths,
     DLOTransfer,
     OffloadStrategy,
     parse_dlo_transfer,
@@ -78,6 +79,8 @@ class OffloadConfig:
     # a frozenset is an explicit compact-API selection.
     components: frozenset[str] | None = None
     dlo_transfers: dict[str, DLOTransfer] | None = None
+    # User block-list overrides from layer_options, keyed by component type.
+    block_paths: Mapping[str, BlockPaths] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.components is not None:
@@ -95,6 +98,13 @@ class OffloadConfig:
         # Historically the generic selector covered DiT directly while model
         # plans opted auxiliary components into their lifecycle.
         return component == DIT_COMPONENT if self.components is None else component in self.components
+
+    def block_paths_for(self, component: str, path: str) -> tuple[str, ...] | None:
+        """Return the user's block lists for one discovered component path."""
+        paths = self.block_paths.get(component)
+        if paths is None or isinstance(paths, tuple):
+            return paths
+        return paths.get(path)
 
     def transfer_for(self, component: str) -> DLOTransfer:
         if self.dlo_transfers is None:
@@ -219,6 +229,7 @@ class OffloadConfig:
             dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
             components=components,
             dlo_transfers=dlo_transfers,
+            block_paths=dict(resolved.block_paths),
         )
 
 
