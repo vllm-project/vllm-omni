@@ -44,6 +44,7 @@ import torch
 import torch.distributed
 
 from tests.helpers.mark import hardware_marks, hardware_test
+from vllm_omni.diffusion import forward_context
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata, QueryRange
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
@@ -55,15 +56,21 @@ from vllm_omni.diffusion.attention.parallel.ulysses_allgather import (
 )
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
     DiffusionParallelConfig,
     OmniDiffusionConfig,
 )
+from vllm_omni.diffusion.distributed import parallel_state
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, SequenceParallelInput
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -1547,3 +1554,41 @@ def test_packed_allgather_matches_unsplit_flash_varlen():
 
         assert sp_output.shape == baseline.shape
         torch.testing.assert_close(sp_output, baseline, atol=5e-2, rtol=5e-2)
+
+
+# Auto-pad probes only the baseline backend at pad time. Startup validation checks the
+# schedule profiles, and only when the model masks SP padding.
+
+
+def _auto_pad_hook():
+    metadata = {"hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True)}
+    return SequenceParallelSplitHook(metadata, SequenceParallelConfig(ulysses_degree=2))
+
+
+def _patch_sp_env(monkeypatch, *, od_config, world_size=2, rank=0):
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: world_size)
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: rank)
+    monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+    ctx = forward_context.ForwardContext(omni_diffusion_config=od_config)
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: ctx)
+    return ctx
+
+
+@pytest.mark.cpu
+def test_auto_pad_accepts_mask_free_schedule_profile(monkeypatch):
+    # The real selector resolves the baseline; only the SP world and forward context are patched.
+    schedule = AttentionScheduleConfig(
+        profiles={"mask_free": AttentionConfig(default=AttentionSpec(backend="TRTLLM_ATTN"))},
+        default=[{"start": 0, "end": None, "profile": "mask_free"}],
+    )
+    od_config = OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="CUDNN_ATTN")),
+        diffusion_attention_schedule=schedule,
+    )
+    ctx = _patch_sp_env(monkeypatch, od_config=od_config)
+
+    shard = _auto_pad_hook()._shard_with_auto_pad(torch.zeros((1, 5, 4)), 1, None)
+
+    assert shard.shape == (1, 3, 4)
+    assert ctx.sp_padding_size == 1
