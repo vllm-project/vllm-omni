@@ -1034,6 +1034,25 @@ def _ingest_errors_from_errors_section(
         error_excerpts[key] = body_text
 
 
+# Cheap necessary-condition gate for "<node> FAILED [N%]" / "<node> ERROR [N%]"
+# summary lines. The full patterns in parse_pytest_log (e.g.
+# ^(.+::.+)\s+FAILED...) backtrack catastrophically on long "::"-containing
+# lines that do NOT end with the status token (py-spy: 90+ min of 92% CPU on
+# a single re.match), so they must only run on lines whose stripped form
+# plausibly ends with "<STATUS>" or "<STATUS> [N%]".
+_STATUS_PCT_TAIL_RES: dict = {}
+
+
+def _ends_with_status(s: str, status: str) -> bool:
+    if s.endswith(status):
+        return True
+    pat = _STATUS_PCT_TAIL_RES.get(status)
+    if pat is None:
+        pat = re.compile(re.escape(status) + r"\s+\[\d+%\]$")
+        _STATUS_PCT_TAIL_RES[status] = pat
+    return pat.search(s) is not None
+
+
 def parse_pytest_log(text: str) -> dict[str, Any]:
     """
     Parse pytest-flavored log text.
@@ -1073,35 +1092,38 @@ def parse_pytest_log(text: str) -> dict[str, Any]:
             _upsert_error(node, inline, lines, i, error_reasons, error_excerpts, order_err)
             continue
         s = line.strip()
-        prog_fail = re.match(r"^(.+::.+)\s+FAILED(?:\s+\[\d+%\])?\s*$", s)
-        if prog_fail:
-            node_pf = prog_fail.group(1).strip()
-            if _is_pytest_test_node_id(node_pf):
-                _upsert_failure(node_pf, "", lines, i, failed_reasons, failure_excerpts, order_fail)
+        if _ends_with_status(s, "FAILED"):
+            prog_fail = re.match(r"^(.+::.+)\s+FAILED(?:\s+\[\d+%\])?\s*$", s)
+            if prog_fail:
+                node_pf = prog_fail.group(1).strip()
+                if _is_pytest_test_node_id(node_pf):
+                    _upsert_failure(node_pf, "", lines, i, failed_reasons, failure_excerpts, order_fail)
+                    continue
+            pf_suf = re.search(
+                r"([\w/\.\-]+\.py(?:::[^\s\[]+(?:\[[^\]]+\])?)+)\s+FAILED(?:\s+\[\d+%\])?\s*$",
+                s,
+            )
+            if pf_suf:
+                node = pf_suf.group(1).strip()
+                if _is_pytest_test_node_id(node):
+                    _upsert_failure(node, "", lines, i, failed_reasons, failure_excerpts, order_fail)
                 continue
-        pf_suf = re.search(
-            r"([\w/\.\-]+\.py(?:::[^\s\[]+(?:\[[^\]]+\])?)+)\s+FAILED(?:\s+\[\d+%\])?\s*$",
-            s,
-        )
-        if pf_suf:
-            node = pf_suf.group(1).strip()
-            if _is_pytest_test_node_id(node):
-                _upsert_failure(node, "", lines, i, failed_reasons, failure_excerpts, order_fail)
-            continue
-        prog_err = re.match(r"^(.+::.+)\s+ERROR(?:\s+\[\d+%\])?\s*$", s)
-        if prog_err:
-            node_pe = prog_err.group(1).strip()
-            if _is_pytest_test_node_id(node_pe):
-                _upsert_error(node_pe, "", lines, i, error_reasons, error_excerpts, order_err)
+        if _ends_with_status(s, "ERROR"):
+            prog_err = re.match(r"^(.+::.+)\s+ERROR(?:\s+\[\d+%\])?\s*$", s)
+            if prog_err:
+                node_pe = prog_err.group(1).strip()
+                if _is_pytest_test_node_id(node_pe):
+                    _upsert_error(node_pe, "", lines, i, error_reasons, error_excerpts, order_err)
+                    continue
+            pe_suf = re.search(
+                r"([\w/\.\-]+\.py(?:::[^\s\[]+(?:\[[^\]]+\])?)+)\s+ERROR(?:\s+\[\d+%\])?\s*$",
+                s,
+            )
+            if pe_suf:
+                node = pe_suf.group(1).strip()
+                if _is_pytest_test_node_id(node):
+                    _upsert_error(node, "", lines, i, error_reasons, error_excerpts, order_err)
                 continue
-        pe_suf = re.search(
-            r"([\w/\.\-]+\.py(?:::[^\s\[]+(?:\[[^\]]+\])?)+)\s+ERROR(?:\s+\[\d+%\])?\s*$",
-            s,
-        )
-        if pe_suf:
-            node = pe_suf.group(1).strip()
-            if _is_pytest_test_node_id(node):
-                _upsert_error(node, "", lines, i, error_reasons, error_excerpts, order_err)
 
     _ingest_short_summary_extra(
         lines,
