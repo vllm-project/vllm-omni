@@ -9,6 +9,7 @@ from PIL import Image
 
 QWEN_IMAGE_21_EXTRA_BODY_PARAMS = frozenset(
     {
+        "attn_path",
         "sigmas",
     }
 )

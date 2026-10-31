@@ -1505,6 +1505,70 @@ def test_npu_piecewise_matches_block_causal_reference(monkeypatch, causal):
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("path", ["piecewise", "mask", "flex"])
+def test_npu_flex_is_explicit_and_preserves_fa_paths(monkeypatch, npu_contract, path):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    impl, query, dense, packed = npu_contract
+    calls = []
+
+    def run_piecewise(q, k, v, metadata):
+        calls.append("piecewise")
+        return q
+
+    def run_flex(q, k, v, metadata, scale):
+        calls.append("flex")
+        assert metadata.extra["npu_flex_attention"] is True
+        assert scale == impl.softmax_scale
+        return q
+
+    monkeypatch.setattr(impl, "_forward_piecewise_npu", run_piecewise)
+    monkeypatch.setattr(npu_flex_attention, "try_npu_flex_attention", run_flex)
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones(1, 1, 8, 8, dtype=torch.bool) if path == "mask" else None,
+        full_attn_spans=None if path == "mask" else [[(3, 5)]],
+        extra={"npu_flex_attention": True} if path == "flex" else {},
+    )
+    impl.forward_npu(query, query, query, metadata)
+    assert calls == ([] if path == "mask" else [path])
+    assert dense.call_count == (1 if path == "mask" else 0)
+    packed.assert_not_called()
+    if path == "mask":
+        torch.testing.assert_close(dense.call_args.kwargs["attn_mask"], metadata.attn_mask)
+
+
+@pytest.mark.cpu
+def test_npu_flex_reports_its_execution_path(npu_contract):
+    impl, query, _, _ = npu_contract
+    metadata = AttentionMetadata(full_attn_spans=[[(3, 5)]], extra={"npu_flex_attention": True})
+    context = ExecutionContext(platform="npu")
+    result = impl.resolve_execution_path(context, query, query, query, metadata)
+    assert result.path == "npu_flex"
+    assert result.kernel_variant == "flex_attention"
+    assert result.support.status is SupportStatus.UNMIGRATED
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("unsupported", [True, False])
+def test_npu_flex_never_silently_falls_back(monkeypatch, npu_contract, unsupported):
+    from vllm_omni.diffusion.attention.backends.utils import npu_flex_attention
+
+    impl, query, dense, packed = npu_contract
+
+    def decline_or_fail(*args):
+        if unsupported:
+            return None
+        raise RuntimeError("Flex compilation failed")
+
+    monkeypatch.setattr(npu_flex_attention, "try_npu_flex_attention", decline_or_fail)
+    metadata = AttentionMetadata(full_attn_spans=[[(3, 5)]], extra={"npu_flex_attention": True})
+    with pytest.raises(ValueError if unsupported else RuntimeError, match="NPU FlexAttention|Flex compilation failed"):
+        impl.forward_npu(query, query, query, metadata)
+    dense.assert_not_called()
+    packed.assert_not_called()
+
+
 if __name__ == "__main__":
     print("Running FlashAttention Padding Tests...")
     print("=" * 60)

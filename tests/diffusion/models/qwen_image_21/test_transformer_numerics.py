@@ -13,6 +13,132 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @pytest.mark.parametrize(
+    "device,attention_device",
+    [
+        pytest.param("cpu", "cpu", marks=pytest.mark.cpu),
+        pytest.param("cpu", "npu", marks=pytest.mark.cpu),
+        pytest.param("cuda", "cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ],
+)
+@pytest.mark.parametrize("attn_path", [None, "auto", "piecewise", "mask", "flex"])
+def test_prefill_attention_metadata(monkeypatch, device, attention_device, attn_path):
+    seen = []
+
+    class CaptureBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = SimpleNamespace(
+                attn=SimpleNamespace(
+                    attn_backend=SimpleNamespace(supports_piecewise_spans=True, get_name=lambda: "FLASH_ATTN")
+                )
+            )
+
+        def forward(self, hidden_states, attn_metadata, **kwargs):
+            seen.append(attn_metadata)
+            return hidden_states
+
+    class SequencePrepare:
+        def __call__(self, hidden_states, text, layout, img_mask, is_decode):
+            return text, hidden_states, text.new_zeros(2, 1), hidden_states.new_zeros(2, 1)
+
+        @staticmethod
+        def expand_image_pad_mask(mask):
+            return mask
+
+    # Exercise the real model forward and metadata selection without weights.
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.parallel_config = None
+    model.causal_block = True
+    model.causal_condition = False
+    model.txt_in = torch.nn.Identity()
+    model.sequence_prepare = SequencePrepare()
+    model.time_text_embed = lambda timestep, hidden_states: timestep
+    model.modulation = torch.nn.Identity()
+    model.transformer_blocks = torch.nn.ModuleList([CaptureBlock()])
+    model.norm_out = lambda hidden_states, *args: hidden_states
+    model.proj_out = torch.nn.Identity()
+
+    if attention_device == "npu":
+        # Exercise NPU routing with CPU tensors and no model weights.
+        resolve_attn_path = model._resolve_attn_path
+        monkeypatch.setattr(
+            model,
+            "_resolve_attn_path",
+            lambda hint, padding, sp_padding, device_type: resolve_attn_path(hint, padding, sp_padding, "npu"),
+        )
+
+    hidden = torch.ones(1, 2, 4, device=device)
+    text = torch.zeros_like(hidden)
+    inputs = dict(
+        hidden_states=hidden,
+        encoder_hidden_states=text,
+        timestep=hidden.new_zeros(1),
+        img_shapes=[[(1, 1, 2)]],
+        img_mask=torch.tensor([[False, False, True, True]], device=device),
+        attention_kwargs=None if attn_path is None else {"attn_path": attn_path},
+        return_dict=False,
+    )
+    if attn_path == "flex" and attention_device != "npu":
+        with pytest.raises(ValueError, match="unpadded NPU prefill"):
+            model(**inputs)
+        return
+    output = model(**inputs)[0]
+    assert len(seen) == 1
+
+    for metadata in seen:
+        if attn_path == "mask":
+            assert metadata.full_attn_spans is None
+            expected = torch.tensor(
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [True, True, True, True],
+                    [True, True, True, True],
+                ],
+                device=device,
+            )[None, None]
+            torch.testing.assert_close(metadata.attn_mask, expected)
+        else:
+            assert metadata.full_attn_spans == [[(2, 4)]]
+            assert metadata.attn_mask is None
+        if attn_path == "flex":
+            assert metadata.extra == {"npu_flex_attention": True, "_qwen_image21_flex_cache": {}}
+        else:
+            assert metadata.extra == {}
+    torch.testing.assert_close(output, torch.cat([text, hidden], dim=1), rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "hint,padding,sp_padding,supports_spans,backend_name,expected",
+    [
+        ("auto", False, False, True, "FLASH_ATTN", "piecewise"),
+        ("auto", True, False, True, "FLASH_ATTN", "mask"),
+        ("auto", False, True, True, "FLASH_ATTN", "mask"),
+        ("auto", False, False, False, "SDPA", "mask"),
+        ("mask", False, False, True, "FLASH_ATTN", "mask"),
+        ("flex", False, False, True, "FLASH_ATTN", "flex"),
+        ("flex", True, False, True, "FLASH_ATTN", None),
+        ("flex", False, True, True, "FLASH_ATTN", None),
+        ("flex", False, False, True, "SDPA", None),
+        ("invalid", False, False, True, "FLASH_ATTN", None),
+    ],
+)
+def test_npu_prefill_path_contract(hint, padding, sp_padding, supports_spans, backend_name, expected):
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.causal_block = True
+    backend = SimpleNamespace(supports_piecewise_spans=supports_spans, get_name=lambda: backend_name)
+    model.transformer_blocks = [SimpleNamespace(attn=SimpleNamespace(attn=SimpleNamespace(attn_backend=backend)))]
+    if expected is None:
+        with pytest.raises(ValueError):
+            model._resolve_attn_path(hint, padding, sp_padding, "npu")
+    else:
+        assert model._resolve_attn_path(hint, padding, sp_padding, "npu") == expected
+
+
+@pytest.mark.parametrize(
     "device",
     [
         pytest.param("cpu", marks=pytest.mark.cpu),

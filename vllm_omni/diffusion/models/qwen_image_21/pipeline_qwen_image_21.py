@@ -1171,7 +1171,14 @@ class QwenImage21Pipeline(
             for entry in per_request_images
         ]
         homogeneous = all(sig == signatures[0] for sig in signatures)
-        attention_kwargs = {"attn_path": "auto" if homogeneous else "mask"}
+        attn_path = (common_sampling_params.extra_args or {}).get("attn_path", "auto")
+        if any((params.extra_args or {}).get("attn_path", "auto") != attn_path for params in sampling_params_list):
+            raise ValueError("All requests in a batch must use the same attn_path.")
+        if not homogeneous:
+            if attn_path not in ("auto", "mask"):
+                raise ValueError("Heterogeneous Qwen-Image 2.1 batches require attn_path='auto' or 'mask'.")
+            attn_path = "mask"
+        attention_kwargs = {"attn_path": attn_path}
 
         ctx = self._prepare_generation_context(
             prompt=prompt,
@@ -1246,7 +1253,8 @@ class QwenImage21Pipeline(
             true_cfg_scale=sampling.true_cfg_scale if sampling.true_cfg_scale is not None else 1.0,
             max_sequence_length=sampling.max_sequence_length or self._max_length,
             per_request_images=per_request_images,
-            attention_kwargs=kwargs.get("attention_kwargs"),
+            attention_kwargs=kwargs.get("attention_kwargs")
+            or {"attn_path": (sampling.extra_args or {}).get("attn_path", "auto")},
         )
 
         # prepare_timesteps() has already materialized request-specific timestep

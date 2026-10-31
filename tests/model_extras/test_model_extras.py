@@ -506,8 +506,8 @@ def test_bagel_image_to_image_prompt_builder() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_qwen_image_21_extra_registry_declares_sigmas() -> None:
-    assert get_extra_body_params("QwenImage21Pipeline") == frozenset({"sigmas"})
+def test_qwen_image_21_extra_registry_declares_sampling_and_attention_options() -> None:
+    assert get_extra_body_params("QwenImage21Pipeline") == frozenset({"sigmas", "attn_path"})
     assert get_extra_output_params("QwenImage21Pipeline") == frozenset()
     assert should_init_extra_args_for_non_diffusion_stages("QwenImage21Pipeline") is False
 
