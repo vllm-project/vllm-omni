@@ -15,6 +15,7 @@ import pytest
 import torch
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
+import vllm_omni.diffusion.ipc as diffusion_ipc
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import (
@@ -240,6 +241,83 @@ def test_numpy_object_array_stays_inline() -> None:
     assert packed is values
 
 
+@pytest.mark.parametrize("writeable", [True, False])
+def test_nested_non_native_endian_numpy_round_trips_through_shm(writeable: bool) -> None:
+    dtype = np.dtype(np.float32).newbyteorder("S")
+    values = np.arange(300_000, dtype=dtype).reshape(600, 500)
+    values.flags.writeable = writeable
+    output = DiffusionOutput(output={"nested": [values]})
+    created = []
+
+    try:
+        pack_diffusion_output_shm(output)
+        handle = output.output["nested"][0]
+        created.append(handle)
+        assert handle["__ndarray_shm__"] is True
+        assert handle["numpy_dtype"] == str(dtype)
+
+        unpack_diffusion_output_shm(output)
+        restored = output.output["nested"][0]
+        assert restored.dtype == dtype
+        assert restored.shape == values.shape
+        np.testing.assert_array_equal(restored, values)
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=handle["name"])
+    finally:
+        diffusion_ipc._unlink_shm_handles(created)
+
+
+@pytest.mark.parametrize("copy_backend", ["torch", "numpy"])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_numpy_packing_failure_unlinks_all_allocations(
+    monkeypatch: pytest.MonkeyPatch, copy_backend: str, error_type: type[BaseException]
+) -> None:
+    first = np.arange(300_000, dtype=np.float32)
+    second = first.copy()
+    second.flags.writeable = copy_backend == "torch"
+    payload = {"nested": [first, second]}
+    output = DiffusionOutput(output=payload)
+    segments = []
+    real_new_shm_array = diffusion_ipc._new_shm_array
+
+    def track_allocation(shape, dtype):
+        shm, array, handle = real_new_shm_array(shape, dtype)
+        segments.append(shm)
+        return shm, array, handle
+
+    error = error_type("injected packing failure")
+
+    def fail_second_copy(*args, **kwargs):
+        if len(segments) == 2:
+            raise error
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(diffusion_ipc, "_new_shm_array", track_allocation)
+    if copy_backend == "torch":
+        real_copy = torch.Tensor.copy_
+        monkeypatch.setattr(torch.Tensor, "copy_", fail_second_copy)
+    else:
+        real_copy = np.copyto
+        monkeypatch.setattr(np, "copyto", fail_second_copy)
+
+    try:
+        with pytest.raises(error_type, match="injected packing failure") as raised:
+            pack_diffusion_output_shm(output)
+
+        assert raised.value is error
+        assert output.output is payload
+        assert len(segments) == 2
+        for segment in segments:
+            assert segment.buf is None
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=segment.name)
+    finally:
+        for segment in segments:
+            segment.close()
+            with contextlib.suppress(FileNotFoundError):
+                segment.unlink()
+
+
 def test_rpc_result_envelope_diffusion_output_round_trips_through_shm() -> None:
     tensor = torch.arange(300_000, dtype=torch.float32)
     envelope = {
@@ -430,12 +508,12 @@ def test_pack_value_preserves_dtype_shape_and_values_for_bfloat16() -> None:
         assert packed["__tensor_shm__"] is True
         assert packed["shape"] == list(tensor.shape)
         assert packed["torch_dtype"] == "torch.bfloat16"
-        assert packed["numpy_dtype"] == "float32"
+        assert packed["numpy_dtype"] == "uint16"
 
         unpacked = _unpack_if_shm_handle(packed)
         assert isinstance(unpacked, torch.Tensor)
         assert unpacked.dtype == torch.bfloat16
-        torch.testing.assert_close(unpacked, tensor)
+        assert torch.equal(unpacked.view(torch.uint16), tensor.view(torch.uint16))
     finally:
         _cleanup_shm_handle(packed)
 

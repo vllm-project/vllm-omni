@@ -12,7 +12,6 @@ serialised through the queue.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import suppress
 from typing import Any, TypeGuard
 
 import numpy as np
@@ -54,8 +53,12 @@ class _SharedMemoryLease:
         self.__array_interface__ = array.__array_interface__
 
     def __del__(self) -> None:
-        with suppress(BufferError):
+        # No contextlib.suppress: module globals may already be gone when a
+        # borrowed tensor is collected during interpreter shutdown.
+        try:
             self.shm.close()
+        except BufferError:
+            pass
 
 
 def _new_shm_array(shape: tuple[int, ...], dtype: np.dtype) -> tuple[Any, np.ndarray, dict[str, Any]]:
@@ -79,10 +82,30 @@ def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
         raise TypeError("NumPy object arrays cannot be transferred through raw shared memory")
 
     array = np.ascontiguousarray(array)
+    try:
+        # Torch rejects non-native byte order and some NumPy dtypes, and warns
+        # on read-only arrays. Keep those on the dtype-preserving NumPy path.
+        source = torch.from_numpy(array) if array.flags.writeable and array.dtype.isnative else None
+    except TypeError:
+        source = None
     shm, shm_array, handle = _new_shm_array(array.shape, array.dtype)
-    np.copyto(shm_array, array)
-    del shm_array
-    shm.close()
+    destination = None
+    try:
+        try:
+            if source is None:
+                np.copyto(shm_array, array)
+            else:
+                # Torch copies (and faults in the fresh SHM pages) on all
+                # intra-op threads; np.copyto does both on a single thread.
+                destination = torch.from_numpy(shm_array)
+                destination.copy_(source)
+        finally:
+            del destination, shm_array
+            shm.close()
+    except BaseException:
+        # The caller cannot track this segment until we return its handle.
+        shm.unlink()
+        raise
     return handle
 
 
@@ -233,8 +256,9 @@ def _tensor_to_shm(
         if created is not None:
             created.append(handle)
         return handle
-    if d2h_stream is not None:
-        # Non-blocking D2H: copy on side stream to pinned CPU memory.
+    if d2h_stream is not None and tensor.device.type != "cpu":
+        # Non-blocking D2H: copy on side stream to pinned CPU memory. Host
+        # tensors skip this staging copy; they are copied into SHM directly.
         old_stream = torch.accelerator.current_stream()
         torch.accelerator.set_stream(d2h_stream)
         try:
@@ -245,20 +269,21 @@ def _tensor_to_shm(
             torch.accelerator.set_stream(old_stream)
         d2h_stream.synchronize()
         tensor = cpu
-        # numpy has no bfloat16, so widen on the host after D2H. Never widen on
-        # the accelerator before the copy: a payload that already fell back after
-        # an fp32 OOM would OOM again on a second device-side fp32 allocation.
-        if original_dtype == torch.bfloat16:
-            tensor = tensor.to(torch.float32)
     else:
         tensor = tensor.detach().cpu().contiguous()
-        if original_dtype == torch.bfloat16:
-            tensor = tensor.to(torch.float32)
+    # NumPy has no bfloat16: transfer the original bits as uint16 and view them
+    # back on unpack, instead of widening to (and narrowing from) fp32 on the host.
+    bf16_view = original_dtype == torch.bfloat16
+    if bf16_view:
+        tensor = tensor.view(torch.uint16)
     handle = _array_to_shm(tensor.numpy())
     handle.update(
         {
+            # The receiver adopts the segment instead of copying it again.
+            "borrow_on_unpack": True,
             "__tensor_shm__": True,
             "torch_dtype": str(original_dtype),
+            "torch_dtype_view": bf16_view,
         }
     )
     if created is not None:
