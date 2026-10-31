@@ -3289,6 +3289,13 @@ class TestPlatformOverrides:
         with pytest.raises(ValueError, match="model_runner: v1"):
             merge_pipeline_deploy(pipeline, deploy)
 
+        # 0 looks neutral but still requests a logprob; keep it rejected so
+        # startup matches add_request.
+        deploy = load_deploy_config(deploy_path)
+        deploy.stages[0].default_sampling_params["logprobs"] = 0
+        with pytest.raises(ValueError, match="model_runner: v1"):
+            merge_pipeline_deploy(pipeline, deploy)
+
         # The same penalties are legal on the v1 opt-out path.
         deploy_v1 = _apply_platform_overrides(load_deploy_config(deploy_path), platform="rocm")
         deploy_v1.stages[0].default_sampling_params["repetition_penalty"] = 1.1
