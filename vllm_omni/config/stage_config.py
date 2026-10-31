@@ -1184,11 +1184,9 @@ _MRV2_UNSUPPORTED_PLATFORMS: dict[str, str] = {}
 
 # Engine-default (neutral) values for sampling params a v2 stage may list as
 # unsupported: a default equal to the engine default is a no-op and passes.
-# Unlisted keys have no scalar neutral; for them an empty value (None, [], {})
-# passes as well. logprobs/prompt_logprobs stay unlisted on purpose: 0 is not
-# neutral there (it still requests the sampled token's logprob under the
-# completions-API semantics vLLM implements), and the model state rejects any
-# explicit value per request, so startup validation matches the request path.
+# Unlisted keys have no scalar neutral; an empty value (None, [], {}) passes.
+# logprobs/prompt_logprobs stay unlisted: 0 still requests the sampled
+# token's logprob, and the request path rejects any explicit value.
 _MRV2_NEUTRAL_SAMPLING_VALUES: dict[str, Any] = {
     "frequency_penalty": 0.0,
     "presence_penalty": 0.0,
