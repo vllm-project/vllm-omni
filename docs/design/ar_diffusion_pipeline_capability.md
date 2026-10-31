@@ -59,6 +59,27 @@ load if `step_execution=True`. Capable pipelines bind KV around each
 `execute_stepwise` invocation instead of inheriting the generic runner entry
 point unwrapped.
 
+### Request-level execution seam
+
+Ordinary request-mode diffusion and the cell path already enter the model through
+the same seam: `execute_model()` → `_execute_request_list()` →
+`pipeline.forward(batch)`. What differs is only what runs inside `forward` and how
+its KV is released, so unifying the cell path does not require exposing individual
+cells to the outer scheduler. A cell remains internal to AR-DiT execution, and
+`Request` / `Batch` stay the execution granularity of the runner.
+
+`Session` is not a runner execution granularity. It is the longer-lived container
+that creates, associates and terminates requests, comparable to the duplex
+serving model, and it does not participate in each model invocation. Session
+integration therefore means lifecycle linkage only: a session ending must not
+silently discard state another live request still needs, and a request ending
+must not tear down session-scoped state. Reusing KV across requests is a separate
+capability and is not implied by this contract.
+
+Failure cleanup for the cell path is request-scoped
+(`_release_cell_requests()`); the pool-wide `reset_all()` is reserved for cache
+teardown. See [Noisy KV](feature/noisy_kv.md) for the KV lifecycle contract.
+
 The implementation may retain multiple sessions per model instance. It selects
 the largest feasible capacity up to the pipeline's `session_capacity`, based on
 self-attention pages, cross-attention allocations, scratch, and declared

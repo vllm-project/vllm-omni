@@ -37,6 +37,8 @@ from vllm_omni.platforms import current_omni_platform
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import MultipleOf
 
+    from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext
+
 logger = init_logger(__name__)
 
 
@@ -491,6 +493,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             kv=NoisyKVState(self.noisy_kv_cache),
         )
 
+    @staticmethod
+    def _release_cell_requests(ctx: ARDiffusionCellContext) -> None:
+        """Release only the requests this cell context owns.
+
+        ``reset_all()`` also drops versions owned by other requests that share
+        the pool, so a request-scoped cell failure must not use it.
+        """
+        for req in {item.req for item in ctx.inflight} | {item.req for item in ctx.pending}:
+            ctx.drop(req)
+
     def execute_model(
         self,
         req: OmniDiffusionRequest,
@@ -506,8 +518,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                         req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
                     )
             except Exception:
-                ctx.kv.reset_all()
-                logger.warning("AR-Diffusion chunk forward failed; NoisyKV versions were released fail-closed")
+                self._release_cell_requests(ctx)
+                logger.warning("AR-Diffusion chunk forward failed; the request's NoisyKV versions were released")
                 raise
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output
@@ -545,8 +557,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     return super().execute_model_batch(scheduler_output, od_config)
             except Exception:
-                ctx.kv.reset_all()
-                logger.warning("AR-Diffusion chunk batch failed; NoisyKV versions were released fail-closed")
+                self._release_cell_requests(ctx)
+                logger.warning("AR-Diffusion chunk batch failed; the request's NoisyKV versions were released")
                 raise
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."

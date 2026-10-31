@@ -177,6 +177,12 @@ consumer of the same version is forbidden.
 exception does not leak `VersionPool` slots. Rank topology is described by
 `CellTopology` / `CellRunSpec` inside `ARDiffusionCellContext`.
 
+Failure cleanup is **request-scoped**: a failed cell releases only the requests
+that execution context owns (`ARDiffusionModelRunner._release_cell_requests()`),
+not the whole pool. `NoisyKVState.reset_all()` remains reserved for tearing down
+the cache itself, because it also drops versions belonging to requests that were
+never part of the failing execution.
+
 ## NoisyKV
 
 Implemented in `experimental/ar_diffusion/kv_cache/noisy.py`.
@@ -187,6 +193,22 @@ Implemented in `experimental/ar_diffusion/kv_cache/noisy.py`.
 | Storage | Per-layer `VersionPool` from `ARDiffusionNoisyKVSpec` |
 | Transport | Planned PP-group P2P; post on cell complete |
 | Eviction | `last_use` per cell; no in-place overwrite of live sends |
+
+### Lifecycle contract
+
+The paged session KV and the cell-scoped `VersionPool` keep their own storage and
+version semantics. A shared execution flow needs one contract from either
+implementation, expressed on the operations rather than on the data layout:
+
+| Question | Contract |
+| --- | --- |
+| Ownership | Versions belong to the request that produced them; the runner owns the pools. A session may outlive requests but never owns cell versions. |
+| Identity | `(request_id, chunk, step, block)` for a cell version; paged sessions keep their own branch/adapter identity. |
+| Validity | A version is consumable only after its producing cell completed on an earlier tick and, when remote, after `await_ready`. |
+| Completion | A returned `forward` is not proof that K/V writes and transfers are visible; that boundary belongs to the transport completion contract (#9368). |
+| Dependency | `CellPlan.sources` / `transfers` / `last_use` decide who still reads a version. |
+| Reclamation | `evict` releases a version only after its last planned use and after any send referencing it completed. |
+| Failure | Cancellation and exceptions release exactly the failed request's versions, leaving unrelated resident requests intact. |
 
 Per-tick KV traffic ≈ history depth × one block × tokens × heads × dim per
 remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`.
