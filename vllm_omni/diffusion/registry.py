@@ -575,8 +575,10 @@ def initialize_model(
 
 
 def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
-    """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
+    """Install independent Wan-family VAE encoder/decoder fast paths on pipeline VAEs.
 
+    Applies to every VAE whose implementation is registered in
+    ``wan_vae_fastpath.families`` (diffusers Wan, Qwen-Image, Qwen-Image-2.1).
     Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
     ``lossless`` / ``channels_last``). Only CUDA and XPU are supported; other
     platforms keep the reference implementation. Failures never abort model loading.
@@ -589,9 +591,8 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
         logger.debug("Wan VAE fast path is only supported on CUDA and XPU; skipping")
         return
 
-    from diffusers.models.autoencoders import AutoencoderKLWan
-
     from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
+        find_family,
         install_wan_vae_encoder_fastpath,
         install_wan_vae_fastpath,
     )
@@ -607,7 +608,8 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
         candidates = [("vae", model.vae)]
 
     for name, vae in candidates:
-        if not isinstance(vae, AutoencoderKLWan):
+        family = find_family(vae)
+        if family is None:
             continue
         for component, component_level, install in (
             ("decoder", level, install_wan_vae_fastpath),
@@ -627,7 +629,9 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
                 )
                 continue
             if report.installed:
-                logger.info("Wan VAE %s fast path (%s) active on %s", component, component_level, name)
+                logger.info(
+                    "Wan VAE %s fast path (%s) active on %s (%s family)", component, component_level, name, family.name
+                )
 
 
 def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -> None:

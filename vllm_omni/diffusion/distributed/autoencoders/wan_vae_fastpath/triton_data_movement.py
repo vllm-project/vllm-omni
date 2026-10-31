@@ -546,7 +546,7 @@ def cat_pad_5d(
     the same dense layout that the reference ``cat``/``pad`` path selects, or
     ``channels_last_3d`` when ``channels_last_output`` is set (a fused transpose
     for channels-first ``x``; the cache refresh still follows ``x``'s layout).
-    With ``keep_cache_frames > 0`` the last frames of the assembled input
+    With ``keep_cache_frames > 0`` the last non-padding frames of the assembled input
     (without spatial padding) are also written to a second tensor that
     replaces the reference ``x[:, :, -CACHE_T:].clone()`` cache refresh.
     ``cache_x`` may use either layout. Unsupported inputs return ``None`` so
@@ -590,7 +590,8 @@ def cat_pad_5d(
     out_frames = pad_front + frames
     out_height = height + 2 * pad_height_top
     out_width = width + 2 * pad_width_left
-    keep_frames = min(keep_cache_frames, out_frames)
+    # Never keep the zero front frames (as upstream caches ``x[:, :, -CACHE_T:]``): the next call pads them again.
+    keep_frames = min(keep_cache_frames, cache_frames + frames)
     out = torch.empty(
         (batch, channels, out_frames, out_height, out_width),
         device=x.device,
@@ -713,8 +714,8 @@ def cat_time_5d(
     """Assemble ``[zeros(pad_front - Tc) | cache | x]`` along time, without spatial padding.
 
     Returns the assembled tensor (in the memory format upstream's ``torch.cat``
-    would allocate) and, with ``keep_cache_frames > 0``, its last frames as the
-    next feature-cache entry.
+    would allocate) and, with ``keep_cache_frames > 0``, its last cache/``x`` frames as
+    the next feature-cache entry.
     Because only whole aligned planes move, this runs at memory bandwidth in
     both layouts; the spatial zero padding is left to the convolution
     (``padding=(0, ph, pw)``), whose bitwise agreement with a pre-padded input
@@ -755,7 +756,8 @@ def cat_time_5d(
 
     batch, channels, frames, height, width = x.shape
     out_frames = pad_front + frames
-    keep_frames = min(keep_cache_frames, out_frames)
+    # Never keep the zero front frames (as upstream caches ``x[:, :, -CACHE_T:]``): the next call pads them again.
+    keep_frames = min(keep_cache_frames, cache_frames + frames)
     memory_format = torch.channels_last_3d if channels_last else torch.contiguous_format
     out = torch.empty(
         (batch, channels, out_frames, height, width), device=x.device, dtype=x.dtype, memory_format=memory_format
