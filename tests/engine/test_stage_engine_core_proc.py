@@ -146,6 +146,22 @@ def test_handshake_wait_is_extended_but_never_shortened(monkeypatch, timeout_s, 
     assert engine_core_module.HANDSHAKE_TIMEOUT_MINS == expected_minutes
 
 
+@pytest.mark.parametrize("opt_in,expected", [(True, True), (False, False)])
+def test_first_audio_sink_binds_a_model_state_that_opts_in(mocker, opt_in, expected):
+    executor = UniProcExecutor.__new__(UniProcExecutor)
+    executor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1)
+    )
+    executor.driver_worker = mocker.Mock()
+    runner = executor.driver_worker.worker.model_runner
+    runner.model.first_frame_decoder = None
+    runner.model.stream_decoder = None
+    runner.model_state.accepts_first_audio_sink = opt_in
+    runner._omni_data_plane = None
+    assert _bind_first_audio_sink(executor, mocker.Mock(), mocker.Mock()) is expected
+    assert runner.model_state.set_first_audio_sink.call_count == int(expected)
+
+
 def test_platform_compat_runs_before_engine_construction(monkeypatch):
     from vllm_omni.engine import stage_engine_core_proc as module
 

@@ -179,6 +179,7 @@ def test_mixed_batch_only_publishes_unconstrained_request(mocker):
 def test_weight_loading_skips_unusable_first_decoder(mocker, backend, tp, pp, loads_decoder):
     model = torch.nn.Module()
     model.config = SimpleNamespace()
+    model.fused_codec = None
     model.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(use_v2_model_runner=True, async_chunk=True, enforce_eager=True),
         parallel_config=SimpleNamespace(

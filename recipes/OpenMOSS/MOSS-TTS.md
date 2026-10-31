@@ -428,3 +428,31 @@ python -m pytest -q tests/model_executor/models/moss_tts/test_slot_attention.py 
   tests/model_executor/models/moss_tts/test_streaming_attention.py \
   -m 'core_model and cuda' --run-level=core_model
 ```
+
+## Single-stage Local fused profile (CUDA)
+
+`moss_tts_local_fused.yaml` runs the Local talker and streaming codec in one
+process on one CUDA GPU, using the existing packed codec backend. The
+ordinary `moss_tts_local.yaml` retains its two-stage pipeline. Both profiles
+have 128 request slots and a 32 GiB talker KV cache.
+
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
+  --omni --api-server-count 4 \
+  --deploy-config vllm_omni/deploy/moss_tts_local_fused.yaml
+```
+
+The fused profile emits 1, 3, 7, then 15-frame chunks (80, 240, 560, then
+1200 ms). `additional_config.moss_fused_codec.codec_chunk_ramp_frames` sets
+the intermediate sizes; they must increase strictly between the initial and
+steady chunk sizes. An empty list skips the ramp. Early first audio counts
+as the first chunk; later chunks and terminal output follow it in order.
+The scheduler reserves codec capacity until stopped requests finish their
+last audio. KV-cache preemption fails the affected request explicitly because
+an already streamed waveform cannot be restarted.
+
+Chunk boundaries and BF16 rounding can change the waveform. Fixed request
+seeds do not guarantee identical codec tokens across dynamic serving batches;
+validate chunking changes with fixed-token decoder comparisons and end-to-end
+quality checks. Historical measurements do not establish the performance or
+quality of a rebase onto a new main.

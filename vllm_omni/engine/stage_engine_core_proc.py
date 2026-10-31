@@ -92,8 +92,10 @@ def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: An
     model_runner = getattr(worker, "model_runner", None)
     model_state = getattr(model_runner, "model_state", None)
     model = getattr(model_runner, "model", None)
-    decodes_audio = getattr(model, "first_frame_decoder", None) is not None or (
-        getattr(model, "stream_decoder", None) is not None and bool(getattr(model, "stream_first_audio", False))
+    decodes_audio = (
+        getattr(model, "first_frame_decoder", None) is not None
+        or (getattr(model, "stream_decoder", None) is not None and bool(getattr(model, "stream_first_audio", False)))
+        or getattr(model_state, "accepts_first_audio_sink", False) is True
     )
     if decodes_audio and hasattr(model_state, "set_first_audio_sink"):
         assert model_state is not None
@@ -143,6 +145,9 @@ class StageEngineCoreProc(EngineCoreProc):
         current_omni_platform.prepare_stage_engine()
         super().__init__(*args, **kwargs)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
+        bind_executor = getattr(self.scheduler, "bind_model_executor", None)
+        if callable(bind_executor):
+            bind_executor(self.model_executor)
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
 

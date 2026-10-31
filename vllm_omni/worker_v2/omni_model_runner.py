@@ -906,3 +906,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
+        # Audio of requests that already stopped generating is serviced on
+        # every step, also on steps that run no batch.
+        drain = getattr(self.model_state, "drain_detached_audio", None)
+        if callable(drain):
+            drain()
