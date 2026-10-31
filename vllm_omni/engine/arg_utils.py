@@ -746,6 +746,7 @@ class OrchestratorArgs:
     forced_aligner_device: str | None = None
 
     # === Observability ===
+    otlp_traces_endpoint: str | None = None
     log_stats: bool = False
     collect_stage_metrics: bool = True
     enable_orch_monitor: bool = False

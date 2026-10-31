@@ -413,6 +413,20 @@ async def omni_run_server_worker(
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
+        provider = getattr(getattr(engine_client, "engine", None), "tracer_provider", None)
+        if provider is not None:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+            from vllm_omni.tracing import TraceContextMiddleware
+
+            # Upstream build_app may already have cached the uninstrumented stack.
+            app.middleware_stack = None
+            FastAPIInstrumentor.instrument_app(
+                app,
+                tracer_provider=provider,
+                exclude_spans=["send", "receive"],
+                excluded_urls="health,healthz,metrics",
+            )
         app.state.api_server_count = api_server_count
 
         # OMNI: Remove upstream routes that we override with omni-specific handlers
@@ -524,6 +538,7 @@ async def omni_run_server_worker(
 
             def __init__(self, inner: ASGIApp) -> None:
                 self._inner = inner
+                self._asgi = TraceContextMiddleware(inner) if provider is not None else inner
 
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._inner, name)
@@ -533,7 +548,7 @@ async def omni_run_server_worker(
                     scope.setdefault("state", {})
                     scope["state"]["request_timestamp"] = time.time()
 
-                await self._inner(scope, receive, send)
+                await self._asgi(scope, receive, send)
 
         # Startup duplex warmup: real /v1/realtime connections wait on this
         # event. Video-required models (AURA) do this by default — one short
