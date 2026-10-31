@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
@@ -27,13 +28,17 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
+from vllm_omni.diffusion.models.hunyuan_video.quantization import prepare_hunyuan15_text_encoder_fp8
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, resolve_offload
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization import resolve_component_quant_config
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +98,7 @@ class HunyuanVideo15Pipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    _offload_plan = OffloadPlan(encoder_block_attrs={"text_encoder": ("layers",), "text_encoder_2": ("encoder.block",)})
 
     def __init__(
         self,
@@ -125,6 +131,8 @@ class HunyuanVideo15Pipeline(
             torch_dtype=dtype,
         ).to(self.device)
 
+        prepare_hunyuan15_text_encoder_fp8(self.text_encoder, od_config.quantization_config, self.device)
+
         self.tokenizer_2 = ByT5Tokenizer.from_pretrained(
             model, subfolder="tokenizer_2", local_files_only=local_files_only
         )
@@ -150,9 +158,15 @@ class HunyuanVideo15Pipeline(
             self.scheduler._shift = od_config.flow_shift
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
-        self.transformer = HunyuanVideo15Transformer3DModel(
-            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
-        )
+        # Keep an offloaded BF16 DiT on CPU when only the encoder is quantized.
+        dit_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
+        cpu_dit = resolve_offload(od_config).offloads(DIT_COMPONENT) and dit_quant_config is None
+        with torch.device("cpu") if cpu_dit else contextlib.nullcontext():
+            self.transformer = HunyuanVideo15Transformer3DModel(
+                od_config=od_config,
+                quant_config=dit_quant_config,
+                **transformer_kwargs,
+            )
 
         # Check if model uses meanflow (distilled variants)
         self.use_meanflow = getattr(od_config.tf_model_config, "use_meanflow", False)
