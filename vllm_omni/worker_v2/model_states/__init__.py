@@ -57,12 +57,22 @@ def init_omni_model_state(
 ) -> ModelState:
     """Create the appropriate ``ModelState`` for *model*.
 
-    Returns an ``OmniModelState`` when the model declares Omni lifecycle
-    capabilities, an ``OmniMambaHybridModelState`` for hybrid models of an
-    Omni stage that do not supply their own state, and an
-    ``OmniEncoderOnlyModelState`` for encoder-only pooling models of an Omni
-    stage. Otherwise delegates to the upstream v2 factory, wrapping its default
-    state for auxiliary Omni stages.
+    The first matching rule wins:
+
+    1. ``model.create_omni_model_state(vllm_config, encoder_cache, device)``.
+    2. A hybrid model of an Omni stage that defines neither
+       ``get_model_state_cls`` nor ``create_mrv2_model_state`` gets an
+       ``OmniMambaHybridModelState``.
+    3. An encoder-only model of an Omni stage (an encoder-only attention layer
+       and no cross-attention) that defines neither of those gets an
+       ``OmniEncoderOnlyModelState``.
+    4. A model with an Omni lifecycle flag (``has_preprocess``,
+       ``has_postprocess`` or ``have_multimodal_outputs``) gets
+       ``type(model).create_mrv2_model_state(...)`` if defined, else an
+       ``OmniModelState``.
+    5. The upstream v2 factory (``get_model_state_cls``, then upstream's
+       architecture dispatch). Its ``DefaultModelState`` becomes an
+       ``OmniModelState`` for an Omni stage; other upstream states are kept.
     """
     factory = getattr(model, "create_omni_model_state", None)
     if factory is not None:

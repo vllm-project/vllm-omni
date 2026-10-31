@@ -196,8 +196,9 @@ def test_mtp_dispatch_without_supported_bucket_stays_eager(mocker, capture_sizes
     assert desc == BatchExecutionDescriptor(CUDAGraphMode.NONE, num_reqs, num_reqs)
 
 
+@pytest.mark.parametrize("upstream_hook", [True, False])
 @pytest.mark.parametrize("hook_fails", [False, True])
-def test_load_model_captures_custom_sampler_warmups_without_leaking_context(monkeypatch, hook_fails):
+def test_load_model_captures_custom_sampler_warmups_without_leaking_context(monkeypatch, hook_fails, upstream_hook):
     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
     from vllm.v1.worker.gpu import model_runner as upstream_model_runner
 
@@ -207,6 +208,7 @@ def test_load_model_captures_custom_sampler_warmups_without_leaking_context(monk
     runner.jit_warmup_registry = JitWarmupRegistry(SimpleNamespace())
     runner.use_aux_hidden_state_outputs = False
     runner.model = SimpleNamespace(has_preprocess=False)
+    runner.vllm_config = runner.encoder_cache = runner.device = None
     state = object.__new__(OmniModelState)
     state.model = runner.model
     sampler_kernel = object()
@@ -224,9 +226,13 @@ def test_load_model_captures_custom_sampler_warmups_without_leaking_context(monk
     def upstream_load(self):
         # Match the target's ordering: model state and its sampler hook are
         # initialized after the model-construction registry context ends.
-        self.model_state = upstream_model_runner.init_model_state(None, self.model, None, None)
+        if upstream_hook:
+            self.model_state = self._init_model_state()
+        else:
+            self.model_state = upstream_model_runner.init_model_state(None, self.model, None, None)
         self.model_state.custom_sampler(object())
 
+    monkeypatch.setattr(omni_model_runner, "_UPSTREAM_HAS_MODEL_STATE_HOOK", upstream_hook)
     monkeypatch.setattr(GPUModelRunner, "load_model", upstream_load)
     monkeypatch.setattr(omni_model_runner, "init_omni_model_state", lambda *args: state)
     monkeypatch.setattr(runner, "_configure_cudagraph_output_contract", lambda: None)
@@ -588,6 +594,45 @@ def test_mrv2_rejects_parallel_modes_at_startup(parallel_config, match):
     runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(**parallel_config))
     with pytest.raises(NotImplementedError, match=match):
         runner._validate_parallel_support()
+
+
+@pytest.mark.parametrize("upstream_hook", [True, False])
+def test_load_model_builds_omni_state_through_hook_or_factory_swap(monkeypatch, upstream_hook):
+    """With vLLM's runner hook the module factory stays untouched; older vLLM
+    gets the Omni state through a swap of that factory, restored afterwards."""
+    import vllm.v1.worker.gpu.model_runner as mr
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+
+    import vllm_omni.worker_v2.omni_model_runner as omni_mr
+
+    upstream_factory = mr.init_model_state
+    model = SimpleNamespace(logits_vocab_size=7)
+    omni_state = object()
+    factory_seen_by_load = []
+
+    def upstream_load_model(self, *args, **kwargs):
+        self.model = model
+        factory_seen_by_load.append(mr.init_model_state)
+        if upstream_hook:
+            self.model_state = self._init_model_state()
+        else:
+            self.model_state = mr.init_model_state(self.vllm_config, self.model, self.encoder_cache, self.device)
+
+    monkeypatch.setattr(omni_mr, "_UPSTREAM_HAS_MODEL_STATE_HOOK", upstream_hook)
+    monkeypatch.setattr(GPUModelRunner, "load_model", upstream_load_model)
+    monkeypatch.setattr(omni_mr, "init_omni_model_state", lambda *args: omni_state)
+    runner = _make_runner()
+    runner.vllm_config, runner.encoder_cache, runner.device = object(), None, torch.device("cpu")
+    runner.vocab_size = runner.req_states.vocab_size = 10
+    runner.supports_mm_inputs = False
+    runner.jit_warmup_registry = JitWarmupRegistry(SimpleNamespace())
+
+    runner.load_model()
+
+    assert runner.model_state is omni_state
+    assert runner.vocab_size == runner.req_states.vocab_size == 7
+    assert (factory_seen_by_load[0] is upstream_factory) is upstream_hook
+    assert mr.init_model_state is upstream_factory
 
 
 @pytest.mark.parametrize(
