@@ -1020,7 +1020,7 @@ class OmniDiffusionConfig:
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
 
-    # Shard meta parameters before reading rank-local HF safetensors slices.
+    # Read rank-local slices into disposable proxies, then process/shard real blocks.
     hsdp_weight_load_strategy: str = "full"
 
     # Enable sleep mode

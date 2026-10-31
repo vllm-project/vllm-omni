@@ -119,15 +119,15 @@ def apply_hsdp_to_model(
     Returns:
         HSDP-wrapped model ready for inference
     """
+    hsdp_shard_conditions = getattr(model, "_hsdp_shard_conditions", None)
+    if not hsdp_shard_conditions:
+        raise ValueError(f"Model {type(model).__name__} has no _hsdp_shard_conditions defined")
+
     context = prepare_hsdp_shard_context(
         model,
         hsdp_config,
         target_device=target_device,
     )
-
-    hsdp_shard_conditions = getattr(model, "_hsdp_shard_conditions", None)
-    if not hsdp_shard_conditions:
-        raise ValueError(f"Model {type(model).__name__} has no _hsdp_shard_conditions defined")
 
     # Apply HSDP sharding, this will automatically handle weight distribution
     shard_model(
@@ -138,6 +138,22 @@ def apply_hsdp_to_model(
 
     logger.info("HSDP applied to model: %s", type(model).__name__)
     return model
+
+
+def _hsdp_mixed_precision_policy(model: nn.Module, hsdp_config: HSDPInferenceConfig) -> MixedPrecisionPolicy:
+    """Use the real model's dtypes and settings to select HSDP gather precision."""
+    # When the model contains FP8 parameters (online quantization), let FSDP
+    # keep the original storage dtype on all-gather instead of casting to
+    # hsdp_config.param_dtype (typically bfloat16). FP8 GEMM kernels expect
+    # FP8 inputs; an implicit FP8 -> bf16 cast would silently break them.
+    has_fp8_params = any(p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters())
+    preserve_parameter_dtypes = bool(getattr(model, "_hsdp_preserve_parameter_dtypes", False))
+    return MixedPrecisionPolicy(
+        param_dtype=None if has_fp8_params or preserve_parameter_dtypes else hsdp_config.param_dtype,
+        reduce_dtype=hsdp_config.reduce_dtype,
+        output_dtype=hsdp_config.output_dtype,
+        cast_forward_inputs=False,
+    )
 
 
 def prepare_hsdp_shard_context(
@@ -174,18 +190,7 @@ def prepare_hsdp_shard_context(
         rank,
     )
 
-    # When the model contains FP8 parameters (online quantization), let FSDP
-    # keep the original storage dtype on all-gather instead of casting to
-    # hsdp_config.param_dtype (typically bfloat16). FP8 GEMM kernels expect
-    # FP8 inputs; an implicit FP8 -> bf16 cast would silently break them.
-    has_fp8_params = any(p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for p in model.parameters())
-    preserve_parameter_dtypes = bool(getattr(model, "_hsdp_preserve_parameter_dtypes", False))
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=None if has_fp8_params or preserve_parameter_dtypes else hsdp_config.param_dtype,
-        reduce_dtype=hsdp_config.reduce_dtype,
-        output_dtype=hsdp_config.output_dtype,
-        cast_forward_inputs=False,
-    )
+    mp_policy = _hsdp_mixed_precision_policy(model, hsdp_config)
 
     device_type = current_omni_platform.device_type
 
@@ -198,10 +203,6 @@ def prepare_hsdp_shard_context(
         replicate_size=hsdp_replicate_size,
         shard_size=hsdp_shard_size,
     )
-
-    hsdp_shard_conditions = getattr(model, "_hsdp_shard_conditions", None)
-    if not hsdp_shard_conditions:
-        raise ValueError(f"Model {type(model).__name__} has no _hsdp_shard_conditions defined")
 
     # Collect parameters of any modules the model wants excluded from FSDP sharding.
     # See _hsdp_ignored_modules on each model class. These params keep their
@@ -279,7 +280,7 @@ def prepare_hsdp_shard_context(
 
 
 def shard_hsdp_module(module: nn.Module, context: HSDPShardContext) -> None:
-    """Shard one completed child module with a prepared HSDP context."""
+    """Shard a completed block or model root with a prepared HSDP context."""
     module_kwargs = dict(context.hsdp_kwargs)
     if context.ignored_params:
         module_ignored_params = context.ignored_params.intersection(module.parameters())
@@ -287,16 +288,6 @@ def shard_hsdp_module(module: nn.Module, context: HSDPShardContext) -> None:
             module_kwargs["ignored_params"] = module_ignored_params
     fully_shard(module, **module_kwargs)
     for param in module.parameters():
-        param.requires_grad = False
-
-
-def finalize_hsdp_root(model: nn.Module, context: HSDPShardContext) -> None:
-    """Shard the model root after all selected child modules are sharded."""
-    root_kwargs = dict(context.hsdp_kwargs)
-    if context.ignored_params:
-        root_kwargs["ignored_params"] = context.ignored_params
-    fully_shard(model, **root_kwargs)
-    for param in model.parameters():
         param.requires_grad = False
 
 
@@ -340,7 +331,7 @@ def shard_model(
     if num_sharded == 0:
         raise ValueError("No modules were sharded")
 
-    finalize_hsdp_root(model, context)
+    shard_hsdp_module(model, context)
     logger.info(
         "Sharded %d modules + root (ignored_params=%d)",
         num_sharded,

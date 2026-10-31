@@ -27,7 +27,6 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     HostWeightPlanResult,
     TensorBinding,
-    build_checkpoint_binding_plan,
 )
 from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.models.helios import HeliosPipeline
@@ -2207,32 +2206,18 @@ def test_hsdp_broadcast_weight_load_online_quant_multiprocess():
         assert os.path.exists(os.path.join(temp_dir, "rank_1_success.flag"))
 
 
-def test_pre_sharded_hsdp_rejects_quantization_before_loading():
-    od_config = SimpleNamespace(
-        dtype=torch.float32,
-        hsdp_weight_load_strategy="pre_sharded",
-        lora_path=None,
-        quantization_config=object(),
-        parallel_config=SimpleNamespace(
-            use_hsdp=True,
-            hsdp_replicate_size=1,
-            hsdp_shard_size=2,
-        ),
-    )
-    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
-    with pytest.raises(ValueError, match="does not support quantization"):
-        loader._load_model_with_hsdp(torch.device("cpu"))
-
-
-def test_pre_sharded_hsdp_strategy_dispatches_without_using_full_loader(mocker):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_pre_sharded_hsdp_strategy_dispatches_without_using_full_loader(mocker, quantized):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
+    from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
     from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
     od_config = SimpleNamespace(
         dtype=torch.float32,
         hsdp_weight_load_strategy="pre_sharded",
         lora_path=None,
-        quantization_config=None,
+        quantization_config=object() if quantized else None,
+        num_weight_load_threads=3,
         parallel_config=SimpleNamespace(
             use_hsdp=True,
             hsdp_replicate_size=1,
@@ -2254,138 +2239,357 @@ def test_pre_sharded_hsdp_strategy_dispatches_without_using_full_loader(mocker):
     loader._init_from_load_format = mocker.Mock(return_value=model)  # type: ignore[method-assign]
     loader.load_weights = mocker.Mock(side_effect=AssertionError("full loader must not run"))  # type: ignore[method-assign]
     mocker.patch.object(loader_mod.ModuleDiscovery, "discover", return_value=discovered)
-    pre_sharded_load = mocker.patch.object(
-        loader,
-        "_load_model_with_pre_sharded_hsdp",
-        return_value=model,
-    )
+    proxy_load = mocker.patch("vllm_omni.diffusion.model_loader.checkpoint_load_proxy.load_with_checkpoint_proxies")
 
     assert loader._load_model_with_hsdp(torch.device("cpu")) is model
-    pre_sharded_load.assert_called_once()
+    hsdp_config = HSDPInferenceConfig(enabled=True, hsdp_shard_size=2, param_dtype=torch.float32)
+    proxy_load.assert_called_once_with(loader, model, discovered, hsdp_config, torch.device("cpu"))
 
 
-def test_pre_sharded_hsdp_rejects_tensor_transform():
-    def transform(tensor):
-        return tensor.transpose(-2, -1)
+@pytest.mark.parametrize(
+    "dtype,missing,optional_in_checkpoint,late_fp8",
+    [
+        (torch.bfloat16, False, False, False),
+        (torch.float32, False, False, False),
+        (torch.float8_e4m3fn, False, False, False),
+        (torch.float32, True, False, False),
+        (torch.bfloat16, False, True, False),
+        (torch.bfloat16, False, False, True),
+    ],
+)
+def test_checkpoint_proxies_load_then_process_then_shard(
+    tmp_path, monkeypatch, mocker, dtype, missing, optional_in_checkpoint, late_fp8
+):
+    from vllm_omni.diffusion.distributed import hsdp as hsdp_module
+    from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
+    from vllm_omni.diffusion.model_loader import checkpoint_load_proxy as proxy_module
+    from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
-    load_plan = SimpleNamespace(
-        bindings={
-            "transformer.weight": TensorBinding(
-                checkpoint_key="weight",
-                file_path="model.safetensors",
-                transform=transform,
+    model = nn.Module()
+    model.transformer = nn.Module()
+    model.transformer.blocks = nn.ModuleList([nn.Linear(16, 16, bias=False, device="meta") for _ in range(2)])
+    for layer in model.transformer.blocks:
+        layer.weight = nn.Parameter(torch.empty(16, 16, dtype=dtype, device="meta"), requires_grad=False)
+        layer.mul_scale = nn.Parameter(torch.ones(1), requires_grad=False)
+        layer.mul_scale.is_checkpoint_optional = True
+        release_module_parameters_to_meta(layer)
+        assert layer.weight.is_meta
+        torch.testing.assert_close(layer.mul_scale, torch.ones(1))
+    model.transformer.blocks[0].norm = nn.LayerNorm(16, device="meta")
+    model.transformer.gain = nn.Parameter(torch.empty((), device="meta"), requires_grad=False)
+    cached = torch.tensor([3.0])
+    model.transformer.register_buffer("cached", cached, persistent=False)
+    custom_loads = {}
+
+    def load_group(module, weights):
+        weights = list(weights)
+        custom_loads[module] = {name for name, _ in weights}
+        return proxy_module.AutoWeightsLoader(module).load_weights(weights)
+
+    # Exercise custom block/root dispatch, leaving block 1 on the fallback path.
+    for module in (model.transformer.blocks[0], model.transformer):
+        module.load_weights = mocker.Mock(side_effect=lambda weights, module=module: load_group(module, weights))
+    model.load_weights = mocker.Mock(side_effect=AssertionError("Must not invoke the full-pipeline loader"))
+    model.transformer._hsdp_shard_conditions = [lambda name, _: name.startswith("blocks.") and name.count(".") == 1]
+    model.transformer._hsdp_ignored_modules = ["blocks.0.norm"]
+    model.weights_sources = [DiffusersPipelineLoader.ComponentSource(str(tmp_path), None, None, prefix="transformer.")]
+    model.convert_checkpoint_tensor = lambda name, tensor: tensor.t() if name.endswith("weight") else tensor
+    source = (torch.arange(256).reshape(16, 16) % 13).to(dtype)
+    tensors = {
+        "gain": torch.tensor(0.5),
+        "blocks.0.weight": source,
+        "blocks.0.norm.weight": torch.full((16,), 2.0),
+        "blocks.0.norm.bias": torch.full((16,), 0.25),
+    }
+    if not missing:
+        tensors["blocks.1.weight"] = source.clone()
+    if optional_in_checkpoint:
+        tensors.update({f"blocks.{index}.mul_scale": torch.full((1,), 2.0) for index in range(2)})
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    loader = DiffusersPipelineLoader(LoadConfig(), OmniDiffusionConfig(model=str(tmp_path)))
+    discovered = PipelineModules(
+        dits=[model.transformer], dit_names=["transformer"], encoders=[], encoder_names=[], vaes=[]
+    )
+    hsdp_config = HSDPInferenceConfig(enabled=True, hsdp_shard_size=1)
+    monkeypatch.setattr(hsdp_module, "get_world_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
+    monkeypatch.setattr(hsdp_module, "_create_hsdp_mesh", lambda **kwargs: object())
+    monkeypatch.setattr(hsdp_module, "current_omni_platform", SimpleNamespace(device_type="cpu"))
+    prepare = mocker.spy(proxy_module, "prepare_hsdp_shard_context")
+    real_policies = []
+    processed = set()
+    root_events = []
+    model.transformer.post_load_weights = lambda: root_events.append("post_load")
+    model.transformer.validate_loaded_weights = lambda loaded: root_events.append("validate")
+
+    def process(group, device, *, modules_to_process):
+        for layer in modules_to_process:
+            if isinstance(layer, nn.Linear):
+                assert layer not in processed
+                torch.testing.assert_close(layer.weight.float(), source.float().t())
+                torch.testing.assert_close(layer.mul_scale, torch.full((1,), 2.0 if optional_in_checkpoint else 1.0))
+                # Native postprocessing may freely replace Parameters and add
+                # derived scalars because this real layer is not yet sharded.
+                layer.weight = nn.Parameter(layer.weight.detach().clone(), requires_grad=False)
+                # Groups visit block 1 before block 0; introduce FP8 only later.
+                if late_fp8 and layer is model.transformer.blocks[0]:
+                    layer.weight = nn.Parameter(layer.weight.to(torch.float8_e4m3fn), requires_grad=False)
+                layer.backend_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
+                processed.add(layer)
+
+    monkeypatch.setattr(loader, "_process_weights_after_loading", process)
+
+    def fully_shard(module, **kwargs):
+        if isinstance(module, proxy_module._CheckpointProxy):
+            assert all(tensor.is_meta for tensor in module.parameters())
+        else:
+            proxy_context = prepare.spy_return
+            assert kwargs["mesh"] is proxy_context.hsdp_kwargs["mesh"]
+            policy = kwargs["mp_policy"]
+            real_policies.append(policy)
+            assert policy is not proxy_context.hsdp_kwargs["mp_policy"]
+            has_fp8 = any(param.dtype == torch.float8_e4m3fn for param in model.transformer.parameters())
+            assert policy.param_dtype == (None if has_fp8 else torch.bfloat16)
+            assert kwargs["ignored_params"] <= set(module.parameters())
+            if module is model.transformer:
+                assert root_events == ["post_load", "validate"]
+                root_events.append("shard")
+            for layer in module.modules():
+                if isinstance(layer, nn.Linear):
+                    assert layer in processed
+                    assert layer.backend_scale in kwargs["ignored_params"]
+                    if layer is model.transformer.blocks[0]:
+                        assert set(layer.norm.parameters()) <= kwargs["ignored_params"]
+                        assert layer.weight not in kwargs["ignored_params"]
+
+    monkeypatch.setattr(hsdp_module, "fully_shard", fully_shard)
+    monkeypatch.setattr(proxy_module._CheckpointProxy, "unshard", lambda self: None, raising=False)
+
+    proxy_storages = []
+
+    def reshard(proxy):
+        # Freeing/reusing a proxy must not invalidate the real layer's weights.
+        for tensor in (*proxy.parameters(), *proxy.buffers()):
+            tensor.zero_()
+            proxy_storages.append(tensor.untyped_storage())
+
+    monkeypatch.setattr(proxy_module._CheckpointProxy, "reshard", reshard, raising=False)
+    read = mocker.spy(proxy_module, "dcp_load")
+    if missing:
+        with pytest.raises(ValueError, match="did not load all tensors"):
+            proxy_module.load_with_checkpoint_proxies(loader, model, discovered, hsdp_config, torch.device("cpu"))
+        # The first group has no checkpoint tensors, so its proxy owns no storage.
+        assert not proxy_storages
+        return
+    proxy_module.load_with_checkpoint_proxies(loader, model, discovered, hsdp_config, torch.device("cpu"))
+    assert proxy_storages and all(storage.nbytes() == 0 for storage in proxy_storages)
+    read.assert_called_once()
+    prepare.assert_called_once()
+    assert len(real_policies) == 3
+    assert len({id(policy) for policy in real_policies}) == 3
+    if late_fp8:
+        assert [policy.param_dtype for policy in real_policies] == [torch.bfloat16, None, None]
+    assert processed == set(model.transformer.blocks)
+    for layer in model.transformer.blocks:
+        torch.testing.assert_close(layer.weight.float(), source.float().t())
+    norm = model.transformer.blocks[0].norm
+    torch.testing.assert_close(norm.weight, tensors["blocks.0.norm.weight"])
+    torch.testing.assert_close(norm.bias, tensors["blocks.0.norm.bias"])
+    assert model.transformer.gain.item() == 0.5
+    assert model.transformer.cached is cached
+    model.load_weights.assert_not_called()
+    model.transformer.load_weights.assert_called_once()
+    model.transformer.blocks[0].load_weights.assert_called_once()
+    assert custom_loads[model.transformer] == {"gain"}
+    assert custom_loads[model.transformer.blocks[0]] == (
+        {"weight", "norm.weight", "norm.bias"} | ({"mul_scale"} if optional_in_checkpoint else set())
+    )
+    assert root_events == ["post_load", "validate", "shard"]
+    assert not model.transformer.training
+
+
+@pytest.mark.parametrize("missing_scale", [False, True])
+def test_checkpoint_proxies_apply_component_adapter_before_conversion(tmp_path, monkeypatch, mocker, missing_scale):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
+
+    from vllm_omni.diffusion.distributed import hsdp as hsdp_module
+    from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
+    from vllm_omni.diffusion.model_loader import checkpoint_load_proxy as proxy_module
+    from vllm_omni.diffusion.model_loader.checkpoint_adapters import ModelOptFp8CheckpointAdapter
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    class Pipeline(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.transformer.blocks = nn.ModuleList(
+                [nn.Linear(2, 2, bias=False, dtype=torch.bfloat16, device="meta") for _ in range(2)]
             )
-        }
+            self.transformer._hsdp_shard_conditions = [lambda name, _: name in {"blocks.0", "blocks.1"}]
+
+        @staticmethod
+        def remap_checkpoint_key(name):
+            # Runtime names must not be sent through a non-idempotent remapper again.
+            if name.startswith("transformer.orig."):
+                return name.replace("transformer.orig.", "transformer.blocks.", 1)
+            return None
+
+    model = Pipeline()
+    model.weights_sources = [DiffusersPipelineLoader.ComponentSource(str(tmp_path), None, None, prefix="transformer.")]
+    quant_config = ModelOptFp8Config("FP8", True, None, [])
+    loader = DiffusersPipelineLoader(LoadConfig(), OmniDiffusionConfig(model=str(tmp_path)))
+    loader.quant_config = ComponentQuantizationConfig({"transformer": quant_config})
+    fp8_weight = torch.tensor([[2.0, -4.0], [1.0, 3.0]]).to(torch.float8_e4m3fn)
+    weights = {f"orig.{index}.weight": fp8_weight.clone() for index in range(2)}
+    scales = {f"orig.{index}.input_scale": torch.tensor([2.0]) for index in range(2)}
+    scales.update({f"orig.{index}.weight_scale": torch.tensor([0.5 / (index + 1)]) for index in range(2)})
+    if missing_scale:
+        del scales["orig.1.weight_scale"]
+    # The adapter must see all tensors from one component, not one physical file.
+    weight_map = {}
+    for filename, tensors in (("weights.safetensors", weights), ("scales.safetensors", scales)):
+        save_file(tensors, str(tmp_path / filename))
+        weight_map.update(dict.fromkeys(tensors, filename))
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    expected = {
+        f"transformer.blocks.{index}.weight": fp8_weight.to(torch.bfloat16) * (0.5 / (index + 1)) for index in range(2)
+    }
+    converted = []
+    processed = set()
+
+    def convert(name, tensor):
+        assert name in {"transformer.blocks.0.weight", "transformer.blocks.1.weight"}
+        assert tensor.dtype == torch.bfloat16
+        torch.testing.assert_close(tensor, expected[name])
+        converted.append(name)
+        return tensor.t()
+
+    model.convert_checkpoint_tensor = convert
+    expected_blocks = {
+        block: expected[f"transformer.blocks.{index}.weight"].t()
+        for index, block in enumerate(model.transformer.blocks)
+    }
+
+    def process(group, device, *, modules_to_process):
+        for module in modules_to_process:
+            if isinstance(module, nn.Linear):
+                torch.testing.assert_close(module.weight, expected_blocks[module])
+                processed.add(module)
+
+    def fully_shard(module, **kwargs):
+        if isinstance(module, nn.Linear):
+            assert module in processed
+            torch.testing.assert_close(module.weight, expected_blocks[module])
+
+    monkeypatch.setattr(loader, "_process_weights_after_loading", process)
+    monkeypatch.setattr(hsdp_module, "get_world_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
+    monkeypatch.setattr(hsdp_module, "_create_hsdp_mesh", lambda **kwargs: object())
+    monkeypatch.setattr(hsdp_module, "current_omni_platform", SimpleNamespace(device_type="cpu"))
+    monkeypatch.setattr(hsdp_module, "fully_shard", fully_shard)
+    monkeypatch.setattr(proxy_module._CheckpointProxy, "unshard", lambda self: None, raising=False)
+    monkeypatch.setattr(proxy_module._CheckpointProxy, "reshard", lambda self: None, raising=False)
+    adapter_selection = mocker.spy(loader, "_get_checkpoint_adapter")
+    discovered = PipelineModules(
+        dits=[model.transformer], dit_names=["transformer"], encoders=[], encoder_names=[], vaes=[]
     )
+    args = (loader, model, discovered, HSDPInferenceConfig(enabled=True, hsdp_shard_size=1), torch.device("cpu"))
+    if missing_scale:
+        with pytest.raises(ValueError, match="Missing ModelOpt FP8 weight_scale"):
+            proxy_module.load_with_checkpoint_proxies(*args)
+        assert model.transformer.blocks[1] not in processed
+        return
 
-    with pytest.raises(ValueError, match="tensor transforms are unsupported"):
-        DiffusersPipelineLoader._validate_pre_sharded_hsdp_bindings(load_plan)
+    proxy_module.load_with_checkpoint_proxies(*args)
+
+    assert isinstance(adapter_selection.spy_return, ModelOptFp8CheckpointAdapter)
+    assert adapter_selection.call_count == 2
+    assert all(call.args == (model, model.weights_sources[0], True) for call in adapter_selection.call_args_list)
+    assert sorted(converted) == ["transformer.blocks.0.weight", "transformer.blocks.1.weight"]
+    assert processed == set(model.transformer.blocks)
+    for block in model.transformer.blocks:
+        torch.testing.assert_close(block.weight, expected_blocks[block])
 
 
-def test_pre_sharded_hsdp_accepts_direct_safetensors_binding():
-    load_plan = SimpleNamespace(
-        bindings={
-            "transformer.weight": TensorBinding(
-                checkpoint_key="weight",
-                file_path="model.safetensors",
-            )
-        }
+@pytest.mark.parametrize("checkpoint_key", ["block.to_q.weight", "unmapped.weight"])
+def test_checkpoint_proxy_adapter_validates_names(mocker, checkpoint_key):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
+
+    from vllm_omni.diffusion.model_loader import checkpoint_load_proxy as proxy_module
+
+    model = nn.Module()
+    model.transformer = nn.Module()
+    model.transformer.block = nn.Module()
+    model.transformer.block.to_qkv = nn.Linear(2, 2, bias=False)
+    alias = "transformer.block.to_q.weight"
+    model.remap_checkpoint_key = lambda name: None
+    source = DiffusersPipelineLoader.ComponentSource("unused", "transformer", None, prefix="transformer.")
+    loader = DiffusersPipelineLoader(LoadConfig(), OmniDiffusionConfig(model="unused"))
+    loader.quant_config = ModelOptFp8Config("FP8", True, None, [])
+    group = proxy_module._LoadGroup(
+        "transformer.block",
+        model.transformer.block,
+        model.transformer,
+        required_names={"transformer.block.to_qkv.weight"},
+        checkpoint_entries={alias: (checkpoint_key, "unused.safetensors")},
+        checkpoint_sources=[(source, [alias])],
     )
+    tensor = torch.ones(2, 2)
 
-    DiffusersPipelineLoader._validate_pre_sharded_hsdp_bindings(load_plan)
+    proxy = proxy_module._CheckpointProxy.__new__(proxy_module._CheckpointProxy)
+    nn.Module.__init__(proxy)
+    proxy.tensor_bindings = {alias: ("tensor_0", Path("unused"), checkpoint_key)}
+    proxy.register_parameter("tensor_0", nn.Parameter(tensor, requires_grad=False))
+    convert = mocker.Mock(side_effect=lambda name, tensor: tensor)
+
+    if checkpoint_key == "unmapped.weight":
+        with pytest.raises(ValueError, match="Cannot map adapted checkpoint tensor 'transformer.unmapped.weight'"):
+            list(proxy_module._adapt_group_weights(loader, model, group, proxy, convert))
+        convert.assert_not_called()
+        return
+
+    adapted = list(proxy_module._adapt_group_weights(loader, model, group, proxy, convert))
+
+    assert len(adapted) == 1 and adapted[0][0] == "to_q.weight"
+    torch.testing.assert_close(adapted[0][1], tensor)
+    convert.assert_called_once()
+    assert convert.call_args.args[0] == alias
+    torch.testing.assert_close(convert.call_args.args[1], tensor)
 
 
-def test_pre_sharded_hsdp_uses_fsdp_destination_directly():
-    target = torch.empty(8, 4, 3)
-    load_plan = SimpleNamespace(
-        bindings={
-            "transformer.weight": TensorBinding(
-                checkpoint_key="source_weight",
-                file_path="transformer/model.safetensors",
-            )
-        }
+def test_pre_sharded_groups_require_component_sources(mocker):
+    from vllm_omni.diffusion.model_loader import checkpoint_load_proxy as proxy_module
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    model = nn.Module()
+    model.transformer = nn.Module()
+    loader = _make_loader_with_weights([])
+    discovered = PipelineModules(
+        dits=[model.transformer], dit_names=["transformer"], encoders=[], encoder_names=[], vaes=[]
     )
+    index = mocker.patch.object(proxy_module, "_build_source_map")
 
-    checkpoint_states, local_bytes = DiffusersPipelineLoader._prepare_pre_sharded_checkpoint_states(
-        load_plan,
-        {"transformer.weight": target},
-    )
-    checkpoint_target = checkpoint_states[Path("transformer")]["source_weight"]
+    with pytest.raises(ValueError, match="checkpoint sources are missing DiT prefixes"):
+        proxy_module._plan_checkpoint_groups(loader, model, discovered)
 
-    assert checkpoint_target is target
-    assert checkpoint_target.shape == (8, 4, 3)
-    assert checkpoint_target.device.type == "cpu"
-    assert checkpoint_target.untyped_storage().data_ptr() == target.untyped_storage().data_ptr()
-    assert local_bytes == target.numel() * target.element_size()
+    index.assert_not_called()
 
 
-def test_pre_sharded_hsdp_checkpoint_writes_runtime_storage_directly():
-    runtime_target = torch.empty(2, 3)
-    load_plan = SimpleNamespace(
-        bindings={
-            "transformer.weight": TensorBinding(
-                checkpoint_key="source_weight",
-                file_path="transformer/model.safetensors",
-            )
-        }
-    )
-    checkpoint_tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    checkpoint_states, _ = DiffusersPipelineLoader._prepare_pre_sharded_checkpoint_states(
-        load_plan,
-        {"transformer.weight": runtime_target},
-    )
-    checkpoint_states[Path("transformer")]["source_weight"].copy_(checkpoint_tensor)
-
-    assert torch.equal(runtime_target, checkpoint_tensor)
-
-
-def test_pre_sharded_hsdp_rejects_duplicate_checkpoint_destinations():
-    binding = TensorBinding(checkpoint_key="weight", file_path="transformer/model.safetensors")
-    load_plan = SimpleNamespace(
-        bindings={
-            "transformer.first": binding,
-            "transformer.second": binding,
-        }
-    )
-
-    with pytest.raises(ValueError, match="multiple runtime tensors"):
-        DiffusersPipelineLoader._prepare_pre_sharded_checkpoint_states(
-            load_plan,
-            {"transformer.first": torch.empty(2, 3), "transformer.second": torch.empty(2, 3)},
-        )
-
-
-def test_pre_sharded_hsdp_managed_module_traversal_is_child_first_and_skips_nested_roots():
-    root = nn.Module()
-    root.left = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
-    root.right = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
-
-    names = {module: name or "root" for name, module in root.named_modules()}
-    modules = DiffusersPipelineLoader._hsdp_managed_modules_post_order(
-        root,
-        nested_hsdp_roots={root.left},
-    )
-
-    assert [names[module] for module in modules] == ["right.0", "right.1", "right", "root"]
-
-
-@pytest.mark.parametrize("checkpoint_key", ["renamed", "unexpected"])
-def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpoint_key, monkeypatch):
-    import vllm_omni.diffusion.model_loader.host_weight_plan as plan_mod
-
-    monkeypatch.setattr(plan_mod, "get_direct_mmap_adapter", lambda _model: None)
+def test_pre_sharded_groups_apply_model_remap(tmp_path):
+    from vllm_omni.diffusion.model_loader.checkpoint_load_proxy import _plan_checkpoint_groups
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
 
     class Pipeline(nn.Module):
         def __init__(self):
             super().__init__()
             self.transformer = nn.Linear(2, 2, bias=False)
+            self.transformer._hsdp_shard_conditions = [lambda name, module: False]
 
         @staticmethod
         def remap_checkpoint_key(name):
             return "transformer.weight" if name == "transformer.renamed" else name
 
     checkpoint = tmp_path / "model.safetensors"
-    save_file({checkpoint_key: torch.ones(2, 2)}, str(checkpoint))
+    save_file({"renamed": torch.ones(2, 2)}, str(checkpoint))
     source = SimpleNamespace(
         model_or_path=str(tmp_path),
         subfolder=None,
@@ -2393,18 +2597,71 @@ def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpo
         prefix="transformer.",
     )
     model = Pipeline()
-    result = build_checkpoint_binding_plan(
+    model.weights_sources = [source]
+    loader = DiffusersPipelineLoader(LoadConfig(), OmniDiffusionConfig(model=str(tmp_path)))
+    discovered = PipelineModules(
+        dits=[model.transformer], dit_names=["transformer"], encoders=[], encoder_names=[], vaes=[]
+    )
+    groups, _ = _plan_checkpoint_groups(
+        loader,
         model,
-        dit_modules=(("transformer", model.transformer),),
-        sources=(source,),
-        model_path=None,
-        tensor_parallel_size=1,
-        online_quantization=False,
+        discovered,
     )
 
-    if checkpoint_key == "renamed":
-        assert result.plan is not None
-        assert result.plan.bindings["transformer.weight"].checkpoint_key == "renamed"
-    else:
-        assert result.plan is None
-        assert "no checkpoint binding" in result.fallback_reason
+    assert groups[0].checkpoint_entries["transformer.weight"] == ("renamed", str(checkpoint))
+
+
+def test_pre_sharded_groups_assign_nested_blocks_before_parent_and_root(tmp_path):
+    from vllm_omni.diffusion.model_loader.checkpoint_load_proxy import _plan_checkpoint_groups
+    from vllm_omni.diffusion.offloader.module_collector import PipelineModules
+
+    model = nn.Module()
+    root = model.transformer = nn.Module()
+    root.weight = nn.Parameter(torch.ones(2))
+    root.block = nn.Module()
+    root.block.weight = nn.Parameter(torch.ones(2))
+    root.block.inner = nn.Linear(2, 2, bias=False)
+    root._hsdp_shard_conditions = [lambda name, _: name in {"block", "block.inner"}]
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(root.state_dict(), str(checkpoint))
+    model.weights_sources = [DiffusersPipelineLoader.ComponentSource(str(tmp_path), None, None, prefix="transformer.")]
+    loader = DiffusersPipelineLoader(LoadConfig(), OmniDiffusionConfig(model=str(tmp_path)))
+    discovered = PipelineModules(dits=[root], dit_names=["transformer"], encoders=[], encoder_names=[], vaes=[])
+
+    groups, planned = _plan_checkpoint_groups(loader, model, discovered)
+
+    expected = [
+        ("transformer.block.inner", root.block.inner),
+        ("transformer.block", root.block),
+        ("transformer", root),
+    ]
+    assert [group.name for group in groups] == [name for name, _ in expected]
+    for group, (name, module) in zip(groups, expected):
+        # Nested modules and their weights must belong to exactly one group.
+        assert group.managed_modules == [module]
+        model_name = f"{name}.weight"
+        assert group.required_names == {model_name}
+        assert group.checkpoint_entries == {model_name: (model_name.removeprefix("transformer."), str(checkpoint))}
+    assert planned == frozenset(dict(model.named_parameters()))
+
+
+def test_pre_sharded_proxies_reject_duplicate_checkpoint_destinations(tmp_path, mocker):
+    from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, HSDPShardContext
+    from vllm_omni.diffusion.model_loader import checkpoint_load_proxy as proxy_module
+
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"weight": torch.ones(2)}, str(checkpoint))
+    root = nn.Module()
+    groups = [
+        proxy_module._LoadGroup(
+            name, nn.Module(), root, checkpoint_entries={f"{name}.weight": ("weight", str(checkpoint))}
+        )
+        for name in ("first", "second")
+    ]
+    mocker.patch.object(proxy_module, "prepare_hsdp_shard_context", return_value=HSDPShardContext({}))
+    mocker.patch.object(proxy_module, "shard_hsdp_module")
+    read = mocker.patch.object(proxy_module, "dcp_load")
+
+    with pytest.raises(ValueError, match="multiple proxy destinations"):
+        proxy_module._load_checkpoint_shards(groups, HSDPInferenceConfig(enabled=True), torch.device("cpu"), 1)
+    read.assert_not_called()
