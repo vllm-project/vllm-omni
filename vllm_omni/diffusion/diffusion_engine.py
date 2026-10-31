@@ -656,6 +656,9 @@ class DiffusionEngine:
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
+            # Save pages held by finished requests before anything can reuse
+            # their pinned device blocks: the drain runs ahead of schedule().
+            self._drain_kv_page_offloads()
             self._expire_streaming_idle()
             if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():
                 # A paused/idle engine has no next wave to deliver an abort.
@@ -1084,6 +1087,42 @@ class DiffusionEngine:
                 if cleanup_targets:
                     self.executor.remove_diffusion_kv_requests(cleanup_targets)
             except Exception as exc:
+                self._fail_engine(exc)
+                raise
+
+    def _drain_kv_page_offloads(self) -> None:
+        """Relay held completed requests through the Worker page-save RPC.
+
+        The Scheduler holds finished requests whose published prefixes are
+        pending offload; the Workers own the bytes, so the Engine relays the
+        page names over RPC and reports the saved sizes back.  A failed save
+        releases the held requests on-device: offload must never turn a
+        finished request into an error.
+        """
+
+        scheduler = self.scheduler
+        pending = scheduler.pending_kv_page_offloads()
+        if not pending:
+            return
+        request_ids = list(pending)
+        pages = [page for targets in pending.values() for page in targets]
+        try:
+            sizes = self.executor.save_diffusion_kv_pages(pages)
+            for request_id, targets in pending.items():
+                scheduler.commit_kv_page_offload(
+                    request_id,
+                    {page.key: int(sizes.get(page.key, 0)) for page in targets},
+                )
+        except Exception as exc:
+            logger.error(
+                "Diffusion KV page offload failed for requests %s; releasing them on-device",
+                request_ids,
+                exc_info=True,
+            )
+            try:
+                scheduler.abort_kv_page_offload(request_ids)
+            except Exception:
+                logger.exception("Failed to release requests held for Diffusion KV page offload")
                 self._fail_engine(exc)
                 raise
 
