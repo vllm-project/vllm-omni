@@ -332,13 +332,16 @@ def benchmark_params(request):
         yield {"test_name": test_name, "params": params}
 
 
-def _resolve_num_warmups(params: dict[str, Any], *, default: int) -> int:
+def _resolve_num_warmups(params: dict[str, Any], *, default: int, sweep_index: int = 0, sweep_size: int = 1) -> int:
     value = params.get("num_warmups")
     if value is None:
         return default
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError("num_warmups must be a non-negative integer")
-    return value
+    values = value if isinstance(value, list) else [value]
+    if isinstance(value, list) and len(values) != sweep_size:
+        raise ValueError("num_warmups must contain one value per sweep point")
+    if any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in values):
+        raise ValueError("num_warmups must be a non-negative integer or a list of them")
+    return values[sweep_index] if isinstance(value, list) else value
 
 
 def _assert_fixed_stage_workloads(result: dict[str, Any], params: dict[str, Any], num_prompts: int) -> None:
@@ -729,7 +732,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=2),
+            num_warmups=_resolve_num_warmups(params, default=2, sweep_index=sweep_index, sweep_size=len(qps_list)),
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
         )
@@ -749,7 +752,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
+            num_warmups=_resolve_num_warmups(
+                params,
+                default=max(2, int(concurrency)),
+                sweep_index=sweep_index,
+                sweep_size=len(max_concurrency_list),
+            ),
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
         )

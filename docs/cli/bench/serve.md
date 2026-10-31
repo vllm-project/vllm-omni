@@ -784,15 +784,19 @@ Clips remain unmodified: each lasts about five minutes, with two questions
 roughly two and a half minutes apart. This measures intermittent generation
 under concurrent realtime input, not continuously decoding requests.
 The nightly configurations explicitly skip the extra endpoint readiness replay
-(`ready_check_timeout_sec: 0`) and run one unmeasured full-session warmup
-(`num_warmups: 1`) per concurrency. Engine startup separately performs kernel
-warmup and CUDA Graph capture for its configured batch sizes. The session
-warmup exercises the media path; it does not establish that every input shape
-or concurrent execution path is warm.
+(`ready_check_timeout_sec: 0`). The runner pairs `num_warmups: [1, 8, 16]`
+with the C1/C8/C16 sweep: each point first replays the first sample in 1, 8,
+or 16 concurrent, unmeasured full sessions. A scalar `num_warmups` still applies
+the same count to every sweep point; a list must contain one non-negative
+integer per point. Engine startup separately performs kernel warmup and CUDA
+Graph capture for its configured batch sizes. Concurrent session warmup
+exercises the media and concurrent inference paths; it does not establish
+that every input shape or execution path is warm.
 
 Formal replay takes approximately 20, 10, and 10 minutes at concurrency
-1, 8, and 16 respectively; warmup adds about 5 minutes per concurrency. The complete
-sweep therefore takes about 55 minutes plus startup and response drain, within
+1, 8, and 16 respectively. Each warmup wave replays a roughly five-minute clip
+concurrently, adding about 5 minutes per point rather than 5 minutes per session.
+The complete sweep therefore takes about 55 minutes plus startup and response drain, within
 the existing 180-minute job budget. Warmup does not enter metrics. Results and
 hardware baselines are separate for each concurrency. C16 covers two waves of
 sessions; it is not a sustained saturation or long-duration memory test.
