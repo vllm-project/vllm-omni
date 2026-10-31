@@ -12,7 +12,6 @@ Pipeline:
   5. Next decode embeds that id with emb_code and emits it to Code2Wav
 """
 
-import os
 import random
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
@@ -42,9 +41,6 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
     parse_bool_flag as _bool_flag,
-)
-from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
-    read_bool_flag,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
@@ -80,25 +76,8 @@ _CODEC_TOP_K = 25
 _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 
-# Host-side codec boundary sampling (per-frame sync-chain optimization):
-# the K-step frame loop's per-request sampling chain -- ~40 eager
-# micro-kernels plus one packed.cpu() sync per frame -- collapses to a
-# head_code Linear on device plus a single 26KB logits D2H, with every
-# downstream filter / penalty / draw / transition on host scalars.
-# Enabled by default. The switch is an instance attribute resolved from the
-# stage connector ``extra`` config (``talker_codec_host_sample``) with
-# VLLM_OMNI_HOST_CODEC_SAMPLE as a secondary override: runtime.env does not
-# reach engine subprocesses, so the deployment yaml is the reachable opt-out.
-# The host RNG stream is not bit-identical to the NPU
-# multinomial sequence, so generated audio differs from the device
-# sampler, but quality is unchanged (seed-tts WER identical item by
-# item); greedy (temperature==0) stays bit-identical. See
-# _sample_audio_code_host and the _talker_codec_host_sample setup in
-# __init__.
-# Optimization C gate: one-row-deep pipeline of boundary heads on the host
-# sampling path. Default on when host sampling is on; set
-# VLLM_OMNI_HOST_SAMPLE_PIPELINE=0 to settle each row eagerly (A/B arms).
-_HOST_SAMPLE_PIPELINE = os.environ.get("VLLM_OMNI_HOST_SAMPLE_PIPELINE", "1") == "1"
+# K-step sampling transfers codec logits once per frame and filters/draws on
+# the host. Its seeded RNG stream differs from device multinomial sampling.
 _CODEC_MIN_TOKENS = 50
 _CODEC_MAX_TOKENS = 2048
 # The Talker's two-wide stop head emits continue/stop control rows under
@@ -772,20 +751,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._codec_fused_prelude = _bool_flag(
             self._extra_config().get("talker_codec_fused_prelude", True),
             "talker_codec_fused_prelude",
-        )
-        # Host-side codec sampling uses the same connector-extra surface:
-        # the yaml key is the opt-out a deployment can actually reach, and
-        # the env var stays as the secondary override for direct engine
-        # launches / A-B arms. Resolved eagerly so a bare test double that
-        # bypasses __init__ falls back to the device samplers instead of
-        # touching host-only attributes.
-        self._talker_codec_host_sample = read_bool_flag(
-            self._extra_config(),
-            "talker_codec_host_sample",
-            _bool_flag(
-                os.environ.get("VLLM_OMNI_HOST_CODEC_SAMPLE", "1"),
-                "VLLM_OMNI_HOST_CODEC_SAMPLE",
-            ),
         )
 
         # Multi-frame decode: K codec frames per Talker decode step. A value
@@ -1842,20 +1807,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     terminal_flags.append(flag_true)
                     continue
                 eos_window_masked = silent_run < _TURN_END_SILENT_FRAMES
-            # A request pinning temperature to 0 (override or stage default)
-            # takes the deterministic boundary sampler, same as single-frame.
-            # Both boundary samplers return the full sample result; the device
-            # state inside it owns the eos/stop-id/limit transition (single
-            # source).
             host_id: int | None = None
-            if getattr(self, "_talker_codec_host_sample", False) and self._k_step_frames > 0:
-                # Plan B: host-side sampling replaces the device eager
-                # chain for both greedy and random; the three scalars come
-                # back without the per-frame packed.cpu() round trip.
-                # Optimization C: consume the pre-submitted head for this
-                # row when the binding matches, then pre-submit the next
-                # row's head so it overlaps this row's D2H + numpy chain.
-                if _HOST_SAMPLE_PIPELINE and pending_lg is not None and pending_lg_row == index:
+            if self._k_step_frames > 0:
+                # Reuse the next row's head only when its row binding matches.
+                if pending_lg is not None and pending_lg_row == index:
                     lg_dev: torch.Tensor | None = pending_lg
                 else:
                     lg_dev = None
@@ -1871,15 +1826,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     eos_window_masked,
                     lg_dev=lg_dev,
                 )
-                # Submit the NEXT row's head AFTER this row's D2H. Order
-                # matters: .cpu() is a synchronising D2H that waits for
-                # everything already queued on the stream, so submitting
-                # before it makes this row wait for the next row's head
-                # too (measured: +0.7~+1.4% RTF on all three tiers).
-                # Submitting after it overlaps that head with the next
-                # row's host-side entry work.
+                # Queue the next head after this row's blocking D2H, so the
+                # current transfer does not wait for the next row's head.
                 nxt = index + 1
-                if _HOST_SAMPLE_PIPELINE and nxt < len(infos):
+                if nxt < len(infos):
                     s2, e2 = spans[nxt]
                     e2 = min(int(e2), int(hidden.shape[0]))
                     if e2 > s2:
@@ -2380,7 +2330,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         eos_window_masked: bool = False,
         lg_dev: torch.Tensor | None = None,
     ) -> tuple[int, bool, bool]:
-        """Host-side codec boundary sampling (talker_codec_host_sample).
+        """Host-side codec boundary sampling.
 
         Device work per frame: one head_code Linear plus a single D2H of the
         raw logits row (~26KB at the codec vocab). Stop censoring, repetition
@@ -2389,12 +2339,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         host scalars, replacing the per-frame eager micro-kernel chain (and
         its packed.cpu() sync) that the device samplers drive.
 
-        Optimization C: ``lg_dev`` carries a head result the caller
-        pre-submitted one row ahead. The D2H below then returns without
-        waiting (the head finished while the previous row's numpy chain
-        ran) and this row's numpy chain overlaps the next row's head on
-        the device. When it is None the head is submitted here, exactly
-        as before the pipeline existed.
+        ``lg_dev`` optionally carries the next-row head result queued by the
+        caller after the previous row's D2H. Otherwise submit the head here.
 
         The draw uses a per-request python random.Random seeded from the
         same codec_seed the device path derives its NPU generator from: the
@@ -2405,7 +2351,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         """
         if not getattr(self, "_host_codec_sample_logged", False):
             self._host_codec_sample_logged = True
-            logger.info("[host-sample] host-side codec sampling armed (talker_codec_host_sample)")
+            logger.info("[host-sample] host-side codec sampling armed")
         states = getattr(self, "_request_host_codec_states", None)
         if states is None:
             states = {}

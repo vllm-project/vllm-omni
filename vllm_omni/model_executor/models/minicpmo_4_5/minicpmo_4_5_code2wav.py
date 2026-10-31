@@ -439,8 +439,8 @@ class MiniCPMO45Code2Wav(nn.Module):
             "hift_max_lazy_graphs": int(extra.get("hift_max_lazy_graphs", 8)),
             "hift_graph_codec_chunk_frames": list(extra.get("hift_graph_codec_chunk_frames") or ()),
             "hift_graph_first_chunk_frames": list(extra.get("hift_graph_first_chunk_frames") or ()),
-            "hift_graph_continuation_frames": list(extra.get("hift_graph_continuation_frames") or ()),
-            "hift_graph_exact_batch_sizes": list(extra.get("hift_graph_exact_batch_sizes") or (1,)),
+            "hift_graph_continuation_frames": list(extra.get("hift_graph_continuation_frames", (3, 33)) or ()),
+            "hift_graph_exact_batch_sizes": list(extra.get("hift_graph_exact_batch_sizes") or (1, 2)),
         }
         if self._connector_config["codec_chunk_frames"] <= 0 or self._connector_config["codec_left_context_frames"] < 0:
             raise ValueError(f"Invalid MiniCPM-o connector chunk configuration: {self._connector_config}")
