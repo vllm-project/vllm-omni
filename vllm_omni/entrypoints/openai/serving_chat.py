@@ -641,6 +641,31 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        hf_config = getattr(self.model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) == "drvexo_speech_8b":
+            from .drvexo_decision import validate_chat_request
+
+            try:
+                validate_chat_request(request)
+            except (ValueError, TypeError) as exc:
+                return self._create_error_response(str(exc), status_code=400)
+            if getattr(hf_config, "drvexo_text_intermediate", False):
+                from .drvexo_transcription import attach_transcription, current_audio_to_text
+
+                error = await self._check_model(request)
+                if error is not None:
+                    return error
+                try:
+                    converted, transcription = await current_audio_to_text(self, request)
+                except ValueError as exc:
+                    return self._create_error_response(str(exc), status_code=400)
+                except RuntimeError as exc:
+                    return self._create_error_response(str(exc), status_code=503)
+                if transcription is not None:
+                    # Internal serving failures must keep their server-error
+                    # identity, rather than being recast as request validation.
+                    response = await self._create_chat_completion(converted, raw_request)
+                    return attach_transcription(response, transcription)
         stage_configs = getattr(self.engine_client, "stage_configs", ()) or ()
         serves_diffusion = self._diffusion_mode or any(
             get_stage_type(stage_config) == "diffusion" for stage_config in stage_configs
@@ -1007,7 +1032,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Streaming response
         if request.stream:
-            return self.chat_completion_stream_generator(
+            from .stream_lifecycle import owned_chat_stream
+
+            response_stream = self.chat_completion_stream_generator(
                 request,
                 result_generator,
                 request_id,
@@ -1019,6 +1046,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 mm_token_counts=mm_token_counts,
                 raw_request=raw_request,
             )
+            if getattr(self.model_config.hf_config, "model_type", None) == "drvexo_speech_8b":
+                return owned_chat_stream(response_stream, result_generator, self.engine_client, request_id)
+            return response_stream
 
         try:
             return await self.chat_completion_full_generator(
@@ -2563,6 +2593,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt_token_ids = None
         kv_transfer_params = None
         response_metrics: dict[str, Any] | None = None
+        combine_text_audio = getattr(self.model_config.hf_config, "combine_text_audio_response", False) is True
+        spoken_text: dict[int, str] = {}
 
         # For text+audio requests the audio final output shares output
         # indexes with the text final output. Collect audio choices and
@@ -2579,6 +2611,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             choices_data = []
             if not omni_outputs.finished:
                 continue
+
+            if combine_text_audio and omni_outputs.final_output_type == "text":
+                for output in omni_outputs.outputs:
+                    text = getattr(output, "cumulative_text", None) or output.text
+                    if isinstance(text, str):
+                        spoken_text[output.index] = text
 
             # Filter outputs based on requested modalites
             if requested_modalities is not None and omni_outputs.final_output_type not in requested_modalities:
@@ -2644,6 +2682,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         if pending_audio_choices:
             choices = self._merge_audio_choices(choices, pending_audio_choices)
+        if combine_text_audio:
+            from .text_audio_response import combine_text_audio_choices
+
+            choices = combine_text_audio_choices(choices, spoken_text)
 
         response_metrics = self._filter_stage_metrics_detail(response_metrics, request)
 

@@ -217,3 +217,29 @@ stage lifecycle ownership in the parent composition root.
   import boundaries enforce it.
 - Obtain approval from a technical owner and an independent validation
   reviewer.
+
+## DRVEXO opt-in extensions
+
+For a `drvexo_speech_8b` chat config the composition root mounts explicit
+speech and General candidate-scoring routes after initializing serving state.
+Other model configurations do not expose these routes. Ordinary chat does
+not call a device classifier or replace model generation with fixed replies.
+The General endpoint accepts caller-defined state/candidates, returns
+non-executable scores, and skips engine work when explicitly disabled.
+Each recognition, synthesis or candidate-prefill operation owns a unique
+engine request ID; cancellation closes its generator and aborts only that ID.
+Response wrappers shield asynchronous close propagation on disconnect.
+Caller-text speech routes share the Talker's control-token and exact-round-trip
+validation before submitting engine work; failures return 400. The complete
+pipeline loads its local Talker tokenizer once at API bootstrap. A partial
+pipeline returns 503 for sentence speech. NDJSON orchestration cancels and
+joins both workers even when disconnect interrupts an error-event put into
+a full event queue; the cancelled owner does not enqueue a terminal marker.
+Each API process admits one enabled General request at a time (429 when busy)
+and limits scoring to 120 seconds (504 after owned-request cleanup on timeout).
+This bounds decision admission, not shared-Thinker fairness or throughput.
+The chat/audio NDJSON wrapper re-enters the local HTTP stack using the actual
+IPv4/IPv6 listening socket and end-to-end auth/tracing headers, excluding
+transport/proxy-forwarding headers. Direct TLS and Unix socket listeners are
+explicitly unsupported for that wrapper (503); standard endpoints are unchanged.
+See [DRVEXO](../../models/drvexo_speech_8b.md) for schemas and limits.

@@ -1246,6 +1246,7 @@ def test_sub_config_fields_match_structured_scopes():
         "generation_config",
         "override_generation_config",
         "enable_prompt_embeds",
+        "enable_mm_embeds",
         "scheduling_metadata_adapter",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
@@ -2633,3 +2634,20 @@ def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
     assert structured.model_config.recompute_preemption == expected
     if execution_type is not StageExecutionType.LLM_AR:
         assert "recompute_preemption" not in legacy.yaml_engine_args
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_drvexo_mm_embeds_override_reaches_typed_and_legacy_engine_args(enabled, tmp_path):
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    pipeline = _resolve_pipeline_or_skip("drvexo_speech_8b")
+    deploy = load_deploy_config(_DEPLOY_DIR / "drvexo_speech_8b.yaml")
+    deploy.stages[0].engine_extras["enable_mm_embeds"] = enabled
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0]
+    assert legacy.yaml_engine_args["enable_mm_embeds"] is enabled
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert config.stage_by_id(0).model_config.enable_mm_embeds is enabled
+    args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(0), model=str(tmp_path))
+    assert OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args)).enable_mm_embeds is enabled

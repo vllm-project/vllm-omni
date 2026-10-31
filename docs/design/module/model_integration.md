@@ -65,3 +65,42 @@ adapter live under `platforms/npu/models/` and `platforms/npu/quant/`. Shared
 model code selects these adapters lazily on NPU; CUDA keeps the upstream
 implementations. Generic eager kernels and request-history snapshots remain
 in the shared model implementation.
+
+## DRVEXO component views
+
+DRVEXO registers a `drvexo_unified` local-only loader through the existing
+plugin and declares its Thinker/Talker/Codec topology in the pipeline
+registry. Stage-local JSON views resolve namespaced tensors in one root
+safetensors index; they do not materialize another checkpoint. Qwen3-TTS
+subfolder reads select the configured loader as well, so Talker, Codec and
+the optional first-frame decoder preserve the complete checkpoint format.
+The Thinker
+reuses upstream Qwen3 execution and adds an audio encoder/input projector
+and explicit final-prefill candidate scoring. Stage transitions remain owned
+by the pipeline/orchestrator. See [DRVEXO](../../models/drvexo_speech_8b.md)
+for runtime restrictions and validation scope.
+
+### Runner payloads at downstream entry stages
+
+When processing a raw prompt for a downstream entry or handoff stage, preserve
+`model_intermediate_buffer` on the upgraded `OmniEngineCoreRequest`, alongside
+serialized routing metadata. A processed request's buffer is authoritative;
+the raw prompt is only a fallback, including for other pipelines using this
+shared path. On admission the runner combines that buffer with the same
+request's decoded routing metadata (routing keys win conflicts), then installs
+a snapshot when the combined payload is nonempty. An empty admission means
+no metadata update and preserves preseeded or resumed state. Invalid legacy
+serialized metadata is logged and ignored within its decoding boundary;
+valid current-request buffer data and other admissions are still processed.
+For a nonempty snapshot, omitted keys from an earlier admission are cleared, apart from
+the existing streaming `meta.num_processed_tokens` / `meta.resumable` lifecycle
+fields. Model-produced incremental updates still use the separate merge path.
+A direct speech request carries its caller text and fixed-reply provenance in
+the snapshot; dropping that state incorrectly selects the generated-token path.
+
+Qwen3-TTS subfolder reads keep a selected `DefaultModelLoader` subclass,
+including the unified-checkpoint loader. Other outer-model loader protocols
+fall back to a separate native `auto` loader for tokenizer assets, without
+mutating their outer load configuration or forwarding format-specific options.
+This includes an outer `dummy` loader: native speech-tokenizer subfolder assets
+are deliberately loaded from disk rather than dummy-initialized.
