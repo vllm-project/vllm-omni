@@ -214,29 +214,93 @@ cost of a pipeline contract the scheduler must not assume generically:
   stays in the key and per-prompt `additional_information` requests keep
   their key.
 
-With the capability present, `QwenImagePipeline.denoise_step` dispatches on
-list latents to `_denoise_step_mixfusion`, which packs eligible requests into
-ragged latents (text-then-image token order per request) and runs one packed
-forward. Requests fall back to `_denoise_step_serial_ragged` when they carry
-image latents (edit path), raise `zero_cond_t`, run with SP>1, have active
-forward hooks, run with `do_true_cfg`, or when MixFusion hooks are not
-installed on the transformer (`_mixfusion_hooks_applied`); per-request
-thresholds (`mixfusion_min_chunk_tokens`, `mixfusion_max_chunks`) are
-aggregated as max/min across the batch. Backends without packed varlen support (e.g. NPU)
+With the capability present, the model runner hands every denoise step to
+`pipeline.mixfusion_driver`, a model-agnostic `MixFusionDriver` that
+`registry._apply_mixfusion_if_enabled` mounts at model load. The driver
+dispatches on the batch: dense (tensor) latents go straight to
+`pipeline.denoise_step`; list latents return `None` when the pipeline is
+interrupted and otherwise take one packed forward only when
+`MixFusionDriver.admit` accepts them. Rejected batches fall back to `serial_ragged`, which rebuilds one
+single-request dense batch per request and calls the same `denoise_step`
+with flattened latents, so per-image conditioning stays aligned.
+
+Admission rejects, in order:
+
+- a transformer without a `mixfusion_adapter`;
+- a transformer whose `_mixfusion_plan` hooks were not applied
+  (`_mixfusion_hooks_applied`);
+- a non-empty `pipeline.attention_kwargs` (the packed forward has no
+  `attention_kwargs` channel, so the serial path threads them into every
+  block instead);
+- `sequence_parallel_size > 1` (packing already splits and stacks the image
+  stream; SP would shard rows a second time);
+- `do_true_cfg` and image latents (edit path);
+- foreign forward hooks on any module the plan touches, reported by
+  `plan_foreign_hooks` as `<plan name>:torch-native` (layerwise offload,
+  FSDP2 or cache hooks would see a layout they were not written for);
+- a chunk policy the layout cannot meet: the greatest common divisor of the
+  per-request sequence lengths is the chunk size, which must be at least
+  `mixfusion_min_chunk_tokens`, and the total chunk count must not exceed
+  `mixfusion_max_chunks`. Per-request extras are aggregated conservatively
+  (max of the minimums, min of the maximums; defaults 256 and 128), so no
+  request's limits are violated by fusing the batch.
+
+Backends without packed varlen support (e.g. NPU)
 are served by the attention layer's automatic fallback: documents are grouped
 by length into mask-free dense forwards, so the packed dispatch stays active
 and documents remain isolated without a per-request loop.
 
-Known limitation: the packed dispatch does not thread `attention_kwargs`
+Known limitation: the packed path does not thread `attention_kwargs`
 into the packed forward. To keep them from being dropped silently, the
-pipeline falls back to the serial ragged path when they are set; features
+driver falls back to the serial ragged path when they are set; features
 that rely on them (e.g. LoRA scales, TeaCache) therefore lose MixFusion
-batching until `_denoise_step_mixfusion` learns to forward them.
+batching until the packed call grows an `attention_kwargs` channel.
+
+#### Adapter / driver layering
+
+MixFusion is split into three layers so that adding a model touches only the
+model-specific one:
+
+| Layer | Location | Owns |
+|---|---|---|
+| Driver | `vllm_omni/diffusion/mixfusion/driver.py` (`MixFusionDriver`) | Step dispatch, admission, chunk-policy aggregation, arming/restoring `MixFusionStep`, serial-ragged fallback |
+| Hooks + execution plan | `vllm_omni/diffusion/hooks/mixfusion.py`, `mixfusion/plan.py`, `mixfusion/execution_plan.py` | Applying `_mixfusion_plan` at module boundaries, the chunk-stacked layout (`PackedExecutionPlan`, gather/scatter, chunk split/reassembly), carrying opaque `PackedInputs` payloads |
+| Adapter | `vllm_omni/diffusion/models/<model>/mixfusion_adapter.py` | The model's forward signature and packed-call shape, attention-stream declaration, packing/preparation and output restoration |
+
+Framework responsibilities:
+
+- `registry._apply_mixfusion_if_enabled` mounts the driver and calls
+  `apply_mixfusion(transformer, plan)`; the hooks stay inert unless the
+  driver arms a `MixFusionStep`.
+- The driver never interprets the model-specific payloads it carries
+  (`PackedInputs.boundary_outputs` / `adapter_state`); it only moves them
+  between the hooks the plan declares.
+- The layout primitives (`gcd_chunk_size`, `plan_chunk_size`,
+  `build_execution_plan`, `split_sequence_chunks`, `expand_per_chunk`,
+  `reassemble_chunk_rows`) know only `AttentionLayout`/`StreamSpec` and
+  tensors.
+
+Model responsibilities:
+
+- Implement the `MixFusionAdapter` protocol: `build_packed_call`,
+  `can_pack`, `build_attention_layout`, `pack_inputs`, `restore_output`.
+  The protocol is structural (`runtime_checkable`): an adapter only needs
+  the methods, not a base class.
+- Declare `_mixfusion_plan` on the transformer and register the adapter as
+  `mixfusion_adapter`.
+- Keep mixed-resolution attention in the model's attention leaf, which reads
+  the stream layout from the armed step instead of a forward argument.
+
+`QwenImageMixFusionAdapter` is the reference implementation. Porting a model
+therefore means adding `models/<model>/mixfusion_adapter.py`, registering the
+adapter and `_mixfusion_plan` in `transformer.py`, and adding a model test;
+the driver, hooks and execution plan stay unchanged.
 
 #### Layout abstraction
 
 The sequence chunking/restoration primitives are model-agnostic and live in
-`vllm_omni/diffusion/mixfusion` (`MixFusionPlan`, `build_mixfusion_plan`,
+`vllm_omni/diffusion/mixfusion/execution_plan.py` (`PackedExecutionPlan`,
+`build_execution_plan`, `gcd_chunk_size`, `plan_chunk_size`,
 `split_sequence_chunks`, `reassemble_chunk_rows`, `expand_per_chunk`),
 analogous to how `_sp_plan` centralizes sequence-parallel layout. A model
 adopts the layout by declaring `_mixfusion_plan`, the MixFusion counterpart
@@ -244,33 +308,35 @@ of `_sp_plan`, and does not branch on MixFusion in its forward code:
 
 ```python
 _mixfusion_plan = {
-    "": MixFusionRoot(pack_method="prepare_mixfusion_inputs"),
-    "image_rope_prepare": MixFusionRopePrepare(),
+    "": MixFusionRoot(),
+    "image_rope_prepare": MixFusionReplaceOutput(boundary="rope"),
     "transformer_blocks.*.img_mod": MixFusionExpandRows(),
+    "norm_out": MixFusionExpandArg(arg_name="conditioning_embedding"),
 }
 ```
 
-- `initialize_model` applies the plan with `apply_mixfusion`, mirroring
-  `apply_sequence_parallel_if_enabled`; the hooks are registered at the
-  declared module boundaries and stay inert unless the pipeline arms a
-  `MixFusionStep` on the forward context.
-- `_denoise_step_mixfusion` arms that step for exactly the packed
-  transformer call and restores the previous value afterwards. The root
-  hook then packs the per-request latent list at the model boundary, the
-  rope hook hands forward the packed frequency tensors, and expand hooks
-  map per-request conditioning rows to per-chunk rows. Without an armed
-  step the model runs its serial forward unchanged.
+- `apply_mixfusion` registers the hooks at the declared module boundaries;
+  they stay inert unless the driver arms a `MixFusionStep` on the forward
+  context.
+- `MixFusionDriver.armed` arms that step for exactly the packed transformer
+  call and restores the previous value afterwards (CFG may call the
+  transformer twice per step). The root hook then asks the adapter to pack
+  the per-request latent list, `MixFusionReplaceOutput` hands `forward` the
+  adapter-computed packed value for that boundary (e.g. the packed hidden
+  states and RoPE tables), and the expand hooks map per-request conditioning
+  rows to per-chunk rows. Without an armed step the model runs its serial
+  forward unchanged.
 - Attention remains the one layout-aware leaf: the packed layout has
   image-batch = num-chunks versus text-batch = num-requests, so joint
   attention reassembles the per-request logical domain itself instead of
   relying on a shared batch dimension. It reads the plan from the armed
   step instead of a forward argument.
-- Paths the packed layout cannot express (`zero_cond_t`, block or root
-  hooks, non-empty `attention_kwargs`) are rejected by guards in
-  `prepare_mixfusion_inputs`, and the pipeline falls back to the serial
-  path. The fused joint QK-norm-RoPE table is disabled while a step is
-  armed, because text (per-request) and image rows (per-chunk) cannot share
-  one table.
+- Paths the packed layout cannot express are refused by the driver's
+  admission guards (above); model-specific refusals live in the adapter.
+  For Qwen-Image, `can_pack` keeps a batched tensor on the serial forward,
+  and `prepare_inputs` raises on `zero_cond_t` (editing). The fused joint
+  QK-norm-RoPE table is disabled while a step is armed, because text
+  (per-request) and image rows (per-chunk) cannot share one table.
 
 ## Model Author Guidelines
 

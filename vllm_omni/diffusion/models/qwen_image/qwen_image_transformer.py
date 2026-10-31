@@ -795,11 +795,11 @@ class QwenImageCrossAttention(nn.Module):
         encoder_hidden_states_mask: torch.Tensor | None = None,
         qk_norm_rope_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The packed MixFusion plan travels on the forward context (armed by
-        # the pipeline's `_denoise_step_mixfusion`, filled by the root hook)
-        # so this signature stays free of MixFusion threading. No context / no
-        # armed step (serial forwards, unit tests) means the packed branch
-        # below stays dormant.
+        # The packed MixFusion plan travels on the forward context (the
+        # MixFusionDriver arms the step, the root hook fills it in) so this
+        # signature stays free of MixFusion threading. No context / no armed
+        # step (serial forwards, unit tests) means the packed branch below
+        # stays dormant.
         mixfusion_plan = None
         if is_forward_context_available():
             step = get_forward_context().mixfusion_step
@@ -1208,7 +1208,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
     }
 
     # MixFusion packed-layout plan (the MixFusion counterpart of _sp_plan, see
-    # mixfusion/plan.py). The pipeline arms a MixFusionStep on the
+    # mixfusion/plan.py). The MixFusionDriver arms a MixFusionStep on the
     # forward context per packed denoise step; these boundary hooks then run
     # the chunk-stacked layout without any MixFusion branching in forward().
     _mixfusion_plan = {

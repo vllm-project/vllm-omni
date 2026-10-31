@@ -595,7 +595,7 @@ def initialize_model(
 
         # Apply the MixFusion packed-layout hooks declared by _mixfusion_plan.
         # They are the MixFusion counterpart of _sp_plan and stay inert unless
-        # the pipeline arms a MixFusionStep on the forward context.
+        # the MixFusionDriver arms a MixFusionStep on the forward context.
         _apply_mixfusion_if_enabled(model, od_config)
 
         # Install the Wan VAE decoder fast path once the VAE parallel mode is
