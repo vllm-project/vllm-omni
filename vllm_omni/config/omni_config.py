@@ -1855,7 +1855,11 @@ def _build_common_stage_config_kwargs(
     model: str | None,
 ) -> tuple[dict[str, Any], str | None, str | None]:
     input_proc, next_stage_proc = _select_processor_funcs(topology, resolve_stage_async_chunk(deploy, stage_deploy))
-    quantization_config = _build_quantization_config(deploy, engine.quantization)
+    quantization_config = _build_quantization_config(
+        deploy,
+        engine.quantization,
+        is_diffusion=topology.execution_type == StageExecutionType.DIFFUSION,
+    )
     parallel_config = _build_parallel_config(deploy, engine.parallel, parallel_config_cls)
 
     return (
@@ -2043,12 +2047,16 @@ def _build_stage_config(
 def _build_quantization_config(
     deploy: DeployConfig,
     engine: _QuantizationEngineOverrides,
+    *,
+    is_diffusion: bool = False,
 ) -> _QuantizationConfigType:
-    return _first_defined(
-        engine.get("quantization_config"),
-        engine.get("quantization"),
-        deploy.quantization,
-    )
+    config = engine.get("quantization_config")
+    method = _first_defined(engine.get("quantization"), deploy.quantization)
+    if not is_diffusion and isinstance(method, str) and isinstance(config, Mapping) and "method" not in config:
+        # vLLM combines --quantization with --quantization-config, e.g. an
+        # online shorthand with an ignore list. Keep both for LLM stages.
+        return {"method": method, **_copy_value(config)}
+    return _first_defined(config, method)
 
 
 def _build_model_config(
