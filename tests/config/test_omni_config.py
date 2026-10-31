@@ -228,6 +228,16 @@ def test_duplex_worker_capacity_matches_both_config_build_paths(session_mode, pl
     assert deploy.duplex_session.max_sessions == 11
 
 
+@pytest.mark.parametrize(("platform", "capacity"), [("cuda", 32), ("npu", 16)])
+def test_minicpmo_platform_session_capacity_reaches_structured_stages(monkeypatch, platform, capacity):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    config = _from_pipeline_key("minicpmo_4_5", deploy_config_path="minicpmo_4_5")
+    assert [stage.model_config.duplex_max_sessions for stage in config.stage_configs] == [capacity] * 3
+    assert [stage.scheduler_config.max_num_seqs for stage in config.stage_configs] == [capacity] * 3
+
+
 def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
     deploy_path = tmp_path / "personaplex-turn.yaml"
     deploy_path.write_text("session_mode: turn\n", encoding="utf-8")
@@ -563,8 +573,8 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
     if deploy_name == "minicpmo_4_5":
         # Single-card deploy: batch sizes round up to a capture bucket so the
-        # 32-entry pool covers the shape space.
-        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
+        # bounded pool can reuse captures across nearby batch sizes.
+        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8, 16]
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
     assert engine_args["additional_config"] == expected

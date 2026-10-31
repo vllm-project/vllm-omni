@@ -1,5 +1,10 @@
 # MiniCPM-o 4.5 MRv2 profiles
 
+The default `minicpmo_4_5.yaml` selects MRv1 for all three stages, including
+CUDA. Explicit MRv2 profiles opt in on CUDA. CUDA stage 0 uses a full-payload
+handoff; downstream stages retain streaming chunks. The ordinary turn profile
+keeps Thinker prefix caching disabled with either runner.
+
 Turn mode uses the stage-level MRv2 contracts from #8184. Thinker emits live
 latent metadata outside graph replay; Talker keeps codec history and EOS
 control on device. Code2Wav reuses mainline Whole-Euler Flow graphs and shared
@@ -17,9 +22,9 @@ ordinary TF32 for CFM DiT GEMMs within Code2Wav forward/capture only
 `input_precision="tf32"` on tiled attention). This is not compensated TF32x3.
 The previous process matmul policy is restored afterwards. cuDNN's TF32 policy
 is independent. HiFT stays IEEE FP32. TF32 changes rounding.
-Duplex defaults to the V1 session path; `minicpmo_4_5_duplex_mrv2.yaml` is the
-opt-in CUDA overlay that runs all three duplex stages on MRv2. Turn results do
-not establish duplex performance or interruption correctness.
+Duplex defaults to MRv1; `minicpmo_4_5_duplex_mrv2.yaml` opts into MRv2
+on CUDA. Other platforms keep V1. Turn results
+do not establish duplex performance or interruption correctness.
 
 The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
 NPU, subject to architecture and attention-cache eligibility. CUDA accepts
@@ -124,8 +129,8 @@ or reference normalization policy.
 
 ## Full-duplex MRv2
 
-`minicpmo_4_5_duplex_mrv2.yaml` opts all three CUDA stages into MRv2 and
-otherwise inherits the default duplex profile; non-CUDA platforms keep V1.
+`minicpmo_4_5_duplex_mrv2.yaml` opts all three CUDA stages into MRv2;
+the default duplex profile and non-CUDA platforms keep V1.
 Stage 0 keeps `async_chunk: false` because the Thinker has no async producer:
 as on V1, the orchestrator hands each finished segment to `llm2tts`.
 The Talker reuses the streaming prompt recipe (full attention extends its KV
@@ -266,3 +271,82 @@ changing backend versions; floating-point waveform identity is not promised.
 `platforms.cuda.cuda_mps`. Profiles that inherit it, including
 `minicpmo_4_5_turn.yaml`, inherit both. Set either key to `false` in an
 overlay to disable that part.
+
+## V1 Talker decode bookkeeping
+
+The CUDA V1 Talker uses the existing batch-preprocess row-fill hook for batches
+containing only one-token decode requests with initialized audio state. It
+checks the current request order, token offsets and prompt boundaries on every
+step; it does not cache metadata by batch size. New admissions, preemption
+resumes, mixed prefill/decode and K-step execution keep the generic path.
+The hook preserves condition metadata and updates only the live decode fields
+and the empty codec delta; the Talker still owns the sampled-id snapshot.
+
+For a full CUDA decode batch, codec ids, validity and completion flags stay
+batched until the runner's owned output snapshot has been copied. The output
+finalizer then restores per-request tensors and scalar completion flags.
+Mixed batches retain row-wise output. CPU placeholders are allocated only for
+rows without a device result. Snapshot ownership remains necessary even when
+all rows share one tensor: producer buffers may be overwritten on the next
+step.
+
+These shortcuts target V1. The opt-in CUDA MRv2 Talker already skips identity
+decode preprocessing and emits device batches, so a V1 improvement alone does
+not establish a speedup for the opt-in MRv2 deployment.
+
+## Reference reuse across concurrent bursts
+
+The default `minicpmo_4_5.yaml` sets the runtime reference cache retention target
+to 16 instead of the backend default of 4. Each retained entry keeps its
+temporary reference WAV and cached speech tokens, speaker embedding and mel
+features. Unowned, unpinned entries are evicted when the total exceeds the
+target. Active requests and prefetch pins keep their existing ownership rules
+and may temporarily exceed it; the CFM setup cache is unchanged.
+
+This targets repeated references across concurrent bursts. The first 16
+English SeedTTS requests use nine different references, so a capacity of four
+cannot retain the full warmed set. Fresh references still require extraction;
+a warm-reference speedup does not establish cold-reference performance.
+Override `token2wav_runtime_prompt_cache_size` in connector `extra` to trade
+retention memory and temporary-file space for reuse. The backend default remains
+four; overlays inheriting this profile also inherit its retention setting unless
+they override it.
+
+## Warm-reference retention validation
+
+Compared `4dc28a45f8` with only `token2wav_runtime_prompt_cache_size` changed
+from 4 to 16. Same reserved NVIDIA L20X GPU 1, vLLM 0.32.0, Torch 2.13.0+cu130,
+MPS and Torch speaker backend; all three stages stay on MRv2. The measured
+cache overlay is semantically identical to the updated deployment YAML.
+
+Fixed English SeedTTS order, C16/N16, 16 warmup requests per startup, five
+measured rounds per startup, two independent starts per configuration.
+Baseline starts bracketed the experiment session. Each configuration completed
+160/160 measured requests without failures; profiling was inactive during
+measurement. These 16 requests reuse nine references. This measures retention
+across warmed bursts, not cold-reference latency or arbitrary reference mixes.
+
+| Metric, mean of ten rounds | Cache 4 | Cache 16 | Change |
+| --- | ---: | ---: | ---: |
+| Mean E2E (ms) | 1479 | 1278 | -13.6% |
+| Mean audio TTFP (ms) | 1008 | 789 | -21.7% |
+| Request throughput (req/s) | 9.467 | 10.687 | +12.9% |
+| Mean audio RTF | 0.3978 | 0.3415 | -14.2% |
+| Generated audio per round (s) | 64.128 | 64.208 | +0.1% |
+
+The same 128 utterances were evaluated twice per configuration with Whisper
+large-v3 and WavLM base-plus pooled embedding cosine (not official UniSpeech
+speaker-verification SIM). All 256 requests per configuration were scored;
+there were no failed requests, empty/missing audio, ASR failures or SIM failures.
+Mean utterance WER was **2.366% → 2.032%**; cosine similarity was
+**0.8478 → 0.8479**. After averaging the two runs per utterance, paired
+bootstrap 95% intervals for cache-16 minus cache-4 were
+**[-0.836, +0.109] percentage points** for WER and
+**[-0.00087, +0.00125]** for similarity. This does not prove
+accuracy equivalence or an accuracy improvement.
+
+Configuration and Code2Wav cache regressions: **1284 passed, 1 skipped**.
+Local pre-commit and `git diff --check` passed. No NPU/ROCm hardware, CUDA C32,
+or full repository suite was run for this retention change. Higher retention
+keeps more idle reference features and temporary WAVs; active/pinned ownership
+and the CFM setup-cache capacity are unchanged.

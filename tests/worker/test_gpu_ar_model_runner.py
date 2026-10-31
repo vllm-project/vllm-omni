@@ -2360,3 +2360,22 @@ def test_shutdown_drains_output_builder_before_releasing_runner_state(mocker):
         stopped.result(timeout=5)
     assert order == ["built", "clear", "shutdown"]
     assert runner._omni_output_executor is None
+
+
+@pytest.mark.parametrize("shape", [(), (1, 1), (2, 3), (0, 1)])
+@pytest.mark.parametrize("is_tuple", [False, True])
+def test_unpack_equal_shape_snapshot_preserves_rows_and_container(shape, is_tuple):
+    count = 16
+    size = torch.Size(shape)
+    flat = torch.arange(count * size.numel())
+    packed = gpu_ar_model_runner._PackedTensorPayload(flat, [size] * count, is_tuple)
+    rows = gpu_ar_model_runner._copy_tensor_payload_to_cpu(packed, pin_memory=False)
+    assert type(rows) is (tuple if is_tuple else list)
+    assert len(rows) == count
+    for index, row in enumerate(rows):
+        expected = torch.arange(index * size.numel(), (index + 1) * size.numel()).reshape(shape)
+        torch.testing.assert_close(row, expected)
+    if flat.numel():
+        # Unpacking preserves views of the owned snapshot, without row copies.
+        flat.fill_(-1)
+        assert all(torch.all(row == -1) for row in rows)

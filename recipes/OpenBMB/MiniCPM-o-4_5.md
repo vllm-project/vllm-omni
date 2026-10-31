@@ -70,6 +70,33 @@ Code2Wav consumes them through a shared-memory async connector.
 | 3-GPU | GPU 0 | GPU 1 | GPU 2 | 3x GPU |
 | 8x RTX 4090 24GB | GPU 0–3 (TP=4) | GPU 4 | GPU 5 | 8x RTX 4090 consumer |
 
+### Default model runner
+
+The default deployment uses Model Runner V1 for all three stages, including
+CUDA. The Thinker hands its complete payload to Talker (`async_chunk: false`
+on CUDA stage 0); Talker and Code2Wav continue streaming chunks.
+
+To opt into Model Runner V2 on CUDA, use `minicpmo_4_5_duplex_mrv2.yaml`
+or `minicpmo_4_5_turn_mrv2.yaml` for the corresponding serving mode.
+The ordinary turn profile also defaults to V1 and keeps Thinker prefix
+caching disabled.
+
+### Single-device concurrency
+
+The default `minicpmo_4_5.yaml` profile allows 32 concurrent sequences per
+stage on CUDA and 16 on NPU, with matching duplex session limits. CUDA
+reserves 8 GiB for Talker KV; NPU reserves 4 GiB. At the Talker's 4096-token
+context limit, these settings need at least 131072 and 65536 KV tokens,
+respectively. Check the reported KV capacity at startup, including speculative
+lookahead on NPU, because physical-preemption replay is unsupported.
+
+These are admission and scheduling limits, not measured throughput guarantees.
+Concurrent Code2Wav request caches and graph buffers also consume device memory;
+validate peak memory and audio latency on the target card and workload. The NPU
+CFM capture buckets include batch 16 while the graph pool remains capped at 32.
+Profiles inheriting these values also inherit the new limits unless they
+explicitly override them.
+
 ### Migration from the fused deployment
 
 MiniCPM-o 4.5 now requires the three-stage topology: the Talker owns

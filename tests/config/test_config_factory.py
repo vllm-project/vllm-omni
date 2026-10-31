@@ -1516,12 +1516,12 @@ class TestDeployConfigLoading:
     @pytest.mark.parametrize(
         ("filename", "max_sessions"),
         [
-            ("minicpmo_4_5.yaml", 16),
+            ("minicpmo_4_5.yaml", 32),
             ("minicpmo_4_5_2gpu.yaml", 4),
             ("minicpmo_4_5_3gpu.yaml", 4),
             ("minicpmo_4_5_8x4090.yaml", 1),
-            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
-            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 16),
+            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 32),
+            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 32),
             ("minicpmo_4_5_8x4090_stage1_replicas.yaml", 1),
         ],
     )
@@ -1610,7 +1610,7 @@ class TestDeployConfigLoading:
                 "prompt_lookup_max": 1,
             }
             assert stages[1].yaml_engine_args["async_scheduling"] is False
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
         else:
             assert "stop_token_ids" not in (deploy_stage1.default_sampling_params or {})
             # Without the block the head is the full codec vocabulary, so the
@@ -1624,7 +1624,7 @@ class TestDeployConfigLoading:
             assert stages[1].yaml_engine_args["async_scheduling"] is True
             # Base concurrency stays 16; only the NPU overlay lowers it to 8,
             # so a CUDA deployment keeps the pipeline default.
-            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [32, 32, 32]
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
@@ -2072,7 +2072,7 @@ stages:
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
-            ("minicpmo_4_5_turn.yaml", "cuda", True),
+            ("minicpmo_4_5_turn.yaml", "cuda", False),
             *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5_turn_mrv2.yaml", "cuda", False),
             ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", False),
@@ -3185,8 +3185,38 @@ class TestPlatformOverrides:
 
         deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
         stages = merge_pipeline_deploy(pipeline, deploy)
-        # Both single-device profiles reserve headroom for colocated Code2Wav.
-        assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
+        # CUDA admits 32 requests; NPU admits 16, each with a 4096-token Talker.
+        concurrency = 32 if platform == "cuda" else 16
+        assert deploy.duplex_session.max_sessions == concurrency
+        assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [concurrency] * 3
+        assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == (8 if platform == "cuda" else 4) * 1024**3
+
+    def test_platform_duplex_session_preserves_other_limits(self, tmp_path):
+        deploy_path = tmp_path / "deploy.yaml"
+        deploy_path.write_text(
+            "duplex_session:\n  max_sessions: 32\n  idle_ttl_s: 123\n"
+            "platforms:\n  npu:\n    duplex_session:\n      max_sessions: 16\n",
+            encoding="utf-8",
+        )
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        assert deploy.duplex_session.max_sessions == 16
+        assert deploy.duplex_session.idle_ttl_s == 123
+        assert deploy.duplex_session.worker_max_sessions == 16
+
+    @pytest.mark.parametrize("override", ["[]", "null", "{max_sessions: 0}", "{unknown_limit: 16}"])
+    def test_platform_duplex_session_rejects_invalid_limits(self, tmp_path, override):
+        deploy_path = tmp_path / "deploy.yaml"
+        deploy_path.write_text(f"platforms:\n  npu:\n    duplex_session: {override}\n", encoding="utf-8")
+        with pytest.raises((ValueError, TypeError)):
+            _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+
+    def test_minicpmo_stage2_replicas_keep_npu_session_capacity(self):
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5_stage2_replicas.yaml"))),
+            platform="npu",
+        )
+        assert deploy.duplex_session.max_sessions == 4
+        assert all(stage.max_num_seqs == 4 for stage in deploy.stages)
 
     def test_minicpmo_4_5_cuda_replicas_use_automatic_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
@@ -3201,7 +3231,7 @@ class TestPlatformOverrides:
                 load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
             )
             replica_stages = merge_pipeline_deploy(pipeline, replica)
-            # Explicit null clears the inherited single-GPU 4 GiB CUDA cap.
+            # Explicit null clears the inherited single-GPU 8 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
     def test_fish_speech_npu_uses_ascend_kv_block_size(self):
@@ -3212,18 +3242,25 @@ class TestPlatformOverrides:
         assert deploy.stages[0].engine_extras["block_size"] == 128
 
     @pytest.mark.parametrize(
-        "filename,pipeline_key",
+        "filename,pipeline_key,cuda_default_runner,cuda_v2",
         [
-            ("qwen3_tts_mrv2.yaml", "qwen3_tts"),
-            ("moss_tts_local.yaml", "moss_tts_local"),
+            ("qwen3_tts_mrv2.yaml", "qwen3_tts", "v2", True),
+            ("moss_tts_local.yaml", "moss_tts_local", "v2", True),
+            ("minicpmo_4_5.yaml", "minicpmo_4_5", "v1", False),
+            ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v1", False),
+            ("minicpmo_4_5_duplex_mrv2.yaml", "minicpmo_4_5", "v2", True),
+            ("minicpmo_4_5_turn_mrv2.yaml", "minicpmo_4_5", "v1", True),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
-    def test_recommended_native_runner_platform_defaults(self, platform, filename, pipeline_key):
+    def test_recommended_native_runner_platform_defaults(
+        self, platform, filename, pipeline_key, cuda_default_runner, cuda_v2
+    ):
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
-        expect_v2 = platform == "cuda"
-        assert deploy.model_runner == ("v2" if expect_v2 else "v1")
+        expect_v2 = platform == "cuda" and cuda_v2
+        # The turn MRv2 overlay selects V2 per stage, retaining the V1 global default.
+        assert deploy.model_runner == (cuda_default_runner if platform == "cuda" else "v1")
 
         # The selection must reach the live worker-dispatch consumer, not just
         # the transport-level DeployConfig field.

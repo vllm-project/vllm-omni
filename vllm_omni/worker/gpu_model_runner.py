@@ -1958,8 +1958,15 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # need the scheduled token ids to build or replace those embeddings.
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
             preprocess_device = preprocess_input_ids.device
+            batch_preprocess_embeds = inputs_embeds
+            if getattr(self.model, "preprocess_batch_requires_stable_decode", False) and (
+                scheduler_output.scheduled_new_reqs or scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            ):
+                # Keep cleanup/prefetch hooks, but do not let a decode-only
+                # shortcut consume newly admitted or resumed requests.
+                batch_preprocess_embeds = None
             batch_filled_req_ids = self._maybe_run_batch_preprocess(
-                req_ids, preprocess_device, preprocess_input_ids, inputs_embeds, num_scheduled_tokens_np
+                req_ids, preprocess_device, preprocess_input_ids, batch_preprocess_embeds, num_scheduled_tokens_np
             )
 
             # Overlay custom prompt_embeds per request for the prompt portion;

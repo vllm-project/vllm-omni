@@ -9,7 +9,7 @@ import math
 import re
 import warnings
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -1186,6 +1186,11 @@ def _apply_platform_overrides(
         device_name = current_omni_platform.device_name
         platform = device_name.lower() if device_name is not None else None
     platform_section = (deploy.platforms or {}).get(platform) if platform is not None else None
+    if platform_section is not None and "duplex_session" in platform_section:
+        session_overrides = platform_section["duplex_session"]
+        if not isinstance(session_overrides, dict):
+            raise ValueError("platform duplex_session must be a mapping")
+        deploy.duplex_session = replace(deploy.duplex_session, **session_overrides)
     if platform_section is not None and "cuda_mps" in platform_section:
         cuda_mps = platform_section["cuda_mps"]
         if not isinstance(cuda_mps, bool):
