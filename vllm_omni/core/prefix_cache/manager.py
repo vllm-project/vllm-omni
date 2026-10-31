@@ -851,6 +851,7 @@ class OmniPrefixCacheManager:
 
             if include_uncached:
                 self._merge_uncached_mm(ctx, req_ids, cached_keys, mm_out)
+            self._seed_session_rows(ctx, req_ids, session_for_req, hidden_out, mm_out)
             self._append_session_rows(ctx, req_ids, session_for_req, current)
             return StageCacheOutputs(hidden_states=hidden_out, mm_outputs=mm_out)
         finally:
@@ -1586,6 +1587,72 @@ class OmniPrefixCacheManager:
             return merged
         cached = self._fetch_source(src)
         return torch.cat([cached, new_rows], dim=0)
+
+    def _seed_session_rows(
+        self,
+        ctx: _StepContext,
+        req_ids: list[str],
+        session_for_req: dict[str, str],
+        hidden_out: dict[str, torch.Tensor] | None,
+        mm_out: dict[str, dict[str, Any]],
+    ) -> None:
+        """Seed session streams from pool-hit prefixes (best-effort).
+
+        A session-bound request that starts with a pool hit (hit_end > 0)
+        has no session rows yet when its store is empty — and the
+        continuation rule demands contiguity from 0, so suffix appends
+        at position hit_end are refused forever and the session can
+        never hit. When the pool covers [0, hit_end) — the normal case
+        for a repeated prompt prefix — copy exactly that span into the
+        store first (from this step's merged outputs, which already
+        hold the pool prefix), so the suffix append lands on exact
+        continuation and later turns can hit.
+
+        Best-effort and retried at every materialize while uncovered:
+        a failed seed (race, short merge, shape mismatch) leaves
+        today's stall behavior — no corruption, and the next turn's
+        materialize tries again. Seeding runs after the merge, so pool
+        rows are already validated readable by the merge itself; a
+        discarded prefill (no materialize) only delays seeding by one
+        turn, since the next turn's prefill materialize seeds the full
+        prefix then. Only merged tensors are used: hidden rows are
+        hole-free by contract (hidden rejects absent slots), and mm
+        holes read as zeros exactly as pool-serving does, so seeding
+        preserves pool-serving semantics.
+        """
+        hidden_key = self._policy.hidden_key
+        for req_id in req_ids:
+            hit = ctx.hits.get(req_id)
+            session_id = session_for_req.get(req_id)
+            if not hit or session_id is None:
+                continue
+            hit_upto, _ = hit
+            if hit_upto <= 0:
+                continue
+            merged_by_key: dict[str, torch.Tensor] = {}
+            if hidden_out is not None and hidden_key is not None:
+                merged = hidden_out.get(req_id)
+                if isinstance(merged, torch.Tensor):
+                    merged_by_key[hidden_key] = merged
+            for key, per_req in mm_out.items():
+                merged = per_req.get(req_id)
+                if isinstance(merged, torch.Tensor):
+                    merged_by_key[key] = merged
+            for key in self._policy.get_hit_keys(ctx.cached_keys):
+                merged = merged_by_key.get(key)
+                if merged is None:
+                    continue
+                if self._session_store.covers(session_id, key, hit_upto):
+                    continue
+                if merged.shape[0] < hit_upto:
+                    continue
+                stored = self._session_store.stored_tokens(session_id, key)
+                if stored >= hit_upto:
+                    continue
+                try:
+                    self._session_store.append_if_length(session_id, key, stored, merged[stored:hit_upto])
+                except ValueError:
+                    continue
 
     def _append_session_rows(
         self,

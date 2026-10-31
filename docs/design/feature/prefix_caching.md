@@ -540,9 +540,10 @@ history or ends.
 - Coarse invalidation: `invalidate_session` drops a session's segments
   wholesale on any history mutation (edit, truncation, interruption).
   Segments are per-session copies, so dropping one session can never
-  corrupt another's hits. A later turn whose hit length is nonzero after
-  an invalidation is refused by the continuation rule until a
-  full-prefix turn rebuilds the stream.
+  corrupt another's hits. A later turn whose hit length is nonzero
+  after an invalidation rebuilds the stream from its pool-hit prefix
+  when the pool covers it (materialize seeds [0, hit_end) first); it
+  only stalls when the pool does not cover the prefix.
 - Live-session resume: a later turn's hit is served from the session
   store when it covers the hit prefix (snapshot under the lock,
   concatenated unlocked, so a concurrent invalidate cannot corrupt an

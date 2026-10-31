@@ -2288,6 +2288,36 @@ def test_session_decode_discard_appends_and_next_turn_hits():
         mgr.shutdown()
 
 
+def test_session_warm_pool_start_seeds_store_and_next_turn_hits():
+    mgr, view = make_manager()
+    try:
+        # An unrelated request writes the prompt prefix into the pool.
+        s0 = run_session_step(mgr, view, "x", [0, 1], 0, 8)
+        mgr.materialize(s0, ["x"])
+        # New session, warm pool: the first turn starts with a pool hit
+        # (hit=8) and an empty store. Before the seeding fix this
+        # stalled forever (expected=8 vs actual=0 on every append);
+        # now materialize seeds [0, 8) from the pool, then appends the
+        # suffix, so the stream covers the full prefix.
+        s1 = run_session_step(mgr, view, "a", [0, 1, 2], 8, 4, hit=8, session="S")
+        outs = mgr.materialize(s1, ["a"])
+        assert torch.equal(outs.hidden_states["a"][:8], expected_rows(view.slots_for("x", 0, 8)))
+        assert torch.equal(outs.hidden_states["a"][8:], expected_rows(view.slots_for("a", 8, 12)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            expected_rows(view.slots_for("a", 0, 12)),
+        )
+        # Next turn hits from the session store (not the pool).
+        s2 = run_session_step(mgr, view, "a2", [0, 1, 2, 3], 12, 4, hit=12, session="S", finished=["a"])
+        outs = mgr.materialize(s2, ["a2"])
+        assert torch.equal(outs.hidden_states["a2"][:12], expected_rows(view.slots_for("a", 0, 12)))
+        assert torch.equal(outs.hidden_states["a2"][12:], expected_rows(view.slots_for("a2", 12, 16)))
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 16
+    finally:
+        mgr.shutdown()
+
+
 def test_session_discard_without_binding_is_noop():
     mgr, view = make_manager()
     try:
@@ -2313,9 +2343,23 @@ def test_session_coarse_invalidation_is_negative():
         # Post-invalidation turn: no stale pre-mutation row may be served.
         s3 = run_session_step(mgr, view, "a2", [0, 1, 2], 8, 4, hit=8, session="S", finished=["b"])
         outs = mgr.materialize(s3, ["a2"])
+        # Prefix still comes from the pool (b's current rows), never from
+        # the session's invalidated rows: no stale pre-mutation row served.
         assert torch.equal(outs.hidden_states["a2"][:8], expected_rows(view.slots_for("b", 0, 8)) + 1000)
-        # And no misaligned append: hit (8) != stored (0), stream stalls.
-        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 0
+        # But the stream no longer stalls: with the pool covering the
+        # prefix, materialize seeds [0, 8) from the pool (b's rows) and
+        # appends the suffix, so the stream covers the full prefix and
+        # holds no pre-invalidation row.
+        assert mgr._session_store.stored_tokens("S", HIDDEN_KEY) == 12
+        assert torch.equal(
+            mgr._session_store.fetch("S", HIDDEN_KEY, 12),
+            torch.cat(
+                [
+                    expected_rows(view.slots_for("b", 0, 8)) + 1000,
+                    expected_rows(view.slots_for("a2", 8, 12)),
+                ]
+            ),
+        )
     finally:
         mgr.shutdown()
 

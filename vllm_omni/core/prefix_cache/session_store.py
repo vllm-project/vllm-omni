@@ -17,12 +17,15 @@ Ownership rules, all enforced here so callers cannot misalign rows:
   end of the (session, key) stream; there is no positional write. The
   manager only appends when the turn's hit length equals the stored
   length (exact continuation), so a stream always describes one token
-  sequence from position 0.
+  sequence from position 0. A turn that starts with a pool hit
+  instead seeds the stream first: materialize copies the pool-hit
+  prefix [0, hit_end) into the store, so the suffix append lands on
+  exact continuation (see ``_seed_session_rows``).
 - Coarse invalidation. ``invalidate`` drops a session's segments
   wholesale. After it, the stored length resets to 0 and the next
-  append starts a fresh stream; a turn whose hit length is nonzero
-  after an invalidation is refused by the manager's continuation rule
-  until a full-prefix turn rebuilds the stream.
+  append starts a fresh stream; a later turn whose hit length is
+  nonzero rebuilds the stream from its pool-hit prefix when the pool
+  covers it, and only stalls when the pool does not cover the prefix.
 - Per-session copies, never shared rows. Segments belong to exactly one
   session, so dropping a session can never corrupt another session's
   hits — the hazard that rules out namespacing the slot pool itself.
