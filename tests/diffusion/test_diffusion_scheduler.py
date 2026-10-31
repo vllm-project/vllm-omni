@@ -1209,10 +1209,10 @@ class TestRequestScheduler:
         assert third.num_waiting_reqs == 0
 
     def test_records_initial_scheduler_queue_wait(self, mocker: MockerFixture) -> None:
-        # Clock reads: enqueue, iDRR ordering pass, then the queue-wait record.
+        # Clock reads: enqueue, then the queue-wait record (FIFO policy).
         perf_counter = mocker.patch(
             "vllm_omni.diffusion.sched.base_scheduler.time.perf_counter",
-            side_effect=[10.0, 10.125, 10.125],
+            side_effect=[10.0, 10.125],
         )
         request = _make_step_request("queue-wait", num_inference_steps=2)
 
@@ -1220,7 +1220,7 @@ class TestRequestScheduler:
         self.scheduler.schedule()
 
         assert request.scheduler_queue_wait_ms == pytest.approx(125.0)
-        assert perf_counter.call_count == 3
+        assert perf_counter.call_count == 2
 
     def test_batches_compatible_requests_up_to_max_num_seqs(self) -> None:
         scheduler = RequestScheduler()
@@ -2229,7 +2229,12 @@ class TestStepScheduler:
 
     def test_idrr_aging_promotes_waiting_request_over_new_arrivals(self) -> None:
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+        scheduler.initialize(
+            SimpleNamespace(
+                max_num_seqs=1,
+                diffusion_batching_config={"policy": "compute_budget"},
+            )
+        )
 
         req_first = scheduler.add_request(_make_step_request("first"))
         first = scheduler.schedule()
@@ -2266,6 +2271,50 @@ class TestStepScheduler:
         # The aged expensive request must overtake the younger cheap one even
         # though the cheap one arrived (and was enqueued) first.
         assert _new_ids(second) == [req_expensive]
+        assert second.num_waiting_reqs == 1
+
+    def test_fixed_policy_admits_in_arrival_order_not_idrr_score(self) -> None:
+        """With DRR off, admission is upstream FIFO: no cost/aging reordering.
+
+        This is the switch-off contract: the scheduler must behave exactly as
+        on main, even when a later, costlier request would win the iDRR score.
+        """
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=1))
+
+        req_first = scheduler.add_request(_make_step_request("first"))
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_first]
+
+        req_cheap = scheduler.add_request(
+            _make_step_request(
+                "cheap",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=512,
+                    width=512,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        req_expensive = scheduler.add_request(
+            _make_step_request(
+                "expensive",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=1024,
+                    width=1024,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        self._age_request(scheduler, req_expensive, 120.0)
+
+        scheduler.update_from_output(
+            first,
+            _make_step_output(req_first, step_index=4, finished=True),
+        )
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_cheap]
         assert second.num_waiting_reqs == 1
 
     def test_compute_budget_batching_caps_1024_requests_from_512_profile(self) -> None:

@@ -58,10 +58,6 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
     "use_step_execution",
 }
 
-# iDRR cost-normalization reference: one 512x512 image in packed latents
-# ((512 / 16) ** 2 = 1024 compute units).
-_IDRR_REFERENCE_UNITS = 1024.0
-
 
 def _mixfusion_requested(request: OmniDiffusionRequest, *, server_default: bool, supported: bool) -> bool:
     """Whether ``request`` opts into MixFusion on a capable pipeline.
@@ -104,12 +100,10 @@ def _apply_mixfusion_shape_relaxation(
 class BaseScheduler(ABC):
     """Shared queue/state bookkeeping for diffusion schedulers.
 
-    Waiting requests are ordered by iDRR (cost-normalized aging) score:
-    ``age**alpha / (cost / 1024)**beta``. The head of that order is admitted
-    while it fits into the compute budget; an aged head (waiting longer than
-    ``idrr_reserve_time_s``) reserves the remaining budget gap for itself, while
-    a young head is skipped over so lower-scored requests can still fill the
-    batch.
+    Which waiting requests are admitted, and in what order, is owned by the
+    configured ``DiffusionBatchingPolicy``. The default policy reproduces
+    upstream vLLM's FIFO admission; alternative policies (e.g. compute-budget
+    iDRR) override ``admit_waiting`` without changing this class.
     """
 
     def __init__(self) -> None:
@@ -239,7 +233,8 @@ class BaseScheduler(ABC):
             if state is not None and self._can_schedule_running(state):
                 scheduled_cached_request_ids.append(request_id)
 
-        # Second, schedule WAITING requests by iDRR score while capacity remains.
+        # Second, schedule WAITING requests while capacity remains. The
+        # batching policy owns the admission order.
         self._schedule_waiting_requests(scheduled_new_reqs, scheduled_cached_request_ids)
 
         # Expose the next waiting request (serial mode) so the runner can
@@ -393,133 +388,9 @@ class BaseScheduler(ABC):
         scheduled_new_reqs: list[NewRequestData],
         scheduled_cached_request_ids: list[str],
     ) -> None:
-        candidates = self._sorted_waiting_states()
-        if not candidates:
+        if not self._waiting:
             return
-
-        if self.batching_config.uses_compute_budget:
-            self._admit_by_compute_budget(candidates, scheduled_new_reqs, scheduled_cached_request_ids)
-            return
-
-        # Fixed / profiler policies are count-capped; iDRR only orders the queue.
-        for state in candidates:
-            if len(self._running) >= self.max_num_running_reqs:
-                break
-            eff = self._effective_max_running_reqs(state)
-            if len(self._running) >= eff:
-                break
-            if not self._can_schedule_waiting(state):
-                break
-            result = self._admit_state(state, scheduled_new_reqs, scheduled_cached_request_ids)
-            if result == "stalled":
-                break
-
-    def _admit_by_compute_budget(
-        self,
-        candidates: list[SchedulerRequestState],
-        scheduled_new_reqs: list[NewRequestData],
-        scheduled_cached_request_ids: list[str],
-    ) -> None:
-        budget = self.batching_config.effective_compute_unit_budget()
-        running_units = self._running_compute_units()
-        reserve_time = max(0.0, float(self.batching_config.idrr_reserve_time_s))
-        now = time.perf_counter()
-        # A request costlier than the whole budget must not deadlock admission:
-        # when nothing is running there is no concurrency left to budget, so
-        # the highest-scored head is admitted regardless of its cost. This also
-        # covers a budget calibrated from cheaper reference requests (no CFG,
-        # single frame) than the ones the server actually serves.
-        if not self._running and candidates:
-            head = candidates[0]
-            if not self._can_schedule_waiting(head) or self._admit_state(
-                head, scheduled_new_reqs, scheduled_cached_request_ids
-            ) == "stalled":
-                return
-            running_units += self._request_units(head)
-            candidates = candidates[1:]
-
-        # Anti-starvation: an aged waiting request gets the head slot even when
-        # it is not the score head. The waiting score is cost normalized, so
-        # with beta > 0 an old large request can sit behind younger cheap ones
-        # indefinitely; keying the reservation on the score head then never
-        # keeps a slot for it. Pick the oldest request that has aged past the
-        # threshold: admit it directly if it both fits the remaining budget and
-        # is compatible with the running batch, otherwise hold its gap so later
-        # admissions cannot eat it.  Compatibility is deliberately not part of
-        # the selection: an aged request that cannot join the current batch
-        # still needs the gap kept, or filling it would only prolong the batch.
-        remaining = budget - running_units
-        reserve_state = None
-        for state in candidates:
-            age = max(0.0, now - state.queued_at) if state.queued_at else 0.0
-            if age > reserve_time and (
-                reserve_state is None
-                or (state.queued_at or 0.0) < (reserve_state.queued_at or 0.0)
-            ):
-                reserve_state = state
-
-        if reserve_state is not None:
-            reserved_cost = self._request_units(reserve_state)
-            if reserved_cost > remaining or not self._can_schedule_waiting(reserve_state):
-                # Reservation mode: keep a gap for the aged request and admit
-                # only requests that fit into it, then stop admission so the
-                # gap survives until the reserved request can be scheduled.
-                gap = remaining - reserved_cost
-                for state in candidates:
-                    if state is reserve_state:
-                        continue
-                    if len(self._running) >= self.max_num_running_reqs:
-                        break
-                    if not self._can_schedule_waiting(state):
-                        continue
-                    cost = self._request_units(state)
-                    if cost > gap:
-                        continue
-                    if self._admit_state(state, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
-                        break
-                    gap -= cost
-                return
-            # The aged request fits: give it the head slot first, then admit in
-            # score order for whatever budget is left. Without this, cheaper
-            # younger requests in score order would consume the freed slot and
-            # the aged request would miss it again.
-            if self._admit_state(reserve_state, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
-                return
-            running_units += reserved_cost
-            candidates = [state for state in candidates if state is not reserve_state]
-
-        # No aged request is blocked: admit in score order, skipping requests
-        # that do not fit so cheaper ones can fill the remaining budget.
-        index = 0
-        while index < len(candidates) and len(self._running) < self.max_num_running_reqs:
-            head = candidates[index]
-            head_cost = self._request_units(head)
-            if running_units + head_cost <= budget and self._can_schedule_waiting(head):
-                if self._admit_state(head, scheduled_new_reqs, scheduled_cached_request_ids) == "stalled":
-                    break
-                running_units += head_cost
-            index += 1
-
-    def _sorted_waiting_states(self) -> list[SchedulerRequestState]:
-        """Order waiting requests by iDRR score, descending.
-
-        Ties fall back to enqueue time (FIFO) then request_id for
-        determinism. Finished or popped states are skipped.
-        """
-        alpha = float(self.batching_config.idrr_alpha)
-        beta = float(self.batching_config.idrr_beta)
-        now = time.perf_counter()
-        scored: list[tuple[float, float, str, SchedulerRequestState]] = []
-        for request_id in self._waiting:
-            state = self._request_states.get(request_id)
-            if state is None or state.is_finished():
-                continue
-            age = max(0.0, now - state.queued_at) if state.queued_at else 0.0
-            norm_cost = max(self._request_units(state) / _IDRR_REFERENCE_UNITS, 1e-6)
-            score = (age**alpha) / (norm_cost**beta)
-            scored.append((score, state.queued_at, request_id, state))
-        scored.sort(key=lambda item: (-item[0], item[1], item[2]))
-        return [item[3] for item in scored]
+        self.batching_policy.admit_waiting(self, scheduled_new_reqs, scheduled_cached_request_ids)
 
     def _admit_state(
         self,
@@ -612,29 +483,6 @@ class BaseScheduler(ABC):
         else:
             scheduled_cached_request_ids.append(request_id)
         return "admitted"
-
-    def _running_compute_units(self) -> int:
-        return sum(
-            self._request_units(self._request_states[request_id])
-            for request_id in self._running
-            if request_id in self._request_states
-        )
-
-    def _request_units(self, state: SchedulerRequestState) -> int:
-        config = self.batching_config
-        key = state.sampling_params_key
-        if key is None:
-            return config.request_compute_units(state.req.sampling_params, state.req.prompts)
-        # Mixfusion shape relaxation nulls the key's resolution so mixed sizes
-        # can share a batch; fall back to the request's own resolution instead
-        # of the config default, which would overcost smaller requests.
-        sampling = state.req.sampling_params
-        height = key.height if key.height is not None else getattr(sampling, "height", None)
-        width = key.width if key.width is not None else getattr(sampling, "width", None)
-        units = config.spatial_compute_units(height, width, key.num_frames)
-        if key.do_classifier_free_guidance or (key.true_cfg_scale is not None and key.true_cfg_scale > 1):
-            units = int(units * float(config.cfg_compute_multiplier))
-        return max(1, units)
 
     def has_requests(self) -> bool:
         return bool(
@@ -983,6 +831,9 @@ class BaseScheduler(ABC):
 
     def _remove_waiting_id(self, request_id: str) -> None:
         self._waiting = deque(req_id for req_id in self._waiting if req_id != request_id)
+
+    def _can_schedule_running(self, state: SchedulerRequestState) -> bool:
+        return True
 
     def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
         if not self._running:
