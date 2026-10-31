@@ -397,6 +397,34 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.decode_dtype = torch.bfloat16
             self.remote.to(device=initial_device)
         decoder = getattr(self.remote.model, "decoder", None)
+        use_omni_ops = os.environ.get("MINIMAX_H3_VAE_USE_OMNI_OPS", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if use_omni_ops:
+            # Check the execution target, not CPU checkpoint/offload storage.
+            if (
+                not self.encode_only
+                and decoder is not None
+                and decoder_path is None
+                and device.type == "npu"
+                and current_omni_platform.is_npu()
+            ):
+                from .vae_ops import patch_minimax_h3_video_vae
+
+                patch_minimax_h3_video_vae(self.remote.model)
+            else:
+                logger.info(
+                    "Skip MiniMax H3 VAE Omni ops: encode_only=%s, decoder=%s, replacement=%s, "
+                    "target=%s, platform_npu=%s",
+                    self.encode_only,
+                    decoder is not None,
+                    decoder_path is not None,
+                    device,
+                    current_omni_platform.is_npu(),
+                )
         if decoder is not None and decoder_path is None:
             install_h3_vae_optimizations(
                 decoder,
