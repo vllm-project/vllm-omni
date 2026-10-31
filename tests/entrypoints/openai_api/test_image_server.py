@@ -1395,6 +1395,13 @@ def test_parameter_validation():
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", guidance_scale=21.0)
 
+    # Non-finite flow_shift
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="test", flow_shift=float("nan"))
+
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="test", flow_shift=float("inf"))
+
     # Invalid layers for layered models (must stay within the backend-supported range)
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=1)
