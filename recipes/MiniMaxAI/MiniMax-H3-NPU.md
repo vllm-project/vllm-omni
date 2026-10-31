@@ -146,6 +146,7 @@ export PORT=9098
 export MODEL=/path/to/MiniMax-H3
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=4000
+export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=4000
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -174,7 +175,20 @@ vllm serve "${MODEL}" \
 Notes:
 
 - Do not add `--enforce-eager`. The first request includes regional
-  compilation; warm the server once before measuring steady-state latency.
+  compilation. For Ref2VA latency comparisons, run two complete warmup
+  requests on both baseline and candidate before measured requests: the first
+  response can return while peer ranks are still finishing cold audio decode.
+  Remove `--enable-diffusion-pipeline-profiler` for the timing runs and retain
+  profiling as a separate diagnostic run.
+- Long requests need both timeout settings above. The HTTP video deadline
+  does not extend the executor's default 600-second execution RPC deadline.
+  Despite its name, `VLLM_OMNI_DLO_DP_WAVE_TIMEOUT` also applies to the ordinary
+  single-group path, including HSDP without DLO. Set it before starting the
+  server, allow enough time for cold requests, and use the same value for both
+  arms of a comparison. Raising a deadline does not improve inference speed.
+  The [Ref2VA experiment records](https://github.com/InferMatrixLab/InferRSI/issues/293)
+  retain requests that exceeded the default deadline; they are failed attempts,
+  not completed latency measurements.
 - H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
 - Keep `--ring 1` when switching to RainFusion attention (below): the
   block-sparse kernel ranks key blocks over the whole sequence, so ring
