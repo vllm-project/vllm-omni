@@ -1645,6 +1645,24 @@ def test_image_edit_images_processing(async_omni_test_client):
     assert processed_images[1].size == (24, 24)
 
 
+def test_image_edit_reports_peak_memory_header(test_client, mock_async_diffusion):
+    generate = mock_async_diffusion.generate
+
+    async def generate_with_memory(*args, **kwargs):
+        async for result in generate(*args, **kwargs):
+            result.peak_memory_mb = 123.456
+            yield result
+
+    mock_async_diffusion.generate = generate_with_memory
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes())],
+        data={"prompt": "edit this image"},
+    )
+    assert response.status_code == 200
+    assert response.headers["x-peak-memory-mb"] == "123.456"
+
+
 def test_image_edit_rejects_multiple_images_when_model_does_not_support_them(async_omni_test_client):
     img_bytes_1 = make_test_image_bytes((16, 16))
     img_bytes_2 = make_test_image_bytes((32, 32))
@@ -2212,6 +2230,7 @@ def test_image_edits_returns_metrics_multistage(async_omni_test_client):
         data={"prompt": "edit me"},
     )
     assert response.status_code == 200
+    assert response.headers["x-peak-memory-mb"] == "2048.000"
     assert response.json()["metrics"] == {
         "stage_durations": stage_durations,
         "peak_memory_mb": peak_memory_mb,
