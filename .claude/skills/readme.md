@@ -24,6 +24,9 @@ self-check.
 
 ## Available Skills
 
+- [`perf-headroom`](perf-headroom/SKILL.md): maps Omni request/stage execution
+  to component-level headroom, using measured or source-only evidence and L0-L6
+  coverage for RSI reports; does not automatically implement optimizations
 - [`add-diffusion-model`](add-diffusion-model/SKILL.md): guides integration of
   a new diffusion model into `vllm-omni`
 - [`add-recipe`](add-recipe/SKILL.md): creates or updates in-repository model
