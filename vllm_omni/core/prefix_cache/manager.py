@@ -514,9 +514,13 @@ class OmniPrefixCacheManager:
                 # resume. Do not re-infer that lifecycle from write-task state.
                 num_computed = int(event.hit_end)
                 if num_computed > 0:
-                    # block_ids is per-kv-group; group 0 only.
+                    # The selected full-attention group retains prefix blocks
+                    # when an earlier sliding-window group recycles its own.
                     block_groups = event.block_ids
-                    if not block_groups or not block_groups[0]:
+                    if (
+                        len(block_groups) <= self._config.output_group_id
+                        or not block_groups[self._config.output_group_id]
+                    ):
                         # Fail at the cause: a hit we cannot snapshot now would
                         # crash at materialize time with less context (materialize is
                         # forbidden from reading the live batch).
@@ -524,17 +528,13 @@ class OmniPrefixCacheManager:
                             f"prefix hit for req {req_id} ({num_computed} tokens) carries no block_ids"
                         )
                     bs = self._config.block_size
-                    if num_computed % bs != 0:
-                        raise OmniPrefixCacheUnmatchError(
-                            f"prefix hit not block aligned (req={req_id}, hit_upto={num_computed}, block_size={bs})"
-                        )
-                    needed = num_computed // bs
-                    if len(block_groups[0]) < needed:
+                    hit_blocks = list(block_groups[self._config.output_group_id][: (num_computed + bs - 1) // bs])
+                    if len(hit_blocks) * bs < num_computed:
                         raise OmniPrefixCacheUnmatchError(
                             f"prefix hit for req {req_id} ({num_computed} tokens) has "
-                            f"{len(block_groups[0])} group-0 blocks, need {needed}"
+                            f"{len(hit_blocks)} group-{self._config.output_group_id} blocks, "
+                            f"need {(num_computed + bs - 1) // bs}"
                         )
-                    hit_blocks = list(block_groups[0][:needed])
                     self._hit_spans[req_id] = (num_computed, hit_blocks)
 
             # 4. Gather those spans on the prefetch thread; overlaps this forward.
@@ -1155,8 +1155,9 @@ class OmniPrefixCacheManager:
     # -------------------------------------------------- slot ref / fetch
 
     def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int]) -> torch.Tensor:
-        """Prefix-hit block ids → KV slot ids. Alignment is checked at
-        ``new_step_starts``. Does not require ``_state_lock``.
+        """Allocator block ids → exact prefix-hit token slots, excluding padding.
+
+        Does not require ``_state_lock``.
         """
         bs = self._config.block_size
         block_ids = torch.tensor(hit_blocks, dtype=torch.int64)

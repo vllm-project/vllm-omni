@@ -54,6 +54,8 @@ class PrefixCacheConfig:
 
     num_blocks: int
     block_size: int
+    # Dense KV group whose allocator IDs provide stable output-row identity.
+    output_group_id: int = 0
     # GPU-byte budget for device rows awaiting a host copy: step clones,
     # deferred rows and the runner's decode buffer. Exceeding it forces a copy.
     gpu_staging_bytes: int = 512 * 1024 * 1024
@@ -74,6 +76,7 @@ class PrefixCacheConfig:
         *,
         num_blocks: int,
         block_size: int,
+        output_group_id: int = 0,
         scheduler_config: Any = None,
         model_config: Any = None,
     ) -> "PrefixCacheConfig":
@@ -107,6 +110,7 @@ class PrefixCacheConfig:
         return cls(
             num_blocks=num_blocks,
             block_size=block_size,
+            output_group_id=output_group_id,
             staging_capacity_tokens=max(1, capacity),
         )
 

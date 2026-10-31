@@ -68,6 +68,8 @@ def _full_attention_groups():
                 pass
 
             setattr(iface, "FullAttentionSpec", _FullAttentionSpecStub)
+            setattr(iface, "RSWASpec", type("RSWASpec", (_FullAttentionSpecStub,), {}))
+            setattr(iface, "SlidingWindowSpec", type("SlidingWindowSpec", (), {}))
             sys.modules["vllm.v1"] = ModuleType("vllm.v1")
             sys.modules["vllm.v1.kv_cache_interface"] = iface
         FullAttentionSpec = getattr(iface, "FullAttentionSpec")
@@ -81,7 +83,7 @@ class _FakeBlockTables:
         self.block_tables = [object()]
 
     def __getitem__(self, idx):
-        return SimpleNamespace()
+        return SimpleNamespace(block_size=BLOCK_SIZE, kv_cache_block_size=BLOCK_SIZE, dcp_world_size=1)
 
 
 class _Runner(PrefixCacheRunnerMixin):
