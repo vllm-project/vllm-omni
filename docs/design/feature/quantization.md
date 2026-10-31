@@ -166,6 +166,13 @@ quantizable layers are affected. Ordinary `torch.nn` encoder layers, VAEs,
 schedulers, and tokenizers are not rewritten automatically. A component map can
 select a narrower scope, but it cannot add quantization support to a layer.
 
+For ModelOpt NVFP4 checkpoints, a transformer module may intentionally keep a
+full-precision `[N, K]` parameter even when the checkpoint stores a packed
+`uint8` weight of shape `[N, K/2]`. The checkpoint adapter dequantizes matching
+weights at load time using a per-16-element `weight_scale` and scalar
+`weight_scale_2`; both scales are required and may arrive in any order.
+Quantized targets retain their packed weights and scale tensors.
+
 Weight quantization and quantized KV cache are separate paths. The former is
 resolved through `quantization_config`; runtime attention/KV-cache quantization
 is configured by the diffusion attention configuration and must be validated
