@@ -1333,6 +1333,7 @@ def _build_engine_args(
     ``engine_extras`` can still carry a stage-specific ``dtype``).
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
+    engine_args["single_stage_pipeline"] = len(pipeline.stages) == 1
     engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
     if ps.supports_pending_generation:
         engine_args["supports_pending_generation"] = True

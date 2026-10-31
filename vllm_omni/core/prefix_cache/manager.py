@@ -524,11 +524,7 @@ class OmniPrefixCacheManager:
                             f"prefix hit for req {req_id} ({num_computed} tokens) carries no block_ids"
                         )
                     bs = self._config.block_size
-                    if num_computed % bs != 0:
-                        raise OmniPrefixCacheUnmatchError(
-                            f"prefix hit not block aligned (req={req_id}, hit_upto={num_computed}, block_size={bs})"
-                        )
-                    needed = num_computed // bs
+                    needed = (num_computed + bs - 1) // bs
                     if len(block_groups[0]) < needed:
                         raise OmniPrefixCacheUnmatchError(
                             f"prefix hit for req {req_id} ({num_computed} tokens) has "
@@ -1155,8 +1151,9 @@ class OmniPrefixCacheManager:
     # -------------------------------------------------- slot ref / fetch
 
     def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int]) -> torch.Tensor:
-        """Prefix-hit block ids → KV slot ids. Alignment is checked at
-        ``new_step_starts``. Does not require ``_state_lock``.
+        """Allocator block ids → exact prefix-hit token slots, excluding padding.
+
+        Does not require ``_state_lock``.
         """
         bs = self._config.block_size
         block_ids = torch.tensor(hit_blocks, dtype=torch.int64)
