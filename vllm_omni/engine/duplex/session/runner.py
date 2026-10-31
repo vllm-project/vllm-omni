@@ -166,6 +166,28 @@ class _DeferredSilenceContinuation:
 _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"})
 
 
+# A client streaming real input at exactly chunk_period_s races the first
+# continuation's deadline: ordinary jitter can let the deadline fire before
+# the next real append physically arrives, so both get submitted as separate
+# model steps instead of the real append superseding the continuation. A
+# fixed 30ms margin measurably reduced but did not eliminate this -- real
+# client jitter (network, scheduling, bursty delivery) regularly exceeds a
+# small fixed constant. Too little margin recreates the race; too much just
+# delays idle-continuation by a few hundred ms, imperceptible in a voice
+# conversation -- so scale generously with the model's own cadence rather
+# than guessing one constant for every model's chunk_period_s, with a cap so
+# large-native-unit models (e.g. a 1 s chunk_period_s) don't get an
+# excessive multi-second idle-detection delay.
+_CONTINUATION_JITTER_MARGIN_FACTOR = 2.0
+_CONTINUATION_JITTER_MARGIN_CAP_S = 0.25
+
+
+def _continuation_jitter_margin_s(chunk_period_s: float) -> float:
+    if chunk_period_s <= 0:
+        return 0.0
+    return min(_CONTINUATION_JITTER_MARGIN_FACTOR * chunk_period_s, _CONTINUATION_JITTER_MARGIN_CAP_S)
+
+
 def compute_silence_continuation_deadline(
     *,
     chunk_period_s: float,
@@ -176,20 +198,21 @@ def compute_silence_continuation_deadline(
     """Return the silence continuation schedule ``(delay_s, next_silence_deadline)``.
 
     The first continuation anchors to the latest accepted append's submission
-    time (``last_submit + chunk_period_s``), falling back to ``now`` when no
-    submission exists. Later continuations advance from the current deadline
-    instead of from ``now``, so pipeline processing time does not accumulate
-    as timer drift. When the schedule is more than one period overdue it is
-    stale: one continuation submits immediately and the schedule restarts
-    from ``now`` (``next_silence_deadline = now + chunk_period_s``) instead of
-    firing a burst of catch-ups.
+    time plus a jitter margin (see :func:`_continuation_jitter_margin_s`),
+    falling back to ``now`` when no submission exists. Later continuations
+    advance from the current deadline instead of from ``now``, so pipeline
+    processing time does not accumulate as timer drift (the margin is only
+    added once per anchor, not every period). When the schedule is more than
+    one period overdue it is stale: one continuation submits immediately and
+    the schedule restarts from ``now`` (``next_silence_deadline = now +
+    chunk_period_s``) instead of firing a burst of catch-ups.
 
     ``delay_s`` is the wait before this continuation and
     ``next_silence_deadline`` the deadline for the following one.
     """
     if current_deadline is None:
         base = last_submit if last_submit is not None else now
-        deadline = base + chunk_period_s
+        deadline = base + chunk_period_s + _continuation_jitter_margin_s(chunk_period_s)
     else:
         deadline = current_deadline
     if now - deadline > chunk_period_s:
