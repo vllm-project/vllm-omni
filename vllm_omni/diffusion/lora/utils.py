@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 from vllm.config.lora import LoRAConfig
 from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
+from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.platforms import current_platform
 
@@ -224,3 +227,28 @@ def from_layer_diffusion(
             return instance
 
     return layer
+
+
+def validate_generic_peft_ranks(loras: Mapping[str, LoRALayerWeights], max_lora_rank: int) -> None:
+    """Check raw 2D factor compatibility and the planned wrapper capacity.
+
+    The physical rank can differ from PEFT metadata when both factors agree
+    and fit the zero-padded buffers. Keep the loader's resolved rank/scaling;
+    non-2D fused tensors retain the existing loader checks.
+    """
+    mismatched = []
+    for name, weights in loras.items():
+        a, b = weights.lora_a, weights.lora_b
+        if a is None or b is None or a.ndim != 2 or b.ndim != 2:
+            continue
+        if a.shape[0] != b.shape[1] or a.shape[0] > max_lora_rank:
+            mismatched.append(
+                f"{name} (lora_A rows={a.shape[0]}, lora_B columns={b.shape[1]}, buffer capacity={max_lora_rank})"
+            )
+    if mismatched:
+        detail = "; ".join(mismatched[:8])
+        raise ValueError(
+            "Incompatible LoRA factors: "
+            f"{detail}. Supply matching weights or a model-specific "
+            "_load_diffusion_lora_adapter hook for nonstandard layouts."
+        )
