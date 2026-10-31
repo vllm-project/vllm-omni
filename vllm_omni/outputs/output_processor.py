@@ -114,6 +114,73 @@ def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
     return metrics
 
 
+def _is_mirror(value: torch.Tensor, mm_value: torch.Tensor) -> bool:
+    """Whether a pooling tensor repeats the ``mm_output`` tensor under its key.
+
+    Compared by value: the two channels are decoded separately on the way
+    from the engine core, so a mirrored tensor is never the same object here.
+    NaNs compare equal.
+    """
+    if value.dtype != mm_value.dtype or value.shape != mm_value.shape or value.device != mm_value.device:
+        return False
+    if value.is_floating_point() or value.is_complex():
+        return bool(torch.isclose(value, mm_value, rtol=0.0, atol=0.0, equal_nan=True).all())
+    return torch.equal(value, mm_value)
+
+
+def _merge_nested(mm_value: dict[str, Any], value: dict[str, Any]) -> dict[str, Any]:
+    """Merge a nested pooling dict into its ``mm_output`` counterpart.
+
+    Nested dicts are metadata, which a later accumulation replaces as a whole,
+    so siblings from both channels are kept here and the pooling value wins
+    where they overlap, as it did when it was accumulated second.
+    """
+    merged = dict(mm_value)
+    for k, v in value.items():
+        if isinstance(merged.get(k), dict) and isinstance(v, dict):
+            merged[k] = _merge_nested(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+
+def _merge_mirrored_payload(
+    mm_output: object, pooling_output: torch.Tensor | dict[str, Any]
+) -> tuple[object, torch.Tensor | dict[str, Any] | None]:
+    """Fold the pooling payload into ``mm_output`` for one accumulation.
+
+    The MR v2 AR runner's full-payload fallback publishes one per-request
+    payload on both channels; accumulating both concatenates every tensor
+    with itself. Returns ``(merged, extra)``: ``merged`` holds every entry of
+    both channels once (non-tensor entries are metadata and the pooling one
+    wins, as it did when accumulated second), and ``extra`` the top-level
+    pooling entries that would not have merged into the ``mm_output`` one
+    under the same key: a differing tensor, or a tensor/non-tensor pair.
+    These still accumulate after it. V1 never sets both channels.
+    """
+    if not isinstance(pooling_output, dict) or not isinstance(mm_output, dict):
+        return mm_output, pooling_output
+    merged = dict(mm_output)
+    extra: dict[str, Any] = {}
+    for k, v in pooling_output.items():
+        existing = merged.get(k)
+        if k not in merged:
+            merged[k] = v
+        elif isinstance(existing, dict) and isinstance(v, dict):
+            merged[k] = _merge_nested(existing, v)
+        elif isinstance(existing, torch.Tensor) and isinstance(v, torch.Tensor):
+            if not _is_mirror(v, existing):
+                extra[k] = v
+        elif isinstance(existing, torch.Tensor) or isinstance(v, torch.Tensor):
+            # A tensor and a non-tensor land in separate partitions of the
+            # accumulated payload, so both are kept, as when accumulated apart.
+            extra[k] = v
+        else:
+            # Non-tensor metadata: the later accumulation replaces it.
+            merged[k] = v
+    return merged, extra or None
+
+
 class OmniRequestState(RequestState):
     """Request state for omni models, tracking multimodal outputs.
 
@@ -729,15 +796,17 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 mm_type = getattr(eco, "output_type", None) or default_mm_type
 
                 mm_output = getattr(eco, "multimodal_output", None)
-                if mm_output is not None:
-                    req_state.add_multimodal_tensor(mm_output, mm_type)
-
                 # Omni AR stages carry model payloads alongside text tokens in
                 # pooling_output. Preserve the payload, then clear the field so
                 # upstream still runs the normal detokenization path.
+                pooling_payload = None
                 if eco.pooling_output is not None and req_state.detokenizer is not None:
-                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    mm_output, pooling_payload = _merge_mirrored_payload(mm_output, eco.pooling_output)
                     eco.pooling_output = None
+
+                if mm_output is not None:
+                    req_state.add_multimodal_tensor(mm_output, mm_type)
+                req_state.add_multimodal_tensor(pooling_payload, mm_type)
 
             # Native pooling cache-miss errors carry no tensor. Upstream
             # synthesizes their empty pooling output and structured error.

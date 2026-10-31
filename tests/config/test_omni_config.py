@@ -972,19 +972,15 @@ stages:
     assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
 
 
-def test_mrv2_fails_fast_on_xpu():
-    with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform="xpu")
-
-
+@pytest.mark.parametrize("platform", ["npu", "xpu"])
 @pytest.mark.parametrize("stage_override", [False, True])
-def test_mrv2_config_is_allowed_on_npu(stage_override):
+def test_mrv2_config_is_allowed_on_npu_and_xpu(platform, stage_override):
     deploy = (
         DeployConfig(stages=[StageDeployConfig(stage_id=0, model_runner="v2")])
         if stage_override
         else DeployConfig(model_runner="v2")
     )
-    deploy = _apply_platform_overrides(deploy, platform="npu")
+    deploy = _apply_platform_overrides(deploy, platform=platform)
     if stage_override:
         assert deploy.stages[0].model_runner == "v2"
     else:

@@ -111,6 +111,105 @@ def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     assert not state.mm_accumulated.is_empty
 
 
+def test_mrv2_payload_mirrored_on_both_channels_is_accumulated_once():
+    # The MRv2 AR full-payload fallback publishes one payload as both
+    # pooling_output and multimodal_output; each row must reach the next stage once.
+    processor, _ = _make_processor(OutputModality.LATENT, _Detokenizer())
+    hidden = torch.arange(12.0).reshape(3, 4)
+    ids = torch.tensor([[11], [12], [13]])
+    output = _rehydrated_output(pooling_output={"latent": hidden, "latent_input_ids": ids})
+    output.multimodal_output = {"latent": hidden, "latent_input_ids": ids}
+
+    payload = processor.process_outputs([output]).request_outputs[0].outputs[0].multimodal_output
+
+    torch.testing.assert_close(payload["latent"], hidden)
+    torch.testing.assert_close(payload["latent_input_ids"], ids)
+
+
+def _process_mrv2_mirror(pooling_output, multimodal_output):
+    processor, _ = _make_processor(OutputModality.LATENT, _Detokenizer())
+    output = _rehydrated_output(pooling_output=pooling_output)
+    output.multimodal_output = multimodal_output
+    return processor.process_outputs([output]).request_outputs[0].outputs[0].multimodal_output
+
+
+def test_mrv2_partially_mirrored_nested_payload_keeps_every_layer_once():
+    # The channels are decoded separately, so the mirror is equal, not identical.
+    hidden = torch.arange(12.0).reshape(3, 4)
+    layer = torch.arange(6.0).reshape(3, 2)
+    payload = _process_mrv2_mirror(
+        {"latent": hidden, "hidden_states": {"layers": {0: layer, 1: layer + 1}}},
+        {"latent": hidden.clone(), "hidden_states": {"layers": {0: layer.clone()}}},
+    )
+
+    torch.testing.assert_close(payload["latent"], hidden)
+    # _to_cpu stringifies nested dict keys on both channels.
+    layers = payload["hidden_states"]["layers"]
+    assert set(layers) == {"0", "1"}
+    torch.testing.assert_close(layers["0"], layer)
+    torch.testing.assert_close(layers["1"], layer + 1)
+
+
+def test_mrv2_mirror_with_nan_and_deep_nesting_is_accumulated_once():
+    hidden = torch.tensor([[1.0, float("nan")], [2.0, 3.0]])
+    speakers = [torch.tensor([1, 2]), torch.tensor([3])]
+    # Two levels down, so consolidate_metadata leaves the list as is.
+    payload = _process_mrv2_mirror(
+        {"latent": hidden, "extra": {"deep": {"t": hidden, "speakers": speakers}}},
+        {
+            "latent": hidden.clone(),
+            "extra": {"deep": {"t": hidden.clone(), "speakers": [t.clone() for t in speakers]}},
+        },
+    )
+
+    torch.testing.assert_close(payload["latent"], hidden, equal_nan=True)
+    deep = payload["extra"]["deep"]
+    torch.testing.assert_close(deep["t"], hidden, equal_nan=True)
+    assert len(deep["speakers"]) == 2
+
+
+def test_mrv2_distinct_same_key_values_are_not_dropped():
+    first, second = torch.ones(1, 4), torch.zeros(1, 4)
+    payload = _process_mrv2_mirror(
+        {"latent": second, "codes": {"audio": torch.tensor([1, 2])}},
+        {"latent": first, "codes": {"audio": torch.tensor([7, 8]), "text": torch.tensor([5])}},
+    )
+
+    # A top-level tensor accumulates after the mm_output one, as before.
+    torch.testing.assert_close(payload["latent"], torch.cat([first, second]))
+    # Nested metadata keeps both siblings; the pooling value wins on conflict.
+    torch.testing.assert_close(payload["codes"]["audio"], torch.tensor([1, 2]))
+    torch.testing.assert_close(payload["codes"]["text"], torch.tensor([5]))
+
+
+def test_mrv2_differing_top_level_metadata_matches_separate_accumulation():
+    # Same result as accumulating the two channels one after the other: the
+    # pooling value replaces differing metadata, and a tensor and a non-tensor
+    # under one key keep both partitions, where the snapshot shows the metadata.
+    processor, state = _make_processor(OutputModality.LATENT, _Detokenizer())
+    hidden = torch.ones(1, 4)
+    output = _rehydrated_output(
+        pooling_output={"latent": hidden, "spk": ["b", "c"], "a": torch.tensor([9]), "b": ["y"]}
+    )
+    output.multimodal_output = {"latent": hidden.clone(), "spk": ["a"], "a": ["x"], "b": torch.tensor([4])}
+
+    payload = processor.process_outputs([output]).request_outputs[0].outputs[0].multimodal_output
+
+    torch.testing.assert_close(payload["latent"], hidden)
+    assert payload.metadata == {"spk": ["b", "c"], "a": ["x"], "b": ["y"]}
+    # Next stages read this snapshot, so they see the metadata value for a/b,
+    # as before MRv2. The tensor side lives only in the request accumulator,
+    # where it is kept once, not dropped or concatenated. Payload lookup
+    # prefers tensors, so indexing the accumulator returns them.
+    accumulated = state.mm_accumulated
+    # Each partition holds exactly these keys: a/b once in each, no extras.
+    assert set(accumulated.tensors) == {"latent", "a", "b"}
+    assert set(accumulated.metadata) == {"spk", "a", "b"}
+    torch.testing.assert_close(accumulated["latent"], hidden)
+    torch.testing.assert_close(accumulated["a"], torch.tensor([9]))
+    torch.testing.assert_close(accumulated["b"], torch.tensor([4]))
+
+
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
     processor, state = _make_processor(OutputModality.TEXT, _Detokenizer())
     request = EngineCoreRequest(
