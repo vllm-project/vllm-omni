@@ -82,10 +82,7 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
     # `__init__` is bypassed here: `_codec_sample_setup` still reads the
     # fused-prelude switch, so set it explicitly (eager chain, no kernels).
     model._codec_fused_prelude = False
-    # Same for the host-sampling switch: keep these tests on the device
-    # samplers they were written for (the host path needs __init__-set
-    # attributes such as _codec_seed / head_code that this double omits).
-    model._talker_codec_host_sample = False
+    model.head_code = nn.ModuleList([nn.Identity()])
     emb = nn.Embedding(_NUM_AUDIO_TOKENS, 4)
     with torch.no_grad():
         emb.weight.zero_()
@@ -103,6 +100,17 @@ def _make_talker(*, k_step_frames: int, scripted_samples: list[int]):
         return codec_sample_result(device_state, torch.tensor(next(queue), dtype=torch.long), eos_token_id=_EOS_ID)
 
     model._sample_audio_code_greedy = _greedy
+
+    def _host(hidden, codes, request_id, state, step, min_tokens, max_tokens, eos_window_masked, *, lg_dev=None):
+        if state.get("codec_temperature", model._codec_temperature) == 0.0:
+            result = model._sample_audio_code_greedy(
+                hidden, codes, request_id, step, min_tokens, max_tokens, eos_window_masked
+            )
+        else:
+            result = model._sample_audio_code(hidden, codes, request_id, step, eos_window_masked)
+        return int(result.sampled_token.item()), bool(result.state.finished.item()), bool(result.emit.item())
+
+    model._sample_audio_code_host = _host
     return model
 
 
@@ -1324,6 +1332,28 @@ def _bias_head_to(model, token_id: int):
     with torch.no_grad():
         model.head_code[0].weight.zero_()
         model.head_code[0].weight[token_id] = 1.0
+
+
+@pytest.mark.parametrize(
+    ("token_id", "limit", "finished", "emit"),
+    [(42, 10, False, True), (_EOS_ID, 10, True, False), (42, 1, True, False)],
+)
+def test_host_boundary_default_emits_and_stops(token_id, limit, finished, emit):
+    model = _real_boundary_talker(0.0)
+    model._codec_seed = 42
+    model._codec_top_k = 0
+    model._codec_top_p = 1.0
+    _bias_head_to(model, token_id)
+    model._sample_audio_code_host = type(model)._sample_audio_code_host.__get__(model, type(model))
+    state = {"step": 0, "codes": torch.tensor([10, 11]), "max_tokens": limit}
+    model._request_audio_states["r1"] = state
+
+    output = _frame_call(model, torch.ones(1, 8))
+
+    assert state["finished"] is finished
+    audio = output.multimodal_outputs["codes"]["audio"][0]
+    assert audio.reshape(-1).tolist() == ([token_id] if emit else [])
+    assert model._request_host_codec_states["r1"]["finished"] is finished
 
 
 def test_stop_id_finishes_request_through_device_state_greedy():

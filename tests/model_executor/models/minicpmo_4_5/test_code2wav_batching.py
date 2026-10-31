@@ -194,6 +194,22 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
 
 
 @pytest.mark.parametrize(
+    ("extra", "frames", "batches"),
+    [
+        ({}, [3, 33], [1, 2]),
+        ({"hift_graph_continuation_frames": [], "hift_graph_exact_batch_sizes": [1]}, [], [1]),
+        ({"hift_graph_continuation_frames": [4, 28], "hift_graph_exact_batch_sizes": [2]}, [4, 28], [2]),
+    ],
+)
+def test_hift_exact_graph_defaults_and_overrides(extra, frames, batches):
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    assert model._connector_config["hift_graph_continuation_frames"] == frames
+    assert model._connector_config["hift_graph_exact_batch_sizes"] == batches
+
+
+@pytest.mark.parametrize(
     ("cuda", "extra", "env", "expected"),
     [
         (True, {}, None, True),
