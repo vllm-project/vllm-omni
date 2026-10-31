@@ -9,7 +9,12 @@
 # extra_args block below is what turns on has_sampling_extra_args (so per-row
 # sampling extra args reach the model's forward) and is also how the CFG
 # scheduler patches learn this stage is paired.
+#
+# Runner selection: both stages run Model Runner V2 on CUDA (the
+# `platforms.cuda` entry below) and V1 everywhere else. Set
+# `model_runner: v1` under `platforms.cuda` in a copy of this file to opt out.
 pipeline: minimax_music3
+model_runner: v1
 async_chunk: true
 
 # The repo-root config.json reports model_type=minimax_music3, which upstream
@@ -116,10 +121,17 @@ stages:
     # input batch, which breaks when chunk arrival staggers requests.
     async_scheduling: false
     enable_prefix_caching: false
-    # One placeholder prompt token per arriving window, so a six-minute song
-    # (90 windows) needs a tiny context.
+    # V1: one placeholder prompt token per arriving window, so a six-minute
+    # song (90 windows) needs a tiny context. V2: each window's codes replace
+    # the prompt (200 frames x 8 codebooks = 1600 tokens), so the context only
+    # has to hold one window.
     max_model_len: 4096
-    max_num_batched_tokens: 4096
+    # On V2 one step should fit a window for every request: a window is 1600
+    # tokens and a song's last window at most 1608, so 8 x 1608 = 12864.
+    # A window is never split, and the scheduler stops at the first window
+    # that does not fit, so a smaller budget lets the same few requests take
+    # every step.
+    max_num_batched_tokens: 16384
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
@@ -129,6 +141,8 @@ stages:
       seed: 0
 
 platforms:
+  cuda:
+    model_runner: v2
   xpu:
     stages:
       - stage_id: 0
@@ -139,5 +153,8 @@ platforms:
       - stage_id: 1
         # Acoustic decoder on the second card.
         max_num_seqs: 2
+        # V1 here: one placeholder token per window, so the old budget is
+        # plenty, and it stays within max_num_seqs x max_model_len.
+        max_num_batched_tokens: 4096
         gpu_memory_utilization: 0.9
         devices: "1"

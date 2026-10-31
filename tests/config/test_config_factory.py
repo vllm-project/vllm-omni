@@ -3216,6 +3216,8 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts_mrv2.yaml", "qwen3_tts"),
             ("moss_tts_local.yaml", "moss_tts_local"),
+            ("minimax_music3.yaml", "minimax_music3"),
+            ("minimax_music3_2gpu.yaml", "minimax_music3"),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])

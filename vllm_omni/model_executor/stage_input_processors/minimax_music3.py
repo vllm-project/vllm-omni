@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-input processors for MiniMax Music 3: AR talker -> acoustic decoder.
 
 Three entry points, all referenced from
@@ -32,11 +32,13 @@ Per emission the talker publishes a multimodal output shaped like::
 The span is normally one window: ``T == AR_CHUNK_FRAMES``, windows advance by
 ``AR_CHUNK_HOP_FRAMES``, and window ``k`` starts at AR frame
 ``k * AR_CHUNK_HOP_FRAMES``. The terminal emission is the exception. A window
-cannot be proven non-final until a further frame exists, so the talker holds
-the most recently completed window back and, on the step where it knows the
-request is ending, publishes the whole remaining frame span at once. That span
-covers up to two windows (the held-back complete one plus the truncated final
-one), so ``T`` can reach ``AR_CHUNK_FRAMES + AR_CHUNK_HOP_FRAMES``. Stage 1
+cannot be proven non-final until a further frame exists, so the talker releases
+each window one frame late and, on the step where it knows the request is
+ending, publishes the whole remaining frame span at once. That span can cover
+two windows (a complete one not yet released plus the truncated final one), but
+it is at most one frame longer than a window: ``T`` reaches
+``AR_CHUNK_FRAMES + 1`` when the frame budget ends the song on the frame that
+would have released the next window. Stage 1
 re-derives the window boundaries inside a span from
 ``meta.num_processed_tokens`` and the span length through
 ``models/minimax_music3/chunking.chunk_windows``.
@@ -81,6 +83,7 @@ owner of that arithmetic; duplicating it here would let the two copies drift.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -94,7 +97,7 @@ from vllm_omni.model_executor.models.minimax_music3.constants import (
     AR_HIDDEN_SIZE,
     NUM_CODEBOOKS,
 )
-from vllm_omni.model_executor.models.minimax_music3.prompt import build_cfg_null_token_ids
+from vllm_omni.model_executor.models.minimax_music3.prompt import SPECIAL_TOKEN_IDS, build_cfg_null_token_ids
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 __all__ = [
@@ -110,6 +113,8 @@ CFG_UNCOND_SUFFIX = "__cfg_uncond"
 
 _COND = "cond"
 _UNCOND = "uncond"
+
+_AUDIO_END_TOKEN_ID = SPECIAL_TOKEN_IDS["<|audio_end|>"]
 
 # Per-request forwarder state, parked on the transfer manager's request map.
 _STATE_KEY = "_minimax_music3_async_state"
@@ -250,12 +255,16 @@ def expand_cfg_prompts(
 # ---------------------------------------------------------------------------
 
 
-def _payload_section(payload: Any, key: str) -> dict[str, Any]:
-    """Return a nested payload section as a dict (empty when absent)."""
-    if not isinstance(payload, dict):
+def _payload_section(payload: Any, key: str) -> Mapping[str, Any]:
+    """Return a nested payload section (empty when absent).
+
+    The engine hands ``ar2acoustic`` a ``MultimodalPayload``, which is a
+    ``Mapping`` but not a ``dict``.
+    """
+    if not isinstance(payload, Mapping):
         return {}
     section = payload.get(key)
-    return section if isinstance(section, dict) else {}
+    return section if isinstance(section, Mapping) else {}
 
 
 def _window_latent(payload: Any) -> torch.Tensor | None:
@@ -265,7 +274,7 @@ def _window_latent(payload: Any) -> torch.Tensor | None:
     talkers that publish through the hidden-state channel instead. A leading
     singleton batch dimension is squeezed so stage 1 sees a stable rank.
     """
-    if not isinstance(payload, dict):
+    if not isinstance(payload, Mapping):
         return None
     tensor = payload.get("latent")
     if not isinstance(tensor, torch.Tensor):
@@ -314,6 +323,18 @@ def _request_audio_seed(request: Any, payload: Any) -> int | None:
         return published
     seed = getattr(getattr(request, "sampling_params", None), "seed", None)
     return int(seed) if isinstance(seed, int) else None
+
+
+def _stop_sampled(request: Any) -> bool:
+    """Whether the step being published sampled the request's ``<|audio_end|>``.
+
+    On the Model Runner V2 data plane a step's payload is published with the
+    tokens sampled in that step, before the scheduler acknowledges the finish.
+    The talker's terminal span rides on the step that samples the stop token,
+    so ``request.is_finished()`` is still False there; the sampled ids are what
+    say the engine is ending the request. V1 requests carry no such field.
+    """
+    return _AUDIO_END_TOKEN_ID in (getattr(request, "sampled_token_ids", None) or ())
 
 
 def _forwarder_state(transfer_manager: Any, request_id: str) -> dict[str, Any]:
@@ -403,7 +424,7 @@ def ar2acoustic_async_chunk(
     # so. Only the engine's verdict closes the stream, so a talker that flags
     # a span last while generation continues is reported rather than obeyed.
     terminal = bool(finished or published_last)
-    if published_last and not finished:
+    if published_last and not finished and not _stop_sampled(request):
         logger.warning(
             "MiniMax Music 3 talker flagged a terminal span for request %s while the "
             "engine still has the request running",
@@ -522,6 +543,10 @@ def ar2acoustic(
             "req_id": [ar_output.request_id],
         }
         published_seed = _payload_section(multimodal_output, "meta").get("audio_seed")
+        # Model Runner V1 hands stage 0's payload over as tensors, so the seed
+        # arrives as a 0-d tensor there and as an int on V2.
+        if isinstance(published_seed, torch.Tensor) and published_seed.numel() == 1:
+            published_seed = int(published_seed.item())
         if isinstance(published_seed, int):
             meta["audio_seed"] = published_seed
 
