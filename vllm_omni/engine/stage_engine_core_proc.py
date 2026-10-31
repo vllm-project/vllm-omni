@@ -143,6 +143,13 @@ class StageEngineCoreProc(EngineCoreProc):
         current_omni_platform.prepare_stage_engine()
         super().__init__(*args, **kwargs)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
+        if isinstance(self.model_executor, UniProcExecutor):
+            worker = self.model_executor.driver_worker.worker
+            bind_audio = getattr(
+                getattr(getattr(worker, "model_runner", None), "model_state", None), "bind_async_audio", None
+            )
+            if callable(bind_audio):
+                bind_audio(self.scheduler)
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
 

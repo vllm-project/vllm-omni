@@ -163,3 +163,20 @@ def test_platform_compat_runs_before_engine_construction(monkeypatch):
     with pytest.raises(ConstructionStoppedError):
         StageEngineCoreProc()
     assert calls == ["platform", "engine"]
+
+
+def test_engine_binds_model_local_async_audio(mocker):
+    from vllm_omni.engine import stage_engine_core_proc as module
+
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    executor = UniProcExecutor.__new__(UniProcExecutor)
+    state = SimpleNamespace(bind_async_audio=mocker.Mock())
+    executor.driver_worker = SimpleNamespace(worker=SimpleNamespace(model_runner=SimpleNamespace(model_state=state)))
+    engine.model_executor = executor
+    engine.output_queue = object()
+    engine.scheduler = object()
+    mocker.patch.object(EngineCoreProc, "__init__", return_value=None)
+    mocker.patch.object(module, "_bind_first_audio_sink", return_value=False)
+    mocker.patch.object(module, "_bind_native_data_plane_ready_sink", return_value=False)
+    engine.__init__()
+    state.bind_async_audio.assert_called_once_with(engine.scheduler)

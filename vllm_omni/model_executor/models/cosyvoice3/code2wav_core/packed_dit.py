@@ -294,12 +294,18 @@ class PackedRows:
 
 def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
     lengths = tuple(int(length) for length in lengths)
-    starts_host = F.pad(torch.tensor(lengths, dtype=torch.int64).cumsum(0), (1, 0))
-    starts = starts_host.to(device)
+    # Own pinned staging storage for both uploads. A blocking .to(device)
+    # here would also wait for the previous chunk on the codec stream.
+    pinned = device.type == "cuda"
+    lengths_host = torch.tensor(lengths, dtype=torch.int64, device="cpu", pin_memory=pinned)
+    starts_host = torch.empty(len(lengths) + 1, dtype=torch.int64, device="cpu", pin_memory=pinned)
+    starts_host[0] = 0
+    torch.cumsum(lengths_host, dim=0, out=starts_host[1:])
+    starts = starts_host.to(device, non_blocking=True)
     total = int(starts_host[-1])
     row_ids = torch.repeat_interleave(
         torch.arange(len(lengths), device=device),
-        torch.tensor(lengths, dtype=torch.int64, device=device),
+        lengths_host.to(device, non_blocking=True),
         output_size=total,
     )
     positions = torch.arange(total, device=device) - starts[row_ids]
@@ -684,6 +690,7 @@ class FlowGraphRunner:
         self.estimator = estimator
         self.graphs: dict[tuple, _FlowGraph] = {}
         self.pool = None
+        self.capture_stream: torch.cuda.Stream | None = None
         attn = estimator.dit.transformer_blocks[0].attn
         self.heads, self.head_dim = attn.heads, attn.inner_dim // attn.heads
 
@@ -820,12 +827,16 @@ class FlowGraphRunner:
         if fresh:
             # Warm up (and compile new dynamic shapes) off the capture, then
             # record the solve into the shared pool.
-            stream = torch.cuda.Stream()
+            if self.capture_stream is None:
+                self.capture_stream = torch.cuda.Stream(device=noise.device)
+            stream = self.capture_stream
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 self._solve(state, cfg_rate, graph_key)
             torch.cuda.current_stream().wait_stream(stream)
-            with torch.cuda.graph(state.graph, pool=self.pool):
+            from .graph_capture import capture_codec_graph
+
+            with capture_codec_graph(state.graph, pool=self.pool, stream=self.capture_stream):
                 state.output = self._solve(state, cfg_rate, graph_key)
             if self.pool is None:
                 self.pool = state.graph.pool()

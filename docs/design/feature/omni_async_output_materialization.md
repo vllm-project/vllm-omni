@@ -459,3 +459,95 @@ without pinned memory, copies remain blocking. These guards prevent accumulation
 or serialization from observing unfinished CPU tensors. This changes where the
 host waits, not the amount of NPU model computation or the D2H dependency on it.
 A shorter `sample_tokens()` interval alone is not an end-to-end speedup.
+
+## CosyVoice3 single-stage codec output
+
+The `cosyvoice3_single_stage` pipeline uses a model-local asynchronous scheduler
+and an in-process codec worker (UniProc, TP=1, PP=1). The runner appends samples
+and speech/EOS validity bits to per-request GPU buffers sized by
+`max_model_len`. It publishes only the latest written-prefix event and length
+in a per-request mailbox. There is no per-step notification FIFO or producer
+wait for codec consumption. Published prefixes are immutable; the producer can
+write later suffix positions while the codec reads an earlier chunk.
+The producer passes CPU row numbers as metadata and copies basic row slices into
+the owned buffers before graph output reuse. It does not advanced-index CUDA
+tensors with Python lists, which would upload indices and synchronize the AR
+stream for each selection.
+
+Codec state is keyed by the unique internal request ID assigned at ingress.
+Client audio routes are installed in `add_request()`, including waiting
+requests. Only AR-completed requests with pending codec tails reserve detached
+codec capacity; queued requests do not reduce the AR admission limit.
+Buffers are created on the first sampled-token submission, with no separate
+codec registration. The runner shares the scheduler's existing audio-route
+table to skip retired requests; the scheduler also discards their queued audio. Cancellation
+markers remain until pending control and audio copies have completed.
+
+The codec worker snapshots mailbox progress and copies previously unread
+validity bits to a request-owned pinned host buffer on a control stream. It
+checks that copy's event before reading the bits on the CPU. Keeping the whole
+validity prefix preserves EOS even when many progress notifications coalesce.
+Length-limit termination also preserves its original token position. Cancellation
+and release use a separate coalesced control mailbox, without waiting for space
+in a token queue. Decoder state stays owned by the codec thread. The worker plans chunk windows
+over validated token prefixes using the confirmed length and optional stop
+position; only the AR producer writes tokens. Readiness, prefix boundaries,
+chunk-ramp advancement and tail selection are decided together by the worker,
+including when EOS progress has coalesced. The existing two-stage forward path
+keeps its request routing and cache cleanup in the model; the single-stage
+codec runs alongside it without a shared pipeline adapter.
+
+The worker catches up through the existing chunk ramp and lookahead before
+finalizing the tail, rather than merging a backlog into one large final decode.
+Decoder caches stay on the GPU. Flow is still batched, but the codec worker
+receives one HiFT result at a time. It snapshots that request's PCM and
+immediately schedules D2H on the audio copy stream using a per-request GPU event,
+before submitting the next request's HiFT. Copy-stream waits order the transfer
+without making the codec CPU thread wait for HiFT or D2H. Completed copies can
+be published between submissions; each GPU source remains owned until its copy
+event completes.
+
+The original pending-audio threshold is checked before admitting a decode
+batch. It is not a strict per-row cap: an admitted batch can exceed the remaining
+slots, and another batch may be submitted while earlier copies are in flight
+when the pending count is below the threshold. This retains the previous
+submission depth. There is no one-batch limit or per-HiFT completion gate.
+Only completed host PCM enters the scheduler's audio inbox. Reaching the
+admission threshold does not prevent the runner from appending tokens.
+The executor holds the decoder directly; it does not depend on the Talker model.
+Both topologies select their backend through the same iterator. Its input index
+identifies the original request; a yield means submission, not GPU completion,
+and several per-request yields may come from one batched computation. The list
+interface restores input order, while the codec owner schedules per-result D2H.
+
+Input memory is bounded by request admission and
+`max_model_len`, rather than by an unbounded queue of step snapshots.
+
+Codec Flow/HiFT graph construction uses an owner-private non-default stream
+and thread-local capture error checking. Warmup and static-buffer writes are ordered
+before capture with stream dependencies. The capture helper calls
+`CUDAGraph.capture_begin/end` directly, avoiding the device-wide synchronization,
+cache flush and shared default capture stream in `torch.cuda.graph`. AR graph
+construction must finish before the codec owner starts; this does not permit
+multiple concurrent graph captures. The single codec owner serializes graph
+capture/replay and keeps the captured buffers and graph pool alive. Independent
+AR allocations are not included in the codec graph, and captured-thread unsafe
+operations remain errors. This changes codec capture only, not the global
+PyTorch capture policy or Inductor's separate cudagraph option.
+
+AR resources are released normally at EOS. The scheduler retains the terminal
+output until the final audio notification arrives, and reserves admission
+capacity for these tails. Generation numbers reject late messages from retired
+requests. In-flight control reads retain their GPU sources and pinned destinations
+through cancellation. KV preemption fails a request rather than restarting an
+already emitted waveform. Worker failures propagate to the engine, and shutdown
+drains submitted work before decoder resources disappear. Final client delivery
+still follows engine-loop consumption; this path does not promise that CPU/GIL
+or GPU resource contention disappears.
+
+CPU tests cover prefill handoff, chunk boundaries, EOS and length stops,
+cancellation during control D2H, deferred termination, late audio after
+retirement and admission. CUDA tests also hold codec work open while the
+producer appends tokens, checking progress and owned token snapshots. CUDA stream tests require a CUDA
+host; CPU tests do not establish stream correctness, audio equivalence or a
+performance gain.
