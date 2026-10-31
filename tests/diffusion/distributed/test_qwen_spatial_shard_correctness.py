@@ -149,7 +149,11 @@ def test_qwen_spatial_shard_decode_matches_reference(split_dim: str) -> None:
         # Tile is intentionally lossy for above-threshold shapes and is not
         # gated; for the small below-threshold shape it is exact (PSNR inf).
         tile_psnr = return_dict[f"{case_id}:tile:psnr"]
-        assert tile_psnr >= 0
+        if shape == (1, 16, 1, 16, 16):
+            tile_max = return_dict[f"{case_id}:tile:max_abs_diff"]
+            assert tile_max == 0, (
+                f"Below-threshold tile fallback must be exact, got max_abs_diff {tile_max} for {shape}"
+            )
         assert return_dict[f"{case_id}:tile:shape"] == return_dict[f"{case_id}:{spatial_mode}:shape"]
 
         print(
