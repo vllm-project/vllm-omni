@@ -55,6 +55,7 @@ from vllm_omni.diffusion.offloader import (
 from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
+    VAE_COMPONENT,
     OffloadStrategy,
     offload_streams_blocks,
     resolve_offload,
@@ -1736,6 +1737,10 @@ class MiniMaxH3Pipeline(
             if TEXT_ENCODER_COMPONENT in offload_components and not components.encoders:
                 raise ValueError("MiniMax-H3 has no loaded text encoder for selected module offload")
             selected_explicit_stages = [*components.encoders] if TEXT_ENCODER_COMPONENT in offload_components else []
+            if VAE_COMPONENT in offload_components:
+                if not components.vaes:
+                    raise ValueError("MiniMax-H3 has no loaded VAE for selected module offload")
+                selected_explicit_stages.extend(components.vaes)
             if upscaler is not None and upscaler.resident:
                 selected_explicit_stages.append(upscaler)
             selection_options = {
