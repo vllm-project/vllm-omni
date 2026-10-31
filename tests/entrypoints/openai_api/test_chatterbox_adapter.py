@@ -177,13 +177,16 @@ def reference(seconds: float, seed: int, sample_rate: int = 24000, mime: str = "
     return f"data:{mime};base64,{base64.b64encode(buffer.getvalue()).decode()}"
 
 
+# References the batching tests admit at once: a whole admission of the shipped
+# profiles, 64, is too much CPU encoding for a shared runner.
+ADMISSION = 8
+
+
 def deploy_on_cpu(name: str, max_num_seqs: int | None = None) -> str:
     """A copy of deploy file ``name`` with its reference encoders on this host's CPU.
 
     Every CUDA profile conditions on ``cuda:0``; these tests build servers on a
-    CPU host. ``max_num_seqs`` replaces stage 0's, which sizes the encoder
-    batch: encoding a shipped profile's 64 references on a shared CPU runner
-    can outlast a test's wait.
+    CPU host. ``max_num_seqs`` replaces stage 0's, which sizes the encoder batch.
     """
     stage: dict[str, object] = {"additional_config.conditioning_device": "cpu"}
     if max_num_seqs is not None:
@@ -320,17 +323,17 @@ async def test_original_controls_default_to_the_deploy_files(original, extra_par
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("variant", "adapter_cls", "seconds", "max_num_seqs", "admission"),
-    [("turbo", ChatterboxAdapter, 5.04, 8, 8), ("original", ChatterboxOriginalAdapter, 1.0, 16, 8)],
+    ("variant", "adapter_cls", "seconds", "max_num_seqs"),
+    [("turbo", ChatterboxAdapter, 5.04, ADMISSION), ("original", ChatterboxOriginalAdapter, 1.0, 2 * ADMISSION)],
 )
 async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
-    request, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds, max_num_seqs, admission
+    request, tmp_path, monkeypatch, clean_speaker_cache, variant, adapter_cls, seconds, max_num_seqs
 ):
     """Everything queued while the encoders are busy goes through them as one batch, with no cap of its own.
 
-    Stage 0 admits ``admission`` requests (Original's 16 sequences are 8
-    guided pairs), so that many references arriving together are one
-    admission. The first batch is held so that the other references queue
+    Stage 0 admits ``ADMISSION`` requests (Original's twice as many sequences
+    are that many guided pairs), so that many references arriving together
+    are one admission. The first batch is held so that the other references queue
     behind it; the batch after it is all of them. Each clip is 40 ms (one
     prompt token) longer than the one before, so the prompt lengths show
     every voice is its own reference's. A second wave of the same references
@@ -341,13 +344,13 @@ async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
     speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY[variant], max_num_seqs)))
     concurrent = speech._adapter
     assert isinstance(concurrent, adapter_cls)
-    assert concurrent.conditioning_capacity == admission
+    assert concurrent.conditioning_capacity == ADMISSION
     batches = EncoderBatches(encoder(concurrent), hold=True)
-    sources = [reference(seconds + 0.04 * index, seed=index) for index in range(admission)]
+    sources = [reference(seconds + 0.04 * index, seed=index) for index in range(ADMISSION)]
     try:
         requests = [asyncio.create_task(concurrent.resolve_voice(source)) for source in sources]
         await asyncio.to_thread(batches.started.wait, 30)
-        while len(concurrent.conditioning_pending) < admission:
+        while len(concurrent.conditioning_pending) < ADMISSION:
             await asyncio.sleep(0.01)
         batches.released.set()
         voices = await asyncio.wait_for(asyncio.gather(*requests), 120)
@@ -358,8 +361,8 @@ async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
         speech.shutdown()
 
     lengths = [voice.prompt_token.shape[1] for voice in voices]
-    assert lengths == list(range(lengths[0], lengths[0] + admission))
-    assert encoded == [encoded[0], admission - encoded[0]]
+    assert lengths == list(range(lengths[0], lengths[0] + ADMISSION))
+    assert encoded == [encoded[0], ADMISSION - encoded[0]]
     assert batches.most_active == 1
     # Served from the speaker cache: the same tensors, and no further encoder batch.
     assert all(left.prompt_feat is right.prompt_feat for left, right in zip(voices, cached, strict=True))
@@ -461,7 +464,7 @@ async def test_cancelled_wave_cannot_overfill_encoder_queue(
 ):
     """Cancelled waiters keep their encoder work, and with it the slots a new wave would take."""
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path / "speakers"))
-    speech = serving(engine_client(original_model_dir, deploy_on_cpu(DEPLOY["original"], max_num_seqs=16)))
+    speech = serving(engine_client(original_model_dir, deploy_on_cpu(DEPLOY["original"], max_num_seqs=2 * ADMISSION)))
     original = speech._adapter
     assert isinstance(original, ChatterboxOriginalAdapter)
     admission = original.conditioning_capacity
