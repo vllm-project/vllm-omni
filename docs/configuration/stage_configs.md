@@ -571,6 +571,45 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 !!! important
     We are actively iterating on the definition of deployment configurations, and we welcome feedback from users and developers.
 
+## Qwen3-Omni streaming sampler and decoder defaults
+
+The default `qwen3_omni_moe.yaml` enables two CUDA streaming optimizations
+for concurrent speech generation:
+
+| Connector option | Default | Purpose |
+| --- | --- | --- |
+| `code_predictor_fused_sampling` | `true` | Fuse the residual-codebook sampler's final nucleus mask and Gumbel selection. Native top-k, sorting, softmax and cumulative sums remain. |
+| `codec_graph_batch_sizes` | `[2, 4]` | Capture multi-row Code2Wav graphs for streaming windows, avoiding eager decoding for compatible batches. Larger batches are split into supported groups. |
+
+The implementation gates these paths on CUDA support. The two-GPU placement,
+sampling parameters and chunk policy remain unchanged: four frames initially,
+then 25 new frames with up to 25 frames of left context. Existing deploy
+profiles inherit these options unless they override them.
+
+Additional decoder graphs increase startup work and can increase memory use.
+Fused logarithms and batched convolution shapes can change floating-point
+rounding; do not assume bitwise-identical codec tokens or audio. Validate
+speech quality as well as first audio packet latency and throughput on the
+intended hardware and concurrency. First packet latency does not measure
+leading silence or time to first audible speech.
+
+For rollback or an A/B baseline, set `code_predictor_fused_sampling: false`
+and `codec_graph_batch_sizes: []` in the connector's `extra` section of your
+deploy config. Change one option at a time to isolate its effect. Warm each
+configuration with representative batch and chunk shapes, then record repeated
+measurements with the profiler disabled:
+
+```bash
+# Requires a local Seed-TTS evaluation dataset. Repeat at concurrency 1 and 4.
+vllm-omni bench serve --omni --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --backend openai-chat-omni --endpoint /v1/chat/completions \
+  --dataset-name seed-tts --dataset-path /path/to/seed-tts-eval \
+  --seed-tts-locale en --disable-shuffle --no-oversample \
+  --temperature 0 --num-prompts 32 --max-concurrency 4 \
+  --percentile-metrics ttft,e2el,audio_ttfp,audio_rtf \
+  --save-result --save-detailed --result-dir ./streaming-results
+```
+
 ## Qwen3-TTS with Model Runner V2
 
 Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
