@@ -213,6 +213,20 @@ they are not silently recovered in the same process. `ASCEND_LAUNCH_BLOCKING=1`
 is incompatible with this graph mode. The generic deploy YAML and non-NPU
 execution paths retain their defaults.
 
+### Optional padded DiT compilation
+
+The generic CUDA Code2Wav path can opt into DiT compilation through the existing HF override interface:
+
+```bash
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 \
+  --trust-remote-code --deploy-config cosyvoice3.yaml \
+  --hf-overrides '{"cosyvoice3_compile_dit": true}'
+```
+
+This option defaults to `false`, preserves the selected attention backend, and compiles only the padded DiT estimator after loading its weights. CUDA with CUDNN_ATTN, FLASH_ATTN, or TORCH_SDPA is required; CPU and the separately compiled packed Flow profiles reject this option. HiFT and the Talker are unchanged. It is independent of speculative decoding and introduces no environment variable.
+
+Compilation occurs on first use, so warm up representative shapes before measuring serving latency. This experimental option is not waveform-equivalent to the eager path: finite-precision changes can affect generated audio, and a small automatic quality screen does not establish equivalence for all inputs. End-to-end throughput and average first-audio latency improved in the measured short-text workload, but tail latency was variable. Validate audio quality and latency for your deployment before enabling it.
+
 ### Optional DSpark speculative decoding
 
 CosyVoice3 can use vLLM's DSpark drafter on the Talker stage with Model Runner V2 and tensor parallel size 1. This is opt-in and requires a compatible CosyVoice3 DSpark checkpoint; do not configure the drafter on Code2Wav. Convert the checkpoint's unified vocabulary to the speech vocabulary before serving:
