@@ -27,6 +27,25 @@ def test_offline_ulysses_argument(tmp_path):
         example.build_omni_kwargs(args, paths)
 
 
+def test_action_root_uses_stage_scoped_model_config(tmp_path):
+    argv = ["--image", "frame.jpg", "--action-dir", "forward", "--prompt", "A lake"]
+    paths = example.LingBotPaths(
+        tmp_path / "frame.jpg", tmp_path / "forward", tmp_path, Path("forward"), 9, tmp_path / "out.mp4"
+    )
+    kwargs = example.build_omni_kwargs(example.parse_args(argv), paths)
+
+    assert kwargs["stage_0_model_config"] == {"lingbot_action_root": str(paths.action_root)}
+    assert "model_config" not in kwargs
+    assert set(kwargs) == {
+        "model",
+        "flow_shift",
+        "tensor_parallel_size",
+        "ulysses_degree",
+        "enforce_eager",
+        "stage_0_model_config",
+    }
+
+
 @pytest.mark.parametrize(("num_blocks", "num_frames"), [(10, 117), (11, 129)])
 def test_streaming_action_script_accepts_long_rollouts(tmp_path, num_blocks, num_frames):
     action_script = tmp_path / "actions.json"
