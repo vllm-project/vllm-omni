@@ -16,7 +16,11 @@ stages:
     skip_tokenizer_init: true
     tokenizer: gpt2
     async_scheduling: true
-    max_num_batched_tokens: 512
+    # IndexTTS prefill needs the whole prompt in one step, so chunked prefill
+    # must stay off; with it off vLLM requires
+    # max_num_batched_tokens >= max_model_len.
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 4096
     max_model_len: 2560
     devices: "0"
     output_connectors:
