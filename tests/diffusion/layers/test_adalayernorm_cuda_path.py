@@ -69,6 +69,26 @@ def test_fused_fast_path_matches_native(dtype, affine, bs, seq, hidden):
     assert_close(out, fp32_reference(x, scale, shift, 1e-6), dtype, loose=True)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.no_grad()
+def test_fused_modulation_preserves_intermediate_rounding(dtype):
+    # Mean zero and variance five eliminate reduction-order differences, so
+    # this checks the eager rounding between multiplication and addition.
+    x = (
+        torch.tensor([-3.0, -1.0, 1.0, 3.0], device="cuda", dtype=dtype)
+        .repeat(128)
+        .reshape(1, 1, 512)
+        .expand(1, 4, 512)
+        .contiguous()
+    )
+    scale = torch.linspace(-0.8, 0.9, 512, device="cuda").to(dtype).reshape(1, 1, 512)
+    shift = torch.linspace(0.4, -0.3, 512, device="cuda").to(dtype).reshape(1, 1, 512)
+    module = make_module(512, False, 0.0, "cuda", dtype)
+    actual = _adaln_fused_forward(module, x, scale, shift)
+    assert actual is not None
+    torch.testing.assert_close(actual, module.forward_native(x, scale, shift), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_fused_noncontiguous_x(dtype):
     # Non-contiguous x routes to the forward_native fallback (the fused kernel
