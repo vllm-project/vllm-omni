@@ -78,6 +78,12 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "tool_result_retirement_failed": "server_error",
     "server_vad_unavailable": "server_error",
     "semantic_vad_unavailable": "server_error",
+    # A bare ``timeout`` is the engine failing to answer a control RPC, not the
+    # caller sending a malformed request: ``duplex_omni_engine.py`` raises
+    # ``DuplexSessionError(code="timeout")`` when the open (or an in-session
+    # RPC) runs out of budget. ``config_timeout`` above is the caller's own
+    # config budget and stays a client error.
+    "timeout": "server_error",
 }
 
 
