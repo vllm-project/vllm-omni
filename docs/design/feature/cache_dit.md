@@ -230,6 +230,20 @@ CUSTOM_DIT_ENABLERS.update(
 
 ---
 
+### MiniMax-H3 reference isolation
+
+MiniMax-H3's opt-in `--kv-isolate` path uses the existing reference-KV-aware
+Cache-DiT adapter even when `--kv-offload-config` is absent. It captures reference
+K/V once, then switches from full to compact hidden states. The adapter's
+history key includes the request's reference-state identity, epoch, isolation
+policy, layout, shape, dtype and device. A changed key clears residual and
+TaylorSeer history before permitting reuse; capture steps execute all blocks.
+
+This preserves the existing refresh-first scheduling behavior. Isolation does
+not introduce a Cache-DiT hit-priority scheduler, and its changed attention
+semantics require separate output-quality evaluation. See the
+[configuration and support limits](../../user_guide/diffusion_features.md#experimental-minimax-h3-reference-isolation).
+
 ## Testing
 
 After adding cache-dit support, test with:
