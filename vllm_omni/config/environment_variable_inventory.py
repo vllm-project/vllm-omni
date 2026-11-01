@@ -296,6 +296,7 @@ _INTERNAL = (
     "VLLM_OMNI_CONNECTOR_RECV_POLL_MS",
     "VLLM_OMNI_SHM_WAKEUP",
     "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT",
+    "VLLM_OMNI_EXECUTE_RPC_TIMEOUT",
     "VLLM_OMNI_GROUP_NORM_SPLIT_WAVES",
     "VLLM_OMNI_REPLICA_ID",
     # Removed in vLLM v0.16.0. Omni reads it only to emit a migration warning;
