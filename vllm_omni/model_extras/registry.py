@@ -44,6 +44,7 @@ from vllm_omni.model_extras.kandinsky6 import (
     KANDINSKY6_EXTRA_BODY_PARAMS,
     KANDINSKY6_EXTRA_OUTPUT_PARAMS,
     get_kandinsky6_video_generation_defaults,
+    preserve_kandinsky6_reference_image_size,
 )
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import (
@@ -258,6 +259,7 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": KANDINSKY6_EXTRA_BODY_PARAMS,
         "extra_output_params": KANDINSKY6_EXTRA_OUTPUT_PARAMS,
         "video_generation_defaults_builder": get_kandinsky6_video_generation_defaults,
+        "reference_image_size_resolver": preserve_kandinsky6_reference_image_size,
         # forward() returns uint8 frames already; declared for completeness.
         "output_tensor_range": "zero_to_one",
     },
