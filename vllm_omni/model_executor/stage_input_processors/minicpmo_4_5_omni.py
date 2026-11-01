@@ -859,6 +859,10 @@ def _native_duplex_forwarded_hidden_rows(
     )
 
 
+# Set after the first output whose row ledger does not match its latent rows.
+_turn_ledger_mismatch_logged = False
+
+
 def _turn_hidden_rows(
     mm_output: Mapping[str, object],
     thinker_hidden_states: torch.Tensor,
@@ -876,25 +880,48 @@ def _turn_hidden_rows(
     position. The slice ends at the first token with no row, e.g. the last
     sampled token, which is never forwarded. Without a ledger the rows are
     taken by position.
+
+    Ledger positions are token indices: the Thinker's positions are 1-D
+    (MiniCPM-o 4.5 has no M-RoPE), placeholder tokens included.
     """
+    global _turn_ledger_mismatch_logged
     row_ids = mm_output.get("latent_input_ids")
     row_positions = mm_output.get("latent_positions")
     num_rows = int(thinker_hidden_states.shape[0])
-    if (
-        not isinstance(row_ids, torch.Tensor)
-        or not isinstance(row_positions, torch.Tensor)
-        or row_ids.numel() != num_rows
-        or row_positions.numel() != num_rows
-    ):
+    if not isinstance(row_ids, torch.Tensor) or not isinstance(row_positions, torch.Tensor):
+        return thinker_hidden_states[start:end].to(torch.float32).contiguous()
+    if row_ids.numel() != num_rows or row_positions.numel() != num_rows:
+        if not _turn_ledger_mismatch_logged:
+            _turn_ledger_mismatch_logged = True
+            logger.warning(
+                "MiniCPM-o turn handoff: Thinker row ledger has %d ids and %d positions for %d latent rows; "
+                "taking rows by index",
+                row_ids.numel(),
+                row_positions.numel(),
+                num_rows,
+            )
         return thinker_hidden_states[start:end].to(torch.float32).contiguous()
     ids = row_ids.reshape(-1).tolist()
-    latest_row = {int(position): row for row, position in enumerate(row_positions.reshape(-1).tolist())}
+    latest_row = {
+        int(position): row
+        for row, position in enumerate(row_positions.reshape(-1).tolist())
+        if start <= int(position) < end
+    }
     rows: list[int] = []
     for position in range(start, end):
         row = latest_row.get(position)
         if row is None or int(ids[row]) != int(full_token_ids[position]):
             break
         rows.append(row)
+    if len(rows) < end - start - 1:
+        # Only the last sampled token is expected to have no row.
+        logger.warning(
+            "MiniCPM-o turn handoff: Thinker rows stop at token %d of %d (position %d); "
+            "the Talker gets the shorter reply",
+            len(rows),
+            end - start,
+            start + len(rows),
+        )
     return thinker_hidden_states[rows].to(torch.float32).contiguous()
 
 
