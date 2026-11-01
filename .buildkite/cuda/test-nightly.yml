@@ -443,6 +443,12 @@ steps:
       - label: ":full_moon: Diffusion X2V · MiniMax H3 I2VA/Ref2VA/Timeline Guide Accuracy Test"
         source_file_dependencies: diffusion_minimax_h3_accuracy
         timeout_in_minutes: 180
+        artifact_paths:
+          - tests/e2e/accuracy/artifacts/minimax_h3_i2va/input.png
+          - tests/e2e/accuracy/artifacts/minimax_h3_i2va/reference.mp4
+          - tests/e2e/accuracy/artifacts/minimax_h3_i2va/vllm_omni.mp4
+          - tests/e2e/accuracy/artifacts/minimax_h3_ref2va/reference.mp4
+          - tests/e2e/accuracy/artifacts/minimax_h3_ref2va/vllm_omni.mp4
         commands:
           - pytest -s -v tests/e2e/accuracy/minimax_h3/ -m "full_model and H100 and B200 and (cards_2 or cards_4)" --run-level full_model
 
