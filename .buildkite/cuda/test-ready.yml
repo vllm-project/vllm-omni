@@ -41,7 +41,9 @@ steps:
       - label: "Diffusion · FlashAttention Test"
         timeout_in_minutes: 20
         commands:
-          - timeout 15m pytest -s -v tests/diffusion/attention/ -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
+          - uv pip install --system --no-deps 'fastvideo-kernel==0.3.4'
+          - python3 -c 'from fastvideo_kernel.block_sparse_attn import block_sparse_attn_triton'
+          - timeout 15m pytest -s -v tests/diffusion/attention/ tests/diffusion/utils/test_chunked_transfer.py -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Offloader Test"
@@ -66,17 +68,21 @@ steps:
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Distributed Test · 2-GPU"
+        timeout_in_minutes: 65
         source_file_dependencies: diffusion_distributed_attention
         commands:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
           - timeout 10m pytest -sv tests/diffusion/attention/test_ulysses_uaa.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_2' --run-level "core_model"
         mirror_hardwares: l4_2
 
       - label: "Diffusion · Distributed & Attention Test · 4-GPU"
+        timeout_in_minutes: 65
         source_file_dependencies: diffusion_distributed_attention
         commands:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
           - timeout 20m pytest -sv tests/diffusion/attention/test_attention_sp.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/attention/test_ulysses_uaa.py -m 'core_model and cuda and L4 and cards_4' --run-level "core_model"
         mirror_hardwares: l4_4
 
       - label: "Diffusion · Model Test"
@@ -236,16 +242,6 @@ steps:
             timeout 40m bash -c "
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model and cuda' --run-level 'core_model'
-            "
-        mirror_hardwares: h100_1
-
-      - label: "Diffusion · Cosmos3 Test"
-        source_file_dependencies: diffusion_cosmos3_function
-        commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_cosmos3.py -m 'core_model' --run-level 'core_model'
             "
         mirror_hardwares: h100_1
 

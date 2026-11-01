@@ -32,6 +32,7 @@ MODEL = "Qwen/Qwen-Image"
 T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
 NEGATIVE_PROMPT = "blurry, low quality"
 
+DEFAULT_SMOKE_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325", "npu": "A3"})
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
 
@@ -47,20 +48,21 @@ TEST_PROMPTS: list[dict[str, str]] = [
 ]
 
 
-def _get_default_case(model: str):
+def _get_default_case(model: str, marks):
     """Return a single default ``OmniServerParams`` row (no extra ``server_args``)."""
     return [
         pytest.param(
             OmniServerParams(model=model),
             id="default",
-            marks=SINGLE_CARD_FEATURE_MARKS,
+            marks=marks,
         ),
     ]
 
 
 @pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)
+@pytest.mark.parametrize("omni_server", _get_default_case(MODEL, DEFAULT_SMOKE_MARKS), indirect=True)
 def test_text_to_image_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
     """Default Qwen-Image T2I smoke (single ``default`` server config)."""
     messages = dummy_messages_from_mix_data(content_text=T2I_PROMPT)
@@ -82,7 +84,7 @@ def test_text_to_image_001(omni_server: OmniServer, online_client: OnlineOmniCli
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
-@pytest.mark.parametrize("omni_server", _get_default_case(MODEL), indirect=True)
+@pytest.mark.parametrize("omni_server", _get_default_case(MODEL, SINGLE_CARD_FEATURE_MARKS), indirect=True)
 def test_batch_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
     """Concurrent T2I: one ``request_config`` dict per prompt (``send_diffusion_request`` list mode)."""
     request_config = [

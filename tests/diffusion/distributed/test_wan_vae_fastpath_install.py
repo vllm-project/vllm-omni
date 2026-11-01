@@ -720,11 +720,13 @@ class _StubPipeline(nn.Module):
         self.vae = vae
 
 
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
 @pytest.mark.parametrize(("level", "expected"), [("lossless", True), ("channels_last", True), ("off", False)])
-def test_registry_hook_installs_on_cuda_platform(mocker, level: str, expected: bool) -> None:
+def test_registry_hook_installs_on_supported_platform(mocker, device_type: str, level: str, expected: bool) -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     platform = mocker.Mock()
-    platform.is_cuda.return_value = True
+    platform.is_cuda.return_value = device_type == "cuda"
+    platform.is_xpu.return_value = device_type == "xpu"
     mocker.patch.object(registry_module, "current_omni_platform", platform)
 
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path=level))
@@ -733,10 +735,11 @@ def test_registry_hook_installs_on_cuda_platform(mocker, level: str, expected: b
         assert getattr(vae, REPORT_ATTR).level == level
 
 
-def test_registry_hook_skips_non_cuda_platform_and_non_wan_vaes(mocker) -> None:
+def test_registry_hook_skips_unsupported_platform_and_non_wan_vaes(mocker) -> None:
     _, vae = _build_pair(TINY_RESIDUAL, torch.float32)
     platform = mocker.Mock()
     platform.is_cuda.return_value = False
+    platform.is_xpu.return_value = False
     mocker.patch.object(registry_module, "current_omni_platform", platform)
     registry_module._apply_wan_vae_fastpath_if_enabled(_StubPipeline(vae), SimpleNamespace(vae_fast_path="lossless"))
     assert not is_installed(vae)
@@ -779,3 +782,43 @@ def test_registry_component_failure_does_not_disable_other_component(mocker, fai
     )
     assert is_encoder_installed(vae) == (failed_component != "encoder")
     assert is_installed(vae) == (failed_component != "decoder")
+
+
+@pytest.mark.parametrize("level", ["lossless", "channels_last"])
+def test_decoder_spatial_probe_policy_is_scoped_and_reversible(level: str) -> None:
+    vae = AutoencoderKLWan(**TINY_RESIDUAL).eval()
+    assert install_wan_vae_fastpath(vae, level=level).installed
+    for module in vae.decoder.modules():
+        if type(module) is fastpath_forwards.WanCausalConv3d:
+            cfg = getattr(module, fastpath_forwards.CFG_ATTR)
+            assert cfg.verify_spatial_padding == (level == "lossless" or module is vae.decoder.conv_out)
+    assert not hasattr(vae.encoder, fastpath_forwards.CFG_ATTR)
+    uninstall_wan_vae_fastpath(vae)
+    assert all(not hasattr(module, fastpath_forwards.CFG_ATTR) for module in vae.modules())
+
+
+@torch.no_grad()
+def test_decode_releases_previous_chunk_before_next_decoder_call() -> None:
+    import weakref
+
+    chunks: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    class Decoder:
+        temperal_upsample: list[bool] = []
+
+        def __call__(self, x, **kwargs):
+            assert all(ref() is None for ref in chunks)
+            result = x.clone()
+            chunks.append(weakref.ref(result))
+            return result
+
+    vae = SimpleNamespace(
+        clear_cache=lambda: None,
+        post_quant_conv=lambda x: x,
+        config=SimpleNamespace(patch_size=None),
+        decoder=Decoder(),
+        _feat_map=[],
+    )
+    latents = torch.rand(1, 2, 3, 2, 2)
+    torch.testing.assert_close(decode_frames(vae, latents), latents, rtol=0, atol=0)
+    assert all(ref() is None for ref in chunks)

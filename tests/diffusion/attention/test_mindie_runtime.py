@@ -218,19 +218,28 @@ def test_sparse_model_padding_mask_is_equivalent_to_trimming(runtime):
     assert sparse()._resolve_plan(metadata).used_len == 4096
 
 
-def test_bsa_operator_failure_never_retries(runtime, monkeypatch):
-    runtime.sparse_attention = Mock(side_effect=RuntimeError("BSA operator failure"))
+@pytest.mark.parametrize(
+    "method,error",
+    [
+        ("mxfp4", RuntimeError("BSA operator failure")),
+        ("mxfp8", ValueError("unsupported precision: mxfp8")),
+    ],
+)
+def test_sparse_runtime_failure_never_retries(runtime, monkeypatch, method, error):
+    runtime.sparse_attention = Mock(side_effect=error)
     monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
     q = torch.randn(1, 4096, 2, 64, dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="BSA operator failure"):
-        sparse().forward_npu(q, q, q, video_metadata(kv_cache_dtype="mxfp4"))
+    with pytest.raises(type(error)) as exc_info:
+        sparse().forward_npu(q, q, q, video_metadata(kv_cache_dtype=method))
+    assert exc_info.value is error
     runtime.sparse_attention.assert_called_once()
+    assert runtime.sparse_attention.call_args.kwargs["precision"] == method
+    runtime.quant_attention.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "method,shape,supports_precision,error",
     [
-        ("mxfp8", (1, 4096, 2, 64), True, "sparse mxfp8 is not supported"),
         ("mxfp4", (1, 4096, 2, 64), False, "explicitly support precision"),
         ("fp8", (2, 4096, 2, 64), True, "batch size 1"),
         ("fp8", (1, 4096, 2, 32), True, "power-of-two head dimension"),

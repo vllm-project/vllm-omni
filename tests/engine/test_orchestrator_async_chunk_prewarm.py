@@ -74,6 +74,9 @@ class _FakePool:
     def get_bound_client(self, request_id):
         return self.stage_client
 
+    def get_payload_sender_info(self, request_id):
+        return None
+
 
 def _orchestrator(payload_func: Any = None, cls: type[Orchestrator] = Orchestrator) -> Orchestrator:
     """Thinker -> Talker (no payload hook) -> Code2Wav (``payload_func``, if any)."""
@@ -245,6 +248,7 @@ async def test_add_request_attaches_payload_once_and_streaming_update_does_not(m
 @pytest.mark.asyncio
 async def test_duplex_session_submit_does_not_request_payload(mocker) -> None:
     orchestrator = _orchestrator(cls=DuplexOrchestrator)
+    orchestrator.replica_placement = None
     prewarm = mocker.AsyncMock(return_value=True)
     orchestrator._prewarm_async_chunk_stages = prewarm  # type: ignore[method-assign]
     sampling_params = tuple(_sampling_params())

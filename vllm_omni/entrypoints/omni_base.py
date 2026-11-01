@@ -13,12 +13,14 @@ from typing import TYPE_CHECKING, Any, Literal
 import huggingface_hub
 import vllm.envs as envs
 from omegaconf import OmegaConf
+from vllm.exceptions import RetryableRequestError
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
@@ -170,8 +172,11 @@ class OmniBase(PDDisaggregationMixin):
     def __init__(
         self,
         model: str,
+        watermark_config: WatermarkConfig | None = None,
         **kwargs: Any,
     ) -> None:
+        if watermark_config is not None and not isinstance(watermark_config, WatermarkConfig):
+            raise TypeError("watermark_config must be a WatermarkConfig; use --watermark-config for CLI JSON")
         if "engine_args" in kwargs:
             logger.warning(
                 "engine_args were passed as a kwarg to an Omni instance; this is not supported. "
@@ -222,6 +227,7 @@ class OmniBase(PDDisaggregationMixin):
             prom_metrics=self.prom_metrics,
             log_stats=log_stats,
             collect_stage_metrics=collect_stage_metrics,
+            watermark_config=watermark_config,
             **kwargs,
         )
         self._shutdown_called = False
@@ -509,6 +515,9 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
+            if msg.request_id is not None and msg.request_id not in self.request_states:
+                # Ignore queued errors from completed or cancelled requests.
+                return True, None, None, None
             self._raise_nonfatal_error_message(msg)
 
         if not isinstance(msg, OutputMessage):
@@ -547,6 +556,8 @@ class OmniBase(PDDisaggregationMixin):
 
     def _raise_nonfatal_error_message(self, msg: ErrorMessage) -> None:
         """Raise the exception for a non-fatal, request-scoped error message."""
+        if msg.mm_cache_miss_hashes and msg.status_code == 503 and msg.error_type == "ServiceUnavailableError":
+            raise RetryableRequestError(msg.error)
         raise_client_error_or(
             msg.error,
             status_code=msg.status_code,
