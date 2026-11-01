@@ -412,10 +412,19 @@ class SileroStreamingVAD:
         """Decode one appended chunk to 16 kHz float32 samples."""
         if not isinstance(audio, str):
             raise ValueError("Silero server VAD requires base64 audio")
-        try:
-            raw = base64.b64decode(audio, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError("Silero server VAD received invalid base64 audio") from exc
+        return self.decode_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+
+    def decode_audio(self, audio: object, *, fmt: object, sample_rate_hz: object) -> np.ndarray:
+        """:meth:`decode_base64`, also taking a chunk that is already decoded to bytes."""
+        if isinstance(audio, bytes | bytearray):
+            raw = bytes(audio)
+        elif isinstance(audio, str):
+            try:
+                raw = base64.b64decode(audio, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("Silero server VAD received invalid base64 audio") from exc
+        else:
+            raise ValueError("Silero server VAD requires base64 audio or PCM bytes")
         rate = int(sample_rate_hz) if isinstance(sample_rate_hz, int | float) else self._SAMPLE_RATE_HZ
         if rate <= 0:
             raise ValueError("Silero server VAD requires a positive sample rate")

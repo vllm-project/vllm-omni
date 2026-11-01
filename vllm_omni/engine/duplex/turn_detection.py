@@ -307,7 +307,7 @@ def _frame_steps(detector: TurnDetector, samples: np.ndarray) -> FrameSteps[list
 
 def _segment_steps(
     detector: TurnDetector,
-    base64_audio: str,
+    audio: str | bytes,
     *,
     fmt: str,
     sample_rate_hz: int | None,
@@ -317,8 +317,9 @@ def _segment_steps(
     Only audio through the current frame may reach Smart Turn. Flush a segment
     at each commit so the runner can commit it before buffering the next turn.
     The final partial frame stays in the detector for the next append.
+    ``audio`` is base64 or the already-decoded bytes.
     """
-    samples = detector.vad.decode_base64(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+    samples = detector.vad.decode_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
     segments: list[TurnDetectionSegment] = []
     start = 0
     accumulated: TurnDetectionResult | None = None
@@ -424,10 +425,10 @@ class ServerTurnDetector:
         )
 
     def segment_steps(
-        self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None
+        self, audio: str | bytes, *, fmt: str, sample_rate_hz: int | None
     ) -> FrameSteps[list[TurnDetectionSegment]]:
-        """:meth:`process_segments` with Silero frame scoring left to the driver."""
-        return _segment_steps(self, base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+        """:meth:`process_segments` with Silero frame scoring left to the driver; ``audio`` may be decoded bytes."""
+        return _segment_steps(self, audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
 
     def _sample_steps(self, samples: np.ndarray) -> FrameSteps[TurnDetectionResult]:
         result: StreamingVADResult = yield from self._vad.frame_steps(samples)
@@ -548,10 +549,10 @@ class SemanticTurnDetector:
         )
 
     def segment_steps(
-        self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None
+        self, audio: str | bytes, *, fmt: str, sample_rate_hz: int | None
     ) -> FrameSteps[list[TurnDetectionSegment]]:
-        """:meth:`process_segments` with Silero frame scoring left to the driver."""
-        return _segment_steps(self, base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+        """:meth:`process_segments` with Silero frame scoring left to the driver; ``audio`` may be decoded bytes."""
+        return _segment_steps(self, audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
 
     def process(
         self,

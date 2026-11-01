@@ -120,7 +120,7 @@ class SessionControl:
         if detector is None:
             return [(event, None)]
         audio = event.get("audio")
-        if not isinstance(audio, str) or not audio:
+        if not isinstance(audio, str | bytes) or not audio:
             return [(event, None)]
         fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm_f32le"
         sample_rate_hz = event.get("sample_rate_hz")

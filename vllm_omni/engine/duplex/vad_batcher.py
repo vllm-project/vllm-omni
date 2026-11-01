@@ -91,15 +91,15 @@ class TurnDetectionBatcher:
         self._closed = False
 
     async def process_segments(
-        self, detector: TurnDetector, base64_audio: str, *, fmt: str, sample_rate_hz: int | None
+        self, detector: TurnDetector, audio: str | bytes, *, fmt: str, sample_rate_hz: int | None
     ) -> list[TurnDetectionSegment]:
         """``detector.process_segments`` for one append, scored together with every other session's.
 
-        Raises what ``process_segments`` raises.
+        ``audio`` is base64 or the already-decoded bytes. Raises what ``process_segments`` raises.
         """
         loop = asyncio.get_running_loop()
         append = _Append(
-            steps=detector.segment_steps(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz),
+            steps=detector.segment_steps(audio, fmt=fmt, sample_rate_hz=sample_rate_hz),
             vad=detector.vad,
             future=loop.create_future(),
         )
