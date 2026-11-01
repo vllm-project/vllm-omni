@@ -29,6 +29,9 @@ class PersonaPlexDataPlaneContext:
 
 @dataclass(slots=True)
 class _RequestCursor:
+    audio_samples: int = 0
+    accepted_frames: int = 0
+    delivered_audio_samples: int = 0
     text: str = ""
     terminal: bool = False
 
@@ -47,6 +50,41 @@ class PersonaPlexDataPlaneSession:
 
     def begin_request(self, request_id: str) -> None:
         self._requests.setdefault(request_id, _RequestCursor()).terminal = False
+
+    def note_accepted_input(self, request_id: str, sequence: int) -> None:
+        """Record the greatest engine-accepted append sequence for a stream."""
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise ValueError("PersonaPlex append requires a positive engine sequence")
+        state = self._requests.setdefault(request_id, _RequestCursor())
+        state.accepted_frames = max(state.accepted_frames, sequence)
+
+    def mark_outputs_delivered(self, request_id: str) -> None:
+        """Acknowledge all projected output after its ordered send completes.
+
+        The caller must serialize projection and send completion for a request.
+        This watermark is transport delivery, not client playback acknowledgement.
+        """
+        state = self._requests[request_id]
+        state.delivered_audio_samples = state.audio_samples
+
+    def drain_status(self, request_id: str) -> dict[str, int | bool]:
+        """Report delivery progress with PersonaPlex's one-frame model delay."""
+        state = self._requests[request_id]
+        # Agent cb1..7 for acoustic frame t arrive at t+1. EOF cannot invent
+        # that successor. Drain every fully generated frame and expose the
+        # model delay separately from missing/undelivered audio.
+        delay = min(state.accepted_frames, 1)
+        expected = state.accepted_frames - delay
+        samples = state.delivered_audio_samples
+        if samples % 1920 or samples > expected * 1920:
+            raise RuntimeError("PersonaPlex stream produced invalid acoustic frame accounting")
+        return {
+            "accepted_frames": state.accepted_frames,
+            "expected_audio_frames": expected,
+            "model_delay_frames": delay,
+            "audio_frames": samples // 1920,
+            "drained": samples == expected * 1920,
+        }
 
     def is_terminal(self, request_id: str | None) -> bool:
         if request_id is None:
@@ -112,8 +150,10 @@ class PersonaPlexDataPlaneSession:
         )
         if delta_samples and not encoded:
             raise RuntimeError("PersonaPlex could not encode a nonempty audio delta")
-        # Encoding failure must not consume the transcript cursor. Projection
-        # is not a server-send completion or a client playback acknowledgement.
+        # Retain only the sample count, not PCM history. Failed encoding must
+        # advance neither this total nor the transcript cursor. Projection is
+        # not a server-send completion or a client playback acknowledgement.
+        state.audio_samples += delta_samples
         if text:
             state.text = text
         if not encoded and not text_delta:
