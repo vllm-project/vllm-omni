@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
+from collections import deque
 from dataclasses import dataclass
 from enum import Flag
 from types import SimpleNamespace
@@ -10,13 +11,21 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
-from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
-from vllm.sampling_params import RequestOutputKind
-from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
+from vllm.sampling_params import RequestOutputKind, SamplingParams
+from vllm.v1.engine import (
+    EngineCoreEvent,
+    EngineCoreEventType,
+    EngineCoreRequest,
+    FinishReason,
+)
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
-from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
+from vllm.v1.engine.output_processor import (
+    OutputProcessor as VLLMOutputProcessor,
+)
+from vllm.v1.engine.output_processor import RequestOutputCollector, StreamingUpdate
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -1665,3 +1674,113 @@ def test_native_finished_stats_preserve_watermark_status(watermarked, skipped, s
     assert stats.num_watermarked_reqs == int(watermarked)
     assert stats.num_watermark_skipped_reqs == int(skipped)
     assert stats.num_not_watermarked_reqs == int(not watermarked and not skipped)
+
+
+def _make_realtime_request(*, resumable: bool) -> EngineCoreRequest:
+    return EngineCoreRequest(
+        request_id="r",
+        external_req_id="r",
+        prompt_token_ids=[1],
+        mm_features=None,
+        sampling_params=SamplingParams(
+            max_tokens=8,
+            temperature=0.0,
+            detokenize=False,
+            output_kind=RequestOutputKind.DELTA,
+        ),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        resumable=resumable,
+    )
+
+
+def _make_idle_stream_processor() -> tuple[MultimodalOutputProcessor, OmniRequestState]:
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    state = _make_no_detok_state(RequestOutputKind.DELTA)
+    state.streaming_input = True
+    state.input_chunk_queue = None
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+    return processor, state
+
+
+def test_queue_less_idle_final_waits_for_terminal_output():
+    processor, state = _make_idle_stream_processor()
+
+    processor.add_request(_make_realtime_request(resumable=False), prompt=None)
+
+    assert processor.request_states[state.request_id] is state
+    assert not state.streaming_input
+    assert state.awaiting_terminal_output
+
+
+def test_queue_less_idle_final_is_idempotent():
+    processor, state = _make_idle_stream_processor()
+    final_request = _make_realtime_request(resumable=False)
+
+    processor.add_request(final_request, prompt=None)
+    processor.add_request(final_request, prompt=None)
+
+    assert processor.request_states[state.request_id] is state
+    assert state.awaiting_terminal_output
+
+
+def test_queue_less_idle_final_emits_one_terminal_output():
+    processor, state = _make_idle_stream_processor()
+    processor.add_request(_make_realtime_request(resumable=False), prompt=None)
+    terminal_output = OmniEngineCoreOutput(
+        request_id=state.request_id,
+        new_token_ids=[],
+        finish_reason=FinishReason.ABORT,
+    )
+
+    result = processor.process_outputs([terminal_output])
+
+    assert len(result.request_outputs) == 1
+    assert result.request_outputs[0].finished
+    assert result.request_outputs[0].outputs[0].finish_reason == "abort"
+    assert state.request_id not in processor.request_states
+    assert state.external_req_id not in processor.external_req_ids
+
+    duplicate = processor.process_outputs([terminal_output])
+    assert duplicate.request_outputs == []
+
+
+def test_queue_less_active_final_keeps_upstream_behavior():
+    processor, state = _make_idle_stream_processor()
+    state.input_chunk_queue = deque()
+
+    processor.add_request(_make_realtime_request(resumable=False), prompt=None)
+
+    assert processor.request_states[state.request_id] is state
+    assert not state.streaming_input
+    assert not state.input_chunk_queue
+    assert not state.awaiting_terminal_output
+
+
+def test_queue_less_queued_final_keeps_upstream_behavior():
+    processor, state = _make_idle_stream_processor()
+    state.input_chunk_queue = deque([StreamingUpdate(prompt=None, prompt_token_ids=[2], arrival_time=1.0)])
+
+    processor.add_request(_make_realtime_request(resumable=False), prompt=None)
+
+    assert processor.request_states[state.request_id] is state
+    assert state.streaming_input
+    assert state.input_chunk_queue[-1].final
+    assert not state.awaiting_terminal_output
+
+
+def test_queue_backed_idle_final_keeps_upstream_behavior():
+    processor, state = _make_idle_stream_processor()
+    queue = RequestOutputCollector(RequestOutputKind.DELTA, state.request_id)
+    state.queue = queue
+
+    processor.add_request(_make_realtime_request(resumable=False), prompt=None)
+
+    assert state.request_id not in processor.request_states
+    assert state.external_req_id not in processor.external_req_ids
+    assert not state.awaiting_terminal_output
+    assert queue.output is STREAM_FINISHED
