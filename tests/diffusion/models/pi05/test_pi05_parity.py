@@ -483,7 +483,7 @@ def _diagnose_divergence(lerobot_flow_model, omni_model, images, img_masks, lang
     _, sg_kv = omni_model.paligemma_with_expert.forward(
         attention_mask=prefix_att_4d,
         position_ids=prefix_pos,
-        past_key_values=None,
+        past_key_values=omni_model.new_kv_cache(sg_embs.shape[0], sg_embs.shape[1]),
         inputs_embeds=[sg_embs, None],
         use_cache=True,
     )
