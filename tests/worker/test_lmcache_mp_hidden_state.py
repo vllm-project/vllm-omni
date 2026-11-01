@@ -18,6 +18,8 @@ from vllm_omni.worker.lmcache_mp_hidden_state import (
     unstack_layers,
 )
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 CHUNK_SIZE = 4
 HIDDEN = 3
 MM_KEYS = ("0", "7")
