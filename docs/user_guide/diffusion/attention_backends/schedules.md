@@ -133,7 +133,9 @@ request is at the same step and sigma and the selected profile's backends
 isolate packed requests; otherwise it runs one forward per request so each
 uses its own progress.
 
-Malformed or unknown-profile schedules return HTTP 400 before dispatch.
+Malformed schedules return HTTP 400 before dispatch. An unknown profile fails
+when the diffusion stage admits the request, so a disaggregated deployment has
+already run its earlier stages.
 A bounded range in the request's own schedule that ends after the sequence
 fails before denoising and retains the client error through
 the runner and multiprocess executor. Asynchronous `/v1/videos` reports these
@@ -155,7 +157,9 @@ errors on the job record rather than the creation response.
   gate or a VSA base, and gated FastH3 layers accept only VSA.
   FastH3 checkpoints pin VSA sparsity, so their profiles cannot set
   `fastvideo_vsa_topk`. They also check each VSA profile's provider and
-  precision at startup, because warm-up runs only the base.
+  precision at startup, because warm-up runs only the base. FastH3 deltas fused
+  at load time don't run this check, so a provider or precision the device can't
+  run can fail on the first step that selects the profile.
 - TRTLLM `target_sparsity` needs a per-layer calibration curve unless the
   layer is explicitly ignored.
 - Regional `torch.compile` stays enabled: H3 selects the profile and runs
