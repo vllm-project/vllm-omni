@@ -41,7 +41,7 @@ class PrefixCacheRunnerMixin:
     """Prefix-cache integration for a model runner (no state machine here).
 
     Host-class contract — the runner must provide:
-        ``input_batch``        live batch with the group-0 block table
+        ``input_batch``        live batch with per-group block tables
         ``kv_cache_config``    for ``kv_cache_groups`` at construction
         ``omni_prefix_cache``  set here; ``None`` until first-step build
         ``_omni_prefix_cache_cfg``  staged by the runner's kv-cache init
@@ -113,7 +113,7 @@ class PrefixCacheRunnerMixin:
         view = get_prefix_cache_group_view(
             self.input_batch,
             cfg.block_size,
-            kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
+            kv_cache_groups=self.kv_cache_config.kv_cache_groups,
         )
         if view is None:
             raise OmniPrefixCacheUnmatchError(
