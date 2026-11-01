@@ -1764,7 +1764,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Parsed before the platform branches: a typo in a shared stage config
         # must fail at startup on every platform, not only where the toggle is
         # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
-        device_spk = read_bool_flag(extra, "token2wav_device_spk", True)
+        device_spk = read_bool_flag(
+            extra, "token2wav_device_spk", current_omni_platform.is_cuda() or current_omni_platform.is_npu()
+        )
         use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
         cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
         # The flag selects a CUDA speaker-only engine. Keep the previous path
@@ -1825,7 +1827,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             token2wav.enable_trt_spk_embedding(cpu_reference=True)
             logger.info("MiniCPM-o Code2Wav: CPU-reference campplus speaker embedding on TensorRT")
-        elif current_omni_platform.is_cuda() or current_omni_platform.is_npu():
+        elif next(token2wav.flow.parameters()).device.type != "cpu":
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
