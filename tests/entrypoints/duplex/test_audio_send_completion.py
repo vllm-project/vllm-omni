@@ -12,6 +12,7 @@ import asyncio
 
 import pytest
 
+from tests.engine.duplex.test_audio_drain import _generated
 from tests.engine.duplex.test_session_runner import close_harness
 from tests.engine.duplex.test_session_runner_personaplex import code2wav_output, frame, open_personaplex_harness
 from vllm_omni.engine.duplex import commands
@@ -148,5 +149,73 @@ async def test_failed_submission_cannot_advance_accepted_pcm_sequence(monkeypatc
         assert h.session.audio_delivery.completed_samples == 0
         assert len(h.port.submissions) == 1
         assert h.runner.model_state.audio_buffer.pending_byte_count == 960 * 4
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("engine unavailable"), KeyError("session unavailable"), asyncio.CancelledError()]
+)
+async def test_receipt_submission_failure_is_not_a_socket_failure(monkeypatch, mocker, failure):
+    monkeypatch.setattr(stage0, "personaplex_prefill_slots", lambda *_: 4)
+    h = await open_personaplex_harness()
+    mocker.patch.object(h.runner.model, "_schedule_silence_continuation", new=mocker.AsyncMock(return_value=False))
+    engine = DuplexOmniEngine.__new__(DuplexOmniEngine)
+    engine.duplex_session_config = h.manager.runtime_config
+    # Keep the actual async engine submission boundary, including its executor.
+    submit = mocker.patch.object(engine, "_submit_command", side_effect=failure)
+    omni = DuplexOmni.__new__(DuplexOmni)
+    omni.engine = engine
+    handle = DuplexSessionHandle(omni, h.session.session_id)
+    handle._outbox = h.output_buffer
+    omni._handles = {h.session.session_id: handle}
+    handler = OmniDuplexSessionHandler(duplex_omni=omni)
+    detach = mocker.patch.object(handler, "_detach_current_attachment", new=mocker.AsyncMock())
+    receipt_log = mocker.patch("vllm_omni.entrypoints.duplex.serving.logger.exception")
+    transport_log = mocker.patch("vllm_omni.entrypoints.duplex.serving.logger.info")
+    sent = []
+
+    async def send(payload):
+        sent.append(payload)
+
+    try:
+        await h.run(frame())
+        await h.run(frame())
+        _generated(h, 1)
+        _generated(h, 2)
+        flush = mocker.patch.object(h.port, "flush_audio_prefix", new=mocker.AsyncMock(return_value=2))
+        h.deliver(code2wav_output(h.stage0_request_id(), samples=1920, text="hello"))
+        audio = await _next_audio(h.output_buffer)
+        await handler._attachment_registry.create(h.session.session_id, send=send, close=mocker.AsyncMock())
+        cancelled = isinstance(failure, asyncio.CancelledError)
+        if cancelled:
+            with pytest.raises(asyncio.CancelledError):
+                await handler._send_event(h.session.session_id, audio, handle=handle)
+        else:
+            await handler._send_event(h.session.session_id, audio, handle=handle)
+        assert len(sent) == 1
+        submit.assert_called_once()
+        assert isinstance(submit.call_args.args[1], commands.AudioSendCompleted)
+        assert h.session.audio_delivery.completed_samples == 0
+        detach.assert_not_awaited()
+        assert await handler._attachment_registry.has_attachment(h.session.session_id)
+        assert receipt_log.call_count == int(not cancelled)
+        if not cancelled:
+            assert "receipt" in receipt_log.call_args.args[0].lower()
+            assert receipt_log.call_args.args[1:] == (h.session.session_id, audio.event_id, audio.epoch)
+        assert not any("transport send failed" in call.args[0] for call in transport_log.call_args_list)
+        # Isolation does not recover a missing receipt. With generation and
+        # projection complete, the real runner must still time out rather than
+        # claim an acoustic prefix was accounted as sent.
+        with pytest.raises(TimeoutError, match="audio drain timed out"):
+            await h.runner.begin_audio_drain(timeout=0.1)
+        flush.assert_awaited_once_with(h.stage0_request_id(), epoch=0, sequence=2)
+        assert h.session.audio_delivery.accepted_seq == 2
+        assert h.session.audio_delivery.projected_samples == 1920
+        assert h.session.audio_delivery.completed_samples == 0
+        # Python consumers still observe the original submission failure.
+        with pytest.raises(type(failure)):
+            await handle.confirm_output_sent(audio)
     finally:
         await close_harness(h)

@@ -603,7 +603,23 @@ class OmniDuplexSessionHandler:
             transport_delivered = True
 
         event_guard = partial(handle.output_guard, event)
-        on_sent = partial(handle.confirm_output_sent, event)
+
+        async def on_sent() -> None:
+            try:
+                await handle.confirm_output_sent(event)
+            except Exception:
+                # The socket send already succeeded. Losing its accounting
+                # receipt must not detach a healthy transport or fabricate
+                # send credit; a drain may still reach its bounded timeout.
+                # CancelledError is deliberately not caught here.
+                logger.exception(
+                    "Duplex audio send receipt failed for session=%s event=%s epoch=%s; "
+                    "transport send succeeded, acoustic drain may time out",
+                    session_id,
+                    event.event_id,
+                    event.epoch,
+                )
+
         try:
             try:
                 await self._attachment_registry.send_event(

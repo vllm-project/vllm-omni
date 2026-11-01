@@ -396,6 +396,12 @@ handler does this after `attachment.send` returns and after rechecking the
 current attachment and output validity. Receipts are event-specific,
 request/epoch-fenced and idempotent: dequeue, encoding, journaling, blocked or
 failed sends, detachment, and invalidated output do not earn send credit.
+If the WebSocket send succeeds but receipt submission raises an ordinary
+exception, serving logs a receipt/accounting failure without detaching the
+healthy transport. It does not retry the receipt or fabricate send credit;
+a drain missing that receipt may still reach its bounded timeout. Cancellation
+propagates, and direct Python `confirm_output_sent` callers still receive
+submission errors. This isolation is not recovery of lost accounting.
 Playback ACK and the playback ledger are unchanged.
 
 The correlated drain control schedules its wait outside the session mailbox

@@ -176,7 +176,8 @@ async def test_partial_input_does_not_require_generation_or_flush(mocker):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("binding", [None, 0, 1])
-async def test_flush_only_uses_existing_live_bound_replica(binding, mocker):
+@pytest.mark.parametrize("keyword", [False, True])
+async def test_flush_only_uses_existing_live_bound_replica(binding, mocker, keyword):
     clients = [FakeStageClient(stage_type="llm"), FakeStageClient(stage_type="llm")]
     pool = _build_stage_pools([clients])[0]
     calls = [
@@ -185,12 +186,13 @@ async def test_flush_only_uses_existing_live_bound_replica(binding, mocker):
     ]
     if binding is not None:
         pool._request_bindings["epoch-qualified"] = binding
+    args, kwargs = ((), {"request_id": "epoch-qualified", "sequence": 4}) if keyword else (("epoch-qualified", 4), {})
     if binding is None:
         with pytest.raises(RuntimeError, match="bound"):
-            await pool.flush_codec_prefix("epoch-qualified", 4)
+            await pool.flush_codec_prefix(*args, **kwargs)
         assert all(call.await_count == 0 for call in calls)
     else:
-        assert await pool.flush_codec_prefix("epoch-qualified", 4) == 4
+        assert await pool.flush_codec_prefix(*args, **kwargs) == 4
         calls[binding].assert_awaited_once_with("epoch-qualified", 4)
         assert calls[1 - binding].await_count == 0
 
@@ -283,12 +285,17 @@ async def test_cancelled_caller_releases_waiter_without_poisoning_append_tail(mo
 
 
 @pytest.mark.asyncio
-async def test_dp_flush_targets_only_the_request_engine_and_never_broadcasts(mocker):
+@pytest.mark.parametrize("keyword", [False, True])
+async def test_dp_flush_targets_only_the_request_engine_and_never_broadcasts(mocker, keyword):
     client = DPLBStageEngineCoreClient.__new__(DPLBStageEngineCoreClient)
     client.reqs_in_flight = {"epoch-qualified": b"engine-two"}
     targeted = mocker.patch.object(client, "_call_utility_async", new=mocker.AsyncMock(return_value=4))
     broadcast = mocker.patch.object(client, "call_utility_async", new=mocker.AsyncMock())
-    assert await client.flush_codec_prefix_async("epoch-qualified", 4) == 4
+    if keyword:
+        result = await client.flush_codec_prefix_async(request_id="epoch-qualified", sequence=4)
+    else:
+        result = await client.flush_codec_prefix_async("epoch-qualified", 4)
+    assert result == 4
     targeted.assert_awaited_once_with("omni_flush_codec_prefix", "epoch-qualified", 4, engine=b"engine-two")
     broadcast.assert_not_awaited()
 
@@ -310,11 +317,16 @@ async def test_missing_or_rebound_dp_route_cannot_claim_flush(mocker, missing):
 
 
 @pytest.mark.asyncio
-async def test_single_engine_client_uses_scheduler_utility_not_worker_collective_rpc(mocker):
+@pytest.mark.parametrize("keyword", [False, True])
+async def test_single_engine_client_uses_scheduler_utility_not_worker_collective_rpc(mocker, keyword):
     client = StageEngineCoreClient.__new__(StageEngineCoreClient)
     utility = mocker.patch.object(client, "call_utility_async", new=mocker.AsyncMock(return_value=4))
     collective = mocker.patch.object(client, "collective_rpc_async", new=mocker.AsyncMock())
-    assert await client.flush_codec_prefix_async("epoch-qualified", 4) == 4
+    if keyword:
+        result = await client.flush_codec_prefix_async(request_id="epoch-qualified", sequence=4)
+    else:
+        result = await client.flush_codec_prefix_async("epoch-qualified", 4)
+    assert result == 4
     utility.assert_awaited_once_with("omni_flush_codec_prefix", "epoch-qualified", 4)
     collective.assert_not_awaited()
 
