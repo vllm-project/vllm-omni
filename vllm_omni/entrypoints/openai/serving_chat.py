@@ -3284,7 +3284,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt_token_ids: list[int] | None = None
         system_prompt_type: str | None = None
         build_kwargs: dict[str, Any] = {}
-        ar_stop_token_ids: list[int] | None = None
+        autoregressive_stop_token_ids: list[int] | None = None
 
         if bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
@@ -3334,7 +3334,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ar_stop_kwargs: dict[str, Any] = {}
             if "bot_task" in build_kwargs:
                 ar_stop_kwargs["bot_task"] = build_kwargs["bot_task"]
-            ar_stop_token_ids = resolve_stop_token_ids(
+            autoregressive_stop_token_ids = resolve_stop_token_ids(
                 task=ar_task,
                 tokenizer=tokenizer,
                 image_size=ar_image_size,
@@ -3385,8 +3385,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # AR stop tokens: use stage_type=="llm" instead of comprehension_idx
             # (None for DictConfig where is_comprehension is nested in engine_args).
-            if stage_type == "llm" and ar_stop_token_ids is not None:
-                setattr(default_stage_params, "stop_token_ids", ar_stop_token_ids)
+            if stage_type == "llm" and autoregressive_stop_token_ids is not None:
+                setattr(default_stage_params, "stop_token_ids", autoregressive_stop_token_ids)
 
             if stage_type == "llm" and idx == 0 and ar_prompt_info is not None:
                 if should_init_extra_args_for_non_diffusion_stages(model_class_name):
