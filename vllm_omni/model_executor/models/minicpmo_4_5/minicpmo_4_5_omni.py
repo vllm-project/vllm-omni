@@ -774,8 +774,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 "need the Thinker stage on model_runner: v2"
             )
         super().set_aux_hidden_state_layers(layers)
+        language_model = self.get_language_model()
+        decoder = getattr(language_model, "model", language_model)
         self._returns_aux_hidden_states = True
-        self._num_aux_hidden_states = len(set(layers))
+        # The decoder returns one tensor per layer it stored (vLLM dedupes them).
+        self._num_aux_hidden_states = len(decoder.aux_hidden_state_layers)
 
     def get_multimodal_embeddings(self, **kwargs):
         # Delegate to the active stage submodule when it implements MM encoding.

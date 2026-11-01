@@ -131,23 +131,24 @@ def test_plain_chat_handoff_warns_when_rows_stop_before_the_last_token(mocker) -
     assert info["ids"]["tts"] == [11]
     warning.assert_called_once()
     assert "stop at token" in warning.call_args.args[0]
+    assert warning.call_args.args[1] == "req-1"
 
 
 def test_plain_chat_handoff_logs_a_ledger_of_the_wrong_length_once(mocker) -> None:
     from vllm_omni.model_executor.stage_input_processors import minicpmo_4_5_omni as module
 
-    mocker.patch.object(module, "_turn_ledger_mismatch_logged", False)
-    warning = mocker.patch.object(module.logger, "warning")
+    warning_once = mocker.patch.object(module.logger, "warning_once")
     prompt_ids, output_ids = [101, 102], [11, 12]
     forwarded = [(101, 0), (102, 1), (11, 2)]
-    for _ in range(2):
-        source = _ledger_output(prompt_ids, output_ids, forwarded)
-        source.outputs[0].multimodal_output["latent_positions"] = torch.tensor([0, 1]).reshape(-1, 1)
-        info = llm2tts([source], prompt=[{}])[0]["model_intermediate_buffer"]
-        # Without a usable ledger the rows are taken by index.
-        assert info["ids"]["tts"] == [11]
-    warning.assert_called_once()
-    assert "row ledger" in warning.call_args.args[0]
+    source = _ledger_output(prompt_ids, output_ids, forwarded)
+    source.outputs[0].multimodal_output["latent_positions"] = torch.tensor([0, 1]).reshape(-1, 1)
+
+    info = llm2tts([source], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    # Without a usable ledger the rows are taken by index.
+    assert info["ids"]["tts"] == [11]
+    warning_once.assert_called_once()
+    assert "row ledger" in warning_once.call_args.args[0]
 
 
 def test_llm2tts_carries_request_ref_audio() -> None:

@@ -517,7 +517,11 @@ def test_async_output_drops_rejected_draft_rows(monkeypatch, mocker, async_chunk
     output = _async_output(
         req_ids=["req-0", "req-1"],
         sampler_output=SamplerOutput(
-            torch.ones(2, 4, dtype=torch.long), None, None, torch.tensor([3, 1]), torch.tensor([1, 3])
+            sampled_token_ids=torch.ones(2, 4, dtype=torch.long),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=torch.tensor([3, 1]),
+            num_rejected=torch.tensor([1, 3]),
         ),
         num_sampled_tokens=torch.tensor([3, 1]),
         num_rejected_tokens=torch.tensor([1, 3]),
@@ -552,7 +556,11 @@ def test_rejected_rows_trim_latent_and_ledger_together_and_spare_prefill(monkeyp
     output = _async_output(
         req_ids=["prefill", "verify"],
         sampler_output=SamplerOutput(
-            torch.ones(2, 4, dtype=torch.long), None, None, torch.tensor([1, 2]), torch.tensor([0, 2])
+            sampled_token_ids=torch.ones(2, 4, dtype=torch.long),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=torch.tensor([1, 2]),
+            num_rejected=torch.tensor([0, 2]),
         ),
         num_sampled_tokens=torch.tensor([1, 2]),
         num_rejected_tokens=torch.tensor([0, 2]),
