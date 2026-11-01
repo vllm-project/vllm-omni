@@ -32,6 +32,7 @@ from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
     OmniKVTransferManager,
 )
+from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_flat_payload
@@ -295,6 +296,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         # --- Async D2H via OmniAsyncOutput ---
         materialize_native = self._uses_native_output_materializer()
         get_request_errors = getattr(self.model_state, "get_request_errors", None)
+        async_chunk = bool(getattr(self.model_config, "async_chunk", False))
         async_output = OmniAsyncOutput(
             model_runner_output=model_runner_output,
             sampler_output=sampler_output,
@@ -304,7 +306,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
             text_hidden=text_hidden if need_pooler and include_hidden else None,
             multimodal_outputs=multimodal_outputs if need_pooler else None,
             input_batch=input_batch if need_pooler else None,
-            async_chunk=bool(getattr(self.model_config, "async_chunk", False)),
+            async_chunk=async_chunk,
+            # Connector senders drop the orchestrator pooler. Stage 0 still
+            # partitions latent off the client channel and publishes it once
+            # through pooling_output for llm2tts.
+            partition_async_payload=async_chunk and stage_sends_async_output(self.model_config),
             finalize_output=(None if materialize_native else self._finalize_native_data_plane_output),
             finalize_multimodal=sampling_output.finalize_multimodal,
             check_ep_fault=self.check_ep_fault,
@@ -739,6 +745,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         multimodal_outputs: dict | None = None,
         input_batch: Any | None = None,
         async_chunk: bool = False,
+        partition_async_payload: bool | None = None,
         finalize_output: Any | None = None,
         finalize_multimodal: Any | None = None,
         check_ep_fault: bool = False,
@@ -753,6 +760,11 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self.pending_aux_output = pending_aux_output
         self.copy_event = copy_event if copy_event is not None else torch.cuda.Event(blocking=True)
         self._async_chunk = bool(async_chunk)
+        # None preserves the historical split whenever async_chunk is on.
+        # Callers that keep an orchestrator bridge pass False.
+        self._partition_async_payload = (
+            self._async_chunk if partition_async_payload is None else bool(partition_async_payload)
+        )
         self._finalize_output = finalize_output
         self._finalize_multimodal = finalize_multimodal
         self._has_fault: torch.Tensor | None = None
@@ -981,7 +993,11 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 def copy_payload(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
                     return _ensure_tensor_values(_async_copy_mm_value(payload))
 
-            self.model_runner_output.pooler_output = None if self._async_chunk else pooler_inter
+            # Connector senders publish through inter_stage_outputs only.
+            # An orchestrator bridge such as llm2tts reads pooling_output.
+            # Copying that payload onto multimodal_output as well makes the
+            # output processor accumulate every latent row twice.
+            self.model_runner_output.pooler_output = None if self._partition_async_payload else pooler_inter
             self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (
                 [copy_payload(p) if p else {} for p in pooler_client] if pooler_client else None
