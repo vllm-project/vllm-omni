@@ -234,6 +234,46 @@ def vllm_flash_attn_forward(
 flash_attn3_func_forward = fa3_forward
 
 
+if not hasattr(torch.ops.vllm_omni, "fa4_ring_attention"):
+
+    @torch.library.custom_op("vllm_omni::fa4_ring_attention", mutates_args=())
+    def _fa4_ring_attention_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        softmax_scale: float | None,
+        causal: bool,
+        window_left: int,
+        window_right: int,
+        softcap: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The CuTe Python launcher is opaque; its attention arithmetic is unchanged.
+        if fa4_attn_func is None:
+            raise RuntimeError("CuTe FlashAttention-4 is unavailable")
+        out, lse = fa4_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=(None if window_left == -1 else window_left, None if window_right == -1 else window_right),
+            softcap=softcap,
+            return_lse=True,
+        )
+        return out, lse
+
+    @_fa4_ring_attention_op.register_fake
+    def _fa4_ring_attention_op_fake(q, k, v, softmax_scale, causal, window_left, window_right, softcap):
+        # Match FA4's contiguous BSHD output and contiguous FP32 BHS LSE.
+        return (
+            torch.empty((q.shape[0], q.shape[1], q.shape[2], v.shape[-1]), dtype=q.dtype, device=q.device),
+            torch.empty((q.shape[0], q.shape[2], q.shape[1]), dtype=torch.float32, device=q.device),
+        )
+
+
+_fa4_ring_attention_op = torch.ops.vllm_omni.fa4_ring_attention
+
+
 def flash_attn4_func_forward(
     q,
     k,
@@ -252,6 +292,8 @@ def flash_attn4_func_forward(
     assert fa4_attn_func is not None, "FA4 high-level API is not available"
 
     left, right = window_size if window_size else (-1, -1)
+    if torch.compiler.is_compiling() and not torch.is_grad_enabled():
+        return _fa4_ring_attention_op(q, k, v, softmax_scale, causal, left, right, softcap or 0.0)
     out, softmax_lse = fa4_attn_func(
         q,
         k,
