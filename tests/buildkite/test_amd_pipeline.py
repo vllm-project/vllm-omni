@@ -167,19 +167,34 @@ def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
 
 
 def test_qwen_image_has_one_amd_official_weight_nightly_owner() -> None:
-    owners = [
-        (pipeline_path, step)
-        for pipeline_path in (
-            AMD_READY_PIPELINE,
-            AMD_MERGE_PIPELINE,
-            AMD_NIGHTLY_PIPELINE,
-        )
-        for step in _steps_selecting_node(pipeline_path, QWEN_IMAGE_SMOKE_NODE)
-    ]
+    nightly = _steps_selecting_node(AMD_NIGHTLY_PIPELINE, QWEN_IMAGE_SMOKE_NODE)
+    ready = _steps_selecting_node(AMD_READY_PIPELINE, QWEN_IMAGE_SMOKE_NODE)
 
-    assert len(owners) == 1
-    assert owners[0][0] == AMD_NIGHTLY_PIPELINE
-    assert owners[0][1]["label"] == QWEN_IMAGE_SMOKE_LABEL
+    assert len(nightly) == 1
+    assert nightly[0]["label"] == QWEN_IMAGE_SMOKE_LABEL
+    assert ready == []
+
+
+def test_qwen_image_merge_smoke_is_one_blocking_sdpa_job() -> None:
+    """MERGE runs the default node with SDPA. Nightly keeps the AITER smoke."""
+    step = _find_step("MERGE · Qwen-Image Online Smoke", AMD_MERGE_PIPELINE)
+    command = "\n".join(step["commands"])
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 60
+    assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-merge/**/*"]
+    assert "source_file_dependencies" not in step
+    assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in step["commands"]
+    assert "VLLM_ROCM_USE_AITER=1" not in command
+    assert "AITER_JIT_DIR" not in command
+    assert QWEN_IMAGE_SMOKE_NODE in command
+    assert "advanced_model and diffusion and rocm and MI325 and cards_1" in command
+    assert "--run-level advanced_model" in command
+    assert "full_model" not in command
+    assert "Expected exactly one executed Qwen-Image MERGE test" in command
+    assert "timeout --signal=TERM --kill-after=2m 45m" in command
 
 
 def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> None:
@@ -682,7 +697,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
     (
         "Qwen3-Omni SHM Leak Test",
         AMD_MERGE_PIPELINE,
-        "NonBlocking",
+        "Blocking",
         1,
         "advanced_model and rocm and MI325 and cards_2 and not nvidia_only",
     ),
@@ -2583,7 +2598,7 @@ def test_wan22_function_executes_junit_guard_before_exit(
     )
 
 
-def test_qwen3_omni_shm_leak_is_a_separate_nonblocking_merge_job() -> None:
+def test_qwen3_omni_shm_leak_is_a_separate_blocking_merge_job() -> None:
     blocking_step = _find_step("Omni Model Test Qwen3-Omni", AMD_MERGE_PIPELINE)
     shm_path = "tests/e2e/online_serving/test_qwen3_omni_shm_leak.py"
     blocking_commands = "\n".join(blocking_step["commands"])
@@ -2598,7 +2613,7 @@ def test_qwen3_omni_shm_leak_is_a_separate_nonblocking_merge_job() -> None:
 
     assert step["agent_pool"] == "mi300_2"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 50
     assert step["artifact_paths"] == ["artifacts/rocm-qwen3-omni-shm-leak/**/*"]
     assert commands.count(shm_path) == 2
@@ -2919,13 +2934,13 @@ _MINICPMO_READY_JOBS = (
 
 
 def test_minicpmo_ready_jobs_select_marked_core_model_nodes() -> None:
-    """READY owns the CUDA core_model cases, selected by an explicit ROCm mark."""
+    """READY blocks on the CUDA core_model cases, selected by an explicit ROCm mark."""
     for label, timeout, command_timeout, artifact, nodes, junit_message in _MINICPMO_READY_JOBS:
         step = _find_step(label, AMD_READY_PIPELINE)
         command = "\n".join(step["commands"])
 
         assert step["agent_pool"] == "mi300_1"
-        assert step["grade"] == "NonBlocking"
+        assert step["grade"] == "Blocking"
         assert step["timeout_in_minutes"] == timeout
         assert step["artifact_paths"] == [f"{artifact}/**/*"]
         assert f"--kill-after=1m {command_timeout}" in command
@@ -2943,6 +2958,57 @@ def test_minicpmo_ready_jobs_select_marked_core_model_nodes() -> None:
         assert "tee " not in command
         for node in nodes:
             assert command.count(node) == 2
+
+
+_MINICPMO_MERGE_JOBS = (
+    (
+        "MERGE · MiniCPM-o 4.5 Offline",
+        "artifacts/rocm-minicpmo-45-merge-offline",
+        (
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_text_to_text[omni_runner0]",
+            "tests/e2e/offline_inference/test_minicpmo_4_5.py::test_mix_to_audio[omni_runner0]",
+        ),
+    ),
+    (
+        "MERGE · MiniCPM-o 4.5 Online",
+        "artifacts/rocm-minicpmo-45-merge-online",
+        (
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[async_chunk]",
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_text_to_text_001[turn_async_chunk]",
+            "tests/e2e/online_serving/test_minicpmo_4_5.py::test_mix_to_text_audio_001[async_chunk]",
+        ),
+    ),
+    (
+        "MERGE · MiniCPM-o 4.5 Duplex",
+        "artifacts/rocm-minicpmo-45-merge-duplex",
+        (
+            "tests/e2e/online_serving/test_minicpmo_4_5_duplex.py::"
+            "test_duplex_websocket_protocol_smoke[three-stage-single-gpu]",
+            "tests/e2e/online_serving/test_duplex_client_live.py::"
+            "test_duplex_client_live_session[three-stage-single-gpu]",
+        ),
+    ),
+)
+
+
+def test_minicpmo_merge_jobs_repeat_the_ready_nodes() -> None:
+    """MERGE blocks on the same one-card nodes READY already gates."""
+    for label, artifact, nodes in _MINICPMO_MERGE_JOBS:
+        step = _find_step(label, AMD_MERGE_PIPELINE)
+        command = "\n".join(step["commands"])
+        assert step["agent_pool"] == "mi300_1"
+        assert step["grade"] == "Blocking"
+        assert step["mirror_hardwares"] == ["amdproduction"]
+        assert step["artifact_paths"] == [f"{artifact}/**/*"]
+        assert _MINICPMO_READY_MARKER in command
+        assert "--run-level core_model" in command
+        assert "test_minicpmo_4_5_duplex_mrv2.py" not in command
+        assert "--junitxml=" in command
+        for node in nodes:
+            assert command.count(node) == 2
+    ready_labels = {label for label, *_rest in _MINICPMO_READY_JOBS}
+    merge_labels = {label for label, *_rest in _MINICPMO_MERGE_JOBS}
+    assert ready_labels.isdisjoint(merge_labels)
 
 
 def test_minicpmo_ready_core_model_cases_declare_mi325() -> None:
@@ -3176,7 +3242,7 @@ _WORKER_ONE_CARD_NODES = (
 
 
 def test_worker_one_card_ready_stays_outside_r2_01() -> None:
-    """READY adds one NonBlocking MI300 job for the collected one-card nodes.
+    """READY blocks on the collected one-card worker nodes.
 
     Local collection of the three files with the MI325 marker returned these
     32 ids. R2-01 still collects 1416 model-executor nodes and does not run them.
@@ -3188,7 +3254,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 30
     assert step["artifact_paths"] == ["artifacts/rocm-worker-one-card/**/*"]
     assert "timeout --signal=TERM --kill-after=1m 25m" in command
@@ -3208,6 +3274,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
         assert "MI325" not in Path(path).read_text(encoding="utf-8")
     assert "diff -u /tmp/worker-ready-expected.txt" in command
     assert "--junitxml=" in command
+    assert "Expected exactly 32 executed one-card worker GPU tests" in command
     assert "pytest.log" not in command
     assert "pytest-summary.txt" not in command
     assert "PIPESTATUS" not in command
@@ -3278,6 +3345,28 @@ def test_drama3_ready_adds_one_nonblocking_text_to_audio_node() -> None:
     for name in _DRAMA3_EXCLUDED:
         assert "rocm" not in _hardware_decorator(source, name)
     assert source.count('"rocm": "MI325"') == 1
+
+
+def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
+    """MERGE gates the one ROCm text-to-audio case. READY keeps its own job."""
+    ready = _find_step("Drama 3 E2E Test", AMD_READY_PIPELINE)
+    step = _find_step("MERGE · Drama 3 Text-to-Audio", AMD_MERGE_PIPELINE)
+    command = "\n".join(step["commands"])
+
+    assert ready["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "Blocking"
+    assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == ["artifacts/rocm-drama3-merge/**/*"]
+    assert "timeout 30m" in command
+    assert _marker_expressions(step) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
+    assert command.count('--run-level "core_model"') == 2
+    assert command.count(_DRAMA3_READY_NODE) == 1
+    assert "diff -u /tmp/drama3-merge-expected.txt" in command
+    assert "Expected exactly one executed Drama 3 MERGE test" in command
+    for name in _DRAMA3_EXCLUDED:
+        assert name not in command
 
 
 _DEVICE_REDUCTION_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
@@ -3379,7 +3468,7 @@ _WORKER_COPY_NODES = (
 
 
 def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
-    """READY adds one NonBlocking MI300 job for the remaining copy cases.
+    """READY blocks on the remaining one-card copy cases.
 
     The marker selects both intermediate-buffer residency rows and the three
     device-copy GPU tests. #9552's worker files stay on the other job. R2-01
@@ -3392,7 +3481,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 25
     assert step["artifact_paths"] == ["artifacts/rocm-worker-copy/**/*"]
     assert "timeout --signal=TERM --kill-after=1m 20m" in command
@@ -3420,6 +3509,7 @@ def test_worker_copy_ready_pins_remaining_one_card_nodes() -> None:
     assert "test_device_stager_cpu_falls_back_to_a_copy" not in command
     assert "diff -u /tmp/worker-copy-ready-expected.txt" in command
     assert "--junitxml=" in command
+    assert "Expected exactly 6 executed one-card worker copy tests" in command
 
     device_copy = Path(_WORKER_COPY_FILES[0]).read_text(encoding="utf-8")
     assert device_copy.count('res={"cuda": "L4", "rocm": "MI325"}, num_cards=1') == 3
@@ -3473,10 +3563,11 @@ def test_pause_keep_two_ranks_ready_pins_the_mi325_node() -> None:
 
 _VERL_GENERATE_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
 _VERL_GENERATE_READY_NODE = "tests/e2e/features/rlhf_test/test_verl_omni_e2e.py::test_generate"
+_VERL_GENERATE_JUNIT_MESSAGE = "Expected exactly one executed VeRL-Omni generate test"
 
 
 def test_verl_generate_ready_pins_the_mi325_node() -> None:
-    """READY fail-closes on the one-card VeRL-Omni generate case."""
+    """READY blocks on the one-card VeRL-Omni generate case."""
     step = _find_step("ROCm · VeRL-Omni Generate GPU Test", AMD_READY_PIPELINE)
     command = "\n".join(step["commands"])
     source = Path("tests/e2e/features/rlhf_test/test_verl_omni_e2e.py").read_text(encoding="utf-8")
@@ -3484,8 +3575,9 @@ def test_verl_generate_ready_pins_the_mi325_node() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
-    assert step["grade"] == "NonBlocking"
+    assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == ["artifacts/rocm-verl-generate/**/*"]
     assert "timeout --signal=TERM --kill-after=1m 30m" in command
     assert _marker_expressions(step) == [
         _VERL_GENERATE_READY_MARKER,
@@ -3494,6 +3586,12 @@ def test_verl_generate_ready_pins_the_mi325_node() -> None:
     assert command.count('--run-level "core_model"') == 2
     assert command.count(_VERL_GENERATE_READY_NODE) == 1
     assert "diff -u /tmp/verl-generate-ready-expected.txt" in command
+    assert "--junitxml=" in command
+    assert _VERL_GENERATE_JUNIT_MESSAGE in command
+    assert "pytest.log" not in command
+    assert "pytest-summary.txt" not in command
+    assert "PIPESTATUS" not in command
+    assert "tee " not in command
     assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in command
     assert "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT" not in command
     assert "test_weight_transfer" not in command
@@ -3609,6 +3707,25 @@ _DISTRIBUTED_BUFFER_READY_NODES = (
 )
 _DISTRIBUTED_BUFFER_JUNIT_MESSAGE = "Expected exactly two executed distributed buffer GPU smokes"
 _DEVICE_REDUCTION_JUNIT_MESSAGE = "Expected exactly 17 executed device-reduction GPU tests"
+_ROCM_V1_DUPLEX_READY_LABEL = "ROCm · MiniCPM-o 4.5 V1 Fallback Duplex Coverage"
+_ROCM_V1_DUPLEX_READY_MARKER = "advanced_model and omni and rocm and MI325 and cards_1"
+_ROCM_V1_DUPLEX_FILE = "tests/e2e/online_serving/test_minicpmo_4_5_duplex_mrv2.py"
+_ROCM_V1_DUPLEX_CONFIG_NODE = (
+    "tests/config/test_minicpmo_4_5_duplex_mrv2_deploy.py::test_duplex_mrv2_profile_keeps_non_cuda_on_v1[rocm]"
+)
+_ROCM_V1_DUPLEX_NODES = (
+    f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_overlapping_turns[1-mrv2-real-weights]",
+    f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_overlapping_turns[2-mrv2-real-weights]",
+    f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_overlapping_turns[4-mrv2-real-weights]",
+    (f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_new_session_during_long_response[mrv2-real-weights]"),
+    (f"{_ROCM_V1_DUPLEX_FILE}::test_mrv2_duplex_server_answers_image_chat_from_the_image[mrv2-real-weights]"),
+)
+_ROCM_V1_DUPLEX_JUNIT_MESSAGE = "Expected exactly five executed MiniCPM-o ROCm V1 fallback duplex tests"
+
+
+def _quoted_ready_nodes(command: str) -> tuple[str, ...]:
+    body = command.split(")", 1)[0]
+    return tuple(re.findall(r'"(tests/[^"]+)"', body))
 
 
 def _minijinja_bin() -> str | None:
@@ -3671,6 +3788,58 @@ def _rendered_ready_step(label: str) -> dict:
     matches = [step for step in _walk_rendered_steps(rendered["steps"]) if step["label"].endswith(label)]
     assert len(matches) == 1, [step["label"] for step in matches]
     return matches[0]
+
+
+def test_verl_generate_ready_renders_blocking() -> None:
+    """The VeRL generate job renders as a hard failure on amd_mi300_1."""
+    label = "ROCm · VeRL-Omni Generate GPU Test"
+    step = _find_step(label, AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert command.count(_VERL_GENERATE_READY_NODE) == 1
+    assert "export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA" in command
+    rendered = _rendered_ready_step(label)
+    assert rendered["agents"]["queue"] == "amd_mi300_1"
+    assert rendered["depends_on"] == "amd-build"
+    assert rendered["soft_fail"] is False
+    assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_verl_generate_ready_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    """VeRL READY fails closed unless test_generate executed and was not skipped."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label="ROCm · VeRL-Omni Generate GPU Test",
+        command_fragment="pytest -s -v tests/e2e/features/rlhf_test/test_verl_omni_e2e.py",
+        expected_message=_VERL_GENERATE_JUNIT_MESSAGE,
+        artifact_env="ROCM_VERL_GENERATE_ARTIFACT_DIR",
+        job_id_prefix="verl-generate-ready-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
 
 
 def test_distributed_buffer_ready_pins_two_gpu_smokes() -> None:
@@ -3777,6 +3946,33 @@ def test_device_reduction_ready_renders_blocking() -> None:
 
 
 @pytest.mark.parametrize(
+    ("label", "expected_message"),
+    [
+        (
+            "ROCm · One-Card Worker GPU Test",
+            "Expected exactly 32 executed one-card worker GPU tests",
+        ),
+        (
+            "ROCm · One-Card Worker Copy Test",
+            "Expected exactly 6 executed one-card worker copy tests",
+        ),
+    ],
+    ids=("worker", "copy"),
+)
+def test_worker_ready_jobs_render_blocking(label: str, expected_message: str) -> None:
+    """Both one-card worker jobs render as hard failures on amd_mi300_1."""
+    step = _find_step(label, AMD_READY_PIPELINE)
+    assert step["grade"] == "Blocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert expected_message in "\n".join(step["commands"])
+    rendered = _rendered_ready_step(label)
+    assert rendered["agents"]["queue"] == "amd_mi300_1"
+    assert rendered["depends_on"] == "amd-build"
+    assert rendered["soft_fail"] is False
+    assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
+
+
+@pytest.mark.parametrize(
     ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
     [
         (0, 17, 0, None, 0),
@@ -3804,6 +4000,182 @@ def test_device_reduction_ready_executes_junit_guard_before_exit(
         expected_message=_DEVICE_REDUCTION_JUNIT_MESSAGE,
         artifact_env="ROCM_DEVICE_REDUCTION_ARTIFACT_DIR",
         job_id_prefix="device-reduction-ready-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "expected_tests", "expected_message", "artifact_env", "job_id_prefix"),
+    [
+        (
+            "ROCm · One-Card Worker GPU Test",
+            32,
+            "Expected exactly 32 executed one-card worker GPU tests",
+            "WORKER_READY_ARTIFACT_DIR",
+            "worker-ready-guard",
+        ),
+        (
+            "ROCm · One-Card Worker Copy Test",
+            6,
+            "Expected exactly 6 executed one-card worker copy tests",
+            "WORKER_COPY_ARTIFACT_DIR",
+            "worker-copy-ready-guard",
+        ),
+    ],
+    ids=("worker", "copy"),
+)
+@pytest.mark.parametrize(
+    ("pytest_status", "tests_override", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, None, 0, None, 0),
+        (0, None, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, None, 0, None, 1),
+        (0, None, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_worker_ready_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    label: str,
+    expected_tests: int,
+    expected_message: str,
+    artifact_env: str,
+    job_id_prefix: str,
+    pytest_status: int,
+    tests_override: int | None,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    """Worker READY jobs fail closed unless every pinned node executed."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label=label,
+        command_fragment="pytest -s -v",
+        expected_message=expected_message,
+        artifact_env=artifact_env,
+        job_id_prefix=job_id_prefix,
+        pytest_status=pytest_status,
+        tests=expected_tests if tests_override is None else tests_override,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
+def test_minicpmo_ready_grades_render_blocking() -> None:
+    """The three MiniCPM READY grades are Blocking and the JUnit guards remain."""
+    for label, _timeout, _command_timeout, _artifact, _nodes, junit_message in _MINICPMO_READY_JOBS:
+        step = _find_step(label, AMD_READY_PIPELINE)
+        command = "\n".join(step["commands"])
+        assert step["grade"] == "Blocking"
+        assert step["agent_pool"] == "mi300_1"
+        assert junit_message in command
+        assert "--junitxml=" in command
+        rendered = _rendered_ready_step(label)
+        assert rendered["agents"]["queue"] == "amd_mi300_1"
+        assert rendered["depends_on"] == "amd-build"
+        assert rendered["soft_fail"] is False
+        assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
+
+
+def test_minicpmo_rocm_v1_duplex_ready_pins_five_one_card_nodes() -> None:
+    """READY qualifies five real-weight duplex cases on the resolved V1 runner.
+
+    ``--run-level advanced_model`` keeps real weights. The config test invokes
+    the production platform resolver and proves that the shared CUDA-MRv2
+    profile deliberately selects V1 for ROCm before the GPU cases run.
+    """
+    step = _find_step(_ROCM_V1_DUPLEX_READY_LABEL, AMD_READY_PIPELINE)
+    command = "\n".join(step["commands"])
+    node_lists = command.split("nodes=(")[1:]
+    quoted = tuple(_quoted_ready_nodes(part) for part in node_lists)
+    source = Path(_ROCM_V1_DUPLEX_FILE).read_text(encoding="utf-8")
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["depends_on"] == "amd-build"
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 45
+    assert step["artifact_paths"] == ["artifacts/rocm-minicpmo-45-v1-fallback-duplex/**/*"]
+    assert "VLLM_ROCM_USE_AITER" not in step.get("env", {})
+    assert "timeout --signal=TERM --kill-after=1m 35m" in command
+    assert "timeout 45m" not in command
+    assert command.count(_ROCM_V1_DUPLEX_READY_MARKER) == 2
+    assert _marker_expressions(step) == ["$$marker", _ROCM_V1_DUPLEX_READY_MARKER]
+    assert command.count("--run-level advanced_model") == 2
+    assert command.count("--run-level core_model") == 1
+    assert _ROCM_V1_DUPLEX_CONFIG_NODE in command
+    assert quoted == (_ROCM_V1_DUPLEX_NODES, _ROCM_V1_DUPLEX_NODES)
+    assert len(_ROCM_V1_DUPLEX_NODES) == 5
+    assert _ROCM_V1_DUPLEX_JUNIT_MESSAGE in command
+    assert "--junitxml=" in command
+    assert "pytest.log" not in command
+    assert "pytest-summary.txt" not in command
+    assert "PIPESTATUS" not in command
+    assert "tee " not in command
+    assert "VLLM_ROCM_USE_AITER" not in command
+    assert "ROCm V1 fallback" in source
+    assert source.count('res={"cuda": "H100", "rocm": "MI325"}, num_cards=1') == 3
+    assert 'res={"cuda": "H100"}, num_cards=' not in source
+    for function_name in (
+        "def test_mrv2_duplex_overlapping_turns(",
+        "def test_mrv2_duplex_new_session_during_long_response(",
+        "def test_mrv2_duplex_server_answers_image_chat_from_the_image(",
+    ):
+        head, _, _ = source.partition(function_name)
+        assert '"rocm": "MI325"' in head[-300:]
+    ready_text = AMD_READY_PIPELINE.read_text(encoding="utf-8")
+    assert ready_text.count(f'label: "{_ROCM_V1_DUPLEX_READY_LABEL}"') == 1
+    for pipeline_path in (AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert _ROCM_V1_DUPLEX_FILE not in text
+
+
+def test_minicpmo_rocm_v1_duplex_ready_renders_nonblocking() -> None:
+    """NonBlocking renders soft_fail true on queue amd_mi300_1."""
+    rendered = _rendered_ready_step(_ROCM_V1_DUPLEX_READY_LABEL)
+    assert rendered["agents"]["queue"] == "amd_mi300_1"
+    assert rendered["depends_on"] == "amd-build"
+    assert rendered["soft_fail"] is True
+    assert rendered["env"]["VLLM_ROCM_USE_AITER"] == "0"
+    assert rendered["timeout_in_minutes"] == 45
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 5, 0, None, 0),
+        (0, 5, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 5, 0, None, 1),
+        (0, 5, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_minicpmo_rocm_v1_duplex_ready_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    """The V1 fallback job fails closed unless exactly five cases execute."""
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_READY_PIPELINE,
+        step_label=_ROCM_V1_DUPLEX_READY_LABEL,
+        command_fragment='pytest -s -v "$${nodes[@]}"',
+        expected_message=_ROCM_V1_DUPLEX_JUNIT_MESSAGE,
+        artifact_env="ROCM_MINICPMO_V1_DUPLEX_ARTIFACT_DIR",
+        job_id_prefix="minicpmo-rocm-v1-duplex-ready-guard",
         pytest_status=pytest_status,
         tests=tests,
         skipped=skipped,
