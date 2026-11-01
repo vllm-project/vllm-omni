@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Independent fast paths for the diffusers Wan causal video VAE.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Independent fast paths for Wan-family causal VAEs.
+
+The diffusers Wan VAE and the implementations registered in :mod:`.families`
+(Qwen-Image, Qwen-Image-2.1) share the replacement forwards below.
 
 ``install_wan_vae_fastpath(vae, level=...)`` rebinds the forwards of one loaded
 ``AutoencoderKLWan`` instance:
@@ -22,6 +25,8 @@ separate from the decoder's.
 
 from .decode import decode_frames
 from .encode import can_encode_frames, encode_frames
+from .families import WanVaeFamily, find_family, register_family
+from .forwards import probe_stats, reset_probe_stats
 from .install import (
     ENCODER_REPORT_ATTR,
     REPORT_ATTR,
@@ -40,13 +45,18 @@ __all__ = [
     "REPORT_ATTR",
     "VAE_FAST_PATH_LEVELS",
     "WanVaeFastPathReport",
+    "WanVaeFamily",
     "decode_frames",
+    "find_family",
+    "register_family",
     "can_encode_frames",
     "encode_frames",
     "install_wan_vae_encoder_fastpath",
     "install_wan_vae_fastpath",
     "is_installed",
     "is_encoder_installed",
+    "probe_stats",
+    "reset_probe_stats",
     "uninstall_wan_vae_encoder_fastpath",
     "uninstall_wan_vae_fastpath",
 ]
