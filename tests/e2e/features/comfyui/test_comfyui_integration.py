@@ -671,7 +671,7 @@ def mock_async_omni(
 
 
 @pytest.fixture
-def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
+def api_server(server_case: ServerCase, mock_async_omni, tmp_path, request: pytest.FixtureRequest):
     """Set up a API server in background process from command line with parametrized model name and mocked AsyncOmni."""
     # Override the STORAGE_MANAGER path to a writable temp directory before
     # forking the server subprocess.  The default /tmp/storage may be owned
@@ -680,6 +680,8 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
     from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 
     old_storage_path = STORAGE_MANAGER.storage_path
+    # Restore even when server setup fails before this fixture reaches yield.
+    request.addfinalizer(lambda: setattr(STORAGE_MANAGER, "storage_path", old_storage_path))
     new_storage_path = tmp_path / "omni_storage"
     new_storage_path.mkdir(exist_ok=True)
     STORAGE_MANAGER.storage_path = str(new_storage_path)
@@ -701,7 +703,9 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
         except Exception:
             traceback.print_exc()
 
-    server_process = multiprocessing.Process(target=run_server)
+    # This local target must inherit the in-process engine mocks. Other tests
+    # can configure the global default as spawn while preparing real engines.
+    server_process = multiprocessing.get_context("fork").Process(target=run_server)
     server_process.start()
 
     # Wait for the server to be ready by polling the health endpoint.
@@ -725,9 +729,6 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
         pytest.fail(f"API server failed to start within {wait_time} seconds")
 
     yield f"http://127.0.0.1:{port}/v1"
-
-    # Restore the original storage path after the test.
-    STORAGE_MANAGER.storage_path = old_storage_path
 
     if server_process.is_alive():
         server_process.terminate()
