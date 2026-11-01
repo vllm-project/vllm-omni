@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -282,3 +283,134 @@ def test_embedding_preparation_preserves_stubbed_rope_tables(monkeypatch):
         4,
     )
     assert prepared[6:9] == (None, None, None)
+
+
+@pytest.mark.parametrize("modulation", [True, False])
+@pytest.mark.parametrize("kv_heads", [2, HEADS])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("is_full", [True, False])
+def test_full_mask_hint_reaches_shared_attention(monkeypatch, modulation, kv_heads, dtype, is_full):
+    block = _block(kv_heads, modulation).to(dtype)
+    hidden, mask, rotary, temb = _inputs(block.head_dim)
+    if is_full:
+        mask.fill_(True)
+    hidden = hidden.to(dtype)
+    temb = temb.to(dtype) if modulation else None
+    seen = []
+    original = block.attn.omni_attn.forward
+
+    def observe(query, key, value, attn_metadata=None):
+        seen.append(attn_metadata)
+        return original(query, key, value, attn_metadata)
+
+    monkeypatch.setattr(block.attn.omni_attn, "forward", observe)
+    with torch.no_grad():
+        got = block(hidden, mask, rotary, temb, attention_mask_is_full=is_full)
+        legacy = block(hidden, mask, rotary, temb)
+    torch.testing.assert_close(got, legacy, atol=0, rtol=0)
+    assert seen[0].extra == ({"attention_mask_mode": "none"} if is_full and dtype == torch.float16 else {})
+    assert seen[1].extra == {}
+    assert torch.equal(seen[0].attn_mask, mask)
+    assert seen[0] is not seen[1]
+
+
+@pytest.mark.parametrize("boundary", ["compile", "parallel"])
+def test_full_mask_hint_is_omitted_at_unvalidated_boundaries(monkeypatch, boundary):
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+
+    block = _block(2).half()
+    hidden, mask, rotary, temb = _inputs(block.head_dim)
+    mask.fill_(True)
+    seen = []
+    original = block.attn.omni_attn.forward
+
+    def observe(query, key, value, attn_metadata=None):
+        seen.append(attn_metadata)
+        return original(query, key, value, attn_metadata)
+
+    monkeypatch.setattr(block.attn.omni_attn, "forward", observe)
+    if boundary == "compile":
+        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    else:
+
+        class EnabledStrategy(NoParallelAttention):
+            @property
+            def enabled(self):
+                return True
+
+        block.attn.omni_attn.parallel_strategy = EnabledStrategy()
+    with torch.no_grad():
+        block(hidden.half(), mask, rotary, temb.half(), attention_mask_is_full=True)
+    assert len(seen) == 1
+    assert seen[0].extra == {}
+
+
+def test_joint_padding_state_is_prepared_per_forward(monkeypatch):
+    """Real embeddings, refiners, packing and diffusers dispatch share only the
+    joint padding state; changed CFG/batch shapes never reuse old metadata."""
+    torch.manual_seed(0)
+    with set_current_diffusion_config(_SDPA_CONFIG):
+        model = (
+            Transformer2DModel(
+                in_channels=4,
+                hidden_size=DIM,
+                num_layers=2,
+                num_refiner_layers=1,
+                num_attention_heads=HEADS,
+                num_kv_heads=2,
+                multiple_of=8,
+                ffn_dim_multiplier=1.0,
+                axes_dim_rope=(4, 2, 2),
+                axes_lens=(32, 32, 32),
+                text_feat_dim=8,
+            )
+            .eval()
+            .half()
+        )
+    freqs = model.rope_embedder.get_freqs_real((4, 2, 2), (32, 32, 32), theta=10000)
+    seen = []
+
+    def observe(name, attention):
+        original = attention.forward
+
+        def spy(query, key, value, attn_metadata=None):
+            seen.append((name, attn_metadata))
+            return original(query, key, value, attn_metadata)
+
+        monkeypatch.setattr(attention, "forward", spy)
+
+    for name, layers in (("context", model.context_refiner), ("noise", model.noise_refiner), ("joint", model.layers)):
+        for layer in layers:
+            observe(name, layer.attn.omni_attn)
+
+    # The last B=1 forward models CFG's empty-text branch and changes image size.
+    cases = [([4], 4, 4, False), ([4, 4], 4, 4, False), ([4, 2], 4, 4, True), ([0], 4, 6, False)]
+    previous_metadata: list[AttentionMetadata] = []
+    for text_lengths, height, width, has_padding in cases:
+        seen.clear()
+        batch, text_len = len(text_lengths), max(text_lengths)
+        text_mask = torch.arange(text_len)[None, :] < torch.tensor(text_lengths)[:, None]
+        latents = torch.randn(batch, 4, height, width, dtype=torch.float16)
+        with torch.no_grad():
+            output = model(
+                hidden_states=latents,
+                timestep=torch.ones(batch),
+                text_hidden_states=torch.randn(batch, text_len, 8, dtype=torch.float16),
+                freqs_cis=freqs,
+                text_attention_mask=text_mask,
+            )
+        assert output.shape == latents.shape and torch.isfinite(output).all()
+        joint = [metadata for name, metadata in seen if name == "joint"]
+        refiners = [metadata for name, metadata in seen if name != "joint"]
+        assert len(joint) == len(model.layers)
+        assert len(refiners) == (2 if text_len else 1)
+        assert all(metadata.extra == {} for metadata in refiners)
+        expected_lengths = torch.tensor(text_lengths) + height * width // 4
+        expected_mask = torch.arange(expected_lengths.max())[None, :] < expected_lengths[:, None]
+        for metadata in joint:
+            assert metadata.extra == ({} if has_padding else {"attention_mask_mode": "none"})
+            assert torch.equal(metadata.attn_mask, expected_mask)
+            assert all(metadata is not old for old in previous_metadata)
+        assert joint[0] is not joint[1], "mutable wrappers must remain per layer"
+        assert joint[0].attn_mask is joint[1].attn_mask
+        previous_metadata.extend(joint)
