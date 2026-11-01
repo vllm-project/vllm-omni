@@ -30,12 +30,17 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
+from vllm_omni.experimental.ar_diffusion.kv_cache.session import NoisyKVSessionRegistry
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.reservation import CapacityDemand, SessionCapacityLedger
+from vllm_omni.experimental.ar_diffusion.session_affinity import SessionRouter
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import MultipleOf
+
+    from vllm_omni.experimental.ar_diffusion.cell_executor import ARDiffusionCellContext
 
 logger = init_logger(__name__)
 
@@ -126,6 +131,19 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._session_capacity = 0
+        # One resident Noisy KV session: P1 keeps a single replica and a single
+        # request at a time, and the registry refuses a session whose request
+        # failed until it is reset.
+        self._noisy_sessions = NoisyKVSessionRegistry(capacity=1)
+        # Framework seams from the roadmap: which replica owns a session (2.1)
+        # and what capacity the scheduler reserved for it (2.3). Both are
+        # opt-in, so a single-replica deployment without a ledger behaves
+        # exactly as before.
+        self._session_router: SessionRouter | None = None
+        self._replica_id = 0
+        self._capacity_ledger: SessionCapacityLedger | None = None
+        self._session_reservation_versions = 0
+        self._session_reservation_bytes = 0
         self._perf_e2e_times: list[float] = []
         # Wall-clock start of each request's in-flight stepwise chunk, so
         # ``_perf_e2e_times`` keeps one entry per AR block in both execution
@@ -224,7 +242,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             available_bytes=avail,
             layer_offset=layer_offset,
             blocks_per_rank=blocks_per_rank,
+            # Sessions keep their retained window resident while the next request
+            # runs, so that quota is reserved on top of the live one.
+            session_retention_chunks=self._noisy_sessions.capacity * spec.history_versions,
         )
+        # The registry knows session identities; the pool owns their slots, so
+        # dropping a session has to go through the cache to hand them back.
+        self._noisy_sessions.on_release = self.noisy_kv_cache.release_session
         logger.info(
             "AR-Diffusion noisy KV: capacity=%d reserved_bytes=%d layers=%d H=%d G=%d R=%d S=%d K=%d",
             self.noisy_kv_cache.capacity,
@@ -236,6 +260,49 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             step_replicas,
             blocks_per_rank,
         )
+
+    def bind_session_router(self, router: SessionRouter | None, replica_id: int = 0) -> None:
+        """Install the replica-affinity decision the engine made for this worker."""
+        self._session_router = router
+        self._replica_id = int(replica_id)
+
+    def bind_capacity_ledger(
+        self,
+        ledger: SessionCapacityLedger | None,
+        *,
+        versions: int = 0,
+        reserved_bytes: int = 0,
+    ) -> None:
+        """Install the scheduler's session capacity ledger for this worker."""
+        self._capacity_ledger = ledger
+        self._session_reservation_versions = int(versions)
+        self._session_reservation_bytes = int(reserved_bytes)
+
+    def _route_session(self, session_id: str, *, allow_cold: bool) -> None:
+        """Refuse a request whose session belongs to a replica this one is not."""
+        router = getattr(self, "_session_router", None)
+        if router is None:
+            return
+        router.route(session_id, [int(getattr(self, "_replica_id", 0))], allow_cold=allow_cold)
+
+    def _reserve_session_capacity(self, session_id: str) -> None:
+        """Reserve this session's incremental capacity, or send the request back."""
+        ledger = getattr(self, "_capacity_ledger", None)
+        if ledger is None:
+            return
+        demand = CapacityDemand(
+            versions=int(getattr(self, "_session_reservation_versions", 0)),
+            bytes=int(getattr(self, "_session_reservation_bytes", 0)),
+        )
+        ledger.reserve(session_id, demand)
+
+    def _release_session_reservation(self, session_id: str) -> None:
+        ledger = getattr(self, "_capacity_ledger", None)
+        if ledger is not None:
+            ledger.release(session_id)
+        router = getattr(self, "_session_router", None)
+        if router is not None:
+            router.release(session_id)
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
@@ -466,7 +533,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """
         self.release_step_requests(getattr(scheduler_output, "finished_req_ids", None) or ())
 
-    def _make_chunk_context(self):
+    def _make_chunk_context(self, session: Any | None = None):
         from vllm_omni.experimental.ar_diffusion.cell_executor import (
             ARDiffusionCellContext,
             CellRunSpec,
@@ -489,7 +556,19 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 pp_group=pp_group,
             ),
             kv=NoisyKVState(self.noisy_kv_cache),
+            chunk_start=session.committed_chunks if session is not None else 0,
+            session=session,
         )
+
+    @staticmethod
+    def _release_cell_requests(ctx: ARDiffusionCellContext) -> None:
+        """Release only the requests this cell context owns.
+
+        ``reset_all()`` also drops versions owned by other requests that share
+        the pool, so a request-scoped cell failure must not use it.
+        """
+        for req in {item.req for item in ctx.inflight} | {item.req for item in ctx.pending}:
+            ctx.drop(req)
 
     def execute_model(
         self,
@@ -498,17 +577,41 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
+            session_id, extra_args, tick = self._request_session(req)
+            reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
+            close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
+            # Retention is opt-in. ``_request_session`` answers ``default`` for a
+            # missing id because the paged path has always run that way, so
+            # binding it here would let independent requests inherit KV.
+            explicit_session = tick is not None or bool(extra_args.get("session_id"))
+            session = None
+            if explicit_session:
+                if reset:
+                    self._noisy_sessions.reset(session_id)
+                    self._release_session_reservation(session_id)
+                self._route_session(session_id, allow_cold=reset)
+                self._reserve_session_capacity(session_id)
+                session, _generation = self._noisy_sessions.admit(session_id)
             started = time.perf_counter()
-            ctx = self._make_chunk_context()
+            ctx = self._make_chunk_context(session=session)
             try:
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     output = super().execute_model(
                         req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
                     )
             except Exception:
-                ctx.kv.reset_all()
-                logger.warning("AR-Diffusion chunk forward failed; NoisyKV versions were released fail-closed")
+                self._release_cell_requests(ctx)
+                if explicit_session:
+                    self._noisy_sessions.inactivate(session_id, "chunk forward failed")
+                logger.warning(
+                    "AR-Diffusion chunk forward failed; the request's NoisyKV versions were released "
+                    "and session %s was invalidated",
+                    session_id if explicit_session else "<none>",
+                )
                 raise
+            if close_session and explicit_session:
+                self._noisy_sessions.close(session_id)
+                self._release_session_reservation(session_id)
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output
         if self.kv_cache is None:
@@ -545,8 +648,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     return super().execute_model_batch(scheduler_output, od_config)
             except Exception:
-                ctx.kv.reset_all()
-                logger.warning("AR-Diffusion chunk batch failed; NoisyKV versions were released fail-closed")
+                self._release_cell_requests(ctx)
+                logger.warning("AR-Diffusion chunk batch failed; the request's NoisyKV versions were released")
                 raise
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."

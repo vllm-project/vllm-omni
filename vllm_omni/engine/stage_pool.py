@@ -58,6 +58,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def session_id_of(params: Any) -> str | None:
+    """Session identity a request carries, if any.
+
+    A session's KV lives on one replica, so its follow-up requests have to reach
+    that replica. The identity travels in the sampling params' ``extra_args``
+    because that is what the model-facing layers already read.
+    """
+    extra = getattr(params, "extra_args", None)
+    if not isinstance(extra, dict):
+        return None
+    value = extra.get("session_id")
+    return str(value) if value else None
+
+
 class StageUnavailableError(RuntimeError):
     """Raised when dispatch cannot reach a live replica of a stage.
 
@@ -184,6 +198,9 @@ class StagePool:
         self._watermark_lock = asyncio.Lock()
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        # Session -> replica. Round-robin would scatter a session's follow-up
+        # requests across replicas that do not hold its state.
+        self._session_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
         # Invoked whenever the replica set changes, so the event-driven loop can
         # re-bind its readers without waiting for a tick. Must be thread-safe.
@@ -384,6 +401,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Return a replica id for ``request_id``.
 
@@ -396,7 +414,13 @@ class StagePool:
         :meth:`select_replica_id`.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
+
+        # 0. Sticky by session: its history lives on exactly one replica.
+        if session_id is not None:
+            holder = self.session_replica_id(session_id)
+            if holder is not None:
+                return holder
 
         # 1. Sticky: previously bound and still serviceable?
         bound_addr = self._affinity.get(request_id)
@@ -426,6 +450,8 @@ class StagePool:
                 lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
                 replica_info, replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
+                if session_id is not None:
+                    self._session_bindings[session_id] = replica_id
                 return replica_id
 
             now = _time.monotonic()
@@ -441,6 +467,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int | None:
         """Synchronously pick and bind a replica before request preprocessing.
 
@@ -453,7 +480,13 @@ class StagePool:
         submit-time router wait without blocking the caller.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
+
+        if session_id is not None:
+            holder = self.session_replica_id(session_id)
+            if holder is not None:
+                self._request_bindings[request_id] = holder
+                return holder
 
         bound_addr = self._affinity.get(request_id)
         if bound_addr is not None:
@@ -478,6 +511,8 @@ class StagePool:
         lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
         replica_info, replica_id = candidates[lb_idx]
         self._affinity[request_id] = replica_info.input_addr
+        if session_id is not None:
+            self._session_bindings[session_id] = replica_id
         return replica_id
 
     def _collect_serviceable_replicas(self) -> list[tuple[ReplicaInfo, int]]:
@@ -652,6 +687,9 @@ class StagePool:
         released_request_ids = list(dict.fromkeys(released_request_ids))
         for request_id in released_request_ids:
             self.release_binding(request_id)
+        for session_id, bound_replica_id in list(self._session_bindings.items()):
+            if bound_replica_id == replica_id:
+                self._session_bindings.pop(session_id, None)
         return released_request_ids
 
     def mark_replica_unavailable(self, replica_id: int) -> list[str]:
@@ -671,13 +709,48 @@ class StagePool:
     def available_replica_ids(self) -> list[int]:
         return [replica_id for replica_id in range(self.num_replicas) if self.is_replica_available(replica_id)]
 
+    # ---- Session affinity (roadmap 2.1/2.2) ----
+
+    def session_replica_id(self, session_id: str) -> int | None:
+        """Replica that holds *session_id*, if it is still serviceable."""
+        replica_id = self._session_bindings.get(session_id)
+        if replica_id is None:
+            return None
+        if self.is_replica_available(replica_id):
+            return replica_id
+        # The holder is gone, so the session cannot be served from it any more.
+        self._session_bindings.pop(session_id, None)
+        return None
+
+    def bind_session_replica(self, session_id: str, replica_id: int) -> int:
+        """Record the replica that now holds *session_id*."""
+        if not self.is_replica_available(replica_id):
+            raise StageUnavailableError(
+                f"stage {self.stage_id} replica {replica_id} cannot hold session {session_id!r}"
+            )
+        self._session_bindings[session_id] = replica_id
+        return replica_id
+
+    def release_session(self, session_id: str) -> int | None:
+        """Forget a session binding (the session closed, reset, or moved)."""
+        return self._session_bindings.pop(session_id, None)
+
+    def session_binding_count(self) -> int:
+        return len(self._session_bindings)
+
     def select_replica_id(
         self,
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Pick a replica id for *request_id* and cache the choice (legacy path)."""
+        if session_id is not None:
+            holder = self.session_replica_id(session_id)
+            if holder is not None:
+                self._request_bindings[request_id] = holder
+                return holder
         cached = self.get_bound_replica_id(request_id)
         if cached is not None and self.clients[cached] is not None and self.is_replica_available(cached):
             return cached
@@ -705,6 +778,8 @@ class StagePool:
                 self._next_replica_id = (self._next_replica_id + 1) % len(live)
 
         self._request_bindings[request_id] = chosen
+        if session_id is not None:
+            self._session_bindings[session_id] = chosen
         return chosen
 
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
@@ -1064,7 +1139,7 @@ class StagePool:
     def _count_video_units(value: Any) -> int:
         if value is None:
             return 0
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list | tuple):
             return len(value)
         shape = getattr(value, "shape", None)
         if shape is not None:
@@ -1115,9 +1190,12 @@ class StagePool:
         submit_kwargs: DiffusionSubmitKwargs | None = None,
         params_override: Any = None,
         expected_replica_id: int | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
+        if session_id is None:
+            session_id = session_id_of(params)
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
@@ -1137,12 +1215,17 @@ class StagePool:
                 replica_id = await self._pick_or_select(
                     request_id,
                     affinity_request_id=affinity_request_id,
+                    session_id=session_id,
                 )
             if req_state.trace is not None:
                 req_state.trace.start_stage(self.stage_id, replica_id, self.stage_type)
             client = self._diffusion_client(replica_id)
             self.maybe_update_watermarking_state(request_id, params)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
+            if session_id is not None and getattr(params, "extra_args", {}).get("close_session"):
+                # The session ends with this request, so it must not keep a
+                # replica reserved for follow-ups that will never come.
+                self.release_session(session_id)
             return replica_id
 
         if pinned_replica_id is not None:
@@ -1151,6 +1234,7 @@ class StagePool:
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
+                session_id=session_id,
             )
         # A request whose multimodal cache keys name a replica must not move: that
         # replica's sender-cache entries may omit media the new one never received.
@@ -1296,11 +1380,12 @@ class StagePool:
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
         if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
-        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return await self.pick(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
+        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
 
     # ---- Stage-local polling ----
 

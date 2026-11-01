@@ -68,6 +68,9 @@ class RequestKVTransfer:
     version: Cell
     src: int
     dst: int
+    # Pool owner override: session history lives under the session owner rather
+    # than under the request that happens to be reading it.
+    owner: str | None = None
 
 
 @dataclass(frozen=True)
