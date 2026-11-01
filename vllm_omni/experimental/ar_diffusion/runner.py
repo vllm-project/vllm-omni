@@ -30,6 +30,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
+from vllm_omni.experimental.ar_diffusion.kv_cache.session import NoisyKVSessionRegistry
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
@@ -128,6 +129,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._session_capacity = 0
+        # One resident Noisy KV session: P1 keeps a single replica and a single
+        # request at a time, and the registry refuses a session whose request
+        # failed until it is reset.
+        self._noisy_sessions = NoisyKVSessionRegistry(capacity=1)
         self._perf_e2e_times: list[float] = []
         # Wall-clock start of each request's in-flight stepwise chunk, so
         # ``_perf_e2e_times`` keeps one entry per AR block in both execution
@@ -510,6 +515,12 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
         if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
+            session_id, extra_args, tick = self._request_session(req)
+            reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
+            close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
+            if reset:
+                self._noisy_sessions.reset(session_id)
+            self._noisy_sessions.admit(session_id)
             started = time.perf_counter()
             ctx = self._make_chunk_context()
             try:
@@ -519,8 +530,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     )
             except Exception:
                 self._release_cell_requests(ctx)
-                logger.warning("AR-Diffusion chunk forward failed; the request's NoisyKV versions were released")
+                self._noisy_sessions.inactivate(session_id, "chunk forward failed")
+                logger.warning(
+                    "AR-Diffusion chunk forward failed; the request's NoisyKV versions were released "
+                    "and session %s was invalidated",
+                    session_id,
+                )
                 raise
+            if close_session:
+                self._noisy_sessions.close(session_id)
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output
         if self.kv_cache is None:
