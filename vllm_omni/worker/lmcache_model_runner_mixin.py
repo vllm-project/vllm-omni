@@ -236,7 +236,9 @@ class LMCacheHiddenStateMixin:
             self._hs_saved_boundary[req_id] = new_boundary
             self._hs_buffer_origin[req_id] = new_boundary
 
-    def _store_hs_chunk_inprocess(self, hs_store, segment, seg_token_ids, token_offset, expected_chunks, req_id) -> bool:
+    def _store_hs_chunk_inprocess(
+        self, hs_store, segment, seg_token_ids, token_offset, expected_chunks, req_id
+    ) -> bool:
         """Store one chunk range layer by layer into the in-process HS pool."""
         all_stored = True
         for layer_key, rows in segment.items():

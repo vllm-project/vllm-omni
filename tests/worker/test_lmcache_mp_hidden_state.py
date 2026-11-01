@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the LMCache MP hidden-state backend."""
 
-import pickle
 from types import SimpleNamespace
 
 import pytest
 import torch
+from lmcache.v1.multiprocess.transfer_context.tensor_wire import (
+    decode_tensors,
+    encode_tensors,
+)
 
 from vllm_omni.worker.lmcache_mp_hidden_state import (
     MPHiddenStateBackend,
@@ -118,7 +121,12 @@ def test_store_splits_the_range_into_chunks():
     assert backend.store(list(range(3 * CHUNK_SIZE)), stacked, CHUNK_SIZE, "req")
 
     _, key, _, data = next(c for c in adapter.req_client.calls if c[0] == "store")
-    chunks = pickle.loads(data)
+    chunks = decode_tensors(
+        data,
+        expected_shape=torch.Size([CHUNK_SIZE, len(layer_order(MM_KEYS)), HIDDEN]),
+        expected_dtype=torch.float32,
+        expected_count=3,
+    )
     assert len(chunks) == 3
     assert all(c.shape[0] == CHUNK_SIZE for c in chunks)
     # The range the server is told must match the rows actually sent.
@@ -140,7 +148,10 @@ def test_retrieve_reassembles_the_chunks():
     backend = MPHiddenStateBackend(adapter)
     stacked = stack_layers(_layers(2 * CHUNK_SIZE), MM_KEYS)
     chunks = list(stacked.split(CHUNK_SIZE, dim=0))
-    adapter.req_client.retrieve_result = (pickle.dumps(chunks), 2 * CHUNK_SIZE)
+    # The server only serves a registered instance, so the backend learns the
+    # layout before it can decode a retrieve.
+    assert backend.ensure_registered(stacked)
+    adapter.req_client.retrieve_result = (encode_tensors(chunks), 2 * CHUNK_SIZE)
 
     restored = backend.retrieve(list(range(2 * CHUNK_SIZE)), "req")
 

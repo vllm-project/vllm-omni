@@ -9,10 +9,13 @@ needs travel together as one object per chunk and the layer set is declared
 once at registration.
 """
 
-import pickle
 from typing import Any
 
 import torch
+from lmcache.v1.multiprocess.transfer_context.tensor_wire import (
+    decode_tensors,
+    encode_tensors,
+)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -36,9 +39,7 @@ def layer_order(mm_keys: tuple[str, ...]) -> tuple[str, ...]:
     return (*mm_keys, "hidden")
 
 
-def stack_layers(
-    layers: dict[str, torch.Tensor], mm_keys: tuple[str, ...]
-) -> torch.Tensor | None:
+def stack_layers(layers: dict[str, torch.Tensor], mm_keys: tuple[str, ...]) -> torch.Tensor | None:
     """Pack ``{layer_key: [rows, hidden]}`` into ``[rows, num_layers, hidden]``.
 
     Returns ``None`` when a layer is missing or the layers disagree on width.
@@ -65,9 +66,7 @@ def stack_layers(
     return torch.stack([layers[key] for key in order], dim=1)
 
 
-def unstack_layers(
-    stacked: torch.Tensor, mm_keys: tuple[str, ...]
-) -> dict[str, torch.Tensor]:
+def unstack_layers(stacked: torch.Tensor, mm_keys: tuple[str, ...]) -> dict[str, torch.Tensor]:
     """Split ``[rows, num_layers, hidden]`` back into per-layer tensors."""
     order = layer_order(mm_keys)
     return {key: stacked[:, idx, :] for idx, key in enumerate(order)}
@@ -128,8 +127,7 @@ class MPHiddenStateBackend:
             return False
         self._registered_shape = shape
         logger.info(
-            "LMCache MP hidden-state layout registered (layers=%d, hidden=%d, "
-            "dtype=%s, chunk=%d)",
+            "LMCache MP hidden-state layout registered (layers=%d, hidden=%d, dtype=%s, chunk=%d)",
             num_layers,
             hidden_size,
             dtype_name,
@@ -160,19 +158,15 @@ class MPHiddenStateBackend:
             return False
         rows = int(stacked.shape[0])
         chunks = list(stacked.split(self.chunk_size, dim=0))
-        key = self._adapter._create_key(
-            token_ids, token_offset, token_offset + rows, request_id
-        )
+        key = self._adapter._create_key(token_ids, token_offset, token_offset + rows, request_id)
         try:
             return bool(
                 self._adapter.req_client.store_hidden_state(
-                    key, self._adapter.instance_id, pickle.dumps(chunks)
+                    key, self._adapter.instance_id, encode_tensors(chunks)
                 ).result(timeout=_RPC_TIMEOUT_S)
             )
         except _UNREACHABLE:
-            logger.warning(
-                "LMCache MP: cache unreachable on store (req_id=%s)", request_id
-            )
+            logger.warning("LMCache MP: cache unreachable on store (req_id=%s)", request_id)
             return False
 
     def retrieve(self, token_ids: list[int], request_id: str) -> torch.Tensor | None:
@@ -183,31 +177,42 @@ class MPHiddenStateBackend:
         """
         key = self._adapter._create_key(token_ids, 0, len(token_ids), request_id)
         try:
-            data, num_tokens = self._adapter.req_client.retrieve_hidden_state(
-                key, self._adapter.instance_id
-            ).result(timeout=_RPC_TIMEOUT_S)
-        except _UNREACHABLE:
-            logger.warning(
-                "LMCache MP: cache unreachable on retrieve (req_id=%s)", request_id
+            data, num_tokens = self._adapter.req_client.retrieve_hidden_state(key, self._adapter.instance_id).result(
+                timeout=_RPC_TIMEOUT_S
             )
+        except _UNREACHABLE:
+            logger.warning("LMCache MP: cache unreachable on retrieve (req_id=%s)", request_id)
             return None
         if not num_tokens or not data:
             return None
-        return torch.cat(pickle.loads(data), dim=0)
+        if self._registered_shape is None:
+            # The server only serves a registered instance, so this is a bug.
+            logger.error("LMCache MP: retrieved hidden states before registering")
+            return None
+        num_layers, hidden_size, dtype_name = self._registered_shape
+        try:
+            chunks = decode_tensors(
+                data,
+                expected_shape=torch.Size([self.chunk_size, num_layers, hidden_size]),
+                expected_dtype=getattr(torch, dtype_name),
+                expected_count=num_tokens // self.chunk_size,
+            )
+        except Exception:
+            logger.exception("LMCache MP: undecodable hidden-state payload (req_id=%s)", request_id)
+            return None
+        return torch.cat(chunks, dim=0)
 
     def lookup(self, token_ids: list[int], request_id: str) -> int:
         """Return how many leading tokens have hidden states cached."""
         key = self._adapter._create_key(token_ids, 0, len(token_ids), request_id)
         try:
             return int(
-                self._adapter.req_client.lookup_hidden_state(
-                    key, self._adapter.instance_id
-                ).result(timeout=_RPC_TIMEOUT_S)
+                self._adapter.req_client.lookup_hidden_state(key, self._adapter.instance_id).result(
+                    timeout=_RPC_TIMEOUT_S
+                )
             )
         except _UNREACHABLE:
-            logger.warning(
-                "LMCache MP: cache unreachable on lookup (req_id=%s)", request_id
-            )
+            logger.warning("LMCache MP: cache unreachable on lookup (req_id=%s)", request_id)
             return 0
 
 
