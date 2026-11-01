@@ -104,6 +104,164 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         ]
         return dec
 
+    def encode_tile_split(self, x: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
+        """Split a sample-space input into overlapping spatial tiles for parallel encoding.
+
+        Args:
+            x: Sample-space input of shape ``(B, C, F, H, W)``. Tiles are sliced on the
+                ``tile_sample_stride_*`` grid with ``tile_sample_min_*`` extents, so
+                neighboring tiles overlap by ``min - stride`` sample pixels. Each tile is
+                pre-chunked temporally for the causal encoder: one leading frame, then
+                ``2 ** sum(config.temperal_downsample)`` frames per chunk, matching
+                diffusers' sequential ``tiled_encode``.
+
+        Returns:
+            A ``(tiletask_list, grid_spec)`` pair. Each task's tensor is the list of
+            temporal chunks for one spatial tile. ``grid_spec.tile_spec`` carries the
+            latent-space merge metadata: ``latent_height``/``latent_width`` (final crop),
+            ``blend_height``/``blend_width`` (overlap extents), and
+            ``tile_latent_stride_*`` (per-tile crop). Encoder output shapes are gathered
+            dynamically by the executor's metadata path, so no predicted shapes are set.
+        """
+        _, _, num_frames, height, width = x.shape
+        latent_height = height // self.spatial_compression_ratio
+        latent_width = width // self.spatial_compression_ratio
+
+        tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
+        tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
+        tile_latent_stride_height = self.tile_sample_stride_height // self.spatial_compression_ratio
+        tile_latent_stride_width = self.tile_sample_stride_width // self.spatial_compression_ratio
+
+        blend_height = tile_latent_min_height - tile_latent_stride_height
+        blend_width = tile_latent_min_width - tile_latent_stride_width
+
+        temporal_compression = 2 ** sum(bool(t) for t in self.config.temperal_downsample)
+
+        tiletask_list = []
+        for i in range(0, height, self.tile_sample_stride_height):
+            for j in range(0, width, self.tile_sample_stride_width):
+                time_list = []
+                frame_range = 1 + (num_frames - 1) // temporal_compression
+                for k in range(frame_range):
+                    if k == 0:
+                        tile = x[:, :, :1, i : i + self.tile_sample_min_height, j : j + self.tile_sample_min_width]
+                    else:
+                        tile = x[
+                            :,
+                            :,
+                            1 + temporal_compression * (k - 1) : 1 + temporal_compression * k,
+                            i : i + self.tile_sample_min_height,
+                            j : j + self.tile_sample_min_width,
+                        ]
+                    time_list.append(tile)
+                tiletask_list.append(
+                    TileTask(
+                        len(tiletask_list),
+                        (i // self.tile_sample_stride_height, j // self.tile_sample_stride_width),
+                        time_list,
+                        workload=time_list[0].shape[3] * time_list[0].shape[4],
+                    )
+                )
+
+        tile_spec = {
+            "latent_height": latent_height,
+            "latent_width": latent_width,
+            "blend_height": blend_height,
+            "blend_width": blend_width,
+            "tile_latent_stride_height": tile_latent_stride_height,
+            "tile_latent_stride_width": tile_latent_stride_width,
+        }
+        grid_spec = GridSpec(
+            split_dims=(3, 4),
+            grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
+            tile_spec=tile_spec,
+            output_dtype=self.dtype,
+        )
+        return tiletask_list, grid_spec
+
+    def encode_tile_exec(self, task: TileTask) -> torch.Tensor:
+        """Encode one spatial tile's temporal chunks into latent moments.
+
+        Resets the encoder feature cache per tile and ``_enc_conv_idx`` per chunk
+        (chunks within a tile intentionally share the causal cache), applies
+        ``quant_conv`` per chunk, and concatenates along the frame axis. Returns
+        latent moments of shape ``(B, 2 * z_dim, F_latent, tile_h // scr, tile_w // scr)``.
+        """
+        self.clear_cache()
+        time = []
+        for tile in task.tensor:
+            self._enc_conv_idx = [0]
+            encoded = self.encoder(tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+            encoded = self.quant_conv(encoded)
+            time.append(encoded)
+        result = torch.cat(time, dim=2)
+        self.clear_cache()
+        return result
+
+    def encode_tile_merge(
+        self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec
+    ) -> torch.Tensor:
+        """Blend and stitch encoded tiles into the full latent tensor.
+
+        Mirrors the sequential blending of diffusers' ``tiled_encode``: each tile is
+        blended against its upper/left neighbors over the latent-space ``blend_*``
+        extents, cropped to ``tile_latent_stride_*``, concatenated, and finally cropped
+        to ``(latent_height, latent_width)``. Returns latent moments of shape
+        ``(B, 2 * z_dim, F_latent, latent_height, latent_width)``.
+        """
+        grid_h, grid_w = grid_spec.grid_shape
+        result_rows = []
+        for i in range(grid_h):
+            result_row = []
+            for j in range(grid_w):
+                tile = coord_tensor_map[(i, j)]
+                if i > 0:
+                    tile = self.blend_v(coord_tensor_map[(i - 1, j)], tile, grid_spec.tile_spec["blend_height"])
+                if j > 0:
+                    tile = self.blend_h(coord_tensor_map[(i, j - 1)], tile, grid_spec.tile_spec["blend_width"])
+                result_row.append(
+                    tile[
+                        :,
+                        :,
+                        :,
+                        : grid_spec.tile_spec["tile_latent_stride_height"],
+                        : grid_spec.tile_spec["tile_latent_stride_width"],
+                    ]
+                )
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        enc = torch.cat(result_rows, dim=3)[
+            :, :, :, : grid_spec.tile_spec["latent_height"], : grid_spec.tile_spec["latent_width"]
+        ]
+        return enc
+
+    def tiled_encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Distributed tiled encode: split across the DiT group, encode, gather, merge.
+
+        Drop-in replacement for diffusers' sequential ``tiled_encode`` — same signature,
+        same return (latent moments ``(B, 2 * z_dim, F_latent, latent_height,
+        latent_width)``), numerically identical output. Falls back to the sequential
+        parent implementation when distribution is disabled (``vae_patch_parallel_size
+        <= 1``, tiling off, or no process group). The merged result is broadcast to all
+        ranks because every rank's denoiser consumes the latents.
+        """
+        if not self.is_distributed_enabled():
+            return super().tiled_encode(x)
+
+        logger.debug("Encode running with distributed executor")
+        self.clear_cache()
+        result = self.distributed_executor.execute(
+            x,
+            DistributedOperator(
+                split=self.encode_tile_split,
+                exec=self.encode_tile_exec,
+                merge=self.encode_tile_merge,
+            ),
+            broadcast_result=True,
+        )
+        self.clear_cache()
+        return result
+
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
         if not self.is_distributed_enabled():
             return super().tiled_decode(z, return_dict=return_dict)
