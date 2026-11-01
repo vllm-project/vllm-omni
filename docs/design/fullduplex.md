@@ -460,6 +460,26 @@ for queue updates and the final validity check before delivery.
   accumulates the snapshot into the active response, so
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
+- **Session stats (busy RTF, RFC #8325).** Opt-in with
+  `duplex_session.collect_stats`. `ModelChannel` stamps each Stage-0 append's
+  envelope with `duplex.perf_chunk = [epoch, seq]` (a seq retried after a failed
+  submit gets a fresh id, so the aborted submit's late spans are ignored); the orchestrator copies the
+  producing step's chunk into forwarded updates and the chunk transfer adapter
+  into connector payloads. Stage schedulers (`DuplexStageWorkRecorder`) time
+  every step of a request that carries a chunk and return the spans on
+  `OmniEngineCoreOutput.stage_work`, which the orchestrator hands to the
+  session as it collects them. `DuplexEngineSession.perf`
+  (`SessionPerfLedger`) groups chunks by turn with their acceptance times and
+  spans (a chunk is done at its last span end), and records each turn's emitted audio through the
+  response it belongs to; turns close on model-turn completion, barge-in or
+  close. The runner answers `session.stats.get` from the ledger on
+  the ordered mailbox; clients derive busy RTF and stall ratio
+  (`vllm_omni.benchmarks.duplex_session_metrics`). A turn is reported final
+  only after the model turn completed, its responses ended and every chunk was
+  handled; cancelled turns never become final, and later spans are counted in
+  `late_spans`. With the flag off nothing is stamped or attached, and stage
+  schedulers check only newly scheduled requests. Single-host only: the API and
+  stage processes must share one `CLOCK_MONOTONIC`.
 
 Model plugins may opt into one bounded auxiliary request per Session. The
 Session-owned `SessionMemoryRuntime` gives it a separate resource identity,
@@ -697,10 +717,26 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
-The MiniCPM-o SigLIP vision tower defaults to SDPA on all platforms. An
-explicit engine or vision attention setting still overrides the default.
-Eager attention remains available for checkpoint arithmetic comparisons;
-SDPA and eager can produce different BF16 embeddings.
+The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
+sessions. SDPA and eager produce different BF16 embeddings, which can change
+scene descriptions during long video sessions. Turn-mode and non-CUDA vision
+retain SDPA by default. An explicit engine or vision attention setting still
+overrides the default.
+
+The reference vision path fuses scaling and softmax for unmasked CUDA BF16
+inputs, preserving BF16 score/probability rounding and FP32 accumulation.
+Encoder CUDA graphs remain enabled. This avoids the full FP32 probability
+buffer used by eager attention, but still materializes attention scores and
+can reduce vision throughput compared with SDPA at larger image batches.
+An explicit `vision_config._attn_implementation="sdpa"` keeps the SDPA path.
+
+With reference vision attention, `vision_fused_layers: true` does not enable
+fused encoder layers: `supports_fused_layers()` excludes this attention backend.
+This also applies to the `minicpmo_4_5_duplex_h200.yaml` profile. Packed encoding,
+vision CUDA graphs and the fused scaled softmax remain enabled in that profile.
+Selecting SDPA explicitly allows fused encoder layers, but can change BF16 vision
+outputs and requires rechecking long-video recognition for the workload.
+
 MiniCPM-o deployments select `TRITON_ATTN` for CUDA stage 0, including the
 standalone 2-GPU, 3-GPU and 8x4090 layouts and inherited replica and turn-mode
 profiles. Talker and NPU attention settings are unchanged. This aligns the

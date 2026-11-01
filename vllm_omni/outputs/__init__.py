@@ -46,6 +46,8 @@ class OmniConnectorOutput:
         stage_recv_req_ids: Request IDs that received batch stage inputs.
         has_pending_kv_work: True if the mixin has pending, active, or
             completed KV transfers that the scheduler should account for.
+        stage_payloads: Serialized stage payloads of run requests keyed by
+            request ID, returned to the scheduler instead of sent on the connector.
     """
 
     chunk_ready_req_ids: set[str] = field(default_factory=set)
@@ -54,6 +56,7 @@ class OmniConnectorOutput:
     kv_sent_req_ids: list[str] = field(default_factory=list)
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
+    stage_payloads: dict[str, bytes] = field(default_factory=dict)
 
 
 @dataclass
@@ -86,6 +89,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     pending_generation_req_ids: set[str] = field(default_factory=set)
     # Request-local sampler failures, resolved at the existing token-copy boundary.
     invalid_logits_req_ids: set[str] = field(default_factory=set)
+    # Request-local model failures, materialized after asynchronous D2H.
+    request_errors: dict[str, str] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

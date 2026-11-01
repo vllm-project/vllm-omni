@@ -14,10 +14,12 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import anyio
+import msgspec
 from vllm import TokensPrompt
 from vllm.config.profiler import validate_profile_iteration_bounds
 from vllm.engine.protocol import EngineClient, StreamingInput
@@ -31,11 +33,13 @@ from vllm.tasks import SupportedTask
 
 from vllm_omni.diffusion.data import CuMemTag, OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.messages import ErrorMessage
+from vllm_omni.engine.messages import ErrorMessage, NextStageInputMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S, AsyncOmniBase
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.errors import client_error_metadata
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, disable_watermarking
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -154,6 +158,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         arrival_time: float | None = None,
         submitted: asyncio.Future[None] | None = None,
         entry_stage_id: int = 0,
+        watermarking: bool | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -183,6 +188,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             entry_stage_id: Stage the request is submitted to; > 0 bypasses
                 stage 0 and leaves the prompt raw for that stage. Streaming
                 prompts always enter at stage 0.
+            watermarking: Whether configured watermarking applies to this request
+                (None means enabled); False disables it on every stage.
 
         Yields:
             OmniRequestOutput objects as they are produced by each stage.
@@ -265,6 +272,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 sampling_params_list,
                 allow_delta_coercion=True,
             )
+            if watermarking is False:
+                sampling_params_list = disable_watermarking(sampling_params_list)
 
             # Track per-request metrics
             wall_start_ts = float(arrival_time) if arrival_time is not None else time.time()
@@ -317,6 +326,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    trace_headers=trace_headers,
                     first_chunk_submitted=first_chunk_submitted,
                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
@@ -332,6 +342,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                         final_output_stage_ids=final_output_stage_ids,
                         arrival_time=wall_start_ts,
                         lora_request=lora_request,
+                        trace_headers=trace_headers,
                         entry_stage_id=entry_stage_id,
                         **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                     ),
@@ -515,6 +526,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
         lora_request: Any = None,
+        trace_headers: Mapping[str, str] | None = None,
         first_chunk_submitted: asyncio.Future[None] | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> asyncio.Task:
@@ -597,6 +609,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                trace_headers=trace_headers,
                                 resumable=True,
                                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                             )
@@ -614,6 +627,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                trace_headers=trace_headers,
                                 resumable=True,
                             )
                         )
@@ -643,6 +657,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    trace_headers=trace_headers,
                                     resumable=False,
                                 )
                             )
@@ -657,6 +672,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    trace_headers=trace_headers,
                                     resumable=False,
                                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                                 )
@@ -692,6 +708,78 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 "Input streaming is currently supported only for SamplingParams "
                 "with n == 1, output_kind != FINAL_ONLY, and without stop strings."
             )
+
+    async def run_entry_stage(
+        self, prompt: OmniPromptType, sampling_params_list: Sequence[OmniSamplingParams], *, request_id: str
+    ) -> NextStageInputMessage | OutputMessage:
+        """Run the entry stage as its own request.
+
+        Returns the next stage's input, or the raw output if the entry stage is the final stage.
+        """
+        final_stage_id = self.num_stages - 1
+        # Each call returns one complete output, so we use FINAL_ONLY
+        sampling_params_list = coerce_param_message_types(list(sampling_params_list), is_streaming=False)
+        async with self._stage_request(request_id, stage_id=0) as req_state:
+            await self.engine.add_request_async(
+                request_id=req_state.request_id,
+                prompt=prompt,
+                sampling_params_list=sampling_params_list,
+                final_stage_id=final_stage_id,
+                final_output_stage_ids=[final_stage_id],
+                yield_stage_id=0 if final_stage_id > 0 else None,
+            )
+            return await self._stage_response(req_state)
+
+    async def run_downstream_stage(
+        self, stage_input: NextStageInputMessage, *, request_id: str
+    ) -> NextStageInputMessage | OutputMessage:
+        """Run the receiver stage of a next stage input as its own request."""
+        async with self._stage_request(request_id, stage_id=stage_input.receiver_stage_id) as req_state:
+            await self.engine.add_next_stage_input_async(
+                msgspec.structs.replace(stage_input, request_id=req_state.request_id)
+            )
+            return await self._stage_response(req_state)
+
+    @asynccontextmanager
+    async def _stage_request(
+        self, external_request_id: str, *, stage_id: int
+    ) -> AsyncGenerator[ClientRequestState, None]:
+        """Track one stage call; abort it if the caller is cancelled and always drop its state."""
+        request_id = f"{self._get_unique_request_id(external_request_id)}-{stage_id}"
+        req_state = ClientRequestState(request_id, external_request_id=external_request_id)
+        self.request_states[request_id] = req_state
+        self._final_output_handler()
+        try:
+            yield req_state
+        except asyncio.CancelledError:
+            with anyio.CancelScope(shield=True):
+                await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
+            raise
+        finally:
+            self.request_states.pop(request_id, None)
+
+    async def _stage_response(self, req_state: ClientRequestState) -> NextStageInputMessage | OutputMessage:
+        """Wait for a stage call's response: the next stage input, or the finished output.
+
+        A final stage that decodes emits an unfinished output per step; those are skipped.
+        """
+        # This is analogous to _process_orchestrator_results.
+        while True:
+            response = await req_state.queue.get()
+            if isinstance(response, ErrorMessage):
+                if response.fatal:
+                    raise OmniEngineDeadError(response.error, error_stage_id=response.stage_id)
+                self._raise_nonfatal_error_message(response)
+            if not isinstance(response, OutputMessage) or response.finished:
+                return response
+
+    def _route_engine_message(self, msg: Any) -> bool:
+        if not isinstance(msg, NextStageInputMessage):
+            return False
+        req_state = self.request_states.get(msg.request_id)
+        if req_state is not None:
+            req_state.queue.put_nowait(msg)
+        return True
 
     async def encode(
         self,
@@ -1531,7 +1619,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
-        return False
+        return self.engine.tracer_provider is not None
 
     async def notify_kv_transfer_request_rejected(
         self,

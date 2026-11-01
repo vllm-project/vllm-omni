@@ -155,20 +155,23 @@ def test_early_audio_preserves_decoded_media_and_timestamps(encode_audio_first) 
 
 
 def test_chunked_mp4_is_byte_identical_to_whole_mux() -> None:
+    # mbtree lookahead is not bit-stable across the pauses between chunks.
+    # threads=1 leaves mbtree enabled; AMD CI (Lavf 62) then mismatches.
+    video_codec_options = {"threads": "1", "mbtree": "0"}
     frames = _frames()
     baseline = mux_av_video_audio_bytes(
         (av.VideoFrame.from_ndarray(frame, format="rgb24") for frame in frames),
         width=24,
         height=16,
         fps=24,
-        video_codec_options={"threads": "1"},
+        video_codec_options=video_codec_options,
     )
     encoder = ChunkedMP4Encoder(
         width=24,
         height=16,
         fps=24,
         max_pending=2,
-        video_codec_options={"threads": "1"},
+        video_codec_options=video_codec_options,
     )
     for start in (0, 1, 5):
         stop = {0: 1, 1: 5, 5: len(frames)}[start]
@@ -185,7 +188,7 @@ def test_chunked_mp4_is_byte_identical_to_whole_mux() -> None:
         fps=24,
         audio_waveform=audio,
         audio_sample_rate=32000,
-        video_codec_options={"threads": "1"},
+        video_codec_options=video_codec_options,
         encode_audio_first=True,
     )
     encoder_audio = ChunkedMP4Encoder(
@@ -194,7 +197,7 @@ def test_chunked_mp4_is_byte_identical_to_whole_mux() -> None:
         fps=24,
         audio_waveform=audio,
         audio_sample_rate=32000,
-        video_codec_options={"threads": "1"},
+        video_codec_options=video_codec_options,
     )
     encoder_audio.push(frames)
     assert encoder_audio.finish() == baseline_audio

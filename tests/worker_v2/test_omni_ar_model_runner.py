@@ -148,7 +148,11 @@ def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, 
 
 
 @pytest.mark.parametrize("needs_history", [False, True])
-def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
+@pytest.mark.parametrize("include_hidden", [None, False, True])
+@pytest.mark.parametrize("engine_output_type", ["text", "latent"])
+def test_last_pp_rank_orchestration_and_kv_resolver(
+    monkeypatch, needs_history, include_hidden, engine_output_type
+) -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     input_batch = SimpleNamespace(req_ids=["req"], num_reqs=1, seq_lens=torch.tensor([3]))
     input_batch.idx_mapping, input_batch.query_start_loc = torch.tensor([0]), torch.tensor([0, 1])
@@ -164,7 +168,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
     runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
     runner.aux_output_connector = None
     runner.model_config = SimpleNamespace(async_chunk=False)
-    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="text"))
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type=engine_output_type))
     text_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
     runner.model_state = SimpleNamespace(postprocess_model_output=MagicMock(return_value=(text_hidden, None)))
     runner.model_state.intermediate_buffer = SimpleNamespace(buffers={0: {"global_request_id": "global-req"}})
@@ -188,6 +192,8 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
     runner.model = SimpleNamespace(
         compute_logits=lambda hidden: hidden, logitsprocs_need_output_token_ids=needs_history
     )
+    if include_hidden is not None:
+        runner.model.omni_pooler_payload_include_hidden = include_hidden
     runner.model.mrv2_sampling_context = sampling_context
     runner.sampler = None
     runner.sample = MagicMock(return_value=sampler_out)
@@ -210,7 +216,14 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
     monkeypatch.setattr(omni_ar_model_runner, "OmniAsyncOutput", MagicMock(return_value=mock_out))
 
     assert runner.sample_tokens(None) is mock_out
-    built = omni_ar_model_runner.OmniAsyncOutput.call_args.kwargs["model_runner_output"]
+    kwargs = omni_ar_model_runner.OmniAsyncOutput.call_args.kwargs
+    if engine_output_type != "text" and include_hidden is not False:
+        assert kwargs["text_hidden"] is text_hidden
+    else:
+        assert kwargs["text_hidden"] is None
+    # The output-only policy must never remove the hidden states used to sample.
+    assert runner.sample.call_args.args[0] is text_hidden
+    built = kwargs["model_runner_output"]
     assert built.kv_connector_output is connector_output
     torch.testing.assert_close(built.prompt_token_id_logprobs_dict["req"], torch.tensor([[2.0, 1.0], [4.0, 3.0]]))
     assert runner._resolve_global_request_id("req") == "global-req"  # from the intermediate buffer
@@ -346,6 +359,7 @@ def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> N
     assert client is None and torch.equal(inter_stage[0]["codes.audio"], req_codes[0])
 
 
+@pytest.mark.parametrize("include_hidden", [False, True])
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.parametrize(
     "hidden_padded,codes_padded",
@@ -354,7 +368,7 @@ def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> N
 )
 @pytest.mark.parametrize("lengths", [(1, 1, 1), (3, 1, 1)], ids=["decode", "mixed_prefill_decode"])
 def test_async_output_slices_request_payloads_with_graph_padding(
-    monkeypatch, mocker, async_chunk, hidden_padded, codes_padded, lengths
+    monkeypatch, mocker, async_chunk, hidden_padded, codes_padded, lengths, include_hidden
 ):
     """Sync and async transfers must exclude other requests and graph padding."""
     from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -384,7 +398,7 @@ def test_async_output_slices_request_payloads_with_graph_padding(
             torch.ones(len(lengths), dtype=torch.long),
             torch.zeros(len(lengths), dtype=torch.long),
         ),
-        text_hidden=hidden,
+        text_hidden=hidden if include_hidden else None,
         multimodal_outputs={"codes": {"audio": codes, "ref": refs}},
         input_batch=batch,
         async_chunk=async_chunk,
@@ -394,7 +408,11 @@ def test_async_output_slices_request_payloads_with_graph_padding(
         torch.testing.assert_close(payload["codes.audio"], codes[offsets[i] : offsets[i + 1]])
         torch.testing.assert_close(payload["codes.ref"], refs[i])
         if not async_chunk:
-            torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
+            assert output.pooler_output is not None
+            if include_hidden:
+                torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
+            else:
+                assert "hidden" not in payload
 
 
 def test_finalized_full_payload_latent_ledger_is_accumulated_once(monkeypatch):

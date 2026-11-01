@@ -51,6 +51,7 @@ def scheduler(request):
     sched._new_prompt_len_snapshot = {}
     sched._omits_kv_transfer_cache = {}
     sched._kv_wait_start_ts = {}
+    sched._outputs_awaiting_stage_payload = {}
     return sched
 
 

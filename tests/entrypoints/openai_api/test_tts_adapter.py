@@ -12,13 +12,13 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
-from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -309,9 +309,7 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
             wire_params = StageDiffusionClient._sampling_params_to_dict(sampling_params)
             self.request = OmniDiffusionRequest(
                 prompt=prompt,
-                sampling_params=StageDiffusionProc._reconstruct_sampling_params(
-                    object.__new__(StageDiffusionProc), wire_params
-                ),
+                sampling_params=OmniDiffusionSamplingParams.from_dict(wire_params),
                 request_id=request_id,
             )
 
@@ -339,6 +337,7 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
         stage_type="llm",
         final_output=False,
         get_kv_sender_info=lambda: None,
+        get_payload_sender_info=lambda: None,
     )
     diffusion_stage = RecordingDiffusionStage()
     orchestrator = object.__new__(Orchestrator)
@@ -1121,11 +1120,19 @@ def test_detects_ming3_by_architecture(architecture):
     assert detect_tts_model_type("llm", architecture) == "ming3_tts"
 
 
-def test_ming3_build_accepts_resolver_cache_key(mocker):
-    server = SimpleNamespace(_tts_tokenizer=object())
-    server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.1], 24000, "cache-key"))
+@pytest.mark.parametrize("cuda", [False, True])
+def test_ming3_build_accepts_resolver_cache_key(mocker, cuda):
+    mocker.patch.object(ming3_tts_module.current_platform, "is_cuda", return_value=cuda)
+    server = SimpleNamespace(
+        _tts_tokenizer=object(),
+        engine_client=SimpleNamespace(model_config=SimpleNamespace(model="/model")),
+    )
+    samples = np.array([0.1, 0.2], dtype=np.float32)
+    server._resolve_ref_audio_array = mocker.AsyncMock(return_value=(samples, 24000, "cache-key"))
     server._get_resolved_ref_audio_artifact_key = mocker.Mock(return_value="artifact-key")
-    mocker.patch.object(
+    embedding = torch.ones(1, 192)
+    extract = mocker.patch.object(ming3_tts_module, "_extract_speaker_embeddings", return_value=embedding)
+    build_prompt = mocker.patch.object(
         ming3_tts_module,
         "build_ming3_prompt",
         return_value={
@@ -1144,10 +1151,72 @@ def test_ming3_build_accepts_resolver_cache_key(mocker):
 
     prepared = asyncio.run(Ming3TTSAdapter(SpeechServingContext(server=server)).build(request, [], False))
 
-    server._resolve_ref_audio.assert_awaited_once_with(request.ref_audio)
+    server._resolve_ref_audio_array.assert_awaited_once_with(request.ref_audio)
     server._get_resolved_ref_audio_artifact_key.assert_called_once_with("cache-key")
+    # The cached array is copied, never aliased.
+    [waveform] = build_prompt.call_args.kwargs["reference_waveform"]
+    assert waveform.tolist() == [samples.tolist()] and waveform.data_ptr() != samples.ctypes.data
     assert prepared.prompt["additional_information"]["speaker_audio_keys"] == ["artifact-key"]
     assert prepared.model_type == "ming3_tts"
+    if cuda:
+        # Stage 0 embeds the reference clip on the GPU.
+        extract.assert_not_called()
+        assert build_prompt.call_args.kwargs["speaker_embedding"] is None
+        return
+    # Without CUDA, CAM++ runs in the API process; Stage 0 receives the embedding directly.
+    assert extract.call_args.args[1] == [waveform]
+    assert extract.call_args.args[0] == "/model"
+    assert extract.call_args.args[2:] == ([24000], ["artifact-key"])
+    assert build_prompt.call_args.kwargs["speaker_embedding"] is embedding
+
+
+def test_ming3_api_speaker_embeddings_reuse_artifact_keys(mocker):
+    extractor = mocker.Mock()
+    extractor.extract_from_waveform.side_effect = lambda waveform, rate: torch.full((192,), float(rate))
+    factory = mocker.patch(
+        "vllm_omni.model_executor.models.common.ming.speaker_extractor.SpeakerEmbeddingExtractor",
+        return_value=extractor,
+    )
+    mocker.patch.dict(ming3_tts_module._speaker_extractors, clear=True)
+    mocker.patch.dict(ming3_tts_module._speaker_embeddings, clear=True)
+    waveform = torch.zeros(1, 8)
+
+    first = ming3_tts_module._extract_speaker_embeddings("/model", [waveform, waveform], [16000, 24000], ["a", None])
+    second = ming3_tts_module._extract_speaker_embeddings("/model", [waveform], [16000], ["a"])
+
+    assert first.shape == (2, 192)
+    assert torch.equal(second[0], first[0])
+    assert factory.call_count == 1
+    # The keyed clip is extracted once; the unkeyed clip is never cached.
+    assert extractor.extract_from_waveform.call_count == 2
+
+
+def test_ming3_warmup_loads_tokenizer_and_speaker_extractor(mocker):
+    is_cuda = mocker.patch.object(ming3_tts_module.current_platform, "is_cuda", return_value=False)
+    server = SimpleNamespace(
+        _tts_tokenizer=None,
+        engine_client=SimpleNamespace(model_config=SimpleNamespace(model="/model", trust_remote_code=False)),
+    )
+    tokenizer = object()
+    load = mocker.patch.object(ming3_tts_module.AutoTokenizer, "from_pretrained", return_value=tokenizer)
+    extract = mocker.patch.object(ming3_tts_module, "_extract_speaker_embeddings")
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
+
+    asyncio.run(adapter.warmup())
+
+    assert server._tts_tokenizer is tokenizer
+    assert adapter._tokenizer() is tokenizer and load.call_count == 1
+    assert extract.call_args.args[0] == "/model" and extract.call_args.args[2:] == ([16000], [None])
+
+    # A missing CAM++ asset leaves extraction to the requests.
+    extract.side_effect = RuntimeError("missing campplus.onnx")
+    asyncio.run(adapter.warmup())
+
+    # On CUDA the API process does not run CAM++.
+    is_cuda.return_value = True
+    extract.reset_mock()
+    asyncio.run(adapter.warmup())
+    extract.assert_not_called()
 
 
 def test_ming3_sampling_overrides_attach_request_rng_state(mocker):
