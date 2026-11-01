@@ -173,7 +173,12 @@ def _load_lazy_families() -> None:
 
 
 def register_family(family: WanVaeFamily) -> None:
-    """Make ``family`` eligible for the fast path. Re-registering a family name replaces it."""
+    """Make ``family`` eligible for the fast path. Re-registering a family name replaces it.
+
+    The built-in families load first, so a family registered before first use is newer than them and wins for
+    its classes (and replaces a built-in of the same name).
+    """
+    _load_lazy_families()
     _FAMILIES[:] = [f for f in _FAMILIES if f.name != family.name] + [family]
     _role_types.cache_clear()
 
