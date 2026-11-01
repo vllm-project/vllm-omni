@@ -248,7 +248,9 @@ class ARDiffusionCellContext:
     def drop(self, req: str) -> None:
         self.inflight = [item for item in self.inflight if item.req != req]
         self.pending = [item for item in self.pending if item.req != req]
-        self.kv.end_request(req)
+        # Drop is the failure and teardown path: whatever chunk did not finish
+        # must not advance the session's continuation offset.
+        self.kv.end_request(req, committed=False)
         self.kv.set_inflight(tuple(self.inflight))
 
     def admit_pending(self, slot: int) -> None:

@@ -253,7 +253,7 @@ def test_second_request_continues_from_session_history():
 
     assert first.seq_lens[(0, 0, 0)] == 4
     assert session.committed_chunks == 2
-    assert {chunk for chunk, _block in session.retained} == {1}
+    assert {chunk for chunk, _step, _block in session.retained} == {1}
 
     second = _run_request(state, session, "B", chunk_start=session.committed_chunks)
 
@@ -262,7 +262,7 @@ def test_second_request_continues_from_session_history():
     assert second.seq_lens[(0, 0, 0)] == 8
     assert session.committed_chunks == 4
     # Retention is bounded by H=1, so only the newest committed chunk survives.
-    assert {chunk for chunk, _block in session.retained} == {3}
+    assert {chunk for chunk, _step, _block in session.retained} == {3}
 
 
 def test_retained_history_is_released_when_the_cache_is_reset():
@@ -315,28 +315,9 @@ def test_session_retention_is_reserved_on_top_of_the_live_window():
     assert plain.capacity == 4
 
 
-@pytest.mark.parametrize(
-    ("ordering", "num_denoise_steps", "step_replicas"),
-    [
-        (Ordering.SELF_FORCING, 1, 1),
-        pytest.param(
-            Ordering.SAME_STEP,
-            2,
-            2,
-            marks=pytest.mark.xfail(
-                reason="Same-Step reads one version per denoise step; multi-version retention is not implemented"
-            ),
-        ),
-        pytest.param(
-            Ordering.LATEST_KV,
-            2,
-            3,
-            marks=pytest.mark.xfail(
-                reason="Latest-KV keeps one version per replica; cross-rank retention is not implemented"
-            ),
-        ),
-    ],
-)
+# Same-Step and Latest-KV keep their history on other replicas, so they are
+# covered where the ranks exist: tests/diffusion/ar_diffusion/test_noisy_session_history.py.
+@pytest.mark.parametrize(("ordering", "num_denoise_steps", "step_replicas"), [(Ordering.SELF_FORCING, 1, 1)])
 def test_every_ordering_retains_the_version_the_next_request_reads(ordering, num_denoise_steps, step_replicas):
     """Retain the version each ordering actually reads as history.
 
@@ -465,3 +446,133 @@ def test_rekey_refuses_to_overwrite_a_live_version():
         pool.rekey(("r", 0, 0, 0), ("r", 1, 0, 0))
 
     assert pool.slot_of(("r", 1, 0, 0)) == live
+
+
+def _plan_for(ordering: Ordering, *, chunks: int, steps: int, replicas: int, history: int):
+    return build_cell_plan(
+        CellSchedule(
+            chunks=chunks,
+            num_denoise_steps=steps,
+            step_replicas=replicas,
+            layer_groups=1,
+            ordering=ordering,
+            kv_history_chunks=history,
+        )
+    )
+
+
+class _OffsetRecorder(CellAdapter):
+    """Records the session offset each cell sees, and can fail a given chunk."""
+
+    def __init__(self, session, fail_chunk: int | None = None) -> None:
+        self.session = session
+        self.fail_chunk = fail_chunk
+        self.seen: list[tuple[int, int]] = []
+
+    def forward(self, tasks, kv_contexts, *, hidden):
+        del hidden
+        for (_req, cell), ctx_list in zip(tasks, kv_contexts):
+            chunk = cell[0]
+            self.seen.append((chunk, self.session.committed_chunks))
+            if self.fail_chunk is not None and chunk >= self.fail_chunk:
+                raise RuntimeError("cell forward failed")
+            view = ctx_list[0] if isinstance(ctx_list, list) else ctx_list
+            slot = view.video_slots.long()
+            view.key_pool[slot] = torch.ones(1, 1, 1)
+            view.value_pool[slot] = torch.ones(1, 1, 1)
+        return torch.zeros(1, 4, 8)
+
+    def pack_activation(self, output):
+        return {"hidden_states": output}
+
+    def unpack_activation(self, payload):
+        return payload["hidden_states"]
+
+
+def test_the_session_keeps_a_version_its_own_consumers_already_used():
+    """Eviction's third condition: the session still wants the version.
+
+    The clean version of a chunk is read by the next chunk in this same request,
+    so its last-use passes while the request is still running. Releasing it then
+    is what made the continuation cold; the session's claim has to outrank it.
+    """
+    cache = _cache()
+    state = NoisyKVState(cache)
+    session = NoisyKVSession(session_id="s1")
+
+    _run_request(state, session, "A", chunk_start=0)
+
+    owner = "__noisy_session__::s1"
+    assert cache.pool.has((owner, 1, 1, 0)), "the chunk the next request reads was released"
+
+
+def test_a_version_with_an_outstanding_receive_is_not_released_first():
+    """Eviction's first condition: compute and communication both finished."""
+    cache = _cache()
+    state = NoisyKVState(cache)
+    plan = _plan_for(Ordering.SELF_FORCING, chunks=1, steps=1, replicas=1, history=1)
+    state.begin_request("A", plan, chunk_tokens=4)
+    key = ("A", 0, 0, 0)
+    cache.pool.alloc(key)
+    waited: list[int] = []
+    cache.transport._pending_recv[key] = ([SimpleNamespace(wait=lambda: waited.append(1))], None, 7)
+
+    state.end_request("A")
+
+    assert waited == [1], "the receive was still in flight when the slot was released"
+    assert not cache.pool.has(key)
+    assert cache.transport.bytes_received == 7
+
+
+def test_a_commit_after_a_reset_is_refused():
+    """The offset moves through the fenced API, so a stale commit cannot land."""
+    cache = _cache()
+    state = NoisyKVState(cache)
+    session = NoisyKVSession(session_id="s1")
+    plan = _plan_for(Ordering.SELF_FORCING, chunks=2, steps=1, replicas=1, history=1)
+    state.begin_request("A", plan, chunk_tokens=4, session=session, chunk_start=0)
+
+    session.reset()
+
+    with pytest.raises(NoisySessionError):
+        state.end_request("A")
+
+
+def test_the_offset_advances_per_chunk_and_stops_at_the_last_finished_one():
+    """A chunk is handed over when it finishes, not when the request does."""
+    cache = _cache()
+    state = NoisyKVState(cache)
+    session = NoisyKVSession(session_id="s1")
+    plan = _plan_for(Ordering.SELF_FORCING, chunks=2, steps=1, replicas=1, history=1)
+    ctx = ARDiffusionCellContext(
+        spec=CellRunSpec(topology=CellTopology(step_replicas=1, layer_groups=1), rank=0),
+        kv=state,
+        chunk_start=0,
+        session=session,
+    )
+    assert ctx.admit("A", plan, chunk_tokens=4, slot=0)
+
+    recorder = _OffsetRecorder(session)
+    run_cell_pipeline(ctx=ctx, adapter=recorder)
+
+    # Chunk 0's cells run before the offset moves; chunk 1's cells see it moved.
+    assert recorder.seen[0] == (0, 0)
+    assert (1, 1) in recorder.seen
+    assert session.committed_chunks == 2
+
+    failing = NoisyKVSession(session_id="s2")
+    cache2 = _cache()
+    state2 = NoisyKVState(cache2)
+    ctx2 = ARDiffusionCellContext(
+        spec=CellRunSpec(topology=CellTopology(step_replicas=1, layer_groups=1), rank=0),
+        kv=state2,
+        chunk_start=0,
+        session=failing,
+    )
+    assert ctx2.admit("B", plan, chunk_tokens=4, slot=0)
+
+    with pytest.raises(RuntimeError, match="cell forward failed"):
+        run_cell_pipeline(ctx=ctx2, adapter=_OffsetRecorder(failing, fail_chunk=1))
+
+    # The finished chunk stays committed; the failed one does not.
+    assert failing.committed_chunks == 1

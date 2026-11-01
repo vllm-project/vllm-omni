@@ -51,7 +51,8 @@ class NoisyKVSession:
     state: NoisySessionState = NoisySessionState.ACTIVE
     committed_chunks: int = 0
     generation: int = 0
-    retained: dict[tuple[int, int], object] = field(default_factory=dict)
+    # Absolute chunk, step, block → the pool key holding that version.
+    retained: dict[tuple[int, int, int], object] = field(default_factory=dict)
 
     def admit(self) -> int:
         """Return the generation this request must present when committing."""

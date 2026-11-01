@@ -233,7 +233,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             blocks_per_rank=blocks_per_rank,
             # Sessions keep their retained window resident while the next request
             # runs, so that quota is reserved on top of the live one.
-            session_retention_chunks=self._noisy_sessions.capacity * spec.max_history_chunks,
+            session_retention_chunks=self._noisy_sessions.capacity * spec.history_versions,
         )
         # The registry knows session identities; the pool owns their slots, so
         # dropping a session has to go through the cache to hand them back.

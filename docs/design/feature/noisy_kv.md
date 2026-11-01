@@ -210,19 +210,20 @@ implementation, expressed on the operations rather than on the data layout:
 | Validity | A version is consumable only after its producing cell completed on an earlier tick and, when remote, after `await_ready`. |
 | Completion | A returned `forward` is not proof that K/V writes and transfers are visible; that boundary belongs to the transport completion contract (#9368). |
 | Dependency | `CellPlan.sources` / `transfers` / `last_use` decide who still reads a version. |
-| Reclamation | `evict` releases a version only after its last planned use and after any send referencing it completed. |
+| Reclamation | `evict` releases a version only when all three hold: its last planned use passed, its transfers completed, and no session retains it. |
 | Failure | Cancellation and exceptions release exactly the failed request's versions, leaving unrelated resident requests intact. |
 
 Per-tick KV traffic ≈ history depth × one block × tokens × heads × dim per
 remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`.
 
-### Session integration (P1 target contract)
+### Session integration (P1, implemented for CausVid)
 
-> Status: target contract for the P1 integration. Not implemented yet; the
-> current cell path is request-scoped and releases everything it produced.
+> Status: implemented. `NoisyKVSession` and `NoisyKVSessionRegistry` own the
+> lifecycle, `NoisyKVState` performs the per-chunk hand-over, and the runner
+> binds one session per request.
 
-**Ownership.** A session owns the history that later requests must continue from.
-A request owns the versions it produces for its own plan plus any temporary
+**Ownership.** A session owns the history that later requests continue from. A
+request owns the versions it produces for its own plan plus any temporary
 scratch. Both live in the same `VersionPool`; ownership decides what survives
 request termination, not where the bytes sit.
 
@@ -231,35 +232,51 @@ starts at `chunk_offset = committed_chunks`. Cell coordinates stay
 request-local, while the session records absolute chunk positions, so
 `chunk_history_chunks` never reaches back into chunks the session already owns.
 
-**Retention set.** The versions a session keeps after a request are exactly
-those a later request can be planned to read:
+**Retention set.** A chunk's versions are handed to the session when the chunk
+finishes -- preparing the next chunk is the hand-over point -- so the set is
+exactly what a later request reads:
 
-| Kept | Dropped at request end |
+| Ordering | Versions kept per retained chunk |
 | --- | --- |
-| The last committed clean (or Same-Step step) version per block, per retained chunk | Versions whose `last_use` fell inside this request |
-| Up to `H` most recent retained chunks plus any sink chunk | In-flight receive buffers and staging |
-| Model-declared state the pipeline commits (conditioning, latent, decoder) | Per-request scratch slots |
+| Self-Forcing, Latest-KV | The clean KV (`num_schedule_steps - 1`), the highest step a consumer reads |
+| Same-Step | One version per denoise step, because a consumer reads the matching step, plus chunk 0's clean sink for the life of the session |
 
-Retention is bounded by the same `H` / sink policy the plan already uses, so a
-session can never keep more history than a single request could consume.
+The window is the last `H` committed chunks; Same-Step additionally keeps chunk
+0. Versions are re-keyed to the session owner rather than copied, so the stored
+bytes are the same bytes.
+
+**Reclamation (three conditions).** A version is released only when all three
+hold: the current compute and its transfers finished, no later cell in the plan
+reads it (`last_use`), and the session no longer requires it (the window moved
+past it, or the session ended). The session's claim is what the `evict` guard
+enforces. Without it, a chunk whose only in-request consumer already ran is
+released before the hand-over and the continuation silently runs cold.
+
+**Commit boundary.** The continuation offset advances per finished chunk through
+`commit_chunks(..., generation=...)`. A commit whose generation is stale -- the
+session was reset or invalidated in between -- is refused, and a chunk that did
+not finish never advances the offset, so a failed request leaves the session at
+the last chunk that completed.
+
+**Cross-rank history.** History stays where it was produced. Before the first
+cell of a continuation, `begin_request` copies the versions this rank reads from
+their owner ranks (`NoisyKVTransport.exchange_history`), so a vertical topology
+continues from real history instead of a locally empty set. Missing history
+raises; it never degrades into a cold start.
 
 **State machine.** `ACTIVE` admits requests. A successful request commits its
-retention set and returns to `ACTIVE`. `reset` discards the retention set and
-returns to `ACTIVE` with `chunk_offset = 0`. `close` moves to `CLOSING`, waits
-for compute and transfers belonging to the session to finish, releases slots and
-model-owned state, then `CLOSED`. Cleanup failure leaves `CLEANUP_FAILED` and
-rejects reset, matching the realtime session tombstone.
+retention set and returns to `ACTIVE`. `reset` releases the retention set and
+returns to `ACTIVE` with `chunk_offset = 0`. `close` releases the retention set
+and moves to `CLOSED`. Both are applied between requests, so no compute is
+outstanding when they run. A failed request leaves the session `INVALID`:
+further requests are rejected until an explicit reset, and late results are
+fenced by the generation and the request identity.
 
-**Failure policy.** A failed request, an asynchronous device error, or a broken
-transport leaves the retention set in an unknown state, so the session becomes
-`INVALID`: further requests are rejected until an explicit reset. Late results
-from the failed request are fenced by the request identity and must not update
-session state.
-
-**Completion boundary.** A version may enter the retention set only after its
-producer's completion is established under the transport contract above; a
-returned `forward` is not sufficient evidence.
-
+**Not implemented yet (target contract).** Model-declared state beyond KV --
+conditioning, latent and VAE decoder state -- is not retained across requests;
+each request recomputes it. The retention window is a worker-side quota sized at
+startup, not a per-request reservation from the scheduler, and over-quota demand
+fails instead of returning to the admission queue.
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
@@ -351,14 +368,21 @@ regression beyond 2% in chunk cadence, interaction latency or peak memory.
 | Session: reset mid-sequence | CPU | no read of pre-reset history; offset returns to 0 |
 | Session: close then request | CPU | rejected, no silent recreation |
 | Session: failed request | CPU | session `INVALID`; further requests rejected until reset |
+| Session: the session's version outlives its last-use | CPU | the chunk a later request reads is still resident |
+| Session: outstanding receive | CPU | the slot is not released before the receive completes |
+| Session: stale commit | CPU | a commit after a reset raises instead of moving the offset |
+| Session: per-chunk commit | CPU | the offset advances per finished chunk; a failed chunk does not advance it |
+| Session history across ranks | CPU (gloo, 2 and 3 ranks) | a continuation reads the values its history holds, for Same-Step and Latest-KV |
 | Cancel between pieces | CPU | owned versions released; unrelated resident requests intact |
 | Self-Forcing `S=1` smoke | 2 GPU | finite latents, chunk count and order correct |
 | Latest-KV `S=D+1` smoke | 4 GPU | same, plus a cross-rank history read |
-| Baseline parity | GPU | frame-wise match; no metric beyond the 2% budget |
+| Continuation is real | 2 and 4 GPU | two cold runs are bit-identical and the continuation differs from cold |
+| Baseline parity | GPU | the cold path is unchanged against the recorded baseline md5 |
 
-GPU rows stay recorded as unvalidated until a slot is available. A CPU pass must
-not be reported as distributed-execution or output-quality evidence.
-
+The CPU rows run in `tests/diffusion/ar_diffusion`; the GPU rows are the
+`CausVid` recipe runs whose commands and md5s are recorded in the pull request's
+Test Result. A CPU pass is not distributed-execution or output-quality evidence,
+and the GPU rows are not a substitute for the CPU lifecycle cases.
 ## Related
 
 - [Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)
