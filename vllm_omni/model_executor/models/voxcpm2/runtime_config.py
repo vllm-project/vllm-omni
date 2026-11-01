@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any
 
 from vllm.logger import init_logger
@@ -13,6 +14,7 @@ logger = init_logger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class _VoxCPM2RuntimeConfig:
+    startup_lora_path: str | None = None
     enable_profiling: bool = False
     enable_nvtx_profile: bool = False
     enable_loc_dit_layer_nvtx: bool = False
@@ -23,6 +25,8 @@ class _VoxCPM2RuntimeConfig:
     enable_loc_dit_skip_qkv_contig: bool = True
     enable_loc_dit_reduce_overhead_no_cg: bool = False
     enable_loc_dit_fullgraph_no_cg: bool = False
+    inference_timesteps: int = 10
+    cfg_value: float = 2.0
     cfg_cutoff_ratio: float = 1.0
     decode_graph_capture_policy: str = "all"
     enable_vae_cuda_graph: bool = False
@@ -105,16 +109,24 @@ class _VoxCPM2RuntimeConfig:
 
     @staticmethod
     def _coerce_value(key: str, value: Any, default: Any) -> Any:
+        if key == "startup_lora_path":
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError("VoxCPM2 startup_lora_path must be a non-empty local directory path or null")
+            return value
         if isinstance(default, bool):
             if isinstance(value, str):
                 return value.strip().lower() in ("1", "true", "yes", "on")
             return bool(value)
         if isinstance(default, int) and not isinstance(default, bool):
             value = int(value)
+            if key == "inference_timesteps":
+                return max(2, value)
             if key in {"audio_emit_every", "vae_decode_every", "batched_fsq_fusion_max_batch"}:
                 return max(1, value)
             return value
         if isinstance(default, float):
+            if key == "cfg_value" and not math.isfinite(float(value)):
+                raise ValueError("VoxCPM2 cfg_value must be finite.")
             if key == "cfg_cutoff_ratio":
                 return min(1.0, max(0.0, float(value)))
             return float(value)

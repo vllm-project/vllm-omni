@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Integration coverage for the shared task examples' ``_apply_ar_stage_inputs``.
 
 The unit tests in ``test_model_extras.py`` cover ``get_ar_input_builder`` and
@@ -25,6 +25,7 @@ import importlib.util
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,6 +35,96 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("with_ar_stage", [False, True])
+def test_text_to_image_only_builds_ar_inputs_for_ar_deployments(monkeypatch, tmp_path, with_ar_stage):
+    from PIL import Image
+    from vllm import SamplingParams
+
+    from vllm_omni.config.omni_config import normalize_and_validate_diffusion_engine_ingress_kwargs
+
+    module = _load_module("_shared_text_to_image_deploy", "examples/offline_inference/text_to_image/text_to_image.py")
+    tokenizer_calls = _patch_tokenizer_loader(monkeypatch, module)
+    monkeypatch.setattr(module, "get_ar_tokenizer_validator", lambda _: None)
+    monkeypatch.setattr(
+        module, "current_omni_platform", SimpleNamespace(device_type="cpu", pre_register_and_update=lambda parser: None)
+    )
+    monkeypatch.setattr(module, "is_nextstep_model", lambda _: False)
+    monkeypatch.setattr(module, "get_model_class_name", lambda _: "HunyuanImage3ForCausalMM")
+    defaults = [OmniDiffusionSamplingParams()]
+    if with_ar_stage:
+        defaults.insert(0, SamplingParams())
+    captured: dict[str, Any] = {}
+
+    def generate(prompt, *, sampling_params_list):
+        captured.update(prompt=prompt, params=sampling_params_list)
+        return [SimpleNamespace(images=[Image.new("RGB", (8, 8))])]
+
+    def create_omni(**kwargs):
+        # Exercise the real ingress validator so stale example-only options
+        # cannot silently pass this test while breaking model initialization.
+        normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
+        return SimpleNamespace(default_sampling_params_list=defaults, generate=generate)
+
+    monkeypatch.setattr(module, "Omni", create_omni)
+    output = tmp_path / "output.png"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "text_to_image.py",
+            "--model",
+            "test-hunyuan",
+            "--prompt",
+            "A dog",
+            "--output",
+            str(output),
+            "--extra-body",
+            '{"bot_task": null}' if with_ar_stage else '{"bot_task": "none"}',
+            "--trust-remote-code",
+        ],
+    )
+    module.main()
+
+    assert output.is_file()
+    assert bool(tokenizer_calls) == with_ar_stage
+    assert ("prompt_token_ids" in captured["prompt"]) == with_ar_stage
+    if with_ar_stage:
+        assert captured["params"][0].stop_token_ids
+    else:
+        assert captured["prompt"] == {"prompt": "A dog", "modalities": ["image"]}
+        assert captured["params"][0].extra_args["bot_task"] == "none"
+
+
+def test_hunyuan_accuracy_offline_cli_contract(monkeypatch, tmp_path):
+    import subprocess
+
+    from PIL import Image
+
+    accuracy = _load_module("_hunyuan_accuracy", "tests/e2e/accuracy/test_hunyuan_image3_pixel_accuracy.py")
+    module = _load_module("_hunyuan_accuracy_cli", "examples/offline_inference/text_to_image/text_to_image.py")
+    output = tmp_path / "offline.png"
+
+    def run(argv, *, check):
+        assert check
+        assert Path(argv[1]).is_file()
+        monkeypatch.setattr(sys, "argv", argv[1:])
+        args = module.parse_args()
+        assert args.enable_expert_parallel
+        assert args.extra_body == {"bot_task": "none"}
+        assert args.use_system_prompt == "en_unified"
+        assert args.trust_remote_code
+        assert args.seed == accuracy.SEED
+        assert args.num_inference_steps == accuracy.NUM_INFERENCE_STEPS
+        assert args.output == str(output)
+        Image.new("RGB", (8, 8)).save(args.output)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    image = accuracy._run_vllm_omni_hunyuan_image3_offline(
+        model="test-hunyuan", deploy_config="deploy.yaml", output_path=output
+    )
+    assert image.size == (8, 8)
 
 
 def _load_module(name: str, relpath: str):
@@ -75,9 +166,7 @@ def _patch_tokenizer_loader(monkeypatch: pytest.MonkeyPatch, module: Any) -> lis
             calls.append({"model": model, "trust_remote_code": trust_remote_code})
             return _FakeHunyuanTokenizer()
 
-    fake_transformers = type(sys)("transformers")
-    fake_transformers.AutoTokenizer = _FakeAutoTokenizer
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", _FakeAutoTokenizer.from_pretrained)
     return calls
 
 
@@ -90,9 +179,7 @@ def _patch_failing_tokenizer_loader(monkeypatch: pytest.MonkeyPatch) -> None:
         def from_pretrained(model: str, trust_remote_code: bool = False) -> Any:
             raise OSError("simulated tokenizer load failure")
 
-    fake_transformers = type(sys)("transformers")
-    fake_transformers.AutoTokenizer = _FailingAutoTokenizer
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", _FailingAutoTokenizer.from_pretrained)
 
 
 @pytest.mark.parametrize(

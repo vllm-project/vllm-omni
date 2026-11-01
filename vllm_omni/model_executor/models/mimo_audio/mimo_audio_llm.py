@@ -396,25 +396,21 @@ class MimoAudioDummyInputsBuilder(BaseDummyInputsBuilder[MimoAudioProcessingInfo
 
 
 class MimoAudioMultiModalProcessor(BaseMultiModalProcessor[MimoAudioProcessingInfo]):
-    def _preprocess_hf_mm_data(
+    def _get_hf_mm_inputs(
         self,
-        mm_data: Mapping[str, object],
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-        mm_data, hf_processor_mm_kwargs = super()._preprocess_hf_mm_data(
-            mm_data,
-            hf_processor_mm_kwargs,
-        )
-        mm_data = dict(mm_data)
-        audios = mm_data.pop("audios", [])
-        if audios:
-            mm_data["audio"] = audios
-            feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
-            hf_processor_mm_kwargs = {
-                **hf_processor_mm_kwargs,
-                "sampling_rate": feature_extractor.sampling_rate,
-            }
-        return mm_data, hf_processor_mm_kwargs
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
+    ):
+        hf_inputs = super()._get_hf_mm_inputs(mm_items, hf_kwargs)
+        if hf_inputs.hf_data.get("audio"):
+            feature_extractor = self.info.get_feature_extractor(**hf_kwargs)
+            hf_inputs = hf_inputs._replace(
+                hf_kwargs={
+                    **hf_kwargs,
+                    "sampling_rate": feature_extractor.sampling_rate,
+                },
+            )
+        return hf_inputs
 
     def _get_mm_fields_config(
         self,

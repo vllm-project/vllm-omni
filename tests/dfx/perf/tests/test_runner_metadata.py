@@ -205,15 +205,132 @@ def test_is_diffusion_perf_config():
     from tests.dfx.conftest import is_diffusion_perf_config
 
     assert not is_diffusion_perf_config(
-        {"test_name": "omni_a", "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "omni"]}
+        {
+            "test_name": "omni_a",
+            "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "omni"],
+            "benchmark_params": [{"dataset_name": "random", "endpoint": "/v1/chat/completions"}],
+        }
     )
     assert is_diffusion_perf_config(
         {
             "test_name": "diff_a",
             "server_type": "vllm-omni",
             "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "diffusion"],
+            "benchmark_params": [{"task": "t2i", "dataset": "random"}],
         }
     )
+    videos_cfg = {
+        "test_name": "diff_videos",
+        "server_type": "vllm-omni",
+        "mark": [{"hardware_marks": {"res": {"cuda": "H100"}}}, "diffusion"],
+        "benchmark_params": [{"task": "t2v", "dataset_name": "random", "endpoint": "/v1/videos"}],
+    }
+    assert not is_diffusion_perf_config(videos_cfg)
+    custom_edits_cfg = {
+        "test_name": "diff_custom_edits",
+        "server_type": "vllm-omni",
+        "benchmark_endpoint": "/v1/images/edits",
+        "benchmark_params": [{"dataset": "custom", "task": "ti2i"}],
+    }
+    assert is_diffusion_perf_config(custom_edits_cfg)
+
+
+def test_buildkite_perf_steps_use_matching_runner_schema():
+    """Every Buildkite step must run a perf JSON with the runner matching its schema.
+
+    Regression for #8074: the NPU nightly HunyuanVideo-1.5 step kept invoking
+    ``run_diffusion_benchmark.py`` after the JSON was migrated to the omni-bench
+    schema (#7737). The runner skipped every case as omni-bench, pytest selected
+    0 tests and the step failed with exit 5.
+    """
+    import json
+    import re
+    from pathlib import Path
+
+    from tests.dfx.conftest import is_diffusion_perf_config
+
+    repo_root = Path(__file__).resolve().parents[4]
+    step_re = re.compile(
+        r"tests/dfx/perf/scripts/(?P<runner>run_diffusion_benchmark|run_benchmark)\.py"
+        r".*?--test-config-file(?:=|\s+)(?P<file>\S+\.json)"
+    )
+    pipelines = sorted(repo_root.glob(".buildkite/**/*.yml")) + sorted(repo_root.glob(".buildkite/**/*.yaml"))
+    assert pipelines, "no Buildkite pipelines found"
+
+    invocations = 0
+    for pipeline in pipelines:
+        for match in step_re.finditer(pipeline.read_text(encoding="utf-8")):
+            invocations += 1
+            config_rel = match.group("file")
+            config_path = repo_root / config_rel
+            assert config_path.exists(), f"{pipeline}: perf config not found: {config_rel}"
+            runner_is_diffusion = match.group("runner") == "run_diffusion_benchmark"
+            cases = json.loads(config_path.read_text(encoding="utf-8"))
+            mismatched = [cfg["test_name"] for cfg in cases if is_diffusion_perf_config(cfg) != runner_is_diffusion]
+            assert not mismatched, (
+                f"{pipeline}: {match.group('runner')} runs {config_rel}, but case(s) {mismatched} "
+                f"are not {'diffusion' if runner_is_diffusion else 'omni-bench'}-schema; the runner "
+                "would skip them and pytest may select 0 tests (exit 5), see issue #8074"
+            )
+
+    assert invocations, "no perf runner invocations found; the scan regex or pipeline layout changed"
+
+    # Pin the issue #8074 scenario itself: the migrated HunyuanVideo-1.5 t2v JSON
+    # is omni-bench schema and must never go back to run_diffusion_benchmark.py.
+    t2v_json = repo_root / "tests" / "dfx" / "perf" / "tests" / "test_hunyuanvideo15_t2v_vllm_omni.json"
+    t2v_cases = json.loads(t2v_json.read_text(encoding="utf-8"))
+    assert t2v_cases and all(not is_diffusion_perf_config(cfg) for cfg in t2v_cases)
+
+
+def test_merge_omni_default_server_args_respects_json():
+    from tests.dfx.perf.scripts.run_benchmark import _merge_omni_default_server_args
+
+    extra = ("--stage-init-timeout", "1800", "--init-timeout", "1800", "--usp", "4")
+    assert _merge_omni_default_server_args(extra, use_omni=True) == []
+    assert _merge_omni_default_server_args((), use_omni=True) == [
+        "--stage-init-timeout",
+        "600",
+        "--init-timeout",
+        "900",
+    ]
+    assert _merge_omni_default_server_args((), use_omni=False) == []
+    # Only fill the missing default; keep JSON's other timeouts.
+    assert _merge_omni_default_server_args(("--stage-init-timeout=1800",), use_omni=True) == [
+        "--init-timeout",
+        "900",
+    ]
+
+
+def test_prefix_benchmark_uses_unified_runner(monkeypatch):
+    from pathlib import Path
+
+    from tests.dfx.conftest import is_diffusion_perf_config, load_benchmark_configs
+    from tests.dfx.perf.scripts import run_benchmark
+
+    configs = load_benchmark_configs(str(Path(__file__).with_name("test_hunyuan_image3_prefix_caching.json")))
+    assert len(configs) == 3
+    assert all(not is_diffusion_perf_config(config) for config in configs)
+    assert all(config["benchmark_params"] == configs[0]["benchmark_params"] for config in configs)
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", configs)
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        assert "--name" not in kwargs["args"]
+        assert "--warmup-dataset-path" not in kwargs["args"]
+        assert "tests/assets/hunyuan_image3/it2i.jsonl" in kwargs["args"]
+        assert kwargs["num_warmups"] == 2
+        return {"completed": 8}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    for config in configs:
+        for params in config["benchmark_params"]:
+            run_benchmark.test_performance_benchmark(
+                SimpleNamespace(host="localhost", port=8000, model="test-model"),
+                {"test_name": config["test_name"], "params": params},
+            )
+    assert len(calls) == 3
 
 
 def test_benchmark_param_id_suffix_from_task_eval_phase():
@@ -303,12 +420,84 @@ def test_paired_omni_benchmark_reuses_server_and_preserves_case_metadata(tmp_pat
     finally:
         active_context.close()
 
-    assert events == [
-        ("start", omni_p0_server),
-        ("stop", omni_p0_server),
-        ("start", tts_server),
-        ("stop", tts_server),
-    ]
+
+def test_run_benchmark_persists_distinct_benchmark_params_name(tmp_path, monkeypatch):
+    """Two benchmark_params under one test_name must keep distinct saved identity."""
+    import io
+    from pathlib import Path
+
+    from tests.dfx import conftest as dfx_conftest
+
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(result_dir))
+
+    class _FakePopen:
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            result_dir_idx = command.index("--result-dir")
+            filename_idx = command.index("--result-filename")
+            out = Path(command[result_dir_idx + 1]) / command[filename_idx + 1]
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps({"completed": 3, "request_throughput": 0.01}), encoding="utf-8")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(dfx_conftest.subprocess, "Popen", _FakePopen)
+
+    shared_test = "test_wan22_i2v_usp2"
+    name_a = "832x480_frames81_steps4"
+    name_b = "1280x720_frames121_steps4"
+
+    result_a = dfx_conftest.run_benchmark(
+        args=["--host", "127.0.0.1", "--port", "8000"],
+        test_name=shared_test,
+        flow=1,
+        dataset_name="random-mm",
+        num_prompt=10,
+        random_input_len=8,
+        random_output_len=1,
+        resource_label="H800",
+        benchmark_params_name=name_a,
+    )
+    result_b = dfx_conftest.run_benchmark(
+        args=["--host", "127.0.0.1", "--port", "8000"],
+        test_name=shared_test,
+        flow=1,
+        dataset_name="random-mm",
+        num_prompt=10,
+        random_input_len=8,
+        random_output_len=1,
+        resource_label="H800",
+        benchmark_params_name=name_b,
+    )
+
+    assert result_a["test_name"] == shared_test
+    assert result_b["test_name"] == shared_test
+    assert result_a["name"] == name_a
+    assert result_b["name"] == name_b
+    assert "benchmark_params" not in result_a
+    assert "benchmark_params" not in result_b
+
+    files = sorted(p.name for p in result_dir.glob("result_*.json"))
+    assert len(files) == 2
+    assert any(name_a in name for name in files)
+    assert any(name_b in name for name in files)
+    assert files[0] != files[1]
+
+    def omni_group_key(record: dict) -> tuple:
+        return (
+            record.get("model_id") or "",
+            record.get("test_name") or "",
+            record.get("name") or "",
+            record.get("dataset_name") or "",
+            record.get("max_concurrency") if record.get("max_concurrency") is not None else 0,
+            record.get("num_prompts") if record.get("num_prompts") is not None else 0,
+        )
+
+    assert omni_group_key(result_a) != omni_group_key(result_b)
 
 
 def test_is_hardware_nested_baseline():
@@ -552,6 +741,204 @@ def test_omniinteract_result_rejects_incomplete_artifacts():
         )
 
 
+def test_omniinteract_result_accepts_accuracy_at_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 4,
+            "omniinteract": {
+                "total": 4,
+                "success": 4,
+                "failed": 0,
+                "artifacts_complete": True,
+                "accuracy": {
+                    "status": "ok",
+                    "failed": 0,
+                    "evaluated": 4,
+                    "summary": {"IA_QTF1": 0.25},
+                },
+            },
+        },
+        {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_min_ia_qtf1": 0.2},
+        4,
+    )
+
+
+def test_omniinteract_result_rejects_missing_accuracy():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="accuracy is missing"):
+        assert_result(
+            {
+                "completed": 4,
+                "omniinteract": {"total": 4, "success": 4, "failed": 0, "artifacts_complete": True},
+            },
+            {"dataset_name": "omniinteract", "omniinteract_evaluate": True},
+            4,
+        )
+
+
+def test_omniinteract_result_rejects_failed_accuracy():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="accuracy did not complete"):
+        assert_result(
+            {
+                "completed": 4,
+                "omniinteract": {
+                    "total": 4,
+                    "success": 4,
+                    "failed": 0,
+                    "artifacts_complete": True,
+                    "accuracy": {"status": "failed", "failed": 1, "summary": {"IA_QTF1": 0.9}},
+                },
+            },
+            {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_min_ia_qtf1": 0.0},
+            4,
+        )
+
+
+def test_omniinteract_result_rejects_ia_qtf1_below_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="IA-QTF1"):
+        assert_result(
+            {
+                "completed": 4,
+                "omniinteract": {
+                    "total": 4,
+                    "success": 4,
+                    "failed": 0,
+                    "artifacts_complete": True,
+                    "accuracy": {
+                        "status": "ok",
+                        "failed": 0,
+                        "evaluated": 4,
+                        "summary": {"IA_QTF1": 0.1},
+                    },
+                },
+            },
+            {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_min_ia_qtf1": 0.2},
+            4,
+        )
+
+
+def _omniinteract_accuracy_result(
+    *,
+    tp: float,
+    fp: float,
+    fn: float,
+    ia_qtf1: float = 0.5,
+    evaluated: int = 4,
+    skipped: int = 0,
+) -> dict[str, object]:
+    return {
+        "completed": 4,
+        "omniinteract": {
+            "total": 4,
+            "success": 4,
+            "failed": 0,
+            "artifacts_complete": True,
+            "accuracy": {
+                "status": "ok",
+                "failed": 0,
+                "evaluated": evaluated,
+                "skipped": skipped,
+                "total": 4,
+                "summary": {"IA_QTF1": ia_qtf1, "Global_TP": tp, "Global_FP": fp, "Global_FN": fn},
+            },
+        },
+    }
+
+
+def _omniinteract_aggregate_params(subset: str, *, group: str) -> dict[str, object]:
+    return {
+        "dataset_name": "omniinteract",
+        "omniinteract_evaluate": True,
+        "omniinteract_subsets": subset,
+        "omniinteract_aggregate_min_ia_qtf1": 0.2,
+        "omniinteract_aggregate_subsets": ["1q1a", "1q1a_math", "1qna"],
+        "omniinteract_aggregate_group": group,
+    }
+
+
+def test_omniinteract_aggregate_waits_until_all_subsets():
+    from tests.dfx.perf.scripts.run_benchmark import _reset_omniinteract_aggregate_counts, assert_result
+
+    _reset_omniinteract_aggregate_counts()
+    assert_result(
+        _omniinteract_accuracy_result(tp=6.157502, fp=9, fn=8),
+        _omniinteract_aggregate_params("1q1a", group="wait"),
+        4,
+    )
+    assert_result(
+        _omniinteract_accuracy_result(tp=1.133541, fp=2, fn=2),
+        _omniinteract_aggregate_params("1q1a_math", group="wait"),
+        4,
+    )
+
+
+def test_omniinteract_aggregate_accepts_pooled_ia_qtf1_at_floor():
+    from tests.dfx.perf.scripts.run_benchmark import _reset_omniinteract_aggregate_counts, assert_result
+
+    _reset_omniinteract_aggregate_counts()
+    assert_result(
+        _omniinteract_accuracy_result(tp=6.157502, fp=9, fn=8),
+        _omniinteract_aggregate_params("1q1a", group="pass"),
+        4,
+    )
+    assert_result(
+        _omniinteract_accuracy_result(tp=1.133541, fp=2, fn=2),
+        _omniinteract_aggregate_params("1q1a_math", group="pass"),
+        4,
+    )
+    assert_result(
+        _omniinteract_accuracy_result(tp=0.0, fp=11, fn=18, ia_qtf1=0.0),
+        _omniinteract_aggregate_params("1qna", group="pass"),
+        4,
+    )
+
+
+def test_omniinteract_aggregate_rejects_pooled_ia_qtf1_below_floor():
+    from tests.dfx.perf.scripts.run_benchmark import _reset_omniinteract_aggregate_counts, assert_result
+
+    _reset_omniinteract_aggregate_counts()
+    assert_result(
+        _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0),
+        _omniinteract_aggregate_params("1q1a", group="fail"),
+        4,
+    )
+    assert_result(
+        _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0),
+        _omniinteract_aggregate_params("1q1a_math", group="fail"),
+        4,
+    )
+    with pytest.raises(AssertionError, match="aggregate All Global IA-QTF1"):
+        assert_result(
+            _omniinteract_accuracy_result(tp=0.0, fp=1, fn=1, ia_qtf1=0.0),
+            _omniinteract_aggregate_params("1qna", group="fail"),
+            4,
+        )
+
+
+def test_omniinteract_aggregate_rejects_entirely_skipped_subset():
+    from tests.dfx.perf.scripts.run_benchmark import _reset_omniinteract_aggregate_counts, assert_result
+
+    _reset_omniinteract_aggregate_counts()
+    assert_result(
+        _omniinteract_accuracy_result(tp=4.0, fp=0.0, fn=0.0, ia_qtf1=1.0),
+        _omniinteract_aggregate_params("1q1a", group="skipped-subset"),
+        4,
+    )
+    with pytest.raises(AssertionError, match="evaluated 0 cases"):
+        assert_result(
+            _omniinteract_accuracy_result(tp=0.0, fp=0.0, fn=0.0, ia_qtf1=1.0, evaluated=0, skipped=4),
+            _omniinteract_aggregate_params("1q1a_math", group="skipped-subset"),
+            4,
+        )
+
+
 def test_omni_tpot_baseline_accepts_measured_finite_sample():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -570,6 +957,7 @@ def test_omni_tpot_baseline_accepts_measured_finite_sample():
 @pytest.mark.parametrize(
     ("num_tpot_samples", "mean_tpot_ms", "match"),
     [
+        (None, 10.0, "no measurable TPOT samples"),
         (0, float("nan"), "no measurable TPOT samples"),
         (1, float("nan"), "mean_tpot_ms is not finite"),
     ],
@@ -577,14 +965,72 @@ def test_omni_tpot_baseline_accepts_measured_finite_sample():
 def test_omni_tpot_baseline_rejects_missing_or_nonfinite_sample(num_tpot_samples, mean_tpot_ms, match):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
+    result = {
+        "completed": 1,
+        "Hardware": "H100",
+        "mean_tpot_ms": mean_tpot_ms,
+    }
+    if num_tpot_samples is not None:
+        result["num_tpot_samples"] = num_tpot_samples
+
     with pytest.raises(AssertionError, match=match):
         assert_result(
-            {
-                "completed": 1,
-                "Hardware": "H100",
-                "num_tpot_samples": num_tpot_samples,
-                "mean_tpot_ms": mean_tpot_ms,
-            },
+            result,
             {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
             1,
         )
+
+
+# Mirrors the Thinker/Talker lengths in test_qwen3_omni_no_async_chunk.json.
+_FIXED_SAMPLING = {
+    "sampling_params_list": [{"min_tokens": 900, "max_tokens": 900}, {"min_tokens": 1536, "max_tokens": 1536}]
+}
+_FIXED_OK = {"0": {"num_tokens_out": 900}, "1": {"num_tokens_out": 1536}}
+
+
+@pytest.mark.parametrize("extra_body_key", ["extra_body", "extra-body"])
+def test_fixed_stage_workload_accepts_exact_lengths(extra_body_key, capsys):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {"completed": 2, "failed": 0, "request_stage_metrics": [_FIXED_OK, _FIXED_OK]},
+        {extra_body_key: _FIXED_SAMPLING},
+        2,
+    )
+    assert "Fixed stage workload OK: 2 requests, num_tokens_out stage 0=900, stage 1=1536" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "snapshots",
+    [
+        None,
+        [],
+        [_FIXED_OK],
+        [_FIXED_OK, None],
+        [_FIXED_OK, {}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 900}, "1": {}}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 900}, "1": {"num_tokens_out": 486}}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 900}, "1": {"num_tokens_out": 1537}}],
+        [_FIXED_OK, {"1": {"num_tokens_out": 1536}}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 512}, "1": {"num_tokens_out": 1536}}],
+    ],
+)
+def test_fixed_stage_workload_rejects_missing_or_wrong_lengths(snapshots):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="Fixed stage workload"):
+        assert_result({"completed": 2, "request_stage_metrics": snapshots}, {"extra_body": _FIXED_SAMPLING}, 2)
+
+
+def test_fixed_stage_workload_rejects_request_failures():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="Request failures"):
+        assert_result({"completed": 1, "failed": 1}, {}, 2)
+
+
+@pytest.mark.parametrize("extra_body", [{}, {"sampling_params_list": [{"max_tokens": 900}]}])
+def test_variable_stage_workload_does_not_require_stage_metrics(extra_body):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result({"completed": 2}, {"extra_body": extra_body}, 2)

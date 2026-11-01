@@ -79,3 +79,8 @@ def test_minimax_h3_disaggregation_is_explicit_opt_in():
     pipeline = OMNI_PIPELINES["minimax_h3_disaggregated"]
     assert isinstance(pipeline, PipelineConfig)
     assert pipeline.model_type == "minimax_h3_disaggregated"
+
+
+def test_omni_pipelines_sorted_alphabetically():
+    """OMNI_PIPELINES keys must stay sorted (case-insensitive) by model_type."""
+    assert list(OMNI_PIPELINES) == sorted(OMNI_PIPELINES, key=str.lower)

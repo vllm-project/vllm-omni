@@ -32,9 +32,14 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 from .autoencoder import AutoEncoder, AutoEncoderParams, DistributedAutoEncoder
@@ -184,6 +189,45 @@ def _bagel_effective_image_size(
     return min(resized_height, max_image_size), min(resized_width, max_image_size)
 
 
+def _bagel_canvas_requested(sampling: OmniDiffusionSamplingParams) -> bool:
+    return (sampling.height is not None and not sampling.height_not_provided) or (
+        sampling.width is not None and not sampling.width_not_provided
+    )
+
+
+def _bagel_align_requested_canvas(
+    sampling: OmniDiffusionSamplingParams,
+    *,
+    latent_downsample: int,
+    max_latent_size: int,
+) -> None:
+    """Floor an explicitly requested canvas to the latent stride; reject sides over the checkpoint limit."""
+
+    max_image_size = int(max_latent_size * latent_downsample)
+    resized: list[str] = []
+    for name in ("width", "height"):
+        value = getattr(sampling, name)
+        if value is None or getattr(sampling, f"{name}_not_provided"):
+            continue
+        value = int(value)
+        if value > max_image_size:
+            raise OmniClientError(
+                f"Requested {name}={value} exceeds the BAGEL checkpoint limit of {max_image_size} "
+                f"(max_latent_size={max_latent_size}, latent_downsample={latent_downsample})."
+            )
+        aligned = max(latent_downsample, (value // latent_downsample) * latent_downsample)
+        if aligned != value:
+            setattr(sampling, name, aligned)
+            resized.append(f"{name} {value}->{aligned}")
+    if resized:
+        logger.warning(
+            "BAGEL: requested canvas is not a multiple of the latent stride %d and cannot be "
+            "generated as-is; resizing %s.",
+            latent_downsample,
+            ", ".join(resized),
+        )
+
+
 def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
     """Resolve BAGEL execution mode and step-batch compatibility."""
 
@@ -194,12 +238,23 @@ def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
         nonlocal image_geometry
 
         sampling = request.sampling_params
+        modalities = (request.prompt.get("modalities") or []) if isinstance(request.prompt, dict) else []
         kv_metadata = getattr(sampling, "kv_metadata", None) or {}
         image_shape = kv_metadata.get("image_shape")
-        if image_shape is not None:
+        if _bagel_canvas_requested(sampling) and "text" not in modalities:
+            if image_geometry is None:
+                image_geometry = _resolve_bagel_image_geometry(od_config)
+            latent_downsample, max_latent_size = image_geometry
+            _bagel_align_requested_canvas(
+                sampling,
+                latent_downsample=latent_downsample,
+                max_latent_size=max_latent_size,
+            )
+        elif image_shape is not None:
             sampling.height, sampling.width = (int(value) for value in image_shape)
+            sampling.height_not_provided = False
+            sampling.width_not_provided = False
         elif isinstance(request.prompt, dict):
-            modalities = request.prompt.get("modalities") or []
             multi_modal_data = request.prompt.get("multi_modal_data") or {}
             image_input = multi_modal_data.get("img2img")
             if image_input is None and "text" not in modalities:
@@ -220,6 +275,8 @@ def get_bagel_pre_process_func(od_config: OmniDiffusionConfig):
                     latent_downsample=latent_downsample,
                     max_latent_size=max_latent_size,
                 )
+                sampling.height_not_provided = True
+                sampling.width_not_provided = True
 
         extra_args = request.sampling_params.extra_args or {}
         cfg_interval = tuple(extra_args.get("cfg_interval", (0.4, 1.0)))
@@ -447,7 +504,9 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
         #    selectively materialized/moved by the offloader.
         # 3. HSDP: weights should be loaded on CPU first and sharded afterwards,
         #    rather than eagerly placing the full model on one GPU.
-        if quant_config is None and not (od_config.enable_layerwise_offload or od_config.parallel_config.use_hsdp):
+        if quant_config is None and not (
+            resolve_offload_strategy(od_config) is OffloadStrategy.LAYER_WISE or od_config.parallel_config.use_hsdp
+        ):
             self.to(self.device)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -528,6 +587,7 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 f"latent_downsample={self.bagel.latent_downsample})."
             )
         image_shape = (height, width)
+        image_shape_requested = _bagel_canvas_requested(sampling)
 
         extra_args = getattr(sampling, "extra_args", {}) or {}
         cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)
@@ -568,7 +628,15 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                 gen_context["ropes"] = [seq_len]
 
             if sampling.kv_metadata and "image_shape" in sampling.kv_metadata:
-                image_shape = tuple(sampling.kv_metadata["image_shape"])
+                if not image_shape_requested:
+                    image_shape = tuple(sampling.kv_metadata["image_shape"])
+                elif tuple(sampling.kv_metadata["image_shape"]) != image_shape:
+                    logger.info(
+                        "Generating at requested %dx%d instead of KV image shape %s",
+                        image_shape[1],
+                        image_shape[0],
+                        sampling.kv_metadata["image_shape"],
+                    )
 
             branch_kvs = getattr(sampling, "cfg_branch_past_key_values", None) or {}
             branch_metadata = getattr(sampling, "cfg_branch_kv_metadata", None) or {}
@@ -673,8 +741,15 @@ class BagelPipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProf
                     image_input = [_resize_to_stride(img) for img in image_input]
 
                     resized_w, resized_h = image_input[0].size
-                    image_shape = (resized_h, resized_w)
-                    logger.info(f"img2img: resized image to {resized_w}x{resized_h}")
+                    if not image_shape_requested:
+                        image_shape = (resized_h, resized_w)
+                    logger.info(
+                        "img2img: resized source to %dx%d, generating at %dx%d",
+                        resized_w,
+                        resized_h,
+                        image_shape[1],
+                        image_shape[0],
+                    )
 
                     def vae_transforms(img):
                         if img.mode != "RGB":

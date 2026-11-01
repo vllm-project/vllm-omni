@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 from torch import nn
 
 from tests.diffusion.models.wan2_2.conftest import StubScheduler, StubTransformer, StubVAE, noop_progress_bar
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import _WAN_TEXT_ENCODER_OFFLOAD_PLAN
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import _WAN_TEXT_ENCODER_OFFLOAD_PLAN, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
     Wan22I2VPipeline,
     get_wan22_i2v_post_process_func,
@@ -50,7 +51,7 @@ def _make_i2v_pipeline(*, expand_timesteps: bool) -> Wan22I2VPipeline:
 
 
 def _make_i2v_sampling(**overrides):
-    values = {
+    values: dict[str, object] = {
         "height": 16,
         "width": 16,
         "num_frames": 5,
@@ -275,16 +276,18 @@ def test_i2v_prepare_latents_preserves_batched_image_conditions() -> None:
     assert first_frame_mask.shape == (2, 1, 2, 2, 2)
 
 
-def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch) -> None:
+@pytest.mark.parametrize("solver", ["unipc", "euler"])
+@pytest.mark.parametrize("shift", [3.0, 5.0, 12.0])
+def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch, solver: str, shift: float) -> None:
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v.current_omni_platform",
         SimpleNamespace(is_available=lambda: False),
     )
     pipeline = _make_i2v_pipeline(expand_timesteps=True)
-    pipeline.scheduler = StubScheduler([9])
-    pipeline.od_config = SimpleNamespace(flow_shift=5.0)
-    pipeline._sample_solver = "unipc"
-    pipeline._flow_shift = 5.0
+    pipeline.scheduler = build_wan_scheduler(solver, shift)
+    pipeline.od_config = SimpleNamespace(flow_shift=shift)
+    pipeline._sample_solver = solver
+    pipeline._flow_shift = shift
     pipeline.boundary_ratio = 0.875
     pipeline.has_image_encoder = False
     pipeline._guidance_scale = None
@@ -327,6 +330,8 @@ def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch) -
                     generator=gen_a,
                     latents=latents_a,
                     num_outputs_per_prompt=2,
+                    num_inference_steps=50,
+                    extra_args={"sample_solver": solver, "flow_shift": shift},
                 ),
             ),
             SimpleNamespace(
@@ -336,12 +341,25 @@ def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch) -
                     generator=gen_b,
                     latents=latents_b,
                     num_outputs_per_prompt=2,
+                    num_inference_steps=50,
+                    extra_args={"sample_solver": solver, "flow_shift": shift},
                 ),
             ),
         ]
     )
 
     outputs = pipeline.forward(batch)
+    if solver == "unipc":
+        sigmas = np.linspace(float(np.float32(0.999)), 0.0, 51)[:-1]
+        sigmas = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
+        torch.testing.assert_close(
+            pipeline.scheduler.sigmas, torch.tensor(np.append(sigmas, 0.0), dtype=torch.float32), rtol=0, atol=0
+        )
+        assert pipeline.scheduler.timesteps.tolist() == (sigmas * 1000).astype(np.int64).tolist()
+    else:
+        reference = build_wan_scheduler("euler", shift)
+        reference.set_timesteps(50, device="cpu")
+        torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
 
     assert prepare_call["batch_size"] == 4
     assert prepare_call["generator"] == [gen_a, gen_a, gen_b, gen_b]

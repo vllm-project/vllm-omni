@@ -12,7 +12,6 @@ incremental playback acks, a forced transport drop recovered by automatic
 from __future__ import annotations
 
 import asyncio
-import uuid
 from pathlib import Path
 
 import pytest
@@ -47,7 +46,6 @@ async def _run_live_session(*, url: str, model: str, ref_audio: Path, input_wav:
         url,
         model=model,
         config=config,
-        session_id=f"duplex-client-live-{uuid.uuid4().hex}",
         reconnect=ReconnectPolicy(max_attempts=5, backoff_s=(0.25, 1.0)),
         # Short interval so the periodic heartbeat path runs during the
         # session — including across the forced transport drop below.

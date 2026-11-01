@@ -43,8 +43,7 @@ class _SmokeDiffusionAttention(nn.Module):
         self.softmax_scale = _HEAD_SIZE**-0.5
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native paged attention")
-def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> None:
+def _native_adapter(num_rows: int = 1):
     device = torch.device("cuda", torch.accelerator.current_device_index())
     vllm_config = VllmConfig(
         cache_config=CacheConfig(
@@ -89,8 +88,8 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
 
     canonical_spec = native_layer.spec
     kv_cache_config = KVCacheConfig(
-        num_blocks=4,
-        kv_cache_tensors=[build_kv_cache_tensor(canonical_spec, 4, [_LAYER_NAME])],
+        num_blocks=4 * num_rows,
+        kv_cache_tensors=[build_kv_cache_tensor(canonical_spec, 4 * num_rows, [_LAYER_NAME])],
         kv_cache_groups=[
             KVCacheGroupSpec(
                 layer_names=[_LAYER_NAME],
@@ -107,11 +106,9 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
             vllm_config,
             device,
         )
-        runner_kv_caches: list[torch.Tensor | list[torch.Tensor]] = []
-        # vLLM 0.29 dropped attn_groups and cache_dtype here: the layout now
-        # comes from the resolved CacheConfig.kv_cache_layout inside the call.
+        # f2aad6aa70 (#56888): init_kv_cache no longer mutates a runner list;
+        # first arg is forward_context and the allocated caches are returned.
         init_kv_cache(
-            runner_kv_caches,
             vllm_config.compilation_config.static_forward_context,
             kv_cache_config,
             device,
@@ -120,14 +117,15 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
         )
         block_tables = BlockTables(
             block_sizes=[_BLOCK_SIZE],
-            max_num_reqs=1,
-            max_num_batched_tokens=32,
+            max_num_reqs=num_rows,
+            max_num_batched_tokens=32 * num_rows,
             max_num_blocks_per_group=[2],
             device=device,
             kernel_block_sizes=kernel_block_sizes,
         )
 
-    block_tables.append_block_ids(0, ([3, 1],), overwrite=True)
+    for row in range(num_rows):
+        block_tables.append_block_ids(row, ([4 * row + 3, 4 * row + 1],), overwrite=True)
     block_tables.apply_staged_writes()
     adapter = DiffusionPagedAttentionAdapter(
         vllm_config=vllm_config,
@@ -136,11 +134,17 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
         block_tables=block_tables,
         attn_groups=attn_groups,
         layers={_LAYER_NAME: native_layer},
-        resolve_row=lambda _request_id, _sequence_id, _context_id: DiffusionPagedAttentionRowBinding(
-            row_index=0,
+        resolve_row=lambda _request_id, sequence_id, _context_id: DiffusionPagedAttentionRowBinding(
+            row_index=sequence_id,
             max_seq_len=19,
         ),
     )
+    return adapter, diffusion_layer, device
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native paged attention")
+def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> None:
+    adapter, diffusion_layer, device = _native_adapter()
     prefix_batch = adapter.prepare_batch(
         [
             DiffusionPagedAttentionRow(
@@ -258,3 +262,48 @@ def test_adapter_executes_native_paged_attention_on_non_contiguous_blocks() -> N
     torch.testing.assert_close(prefix_output, prefix_reference, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(suffix_output, suffix_reference, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(piecewise_output, piecewise_reference, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native paged attention")
+def test_hunyuan_homogeneous_cfg_paged_attention_graph_replay() -> None:
+    """Real paged kernels, strided QKV, mixed image spans and changed replay inputs."""
+    adapter, layer, device = _native_adapter(num_rows=2)
+    packed = torch.randn(2, 19, 3, _NUM_HEADS, _HEAD_SIZE, device=device, dtype=torch.float16)
+    query, key, value = packed.unbind(dim=2)
+    backend = FlashAttentionImpl(
+        num_heads=_NUM_HEADS, head_size=_HEAD_SIZE, softmax_scale=layer.softmax_scale, num_kv_heads=_NUM_HEADS
+    )
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="cfg", sequence_id=i, query_len=19, seq_len=19) for i in range(2)]
+    )
+    metadata = AttentionMetadata(full_attn_spans=[[(5, 10)], [(5, 10)]])
+    with adapter.activate(batch):
+        context = adapter.prepare_layer_context(_LAYER_NAME, query, key, value, omni_attn_metadata=metadata)
+    assert context.piecewise_plan.homogeneous_batch_shape == (2, 19)
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            backend.forward_paged(context)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = backend.forward_paged(context)
+    output_ptr = captured.data_ptr()
+    mask = torch.ones(19, 19, device=device, dtype=torch.bool).tril()
+    mask[5:10, 5:10] = True
+    for _ in range(2):
+        packed.copy_(torch.randn_like(packed))
+        graph.replay()
+        actual = captured.clone()
+        eager = backend.forward_paged(context)
+        reference = F.scaled_dot_product_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attn_mask=mask,
+            scale=layer.softmax_scale,
+        ).transpose(1, 2)
+        torch.testing.assert_close(actual.reshape_as(reference), reference, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(actual, eager, rtol=2e-2, atol=2e-2)
+        assert captured.data_ptr() == output_ptr

@@ -6,7 +6,7 @@ steps:
     commands:
       - "bash .buildkite/cuda/scripts/build-ci-image.sh"
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
 
   # L2 Test — PR ready label (diff-aware) or main+WEEKLY=1 (--e2e, full E2E group)
   - label: "Upload Ready Pipeline"
@@ -20,7 +20,7 @@ steps:
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-ready.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
 
   # L3 Test — PR merge-test label or post-merge on main (both diff-aware);
   # main+WEEKLY=1 uploads the E2E group only (--e2e).
@@ -35,7 +35,7 @@ steps:
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-merge.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
 
   # L4 Test — main+NIGHTLY=1 (full pipeline), or PR nightly-test label (diff-aware)
   - label: "Upload Nightly Pipeline"
@@ -49,7 +49,7 @@ steps:
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-nightly.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"
 
   # L5 Test — main+WEEKLY=1 / NON_CRITICAL=1 (full pipeline), or PR weekly-test label (diff-aware)
   - label: "Upload Weekly Pipeline"
@@ -63,4 +63,4 @@ steps:
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/cuda/test-weekly.yml
     agents:
-      queue: "cpu_queue_premerge"
+      queue: "medium_cpu_queue_premerge"

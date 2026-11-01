@@ -33,6 +33,12 @@ HARDWARE_HELPERS = ("hardware_test", "hardware_marks")
 # The helper implementation is the only file allowed to write pytest.mark.<SKU>.
 _ALLOWED_DIRECT_SKU_FILES = frozenset({"tests/helpers/mark.py"})
 
+# Common diffusion tests receive per-case marks from this parametrization helper.
+_DELEGATED_MARK_SOURCES = {
+    "tests/model_tests/diffusion/test_common_offline.py": "tests/model_tests/diffusion/case_filtering.py",
+    "tests/model_tests/diffusion/test_common_online.py": "tests/model_tests/diffusion/case_filtering.py",
+}
+
 # Match mark.X since we could also do `from pytest import mark`.
 # \b prevents matching prefixes (e.g., mark.slow vs mark.slow_test).
 HELPER_RE = re.compile(r"(?:" + "|".join(HARDWARE_HELPERS) + r")\s*\(")
@@ -146,6 +152,9 @@ def get_files_missing_markers(
             missing = []
             if has_direct_sku_marker(path, contents):
                 missing.append(DIRECT_SKU_MARKER)
+            mark_source = _DELEGATED_MARK_SOURCES.get(_normalize_path(path))
+            if mark_source is not None and "get_parametrized_options(" in contents:
+                contents += "\n" + (read_test_file(str(_repo_root() / mark_source)) or "")
             if not has_level_marker(contents):
                 missing.append(MISSING_LEVEL_MARKER)
             if not has_hardware_marker(contents):

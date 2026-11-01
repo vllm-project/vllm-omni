@@ -867,6 +867,76 @@ def enable_cache_for_magi2(pipeline: Any, cache_config: Any) -> CacheDiTEnableRe
     return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
 
 
+def _get_mammothmoda2_transformer(pipeline: Any) -> torch.nn.Module:
+    return pipeline.gen_transformer
+
+
+def enable_cache_for_mammothmoda2(pipeline: Any, cache_config: Any) -> CacheDiTEnableResult:
+    """Cache only MammothModa2's repeated main DiT stack.
+
+    ``Transformer2DModel`` runs three Q-Former refiners (noise / ref-image /
+    context) whose inputs change every denoise step, plus the ``layers``
+    stack that dominates per-step compute. Only ``layers`` is a repeated
+    residual stack, so the ``BlockAdapter`` wraps it and the refiners stay
+    outside the cached region. Blocks take ``hidden_states`` plus keyword
+    step context and return only hidden states (``Pattern_3``).
+
+    The pipeline runs sequential CFG: each conditional forward is followed by
+    an unconditional forward. cache-dit tells cond/uncond apart purely by
+    transformer-forward parity (``has_separate_cfg=True``), so the
+    ``cfg_range`` optimization that skips the unconditional pass outside the
+    interval would desync that accounting. Like Cosmos3, we keep the passes
+    paired and neutralize CFG via scale=1.0 outside the interval; the
+    pipeline also disables hooks for no-CFG requests (single forward per
+    step), whose parity the accounting cannot represent.
+    """
+    pipeline._cache_dit_requires_paired_cfg = True
+    transformer = _get_mammothmoda2_transformer(pipeline)
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.layers],
+        forward_pattern=[ForwardPattern.Pattern_3],
+        has_separate_cfg=True,
+        check_forward_pattern=True,
+    )
+    refresh = enable_cache_for_dit(
+        pipeline,
+        cache_config,
+        block_adapter,
+        get_pipeline_transformer=_get_mammothmoda2_transformer,
+    )
+    return CacheDiTEnableResult(refresh=refresh, targets=(block_adapter,))
+
+
+def enable_cache_for_kandinsky6(pipeline: Any, cache_config: Any) -> RefreshCacheContextFunc:
+    """Cache-DiT over K6 visual blocks only.
+
+    Text and audio block lists are not one residual chain with the visual
+    stack. If the block adapter rejects the fused ``(video, audio)`` return,
+    fall back to the same step-level velocity cache MagCache uses.
+    """
+    transformer = pipeline.transformer
+    block_adapter = BlockAdapter(
+        transformer=transformer,
+        blocks=[transformer.visual_transformer_blocks],
+        forward_pattern=[ForwardPattern.Pattern_0],
+        has_separate_cfg=True,
+        check_forward_pattern=False,
+    )
+    try:
+        return enable_cache_for_dit(pipeline, cache_config, block_adapter)
+    except Exception as exc:
+        logger.warning("Cache-DiT block adapter failed for Kandinsky 6 (%s); using step cache", exc)
+        from vllm_omni.diffusion.models.kandinsky6.cache_accel import attach_mag_cache
+
+        attach_mag_cache(transformer, threshold=0.24, max_skip_steps=3, retention_ratio=0.1)
+
+        def _refresh(*_args, **_kwargs):
+            return None
+
+        return _refresh
+
+
 def register_custom_dit_enablers() -> None:
     """Register model-specific Cache-DiT enablers.
 
@@ -884,7 +954,9 @@ def register_custom_dit_enablers() -> None:
             "Cosmos3OmniDiffusersPipeline": enable_cache_for_cosmos3,
             "Cosmos3OmniPipeline": enable_cache_for_cosmos3,
             "Krea2Pipeline": enable_cache_for_krea2,
+            "Kandinsky6TI2VAPipeline": enable_cache_for_kandinsky6,
             "Magi2Pipeline": enable_cache_for_magi2,
+            "MammothModa2DiTPipeline": enable_cache_for_mammothmoda2,
         }
     )
 

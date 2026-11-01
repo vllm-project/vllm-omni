@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen3-TTS pipeline: Talker (text → RVQ codec) → Code2Wav (codec → audio).
 
 Chunked vs end-to-end mode is dispatched from ``deploy.async_chunk``.
@@ -10,8 +10,24 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.outputs.output_modality import (
+    TensorAccumulationStrategy,
+    register_key_accumulation_strategy,
+)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
+
+# The talker's codec-frame keys are not waveform chunks, so they must not go
+# through the AUDIO modality's waveform-tuned default (CONCAT_LAST) whenever
+# a stage carrying them consolidates its output under that modality (e.g. an
+# AUDIO-typed final stage that forwards them directly instead of routing
+# through code2wav): ``codes.audio`` grows one row per decode step along
+# dim 0, and ``codes.ref`` re-emits the constant reference-context matrix
+# unchanged at every step.
+register_key_accumulation_strategy("codes.audio", TensorAccumulationStrategy.CONCAT_DIM0)
+register_key_accumulation_strategy("codes.ref", TensorAccumulationStrategy.REPLACE)
+# code2wav's client key for the frames it decoded: [frames, codebooks] per step.
+register_key_accumulation_strategy("codec_frames", TensorAccumulationStrategy.CONCAT_DIM0)
 
 QWEN3_TTS_PIPELINE = PipelineConfig(
     model_type="qwen3_tts",
@@ -27,6 +43,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
+            supports_native_mrv2_data_plane=True,
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={
                 "detokenize": False,
@@ -42,6 +59,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="Qwen3TTSCode2Wav",
+            supports_native_mrv2_data_plane=True,
             # ``sync_process_input_func`` is the only input-proc override for
             # this stage in sync (non-async-chunk) mode: a length-only
             # ``_token_only`` placeholder.  The bulk codec payload itself
@@ -53,6 +71,36 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             sampling_constraints={"detokenize": True},
             extras={"tts_args": {"max_instructions_length": 500}},
             requires_full_payload_input=True,
+        ),
+    ),
+)
+
+
+# Single-stage variant: the Talker decodes each frame with the stateful
+# streaming codec decoder and emits PCM as the final output (enable with the
+# ``talker_stream_decode`` model option). No Code2Wav stage, no connector.
+QWEN3_TTS_FUSED_PIPELINE = PipelineConfig(
+    model_type="qwen3_tts_fused",
+    default_deploy_config_name="qwen3_tts_fused_single_gpu.yaml",
+    single_stage_async_chunk=True,
+    model_arch="Qwen3TTSTalkerForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="qwen3_tts",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            final_output=True,
+            final_output_type="audio",
+            # The API output processor tags ``model_outputs`` by this modality.
+            engine_output_type="audio",
+            supports_running_prefix_cache_reset=False,
+            supports_native_mrv2_data_plane=True,
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [2150],
+            },
         ),
     ),
 )

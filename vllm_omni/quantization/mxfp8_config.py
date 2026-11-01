@@ -167,6 +167,21 @@ class _LazyWeightMixin:
 
     uses_meta_device: bool = True
 
+    # This mixin knows when a layer's weight is final, so it can hand the layer
+    # back to the host right there. Loaders that intend to offload the whole
+    # model after loading opt in per layer via ``enable_offload_after_quant``.
+    supports_offload_after_quant: bool = True
+    _offload_after_quant: bool = False
+
+    def enable_offload_after_quant(self) -> None:
+        """Return each layer to host memory as soon as it has been quantized.
+
+        Caps the load-time device footprint at one layer instead of the whole
+        model. A quant method instance belongs to a single layer, so this is not
+        a global switch.
+        """
+        self._offload_after_quant = True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -202,12 +217,17 @@ class _LazyWeightMixin:
             param = layer.weight
             counter = CopyNumelCounter()
             with counter:
-                res = weight_loader(param, loaded_weight, *args, **kwargs)
+                res = weight_loader(param, loaded_weight, *args, **kwargs)  # type: ignore[misc]
             layer._loaded_numel += counter.copied_numel
 
             if layer._loaded_numel == layer.weight.numel():
-                self.process_weights_after_loading(layer)
+                self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
                 layer._already_called_process_weights_after_loading = True
+
+                # This layer's weight is final, so nothing needs it on the
+                # accelerator until inference.
+                if self._offload_after_quant:
+                    layer.to("cpu")
             return res
 
         weight = ModelWeightParameter(

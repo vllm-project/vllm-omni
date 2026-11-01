@@ -135,6 +135,32 @@ def resolve_similarity_thresholds(
     return table.get(profile, table[DEFAULT_DEVICE_PROFILE])
 
 
+def resolve_device_threshold(
+    thresholds: float | int | Mapping[str, float],
+    *,
+    device_name: str | None = None,
+    label: str = "threshold",
+) -> tuple[str, float]:
+    """Resolve a scalar or per-GPU threshold for the current CUDA device.
+
+    Returns ``(profile_key, threshold)``. A bare number uses profile ``default``.
+    A mapping matches keys as substrings of the device name via
+    ``resolve_device_profile`` (for example ``{"H100": 0.3, "B200": 0.36}``).
+    Prefer an explicit ``default`` entry when unmatched GPUs should fall back;
+    otherwise unmatched devices raise.
+    """
+    if isinstance(thresholds, float | int):
+        return DEFAULT_DEVICE_PROFILE, float(thresholds)
+
+    profile = resolve_device_profile(device_name, profiles=thresholds)
+    if profile in thresholds:
+        return profile, float(thresholds[profile])
+    if DEFAULT_DEVICE_PROFILE in thresholds:
+        return DEFAULT_DEVICE_PROFILE, float(thresholds[DEFAULT_DEVICE_PROFILE])
+    known = ", ".join(str(key) for key in thresholds)
+    raise RuntimeError(f"no {label} entry for device profile {profile!r}; known: {known}")
+
+
 _SSIM_RE = re.compile(r"All:(?P<score>[0-9.]+)")
 _PSNR_RE = re.compile(r"average:(?P<score>[0-9.]+)")
 

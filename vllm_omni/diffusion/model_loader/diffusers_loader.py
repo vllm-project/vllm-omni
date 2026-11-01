@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -16,6 +16,7 @@ import torch
 from torch import nn
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
@@ -25,13 +26,19 @@ from vllm.model_executor.model_loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
-from vllm.transformers_utils.repo_utils import hf_api
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, apply_hsdp_to_model
+from vllm_omni.diffusion.distributed.hsdp import (
+    HSDPInferenceConfig,
+    HSDPShardContext,
+    apply_hsdp_to_model,
+    finalize_hsdp_root,
+    prepare_hsdp_shard_context,
+    shard_hsdp_module,
+)
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_checkpoint_adapter,
@@ -39,6 +46,8 @@ from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
 from vllm_omni.diffusion.model_loader.host_weight_loader import HWRLoaderMixin, _HWRCommitError
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
+    TensorBinding,
+    build_checkpoint_binding_plan,
     build_checkpoint_mmap_plan,
     has_online_quantization,
 )
@@ -50,10 +59,11 @@ from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload,
 )
-from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery, PipelineModules
 from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).
@@ -136,6 +146,36 @@ def _resolve_custom_pipeline_cls(custom_pipeline_name: str | type | None) -> typ
     raise TypeError(
         f"custom_pipeline_name must be a qualified name string or a class, got {type(custom_pipeline_name).__name__}"
     )
+
+
+def _is_distributed_rank_zero() -> bool:
+    return (
+        not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_rank() == 0
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _HSDPLoadRoot:
+    name: str
+    module: nn.Module
+    context: HSDPShardContext
+
+
+@dataclasses.dataclass(frozen=True)
+class _HSDPModuleLoadGroup:
+    name: str
+    module: nn.Module
+    context: HSDPShardContext
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreShardedHSDPLoadPlan:
+    roots: list[_HSDPLoadRoot]
+    groups: list[_HSDPModuleLoadGroup]
+    bindings: dict[str, TensorBinding]
+    binding_names: frozenset[str]
 
 
 class DiffusersPipelineLoader(HWRLoaderMixin):
@@ -481,8 +521,14 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         )
 
     def _get_expected_parameter_names(self, model: nn.Module) -> set[str]:
-        """Return parameter names that should be covered by strict load checks."""
-        all_parameter_names = {name for name, _ in model.named_parameters()}
+        """Return parameter names that should be covered by strict load checks.
+
+        A parameter with an initialized checkpoint default can explicitly set
+        ``is_checkpoint_optional``. It is still loaded when present on disk.
+        """
+        all_parameter_names = {
+            name for name, param in model.named_parameters() if not getattr(param, "is_checkpoint_optional", False)
+        }
         sources = self._get_weight_sources(model)
 
         # Keep strict behavior if no source metadata exists.
@@ -673,10 +719,21 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         with set_default_torch_dtype(self.od_config.dtype):
             if self.parallel_config.use_hsdp:
                 model = self._load_model_with_hsdp(
-                    target_device=device, load_format=load_format, custom_pipeline_name=custom_pipeline_name
+                    target_device=device,
+                    load_format=load_format,
+                    custom_pipeline_name=custom_pipeline_name,
+                    offload_after_quant=offload_after_quant,
                 )
             else:
-                model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
+                # The model is headed back to host memory right after online
+                # quantization, so over-wide NPU-unquantizable fallback weights
+                # load straight into host memory instead of round-tripping
+                # through the accelerator (~24 GiB startup peak on MiniMax H3).
+                from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
+
+                fallback_ctx = load_unquantizable_fallback_on_cpu() if offload_after_quant else contextlib.nullcontext()
+                with fallback_ctx:
+                    model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
 
                 resolved_offload = resolve_offload(self.od_config)
                 distributed_offload = resolved_offload.strategy is OffloadStrategy.DISTRIBUTED_LAYER_WISE
@@ -715,8 +772,9 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     if unsupported_methods:
                         raise ValueError(
                             "DLO+AllGather supports online quantization only for "
-                            "per-tensor FP8, INT8, and MXFP8 linears; unsupported "
-                            f"online methods: {', '.join(sorted(unsupported_methods))}. "
+                            "per-tensor FP8, INT8, and MXFP8 linears "
+                            "(host-loaded unquantized fallback layers are also allowed); "
+                            f"unsupported online methods: {', '.join(sorted(unsupported_methods))}. "
                             "Use rank-local transfer for the affected component or "
                             "disable online quantization."
                         )
@@ -853,8 +911,23 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     del model
                     return self.load_fresh_canonical_model()
             raise
+        self._log_w4a8_fallback_load_summaries(model)
         self._attach_offload_startup_state(model)
         return model
+
+    @staticmethod
+    def _log_w4a8_fallback_load_summaries(model: nn.Module) -> None:
+        """Ask discovered DiTs to report W4A8 state at the common load exit.
+
+        Each DiT derives readiness from its processed layers, so a deferred
+        weight plan cannot be mistaken for the ordinary or HSDP load path.
+        """
+        components = ModuleDiscovery.discover(model)
+        for component_name, dit in zip(components.dit_names, components.dits):
+            candidate = getattr(dit, "_log_w4a8_fallback_load_summary", None)
+            if callable(candidate):
+                reporter = cast(Callable[[str], None], candidate)
+                reporter(component_name)
 
     @staticmethod
     def _request_offload_after_quant(model: nn.Module) -> int:
@@ -909,6 +982,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         scale, packing, or aliasing layouts (e.g. dual-scale fp4 pairs,
         swizzled or NZ hardware formats) and remain fail-closed until
         validated.
+
+        ``UnquantizedHostLinearMethod`` is also allowed: it backs layers too
+        wide for npu_quant_matmul, loads their weights straight into host
+        memory, and its runtime layout is a plain contiguous bf16 weight —
+        identical to the ordinary unquantized path DLO already shards.
         """
         from vllm.model_executor.layers.quantization.online.fp8 import (
             Fp8PerTensorOnlineLinearMethod,
@@ -917,6 +995,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         from vllm_omni.quantization.int8_config import (
             Int8OnlineLinearMethod,
             NPUInt8OnlineLinearMethod,
+            UnquantizedHostLinearMethod,
         )
 
         try:
@@ -938,6 +1017,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             Fp8PerTensorOnlineLinearMethod,
             Int8OnlineLinearMethod,
             NPUInt8OnlineLinearMethod,
+            UnquantizedHostLinearMethod,
             *mxfp8_online_methods,
         )
 
@@ -1065,6 +1145,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # that have loaded weights tracking currently.
         if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
+            # Offline formats can require scales that older online loaders
+            # were allowed to synthesize. Do not apply that legacy tolerance
+            # to an explicitly required checkpoint tensor.
+            required_missing = {
+                name
+                for name, param in model.named_parameters()
+                if name in weights_not_loaded and getattr(param, "is_checkpoint_required", False)
+            }
+            if required_missing:
+                raise ValueError(f"Required weights were not initialized from checkpoint: {required_missing}")
             # NOTE: if the model is quantized, ignore not_loaded check for scale
             # weights. ModelOpt FP8 carries a per-tensor `weight_scale` and a
             # static activation `input_scale`, which the quant method may
@@ -1172,11 +1262,457 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                     raise ValueError(f"Unknown load_format: {load_format}")
         return model
 
+    def _load_model_with_pre_sharded_hsdp(
+        self,
+        model: nn.Module,
+        discovered_modules: PipelineModules,
+        hsdp_config: HSDPInferenceConfig,
+        target_device: torch.device,
+    ) -> nn.Module:
+        """Shard meta DiT parameters before reading their rank-local checkpoint slices."""
+        from torch.distributed.checkpoint import HuggingFaceStorageReader
+        from torch.distributed.checkpoint import load as dcp_load
+
+        if self.counter_before_loading_weights == 0.0:
+            self.counter_before_loading_weights = time.perf_counter()
+
+        load_plan = self._prepare_pre_sharded_hsdp_load(
+            model,
+            discovered_modules,
+            hsdp_config,
+            target_device,
+        )
+        self._check_no_unplanned_meta_tensors(model, load_plan.binding_names)
+        self._validate_pre_sharded_hsdp_bindings(load_plan)
+
+        self._process_pre_sharded_hsdp_groups_on_meta(load_plan)
+
+        for group in load_plan.groups:
+            logger.debug("Applying meta-first HSDP shard to %s", group.name)
+            shard_hsdp_module(group.module, group.context)
+        for root in load_plan.roots:
+            logger.debug("Finalizing meta-first HSDP root %s", root.name)
+            finalize_hsdp_root(root.module, root.context)
+
+        self._materialize_pre_sharded_hsdp_state(model, load_plan, target_device)
+
+        targets = self._get_pre_sharded_hsdp_targets(model, load_plan)
+        checkpoint_states, local_payload_bytes = self._prepare_pre_sharded_checkpoint_states(
+            load_plan,
+            targets,
+        )
+
+        thread_count = int(getattr(self.od_config, "num_weight_load_threads", 4))
+        if _is_distributed_rank_zero():
+            directory_label = "directory" if len(checkpoint_states) == 1 else "directories"
+            logger.info(
+                "Pre-sharded HSDP loading %.2f GiB of rank-local tensor slices directly into "
+                "FSDP-owned storage from %d HF safetensors %s with %d reader thread(s) per rank",
+                local_payload_bytes / 1024**3,
+                len(checkpoint_states),
+                directory_label,
+                thread_count,
+            )
+
+        for checkpoint_dir in sorted(checkpoint_states, key=str):
+            reader = HuggingFaceStorageReader(str(checkpoint_dir), thread_count=thread_count)
+            # Each worker has the full checkpoint available and each DTensor
+            # already describes its rank-local destination slice. Avoid DCP's
+            # coordinator collectives, which can leave rank 0 with less GPU
+            # memory headroom than the other HSDP workers.
+            dcp_load(checkpoint_states[checkpoint_dir], storage_reader=reader, no_dist=True)
+
+        remaining_meta = self._pre_sharded_meta_target_names(model, load_plan)
+        if remaining_meta:
+            raise ValueError(
+                "Pre-sharded HSDP checkpoint loading left tensors on meta; "
+                f"first missing tensors: {remaining_meta[:16]}"
+            )
+
+        self._finalize_pre_sharded_hsdp_loaded_weights(load_plan)
+
+        self.counter_after_loading_weights = time.perf_counter()
+        logger.info_once(
+            "Loading weights took %.2f seconds",
+            self.counter_after_loading_weights - self.counter_before_loading_weights,
+        )
+        self._move_non_hsdp_modules(discovered_modules, target_device)
+        return model
+
+    @staticmethod
+    def _validate_pre_sharded_hsdp_bindings(load_plan: _PreShardedHSDPLoadPlan) -> None:
+        unsupported = [name for name, binding in load_plan.bindings.items() if binding.transform is not None]
+        if unsupported:
+            raise ValueError(
+                "Pre-sharded HSDP requires checkpoint tensors in runtime layout; "
+                f"tensor transforms are unsupported: {unsupported[:16]}"
+            )
+        non_safetensors = sorted(
+            {
+                binding.file_path
+                for binding in load_plan.bindings.values()
+                if not binding.file_path.endswith(".safetensors")
+            }
+        )
+        if non_safetensors:
+            raise ValueError(
+                f"Pre-sharded HSDP requires existing HF safetensors files; unsupported files: {non_safetensors[:8]}"
+            )
+
+    @staticmethod
+    def _get_pre_sharded_hsdp_targets(
+        model: nn.Module,
+        load_plan: _PreShardedHSDPLoadPlan,
+    ) -> dict[str, torch.Tensor]:
+        targets: dict[str, torch.Tensor] = {
+            **dict(model.named_buffers()),
+            **dict(model.named_parameters()),
+        }
+        missing_targets = sorted(load_plan.binding_names - targets.keys())
+        if missing_targets:
+            raise ValueError(
+                f"Pre-sharded HSDP changed checkpoint target names; first missing targets: {missing_targets[:16]}"
+            )
+        return targets
+
+    @staticmethod
+    def _materialize_pre_sharded_hsdp_state(
+        model: nn.Module,
+        load_plan: _PreShardedHSDPLoadPlan,
+        target_device: torch.device,
+    ) -> None:
+        """Materialize the installed FSDP rank-local state before checkpoint I/O.
+
+        ``fully_shard`` supports meta initialization through ``Module.to_empty``:
+        its registered ``_apply`` hooks update the internal sharded storage to
+        point at the newly allocated rank-local tensors. Modules are materialized
+        in the same HSDP-group order and child-first traversal used by ordinary
+        ``fully_shard`` initialization instead of the forward traversal used by
+        a recursive ``to_empty`` call.
+        PyTorch's swap-on-conversion mode preserves Parameter identity so that
+        post-load kernel objects created before sharding cannot retain stale
+        references to the original meta Parameters.
+
+        A complete checkpoint plan covers every parameter and persistent buffer
+        in each DiT.  Non-persistent buffers are not checkpoint entries, so keep
+        their initialized values across ``to_empty``.
+        """
+        unplanned_parameters: list[str] = []
+        saved_buffers: dict[str, torch.Tensor] = {}
+        for root in load_plan.roots:
+            prefix = f"{root.name}."
+            for local_name, _parameter in root.module.named_parameters():
+                full_name = prefix + local_name
+                if full_name not in load_plan.binding_names:
+                    unplanned_parameters.append(full_name)
+            for local_name, buffer in root.module.named_buffers():
+                full_name = prefix + local_name
+                if full_name in load_plan.binding_names:
+                    continue
+                if buffer.device.type == "meta":
+                    raise ValueError(f"Pre-sharded HSDP cannot preserve an unplanned meta buffer: {full_name}")
+                saved_buffers[full_name] = buffer.detach().cpu().clone()
+
+        if unplanned_parameters:
+            raise ValueError(
+                "Pre-sharded HSDP requires checkpoint coverage for every DiT parameter; "
+                f"first unplanned parameters: {unplanned_parameters[:16]}"
+            )
+
+        previous_swap_mode = torch.__future__.get_swap_module_params_on_conversion()
+        torch.__future__.set_swap_module_params_on_conversion(True)
+        try:
+            sharded_group_roots = {group.module for group in load_plan.groups}
+            materialized_modules: set[nn.Module] = set()
+            for group in load_plan.groups:
+                for module in DiffusersPipelineLoader._hsdp_managed_modules_post_order(
+                    group.module,
+                    nested_hsdp_roots=sharded_group_roots - {group.module},
+                ):
+                    if module not in materialized_modules:
+                        module.to_empty(device=target_device, recurse=False)
+                        materialized_modules.add(module)
+            for root in load_plan.roots:
+                for module in DiffusersPipelineLoader._hsdp_managed_modules_post_order(
+                    root.module,
+                    nested_hsdp_roots=sharded_group_roots,
+                ):
+                    if module not in materialized_modules:
+                        module.to_empty(device=target_device, recurse=False)
+                        materialized_modules.add(module)
+        finally:
+            torch.__future__.set_swap_module_params_on_conversion(previous_swap_mode)
+
+        if saved_buffers:
+            materialized_buffers = dict(model.named_buffers())
+            with torch.no_grad():
+                for name, value in saved_buffers.items():
+                    target = materialized_buffers[name]
+                    target.copy_(value.to(device=target.device, dtype=target.dtype))
+
+    @staticmethod
+    def _hsdp_managed_modules_post_order(
+        root: nn.Module,
+        *,
+        nested_hsdp_roots: set[nn.Module],
+    ) -> list[nn.Module]:
+        """Mirror FSDP's child-first managed-module traversal.
+
+        Nested FSDP roots own their own parameters and are materialized in their
+        corresponding load group, so the enclosing traversal must not descend
+        into them.
+        """
+        modules: list[nn.Module] = []
+        visited: set[nn.Module] = set()
+
+        def visit(module: nn.Module) -> None:
+            if module in visited:
+                return
+            visited.add(module)
+            for child in module.children():
+                if child not in nested_hsdp_roots:
+                    visit(child)
+            modules.append(module)
+
+        visit(root)
+        return modules
+
+    @staticmethod
+    def _prepare_pre_sharded_checkpoint_states(
+        load_plan: _PreShardedHSDPLoadPlan,
+        targets: dict[str, torch.Tensor],
+    ) -> tuple[dict[Path, dict[str, torch.Tensor]], int]:
+        from torch.distributed.tensor import DTensor
+
+        checkpoint_states: dict[Path, dict[str, torch.Tensor]] = {}
+        checkpoint_owners: dict[tuple[Path, str], str] = {}
+        local_payload_bytes = 0
+        for name, binding in load_plan.bindings.items():
+            target = targets[name]
+
+            checkpoint_dir = Path(binding.file_path).parent
+            owner_key = (checkpoint_dir, binding.checkpoint_key)
+            if previous_owner := checkpoint_owners.get(owner_key):
+                raise ValueError(
+                    "Pre-sharded HSDP cannot bind one checkpoint tensor to multiple runtime tensors: "
+                    f"{binding.checkpoint_key!r} maps to both {previous_owner!r} and {name!r}"
+                )
+            checkpoint_owners[owner_key] = name
+
+            if target.device.type == "meta":
+                raise ValueError(f"Pre-sharded HSDP target {name!r} was not materialized")
+
+            local_target = target.to_local() if isinstance(target, DTensor) else target
+            local_payload_bytes += local_target.numel() * local_target.element_size()
+            checkpoint_states.setdefault(checkpoint_dir, {})[binding.checkpoint_key] = target
+        return checkpoint_states, local_payload_bytes
+
+    @staticmethod
+    def _pre_sharded_meta_target_names(
+        model: nn.Module,
+        load_plan: _PreShardedHSDPLoadPlan,
+    ) -> list[str]:
+        from torch.distributed.tensor import DTensor
+
+        targets = {
+            **dict(model.named_buffers()),
+            **dict(model.named_parameters()),
+        }
+        return [
+            name
+            for name in load_plan.binding_names
+            if (target := targets[name]).device.type == "meta"
+            or (isinstance(target, DTensor) and target.to_local().device.type == "meta")
+        ]
+
+    @staticmethod
+    def _process_pre_sharded_hsdp_groups_on_meta(load_plan: _PreShardedHSDPLoadPlan) -> None:
+        modules_to_process: list[tuple[nn.Module, QuantizeMethodBase]] = []
+        for group in load_plan.groups:
+            for _, module in group.module.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is None or not isinstance(quant_method, QuantizeMethodBase):
+                    continue
+                modules_to_process.append((module, quant_method))
+
+        if not modules_to_process:
+            return
+        for root in load_plan.roots:
+            if not getattr(root.module, "_hsdp_pre_sharded_meta_post_load", False):
+                raise ValueError(
+                    f"Model {type(root.module).__name__} has not declared its post-load processing safe "
+                    "for pre-sharded meta initialization"
+                )
+        for module, quant_method in modules_to_process:
+            if type(quant_method) is not UnquantizedLinearMethod:
+                raise ValueError(
+                    "Pre-sharded HSDP does not support the selected post-load processing; "
+                    f"{type(module).__name__} uses {type(quant_method).__name__}"
+                )
+        for module, quant_method in modules_to_process:
+            quant_method.process_weights_after_loading(module)
+
+    def _prepare_pre_sharded_hsdp_load(
+        self,
+        model: nn.Module,
+        discovered_modules: PipelineModules,
+        hsdp_config: HSDPInferenceConfig,
+        target_device: torch.device,
+    ) -> _PreShardedHSDPLoadPlan:
+        outer_dit_names, outer_dits = discovered_modules.outermost_dits()
+        if not outer_dits:
+            raise ValueError("No DiT modules discovered for HSDP sharding")
+
+        sources = self._get_weight_sources(model)
+        plan_result = build_checkpoint_binding_plan(
+            model,
+            dit_modules=tuple(zip(outer_dit_names, outer_dits)),
+            sources=sources,
+            model_path=str(getattr(self.od_config, "model", "")) or None,
+            tensor_parallel_size=int(getattr(self.parallel_config, "tensor_parallel_size", 1)),
+            online_quantization=False,
+        )
+        if plan_result.plan is None:
+            raise ValueError(f"Pre-sharded HSDP checkpoint loading is incompatible: {plan_result.fallback_reason}")
+        plan = plan_result.plan
+        unsupported_sources = [source.prefix for source in sources if source.prefix not in plan.planned_source_prefixes]
+        if unsupported_sources:
+            raise ValueError(
+                "Pre-sharded HSDP checkpoint loading requires dedicated DiT sources; "
+                f"unsupported source prefixes: {unsupported_sources}"
+            )
+
+        roots: list[_HSDPLoadRoot] = []
+        groups: list[_HSDPModuleLoadGroup] = []
+        for outer_name, outer_dit in zip(outer_dit_names, outer_dits):
+            conditions = getattr(outer_dit, "_hsdp_shard_conditions", None)
+            if not conditions:
+                raise ValueError(f"Model {type(outer_dit).__name__} has no _hsdp_shard_conditions defined")
+
+            context = prepare_hsdp_shard_context(
+                outer_dit,
+                hsdp_config,
+                target_device=target_device,
+            )
+            roots.append(_HSDPLoadRoot(outer_name, outer_dit, context))
+            for local_name, module in reversed(list(outer_dit.named_modules())):
+                if not any(condition(local_name, module) for condition in conditions):
+                    continue
+                if not local_name:
+                    raise ValueError("_hsdp_shard_conditions must not select the DiT root")
+                full_name = f"{outer_name}.{local_name}" if local_name else outer_name
+                groups.append(_HSDPModuleLoadGroup(full_name, module, context))
+
+        parameters = dict(model.named_parameters())
+        targets: dict[str, torch.Tensor] = {**dict(model.named_buffers()), **parameters}
+        preserved_params = {param for root in roots for param in root.context.ignored_params or ()}
+        binding_names = frozenset(plan.bindings)
+        self._release_hsdp_checkpoint_targets_to_meta(
+            model,
+            targets,
+            parameters,
+            binding_names,
+            preserved_params,
+        )
+
+        return _PreShardedHSDPLoadPlan(
+            roots=roots,
+            groups=groups,
+            bindings=plan.bindings,
+            binding_names=binding_names,
+        )
+
+    @staticmethod
+    def _check_no_unplanned_meta_tensors(model: nn.Module, planned_names: frozenset[str]) -> None:
+        unplanned_meta = [
+            name
+            for name, tensor in (*model.named_parameters(), *model.named_buffers())
+            if tensor.device.type == "meta" and name not in planned_names
+        ]
+        if unplanned_meta:
+            raise ValueError(
+                "Pre-sharded HSDP initialized tensors on meta that are not covered by the "
+                f"checkpoint plan. First unplanned tensors: {unplanned_meta[:16]}"
+            )
+
+    @staticmethod
+    def _release_hsdp_checkpoint_targets_to_meta(
+        model: nn.Module,
+        targets: dict[str, torch.Tensor],
+        parameters: dict[str, nn.Parameter],
+        binding_names: frozenset[str],
+        preserved_params: set[nn.Parameter],
+    ) -> None:
+        released: dict[str, tuple[int, float]] = {}
+        for name in binding_names:
+            target = targets[name]
+            if target in preserved_params or target.device.type == "meta":
+                continue
+            logical_gib = target.numel() * target.element_size() / 1024**3
+            device_type = target.device.type
+            count, gib = released.get(device_type, (0, 0.0))
+            released[device_type] = (count + 1, gib + logical_gib)
+            if name in parameters:
+                replacement = DiffusersPipelineLoader._make_parameter_like(
+                    target,
+                    torch.empty_like(target, device="meta"),
+                )
+                torch.utils.swap_tensors(target, replacement)
+            else:
+                replacement = torch.empty_like(target, device="meta")
+                torch.utils.swap_tensors(target, replacement)
+        if released:
+            logger.info("Released HSDP checkpoint-covered tensors to meta before pre-sharded load: %s", released)
+
+    @staticmethod
+    def _make_parameter_like(template: nn.Parameter, tensor: torch.Tensor) -> nn.Parameter:
+        """Create a Parameter on new storage while preserving loader metadata."""
+        if type(template) is nn.Parameter:
+            replacement = nn.Parameter(tensor, requires_grad=template.requires_grad)
+            replacement.__dict__.update(getattr(template, "__dict__", {}))
+            return replacement
+
+        replacement = template.__class__.__new__(template.__class__, tensor)
+        replacement.__dict__.update(getattr(template, "__dict__", {}))
+        replacement.requires_grad_(template.requires_grad)
+        return replacement
+
+    @staticmethod
+    def _finalize_pre_sharded_hsdp_loaded_weights(
+        load_plan: _PreShardedHSDPLoadPlan,
+    ) -> None:
+        """Run model post-load hooks for tensors materialized by pre-sharded loading."""
+        for root in load_plan.roots:
+            post_load = getattr(root.module, "post_load_weights", None)
+            if callable(post_load):
+                post_load()
+            root.module.eval()
+            validate = getattr(root.module, "validate_loaded_weights", None)
+            if callable(validate):
+                prefix = f"{root.name}."
+                validate({name.removeprefix(prefix) for name in load_plan.binding_names if name.startswith(prefix)})
+
+    @staticmethod
+    def _move_non_hsdp_modules(
+        discovered_modules: PipelineModules,
+        target_device: torch.device,
+    ) -> None:
+        modules_to_move: list[nn.Module] = []
+        if discovered_modules.vaes is not None:
+            modules_to_move.extend(discovered_modules.vaes)
+        if discovered_modules.encoders is not None:
+            modules_to_move.extend(discovered_modules.encoders)
+        if discovered_modules.resident_modules is not None:
+            modules_to_move.extend(discovered_modules.resident_modules)
+        for module in modules_to_move:
+            module.to(target_device)
+
     def _load_model_with_hsdp(
         self,
         target_device: torch.device,
         load_format: str = "default",
         custom_pipeline_name: str | type[nn.Module] | None = None,
+        offload_after_quant: bool = False,
     ) -> nn.Module:
         """Load model with HSDP sharding for inference.
 
@@ -1200,40 +1736,77 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # mapping (QKV fusion, etc.).
         if load_format == "diffusers":
             raise ValueError("HSDP is not supported with the diffusers adapter load format")
-        model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
-        world_size = 1
-        rank = 0
-        if torch.distributed.is_initialized():
-            world_size = torch.distributed.get_world_size()
-            rank = torch.distributed.get_rank()
+        strategy = getattr(self.od_config, "hsdp_weight_load_strategy", "full")
+        if strategy == "pre_sharded":
+            if load_format != "default":
+                raise ValueError(
+                    f"hsdp_weight_load_strategy={strategy!r} currently supports only diffusion_load_format='default'"
+                )
+            if self.quant_config is not None:
+                raise ValueError(f"hsdp_weight_load_strategy={strategy!r} does not support quantization yet")
+            if getattr(self.od_config, "lora_path", None):
+                raise ValueError(f"hsdp_weight_load_strategy={strategy!r} does not support LoRA yet")
+        elif strategy != "full":
+            raise ValueError(f"Unknown hsdp_weight_load_strategy: {strategy!r}")
 
-        has_online_quant = self._has_online_quant(model) or (
-            self.quant_config is not None and not getattr(self.quant_config, "is_checkpoint_quantized", False)
-        )
-        enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
-
-        if enable_broadcast and has_online_quant:
-            logger.info(
-                "Worker %d: Online quantization detected; falling back to ordinary per-rank weight loading for HSDP",
-                rank,
+        if strategy == "pre_sharded":
+            model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
+            discovered_modules = ModuleDiscovery.discover(model)
+            return self._load_model_with_pre_sharded_hsdp(
+                model,
+                discovered_modules,
+                hsdp_config,
+                target_device,
             )
-            enable_broadcast = False
 
-        if enable_broadcast:
-            if rank == 0:
+        # Same host-fallback bound as the ordinary path: with a quant config the
+        # HSDP path initializes on the accelerator (hsdp_defer_to_cpu=False), so
+        # over-wide NPU-unquantizable fallback weights would otherwise round-trip
+        # through the device before apply_hsdp_to_model shards them. Loading them
+        # straight into host memory keeps the load-time device peak at the
+        # quantizable layers alone; sharding then distributes the fallback like
+        # any other parameter. Broadcast loading excludes online quantization
+        # already, so the context below only ever matters on the ordinary
+        # per-rank branch -- but spanning both is harmless.
+        from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
+
+        fallback_ctx = load_unquantizable_fallback_on_cpu() if offload_after_quant else contextlib.nullcontext()
+        with fallback_ctx:
+            model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=True)
+            world_size = 1
+            rank = 0
+            if torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                rank = torch.distributed.get_rank()
+
+            has_online_quant = self._has_online_quant(model) or (
+                self.quant_config is not None and not getattr(self.quant_config, "is_checkpoint_quantized", False)
+            )
+            enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
+
+            if enable_broadcast and has_online_quant:
+                logger.info(
+                    "Worker %d: Online quantization detected; falling back to ordinary "
+                    "per-rank weight loading for HSDP",
+                    rank,
+                )
+                enable_broadcast = False
+
+            if enable_broadcast:
+                if rank == 0:
+                    self.load_weights(model)
+                    self._maybe_fuse_distilled_lora(model)
+                self._broadcast_model_weights(model, target_device=target_device, src_rank=0)
+                if (
+                    rank != 0
+                    and getattr(self.od_config, "lora_backend", None) in (LoRABackend.DISTILL, "distill")
+                    and getattr(self.od_config, "lora_path", None)
+                    and hasattr(model, "load_lora_weights")
+                ):
+                    setattr(model, "lora_is_fused", True)
+            else:
                 self.load_weights(model)
                 self._maybe_fuse_distilled_lora(model)
-            self._broadcast_model_weights(model, target_device=target_device, src_rank=0)
-            if (
-                rank != 0
-                and getattr(self.od_config, "lora_backend", None) in (LoRABackend.DISTILL, "distill")
-                and getattr(self.od_config, "lora_path", None)
-                and hasattr(model, "load_lora_weights")
-            ):
-                setattr(model, "lora_is_fused", True)
-        else:
-            self.load_weights(model)
-            self._maybe_fuse_distilled_lora(model)
 
         # Quantization methods must finish while parameters are ordinary local
         # tensors. Some post-load transforms use operations (for example,

@@ -78,10 +78,15 @@ class _ParallelStub:
 @dataclass
 class _TopologyStub:
     parallel_config: _ParallelStub = field(default_factory=_ParallelStub)
+    diffusion_offload_config: object = None
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_resident_layers: int = 0
+    dlo_host_registration_limit_gib: float = 0.0
+    host_weight_runtime_mode: str = "disabled"
+    pin_cpu_memory: bool = True
     quantization_config: object = None
     cache_backend: str = "none"
     custom_pipeline_args: dict[str, object] = field(default_factory=dict)
@@ -171,7 +176,7 @@ def test_huggingface_url_resolves_pinned_snapshot(tmp_path, monkeypatch):
         else pytest.fail("unexpected snapshot request")
     )
     monkeypatch.setattr(
-        "vllm.transformers_utils.repo_utils.hf_api",
+        "vllm_omni.transformers_utils.repo_utils.hf_api",
         lambda: api,
     )
     assert _resolve_checkpoint_root(
@@ -383,26 +388,33 @@ def test_native_topology_rejects_nondivisible_tensor_parallelism():
 
 
 def test_native_topology_accepts_single_device_layerwise_with_cpu_staging():
-    config = _topology_config(
-        enable_layerwise_offload=True,
-        additional_config={},
+    _validate_native_topology(
+        _topology_config(
+            enable_layerwise_offload=True,
+            additional_config={},
+        )
     )
-    _validate_native_topology(config)
+    _validate_native_topology(
+        _topology_config(
+            enable_cpu_offload=True,
+            enable_layerwise_offload=True,
+            additional_config={},
+        )
+    )
 
-    config.enable_cpu_offload = True
-    _validate_native_topology(config)
-
-    config.enable_layerwise_offload = False
-    with pytest.raises(ValueError, match="Combine --enable-cpu-offload"):
-        _validate_native_topology(config)
+    with pytest.raises(ValueError, match="already stages its auxiliary components"):
+        _validate_native_topology(
+            _topology_config(
+                enable_cpu_offload=True,
+                additional_config={},
+            )
+        )
 
 
 def test_native_topology_requires_dlo_rank_local_mode():
-    config = _topology_config(enable_distributed_layerwise_offload=True)
     with pytest.raises(ValueError, match="dlo-no-use-allgather"):
-        _validate_native_topology(config)
-    config.dlo_use_allgather = False
-    _validate_native_topology(config)
+        _validate_native_topology(_topology_config(enable_distributed_layerwise_offload=True))
+    _validate_native_topology(_topology_config(enable_distributed_layerwise_offload=True, dlo_use_allgather=False))
 
 
 def test_native_topology_accepts_four_device_hsdp_cfg_and_vae_layouts():

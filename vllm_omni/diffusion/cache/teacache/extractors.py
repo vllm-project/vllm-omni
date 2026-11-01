@@ -20,6 +20,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from einops import rearrange
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import get_forward_context
@@ -199,7 +200,7 @@ def extract_qwen_context(
     hidden_states, vid_freqs, txt_freqs = module.image_rope_prepare(hidden_states, img_shapes, txt_seq_lens)
     image_rotary_emb = (vid_freqs, txt_freqs)
 
-    timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype)
+    timestep = torch.as_tensor(timestep, device=hidden_states.device, dtype=hidden_states.dtype)
 
     # Call modulate_index_prepare instead of handling timestep directly.
     # For zero_cond_t=False: timestep unchanged, modulate_index=None.
@@ -444,6 +445,7 @@ def extract_zimage_context(
         cap_pos_ids,
         x_inner_pad_mask,
         cap_inner_pad_mask,
+        _cap_feats_2,
     ) = module.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
 
     # Process image patches through embedder and noise refiner
@@ -618,6 +620,8 @@ def extract_flux2_klein_context(
     # ============================================================================
     dtype = hidden_states.dtype
 
+    if encoder_hidden_states is None:
+        raise ValueError("Flux2Klein requires encoder_hidden_states")
     num_txt_tokens = encoder_hidden_states.shape[1]
 
     timestep = timestep.to(dtype=dtype) * 1000
@@ -817,6 +821,114 @@ def extract_longcat_context(
         temb=temb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
+    )
+
+
+def extract_mammoth_moda2_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_hidden_states: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    text_attention_mask: torch.Tensor,
+    ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
+    ar_image_hidden_states: torch.Tensor | None = None,
+    ar_image_attention_mask: torch.Tensor | None = None,
+    return_dict: bool = False,
+    teacache_branch: str | None = None,
+) -> CacheContext:
+    """Extract cache context for MammothModa2's Lumina-style DiT."""
+    if not hasattr(module, "layers") or len(module.layers) == 0:
+        raise ValueError("Module must have layers")
+
+    batch_size, height, width = module._validate_inputs(
+        hidden_states,
+        text_hidden_states,
+        text_attention_mask,
+        ref_image_hidden_states,
+        return_dict,
+    )
+
+    (
+        temb,
+        text_hidden_states,
+        text_attention_mask,
+        img_tokens,
+        img_mask,
+        img_len,
+        context_rotary_emb,
+        noise_rotary_emb,
+        rotary_emb,
+        encoder_seq_lengths,
+        seq_lengths,
+    ) = module._prepare_embeddings(
+        hidden_states,
+        timestep,
+        text_hidden_states,
+        text_attention_mask,
+        freqs_cis,
+        batch_size,
+        height,
+        width,
+        ar_image_hidden_states,
+        ar_image_attention_mask,
+    )
+
+    text_hidden_states, img_tokens = module._apply_refiners(
+        text_hidden_states,
+        text_attention_mask,
+        context_rotary_emb,
+        img_tokens,
+        img_mask,
+        noise_rotary_emb,
+        temb,
+    )
+
+    max_seq_len = max(seq_lengths)
+    attention_mask = img_tokens.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
+    joint_hidden_states = img_tokens.new_zeros(batch_size, max_seq_len, module.config.hidden_size)
+    for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+        attention_mask[i, :seq_len] = True
+        joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
+        joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
+
+    modulated_input = module.layers[0].norm1(joint_hidden_states, temb)[0]
+
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        h = module._apply_transformer_layers(joint_hidden_states, attention_mask, rotary_emb, temb)
+        return (h,)
+
+    def postprocess(h: torch.Tensor) -> torch.Tensor:
+        h = module.norm_out(h, temb)
+        p = module.config.patch_size
+        img_hidden_states = torch.stack(
+            [
+                h[i, encoder_seq_len : encoder_seq_len + img_len]
+                for i, encoder_seq_len in enumerate(encoder_seq_lengths)
+            ],
+            dim=0,
+        )
+        return rearrange(
+            img_hidden_states,
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=height // p,
+            w=width // p,
+            p1=p,
+            p2=p,
+        )
+
+    extra_states = {}
+    if teacache_branch is not None:
+        extra_states["teacache_branch"] = teacache_branch
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=joint_hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states=extra_states,
     )
 
 
@@ -1216,7 +1328,13 @@ def extract_sensenova_u1_context(
     modulated_input = first_layer.input_layernorm_mot_gen(inputs_embeds)
 
     def run_transformer_blocks():
+        assert indexes is not None
         h = inputs_embeds
+        position_embeddings = (
+            module.model.rotary_emb(h, indexes[0].unsqueeze(0)),
+            module.model.rotary_emb_hw(h, indexes[1].unsqueeze(0)),
+            module.model.rotary_emb_hw(h, indexes[2].unsqueeze(0)),
+        )
         for layer in module.model.layers:
             h = layer(
                 h,
@@ -1224,6 +1342,7 @@ def extract_sensenova_u1_context(
                 exist_und=exist_und,
                 exist_gen=exist_gen,
                 indexes=indexes,
+                position_embeddings=position_embeddings,
                 attention_mask=causal_mask_mapping,
                 past_key_values=past_key_values,
                 **layer_kwargs,
@@ -1260,7 +1379,7 @@ def extract_minimax_h3_context(
     preprocessing via ``_embed``, cacheable ``blocks`` loop, and
     ``final_layer`` postprocessing with row selection and update masks.
     """
-    from vllm_omni.diffusion.attention.ops.minimax_h3_modulation import indexed_scale_shift_
+    from vllm_omni.diffusion.layers.indexed_modulation import indexed_scale_shift_
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _FORWARD_SUPPORTED_KWARGS,
         MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -1466,6 +1585,80 @@ def extract_minimax_h3_context(
     )
 
 
+def extract_cosmos3_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_ids: torch.Tensor,
+    text_mask: torch.Tensor,
+    video_shape: tuple[int, int, int],
+    fps: float | None = None,
+    action_latents: torch.Tensor | None = None,
+    action_domain_ids: torch.Tensor | None = None,
+    action_noisy_mask: torch.Tensor | None = None,
+    action_start_frame_offset: int = 1,
+    action_fps: float | None = None,
+    sound_latents: torch.Tensor | None = None,
+    noisy_frame_mask: torch.Tensor | None = None,
+    control_latents: list[torch.Tensor] | tuple[torch.Tensor, ...] | torch.Tensor | None = None,
+    control_weights: list[float] | tuple[float, ...] | torch.Tensor | None = None,
+    transfer_share_vision_temporal_positions: bool = True,
+    **kwargs: Any,
+) -> CacheContext:
+    """Build the shared cache execution context for Cosmos3's GEN pathway."""
+    if kwargs:
+        raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
+
+    prep = module._gen_preprocess(
+        hidden_states,
+        timestep,
+        text_ids,
+        text_mask,
+        video_shape,
+        fps=fps,
+        action_latents=action_latents,
+        action_domain_ids=action_domain_ids,
+        action_noisy_mask=action_noisy_mask,
+        action_start_frame_offset=action_start_frame_offset,
+        action_fps=action_fps,
+        sound_latents=sound_latents,
+        noisy_frame_mask=noisy_frame_mask,
+        control_latents=control_latents,
+        control_weights=control_weights,
+        transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
+    )
+    # Cache residuals stay rank-local: shard before the context and its
+    # closures retain prep; postprocess gathers on both misses and hits.
+    prep = module._shard_gen_prep(prep, defer_gather=True)
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
+        return (module._run_gen_stack(prep),)
+
+    def postprocess(hidden: torch.Tensor) -> Any:
+        return module._gen_postprocess(hidden, prep)
+
+    if control_latents is None:
+        controls: list[torch.Tensor] = []
+    elif isinstance(control_latents, torch.Tensor):
+        controls = [control_latents]
+    else:
+        controls = list(control_latents)
+
+    return CacheContext(
+        # SeaCache uses the separate inputs in extra_states for its decision.
+        modulated_input=prep.hidden_gen,
+        hidden_states=prep.hidden_gen,
+        encoder_hidden_states=None,
+        temb=prep.time_embed,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states={
+            "sea_cache_latents": [*controls, hidden_states],
+            "sea_cache_noisy_frame_mask": noisy_frame_mask,
+        },
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1475,11 +1668,14 @@ def extract_minimax_h3_context(
 EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "QwenImageTransformer2DModel": extract_qwen_context,
     "Bagel": extract_bagel_context,
+    "Cosmos3EdgeVFMTransformer": extract_cosmos3_context,
+    "Cosmos3VFMTransformer": extract_cosmos3_context,
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
     "Flux2Transformer2DModel": extract_flux2_context,
     "LongCatImageTransformer2DModel": extract_longcat_context,
+    "MammothModa2Transformer2DModel": extract_mammoth_moda2_context,
     "FluxTransformer2DModel": extract_flux_context,
     "SenseNovaU1ForCausalLM": extract_sensenova_u1_context,
     "MiniMaxH3DiTModel": extract_minimax_h3_context,
@@ -1521,16 +1717,15 @@ def register_extractor(transformer_cls_name: str, extractor_fn: Callable) -> Non
     EXTRACTOR_REGISTRY[transformer_cls_name] = extractor_fn
 
 
-def get_extractor(transformer_cls_name: str) -> Callable:
+def get_extractor(transformer_type: str | type) -> Callable:
     """
     Get extractor function for given transformer class.
 
-    This function looks up the extractor based on the exact transformer_cls_name string,
-    which should match the transformer type in the pipeline (i.e., pipeline.transformer.__class__.__name__).
+    String lookups match an exact registered name. Type lookups also check base
+    classes so runtime wrappers such as FSDP retain the underlying model extractor.
 
     Args:
-        transformer_cls_name: Transformer class name (e.g., "QwenImageTransformer2DModel")
-                                Must exactly match a key in EXTRACTOR_REGISTRY.
+        transformer_type: Transformer class name or runtime type.
 
     Returns:
         Extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -1543,14 +1738,18 @@ def get_extractor(transformer_cls_name: str) -> Callable:
         >>> extractor = get_extractor("QwenImageTransformer2DModel")
         >>> ctx = extractor(transformer, hidden_states, encoder_hidden_states, timestep, ...)
     """
-    # Direct lookup - no substring matching
-    if transformer_cls_name in EXTRACTOR_REGISTRY:
-        return EXTRACTOR_REGISTRY[transformer_cls_name]
+    candidate_names: tuple[str, ...]
+    if isinstance(transformer_type, str):
+        candidate_names = (transformer_type,)
+    else:
+        candidate_names = tuple(candidate.__name__ for candidate in transformer_type.__mro__)
+    for candidate_name in candidate_names:
+        if candidate_name in EXTRACTOR_REGISTRY:
+            return EXTRACTOR_REGISTRY[candidate_name]
 
-    # No match found
     available_types = list(EXTRACTOR_REGISTRY.keys())
     raise ValueError(
-        f"Unknown model type: '{transformer_cls_name}'. "
+        f"Unknown model type: '{transformer_type}'. "
         f"Available types: {available_types}\n"
         f"To add support for a new model, use register_extractor() or add to EXTRACTOR_REGISTRY."
     )

@@ -9,7 +9,7 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
 
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
-from vllm_omni.outputs.output_modality import OutputModality, TensorAccumulationStrategy
+from vllm_omni.outputs.output_modality import OutputModality
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor, OmniRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -58,7 +58,7 @@ def test_rate_is_latest_snapshot_before_consolidation(key, representation):
         assert payload.get(key) is payload.to_dict()[key]
     payload = payload.merged_with(MultimodalPayload(tensors={"audio": torch.full((2,), 3)}))
     assert int(payload[key]) == 48000  # Missing metadata means retain, not clear.
-    payload.consolidate_tensors(TensorAccumulationStrategy.CONCAT_LAST)
+    payload.consolidate_tensors(OutputModality.AUDIO)
     payload.consolidate_metadata()
     torch.testing.assert_close(payload["audio"], torch.arange(4).repeat_interleave(2))
 
@@ -86,7 +86,7 @@ def test_self_merge_retains_snapshot_and_content(key):
     assert payload is not None
     payload = payload.merged_with(payload)
     assert int(payload[key]) == 24000
-    payload.consolidate_tensors(TensorAccumulationStrategy.CONCAT_LAST)
+    payload.consolidate_tensors(OutputModality.AUDIO)
     torch.testing.assert_close(payload["audio"], torch.tensor([1.0, 2.0, 1.0, 2.0]))
 
 
@@ -138,6 +138,6 @@ def test_non_snapshot_tensors_still_accumulate_and_empty_merge_keeps_identity():
     assert first is not None and second is not None
     assert MultimodalPayload().merged_with(first) is first
     merged = first.merged_with(second)
-    merged.consolidate_tensors(TensorAccumulationStrategy.CONCAT_LAST)
+    merged.consolidate_tensors(OutputModality.AUDIO)
     torch.testing.assert_close(merged["latent"], torch.tensor([1.0, 3.0]))
     torch.testing.assert_close(merged["audio"], torch.tensor([2.0, 4.0]))

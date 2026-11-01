@@ -143,8 +143,20 @@ fraction to select additional resident sessions up to the model-declared cap.
 All model-owned reservations are deducted before the paged self-attention pool
 is allocated.
 
-LingBot reports its persistent full-horizon image-condition tensor. DreamZero
-reports the measured 603 MiB per-session Wan VAE causal-convolution state.
+LingBot advances a session-owned causal Wan VAE encoder for each condition
+block: the opening pixel frame is followed by four zero pixel frames per later
+latent frame. It retains one current condition block, with separate committed
+and in-flight encoder histories so a failed block cannot overwrite committed
+context. The state reservation includes both encoder histories, derived from
+the encoder's convolution input grids, and the streaming decoder cache. These
+caches are released through the same close/reset hooks. Condition encoding
+currently requires the unpatched, non-tiled Wan encoder path; the existing
+decoder's tiling fallback remains independent. Real-weight GPU parity with a
+full-horizon encode still requires validation because the pointwise posterior
+projection now runs per block.
+
+DreamZero reports the measured 603 MiB per-session Wan VAE causal-convolution
+state.
 
 ## Concurrency and routing limits
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Generate a nightly Excel performance report from JSON results.
 
@@ -137,6 +140,7 @@ def _omni_group_key(record: dict[str, Any]) -> tuple[Any, ...]:
     return (
         record.get("model_id") or "",
         record.get("test_name") or "",
+        record.get("name") or "",
         record.get("dataset_name") or "",
         record.get("max_concurrency") if record.get("max_concurrency") is not None else 0,
         record.get("num_prompts") if record.get("num_prompts") is not None else 0,
@@ -171,6 +175,7 @@ def _load_summary_columns(script_dir: str) -> list[str]:
         "model_id",
         "tokenizer_id",
         "test_name",
+        "name",
         "dataset_name",
         "num_prompts",
         "request_rate",
@@ -218,7 +223,7 @@ def _load_summary_columns(script_dir: str) -> list[str]:
 
 def _ensure_omni_summary_columns(summary_columns: list[str]) -> list[str]:
     """Ensure omni summary contains required columns, even when a custom columns file exists."""
-    required = ("test_name", "dataset_name", "source_file")
+    required = ("test_name", "name", "dataset_name", "source_file")
     existing = set(summary_columns)
     if all(c in existing for c in required):
         return summary_columns
@@ -232,8 +237,18 @@ def _ensure_omni_summary_columns(summary_columns: list[str]) -> list[str]:
         else:
             out.append("test_name")
     existing = set(out)
-    if "dataset_name" not in existing:
+    if "name" not in existing:
         if "test_name" in out:
+            idx = out.index("test_name") + 1
+            out.insert(idx, "name")
+        else:
+            out.append("name")
+    existing = set(out)
+    if "dataset_name" not in existing:
+        if "name" in out:
+            idx = out.index("name") + 1
+            out.insert(idx, "dataset_name")
+        elif "test_name" in out:
             idx = out.index("test_name") + 1
             out.insert(idx, "dataset_name")
         else:

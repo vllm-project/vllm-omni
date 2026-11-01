@@ -24,6 +24,11 @@ from tests.diffusion.offloader.helpers import (
     patch_offload_runtime,
 )
 from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+from vllm_omni.diffusion.offloader.block_discovery import (
+    get_blocks_attr_names,
+    get_blocks_from_dit,
+    set_blocks_attr_names,
+)
 from vllm_omni.diffusion.offloader.layerwise_backend import (
     LayerWiseOffloadBackend,
     LayerwiseOffloadHook,
@@ -209,21 +214,21 @@ class _NoAttrsModel(nn.Module):
 class TestGetBlocksFromDit:
     def test_get_blocks_from_dit_single_block_attr(self):
         model = _SingleBlockModel(num_blocks=3)
-        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        attr_names, blocks = get_blocks_from_dit(model)
         assert attr_names == ["blocks"]
         assert len(blocks) == 3
         assert all(isinstance(b, _DummyBlock) for b in blocks)
 
     def test_get_blocks_from_dit_multi_block_attrs(self):
         model = _MultiBlockModel(num_transformer=2, num_single=3)
-        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        attr_names, blocks = get_blocks_from_dit(model)
         assert set(attr_names) == {"transformer_blocks", "single_transformer_blocks"}
         assert len(blocks) == 5
         assert all(isinstance(b, _DummyBlock) for b in blocks)
 
     def test_get_blocks_from_dit_empty_blocks(self):
         model = _EmptyBlocksModel()
-        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        attr_names, blocks = get_blocks_from_dit(model)
         assert attr_names == []
         assert blocks == []
 
@@ -233,17 +238,17 @@ class TestGetBlocksFromDit:
             AttributeError,
             match="Attribute 'nonexistent_blocks' declared in _layerwise_offload_blocks_attrs does not exist",
         ):
-            LayerWiseOffloadBackend.get_blocks_from_dit(model)
+            get_blocks_from_dit(model)
 
     def test_get_blocks_from_dit_no_attrs_defined(self):
         model = _NoAttrsModel(num_blocks=3)
-        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        attr_names, blocks = get_blocks_from_dit(model)
         assert attr_names == []
         assert blocks == []
 
     def test_get_blocks_from_dit_deprecated_single_attr(self):
         model = _DeprecatedSingleAttrModel(num_blocks=2)
-        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
+        attr_names, blocks = get_blocks_from_dit(model)
         assert attr_names == ["blocks"]
         assert len(blocks) == 2
 
@@ -251,17 +256,17 @@ class TestGetBlocksFromDit:
 class TestGetBlocksAttrNames:
     def test_get_blocks_attr_names_new_format(self):
         model = _MultiBlockModel()
-        attrs = LayerWiseOffloadBackend.get_blocks_attr_names(model)
+        attrs = get_blocks_attr_names(model)
         assert attrs == ["transformer_blocks", "single_transformer_blocks"]
 
     def test_get_blocks_attr_names_no_attrs(self):
         model = _NoAttrsModel()
-        attrs = LayerWiseOffloadBackend.get_blocks_attr_names(model)
+        attrs = get_blocks_attr_names(model)
         assert attrs == []
 
     def test_set_blocks_attr_names(self):
         model = _NoAttrsModel()
-        LayerWiseOffloadBackend.set_blocks_attr_names(model, ["new_blocks"])
+        set_blocks_attr_names(model, ["new_blocks"])
         assert hasattr(model.__class__, "_layerwise_offload_blocks_attrs")
         assert model.__class__._layerwise_offload_blocks_attrs == ["new_blocks"]
 
@@ -536,6 +541,24 @@ class TestLayerwiseComponentSelection:
         assert not backend.enabled
         for name, tensor in pipeline.state_dict().items():
             torch.testing.assert_close(tensor, expected[name])
+
+    def test_shutdown_skips_block_restore(self, patched_offload_runtime, monkeypatch):
+        # Restoring every block copies the whole DiT back onto the device, which
+        # outlived the executor's shutdown grace period (issue 7625).
+        pipeline = nn.Module()
+        pipeline.transformer = _SingleBlockModel(num_blocks=3)
+        backend = _layer_backend()
+        backend.enable(pipeline)
+        restores = Mock()
+        for hook in backend._dit_hooks:
+            monkeypatch.setattr(hook, "restore_next_block", restores)
+
+        backend.shutdown()
+
+        restores.assert_not_called()
+        assert not backend.enabled
+        assert not backend._dit_hooks
+        assert not backend._hooked_dit_blocks
 
     def test_encoder_disable_failure_keeps_host_masters_for_retry(
         self,

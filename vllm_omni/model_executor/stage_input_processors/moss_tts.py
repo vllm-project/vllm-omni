@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
@@ -9,11 +12,13 @@ from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.inputs import TokensPrompt as OmniTokensPrompt
 from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
+from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_chunk_size
 
 logger = init_logger(__name__)
 
@@ -233,7 +238,8 @@ def talker2codec_raw_async_chunk(
     Stage 0 emits newly generated raw codec rows shaped ``[T, n_vq]`` (normally
     ``[1, n_vq]`` per decode step). This processor buffers those new rows until
     a codec chunk is ready, then forwards the chunk to Stage 1. No delay-pattern
-    de-delay is applied on this path.
+    de-delay is applied on this path. An optional ``codec_chunk_ramp`` selects
+    successive chunk sizes and takes precedence over the initial chunk size.
     """
     external_req_id = getattr(request, "external_req_id", None)
     req_id = str(external_req_id if external_req_id is not None else getattr(request, "request_id", id(request)))
@@ -244,6 +250,8 @@ def talker2codec_raw_async_chunk(
         transfer_manager.request_payload = {}
     if not hasattr(transfer_manager, "put_req_chunk"):
         transfer_manager.put_req_chunk = defaultdict(int)
+    if not hasattr(transfer_manager, "ramp_chunk_count"):
+        transfer_manager.ramp_chunk_count = defaultdict(int)
 
     pending_frames = transfer_manager.code_prompt_token_ids[req_id]
 
@@ -251,14 +259,16 @@ def talker2codec_raw_async_chunk(
         codes_dict = multimodal_output.get("codes", {}) or {}
         new_frames = codes_dict.get("audio")
         if isinstance(new_frames, torch.Tensor) and new_frames.numel() > 0:
-            frames_cpu = new_frames.detach().to("cpu", torch.long).contiguous()
-            if frames_cpu.ndim == 1:
-                frames_cpu = frames_cpu.reshape(1, -1)
-            if frames_cpu.ndim != 2:
-                raise ValueError(f"MOSS raw codec frames must be 2-D, got {tuple(frames_cpu.shape)}")
-            valid_rows = frames_cpu.ne(_MOSS_AUDIO_PAD_CODE).any(dim=1)
-            for frame in frames_cpu[valid_rows]:
-                pending_frames.append(frame.clone())
+            # This runs per request on every decode step. Tiny torch ops cost
+            # tens of microseconds each here; NumPy on the host copy does not.
+            frames_np = new_frames.detach().cpu().numpy()
+            if frames_np.ndim == 1:
+                frames_np = frames_np.reshape(1, -1)
+            if frames_np.ndim != 2:
+                raise ValueError(f"MOSS raw codec frames must be 2-D, got {tuple(frames_np.shape)}")
+            valid_rows = (frames_np != _MOSS_AUDIO_PAD_CODE).any(axis=1)
+            owned = np.array(frames_np if valid_rows.all() else frames_np[valid_rows], dtype=np.int64)
+            pending_frames.extend(owned)
         # Raw/local streaming should mirror the non-streaming path: the codec
         # decodes only generated audio rows. Reference audio conditions the
         # talker, but feeding its codes into the codec streaming state adds a
@@ -284,13 +294,27 @@ def talker2codec_raw_async_chunk(
         initial_chunk_frames = chunk_frames
 
     pending = len(pending_frames)
-    emitted_any = int(transfer_manager.put_req_chunk.get(req_id, 0)) > 0
+    emitted_chunks = int(transfer_manager.put_req_chunk.get(req_id, 0))
+    emitted_any = emitted_chunks > 0
     threshold = initial_chunk_frames if initial_chunk_frames > 0 and not emitted_any else chunk_frames
+    # The connector configuration is fixed for this transfer manager's lifetime.
+    if not hasattr(transfer_manager, "_moss_chunk_ramp"):
+        transfer_manager._moss_chunk_ramp = parse_chunk_ramp(cfg, steady=chunk_frames)
+    ramp = transfer_manager._moss_chunk_ramp
+    if ramp is not None:
+        # The ladder is indexed by the connector's segment-local counter, which
+        # restarts at each segment boundary; put_req_chunk is request-global.
+        ramp_index = int(transfer_manager.ramp_chunk_count.get(req_id, 0))
+        threshold = ramp_chunk_size(ramp_index, ramp, chunk_frames)
     if pending <= 0:
         if is_finished:
             transfer_manager.code_prompt_token_ids.pop(req_id, None)
             transfer_manager.request_payload.pop(req_id, None)
             return OmniPayloadStruct(
+                # Explicitly replace the previous chunk (or the prewarmed
+                # placeholder) with no codes. Metadata alone is not an
+                # empty audio snapshot in the native connector contract.
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(
                     req_id=[req_id],
                     left_context_size=0,
@@ -308,13 +332,10 @@ def talker2codec_raw_async_chunk(
     emit_frames = pending if is_finished else threshold
     chunk_rows = pending_frames[:emit_frames]
     del pending_frames[:emit_frames]
-    chunk_codes = torch.stack(
-        [row.to(torch.long).cpu() for row in chunk_rows],
-        dim=0,
-    ).contiguous()
+    chunk_np = np.stack([np.asarray(row, dtype=np.int64) for row in chunk_rows])
     finished = bool(is_finished and len(pending_frames) == 0)
 
-    codec_flat = chunk_codes.transpose(0, 1).contiguous().reshape(-1).to(torch.long)
+    codec_flat = torch.from_numpy(np.ascontiguousarray(chunk_np.T).reshape(-1))
 
     if finished:
         transfer_manager.code_prompt_token_ids.pop(req_id, None)
@@ -325,7 +346,7 @@ def talker2codec_raw_async_chunk(
         meta=MetaStruct(
             req_id=[req_id],
             left_context_size=0,
-            codec_chunk_frames=int(chunk_codes.shape[0]),
+            codec_chunk_frames=int(chunk_np.shape[0]),
             codec_left_context_frames=0,
             code_flat_numel=int(codec_flat.numel()),
             stream_finished=torch.tensor(finished, dtype=torch.bool),

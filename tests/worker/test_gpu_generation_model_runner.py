@@ -3,6 +3,7 @@
 
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -20,6 +21,23 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _StopExecutionError(Exception):
     """Halts execute_model at the model boundary."""
+
+
+@pytest.mark.parametrize("randomize_inputs", [False, True])
+def test_generation_profile_accepts_upstream_randomize_inputs(randomize_inputs):
+    """Release workers can pass the profiling flag to codec-stage runners."""
+    runner = object.__new__(GPUGenerationModelRunner)
+    runner.supports_mm_inputs = False
+    runner.max_num_tokens = 128
+    runner.encoder_cache = {"temporary": object()}
+    runner._dummy_run = Mock(return_value=(torch.zeros(1), None))
+    runner._sync_device = Mock()
+
+    runner.profile_run(randomize_inputs=randomize_inputs)
+
+    runner._dummy_run.assert_called_once_with(128, is_profile=True, randomize_inputs=randomize_inputs)
+    runner._sync_device.assert_called_once_with()
+    assert runner.encoder_cache == {}
 
 
 class _DummyInputBatch:

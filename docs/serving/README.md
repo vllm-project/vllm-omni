@@ -144,16 +144,26 @@ interchangeably.
 | ---------- | ---------- | ------------------- | --------- |
 | Incremental text input for speech synthesis | `WS /v1/audio/speech/stream` | Send text events and receive audio | [Streaming Text to Speech](speech_api.md#streaming-text-input-websocket) |
 | Live video understanding | `WS /v1/video/chat/stream` | Send video frames and receive text/audio | [Streaming Video Input](video_stream_api.md) |
-| Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_api.md) |
-| Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` or `WS /v1/duplex` | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
+| Turn-based realtime audio | `WS /v1/realtime` | Stream one audio input and receive transcript/audio events | [Realtime Audio](realtime_openai_duplex_api.md) |
+| Continuous speech-to-speech interaction | `WS /v1/realtime?duplex=1` (alias `WS /v1/duplex`) | Listen and speak concurrently with session control | [Full Duplex](full_duplex_api.md) |
 | Generated video chunks | `WS /v1/realtime/video` | Start a diffusion request and receive fragmented MP4 | [Streaming Video Output](streaming_video_output_api.md) |
 | Robot policy inference | `WS /v1/realtime/robot/openpi` | Send MessagePack observations and receive action arrays | [OpenPI Robot Policy](openpi_api.md) |
 
 All six routes are model- or configuration-dependent. In particular,
-`/v1/realtime` is not full duplex unless the client sets `duplex=1` and the
-deployment explicitly enables duplex sessions. Clients should also verify the
-duplex capability payload because the query-parameter form falls back to the
-ordinary realtime handler when duplex is unavailable.
+`/v1/realtime` is full duplex when the server is a duplex server: the model's
+pipeline declares a `duplex_plugin` and its deploy configuration sets
+`session_mode: duplex` (with `session_mode: turn` the same model boots the
+ordinary turn-based serving stack instead). On a duplex server a stock
+Realtime client needs no vendor query parameter; `duplex=0` opts out of native
+duplex and selects the turn-based Realtime handler. It runs generation on the
+same stages, alongside live websocket sessions, and opens no duplex session
+or consumes a `duplex_session.max_sessions` slot -- see
+[Full Duplex](full_duplex_api.md).
+Such a server serves the websocket route plus `POST /v1/chat/completions`,
+`/v1/models` and `/health`, and no other turn-based HTTP route. On a server
+that is not duplex, an explicit `?duplex=1` is refused rather than answered by
+the turn-based handler, so a client that requested duplex never silently gets
+the other protocol.
 
 ## Related Endpoints
 

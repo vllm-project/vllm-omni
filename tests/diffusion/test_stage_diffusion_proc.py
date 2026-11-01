@@ -9,6 +9,7 @@ import pytest
 
 import vllm_omni.diffusion.stage_diffusion_proc as stage_diffusion_proc
 import vllm_omni.plugins as omni_plugins
+from vllm_omni.diffusion.data import DIFFUSION_REQUEST_LIFECYCLE_KEY, DIFFUSION_REQUEST_STARTED
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -104,6 +105,49 @@ async def test_proc_streaming_request_yields_each_engine_chunk():
 
 
 @pytest.mark.asyncio
+async def test_proc_non_streaming_forwards_lifecycle_before_final_output():
+    lifecycle = OmniRequestOutput.from_diffusion(
+        request_id="",
+        images=[],
+        custom_output={DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED},
+        finished=False,
+    )
+    intermediate = OmniRequestOutput.from_diffusion(
+        request_id="",
+        images=[],
+        custom_output={"chunk": 0},
+        finished=False,
+    )
+    final = OmniRequestOutput.from_diffusion(request_id="", images=[], finished=True)
+
+    class _LifecycleEngine:
+        async def step_streaming(self, request):
+            del request
+            yield [lifecycle]
+            yield [intermediate]
+            yield [final]
+
+    stage_proc = object.__new__(StageDiffusionProc)
+    stage_proc._engine = _LifecycleEngine()
+    intermediate_outputs = []
+
+    async def _capture(output):
+        intermediate_outputs.append(output)
+
+    result = await stage_proc._process_request(
+        request_id="req-lifecycle",
+        prompt="prompt",
+        sampling_params_dict=asdict(OmniDiffusionSamplingParams()),
+        on_request_started=_capture,
+    )
+
+    assert intermediate_outputs == [lifecycle]
+    assert lifecycle.request_id == "req-lifecycle"
+    assert result is final
+    assert result.request_id == "req-lifecycle"
+
+
+@pytest.mark.asyncio
 async def test_proc_process_request_with_batching_async_output():
     stage_proc = object.__new__(StageDiffusionProc)
     stage_proc._engine = MockDiffusionEngine()
@@ -147,3 +191,62 @@ async def test_proc_process_request_with_batching_async_output():
         time_gap = elapsed_time - base_time
         assert time_gap > time_gap_std - eps and time_gap < time_gap_std + eps
         base_time = elapsed_time
+
+
+class _FailingExecutor:
+    def __init__(self, is_dead: bool = False) -> None:
+        self.is_dead = is_dead
+        self.callbacks = []
+
+    def register_failure_callback(self, callback) -> None:
+        self.callbacks.append(callback)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_before_loop", [False, True])
+async def test_run_loop_exits_when_executor_fails_between_requests(failed_before_loop):
+    """An idle executor failure must reach the client without waiting for a request."""
+    import threading
+
+    import zmq
+    import zmq.asyncio
+
+    ctx = zmq.asyncio.Context()
+    request_socket = ctx.socket(zmq.PUSH)
+    response_socket = ctx.socket(zmq.PULL)
+    request_port = request_socket.bind_to_random_port("tcp://127.0.0.1")
+    response_port = response_socket.bind_to_random_port("tcp://127.0.0.1")
+    executor = _FailingExecutor(is_dead=failed_before_loop)
+    stage_proc = StageDiffusionProc.__new__(StageDiffusionProc)
+    stage_proc._engine = type("_Engine", (), {"executor": executor})()
+    stage_proc._active_tasks = None
+    stage_proc._fatal_event = None
+    try:
+        loop_task = asyncio.create_task(
+            stage_proc.run_loop(f"tcp://127.0.0.1:{request_port}", f"tcp://127.0.0.1:{response_port}")
+        )
+        if not failed_before_loop:
+            for _ in range(500):
+                if executor.callbacks:
+                    break
+                await asyncio.sleep(0.01)
+            assert executor.callbacks, "run_loop did not register an executor failure callback"
+            # Executor monitors report failures from their own threads.
+            monitor = threading.Thread(target=executor.callbacks[0])
+            monitor.start()
+            monitor.join()
+
+        with pytest.raises(RuntimeError, match="permanent failure"):
+            await asyncio.wait_for(loop_task, timeout=5)
+        assert await asyncio.wait_for(response_socket.recv(), timeout=5) == StageDiffusionProc.DIFFUSION_PROC_DEAD
+        assert len(executor.callbacks) == 1
+
+        # A late failure after run_loop has exited must not raise.
+        closed_loop = asyncio.new_event_loop()
+        closed_loop.close()
+        stage_proc._watch_executor_failure(closed_loop)
+        executor.callbacks[-1]()
+    finally:
+        request_socket.close(linger=0)
+        response_socket.close(linger=0)
+        ctx.term()

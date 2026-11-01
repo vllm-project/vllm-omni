@@ -15,6 +15,74 @@ def test_build_quant_config_fp8():
     assert config is not None
     assert config.get_name() == "fp8"
     assert config.activation_scheme == "dynamic"
+    assert not config.is_checkpoint_fp8_serialized
+
+
+def test_build_quant_config_fp8_uses_native_online_quantization():
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8", ignored_layers=["proj_out"])
+    assert isinstance(config, OnlineQuantizationConfig)
+    assert config.args.linear.weight == kFp8StaticTensorSym
+    assert config.args.moe.weight == kFp8StaticTensorSym
+    assert config.ignored_layers == ["proj_out"]
+
+
+def test_build_quant_config_upstream_online_fp8_shorthand():
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config("fp8_per_tensor", ignore=["proj_out"])
+    assert isinstance(config, OnlineQuantizationConfig)
+    assert config.args.linear.weight == kFp8StaticTensorSym
+    assert config.ignored_layers == ["proj_out"]
+
+
+def test_online_fp8_rejects_static_activation():
+    from vllm_omni.quantization import build_quant_config
+
+    with pytest.raises(ValueError, match="activation_scheme='dynamic'"):
+        build_quant_config("fp8", activation_scheme="static")
+
+
+def test_build_online_quant_config_preserves_explicit_native_args():
+    from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+
+    from vllm_omni.quantization import build_quant_config
+
+    args = QuantizationConfigArgs(linear=QuantSpec(weight="fp8_per_tensor_static"), ignore=["proj_out"])
+    config = build_quant_config("online", args=args)
+    assert isinstance(config, OnlineQuantizationConfig)
+    assert config.args is args
+    assert config.ignored_layers == ["proj_out"]
+
+
+def test_build_online_quant_config_requires_args():
+    from vllm_omni.quantization import build_quant_config
+
+    with pytest.raises(ValueError, match="requires quantization config arguments"):
+        build_quant_config("online")
+
+
+def test_serialized_checkpoint_replaces_online_fp8_config():
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+    from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.factory import resolve_quant_config_from_disk
+
+    config = resolve_quant_config_from_disk(
+        build_quant_config("fp8"),
+        {"quant_method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"},
+    )
+    assert isinstance(config, Fp8Config)
+    assert config.is_checkpoint_fp8_serialized
+    assert config.activation_scheme == "static"
 
 
 def test_build_quant_config_none():
@@ -39,7 +107,7 @@ def test_build_quant_config_invalid():
 def test_build_quant_config_dict():
     from vllm_omni.quantization import build_quant_config
 
-    config = build_quant_config({"method": "fp8", "activation_scheme": "static"})
+    config = build_quant_config({"method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"})
     assert config is not None
     assert config.get_name() == "fp8"
     assert config.activation_scheme == "static"
@@ -48,7 +116,7 @@ def test_build_quant_config_dict():
 def test_build_quant_config_dict_not_mutated():
     from vllm_omni.quantization import build_quant_config
 
-    original = {"method": "fp8", "activation_scheme": "static"}
+    original = {"method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"}
     copy = original.copy()
     build_quant_config(original)
     assert original == copy
@@ -99,7 +167,7 @@ def test_build_quant_config_per_component_inner_dict_not_mutated():
     """Inner component dicts should not be mutated by build_quant_config."""
     from vllm_omni.quantization import build_quant_config
 
-    inner = {"method": "fp8", "activation_scheme": "static"}
+    inner = {"method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"}
     original = inner.copy()
     build_quant_config({"transformer": inner, "vae": None})
     assert inner == original
@@ -115,20 +183,18 @@ def test_flat_dict_not_misdetected_as_per_component():
 
 
 def test_build_quant_config_passthrough():
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-
     from vllm_omni.quantization import build_quant_config
+    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
 
-    fp8 = Fp8Config(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+    fp8 = DiffusionFp8Config()
     assert build_quant_config(fp8) is fp8
 
 
 def test_component_config_routing():
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-
     from vllm_omni.quantization import ComponentQuantizationConfig
+    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
 
-    fp8 = Fp8Config(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+    fp8 = DiffusionFp8Config()
     config = ComponentQuantizationConfig(
         component_configs={"transformer": fp8, "vae": None},
     )
@@ -140,11 +206,10 @@ def test_component_config_routing():
 
 
 def test_component_config_with_default():
-    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-
     from vllm_omni.quantization import ComponentQuantizationConfig
+    from vllm_omni.quantization.fp8_config import DiffusionFp8Config
 
-    fp8 = Fp8Config(is_checkpoint_fp8_serialized=False, activation_scheme="dynamic")
+    fp8 = DiffusionFp8Config()
     config = ComponentQuantizationConfig(
         component_configs={"vae": None},
         default_config=fp8,
@@ -167,7 +232,7 @@ def test_integration_dict():
 
     config = OmniDiffusionConfig(
         model="test",
-        quantization_config={"method": "fp8", "activation_scheme": "static"},
+        quantization_config={"method": "fp8", "is_checkpoint_fp8_serialized": True, "activation_scheme": "static"},
     )
     assert config.quantization_config is not None
     assert config.quantization_config.get_name() == "fp8"

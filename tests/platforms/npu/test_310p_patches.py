@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for 310P patch wiring.
 
 The tests load patch modules from source with fake Qwen3-TTS dependencies, so
@@ -644,7 +644,11 @@ def test_qwen3_tts_tokenizer_npu_patch_dispatches_fused_ops(monkeypatch: pytest.
     torch.testing.assert_close(norm_out, torch.tensor([[2.0, 3.0]]))
 
 
-def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+def _load_qwen3_tts_code2wav_npu_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    platform_dtype_override: bool = True,
+):
     linear_weights = []
     conv_weights = []
 
@@ -674,15 +678,22 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
             self.prefix = prefix
             self.decoder = FakeDecoder()
 
-        def _npu_decoder_runtime_dtype(self, _device):
-            return torch.float16
-
         def load_weights(self, weights):
             assert list(weights) == []
+            self.decoder.to(dtype=self.vllm_config.model_config.dtype)
+            self.decoder.precompute_snake_caches()
             return {"loaded"}
 
-    logger = SimpleNamespace(info=lambda *_: None, debug=lambda *_: None)
+    if platform_dtype_override:
+
+        def _npu_decoder_runtime_dtype(self, _device: torch.device) -> torch.dtype:
+            return torch.float16
+
+        FakeCode2Wav._npu_decoder_runtime_dtype = _npu_decoder_runtime_dtype  # type: ignore[attr-defined]
+
+    logger = SimpleNamespace(info=lambda *_: None, debug=lambda *_: None, warning=lambda *_: None)
     current_platform = SimpleNamespace(is_npu=lambda: False)
+
     target = _install_fake_module(
         monkeypatch,
         "vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav",
@@ -702,11 +713,23 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
     path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "models" / "qwen3_tts.py"
     module = _load_source_module("vllm_omni_test_qwen3_tts_code2wav_npu_patch", path)
     module.apply_qwen3_tts_code2wav_patch()
+    return module, target, linear_weights, conv_weights
 
-    model = target.Qwen3TTSCode2Wav(
-        vllm_config=SimpleNamespace(device_config=SimpleNamespace(device=torch.device("cpu"))),
+
+def _make_patched_code2wav(target, *, dtype=torch.bfloat16):
+    return target.Qwen3TTSCode2Wav(
+        vllm_config=SimpleNamespace(
+            device_config=SimpleNamespace(device=torch.device("cpu")),
+            model_config=SimpleNamespace(dtype=dtype),
+        ),
         prefix="stage1",
     )
+
+
+def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, target, linear_weights, conv_weights = _load_qwen3_tts_code2wav_npu_patch(monkeypatch)
+    model = _make_patched_code2wav(target, dtype=torch.bfloat16)
+
     assert model.load_weights(iter(())) == {"loaded"}
 
     assert model.prefix == "stage1"
@@ -717,4 +740,17 @@ def test_qwen3_tts_code2wav_npu_patch_prepares_loaded_decoder(monkeypatch: pytes
         model.decoder.deconv.weight.data_ptr(),
     }
     assert all(fmt == module._ACL_FORMAT_FRACTAL_Z for _, fmt in conv_weights)
+    assert model.decoder.cache_precompute_calls == 2
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_qwen3_tts_code2wav_npu_patch_preserves_stage_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+) -> None:
+    _, target, _, _ = _load_qwen3_tts_code2wav_npu_patch(monkeypatch, platform_dtype_override=False)
+    model = _make_patched_code2wav(target, dtype=dtype)
+
+    assert model.load_weights(iter(())) == {"loaded"}
+    assert all(parameter.dtype is dtype for parameter in model.decoder.parameters())
     assert model.decoder.cache_precompute_calls == 1

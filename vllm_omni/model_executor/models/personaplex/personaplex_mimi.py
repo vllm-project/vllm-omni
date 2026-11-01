@@ -29,18 +29,40 @@ codec composes with elastic slot recycling in batched duplex serving.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
     _apply_rope,
     _RingKV,
+    _ringkv_positions,
+    _rope_tables,
 )
 
 DEFAULT_HF_REPO = "kyutai/mimi"
 FRAME_SIZE = 1920
 CODEBOOKS = 8
+
+logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.personaplex.personaplex_mimi_cudagraph import MimiFrameGraph
+
+
+def _normalize_active(active: torch.Tensor | None, all_active: torch.Tensor) -> torch.Tensor:
+    # Stage 0 shares one codec with a row per session slot and passes bool[B]:
+    # True advances that row's streaming state; False keeps an absent or padded
+    # row's offsets and convolution carries unchanged. Code2Wav leases one B=1
+    # codec per request and omits `active`, which means all rows are active.
+    if active is None:
+        return all_active
+    if active.shape != all_active.shape:
+        raise ValueError(f"active must have shape {tuple(all_active.shape)}, got {tuple(active.shape)}")
+    return active.to(device=all_active.device, dtype=torch.bool)
 
 
 def _map_moshi_codec_weights(
@@ -94,6 +116,10 @@ class _StreamConv1d:
     ``pad_mode`` controls the stream-start left padding: SEANet convs use zeros
     (``constant``); the down/upsample resamplers use ``replicate`` (the first
     real sample), marked per row so elastic slot recycling re-primes correctly.
+
+    The carry and the fresh-row flags are allocated once in ``reset`` and only
+    ever updated in place, so a CUDA graph recorded over ``__call__`` keeps
+    reading and writing the live state across frames, row resets and sessions.
     """
 
     def __init__(self, conv: nn.Conv1d, pad_mode: str = "constant") -> None:
@@ -107,62 +133,76 @@ class _StreamConv1d:
     def reset(self, batch_size: int, device, dtype) -> None:
         pad = self.kernel - self.stride
         self.prev = torch.zeros(batch_size, self.conv.in_channels, pad, device=device, dtype=dtype)
-        self._fresh = torch.ones(batch_size, dtype=torch.bool)
+        self._fresh = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+    def reset_all(self) -> None:
+        self.prev.zero_()
+        self._fresh.fill_(True)
 
     def reset_slot(self, b: int) -> None:
         self.prev[b].zero_()
         self._fresh[b] = True
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        if self.pad_mode == "replicate" and bool(self._fresh.any()):
+    def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        active_view = active.view(-1, 1, 1)
+        if self.pad_mode == "replicate":
             pad = self.prev.shape[-1]
             edge = x[..., 0:1].expand(-1, -1, pad)
-            fresh = self._fresh.to(x.device).view(-1, 1, 1)
-            self.prev = torch.where(fresh, edge.to(self.prev.dtype), self.prev)
-        self._fresh[:] = False
+            fresh = (self._fresh & active).view(-1, 1, 1)
+            self.prev.copy_(torch.where(fresh, edge.to(self.prev.dtype), self.prev))
+        self._fresh.logical_and_(~active)
         x = torch.cat([self.prev, x], dim=-1)
         t = x.shape[-1]
         num_frames = max(0, (t - self.kernel) // self.stride + 1)
-        self.prev = x[..., num_frames * self.stride :]
+        self.prev.copy_(torch.where(active_view, x[..., num_frames * self.stride :], self.prev))
         if num_frames == 0:
             return x.new_zeros(x.shape[0], self.conv.out_channels, 0)
         return self.conv(x[..., : (num_frames - 1) * self.stride + self.kernel])
 
 
 class _StreamConvTr1d:
-    """Moshi ``RawStreamingConvTranspose1d``: overlap-add tail carry per call."""
+    """Moshi ``RawStreamingConvTranspose1d``: overlap-add tail carry per call.
+
+    Like ``_StreamConv1d``, the tail carry is updated in place only.
+    """
 
     def __init__(self, conv: nn.ConvTranspose1d) -> None:
         self.conv = conv
         self.kernel = conv.kernel_size[0]
         self.stride = conv.stride[0]
         self.partial: torch.Tensor | None = None
+        self._fresh: torch.Tensor | None = None
 
     def reset(self, batch_size: int, device, dtype) -> None:
         self.partial = torch.zeros(
             batch_size, self.conv.out_channels, self.kernel - self.stride, device=device, dtype=dtype
         )
-        self._fresh = torch.ones(batch_size, dtype=torch.bool)
+        self._fresh = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+    def reset_all(self) -> None:
+        self.partial.zero_()
+        self._fresh.fill_(True)
 
     def reset_slot(self, b: int) -> None:
         self.partial[b].zero_()
         self._fresh[b] = True
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         out = self.conv(x)
         length = out.shape[-1]
         tail = self.kernel - self.stride
         pt = self.partial.shape[-1]
-        merge = self.partial.clone()
+        merge = self.partial
         if self.conv.bias is not None:
             # The carried tail already includes the bias; the fresh output adds
             # it again, so subtract one copy -- except on a row's very first
             # frame, where the carry is zeros by construction.
             merge = merge - self.conv.bias[:, None]
-            merge[self._fresh] = 0.0
-            self._fresh[:] = False
+            first = (self._fresh & active).view(-1, 1, 1)
+            merge = torch.where(first, torch.zeros_like(merge), merge)
+            self._fresh.logical_and_(~active)
         out[..., :pt] += merge
-        self.partial = out[..., length - tail :].clone()
+        self.partial.copy_(torch.where(active.view(-1, 1, 1), out[..., length - tail :], self.partial))
         return out[..., : length - tail]
 
 
@@ -183,16 +223,25 @@ class _MimiTransformerLayer(nn.Module):
         self.scale1 = nn.Parameter(torch.empty(dim))
         self.scale2 = nn.Parameter(torch.empty(dim))
 
-    def forward(self, x: torch.Tensor, kv: _RingKV, offset: torch.Tensor, context: int) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv: _RingKV,
+        offset: torch.Tensor,
+        context: int,
+        active: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor],
+        ring: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
         B, T, _ = x.shape
         h = self.norm1(x)
         qkv = F.linear(h, self.in_proj_weight)
         qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        q, k = _apply_rope(q, k, offset)
-        keys, values, pos_k = kv.complete(k, v)
+        q, k = _apply_rope(q, k, *rope)
+        keys, values, pos_k = kv.complete(k, v, active, *ring)
         pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])
-        pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
+        pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
         delta = pos_q - pos_k
         attn_bias = (pos_k >= 0) & (delta >= 0) & (delta < context)
         attn = F.scaled_dot_product_attention(q, keys, values, attn_bias.unsqueeze(1), dropout_p=0.0)
@@ -218,7 +267,7 @@ class _MimiStreamingTransformer(nn.Module):
         heads = self.layers[0].num_heads
         hd = self.layers[0].head_dim
         self._kv = [_RingKV(batch_size, heads, hd, self.context, p.device, p.dtype) for _ in self.layers]
-        self._offset = torch.zeros(1, device=p.device, dtype=torch.long)
+        self._offset = torch.zeros(batch_size, device=p.device, dtype=torch.long)
 
     def reset_streaming(self) -> None:
         for kv in self._kv:
@@ -226,14 +275,21 @@ class _MimiStreamingTransformer(nn.Module):
         self._offset.zero_()
 
     def reset_slot(self, b: int) -> None:
+        # A recycled row restarts at position 0, exactly like a fresh stream,
+        # instead of carrying its predecessor's absolute RoPE positions.
         for kv in self._kv:
-            kv.reset_slot(b)
+            kv.reset_row(b)
+        self._offset[b] = 0
 
-    def step(self, x: torch.Tensor) -> torch.Tensor:
+    def step(self, x: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         """``x`` is ``[B, T, dim]`` (T = positions this frame, typically 2)."""
+        T = x.shape[1]
+        # Offset-pure tables, identical for every layer: build once per step.
+        rope = _rope_tables(self._offset, T, self.layers[0].head_dim)
+        ring = _ringkv_positions(self._offset, T, self.context, active)
         for layer, kv in zip(self.layers, self._kv):
-            x = layer(x, kv, self._offset, self.context)
-        self._offset.add_(x.shape[1])
+            x = layer(x, kv, self._offset, self.context, active, rope, ring)
+        self._offset.add_(x.shape[1] * active.to(self._offset.dtype))
         return x
 
     def load_weights(self, state_dict: dict[str, torch.Tensor], prefix: str) -> int:
@@ -332,13 +388,17 @@ class PersonaPlexMimiCodec(nn.Module):
         n_dec = self.decoder_transformer.load_weights(sd, "decoder_transformer")
         assert n_enc == n_dec == 80, (n_enc, n_dec)
         del sd
+        self._init_streaming_stages()
 
+    def _init_streaming_stages(self) -> None:
         m = self.model
         self._enc_stages = _walk_seanet(m.encoder.layers)
         self._downsample = _StreamConv1d(m.downsample.conv, pad_mode="replicate")
         self._upsample = _StreamConvTr1d(m.upsample.conv)
         self._dec_stages = _walk_seanet(m.decoder.layers)
         self._batch_size: int | None = None
+        self._cuda_graphs: dict[str, MimiFrameGraph] = {}
+        self._all_active: torch.Tensor
 
     # -- streaming state ------------------------------------------------------
 
@@ -353,7 +413,23 @@ class PersonaPlexMimiCodec(nn.Module):
         yield self._upsample
 
     def streaming_init(self, batch_size: int) -> None:
+        # Re-initializing at the same batch size resets in place: the state
+        # tensors keep their storage, so captured frame graphs stay valid.
+        if getattr(self, "_batch_size", None) == batch_size:
+            self.reset_streaming()
+            return
+        if getattr(self, "_cuda_graphs", None):
+            # The state is reallocated below, so graphs recorded at the old
+            # batch size would read stale tensors; drop them and say so.
+            logger.warning(
+                "PersonaPlex Mimi stream resized from %s to %d rows; dropping its CUDA graphs (%s)",
+                self._batch_size,
+                batch_size,
+                "/".join(sorted(self._cuda_graphs)),
+            )
         self._batch_size = batch_size
+        self._cuda_graphs = {}
+        self._all_active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
         for s in self._conv_states():
             s.reset(batch_size, self.device, self.dtype)
         self.encoder_transformer.streaming_init(batch_size)
@@ -362,8 +438,7 @@ class PersonaPlexMimiCodec(nn.Module):
     def reset_streaming(self) -> None:
         assert self._batch_size is not None
         for state in self._conv_states():
-            for b in range(self._batch_size):
-                state.reset_slot(b)
+            state.reset_all()
         self.encoder_transformer.reset_streaming()
         self.decoder_transformer.reset_streaming()
 
@@ -373,42 +448,117 @@ class PersonaPlexMimiCodec(nn.Module):
         self.encoder_transformer.reset_slot(b)
         self.decoder_transformer.reset_slot(b)
 
+    def capture_cuda_graphs(
+        self,
+        *,
+        encode: bool = True,
+        decode_frame_counts: tuple[int, ...] = (1,),
+        warmup_iters: int = 2,
+        pool: tuple[int, int] | None = None,
+    ) -> list[str]:
+        """Record the per-frame codec steps at the streaming batch size.
+
+        ``encode`` records ``encode_frame``; each ``F`` in ``decode_frame_counts``
+        records ``decode_frames`` over ``F`` frames (``decode_frame`` is ``F=1``).
+        Every row is recorded active; the ``active`` mask is a graph input, so
+        one graph serves any subset of live rows. Warmup frames run through the
+        real streaming state, which is then reset in place, so the codec is
+        fresh afterwards. ``pool`` is a CUDA graph memory pool to share with
+        other codecs replayed on the same stream; by default the codec gets a
+        private one. Returns the captured graph names; on a non-CUDA device the
+        codec stays eager, and so it does after a recoverable capture failure,
+        which is logged with its traceback. Warmup, device execution and reset
+        failures propagate instead of leaving an apparently usable codec.
+        """
+        from vllm_omni.model_executor.models.personaplex.personaplex_mimi_cudagraph import (
+            capture_mimi_frame_graphs,
+        )
+
+        assert self._batch_size is not None, "call streaming_init first"
+        self._cuda_graphs = capture_mimi_frame_graphs(
+            self,
+            encode=encode,
+            decode_frame_counts=decode_frame_counts,
+            warmup_iters=warmup_iters,
+            pool=pool,
+        )
+        return sorted(self._cuda_graphs)
+
     # -- per-frame codec -------------------------------------------------------
 
     @staticmethod
-    def _run_stages(x: torch.Tensor, stages) -> torch.Tensor:
+    def _run_stages(x: torch.Tensor, stages, active: torch.Tensor) -> torch.Tensor:
         for kind, stage in stages:
             if kind == "res":
                 act0, conv1, act2, conv3 = stage
-                x = x + conv3(act2(conv1(act0(x))))
+                x = x + conv3(act2(conv1(act0(x), active)), active)
             else:
-                x = stage(x)
+                x = stage(x, active) if kind in {"conv", "convtr"} else stage(x)
         return x
 
+    def _frame_graph(self, name: str) -> MimiFrameGraph | None:
+        graph = self._cuda_graphs.get(name)
+        if graph is None or torch.cuda.is_current_stream_capturing():
+            return None
+        return graph
+
     @torch.no_grad()
-    def encode_frame(self, pcm: torch.Tensor) -> torch.Tensor:
+    def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, frame_size]`` float PCM -> ``[B, 8]`` codes."""
+        active = _normalize_active(active, self._all_active)
+        graph = self._frame_graph("encode")
+        if graph is not None:
+            return graph.replay(pcm.reshape(-1, FRAME_SIZE), active)
+        return self._encode_frame_eager(pcm, active)
+
+    def _encode_frame_eager(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
         x = pcm.to(self.device, self.dtype).view(-1, 1, FRAME_SIZE)
-        x = self._run_stages(x, self._enc_stages)
-        x = self.encoder_transformer.step(x.transpose(1, 2)).transpose(1, 2)
-        x = self._downsample(x)
-        codes = self.model.quantizer.encode(x)  # [Q, B, T]
+        x = self._run_stages(x, self._enc_stages, active)
+        x = self.encoder_transformer.step(x.transpose(1, 2), active).transpose(1, 2)
+        x = self._downsample(x, active)
+        codes = self.model.quantizer.encode(x, num_quantizers=CODEBOOKS)  # [Q, B, T]
         return codes[:CODEBOOKS, :, 0].transpose(0, 1).contiguous()
 
-    @torch.no_grad()
-    def decode_frame(self, codes: torch.Tensor) -> torch.Tensor:
-        """``[B, 8]`` codes -> ``[B, frame_size]`` float PCM."""
-        emb = self.model.quantizer.decode(codes.to(self.device).view(-1, CODEBOOKS, 1))
-        emb = self._upsample(emb)
-        emb = self.decoder_transformer.step(emb.transpose(1, 2)).transpose(1, 2)
-        x = self._run_stages(emb, self._dec_stages)
-        return x[:, 0, :]
+    def _quantizer_decode(self, codes: torch.Tensor) -> torch.Tensor:
+        """``MimiSplitResidualVectorQuantizer.decode`` without its host-side scalar.
+
+        The Hugging Face RVQ decode seeds its sum with ``torch.tensor(0.0)``, a
+        host-to-device copy that cannot be recorded in a CUDA graph. This
+        seeds it with an on-device zero instead; the arithmetic is unchanged.
+        """
+        quantizer = self.model.quantizer
+        split = quantizer.num_semantic_quantizers
+
+        def rvq_decode(rvq, rvq_codes: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros((), device=rvq_codes.device)
+            for layer, indices in zip(rvq.layers, rvq_codes.transpose(0, 1)):
+                out = out + layer.decode(indices)
+            if rvq.output_proj is not None:
+                out = rvq.output_proj(out)
+            return out
+
+        out = rvq_decode(quantizer.semantic_residual_vector_quantizer, codes[:, :split])
+        if codes.shape[1] > split:
+            out += rvq_decode(quantizer.acoustic_residual_vector_quantizer, codes[:, split:])
+        return out
 
     @torch.no_grad()
-    def decode_frames(self, codes: torch.Tensor) -> torch.Tensor:
+    def decode_frame(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
+        """``[B, 8]`` codes -> ``[B, frame_size]`` float PCM."""
+        return self.decode_frames(codes.reshape(-1, CODEBOOKS, 1), active)
+
+    @torch.no_grad()
+    def decode_frames(self, codes: torch.Tensor, active: torch.Tensor | None = None) -> torch.Tensor:
         """``[B, 8, F]`` codes -> ``[B, F * frame_size]`` float PCM."""
-        emb = self.model.quantizer.decode(codes.to(self.device))
-        emb = self._upsample(emb)
-        emb = self.decoder_transformer.step(emb.transpose(1, 2)).transpose(1, 2)
-        x = self._run_stages(emb, self._dec_stages)
+        active = _normalize_active(active, self._all_active)
+        graph = self._frame_graph(f"decode_f{codes.shape[-1]}")
+        if graph is not None:
+            return graph.replay(codes, active)
+        return self._decode_frames_eager(codes, active)
+
+    def _decode_frames_eager(self, codes: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
+        emb = self._quantizer_decode(codes.to(self.device))
+        emb = self._upsample(emb, active)
+        emb = self.decoder_transformer.step(emb.transpose(1, 2), active).transpose(1, 2)
+        x = self._run_stages(emb, self._dec_stages, active)
         return x[:, 0, :]

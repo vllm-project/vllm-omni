@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Format-specific live-weight validation and reference A16 materialization."""
 
@@ -7,13 +7,30 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from vllm.model_executor.layers.quantization.modelopt import (
-    ModelOptFp8LinearMethod,
-    ModelOptNvFp4LinearMethod,
-)
+from vllm.config.quantization import QuantSpec
+from vllm.model_executor.layers.quantization.modelopt import ModelOptLinearMethod
 from vllm.model_executor.layers.quantization.utils import nvfp4_emulation_utils
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8StaticTensorSym,
+    kNvfp4Dynamic,
+    kNvfp4Static,
+)
 
 _NVFP4_BLOCK_SIZE = 16
+
+# vLLM #49381 replaced the per-format ModelOpt linear methods
+# (ModelOptFp8LinearMethod / ModelOptNvFp4LinearMethod, reached through the
+# removed ``LinearMethodCls`` attributes) with one generic
+# ``ModelOptLinearMethod`` built from a ``(weight, activation)`` QuantSpec pair
+# produced by ``resolve()``. Identify the formats the same way upstream does:
+# by that exact spec, so the set of accepted methods stays as narrow as it was
+# with the class checks (PcPt / PbWo / W4A16 are still not accepted here).
+_FP8_W8A8_SPEC = QuantSpec(weight=kFp8StaticTensorSym, activation=kFp8StaticTensorSym)
+_NVFP4_W4A4_SPEC = QuantSpec(weight=kNvfp4Static, activation=kNvfp4Dynamic)
+
+
+def _has_spec(method: object | None, spec: QuantSpec) -> bool:
+    return isinstance(method, ModelOptLinearMethod) and getattr(method, "spec", None) == spec
 
 
 class Cosmos3PrecisionStrategy:
@@ -70,7 +87,7 @@ class Fp8W8A8W8A16Strategy(Cosmos3PrecisionStrategy):
     """Use native ModelOpt W8A8 or reference dense W8A16."""
 
     def accepts(self, method: object | None) -> bool:
-        return isinstance(method, ModelOptFp8LinearMethod)
+        return _has_spec(method, _FP8_W8A8_SPEC)
 
     def validate_before_processing(
         self,
@@ -131,7 +148,7 @@ class Nvfp4W4A4W4A16Strategy(Cosmos3PrecisionStrategy):
     """Use native ModelOpt W4A4 or reference dense W4A16."""
 
     def accepts(self, method: object | None) -> bool:
-        return isinstance(method, ModelOptNvFp4LinearMethod)
+        return _has_spec(method, _NVFP4_W4A4_SPEC)
 
     def validate_before_processing(
         self,

@@ -47,6 +47,29 @@ adapter, not injected through unrelated scheduler state.
 
 **Rule:** Workers and model runners MUST NOT implement cross-stage routing.
 
+## Token-only output payloads
+
+An AR stage whose downstream decoder consumes sampled tokens rather than
+hidden states can set `omni_pooler_payload_include_hidden = False`. Hidden
+states remain available for logits and sampling; prefill conditioning and
+other required multimodal outputs still cross the stage boundary.
+
+A chunk processor that needs IDs on steps without a tensor payload declares
+`requires_token_updates = True`. The scheduler then enqueues nonempty sampled
+IDs while preserving final-stage exclusions and the processor's EOF handling.
+Processors without this declaration retain their tensor-payload trigger.
+
+When hidden and multimodal payloads are absent, the shared runner skips empty
+per-request payload construction. Prefix-cache merges and pending model
+postprocess retain the normal path. This policy is independent of whether
+output materialization runs inline or in the background.
+
+Inline construction consumes query offsets, scheduled-token counts and
+scheduler metadata before the next execution can reuse them. Background
+construction snapshots those inputs. Both paths reuse the request IDs already
+copied by upstream bookkeeping; connector collection stays on the main thread
+because it can run a tensor-parallel collective.
+
 ## Safe-change guide
 
 Test request lifecycle, abort, cache state, and every affected worker execution

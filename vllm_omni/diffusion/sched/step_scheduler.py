@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -13,10 +13,11 @@ from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    SchedulerRequestState,
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -62,9 +63,22 @@ class StepScheduler(BaseScheduler):
         )
         return request_id
 
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
+    def _can_schedule_waiting(self, state: SchedulerRequestState) -> bool:
+        if not super()._can_schedule_waiting(state):
+            return False
+
+        is_first_step = self._request_progress[state.request_id].current_step == 0
+        for request_id in self._running:
+            running = self._request_states[request_id]
+            if state.req.allow_mixed_step_phases and running.req.allow_mixed_step_phases:
+                continue
+            if (self._request_progress[request_id].current_step == 0) != is_first_step:
+                return False
+        return True
+
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: BaseRunnerOutput) -> set[str]:
         scheduled_request_ids = sched_output.scheduled_request_ids
-        if not scheduled_request_ids:
+        if not scheduled_request_ids and not sched_output.finished_req_ids:
             return set()
 
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
@@ -125,6 +139,7 @@ class StepScheduler(BaseScheduler):
             return self._sequence_length(sampling.timesteps)
         if sampling.sigmas is not None:
             return len(sampling.sigmas)
+        assert sampling.num_inference_steps is not None
         return int(sampling.num_inference_steps)
 
     @staticmethod

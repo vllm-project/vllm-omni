@@ -12,10 +12,12 @@ serialised through the queue.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Any
+from contextlib import suppress
+from typing import Any, TypeGuard
 
 import numpy as np
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.media import (
@@ -33,49 +35,144 @@ from vllm_omni.diffusion.media import (
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
 DIFFUSION_RPC_RESULT_ENVELOPE = "diffusion_rpc_result"
 _DIFFUSION_MEDIA_WIRE_TYPE = "diffusion_media_v1"
+logger = init_logger(__name__)
+
+# An uncertain CUDA cleanup must not unmap memory still used by the device.
+# Retain failed transfers until worker exit and reject further registrations.
+_failed_shm_copies: list[tuple[Any, torch.Tensor, torch.Tensor, torch.Stream]] = []
 
 # Sentinel so compute-then-assign packing can tell "field not packed" apart from
 # "field packed to None".
 _UNSET = object()
 
 
-def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
-    """Copy a contiguous NumPy-compatible array into shared memory."""
+class _SharedMemoryLease:
+    """Keep an unlinked shared-memory mapping alive while array views use it."""
+
+    def __init__(self, shm: Any, array: np.ndarray) -> None:
+        self.shm = shm
+        self.__array_interface__ = array.__array_interface__
+
+    def __del__(self) -> None:
+        with suppress(BufferError):
+            self.shm.close()
+
+
+def _new_shm_array(shape: tuple[int, ...], dtype: np.dtype) -> tuple[Any, np.ndarray, dict[str, Any]]:
     from multiprocessing import shared_memory
 
+    nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    shm = shared_memory.SharedMemory(create=True, size=nbytes)
+    array = np.ndarray(shape, dtype=dtype, buffer=shm.buf[:nbytes])
+    handle = {
+        "name": shm.name,
+        "shape": list(shape),
+        "numpy_dtype": str(dtype),
+        "nbytes": nbytes,
+    }
+    return shm, array, handle
+
+
+def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
+    """Copy a contiguous NumPy-compatible array into shared memory."""
     if array.dtype.hasobject:
         raise TypeError("NumPy object arrays cannot be transferred through raw shared memory")
 
     array = np.ascontiguousarray(array)
-    nbytes = array.nbytes
-    shm = shared_memory.SharedMemory(create=True, size=nbytes)
-    shm_array = np.ndarray(array.shape, dtype=array.dtype, buffer=shm.buf[:nbytes])
+    shm, shm_array, handle = _new_shm_array(array.shape, array.dtype)
     np.copyto(shm_array, array)
-    handle = {
-        "name": shm.name,
-        "shape": list(array.shape),
-        "numpy_dtype": str(array.dtype),
-        "nbytes": nbytes,
-    }
+    del shm_array
     shm.close()
     return handle
 
 
 def _array_from_shm(handle: dict[str, Any]) -> np.ndarray:
-    """Copy an array from shared memory, then close and unlink its segment."""
+    """Materialize or borrow an array from shared memory and unlink its name."""
     from multiprocessing import shared_memory
 
     shm = shared_memory.SharedMemory(name=handle["name"])
+    array = np.ndarray(
+        handle["shape"],
+        dtype=np.dtype(handle["numpy_dtype"]),
+        buffer=shm.buf[: handle["nbytes"]],
+    )
+    if handle.get("borrow_on_unpack"):
+        # A base owner survives np.asarray(), slicing, and torch.from_numpy().
+        # An ndarray subclass attribute does not survive np.asarray().
+        borrowed = np.asarray(_SharedMemoryLease(shm, array))
+        shm.unlink()
+        return borrowed
     try:
-        array = np.ndarray(
-            handle["shape"],
-            dtype=np.dtype(handle["numpy_dtype"]),
-            buffer=shm.buf[: handle["nbytes"]],
-        ).copy()
+        return array.copy()
     finally:
+        del array
         shm.close()
         shm.unlink()
-    return array
+
+
+def _cuda_registered_shm_copy(tensor: torch.Tensor, d2h_stream: torch.Stream) -> dict[str, Any]:
+    """Copy a CUDA tensor directly into a CUDA-registered POSIX SHM segment."""
+    if _failed_shm_copies:
+        raise RuntimeError("A previous registered SHM transfer failed CUDA cleanup; restart the worker")
+    original_dtype = tensor.dtype
+    source = tensor.detach()
+    # NumPy has no BF16 dtype. Transfer the original bits, without allocating
+    # an FP32 accelerator tensor or converting the borrowed CPU result.
+    if original_dtype == torch.bfloat16:
+        numpy_dtype = np.dtype(np.uint16)
+    else:
+        numpy_dtype = torch.empty((), dtype=source.dtype).numpy().dtype
+    cudart = torch.cuda.cudart()
+    shm, shm_array, handle = _new_shm_array(tuple(source.shape), numpy_dtype)
+    pointer = shm_array.ctypes.data
+    host_tensor = None
+    registered = False
+    succeeded = False
+    try:
+        host_tensor = torch.from_numpy(shm_array).view(original_dtype)
+        error = cudart.cudaHostRegister(pointer, handle["nbytes"], 0)
+        if int(error) != 0:
+            raise RuntimeError(f"cudaHostRegister failed: {cudart.cudaGetErrorString(error)}")
+        registered = True
+        old_stream = torch.accelerator.current_stream()
+        torch.accelerator.set_stream(d2h_stream)
+        try:
+            host_tensor.copy_(source, non_blocking=True)
+        finally:
+            torch.accelerator.set_stream(old_stream)
+        d2h_stream.synchronize()
+        error = cudart.cudaHostUnregister(pointer)
+        if int(error) != 0:
+            raise RuntimeError(f"cudaHostUnregister failed: {cudart.cudaGetErrorString(error)}")
+        registered = False
+        handle["borrow_on_unpack"] = True
+        handle.update(
+            {
+                "__tensor_shm__": True,
+                "torch_dtype": str(original_dtype),
+                "torch_dtype_view": original_dtype == torch.bfloat16,
+            }
+        )
+        succeeded = True
+        return handle
+    finally:
+        if registered:
+            try:
+                # A copy may have been enqueued before a later operation failed.
+                d2h_stream.synchronize()
+                error = cudart.cudaHostUnregister(pointer)
+                if int(error) != 0:
+                    raise RuntimeError(f"cudaHostUnregister failed: {cudart.cudaGetErrorString(error)}")
+                registered = False
+            except Exception:
+                assert host_tensor is not None
+                _failed_shm_copies.append((shm, host_tensor, source, d2h_stream))
+                logger.exception("Retaining registered SHM after CUDA cleanup failure; worker restart required")
+        del host_tensor, shm_array
+        if not registered:
+            shm.close()
+        if not succeeded:
+            shm.unlink()
 
 
 def _unlink_shm_handle(handle: dict[str, Any]) -> None:
@@ -111,6 +208,8 @@ def _tensor_to_shm(
     tensor: torch.Tensor,
     d2h_stream: torch.Stream | None = None,
     created: list[dict[str, Any]] | None = None,
+    *,
+    enable_registered_shm: bool = False,
 ) -> dict[str, Any]:
     """Copy a tensor into POSIX shared memory and return a metadata handle.
 
@@ -123,6 +222,17 @@ def _tensor_to_shm(
     packed.
     """
     original_dtype = tensor.dtype
+    if (
+        d2h_stream is not None
+        and enable_registered_shm
+        and tensor.device.type == "cuda"
+        # ROCm also uses the "cuda" device type, but not this CUDA runtime API.
+        and torch.version.cuda is not None
+    ):
+        handle = _cuda_registered_shm_copy(tensor, d2h_stream)
+        if created is not None:
+            created.append(handle)
+        return handle
     if d2h_stream is not None:
         # Non-blocking D2H: copy on side stream to pinned CPU memory.
         old_stream = torch.accelerator.current_stream()
@@ -165,7 +275,7 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     if torch_dtype_str:
         original_dtype = getattr(torch, torch_dtype_str.replace("torch.", ""), None)
         if original_dtype is not None and tensor.dtype != original_dtype:
-            tensor = tensor.to(original_dtype)
+            tensor = tensor.view(original_dtype) if handle.get("torch_dtype_view") else tensor.to(original_dtype)
     return tensor
 
 
@@ -173,6 +283,8 @@ def _pack_tensor_if_large(
     val: torch.Tensor,
     d2h_stream: torch.Stream | None = None,
     created: list[dict[str, Any]] | None = None,
+    *,
+    enable_registered_shm: bool = False,
 ) -> torch.Tensor | dict:
     """Replace a tensor with an SHM handle if it exceeds the threshold.
 
@@ -187,7 +299,7 @@ def _pack_tensor_if_large(
     except Exception:
         storage_bytes = view_bytes
     if max(view_bytes, storage_bytes) > _SHM_TENSOR_THRESHOLD:
-        return _tensor_to_shm(val, d2h_stream=d2h_stream, created=created)
+        return _tensor_to_shm(val, d2h_stream=d2h_stream, created=created, enable_registered_shm=enable_registered_shm)
     return val
 
 
@@ -255,12 +367,15 @@ def _pack_diffusion_media(
     *,
     d2h_stream: torch.Stream | None,
     created: list[dict[str, Any]] | None = None,
+    enable_registered_shm: bool = False,
 ) -> dict[str, Any]:
     media.validate()
     if not media.prepared_for_transport:
         raise ValueError("Diffusion media must be prepared before IPC packing")
     video = media.video
-    packed_tensor = _pack_tensor_if_large(video.tensor, d2h_stream=d2h_stream, created=created)
+    packed_tensor = _pack_tensor_if_large(
+        video.tensor, d2h_stream=d2h_stream, created=created, enable_registered_shm=enable_registered_shm
+    )
     if isinstance(packed_tensor, torch.Tensor) and packed_tensor.device.type != "cpu":
         packed_tensor = packed_tensor.detach().cpu().contiguous()
     return {
@@ -319,6 +434,8 @@ def _pack_diffusion_fields(
     d2h_stream: torch.Stream | None = None,
     created: list[dict[str, Any]] | None = None,
     pending_updates: list[tuple[DiffusionOutput, str, object]] | None = None,
+    *,
+    enable_registered_shm: bool = False,
 ) -> DiffusionOutput:
     if output.media is not None and output.output is not None:
         raise ValueError("DiffusionOutput cannot contain both media and legacy output")
@@ -329,11 +446,26 @@ def _pack_diffusion_fields(
     # (never enqueue a half-packed object); the caller unlinks any SHM segments
     # accumulated in ``created`` on failure.
     packed_output = _UNSET
-    if output.output is not None:
+    if enable_registered_shm and output.video_output_index is not None:
+        index = output.video_output_index
+        values = output.output
+        if not isinstance(values, tuple) or type(index) is not int or not 0 <= index < len(values):
+            raise ValueError("video_output_index must identify a video tensor in the legacy output tuple")
+        if not isinstance(values[index], torch.Tensor):
+            raise TypeError("The legacy video output must be a tensor")
+        packed_output = tuple(
+            _pack_tensor_if_large(value, d2h_stream=d2h_stream, created=created, enable_registered_shm=True)
+            if position == index
+            else _pack_value_if_large(value, d2h_stream=d2h_stream, created=created)
+            for position, value in enumerate(values)
+        )
+    elif output.output is not None:
         packed_output = _pack_value_if_large(output.output, d2h_stream=d2h_stream, created=created)
     packed_media = _UNSET
     if output.media is not None:
-        packed_media = _pack_diffusion_media(output.media, d2h_stream=d2h_stream, created=created)
+        packed_media = _pack_diffusion_media(
+            output.media, d2h_stream=d2h_stream, created=created, enable_registered_shm=enable_registered_shm
+        )
     packed_latents = _UNSET
     if isinstance(output.trajectory_latents, torch.Tensor):
         packed_latents = _pack_tensor_if_large(output.trajectory_latents, d2h_stream=d2h_stream, created=created)
@@ -363,13 +495,15 @@ def _pack_diffusion_fields(
     return output
 
 
-def _is_rpc_result_envelope(output: object) -> bool:
+def _is_rpc_result_envelope(output: object) -> TypeGuard[dict[str, Any]]:
     return isinstance(output, dict) and output.get("type") == DIFFUSION_RPC_RESULT_ENVELOPE
 
 
 def pack_diffusion_output_shm(
     output: object,
     d2h_stream: torch.Stream | None = None,
+    *,
+    enable_registered_shm: bool = False,
 ) -> object:
     """Replace large tensors in diffusion worker outputs with SHM handles.
 
@@ -381,6 +515,10 @@ def pack_diffusion_output_shm(
 
     If *d2h_stream* is provided, D2H copies use that stream (non-blocking on
     the default stream).  The caller must synchronize *d2h_stream* afterward.
+
+    ``enable_registered_shm`` opts explicitly identified video tensors into
+    direct CUDA-to-SHM transfer and borrowed CPU views. Other payloads keep
+    their existing transport. Registration is per transfer, without pooling.
 
     Packing is failure-atomic: every SHM segment created during the call is
     tracked and unlinked if any part of the payload fails to pack, and field
@@ -394,6 +532,7 @@ def pack_diffusion_output_shm(
             d2h_stream=d2h_stream,
             created=created,
             pending_updates=pending_updates,
+            enable_registered_shm=enable_registered_shm,
         )
     except BaseException:
         _unlink_shm_handles(created)
@@ -444,13 +583,16 @@ def _pack_output_shm(
     d2h_stream: torch.Stream | None,
     created: list[dict[str, Any]],
     pending_updates: list[tuple[DiffusionOutput, str, object]],
+    enable_registered_shm: bool = False,
 ) -> object:
+    transport_options = {"enable_registered_shm": True} if enable_registered_shm else {}
     for item in _iter_diffusion_outputs(output):
         _pack_diffusion_fields(
             item,
             d2h_stream=d2h_stream,
             created=created,
             pending_updates=pending_updates,
+            **transport_options,
         )
     return output
 
@@ -484,7 +626,7 @@ def unpack_diffusion_output_shm(output: object) -> object:
 
     result = getattr(output, "result", None)
     if isinstance(result, DiffusionOutput):
-        output.result = _unpack_diffusion_fields(result)
+        setattr(output, "result", _unpack_diffusion_fields(result))
 
     runner_outputs = getattr(output, "runner_outputs", None)
     if isinstance(runner_outputs, list):

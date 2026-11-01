@@ -1,9 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 Tencent.
 # token2wav: audio token codes -> waveform (inference only)
 # Pipeline: Token -> Latent (flow matching) -> Waveform (BigVGAN)
 
 import math
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 
 import numpy as np
 import torch
@@ -802,25 +805,6 @@ class Token2WavDecoder(nn.Module):
 
         self.upsample_factor = self.token2latent.config.get("upsample_factor", 1)
         self.wav_input_sr = config.get("wav_input_sr", 24000)
-
-        self.trainable_module = ["wavegan", "token2latent"]
-
-    def state_dict(self):
-        param_dict = OrderedDict()
-        for name in self.trainable_module:
-            state = self.get_submodule(name).state_dict(prefix=f"{name}.")
-            param_dict.update(state)
-        return param_dict
-
-    def load_state_dict(self, param_dict):
-        for name in self.trainable_module:
-            module_state = OrderedDict()
-            name_len = len(name)
-            for k, v in param_dict.items():
-                if k.startswith(f"{name}."):
-                    new_k = k[name_len + 1 :]
-                    module_state[new_k] = v
-            self.get_submodule(name).load_state_dict(module_state, strict=False)
 
     @torch.no_grad()
     def preprocess_infer_data(self, data):

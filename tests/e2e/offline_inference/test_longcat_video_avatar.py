@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Generator
+from typing import Any
 
 import numpy as np
 import pytest
@@ -105,15 +106,17 @@ def _generate_avatar_frames(
     num_frames: int = 5,
     sampling_extra_args: dict | None = None,
 ):
+    extra_info: dict[str, Any] = dict(additional_information or {})
+    extra_info.update({"stage": stage, "resolution": "480p"})
+    multi_modal_data: dict[str, Any] = {"audio": audio_path}
+    if image_path is not None:
+        multi_modal_data["image"] = image_path
     prompt = {
         "prompt": PROMPT,
         "negative_prompt": NEGATIVE_PROMPT,
-        "multi_modal_data": {"audio": audio_path},
-        "additional_information": additional_information or {},
+        "multi_modal_data": multi_modal_data,
+        "additional_information": extra_info,
     }
-    prompt["additional_information"].update({"stage": stage, "resolution": "480p"})
-    if image_path is not None:
-        prompt["multi_modal_data"]["image"] = image_path
 
     outputs = omni_runner.generate(
         [prompt],

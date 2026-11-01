@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -200,7 +203,16 @@ class VllmOmniImageClient:
             )
             last_response = response
             if response.status_code != 404:
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as error:
+                    # Keep the server's validation detail in the exception;
+                    # otherwise multipart image tests only report a bare
+                    # ``400 Bad Request`` and hide the actionable cause.
+                    raise requests.HTTPError(
+                        f"{error}: {response.text}",
+                        response=response,
+                    ) from error
                 return decode_base64_image(response.json()["data"][0]["b64_json"])
 
         assert last_response is not None

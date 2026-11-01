@@ -18,7 +18,7 @@ from typing import Any, Literal
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 
@@ -58,6 +58,8 @@ class ImageGenerationRequest(BaseModel):
     Follows the OpenAI Images API specification with vllm-omni extensions
     for advanced diffusion parameters.
     """
+
+    model_config = ConfigDict(extra="allow")
 
     # Required fields
     prompt: str = Field(..., description="Text description of the desired image(s)")

@@ -306,6 +306,23 @@ def test_check_admission_admits_diffusion_with_explicit_util():
     assert ledgers[0].kv_budget_bytes == int(cap * 0.3)
 
 
+def test_check_admission_reads_typed_diffusion_cache_config():
+    cap = 80 * 1024**3
+    diff = _local_diffusion_replica(0, 0, "0", util=None)
+    diff.stage_cfg.cache_config = types.SimpleNamespace(gpu_memory_utilization=0.35)
+    plan = LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[diff])
+
+    ledgers = check_admission(
+        [plan],
+        resolve_physical_devices=lambda _r: [0],
+        device_total_memory=lambda _d: cap,
+        external_reserve_bytes=0,
+        safety_margin_bytes=0,
+    )
+
+    assert ledgers[0].kv_budget_bytes == int(cap * 0.35)
+
+
 def test_check_admission_unresolved_local_raises():
     """A local replica invisible to the ledger must fail admission, not skip it:
     it would otherwise initialize concurrently with unbounded demand."""

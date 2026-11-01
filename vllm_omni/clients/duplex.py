@@ -2,9 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Public asynchronous client for the vLLM-Omni full-duplex Realtime API.
 
-Connects to ``/v1/realtime?duplex=1`` (the normative duplex contract) and
-provides typed events, response demultiplexing, incremental playback
-acking, and transparent session resume on transport drops.
+:class:`DuplexClientBase` holds the transport-agnostic session client (typed
+events, response demultiplexing, incremental playback acking, the session
+handshake). :class:`DuplexClient` connects it to ``/v1/realtime?duplex=1``
+(the normative duplex contract) over WebSocket with transparent session
+resume on transport drops; :class:`vllm_omni.clients.inline_duplex.InlineDuplexClient`
+drives an in-process :class:`~vllm_omni.entrypoints.duplex_omni.DuplexOmni`
+with exactly the same usage.
 
 Example::
 
@@ -35,14 +39,26 @@ import math
 import random
 import time
 import wave
+from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
 import pybase64 as base64
+
+from vllm_omni.clients.utils import (
+    _finite_metric_values,
+    _finite_number,
+    _interval_summary,
+    _rounded_ms,
+    _stage_engine_metrics_block,
+    _stage_id_sort_key,
+    distribution_summary,
+    metric_mean,
+    summarize_stage_metrics,
+)
 
 __all__ = [
     "DUPLEX_FIRST_UNIT_MS",
@@ -53,6 +69,7 @@ __all__ = [
     "AudioDelta",
     "ConnectionResumed",
     "DuplexClient",
+    "DuplexClientBase",
     "DuplexClientError",
     "DuplexConnectionError",
     "DuplexEvent",
@@ -67,6 +84,7 @@ __all__ = [
     "ResponseHandle",
     "SessionConfig",
     "SessionCreated",
+    "SessionUpdated",
     "SpeakDecision",
     "WebSocketTransport",
     "TextDelta",
@@ -80,7 +98,10 @@ __all__ = [
     "image_data_url",
     "read_pcm16_wav",
     "reference_audio_data_url",
+    "distribution_summary",
+    "metric_mean",
     "summarize_session_request_metrics",
+    "summarize_stage_metrics",
     "wait_for_condition",
     "write_pcm16_wav",
 ]
@@ -90,13 +111,10 @@ __all__ = [
 PCM16_SAMPLE_RATE = 16_000
 PCM16_BYTES_PER_SAMPLE = 2
 
-# Server-side model unit boundaries, in cumulative appended audio.
-# Stage0 configures the streaming mel processor with first_chunk_ms=1035 and
-# chunk_ms=1000; the processor aligns the first chunk down to a hop_length (160
-# samples) multiple, so unit 0 closes at 16480 samples and every later unit
-# closes 16000 samples after it. Camera frames must ride the append that closes
-# a unit, otherwise Stage0 cannot bind them to that unit's audio.
-DUPLEX_FIRST_UNIT_MS = 1030
+# The native PCM reservation closes every 1000 ms, including the first unit.
+# Stage0 adds the first mel window's padding internally; the camera frame must
+# arrive with the reservation, before that internal padding is applied.
+DUPLEX_FIRST_UNIT_MS = 1000
 DUPLEX_UNIT_MS = 1000
 
 
@@ -227,7 +245,7 @@ class SessionConfig:
     idle_timeout_s: float | None = None
     extra_body: dict[str, object] = field(default_factory=dict)
 
-    def to_session_payload(self, *, model: str, session_id: str | None = None) -> dict[str, object]:
+    def to_session_payload(self, *, model: str) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": model,
             "modalities": list(self.modalities),
@@ -244,8 +262,6 @@ class SessionConfig:
             },
             "turn_detection": self.turn_detection,
         }
-        if session_id:
-            payload["session_id"] = session_id
         if self.instructions is not None:
             payload["instructions"] = self.instructions
         if self.ref_audio is not None:
@@ -366,14 +382,18 @@ class SessionCreated(DuplexEvent):
         value = self.raw.get("resume_token")
         return value if isinstance(value, str) else None
 
-    @property
-    def incarnation(self) -> int:
-        value = self.raw.get("incarnation")
-        return value if isinstance(value, int) else 0
-
 
 class SessionResumed(SessionCreated):
     pass
+
+
+class SessionUpdated(DuplexEvent):
+    """An acknowledged replacement of the public session configuration."""
+
+    @property
+    def session(self) -> dict[str, object]:
+        value = self.raw.get("session")
+        return value if isinstance(value, dict) else {}
 
 
 class SessionClosed(DuplexEvent):
@@ -456,6 +476,7 @@ class ErrorEvent(DuplexEvent):
 _EVENT_TYPES: dict[str, type[DuplexEvent]] = {
     "session.created": SessionCreated,
     "session.resumed": SessionResumed,
+    "session.updated": SessionUpdated,
     "session.closed": SessionClosed,
     "session.expired": SessionExpired,
     "response.created": ResponseCreated,
@@ -596,79 +617,85 @@ class ResponseHandle:
 # Client
 
 
-class WebSocketTransport(Protocol):
+class WebSocketTransport(ABC):
     """Minimal WebSocket surface the client needs (satisfied by ``websockets``)."""
 
+    @abstractmethod
     async def send(self, data: str) -> None: ...
 
+    @abstractmethod
     async def recv(self) -> str | bytes: ...
 
+    @abstractmethod
     async def close(self) -> None: ...
 
 
 ConnectFn = Callable[[str], Awaitable["WebSocketTransport"]]
 
 
-class DuplexClient:
-    """Async client for one duplex session over ``/v1/realtime?duplex=1``.
+class DuplexClientBase(ABC):
+    """Transport-agnostic duplex session client.
 
-    ``session_id`` only names the session this client creates: entering the
-    client always performs the ``session.update`` handshake. Resuming an
-    existing session is supported only as automatic reconnect within the same
-    client instance (see ``ReconnectPolicy``); taking over a session from a
-    new client requires the wire-level ``session.resume`` handshake
-    (``resume_token``, ``incarnation``, ``last_received_server_event_seq``),
-    which this client does not expose.
+    Everything a caller touches (typed events, response demux, input helpers,
+    playback acks, the ``session.update`` handshake) lives here. A subclass
+    only supplies the transport: :meth:`_open` establishes it and must deliver
+    the server's ``session.created`` payload through :meth:`_dispatch`,
+    :meth:`_send_command` delivers one client event, :meth:`_teardown`
+    releases the transport.
     """
 
     def __init__(
         self,
-        url: str,
         *,
         model: str,
         config: SessionConfig | None = None,
-        session_id: str | None = None,
-        reconnect: ReconnectPolicy | None = ReconnectPolicy(),
-        heartbeat_interval_s: float | None = 30.0,
         handshake_timeout_s: float = 30.0,
-        connect: ConnectFn | None = None,
     ) -> None:
-        self.url = url
         self.model = model
         self.config = config or SessionConfig()
-        self.session_id = session_id
+        #: Allocated by the server; ``None`` until ``session.created`` arrives.
+        self.session_id: str | None = None
         self.session_info: dict[str, object] = {}
-        self.incarnation = 0
-        self.resume_token: str | None = None
-        self._reconnect = reconnect
-        self._heartbeat_interval_s = heartbeat_interval_s
         self._handshake_timeout_s = handshake_timeout_s
-        self._connect_fn: ConnectFn = connect or self._default_connect
-        self._ws: WebSocketTransport | None = None
-        self._reader_task: asyncio.Task[None] | None = None
-        self._heartbeat_task: asyncio.Task[None] | None = None
         self._subscribers: list[asyncio.Queue[DuplexEvent | _ClosedMarker]] = []
         self._response_queue: asyncio.Queue[ResponseHandle | _ClosedMarker | _ErrorMarker] = asyncio.Queue(
             maxsize=_MAX_BUFFERED_EVENTS
         )
         self._responses: dict[str, ResponseHandle] = {}
-        self._last_server_event_seq: int | None = None
         self._input_audio_end_ms = 0.0
         self._closing = False
         self._closed = asyncio.Event()
         self._closed_marker: _ClosedMarker | None = None
+        self._last_error_reason: str | None = None
+
+    # -- transport hooks ------------------------------------------------------
+
+    @abstractmethod
+    async def _open(self) -> None:
+        """Establish the transport and start delivering server events via ``_dispatch``.
+
+        Called once from :meth:`__aenter__`; the base then sends the
+        ``session.update`` handshake and waits for ``session.created``.
+        """
+
+    @abstractmethod
+    async def _send_command(self, payload: dict[str, object]) -> None:
+        """Deliver one client event (already stamped with ``event_id``)."""
+
+    @abstractmethod
+    async def _teardown(self) -> None:
+        """Release the transport; must be idempotent."""
 
     # -- lifecycle ----------------------------------------------------------
 
-    async def __aenter__(self) -> DuplexClient:
-        self._ws = await self._connect_fn(self._target_url())
+    async def __aenter__(self) -> DuplexClientBase:
         handshake_queue = self._add_subscriber()
         try:
-            self._reader_task = asyncio.create_task(self._read_loop(), name="duplex-client-reader")
+            await self._open()
             await self.send(
                 {
                     "type": "session.update",
-                    "session": self.config.to_session_payload(model=self.model, session_id=self.session_id),
+                    "session": self.config.to_session_payload(model=self.model),
                 }
             )
             created = await self._wait_on_queue(
@@ -677,14 +704,12 @@ class DuplexClient:
                 timeout_s=self._handshake_timeout_s,
             )
         except BaseException:
-            await self._teardown()
+            await self._teardown_quietly()
             raise
         finally:
             self._remove_subscriber(handshake_queue)
         assert isinstance(created, SessionCreated)
         self._adopt_session(created)
-        if self._heartbeat_interval_s is not None:
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="duplex-client-heartbeat")
         return self
 
     async def __aexit__(self, exc_type, exc, traceback) -> None:
@@ -704,7 +729,7 @@ class DuplexClient:
                 except DuplexClientError:
                     pass
         finally:
-            await self._teardown()
+            await self._teardown_quietly()
 
     async def close(self, *, timeout_s: float = 20.0) -> None:
         """Send ``session.close`` and wait for the server to confirm."""
@@ -720,6 +745,12 @@ class DuplexClient:
             await asyncio.wait_for(self._closed.wait(), timeout_s)
         except asyncio.TimeoutError:
             self._finalize("close timed out", expected=True)
+
+    async def _teardown_quietly(self) -> None:
+        self._closing = True
+        if not self._closed.is_set():
+            self._finalize("closed", expected=True)
+        await self._teardown()
 
     # -- input ----------------------------------------------------------------
 
@@ -772,10 +803,9 @@ class DuplexClient:
         model unit ``k`` (see :func:`duplex_unit_boundary_ms`), which
         reproduces the official ``streaming_prefill(audio_waveform=<1 s>,
         frame_list=[frame])`` pairing: a second of audio and the picture
-        captured during it enter the same unit. Sending on whole-second
-        boundaries instead would strand frame 0 on an append that cannot
-        close a unit yet, and shift every later frame one unit ahead of its
-        audio.
+        captured during it enter the same unit. Sending a frame before its
+        whole-second unit boundary would strand it on an append that cannot
+        close the unit yet.
 
         ``stacked_video_frames`` is the optional parallel track of composites
         (see ``vllm_omni.experimental.fullduplex.video_stacking``): entry ``k``
@@ -923,8 +953,10 @@ class DuplexClient:
         payload = dict(event)
         payload.setdefault("event_id", f"evt_{uuid4().hex}")
         try:
-            await self._ws.send(json.dumps(payload))
+            await self._send_command(payload)
         except asyncio.CancelledError:
+            raise
+        except DuplexClientError:
             raise
         except Exception as exc:
             raise DuplexConnectionError(f"send failed: {exc}") from exc
@@ -932,44 +964,14 @@ class DuplexClient:
 
     # -- internals ---------------------------------------------------------------
 
-    def _target_url(self) -> str:
-        parts = urlsplit(self.url)
-        path = parts.path if parts.path not in ("", "/") else "/v1/realtime"
-        query = dict(parse_qsl(parts.query, keep_blank_values=True))
-        query.setdefault("duplex", "1")
-        query.setdefault("model", self.model)
-        # The client always opens with an explicit session.update (and resumes
-        # with an explicit session.resume). Autostart would race that handshake:
-        # with a model query param, the server creates a bare default session
-        # before reading the first client event, silently dropping ref_audio
-        # and the model-specific extra_body. Force it off even when the caller's
-        # URL carries autostart=1 — this client cannot operate over it.
-        query["autostart"] = "0"
-        return urlunsplit((parts.scheme or "ws", parts.netloc, path, urlencode(query), parts.fragment))
-
-    async def _default_connect(self, url: str) -> WebSocketTransport:
-        try:
-            import websockets
-        except ImportError as exc:  # pragma: no cover - websockets is a pinned dep
-            raise DuplexConnectionError("The duplex client requires the 'websockets' package") from exc
-        try:
-            return await websockets.connect(url, max_size=_MAX_FRAME_BYTES)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise DuplexConnectionError(f"connect to {url} failed: {exc}") from exc
-
     def _adopt_session(self, event: SessionCreated) -> None:
-        # A resume activation carries no nested session object; keep the
-        # session_info captured at the original handshake in that case.
+        # session.created and session.resumed both carry the engine's current
+        # session object; keep the last one seen.
         if event.session:
             self.session_info = event.session
         session_id = event.session.get("session_id") or event.session.get("id") or event.session_id
         if isinstance(session_id, str) and session_id:
             self.session_id = session_id
-        self.incarnation = event.incarnation
-        if event.resume_token:
-            self.resume_token = event.resume_token
 
     def _announce(self, handle: ResponseHandle) -> None:
         """Deliver a handle to responses() exactly once, decision known."""
@@ -1011,42 +1013,27 @@ class DuplexClient:
             if item.type in types:
                 return item
 
-    async def _read_loop(self) -> None:
-        while True:
-            try:
-                while True:
-                    raw = await self._ws.recv()
-                    if isinstance(raw, (bytes, bytearray)):
-                        continue
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(data, dict):
-                        await self._dispatch(data)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if self._closing or self._closed.is_set():
-                    self._finalize("closed", expected=True)
-                    return
-                if await self._attempt_resume():
-                    continue
-                self._finalize(f"connection lost: {exc}", expected=False)
-                return
+    def _accept_event(self, data: dict[str, object]) -> bool:
+        """Transport hook: return False to drop ``data`` before dispatch (duplicates)."""
+        del data
+        return True
+
+    async def _after_dispatch(self, event: DuplexEvent, data: dict[str, object]) -> None:
+        """Transport hook run after an event was delivered to subscribers."""
+        del event, data
 
     async def _dispatch(self, data: dict[str, object]) -> None:
-        seq = data.get("server_event_seq")
-        if isinstance(seq, int):
-            if self._last_server_event_seq is not None and seq <= self._last_server_event_seq:
-                return  # duplicate delivered by resume replay
-            self._last_server_event_seq = seq
+        if not self._accept_event(data):
+            return
         event = wrap_event(data)
 
         if isinstance(event, SessionResumed):
             self._adopt_session(event)
         elif isinstance(event, SessionCreated):
             self._adopt_session(event)
+        elif isinstance(event, SessionUpdated):
+            if event.session:
+                self.session_info = event.session
         elif isinstance(event, ResponseCreated):
             response_id = event.response_id
             if response_id and response_id not in self._responses:
@@ -1098,29 +1085,173 @@ class DuplexClient:
             # on the response path too so a consumer waiting in responses()
             # is not left waiting forever (see the responses() docstring).
             _put_drop_oldest(self._response_queue, _ErrorMarker(event))
+            # Keep the text for the close that usually follows: a client that
+            # is streaming input is inside send(), not draining responses(),
+            # and would otherwise only ever see "closed".
+            self._last_error_reason = f"{event.code}: {event.message}" if event.code else event.message
 
         for queue in list(self._subscribers):
             _put_drop_oldest(queue, event)
 
         if isinstance(event, SessionClosed):
-            self._finalize("closed", expected=True)
+            self._finalize(self._last_error_reason or "closed", expected=True)
         elif isinstance(event, SessionExpired):
             reason = data.get("reason")
             self._finalize(f"expired: {reason}" if reason else "expired", expected=False)
-        elif event.type == "session.resync_required":
+
+        await self._after_dispatch(event, data)
+
+    def _finalize(self, reason: str, *, expected: bool) -> None:
+        if self._closed.is_set():
+            return
+        marker = _ClosedMarker(reason=reason, expected=expected)
+        self._closed_marker = marker
+        self._closed.set()
+        for handle in self._responses.values():
+            handle._finish(None)
+        self._responses.clear()
+        for queue in (*self._subscribers, self._response_queue):
+            _put_drop_oldest(queue, marker)
+
+
+class DuplexClient(DuplexClientBase):
+    """Async client for one duplex session over ``/v1/realtime?duplex=1``."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        model: str,
+        config: SessionConfig | None = None,
+        reconnect: ReconnectPolicy | None = ReconnectPolicy(),
+        heartbeat_interval_s: float | None = 30.0,
+        handshake_timeout_s: float = 30.0,
+        connect: ConnectFn | None = None,
+    ) -> None:
+        super().__init__(model=model, config=config, handshake_timeout_s=handshake_timeout_s)
+        self.url = url
+        self.resume_token: str | None = None
+        self._reconnect = reconnect
+        self._heartbeat_interval_s = heartbeat_interval_s
+        self._connect_fn: ConnectFn = connect or self._default_connect
+        self._ws: WebSocketTransport | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._last_server_event_seq: int | None = None
+
+    # -- transport hooks ------------------------------------------------------
+
+    async def _open(self) -> None:
+        self._ws = await self._connect_fn(self._target_url())
+        self._reader_task = asyncio.create_task(self._read_loop(), name="duplex-client-reader")
+
+    async def __aenter__(self) -> DuplexClient:
+        await super().__aenter__()
+        if self._heartbeat_interval_s is not None:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="duplex-client-heartbeat")
+        return self
+
+    async def _send_command(self, payload: dict[str, object]) -> None:
+        if self._ws is None:
+            raise DuplexConnectionError("send failed: transport is not connected")
+        await self._ws.send(json.dumps(payload))
+
+    async def _teardown(self) -> None:
+        for task in (self._heartbeat_task, self._reader_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -- internals ---------------------------------------------------------------
+
+    def _target_url(self) -> str:
+        parts = urlsplit(self.url)
+        path = parts.path if parts.path not in ("", "/") else "/v1/realtime"
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query.setdefault("duplex", "1")
+        query.setdefault("model", self.model)
+        # The client always opens with an explicit session.update (and resumes
+        # with an explicit session.resume). Autostart would race that handshake:
+        # with a model query param, the server creates a bare default session
+        # before reading the first client event, silently dropping ref_audio
+        # and the model-specific extra_body. Force it off even when the caller's
+        # URL carries autostart=1 — this client cannot operate over it.
+        query["autostart"] = "0"
+        return urlunsplit((parts.scheme or "ws", parts.netloc, path, urlencode(query), parts.fragment))
+
+    async def _default_connect(self, url: str) -> WebSocketTransport:
+        try:
+            import websockets
+        except ImportError as exc:  # pragma: no cover - websockets is a pinned dep
+            raise DuplexConnectionError("The duplex client requires the 'websockets' package") from exc
+        try:
+            return await websockets.connect(url, max_size=_MAX_FRAME_BYTES)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise DuplexConnectionError(f"connect to {url} failed: {exc}") from exc
+
+    def _adopt_session(self, event: SessionCreated) -> None:
+        super()._adopt_session(event)
+        if event.resume_token:
+            self.resume_token = event.resume_token
+
+    def _accept_event(self, data: dict[str, object]) -> bool:
+        seq = data.get("server_event_seq")
+        if isinstance(seq, int):
+            if self._last_server_event_seq is not None and seq <= self._last_server_event_seq:
+                return False  # duplicate delivered by resume replay
+            self._last_server_event_seq = seq
+        return True
+
+    async def _after_dispatch(self, event: DuplexEvent, data: dict[str, object]) -> None:
+        if event.type == "session.resync_required":
             # The server stopped journaling this session's events, so any
             # retained resume credential will be refused on the next
             # session.resume. Drop it now: a later transport failure then
             # finalizes immediately instead of burning reconnect attempts.
             self.resume_token = None
 
-        if isinstance(seq, int) and not self._closed.is_set():
+        seq = data.get("server_event_seq")
+        if isinstance(seq, int) and not self._closed.is_set() and self._ws is not None:
             try:
                 await self._ws.send(json.dumps({"type": "session.event_ack", "server_event_seq": seq}))
             except asyncio.CancelledError:
                 raise
             except Exception:
                 pass  # the reader will observe the transport failure itself
+
+    async def _read_loop(self) -> None:
+        while True:
+            try:
+                while True:
+                    raw = await self._ws.recv()
+                    if isinstance(raw, (bytes, bytearray)):
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(data, dict):
+                        await self._dispatch(data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._closing or self._closed.is_set():
+                    self._finalize("closed", expected=True)
+                    return
+                if await self._attempt_resume():
+                    continue
+                self._finalize(f"connection lost: {exc}", expected=False)
+                return
 
     async def _attempt_resume(self) -> bool:
         policy = self._reconnect
@@ -1140,7 +1271,6 @@ class DuplexClient:
                         {
                             "type": "session.resume",
                             "session_id": self.session_id,
-                            "incarnation": self.incarnation,
                             "resume_token": self.resume_token,
                             "last_received_server_event_seq": self._last_server_event_seq or 0,
                         }
@@ -1160,7 +1290,10 @@ class DuplexClient:
                         continue
                     event_type = data.get("type")
                     if event_type == "session.resumed":
+                        previous = self._ws
                         self._ws = ws
+                        if previous is not None and previous is not ws:
+                            await self._close_quietly(previous)
                         await self._dispatch({"type": "connection.resumed", "attempt": attempt})
                         await self._dispatch(data)
                         for entry in pending:
@@ -1210,60 +1343,9 @@ class DuplexClient:
             except DuplexClientError:
                 return
 
-    def _finalize(self, reason: str, *, expected: bool) -> None:
-        if self._closed.is_set():
-            return
-        marker = _ClosedMarker(reason=reason, expected=expected)
-        self._closed_marker = marker
-        self._closed.set()
-        for handle in self._responses.values():
-            handle._finish(None)
-        self._responses.clear()
-        for queue in (*self._subscribers, self._response_queue):
-            _put_drop_oldest(queue, marker)
-
-    async def _teardown(self) -> None:
-        self._closing = True
-        if not self._closed.is_set():
-            self._finalize("closed", expected=True)
-        for task in (self._heartbeat_task, self._reader_task):
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception:  # noqa: BLE001
-                pass
-
 
 # ---------------------------------------------------------------------------
 # Test/benchmark collector
-
-
-def _rounded_ms(value: float) -> float:
-    return round(float(value), 3)
-
-
-def _interval_summary(values: list[float]) -> dict[str, float | int]:
-    clean = sorted(_rounded_ms(value) for value in values if math.isfinite(value) and value >= 0)
-    if not clean:
-        return {"count": 0, "mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
-
-    def nearest_rank(percentile: float) -> float:
-        index = max(0, math.ceil(percentile * len(clean)) - 1)
-        return clean[min(index, len(clean) - 1)]
-
-    return {
-        "count": len(clean),
-        "mean": _rounded_ms(sum(clean) / len(clean)),
-        "p50": nearest_rank(0.50),
-        "p95": nearest_rank(0.95),
-        "max": clean[-1],
-    }
 
 
 def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
@@ -1285,6 +1367,34 @@ def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
     return None
 
 
+def _event_response_request_metrics(event: dict[str, object]) -> dict[str, object] | None:
+    direct_metrics = event.get("response_request_metrics")
+    if isinstance(direct_metrics, dict):
+        return direct_metrics
+    candidates: list[object] = [event.get("vllm_omni")]
+    metadata = event.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.extend((metadata, metadata.get("vllm_omni"), metadata.get("duplex_event")))
+    response = event.get("response")
+    if isinstance(response, dict):
+        response_metadata = response.get("metadata")
+        if isinstance(response_metadata, dict):
+            candidates.extend(
+                (
+                    response_metadata,
+                    response_metadata.get("vllm_omni"),
+                    response_metadata.get("duplex_event"),
+                )
+            )
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        request_metrics = candidate.get("response_request_metrics")
+        if isinstance(request_metrics, dict):
+            return request_metrics
+    return None
+
+
 class EventCollector:
     """Accumulate events for assertions and latency summaries (tests/benchmarks).
 
@@ -1299,7 +1409,7 @@ class EventCollector:
         self.response_ids: list[str] = []
         self.output_sample_rate_hz = 24_000
 
-    async def consume(self, client: DuplexClient) -> None:
+    async def consume(self, client: DuplexClientBase) -> None:
         """Subscribe to ``client`` and collect until the session ends."""
         try:
             async for event in client.events():
@@ -1379,6 +1489,85 @@ class EventCollector:
                 return received_at_s
         return None
 
+    def global_timing_summary(
+        self,
+        *,
+        after_s: float,
+        window_started_at_s: float,
+        response_ids: list[str],
+        measurement_origin: dict[str, str],
+    ) -> dict[str, object]:
+        """Summarize one client-observed timing window across responses.
+
+        Returns raw measurements only. Derived metrics such as RTF are computed
+        by the caller — e.g. with ``vllm_omni.metrics.definitions.compute_audio_rtf``.
+        """
+        selected_response_ids = set(response_ids)
+        first_text_received_at_s: float | None = None
+        audio_received_at_s: list[float] = []
+        response_audio_duration_ms: dict[str, float] = {}
+
+        for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
+            if received_at_s < after_s:
+                continue
+            response_id = self.response_id(event)
+            if response_id is None or response_id not in selected_response_ids:
+                continue
+            if (
+                event.get("type")
+                in {
+                    "response.output_audio_transcript.delta",
+                    "response.output_text.delta",
+                    "response.text.delta",
+                }
+                and isinstance(event.get("delta"), str)
+                and bool(event["delta"])
+                and first_text_received_at_s is None
+            ):
+                first_text_received_at_s = received_at_s
+            if event.get("type") not in _AUDIO_DELTA_TYPES:
+                continue
+            delta = event.get("delta") or event.get("audio")
+            if not isinstance(delta, str) or not delta:
+                continue
+            audio_received_at_s.append(received_at_s)
+            metadata = event.get("metadata")
+            duration_ms = metadata.get("audio_duration_ms") if isinstance(metadata, dict) else None
+            parsed_duration_ms = _finite_number(duration_ms, nonnegative=True)
+            if parsed_duration_ms is not None:
+                response_audio_duration_ms[response_id] = max(
+                    response_audio_duration_ms.get(response_id, 0.0),
+                    parsed_duration_ms,
+                )
+
+        if not audio_received_at_s:
+            return {}
+
+        audio_duration_ms = sum(
+            response_audio_duration_ms.get(
+                response_id,
+                self._format_for_bytes().duration_ms(len(self.audio_bytes(response_id))),
+            )
+            for response_id in response_ids
+        )
+        audio_generation_ms = max(
+            0.0,
+            (audio_received_at_s[-1] - window_started_at_s) * 1000.0,
+        )
+        return {
+            "source": "client_monotonic_receive",
+            "response_ids": list(response_ids),
+            "measurement_origin": dict(measurement_origin),
+            "ttft_ms": (
+                _rounded_ms((first_text_received_at_s - window_started_at_s) * 1000.0)
+                if first_text_received_at_s is not None
+                else None
+            ),
+            "ttfp_ms": _rounded_ms((audio_received_at_s[0] - window_started_at_s) * 1000.0),
+            "audio_generation_ms": _rounded_ms(audio_generation_ms),
+            "audio_duration_ms": _rounded_ms(audio_duration_ms),
+        }
+
     def timing_summary(
         self,
         *,
@@ -1388,7 +1577,8 @@ class EventCollector:
         measurement_origin: dict[str, str] | None = None,
     ) -> dict[str, object]:
         """Summarize engine token metrics and client-observed audio cadence."""
-        stage0_metrics: dict[str, object] | None = None
+        observed_stage_metrics: dict[str, dict[str, object]] = {}
+        response_request_metrics: dict[str, object] = {}
         response_created_at_s: float | None = None
         first_text_received_at_s: float | None = None
         audio_received_at_s: list[float] = []
@@ -1415,9 +1605,14 @@ class EventCollector:
                 first_text_received_at_s = received_at_s
 
             stage_metrics = _event_stage_metrics(event)
-            stage0 = stage_metrics.get("0") if isinstance(stage_metrics, dict) else None
-            if isinstance(stage0, dict):
-                stage0_metrics = stage0
+            if isinstance(stage_metrics, dict):
+                for stage_id, stage_snapshot in stage_metrics.items():
+                    if isinstance(stage_snapshot, dict):
+                        observed_stage_metrics[str(stage_id)] = stage_snapshot
+
+            event_request_metrics = _event_response_request_metrics(event)
+            if event_request_metrics is not None:
+                response_request_metrics.update(event_request_metrics)
 
             if event.get("type") not in _AUDIO_DELTA_TYPES:
                 continue
@@ -1431,21 +1626,18 @@ class EventCollector:
                 cumulative_audio_ms.append(max(0.0, float(duration_ms)))
 
         result: dict[str, object] = {}
-        if stage0_metrics is not None:
-            raw_itls = stage0_metrics.get("vllm_itls_ms")
-            itls = (
-                [float(value) for value in raw_itls if isinstance(value, int | float)]
-                if isinstance(raw_itls, list)
-                else []
-            )
-            result["stage0_tokens"] = {
-                "source": "engine_stage_metrics",
-                "output_token_count": int(stage0_metrics.get("num_tokens_out") or 0),
-                "ttft_ms": float(stage0_metrics.get("vllm_ttft_ms") or 0.0),
-                "tpot_ms": float(stage0_metrics.get("vllm_tpot_ms") or 0.0),
-                "itls_ms": itls,
-                "inter_token_interval_ms": _interval_summary(itls),
+        stage0_metrics = observed_stage_metrics.get("0")
+        if observed_stage_metrics:
+            stages = {
+                stage_id: _stage_engine_metrics_block(stage_snapshot)
+                for stage_id, stage_snapshot in sorted(
+                    observed_stage_metrics.items(),
+                    key=lambda item: _stage_id_sort_key(item[0]),
+                )
             }
+            result["stages"] = stages
+            if "0" in stages:
+                result["stage0_tokens"] = stages["0"]
 
         if audio_received_at_s:
             intervals_ms = [
@@ -1478,6 +1670,31 @@ class EventCollector:
             }
             request_started_at_s = input_committed_at_s if input_committed_at_s is not None else response_created_at_s
             if request_started_at_s is not None:
+                default_measurement_origin = (
+                    {
+                        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
+                        "ttfp": "input_audio_buffer.commit client send to first audio packet",
+                    }
+                    if input_committed_at_s is not None
+                    else {
+                        "ttft": "response.created client receive to first non-empty text delta",
+                        "ttfp": "response.created client receive to first audio packet",
+                    }
+                )
+                resolved_measurement_origin = {
+                    **default_measurement_origin,
+                    **(measurement_origin or {}),
+                }
+                if stage0_metrics is not None:
+                    resolved_measurement_origin["tpot"] = "Stage-0 engine mean time per output token"
+                server_ttft_ms = _finite_number(response_request_metrics.get("ttft_ms"), nonnegative=True)
+                server_ttfp_ms = _finite_number(response_request_metrics.get("ttfp_ms"), nonnegative=True)
+                server_origins = response_request_metrics.get("measurement_origin")
+                if isinstance(server_origins, dict):
+                    if server_ttft_ms is not None and isinstance(server_origins.get("ttft"), str):
+                        resolved_measurement_origin["ttft"] = server_origins["ttft"]
+                    if server_ttfp_ms is not None and isinstance(server_origins.get("ttfp"), str):
+                        resolved_measurement_origin["ttfp"] = server_origins["ttfp"]
                 audio_duration_ms = (
                     max(cumulative_audio_ms)
                     if cumulative_audio_ms
@@ -1493,21 +1710,49 @@ class EventCollector:
                 # compute_audio_rtf — so metric definitions stay out of this
                 # dependency-free client module.
                 result["request_metrics"] = {
-                    "source": "client_monotonic_receive",
-                    "measurement_origin": measurement_origin
-                    or {
-                        "ttft": "input_audio_buffer.commit client send to first non-empty text delta",
-                        "ttfp": "input_audio_buffer.commit client send to first audio packet",
-                    },
-                    "ttft_ms": (
-                        _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
-                        if first_text_received_at_s is not None
-                        else None
+                    "source": (
+                        "server_request_start_and_client_receive"
+                        if server_ttft_ms is not None or server_ttfp_ms is not None
+                        else "client_monotonic_receive"
                     ),
-                    "ttfp_ms": _rounded_ms((audio_received_at_s[0] - request_started_at_s) * 1000.0),
+                    "measurement_origin": resolved_measurement_origin,
+                    "ttft_ms": (
+                        server_ttft_ms
+                        if server_ttft_ms is not None
+                        else (
+                            _rounded_ms((first_text_received_at_s - request_started_at_s) * 1000.0)
+                            if first_text_received_at_s is not None
+                            else None
+                        )
+                    ),
+                    "ttfp_ms": (
+                        server_ttfp_ms
+                        if server_ttfp_ms is not None
+                        else _rounded_ms((audio_received_at_s[0] - request_started_at_s) * 1000.0)
+                    ),
                     "audio_generation_ms": _rounded_ms(audio_generation_ms),
                     "audio_duration_ms": _rounded_ms(audio_duration_ms),
                 }
+                if server_ttft_ms is not None or server_ttfp_ms is not None:
+                    request_metrics = result["request_metrics"]
+                    assert isinstance(request_metrics, dict)
+                    request_metrics["response_created_to_first_text_ms"] = (
+                        _rounded_ms((first_text_received_at_s - response_created_at_s) * 1000.0)
+                        if first_text_received_at_s is not None and response_created_at_s is not None
+                        else None
+                    )
+                    request_metrics["response_created_to_first_audio_ms"] = (
+                        _rounded_ms((audio_received_at_s[0] - response_created_at_s) * 1000.0)
+                        if response_created_at_s is not None
+                        else None
+                    )
+                if stage0_metrics is not None:
+                    request_metrics = result["request_metrics"]
+                    assert isinstance(request_metrics, dict)
+                    request_metrics["tpot_ms"] = _finite_number(
+                        stage0_metrics.get("vllm_tpot_ms"),
+                        nonnegative=True,
+                    )
         return result
 
     def _format_for_bytes(self) -> AudioFormat:
@@ -1589,15 +1834,12 @@ def build_realtime_url(
     model: str | None,
     *,
     autostart: bool | None = None,
-    native_duplex: bool | None = None,
-    session_id: str | None = None,
     extra_query: dict[str, str] | None = None,
 ) -> str:
     """Add explicit duplex query parameters to a Realtime URL.
 
     :class:`DuplexClient` builds its own URL; this helper is for drivers that
-    speak the wire protocol directly. ``native_duplex`` sets the per-session
-    model-native opt-in query flag; other model-specific query flags ride in
+    speak the wire protocol directly. Model-specific query flags ride in
     ``extra_query``. ``http(s)`` URLs are rewritten to ``ws(s)``.
     """
     parts = urlsplit(url)
@@ -1609,14 +1851,10 @@ def build_realtime_url(
     query.setdefault("duplex", "1")
     if model:
         query.setdefault("model", model)
-    if native_duplex is not None:
-        query["native_duplex"] = "1" if native_duplex else "0"
     for key, value in (extra_query or {}).items():
         query.setdefault(key, value)
     if autostart is not None:
         query.setdefault("autostart", "1" if autostart else "0")
-    if session_id:
-        query.setdefault("session_id", session_id)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
@@ -1640,33 +1878,32 @@ def summarize_session_request_metrics(
     *,
     session_id: str | None,
 ) -> dict[str, object]:
-    """Average client-observed metrics across turns that emitted audio.
+    """Summarize client- and engine-observed metrics across audio responses.
 
     ``request_metrics`` entries are caller-assembled dicts; keys that are
     absent or non-numeric in an entry are simply skipped. ``rtf`` is not
     produced by :meth:`EventCollector.timing_summary` (which reports raw data
-    only) — callers that want ``mean_rtf`` add an ``rtf`` value per turn,
-    e.g. via ``vllm_omni.metrics.definitions.compute_audio_rtf``.
+    only) — callers that want session ``rtf`` add an ``rtf`` value per turn,
+    e.g. via ``vllm_omni.metrics.definitions.compute_audio_rtf``. Zero or
+    missing ``tpot_ms`` values are omitted from session ``tpot_ms``.
+
+    Aggregatable fields are nested as ``{count, mean, p50, p99}``.
     """
-
-    def mean(metric: str, *, digits: int = 3) -> float | None:
-        values = [
-            float(request[metric])
-            for request in request_metrics
-            if isinstance(request.get(metric), int | float) and math.isfinite(float(request[metric]))
-        ]
-        return round(sum(values) / len(values), digits) if values else None
-
-    return {
+    summary: dict[str, object] = {
         "session_id": session_id,
         "audio_turn_count": len(request_metrics),
-        "mean_ttft_ms": mean("ttft_ms"),
-        "mean_ttfp_ms": mean("ttfp_ms"),
-        "mean_rtf": mean("rtf", digits=6),
+        "ttft_ms": distribution_summary(_finite_metric_values(request_metrics, "ttft_ms")),
+        "ttfp_ms": distribution_summary(_finite_metric_values(request_metrics, "ttfp_ms")),
+        "rtf": distribution_summary(_finite_metric_values(request_metrics, "rtf"), digits=6),
     }
+    if (tpot := distribution_summary(_finite_metric_values(request_metrics, "tpot_ms", positive=True))) is not None:
+        summary["tpot_ms"] = tpot
+    if (stages := summarize_stage_metrics(request_metrics)) is not None:
+        summary["stages"] = stages
+    return summary
 
 
-async def acknowledge_collected_playback(client: DuplexClient, collector: EventCollector) -> None:
+async def acknowledge_collected_playback(client: DuplexClientBase, collector: EventCollector) -> None:
     """Ack playback of every collected response's audio (probe shorthand).
 
     A response that has produced no audio yet is still acked (0 ms) unless it

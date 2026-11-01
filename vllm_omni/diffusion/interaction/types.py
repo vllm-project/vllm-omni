@@ -1,38 +1,75 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Shared types for midway interaction handlers."""
 
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Literal
 
+import torch
+
 # Wire payload for one modality track. Handlers validate keys they need.
 InteractionPayload = Mapping[str, object]
 
 # Shared command semantics across modalities that support them.
-# Prompt specialization uses ``"target"`` only.
-InteractionMode = Literal["target"]
+# Prompt specialization narrows this to ``"target"`` only.
+InteractionMode = Literal["target", "velocity"]
+
+
+def synchronized_monotonic_time(stamp: float | None = None) -> float:
+    """Return a monotonic timestamp shared across DiT ranks.
+
+    ``submit_interaction`` and chunk-boundary apply run as collectives, but
+    ``time.monotonic()`` is rank-local. Under USP/SP, inter-rank skew that
+    straddles a ``1/fps`` bucket edge would schedule the same event onto
+    different frames per shard. Rank 0's stamp is broadcast (callers may pass
+    a local sample; non-source ranks' values are ignored).
+    """
+    if stamp is None:
+        stamp = time.monotonic()
+    if not torch.distributed.is_initialized():
+        return stamp
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+
+        group = get_world_group()
+    except Exception:
+        return stamp
+    if group.world_size <= 1:
+        return stamp
+    return group.broadcast_object(stamp, src=0)
 
 
 @dataclass(frozen=True)
 class ChunkMediaSpec:
-    """Media extent of one generation chunk, for interaction timeline mapping."""
+    """Decoded media extent and latent step count for one generation chunk.
 
-    num_frames: int
+    Attributes:
+        num_media_frames: Number of frames in this chunk when decoded into playable media.
+        fps: Frames per second of the media.
+        num_latent_frames: Number of latent frames in this chunk (internal DiT units).
+    """
+
+    num_media_frames: int
     fps: float
+    num_latent_frames: int
 
     def __post_init__(self) -> None:
-        if self.num_frames <= 0:
-            raise ValueError(f"ChunkMediaSpec.num_frames must be > 0, got {self.num_frames}")
+        if self.num_media_frames <= 0:
+            raise ValueError(f"ChunkMediaSpec.num_media_frames must be > 0, got {self.num_media_frames}")
+        if self.num_latent_frames <= 0:
+            raise ValueError(f"ChunkMediaSpec.num_latent_frames must be > 0, got {self.num_latent_frames}")
         if self.fps <= 0:
             raise ValueError(f"ChunkMediaSpec.fps must be > 0, got {self.fps}")
 
     @property
     def duration_s(self) -> float:
-        return float(self.num_frames) / float(self.fps)
+        return float(self.num_media_frames) / float(self.fps)
 
 
 @dataclass(kw_only=True)
@@ -41,6 +78,7 @@ class InteractionEvent:
 
     Example:
     - ``QueuedPromptEvent`` in ``vllm_omni.diffusion.interaction.modality_handlers.prompt``
+    - ``QueuedCameraEvent`` in ``vllm_omni.diffusion.interaction.modality_handlers.camera``
     """
 
     event_id: str
@@ -60,10 +98,35 @@ class InteractionSession:
 
     Example:
     - ``PromptSession`` in ``vllm_omni.diffusion.interaction.modality_handlers.prompt``
+    - ``CameraSession`` in ``vllm_omni.diffusion.interaction.modality_handlers.camera``
     """
 
     lock: Lock = field(default_factory=Lock, repr=False)
     last_boundary_at: float | None = None
+
+
+def resolve_event_frame_offset(
+    *,
+    received_at: float,
+    previous_boundary_at: float | None,
+    num_frames: int,
+    fps: float,
+) -> int:
+    """Map an event arrival time onto ``[0, num_frames - 1]`` for this chunk.
+
+    * Uses ``floor((received_at - previous_boundary_at) * fps)``.
+    * Events without a prior boundary (or with non-positive fps) map to frame 0.
+    * Offsets past the represented media window are clamped to the final frame.
+    """
+    num_frames = max(int(num_frames), 1)
+    if previous_boundary_at is None or fps <= 0:
+        return 0
+    offset = math.floor((received_at - previous_boundary_at) * float(fps))
+    if offset < 0:
+        return 0
+    if offset >= num_frames:
+        return num_frames - 1
+    return int(offset)
 
 
 @dataclass

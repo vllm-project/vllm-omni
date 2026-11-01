@@ -10,6 +10,11 @@ from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger
 
+# Upper bound on a previous streaming chunk's generation reserve: a duplex
+# turn-end chunk may retain more codec ids than the steady-state per-unit
+# reserve (see MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS).
+_MAX_PREVIOUS_CHUNK_GENERATION_RESERVE = 26 * 4
+
 logger = get_connector_logger(__name__)
 
 
@@ -345,7 +350,9 @@ def construct_next_stage_streaming_input_prompt(
                 f"confirmed={confirmed_num_computed_tokens}, prompt={request.num_prompt_tokens}"
             )
         previous_codec_ids = list(request._all_token_ids[request.num_prompt_tokens : confirmed_num_computed_tokens])
-        max_confirmed_codec_tokens = generation_reserve - 1
+        # The previous chunk may have been a turn-end unit that ran to the
+        # Talker's EOS with a larger reserve than this chunk's.
+        max_confirmed_codec_tokens = max(generation_reserve, _MAX_PREVIOUS_CHUNK_GENERATION_RESERVE) - 1
         if len(previous_codec_ids) > max_confirmed_codec_tokens:
             raise ValueError(
                 "streaming prompt recompute retained too many codec tokens: "

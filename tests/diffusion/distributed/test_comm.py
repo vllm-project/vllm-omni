@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for SeqAllToAll4D, SeqAllToAll5D, and RingComm communication primitives.
 
 CPU tests use gloo on CPU tensors (no GPU). Nightly parity tests run the same
@@ -14,6 +14,7 @@ from typing import Literal
 import pytest
 import torch
 
+from tests.helpers.distributed import configure_cpu_collective_worker, start_collective_workers
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D, SeqAllToAll5D
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -24,8 +25,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-_L4_TWO_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=2)
-_L4_FOUR_GPU = hardware_marks(res={"cuda": "L4"}, num_cards=4)
+_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)
+_L4_FOUR_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=4)
 
 DeviceKind = Literal["cpu", "cuda"]
 
@@ -56,6 +57,8 @@ def _init_worker(
             "MASTER_PORT": str(master_port),
         }
     )
+    if device_kind == "cpu":
+        configure_cpu_collective_worker()
     backend = "gloo" if device_kind == "cpu" else None
     init_distributed_environment(backend=backend)
 
@@ -227,6 +230,10 @@ def _run_ring_p2p(
             atol=atol,
             msg=f"[Rank {local_rank}] Ring P2P data mismatch",
         )
+        if device_kind == "cpu":
+            # P2P completion only synchronizes neighbors. Keep fast CPU ranks
+            # alive until every rank has finished constructing and using groups.
+            torch.distributed.barrier()
     finally:
         destroy_distributed_env()
 
@@ -243,7 +250,7 @@ def _spawn_4d_identity(
     device_kind: DeviceKind,
     master_port: int,
 ) -> None:
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         _run_4d_identity,
         args=(
             world_size,
@@ -257,6 +264,7 @@ def _spawn_4d_identity(
             master_port,
         ),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
 
@@ -272,7 +280,7 @@ def _spawn_5d_identity(
     device_kind: DeviceKind,
     master_port: int,
 ) -> None:
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         _run_5d_identity,
         args=(
             world_size,
@@ -286,6 +294,7 @@ def _spawn_5d_identity(
             master_port,
         ),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
 
@@ -299,10 +308,11 @@ def _spawn_ring_p2p(
     device_kind: DeviceKind,
     master_port: int,
 ) -> None:
-    torch.multiprocessing.spawn(
+    start_collective_workers(
         _run_ring_p2p,
         args=(world_size, dtype, batch_size, num_heads, head_size, device_kind, master_port),
         nprocs=world_size,
+        device_kind=device_kind,
     )
 
 
@@ -460,4 +470,48 @@ def test_ring_p2p_parity(world_size: int, dtype: torch.dtype):
         head_size=128,
         device_kind="cuda",
         master_port=29501,
+    )
+
+
+def _run_fused_qkv_matches_three_4d(
+    local_rank: int,
+    world_size: int,
+    device_kind: DeviceKind,
+    master_port: int,
+) -> None:
+    """LingBot's fused (B, S/N, 3, H, D) exchange must equal three per-tensor 4D exchanges."""
+    from vllm_omni.diffusion.distributed.comm import all_to_all_5D
+
+    device = _worker_device(local_rank, device_kind)
+    if device_kind == "cuda":
+        current_omni_platform.set_device(device)
+    _init_worker(local_rank, world_size, master_port, device_kind)
+    initialize_model_parallel(ulysses_degree=world_size)
+    sp_group = get_sp_group().ulysses_group
+    try:
+        batch, seq_per_rank, heads, head_size = 1, 6, 4 * world_size, 8
+        # Distinguishable values: rank, q/k/v index, position, head, feature.
+        base = torch.arange(seq_per_rank * heads * head_size, dtype=torch.float32, device=device).reshape(
+            batch, seq_per_rank, heads, head_size
+        )
+        tensors = [base + 1000.0 * local_rank + 100000.0 * which for which in range(3)]
+        separate = [SeqAllToAll4D.apply(sp_group, t, 2, 1, False) for t in tensors]
+        fused = all_to_all_5D(torch.stack(tensors, dim=2), scatter_idx=3, gather_idx=1, group=sp_group)
+        assert fused.shape == (batch, seq_per_rank * world_size, 3, heads // world_size, head_size)
+        for which, expected in enumerate(separate):
+            assert torch.equal(fused.unbind(2)[which], expected), f"q/k/v index {which} differs on rank {local_rank}"
+    finally:
+        destroy_distributed_env()
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_fused_qkv_all_to_all_matches_three_4d_exchanges_cpu(world_size: int) -> None:
+    start_collective_workers(
+        _run_fused_qkv_matches_three_4d,
+        args=(world_size, "cpu", 29613),
+        nprocs=world_size,
+        device_kind="cpu",
     )

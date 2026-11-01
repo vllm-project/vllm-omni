@@ -47,7 +47,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_lingbot_world_v2_tp1_one_block(omni_runner_handler: OmniRunnerHandler) -> None:
     """Load the real checkpoint and generate one causal block on one GPU."""
 

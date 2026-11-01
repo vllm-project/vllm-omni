@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Paged self-attention helpers for AR-Diffusion KV reuse."""
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import torch
 
-from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import contiguous_kv_gather_enabled
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping, visible_window_blocks
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backend import MultipleOf
 
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
@@ -19,6 +25,19 @@ def _layer_idx_tensor(layer_idx: int) -> torch.Tensor:
         t = torch.tensor(layer_idx, dtype=torch.int64)
         _LAYER_IDX_TENSORS[layer_idx] = t
     return t
+
+
+def _to_device_async(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host->device copy that does not stall the CPU.
+
+    ``tensor.to(device)`` from pageable memory is synchronous: the CPU blocks until
+    every kernel already queued on the stream has finished. Pinned + non_blocking
+    keeps the CPU running ahead (the caching host allocator keeps the pinned
+    source alive until the copy's stream event completes).
+    """
+    if torch.device(device).type != "cuda" or t.device.type != "cpu":
+        return t.to(device=device)
+    return t.pin_memory().to(device=device, non_blocking=True)
 
 
 class ARDiffusionPagedLayerInputs(NamedTuple):
@@ -48,6 +67,14 @@ class ARDiffusionPagedLayerInputs(NamedTuple):
     seq_lens: torch.Tensor
     max_query_len: int
     max_seq_len: int
+    # Contiguous K/V staging for this layer, when reuse_history_staging is on. ``reuse_history`` is a host
+    # bool decided once per forward (``_prepare_history_staging``): it selects one of two compiled variants.
+    stage_key: torch.Tensor | None = None
+    stage_value: torch.Tensor | None = None
+    reuse_history: bool = False
+    # Index of the current chunk's first block within the staged window: right after the visible history,
+    # which is not the end of the padded block table (that carries at least one action-capacity block).
+    stage_first_block: int = 0
 
 
 @dataclass
@@ -67,6 +94,21 @@ class ARDiffusionPagedForwardContext:
     action_slot_mapping: torch.Tensor | None = None
     query_len: int = 0
     kv_len: int = 0
+    # Tokens already committed when this forward began. Recorded rather than
+    # derived from the block count: the last block of the history is only
+    # partly written when a chunk is not a whole number of blocks, so
+    # blocks * block_size overstates it and would make attention read past
+    # what was written.
+    _history_tokens: int = 0
+    # Scratch blocks the current video tokens occupy. Not the same as
+    # len(current_video_block_ids): when the history ends mid-block, the first
+    # entry there is the history's own tail block, which is managed, not
+    # scratch. Action K/V is placed after this, so it must not count it.
+    _scratch_blocks_used: int = 0
+    # Slot offset of this chunk's first token inside its first block. The
+    # chunk's blocks then hold positions ``history - offset + j * block_size``,
+    # which is how the read path places them among the history's blocks.
+    _current_offset: int = 0
     _allocated_video: bool = False
     _committed: bool = False
     _action_len: int = 0
@@ -83,13 +125,76 @@ class ARDiffusionPagedForwardContext:
         return int(self.kv_cache.block_size)
 
     @property
+    def chunk_size(self) -> int:
+        """Tokens in one chunk -- one latent frame. The eviction unit."""
+        return int(self.kv_cache.spec.chunk_size)
+
+    @property
+    def start_offset(self) -> int:
+        """Where in its first block this forward's tokens begin.
+
+        Non-zero exactly when the committed history does not end on a block
+        boundary, which is the normal case once a frame is not a whole number
+        of blocks: 1560 tokens per frame against 16-token blocks leaves the
+        history 8 slots into its last block on every odd-numbered chunk.
+        """
+        return int(self.adapter.num_computed_tokens) % self.block_size
+
+    @property
+    def sink_tokens(self) -> int:
+        """Leading tokens the window keeps however far it has slid."""
+        return int(self.kv_cache.spec.sink_chunks) * self.chunk_size
+
+    @property
+    def window_tokens(self) -> int:
+        """Most recent tokens the window keeps, this forward's own included."""
+        return self.max_video_tokens - self.sink_tokens
+
+    @property
+    def max_video_blocks(self) -> int:
+        """Most blocks the visible window can span, which fixes the table width.
+
+        The window is two token ranges, the sink and the most recent tokens, and
+        each is converted to blocks on its own because each can straddle a block
+        edge on its own. Rounding the two ranges' *sum* up once was a block short
+        whenever both straddled: at 832x480 a 9-frame sink and a 9-frame window
+        are each 8 tokens past a 16-token edge but 28080 tokens together, a whole
+        number of blocks, so it was short on every tick once the window had
+        filled.
+
+        The sink ends at a fixed position, so its blocks are just its tokens
+        rounded up. The recent range starts at a whole number of chunks, so its
+        start sits at most ``block_size - gcd(chunk_size, block_size)`` tokens
+        past a block edge, and it can need that much more room. A chunk that is
+        a whole number of blocks never straddles, so every geometry that paged
+        one frame per block keeps exactly the width it had.
+
+        The width is a constant of the configuration, which is what keeps the
+        block table a fixed shape as the window fills.
+        """
+        return visible_window_blocks(
+            chunk_size=self.chunk_size,
+            block_size=self.block_size,
+            sink_tokens=self.sink_tokens,
+            window_tokens=self.window_tokens,
+        )
+
+    @property
     def num_current_video_blocks(self) -> int:
-        if self.seq_len % self.block_size != 0:
-            raise AssertionError(
-                "AR-Diffusion paged attention expects frame-aligned seq_len "
-                f"(multiple of block_size={self.block_size}), got {self.seq_len}"
-            )
-        return self.seq_len // self.block_size
+        """Blocks this forward's tokens occupy, counted from where they start.
+
+        A chunk need not be a whole number of blocks, so the count depends on
+        the offset it begins at, not only on its length: thirty tokens
+        starting at position thirty span three sixteen-token blocks, not two.
+        Rounding up leaves the tail of the last block unwritten, which is only
+        safe because nothing reads past ``kv_len`` -- see
+        :meth:`video_block_table`.
+
+        Both paths count the same way. The committing path writes straight
+        after the history; the scratch path is made to line up with it by
+        :meth:`ensure_video_slots`.
+        """
+        return -(-(self.start_offset + self.seq_len) // self.block_size)
 
     def ensure_video_slots(self, device: torch.device) -> None:
         """Allocate/write targets for the current video tokens, once per KV branch."""
@@ -97,22 +202,43 @@ class ARDiffusionPagedForwardContext:
             return
 
         n_blocks = self.num_current_video_blocks
+        self._history_tokens = int(self.adapter.num_computed_tokens)
         if self.commit_current:
             start = int(self.adapter.num_computed_tokens)
+            self._current_offset = start % self.block_size
             self.kv_cache.allocate_token_slots(self.adapter, self.seq_len)
             table = self.kv_cache.block_table(self.adapter)
             start_block = start // self.block_size
             self.current_video_block_ids = [int(b) for b in table[start_block : start_block + n_blocks]]
             positions = torch.arange(start, start + self.seq_len, dtype=torch.long)
-            self.current_video_slot_mapping = compute_slot_mapping(table, positions, self.block_size).to(device=device)
+            self.current_video_slot_mapping = _to_device_async(
+                compute_slot_mapping(table, positions, self.block_size), device
+            )
         else:
-            self.current_video_block_ids = self.kv_cache.scratch_block_ids(self.kv_branch, 0, n_blocks)
-            positions = torch.arange(self.seq_len, dtype=torch.long)
-            self.current_video_slot_mapping = compute_slot_mapping(
-                self.current_video_block_ids,
-                positions,
-                self.block_size,
-            ).to(device=device)
+            # The scratch region cannot simply start at slot zero. The kernel
+            # reads the history and this chunk as one contiguous run, so if the
+            # history stopped mid-block, starting here at zero would leave the
+            # rest of that block unwritten and the kernel would read those dead
+            # slots as if they were tokens, shifting the whole sequence.
+            #
+            # Instead the chunk begins where the history left off, spilling its
+            # first few tokens into the free tail of the history's own last
+            # block. That block is already this session's -- blocks are
+            # allocated whole -- and those slots hold nothing yet; the
+            # committing forward overwrites the same slots with the clean K/V
+            # later, so the committed state is unchanged either way.
+            # A history whose tail block is no longer resident has nothing to
+            # spill into; the window then starts at this chunk and zero is right.
+            offset = self.start_offset if self.history_block_ids else 0
+            self._current_offset = offset
+            self._scratch_blocks_used = n_blocks - (1 if offset else 0)
+            scratch_ids = self.kv_cache.scratch_block_ids(self.kv_branch, 0, self._scratch_blocks_used)
+            tail_block = [self.history_block_ids[-1]] if offset else []
+            self.current_video_block_ids = tail_block + scratch_ids
+            positions = torch.arange(offset, offset + self.seq_len, dtype=torch.long)
+            self.current_video_slot_mapping = _to_device_async(
+                compute_slot_mapping(self.current_video_block_ids, positions, self.block_size), device
+            )
         self._allocated_video = True
 
     def ensure_action_slots(self, action_len: int, device: torch.device) -> None:
@@ -128,38 +254,90 @@ class ARDiffusionPagedForwardContext:
             return
 
         action_blocks = (action_len + self.block_size - 1) // self.block_size
-        scratch_offset = 0 if self.commit_current else len(self.current_video_block_ids)
+        # Count scratch blocks, not entries: the video list may lead with the
+        # history's tail block, which lives in the managed pool.
+        scratch_offset = 0 if self.commit_current else self._scratch_blocks_used
         self.action_scratch_block_ids = self.kv_cache.scratch_block_ids(
             self.kv_branch,
             scratch_offset,
             action_blocks,
         )
         positions = torch.arange(action_len, dtype=torch.long)
-        self.action_slot_mapping = compute_slot_mapping(
-            self.action_scratch_block_ids,
-            positions,
-            self.block_size,
-        ).to(device=device)
+        self.action_slot_mapping = _to_device_async(
+            compute_slot_mapping(self.action_scratch_block_ids, positions, self.block_size), device
+        )
         self._action_len = action_len
 
     def video_block_table(self, device: torch.device) -> tuple[list[int], int]:
+        """Blocks the attention reads, and how many of their slots it reads.
+
+        The kernel reads the listed blocks as one contiguous run and stops after
+        the returned length, so two things must hold: every block holding a
+        token the window keeps is listed, in token order, and only the last
+        listed block may be partly written.
+
+        Blocks are chosen by the token positions they hold rather than counted
+        off the ends of the resident list. The window is the sink ``[0, S)``
+        plus the most recent tokens, and each of those can straddle a block
+        edge on its own. Taking a fixed number of blocks off the tail dropped
+        the block holding the window's first tokens exactly when both
+        straddled, and a length capped by a block count rather than counted
+        from what was written then ran past the last written slot.
+
+        Whole blocks are read, so each boundary block contributes up to
+        ``block_size - 1`` tokens the window has already let go of. They are
+        real K/V at their own positions; a slightly wider window is a far
+        smaller error than a truncated one.
+        """
         self.ensure_video_slots(device)
-        if self.max_video_tokens % self.block_size != 0:
-            raise AssertionError(
-                "AR-Diffusion paged attention requires max_video_tokens to be block-aligned, "
-                f"got max_video_tokens={self.max_video_tokens}, block_size={self.block_size}"
-            )
-        all_video_blocks = self.history_block_ids + self.current_video_block_ids
-        max_video_blocks = self.max_video_tokens // self.block_size
-        sink_blocks = int(self.kv_cache.spec.sink_chunks)
-        if len(all_video_blocks) <= max_video_blocks:
-            visible_video_blocks = all_video_blocks
-        else:
-            tail_blocks = max_video_blocks - sink_blocks
-            visible_video_blocks = all_video_blocks[:sink_blocks]
-            if tail_blocks:
-                visible_video_blocks += all_video_blocks[-tail_blocks:]
-        video_len = len(visible_video_blocks) * self.block_size
+        block_size = self.block_size
+        history = self._history_tokens
+        end = history + self.seq_len
+        sink_end = self.sink_tokens
+        recent_start = end - self.window_tokens
+
+        # Position of each block's first slot. History comes from the block
+        # table, where an evicted block is a null placeholder, so a block's index
+        # is its position -- in storage positions, which is what
+        # num_computed_tokens counts once compaction has dropped an evicted gap.
+        # Compaction shifts storage by whole chunks and whole blocks, so the sink,
+        # the window and every block offset sit exactly where they would in model
+        # positions. Reading the table after ensure_video_slots means a block
+        # this chunk's own allocation evicted is never listed. The current
+        # chunk's blocks follow from where its first token was placed; its first
+        # block is the history's own tail block whenever the history stopped
+        # part way through one, and keeps the history's position.
+        first_position: dict[int, int] = {}
+        #
+        # Only two index ranges can hold a token the window keeps: the sink's
+        # blocks, and the blocks from the recent window's start onward. Evicted
+        # positions stay in the table as null entries until compaction drops
+        # them a whole number of chunks at a time, so the table can still be
+        # much longer than the window; reading just these two ranges, without
+        # copying the table, keeps this at the window's size.
+        history_blocks = -(-history // block_size)
+        sink_blocks = min(-(-sink_end // block_size), history_blocks)
+        recent_first_block = max(max(recent_start, 0) // block_size, sink_blocks)
+        indices = [*range(sink_blocks), *range(recent_first_block, history_blocks)]
+        for index, block in zip(indices, self.kv_cache.block_ids_at(self.adapter, indices)):
+            if block != self.kv_cache.null_block_id:
+                first_position.setdefault(block, index * block_size)
+        current_start = history - self._current_offset
+        for index, block in enumerate(self.current_video_block_ids):
+            first_position.setdefault(int(block), current_start + index * block_size)
+
+        visible_video_blocks: list[int] = []
+        video_len = 0
+        for block, first in sorted(first_position.items(), key=lambda item: item[1]):
+            if first >= sink_end and first + block_size <= recent_start:
+                continue  # wholly between the sink and the recent window
+            if video_len % block_size:
+                raise RuntimeError(
+                    "AR-Diffusion paged attention would read past a partly written block: "
+                    f"block {visible_video_blocks[-1]} is followed by block {block}."
+                )
+            visible_video_blocks.append(block)
+            video_len += min(block_size, end - first)
         return visible_video_blocks, video_len
 
     def build_block_table(
@@ -178,6 +356,21 @@ class ARDiffusionPagedForwardContext:
         ``ceil(seq_lens/block_size)`` entries, so padding is never read.
         """
         video_blocks, video_len = self.video_block_table(device)
+        # Action K/V is listed after the video blocks and the kernel reads the
+        # table as one run, so the video run has to end on a block edge. If it
+        # stops part way through its last block, the run reads that block's
+        # unwritten slots as the first action tokens and never reaches the last
+        # ones -- a wrong attention with every shape intact. A frame that is a
+        # whole number of blocks always ends on an edge, so this refuses only
+        # geometries that could not page at all before the paging unit was
+        # separated from the frame.
+        if action_len > 0 and video_len % self.block_size:
+            raise ValueError(
+                "AR-Diffusion paged attention cannot place action tokens after a partly written video block: "
+                f"the video run ends {video_len % self.block_size} slots into block {video_blocks[-1]}, so the "
+                "kernel would read its unwritten slots as action tokens. Action tokens need tokens_per_frame "
+                f"to be a whole number of blocks (block_size={self.block_size})."
+            )
         self.ensure_action_slots(action_len, device)
         action_blocks = self.action_scratch_block_ids if action_len > 0 else []
         block_ids = video_blocks + action_blocks
@@ -186,15 +379,25 @@ class ARDiffusionPagedForwardContext:
 
         # Fixed capacity: full visible video window + one action-capacity block.
         action_capacity_blocks = max(1, (action_len + self.block_size - 1) // self.block_size)
-        width = max(self.max_video_tokens // self.block_size + action_capacity_blocks, len(block_ids))
+        # Both of these count in blocks. Deriving them from the token count by
+        # flooring would understate the capacity whenever the window is not a
+        # whole number of blocks: the width would fall back on len(block_ids)
+        # and start tracking how full the window is -- the exact shape churn
+        # the fixed width exists to prevent -- and max_seq_len could come out
+        # below the kv_len actually being passed, by up to block_size - 1.
+        capacity_blocks = self.max_video_blocks + action_capacity_blocks
+        width = max(capacity_blocks, len(block_ids))
         padded = block_ids + [0] * (width - len(block_ids))
 
         self.query_len = int(query_len)
         self.kv_len = int(video_len + action_len)
-        max_seq_len = int(self.max_video_tokens + action_capacity_blocks * self.block_size)
-        block_table = torch.tensor([padded], dtype=torch.int32, device=device)
-        query_start_loc = torch.tensor([0, self.query_len], dtype=torch.int32, device=device)
-        seq_lens = torch.tensor([self.kv_len], dtype=torch.int32, device=device)
+        max_seq_len = int(capacity_blocks * self.block_size)
+        # Built on the host once per AR block; the copies go through the same
+        # pinned, non-blocking path as the slot mappings above so the CPU does
+        # not wait for the stream to drain three times before the first layer.
+        block_table = _to_device_async(torch.tensor([padded], dtype=torch.int32), device)
+        query_start_loc = _to_device_async(torch.tensor([0, self.query_len], dtype=torch.int32), device)
+        seq_lens = _to_device_async(torch.tensor([self.kv_len], dtype=torch.int32), device)
         return block_table, query_start_loc, seq_lens, self.query_len, max_seq_len
 
     def prepare(self, device: torch.device, action_len: int, query_len: int) -> None:
@@ -218,15 +421,78 @@ class ARDiffusionPagedForwardContext:
         ) = self.build_block_table(action_len=action_len, query_len=query_len, device=device)
         if self.action_slot_mapping is None:
             self.action_slot_mapping = torch.empty(0, dtype=torch.long, device=device)
+        self._prepare_history_staging(action_len)
         self._prepared = True
+
+    def _prepare_history_staging(self, action_len: int) -> None:
+        """Decide whether this forward can keep the history already staged, and from where.
+
+        The staged window is only reusable when nothing about it moved: the same session adapter, the same
+        visible history blocks, the same sequence bounds. Any difference -- a new AR block, a slid window, a
+        different request -- and the buffer is rebuilt from the pools.
+
+        The decision is a host bool, deliberately. It has to be, for the gather to actually be skipped: a
+        device flag could only select between two results already computed. It is the same value for all
+        layers of a forward, so it costs two compiled variants in total rather than one per layer.
+        """
+        self.staging_enabled = False
+        self.reuse_history = False
+        self.stage_first_block = 0
+        # The manager allocates the staging pairs only when reuse_history_staging is on and the contiguous
+        # gather path -- their only consumer -- is switched on.
+        if not self.kv_cache.history_staging:
+            return
+        assert self.block_table is not None
+        if action_len or self.block_table.shape[0] != 1:
+            # Action tokens live in scratch blocks outside the video window; staging them is not modelled.
+            return
+        capacity = int(self.kv_cache.history_staging[0][0].shape[0])
+        if int(self.max_seq_len) > capacity:
+            raise RuntimeError(
+                f"history staging buffers hold {capacity} tokens but this forward stages {int(self.max_seq_len)}"
+            )
+        state = self.kv_cache.history_staging_state
+        signature = (
+            int(self.adapter.num_computed_tokens),
+            tuple(self.history_block_ids),
+            int(self.max_seq_len),
+            int(self.seq_len),
+        )
+        same_session = state.adapter is not None and state.adapter() is self.adapter
+        # A chunk that is not a whole number of blocks shares its first block with the history's tail (see
+        # ensure_video_slots), and the attention op restages the current chunk in whole blocks of its own,
+        # so such a forward restages the whole window instead.
+        block_aligned = self.start_offset == 0 and self.seq_len % self.block_size == 0
+        reuse = same_session and state.signature == signature and block_aligned
+        state.adapter = weakref.ref(self.adapter)
+        state.signature = signature
+        self.staging_enabled = True
+        self.reuse_history = bool(reuse)
+        # ``kv_len`` is the visible video window here (no action tokens on this path): the current chunk's
+        # blocks are its last ``num_current_video_blocks`` entries, and the table's trailing padding blocks
+        # come after them.
+        self.stage_first_block = self.kv_len // self.block_size - self.num_current_video_blocks
+
+    def history_staging(self, layer_idx: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return the manager-owned tensors marked static for CUDA Graph input mutation.
+
+        Fresh prefix views lose the bases' static-address annotation. Narrow the
+        window inside the attention custom op instead of at the compiled boundary.
+        """
+        if not self.staging_enabled:
+            return None, None
+        return self.kv_cache.history_staging[layer_idx]
 
     def layer_inputs(self, layer_idx: int) -> ARDiffusionPagedLayerInputs:
         if not getattr(self, "_prepared", False):
             raise RuntimeError("ARDiffusionPagedForwardContext.layer_inputs() before prepare()")
+        key_pool = self.kv_cache._k_pools[layer_idx]
+        value_pool = self.kv_cache._v_pools[layer_idx]
+        stage_key, stage_value = self.history_staging(layer_idx)
         return ARDiffusionPagedLayerInputs(
             layer_idx=_layer_idx_tensor(layer_idx),
-            key_pool=self.kv_cache._k_pools[layer_idx],
-            value_pool=self.kv_cache._v_pools[layer_idx],
+            key_pool=key_pool,
+            value_pool=value_pool,
             block_size=int(self.kv_cache.block_size),
             seq_len=int(self.seq_len),
             video_slots=self.current_video_slot_mapping,
@@ -236,6 +502,10 @@ class ARDiffusionPagedForwardContext:
             seq_lens=self.seq_lens,
             max_query_len=int(self.max_query_len),
             max_seq_len=int(self.max_seq_len),
+            stage_key=stage_key,
+            stage_value=stage_value,
+            reuse_history=self.reuse_history,
+            stage_first_block=int(self.stage_first_block),
         )
 
     def mark_committed(self) -> None:
@@ -342,6 +612,22 @@ def _reference_paged_attention(
 _FA_VERSION_BY_HEAD_SIZE: dict[int, int] = {}
 
 
+def _stage_window(stage_key, stage_value, key_cache, value_cache, block_ids, n_blocks, block_size, *, first_block):
+    """Gather visible blocks from ``first_block`` onward into the staging buffers.
+
+    ``first_block`` is 0 for a full restage and the index of the current chunk's first block when the
+    history is already staged. Skipping the leading blocks is the whole point: they were gathered by an
+    earlier forward of the same AR block and cannot have changed since.
+    """
+    ids = block_ids[first_block:]
+    # Write directly into the caller-owned window, avoiding an intermediate
+    # gathered tensor and its copy on every layer and denoising step.
+    torch.index_select(key_cache, 0, ids, out=stage_key.view(n_blocks, block_size, *key_cache.shape[2:])[first_block:])
+    torch.index_select(
+        value_cache, 0, ids, out=stage_value.view(n_blocks, block_size, *value_cache.shape[2:])[first_block:]
+    )
+
+
 def _resolve_fa_version(head_size: int) -> int:
     # get_flash_attn_version -> current_platform.get_device_capability() is not
     # dynamo-traceable, and the answer is fixed per head size for the process.
@@ -355,6 +641,36 @@ def _resolve_fa_version(head_size: int) -> int:
             version = 2
         _FA_VERSION_BY_HEAD_SIZE[head_size] = version
     return version
+
+
+def supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    """Block sizes the kernel this module dispatches to will accept.
+
+    Same shape as vLLM's ``AttentionBackend.get_supported_kernel_block_sizes``
+    -- a plain int is that exact size, ``MultipleOf(b)`` is any positive
+    multiple of ``b`` -- but answered here rather than read off a backend,
+    because AR-Diffusion does not go through backend selection. It calls
+    ``flash_attn_varlen_func`` itself, choosing between vLLM's CUDA build and
+    ROCm's AITER a few lines below, and only this module knows which.
+
+    It lives next to that choice so there is one place to change. The
+    constraint is a property of the kernel, not of the card, and the kernels
+    reachable from here agree on 16 today: vLLM's CUDA FlashAttention, ROCm
+    AITER, and upstream ``flash_attn`` all advertise ``MultipleOf(16)``. Other
+    backends in the same tree do not -- ``hpc_attn`` accepts only 64, and
+    FlashInfer advertises pages of 128 or more solely on Blackwell -- so a
+    caller must treat this as data to be queried, never as the number 16.
+
+    vLLM's FlashAttention backend does advertise a single 128-token page when FA4
+    runs its dedicated head-size-256 kernel on SM100/SM110. That kernel is not
+    reachable from here: ``get_flash_attn_version`` selects it only when the
+    caller passes ``supports_fa4_hd256=True``, and :func:`_resolve_fa_version`
+    does not, so a head size of 256 falls back to FA2, which pages at any
+    multiple of 16. Passing that flag later has to change this answer as well.
+    """
+    from vllm.v1.attention.backend import MultipleOf
+
+    return [MultipleOf(16)]
 
 
 def _rocm_flash_attn_varlen_func():
@@ -385,6 +701,11 @@ def ar_diffusion_paged_attention(
     max_seq_len: int,
     softmax_scale: float,
     causal: bool = False,
+    stage_key: torch.Tensor | None = None,
+    stage_value: torch.Tensor | None = None,
+    reuse_history: bool = False,
+    current_tokens: int = 0,
+    stage_first_block: int = 0,
 ) -> torch.Tensor:
     """Run non-causal paged attention over a vLLM block table.
 
@@ -415,7 +736,7 @@ def ar_diffusion_paged_attention(
         # vLLM's seqused_k/fa_version API. The ROCm flash-attn paged kernel also
         # requires 128-token blocks, while AR-Diffusion uses frame-aligned
         # 16-token blocks, so gather the visible blocks on-device first.
-        flash_attn_varlen_func = _rocm_flash_attn_varlen_func()
+        rocm_flash_attn_varlen_func = _rocm_flash_attn_varlen_func()
         cu_seqlens_k = torch.cat([seq_lens.new_zeros(1), torch.cumsum(seq_lens, dim=0, dtype=torch.int32)])
         positions = torch.arange(int(max_seq_len), device=query_flat.device)
         logical_blocks = torch.div(positions, key_cache.shape[1], rounding_mode="floor")
@@ -426,7 +747,7 @@ def ar_diffusion_paged_attention(
         valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
         packed_k = gathered_k[valid]
         packed_v = gathered_v[valid]
-        out = flash_attn_varlen_func(
+        out = rocm_flash_attn_varlen_func(
             q=query_flat,
             k=packed_k,
             v=packed_v,
@@ -437,13 +758,91 @@ def ar_diffusion_paged_attention(
             softmax_scale=float(softmax_scale),
             causal=causal,
         )
-    else:
+    elif contiguous_kv_gather_enabled() and block_table.shape[0] == 1:
+        # Experimental (VLLM_OMNI_AR_DIFFUSION_KV_GATHER=1): FA3's paged-KV path with the
+        # frame-sized block (1560 tokens, not a multiple of the FA3 K/V tile)
+        # runs ~15-17% slower than the same kernel on contiguous K/V. Gather the
+        # visible blocks into a contiguous buffer once per layer and attend
+        # without a block table; ``seqused_k`` masks the tail-padding block.
         from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+        fa_version = _resolve_fa_version(query_flat.shape[-1])
+        block_size = key_cache.shape[1]
+        n_blocks = int(max_seq_len) // block_size
+        if n_blocks * block_size != int(max_seq_len):
+            raise ValueError("the contiguous K/V gather path requires max_seq_len to be block-aligned")
+        block_ids = block_table[0, :n_blocks].to(torch.long)
+        if stage_key is None or stage_value is None:
+            # Fresh allocations on purpose: a module-level cached buffer that is first
+            # allocated inside a CUDA-graph-trees warm-up run lives in the graph pool
+            # untracked ("tensor(s) in the cudagraph pool not tracked as outputs").
+            k_buf = key_cache.index_select(0, block_ids)
+            v_buf = value_cache.index_select(0, block_ids)
+            k_flat = k_buf.view(n_blocks * block_size, *key_cache.shape[2:])
+            v_flat = v_buf.view(n_blocks * block_size, *value_cache.shape[2:])
+        else:
+            # Caller-owned staging, allocated outside any capture and marked static, so the buffer this
+            # writes into is the same address every forward and the graph pool never owns it.
+            #
+            # Only the current chunk moved. The block table is the visible history followed by the
+            # current chunk's blocks and then padding (at least the action-capacity block, plus unused
+            # window capacity while the window is still growing), so the rows this forward changed start
+            # at ``stage_first_block`` -- the caller's count of visible history blocks -- and NOT at
+            # ``n_blocks - current_blocks``, which would refresh padding and leave the current K/V stale.
+            # Everything before them was staged by an earlier forward of the same AR block and is still
+            # byte-for-byte what a full gather would produce. When the history did move -- new block,
+            # slid window, different session -- reuse_history is 0 and the whole window is re-gathered,
+            # which is the same work the unstaged path always does.
+            # Keep the marked base tensors as graph inputs, but only stage the
+            # active prefix when the manager allocated a larger capacity.
+            k_flat = stage_key[:max_seq_len]
+            v_flat = stage_value[:max_seq_len]
+            if reuse_history:
+                # The caller's metadata must describe a block-aligned current chunk inside the staged
+                # window; anything else is a wrong offset, not a reason to quietly restage everything.
+                current_blocks = current_tokens // block_size
+                assert current_tokens > 0 and current_blocks * block_size == current_tokens, (
+                    f"staged reuse needs a block-aligned current chunk, got {current_tokens} tokens"
+                )
+                assert 0 <= stage_first_block and stage_first_block + current_blocks <= n_blocks, (
+                    f"stage_first_block={stage_first_block} + {current_blocks} blocks "
+                    f"exceeds the {n_blocks}-block window"
+                )
+            _stage_window(
+                k_flat,
+                v_flat,
+                key_cache,
+                value_cache,
+                block_ids,
+                n_blocks,
+                block_size,
+                first_block=stage_first_block if reuse_history else 0,
+            )
+        out = torch.empty_like(query_flat)
+        # Varlen K/V: cu_seqlens_k = [0, kv_len] built on device from seq_lens
+        # (no host sync). Rows past kv_len (the tail-padding block) are never
+        # read, exactly like the ROCm gather path above.
+        cu_seqlens_k = torch.cat((seq_lens.new_zeros(1), seq_lens.to(torch.int32)))
+        flash_attn_varlen_func(
+            q=query_flat,
+            k=k_flat,
+            v=v_flat,
+            out=out,
+            cu_seqlens_q=query_start_loc,
+            max_seqlen_q=int(max_query_len),
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_k=int(max_seq_len),
+            softmax_scale=float(softmax_scale),
+            causal=causal,
+            fa_version=fa_version,
+        )
+    else:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func as paged_flash_attn_varlen_func
 
         fa_version = _resolve_fa_version(query_flat.shape[-1])
 
         out = torch.empty_like(query_flat)
-        flash_attn_varlen_func(
+        paged_flash_attn_varlen_func(
             q=query_flat,
             k=key_cache,
             v=value_cache,
@@ -488,6 +887,10 @@ def _paged_write_attn_impl(
     max_query_len: int,
     max_seq_len: int,
     softmax_scale: float,
+    stage_key: torch.Tensor | None = None,
+    stage_value: torch.Tensor | None = None,
+    reuse_history: bool = False,
+    stage_first_block: int = 0,
 ) -> torch.Tensor:
     key_pool[video_slots] = k_curr.to(key_pool.dtype)
     value_pool[video_slots] = v_curr.to(value_pool.dtype)
@@ -507,16 +910,23 @@ def _paged_write_attn_impl(
         max_seq_len=max_seq_len,
         softmax_scale=softmax_scale,
         causal=False,
+        stage_key=stage_key,
+        stage_value=stage_value,
+        reuse_history=reuse_history,
+        current_tokens=int(k_curr.shape[0]),
+        stage_first_block=stage_first_block,
     )
 
 
 # hasattr guard keeps registration idempotent across test re-imports that pop
 # the module from sys.modules (same as sage_attn3.py).
 if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
-
+    # Keep staging arguments required even when their value is None. The dispatcher
+    # strips trailing defaults, and older PyTorch mutation handlers index the
+    # positional arguments without restoring them before bumping version counters.
     @torch.library.custom_op(
         "vllm_omni::ar_diffusion_paged_write_attn",
-        mutates_args=("key_pool", "value_pool"),
+        mutates_args=("key_pool", "value_pool", "stage_key", "stage_value"),
     )
     def _paged_write_attn_op(
         query: torch.Tensor,
@@ -535,6 +945,10 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         max_query_len: int,
         max_seq_len: int,
         softmax_scale: float,
+        stage_key: torch.Tensor | None,
+        stage_value: torch.Tensor | None,
+        reuse_history: bool,
+        stage_first_block: int,
     ) -> torch.Tensor:
         return _paged_write_attn_impl(
             query,
@@ -553,6 +967,10 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
             max_query_len,
             max_seq_len,
             softmax_scale,
+            stage_key,
+            stage_value,
+            reuse_history,
+            stage_first_block,
         )
 
     @_paged_write_attn_op.register_fake
@@ -573,6 +991,10 @@ if not hasattr(torch.ops.vllm_omni, "ar_diffusion_paged_write_attn"):
         max_query_len,
         max_seq_len,
         softmax_scale,
+        stage_key=None,
+        stage_value=None,
+        reuse_history=False,
+        stage_first_block=0,
     ):
         return torch.empty_like(query)
 
@@ -598,4 +1020,8 @@ def paged_write_attn(
         inputs.max_query_len,
         inputs.max_seq_len,
         softmax_scale,
+        inputs.stage_key,
+        inputs.stage_value,
+        inputs.reuse_history,
+        inputs.stage_first_block,
     )

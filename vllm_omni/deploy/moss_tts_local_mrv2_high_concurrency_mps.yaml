@@ -1,0 +1,8 @@
+# Automatic CUDA MRV2/C128 default on GPUs with at least 140 GiB total memory
+# when nvidia-cuda-mps-control is available. Keep the published C128 baseline
+# and its original Local projection/sampler; add full-quota private MPS only.
+base_config: moss_tts_local_mrv2_high_concurrency.yaml
+
+platforms:
+  cuda:
+    cuda_mps: true

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for LayerNorm and RMSNorm custom ops in diffusion layers."""
 
 import sys
@@ -478,6 +478,19 @@ def test_rmsnorm_forward_hip_does_not_call_fused_during_compile(mocker: MockerFi
 
     mock_fused.assert_not_called()
     assert out.shape == x.shape
+
+
+def test_rmsnorm_skips_fused_kernel_for_empty_input(mocker: MockerFixture) -> None:
+    """Regression: the fused kernel fails to launch on a zero-token tensor and leaves a sticky CUDA error."""
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    norm = RMSNorm(hidden_size=64)
+    x = torch.randn(1, 0, 64)
+    mock_fused = mocker.patch.object(norm, "_forward_fused", wraps=norm._forward_fused)
+
+    assert norm.forward_cuda(x).shape == x.shape
+    assert norm.forward_hip(x).shape == x.shape
+    mock_fused.assert_not_called()
 
 
 def test_rmsnorm_matches_reference_implementation():

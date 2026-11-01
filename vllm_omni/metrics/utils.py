@@ -20,6 +20,40 @@ FAILURE_REASONS = frozenset({"client_abort", "client_disconnect", "stage_error",
 DIFFUSION_METRICS_ONLY_REQUEST_ID = "__vllm_omni_diffusion_metrics__"
 
 
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int | float):
+        return float(value)
+    return default
+
+
+def _as_float_list(value: object) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, int | float) and not isinstance(item, bool)]
+
+
 def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
     if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
         return None

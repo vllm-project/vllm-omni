@@ -1,0 +1,8 @@
+# Concurrent input / interruptible VAD turns; not native streaming input KV.
+base_config: qwen3_omni_moe.yaml
+session_mode: duplex
+stages:
+  - stage_id: 0
+    limit_mm_per_prompt:
+      audio: 4
+      image: 8

@@ -21,8 +21,8 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
 NEGATIVE_PROMPT = "blurry, low quality"
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=2)
 
 MODEL_IMAGE = "Qwen/Qwen-Image"
 MODEL_2512 = "Qwen/Qwen-Image-2512"

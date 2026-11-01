@@ -6,8 +6,9 @@
 #   * enforce_eager=true — the model uses upstream inference_stream() with
 #     trust_remote_code; CUDA graph capture is not wired up.
 #   * gpu_memory_utilization=0.3 — the AR LM + codec fit in ~2 GiB.
-#   * max_num_seqs=4 — supports per-request streaming generators stored in
-#     self._stream_gens.
+#   * max_num_seqs=1 — the remote model and audio tokenizer keep process-wide
+#     RNG and streaming decode state. HTTP requests may arrive concurrently,
+#     but generation must remain serial to avoid cross-request audio corruption.
 #
 # MOSS-TTS-Nano has no multimodal input preprocessing, so skip_mm_profiling
 # bypasses the dummy-MM pass at profile time.
@@ -16,7 +17,7 @@ trust_remote_code: true
 
 stages:
   - stage_id: 0
-    max_num_seqs: 4
+    max_num_seqs: 1
     gpu_memory_utilization: 0.3
     enforce_eager: true
     enable_prefix_caching: false

@@ -103,7 +103,7 @@ class LTXAccuracyCase:
     spatial_upsampler: LTXArtifact | None = None
     distilled_lora: LTXArtifact | None = None
     # Official uses block streaming; Omni uses layerwise offload. Both preserve
-    # bf16 arithmetic while keeping full-resolution two-stage cases on one H100.
+    # bf16 arithmetic while keeping full-resolution cases on one H100.
     enable_layerwise_offload: bool = False
 
 
@@ -182,6 +182,7 @@ TWO_STAGE_CASES = (
         gemma_model_id="Lightricks/LTX-2",
         gemma_model_revision=LTX2_REVISION,
         gemma_model_env="VLLM_TEST_LTX2_MODEL",
+        enable_layerwise_offload=True,
     ),
     LTXAccuracyCase(
         name="ltx23_distilled_i2v",

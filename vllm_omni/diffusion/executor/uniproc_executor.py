@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """In-process diffusion executor for single-GPU deployments.
 
@@ -143,12 +143,14 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
                     )
                 )
             except Exception as exc:
+                # The worker runs inline, so a pipeline's OmniClientError lands
+                # here; from_exception keeps its 4xx status for the engine/API.
                 runner_outputs.append(
                     RunnerOutput(
                         request_id=new_req.request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
                 )
         return BatchRunnerOutput.from_list(runner_outputs)

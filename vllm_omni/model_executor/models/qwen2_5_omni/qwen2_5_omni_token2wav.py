@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 ############################
 #      Start Token2Wav     #
 ############################
@@ -8,7 +11,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniBigVGANConfig,
     Qwen2_5OmniDiTConfig,
@@ -530,6 +532,81 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def block_sparse_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    block_size: int,
+    look_backward_block: int = 0,
+    look_ahead_block: int = 0,
+) -> torch.Tensor:
+    """Attention where each block of ``block_size`` queries attends to its own
+    block plus ``look_backward_block`` blocks before and ``look_ahead_block``
+    blocks after it.
+
+    This is equivalent to dense SDPA with the mask
+    ``(block_j - block_i >= -look_backward_block) & (block_j - block_i <= look_ahead_block)``,
+    but only computes the kept key blocks instead of materializing an (n, n)
+    mask for every layer. q/k/v and the result are ``(batch, heads, seq, dim)``.
+    """
+    batch_size, num_heads, seq_len, head_dim = query.shape
+    num_blocks = -(-seq_len // block_size)
+    pad = num_blocks * block_size - seq_len
+    if pad:
+        query, key, value = (F.pad(t, (0, 0, 0, pad)) for t in (query, key, value))
+    blocked_shape = (batch_size, num_heads, num_blocks, block_size, head_dim)
+    query = query.view(blocked_shape)
+    key = key.view(blocked_shape)
+    value = value.view(blocked_shape)
+
+    # Some key is masked only when the last block is padded or a neighbour
+    # block is shifted past either end, both known from these Python ints, so
+    # the mask decision needs no device sync.
+    has_neighbours = look_backward_block > 0 or look_ahead_block > 0
+    key_valid = None
+    if pad or has_neighbours:
+        # key_valid[b, j] is False for padded positions (only in the last block).
+        key_valid = torch.ones(num_blocks, block_size, dtype=torch.bool, device=query.device)
+        if pad:
+            key_valid[-1, block_size - pad :] = False
+
+    if not has_neighbours:
+        # Own block only (most layers): attend to the blocked keys directly.
+        keys, values, valid = key, value, key_valid
+    else:
+        keys, values, valids = [], [], []
+        for offset in range(-look_backward_block, look_ahead_block + 1):
+            if offset == 0:
+                keys.append(key)
+                values.append(value)
+                valids.append(key_valid)
+                continue
+            # Key block i + offset for each query block i; blocks past either
+            # end are zero-filled and masked out.
+            shifted_key = torch.zeros_like(key)
+            shifted_value = torch.zeros_like(value)
+            valid = torch.zeros_like(key_valid)
+            if offset > 0:
+                shifted_key[:, :, : num_blocks - offset] = key[:, :, offset:]
+                shifted_value[:, :, : num_blocks - offset] = value[:, :, offset:]
+                valid[: num_blocks - offset] = key_valid[offset:]
+            else:
+                shifted_key[:, :, -offset:] = key[:, :, : num_blocks + offset]
+                shifted_value[:, :, -offset:] = value[:, :, : num_blocks + offset]
+                valid[-offset:] = key_valid[: num_blocks + offset]
+            keys.append(shifted_key)
+            values.append(shifted_value)
+            valids.append(valid)
+        keys = torch.cat(keys, dim=3)
+        values = torch.cat(values, dim=3)
+        valid = torch.cat(valids, dim=1)
+    # Every query block keeps at least its own block, so no row is fully masked.
+    mask = None if valid is None else valid.view(1, 1, num_blocks, 1, -1)
+
+    out = F.scaled_dot_product_attention(query, keys, values, attn_mask=mask)
+    return out.reshape(batch_size, num_heads, num_blocks * block_size, head_dim)[:, :, :seq_len]
+
+
 class DiTAttention(nn.Module):
     def __init__(self, config: Qwen2_5OmniDiTConfig, prefix: str = ""):
         super().__init__()
@@ -556,7 +633,9 @@ class DiTAttention(nn.Module):
         self,
         hidden_states,  # noised input x
         position_embeddings=None,  # rotary position embedding for x
-        attention_mask=None,
+        block_size: int | None = None,
+        look_backward_block: int = 0,
+        look_ahead_block: int = 0,
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
 
@@ -576,19 +655,17 @@ class DiTAttention(nn.Module):
         cos, sin = position_embeddings
         query[:, :1], key[:, :1] = apply_rotary_pos_emb(query[:, :1], key[:, :1], cos, sin)
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        attention_weights, _ = attention_interface(
-            self,
+        # The DiT only attends within a window of mel blocks, so run block
+        # sparse attention instead of a dense (n, n) masked SDPA.
+        attention_weights = block_sparse_attention(
             query,
             key,
             value,
-            attention_mask=attention_mask,
-            is_causal=False,
+            block_size=block_size,
+            look_backward_block=look_backward_block,
+            look_ahead_block=look_ahead_block,
         )
-
-        # mask. e.g. inference got a batch with different target durations,
-        # mask out the padding
-        attention_weights = attention_weights.reshape(batch_size, -1, self.heads * head_dim)
+        attention_weights = attention_weights.transpose(1, 2).reshape(batch_size, -1, self.heads * head_dim)
         attention_weights = attention_weights.to(query.dtype)
 
         # linear proj
@@ -610,7 +687,7 @@ class DiTDecoderLayer(nn.Module):
         self.ff = DiTMLP(dim=config.hidden_size, mult=config.ff_mult, dropout=config.dropout)
 
     def forward(
-        self, hidden_states, timestep, position_embeddings=None, block_diff=None
+        self, hidden_states, timestep, position_embeddings=None, block_size=None
     ):  # x: noised input, t: time embedding
         # pre-norm & modulation for attention input
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(hidden_states, emb=timestep)
@@ -619,8 +696,9 @@ class DiTDecoderLayer(nn.Module):
         attn_output = self.attn(
             hidden_states=norm,
             position_embeddings=position_embeddings,
-            attention_mask=(block_diff >= -float(self.look_backward_block))
-            & (block_diff <= float(self.look_ahead_block)),
+            block_size=block_size,
+            look_backward_block=self.look_backward_block,
+            look_ahead_block=self.look_ahead_block,
         )
 
         # process attention output for input x
@@ -945,16 +1023,6 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         self.norm_out = Qwen2_5_OmniAdaLayerNormZero_Final(config.hidden_size)  # final modulation
         self.proj_out = nn.Linear(config.hidden_size, config.mel_dim)
 
-    def _create_block_diff(self, hidden_states):
-        batch, seq_len = hidden_states.shape[0], hidden_states.shape[1]
-        block_indices = torch.arange(seq_len, device=hidden_states.device) // self.block_size  # [seq_length]
-
-        block_i = block_indices.unsqueeze(1)  # [seq_length, 1]
-        block_j = block_indices.unsqueeze(0)  # [1, seq_length]
-        block_diff = block_j - block_i  # (n, n)
-
-        return block_diff.expand(batch, self.num_attention_heads, seq_len, seq_len)
-
     def forward(
         self,
         hidden_states,
@@ -987,7 +1055,6 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
 
         # Compute positional encodings
         position_embeddings = self.rotary_embed(hidden_states)
-        blockwise_difference = self._create_block_diff(hidden_states)
 
         # Transformer blocks
         for transformer_block in self.transformer_blocks:
@@ -995,7 +1062,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                 hidden_states,
                 time_embedding,
                 position_embeddings=position_embeddings,
-                block_diff=blockwise_difference,
+                block_size=self.block_size,
             )
 
         hidden_states = self.norm_out(hidden_states, time_embedding)
@@ -1509,19 +1576,19 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         return loaded
 
     def find_all_registers(self):
-        """
-        Find all registered buffers in a PyTorch model.
-
-        Args:
-        Returns:
-            dict: Dictionary with buffer names as keys and their properties as values
-        """
+        """Find all persistent registered buffers in the model."""
         registers = {}
 
-        # Get all named buffers
-        for name, buf in self.named_buffers():
-            if name in self.state_dict():
-                registers[name] = {"name": name, "buffer": buf}
+        # Match state_dict() by excluding non-persistent buffers.
+        non_persistent_names = set()
+        for module_name, module in self.named_modules():
+            for buffer_name in getattr(module, "_non_persistent_buffers_set", set()):
+                name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+                non_persistent_names.add(name)
+
+        for name, buffer in self.named_buffers():
+            if name not in non_persistent_names:
+                registers[name] = {"name": name, "buffer": buffer}
         return registers
 
     # remove buffers from the weights and reload them after loading weights

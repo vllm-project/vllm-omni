@@ -1,0 +1,62 @@
+[
+    {
+        "test_name": "test_minimax_h3_t2v_stability_4gpu",
+        "description": "MiniMax-H3 FastH3 T2VA on 4 GPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile); fused lora-path from VLLM_TEST_MINIMAX_H3_FASTH3_LORA; requests must use num_inference_steps=4",
+        "mark": [
+            {
+                "hardware_marks": {
+                    "res": {
+                        "cuda": "H800"
+                    },
+                    "num_cards": 4
+                }
+            },
+            "local_model",
+            "slow",
+            "diffusion"
+        ],
+        "server_params": {
+            "model": "MiniMaxAI/MiniMax-H3",
+            "serve_args": {
+                "trust-remote-code": true,
+                "task-type": "fl2va",
+                "num-gpus": 4,
+                "usp": 4,
+                "ring": 1,
+                "use-hsdp": true,
+                "hsdp-shard-size": 4,
+                "text-encoder-tp-size": 4,
+                "vae-patch-parallel-size": 4,
+                "vae-parallel-mode": "tile",
+                "vae-use-tiling": true,
+                "stage-init-timeout": 1800,
+                "init-timeout": 1800
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 50,
+                "seed": 42,
+                "random_request_config": [
+                    {
+                        "width": 1344,
+                        "height": 768,
+                        "prompt": "Cinematic drone shot pushing through misty mountain ridges at sunrise, golden light catching the clouds, slow and smooth.",
+                        "num_inference_steps": 4,
+                        "num_frames": 209,
+                        "fps": 24,
+                        "weight": 1
+                    }
+                ],
+                "extra_body": {
+                    "extra_params": "{\"task\":\"t2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\"}"
+                }
+            }
+        ]
+    }
+]

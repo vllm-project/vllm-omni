@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Shared stage-client typing for vLLM-Omni runtime surfaces."""
 
 from __future__ import annotations
@@ -77,6 +80,8 @@ class StagePoolLLMClient(StagePoolClient, Protocol):
     async def add_request_async(self, request: EngineCoreRequest) -> None: ...
 
     async def get_output_async(self) -> EngineCoreOutputs: ...
+
+    async def flush_codec_prefix_async(self, request_id: str, sequence: int) -> int: ...
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None: ...
 

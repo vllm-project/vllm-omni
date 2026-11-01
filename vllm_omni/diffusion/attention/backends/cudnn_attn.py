@@ -10,11 +10,13 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import piecewise_attn
 
 
 class CuDNNAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_prefix_kv_slicing: bool = True
+    supports_piecewise_spans: bool = True
 
     # cuDNN 9.5+ FMHA on Blackwell: head_dim divisible by 8 and at most 256
     # for BF16/FP16. Used by automatic platform selection; explicit CUDNN_ATTN
@@ -74,6 +76,23 @@ class CuDNNAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if (
+            attn_metadata is not None
+            and attn_metadata.full_attn_spans is not None
+            and (attn_metadata.attn_mask is None or attn_metadata.attn_mask.ndim != 4)
+        ):
+            if attn_metadata.attn_mask is not None or "valid_kv_length" in attn_metadata.extra:
+                raise ValueError("Piecewise cuDNN attention cannot combine spans with a padding mask.")
+            return piecewise_attn(
+                query,
+                key,
+                value,
+                attn_metadata.full_attn_spans,
+                self.softmax_scale,
+                self._piecewise_attention,
+                query_ranges=attn_metadata.query_ranges,
+            )
+
         attention_mask = None
         if attn_metadata:
             valid_kv_length = attn_metadata.extra.get("valid_kv_length")
@@ -97,6 +116,19 @@ class CuDNNAttentionImpl(AttentionImpl):
                     mask_mode="broadcast_k",
                 )
 
+        return self._attention(query, key, value, attention_mask, self.causal, self.softmax_scale)
+
+    def _piecewise_attention(self, query, key, value, *, causal, softmax_scale):
+        mask = None
+        if causal:
+            # SDPA's causal flag aligns at the top left. Text segments need
+            # bottom-right alignment so every query can also see its prefix.
+            q_len, kv_len = query.shape[1], key.shape[1]
+            mask = torch.ones(q_len, kv_len, dtype=torch.bool, device=query.device).tril(kv_len - q_len)
+            mask = mask[None, None]
+        return self._attention(query, key, value, mask, False, softmax_scale)
+
+    def _attention(self, query, key, value, attention_mask, causal, softmax_scale):
         enable_gqa = query.shape[2] != key.shape[2]
         kv_seq_len = key.shape[1]
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
@@ -130,8 +162,8 @@ class CuDNNAttentionImpl(AttentionImpl):
                 value,
                 attn_mask=attention_mask,
                 dropout_p=0.0,
-                is_causal=self.causal,
-                scale=self.softmax_scale,
+                is_causal=causal,
+                scale=softmax_scale,
                 enable_gqa=enable_gqa,
             )
         return output.permute(0, 2, 1, 3)

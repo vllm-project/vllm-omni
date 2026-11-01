@@ -42,7 +42,11 @@ class AudexAdapter(ARTTSAdapter):
 
             from vllm_omni.model_executor.models.audex.checkpoint import ensure_audex_snapshot
 
-            stage = getattr(getattr(self.ctx.server._tts_stage, "engine_args", None), "model_stage", None)
+            stage_config = self.ctx.server._tts_stage
+            topology = getattr(stage_config, "stage_pipeline_config", None)
+            stage = getattr(topology, "model_stage", None)
+            if stage is None:
+                stage = getattr(getattr(stage_config, "engine_args", None), "model_stage", None)
             profile, folder = (
                 ("full", "checkpoint_folder_full") if stage == "audex_omni" else ("tts", "checkpoint_folder_audiogen")
             )

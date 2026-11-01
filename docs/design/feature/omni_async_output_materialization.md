@@ -318,18 +318,18 @@ The same behavior applies to the Base and VoiceDesign Qwen3-TTS checkpoints
 because they use the same Talker implementation.
 
 !!! warning
-    Do not pass `--no-async-chunk` or enable prefix caching when you want this
-    optimization. Either change causes the runner to fall back to synchronous
-    output construction. Enabling async chunk alone cannot activate the feature
-    for a model that has not opted into async Omni output.
+    Do not pass `--no-async-chunk` when you want this optimization. Disabling
+    async chunk causes the runner to fall back to synchronous output
+    construction. Enabling async chunk alone cannot activate the feature for a
+    model that has not opted into async Omni output.
 
 !!! note "Prefix cache compatibility"
-    Async Omni output materialization and Omni prefix caching cannot currently
-    run together. `_should_use_async_omni_output()` returns `False` whenever
-    `self.omni_prefix_cache` is present, so prefix caching selects synchronous
-    output materialization. Supporting both features requires snapshotting or
-    otherwise synchronizing prefix-cache merge and update state before the
-    background output path can consume it safely.
+    Prefix cache and async Omni output can run together. `save_outputs` returns
+    a `step_id`; the output builder later calls `materialize(sid, req_ids)` with
+    the save-time request list, which may be a step late relative to the live
+    `input_batch`. `_should_use_async_omni_output()` does not disable itself
+    when the cache is present. See
+    [Automatic Prefix Caching](prefix_caching.md#implementation).
 
 ## Compatibility and Fallbacks
 
@@ -341,10 +341,9 @@ runtime conditions hold:
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
-| Omni prefix cache is disabled | Prefix-cache merge and update ordering currently requires synchronous materialization |
 | Speculative decoding is disabled | Speculative output state is not included in this deferred path |
 | Routed-expert output is disabled | Routed-expert extraction currently requires the synchronous path |
-| Postprocess is absent or explicitly runs eagerly | State needed by the next decode step must be updated before the runner returns |
+| Postprocess is absent or explicitly runs eagerly | State needed by the next decode step must be updated before the runner returns. Eager postprocess sees the scheduled slice (`None, None` combined tensors), not the prefix-cache-merged full prompt; it must only consume the tail |
 
 These checks are evaluated per stage on runners based on `GPUARModelRunner`.
 An unsupported combination does not prevent serving; it only falls back to
@@ -380,6 +379,8 @@ so Omni payload materialization remains synchronous.
 - `tests/worker/test_gpu_ar_model_runner.py`: Snapshot, guard, connector
   ordering, and background error-propagation tests.
 - [Async Chunk](async_chunk.md): Inter-stage chunking and scheduling design.
+- [Automatic Prefix Caching](prefix_caching.md#implementation): Prefix-cache
+  `step_id` / `materialize` contract used by the deferred output builder.
 - [Qwen3-Omni optimization blog](https://vllm.ai/blog/2026-07-01-qwen3-omni-optimization):
   Optimization context and controlled performance results.
 - [PR #4476](https://github.com/vllm-project/vllm-omni/pull/4476): Feature

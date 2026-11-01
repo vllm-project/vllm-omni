@@ -32,8 +32,8 @@ MODEL = "Qwen/Qwen-Image"
 T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
 NEGATIVE_PROMPT = "blurry, low quality"
 
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"})
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100", "npu": "A3"}, num_cards=2)
 
 TEST_PROMPTS: list[dict[str, str]] = [
     {"prompt": "a cup of coffee on a table", "negative_prompt": "low resolution"},

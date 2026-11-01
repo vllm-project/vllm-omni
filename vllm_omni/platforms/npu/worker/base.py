@@ -59,3 +59,11 @@ class OmniNPUWorkerBase(NPUWorker):
             self.profiler.start()
         else:
             self.profiler.stop()
+
+    def shutdown(self) -> None:
+        try:
+            runner = getattr(self, "model_runner", None)
+            if runner is not None:
+                runner._close_omni_aux_output()
+        finally:
+            super().shutdown()

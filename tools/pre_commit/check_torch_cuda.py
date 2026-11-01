@@ -42,7 +42,6 @@ ALLOWED_FILES = {
     "tests/e2e/accuracy/wan22_i2v/run_wan22_i2v_diffusers_cp.py",
     "tests/e2e/features/custom_pipeline/test_async_omni_collective_rpc.py",
     "tests/e2e/features/fullduplex/test_personaplex_elastic.py",
-    "tests/entrypoints/test_omni_sleep_mode.py",
     "tools/configure_stage_memory.py",
     "vllm_omni/diffusion/models/bagel/pipeline_bagel.py",
     "vllm_omni/diffusion/models/lance/pipeline_lance.py",
