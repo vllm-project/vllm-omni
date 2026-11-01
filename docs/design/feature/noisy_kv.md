@@ -272,11 +272,29 @@ outstanding when they run. A failed request leaves the session `INVALID`:
 further requests are rejected until an explicit reset, and late results are
 fenced by the generation and the request identity.
 
-**Not implemented yet (target contract).** Model-declared state beyond KV --
-conditioning, latent and VAE decoder state -- is not retained across requests;
-each request recomputes it. The retention window is a worker-side quota sized at
-startup, not a per-request reservation from the scheduler, and over-quota demand
-fails instead of returning to the admission queue.
+**Plan matching.** A `CellPlan` depends only on the schedule's structure, so the
+pipeline builds one per configuration and reuses it (`_cell_plan`). A session
+records the chunk shape its history was produced with; a request that asks for a
+different shape is refused (`NoisySessionError`) instead of reading a version
+written under another geometry, which is what the roadmap asks for when a
+configuration change affects the plan.
+
+**Model state.** `NoisyKVSession.model_state` carries what the pipeline keeps
+with the session: the encoded conditioning for the current prompt and the
+streaming decoder (its VAE temporal state). Both are dropped by
+`discard_history()` on reset/close and on release. Latent state is still rebuilt
+per request.
+
+**Delivered history.** `delivered_until` records the offset below which every
+reader rank already holds the history, so a continuation only transfers the
+chunks that are new to it. Every rank advances it from the same admission, which
+keeps the transfer list symmetric.
+
+**Not implemented yet (target contract).** Latent state is recomputed per
+request. The retention window is a worker-side quota sized at startup, not a
+per-request reservation from the scheduler, and over-quota demand fails instead
+of returning to the admission queue. Batch unification, StagePool replica
+affinity and cross-layout history conversion remain open.
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.

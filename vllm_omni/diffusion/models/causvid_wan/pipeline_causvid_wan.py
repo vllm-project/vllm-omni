@@ -47,6 +47,7 @@ from vllm_omni.experimental.ar_diffusion.cell_executor import (
     run_cell_pipeline,
 )
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+    CellPlan,
     CellSchedule,
     Ordering,
     build_cell_plan,
@@ -168,6 +169,9 @@ class CausVidWanPipeline(nn.Module):
         self._chunk_ctx: ARDiffusionCellContext | None = None
         self._stream_decode_group = None
         self._streaming_decoder: WanStreamingDecoder | None = None
+        # CellPlan depends only on the schedule's structure, so one plan serves
+        # every request that runs the same configuration.
+        self._plan_cache: dict[tuple, CellPlan] = {}
         logger.info(
             "CausVidWan pipeline: S=%d G=%d layers=%d local=[%d, %d) codec=%s model=%s causvid_ckpt=%s",
             self.step_replicas,
@@ -391,7 +395,29 @@ class CausVidWanPipeline(nn.Module):
             blocks=num_blocks if num_blocks > 0 else None,
             blocks_per_rank=local_blocks if local_blocks > 0 else None,
         )
-        return build_cell_plan(schedule), extra, denoise
+        return self._cell_plan(schedule), extra, denoise
+
+    def _cell_plan(self, schedule: CellSchedule) -> CellPlan:
+        """Return the plan for this configuration, reusing the cached one."""
+        key = (
+            schedule.chunks,
+            schedule.num_denoise_steps,
+            schedule.step_replicas,
+            schedule.layer_groups,
+            schedule.ordering,
+            schedule.kv_history_chunks,
+            schedule.blocks,
+            schedule.blocks_per_rank,
+        )
+        cache = getattr(self, "_plan_cache", None)
+        if cache is None:
+            # Pipelines built without `__init__` (tests, tooling) still work.
+            cache = self._plan_cache = {}
+        plan = cache.get(key)
+        if plan is None:
+            plan = build_cell_plan(schedule)
+            cache[key] = plan
+        return plan
 
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         assert self.vae is not None
@@ -450,8 +476,32 @@ class CausVidWanPipeline(nn.Module):
                         bucket[chunk] = latent
         return merged
 
-    def _get_streaming_decoder(self) -> WanStreamingDecoder | None:
-        """Reuse experimental ``WanStreamingDecoder`` on the local VAE (rank0)."""
+    def _conditioning(self, prompt: str, device: torch.device, dtype: torch.dtype, session: Any | None):
+        """Text conditioning, kept with the session when one is bound.
+
+        A continuation of the same session does not re-encode the same prompt;
+        reset/close drop it together with the session's other model state.
+        """
+        if session is None:
+            return self._encode_prompt(prompt, device, dtype)
+        if session.model_state.get("prompt") == prompt and "prompt_embeds" in session.model_state:
+            return session.model_state["prompt_embeds"]
+        embeds = self._encode_prompt(prompt, device, dtype)
+        session.model_state["prompt"] = prompt
+        session.model_state["prompt_embeds"] = embeds
+        return embeds
+
+    def _get_streaming_decoder(self, session: Any | None = None) -> WanStreamingDecoder | None:
+        """Reuse experimental ``WanStreamingDecoder`` on the local VAE (rank0).
+
+        With a session bound the decoder belongs to the session, so its VAE
+        temporal state survives a continuation and is dropped on reset/close.
+        """
+        store = session.model_state if session is not None else None
+        if store is not None:
+            cached = store.get("stream_decoder")
+            if isinstance(cached, WanStreamingDecoder):
+                return cached
         if self.vae is None:
             return None
         if self._streaming_decoder is None:
@@ -460,6 +510,8 @@ class CausVidWanPipeline(nn.Module):
             except TypeError as exc:
                 logger.warning("WanStreamingDecoder unavailable for CausVid VAE: %s", exc)
                 return None
+        if store is not None:
+            store["stream_decoder"] = self._streaming_decoder
         return self._streaming_decoder
 
     def _ensure_stream_decode_group(self, pp_group: Any, source_rank: int) -> Any:
@@ -525,7 +577,7 @@ class CausVidWanPipeline(nn.Module):
             ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
 
             prompt = self._prompt_text(item.prompt)
-            prompt_embeds = self._encode_prompt(prompt, device, dtype)
+            prompt_embeds = self._conditioning(prompt, device, dtype, getattr(ctx, "session", None))
             sampler = FlowEuler(denoise, shift=shift)
             stream_decode = bool(extra.get("stream_decode", False))
             # Rank that finishes the last noisy step (WanCell on_finished).
@@ -545,7 +597,7 @@ class CausVidWanPipeline(nn.Module):
                     stream_group = self._ensure_stream_decode_group(pp_group, source_rank)
                 stream_job = start_async_stream_decode(
                     vae=self.vae,
-                    decoder=self._get_streaming_decoder(),
+                    decoder=self._get_streaming_decoder(getattr(ctx, "session", None)),
                     session_id=req_id,
                     n_chunks=plan.schedule.chunks,
                     latent_shape=shape,

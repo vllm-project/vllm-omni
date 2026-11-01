@@ -51,8 +51,18 @@ class NoisyKVSession:
     state: NoisySessionState = NoisySessionState.ACTIVE
     committed_chunks: int = 0
     generation: int = 0
-    # Absolute chunk, step, block → the pool key holding that version.
+    # Absolute chunk, step, block -> the pool key holding that version.
     retained: dict[tuple[int, int, int], object] = field(default_factory=dict)
+    # Chunk shape the retained versions were produced with. A continuation must
+    # match it, because the plan that reads the history is built for one shape.
+    history_chunk_tokens: int | None = None
+    # Chunks below this offset already sit on every rank that reads them, so a
+    # continuation does not have to receive them again. Every rank advances it
+    # from the same admission, which keeps the transfer list symmetric.
+    delivered_until: int = 0
+    # Model-declared state the pipeline keeps with the session (conditioning,
+    # latent, decoder). The KV layer never reads it.
+    model_state: dict[str, object] = field(default_factory=dict)
 
     def admit(self) -> int:
         """Return the generation this request must present when committing."""
@@ -76,11 +86,23 @@ class NoisyKVSession:
         # Invalidating must also fence work that started before the failure.
         self.generation += 1
 
+    def discard_history(self) -> None:
+        """Forget the retained versions and the position they were committed at.
+
+        Releasing the slots without this leaves the session claiming a
+        continuation offset it can no longer serve, and the next request then
+        runs cold from a non-zero offset instead of starting over.
+        """
+        self.retained.clear()
+        self.model_state.clear()
+        self.committed_chunks = 0
+        self.history_chunk_tokens = None
+        self.delivered_until = 0
+
     def reset(self) -> None:
         if self.state in (NoisySessionState.CLOSING, NoisySessionState.CLOSED):
             raise NoisySessionError(f"cannot reset {self.state.value} session {self.session_id!r}")
-        self.retained.clear()
-        self.committed_chunks = 0
+        self.discard_history()
         self.generation += 1
         self.state = NoisySessionState.ACTIVE
 
@@ -88,7 +110,7 @@ class NoisyKVSession:
         if self.state is NoisySessionState.CLOSED:
             return
         self.state = NoisySessionState.CLOSING
-        self.retained.clear()
+        self.discard_history()
         self.generation += 1
         self.state = NoisySessionState.CLOSED
 
@@ -103,7 +125,7 @@ class NoisyKVSessionRegistry:
     def __init__(
         self,
         capacity: int = 1,
-        on_release: Callable[[str], int] | None = None,
+        on_release: Callable[[NoisyKVSession], int] | None = None,
     ) -> None:
         if capacity < 1:
             raise ValueError(f"session capacity must be positive, got {capacity}")
@@ -111,18 +133,19 @@ class NoisyKVSessionRegistry:
         self.on_release = on_release
         self._sessions: OrderedDict[str, NoisyKVSession] = OrderedDict()
 
-    def _release(self, session_id: str) -> None:
+    def _release(self, session: NoisyKVSession) -> None:
         """Hand a session's slots back before the registry forgets the session.
 
         Retention re-keys versions to the session owner, so request cleanup
         never frees them; without this the pool stays short of those slots for
-        every reset, close and eviction.
+        every reset, close and eviction. The hook receives the session so the
+        release can clear the versions it claims in the same step.
         """
         if self.on_release is None:
             return
-        released = self.on_release(session_id)
+        released = self.on_release(session)
         if released:
-            logger.info("Noisy KV session %s released %d retained versions", session_id, released)
+            logger.info("Noisy KV session %s released %d retained versions", session.session_id, released)
 
     def __len__(self) -> int:
         return len(self._sessions)
@@ -145,7 +168,7 @@ class NoisyKVSessionRegistry:
                 if evicted.state is NoisySessionState.ACTIVE:
                     evicted.close()
                 logger.info("Noisy KV session %s evicted from a full registry", evicted_id)
-                self._release(evicted_id)
+                self._release(evicted)
                 del self._sessions[evicted_id]
             session = NoisyKVSession(session_id=session_id)
             self._sessions[session_id] = session
@@ -154,13 +177,13 @@ class NoisyKVSessionRegistry:
     def reset(self, session_id: str) -> None:
         session = self.get(session_id)
         if session is not None:
-            self._release(session_id)
+            self._release(session)
             session.reset()
 
     def close(self, session_id: str) -> None:
         session = self._sessions.pop(session_id, None)
         if session is not None:
-            self._release(session_id)
+            self._release(session)
             session.close()
 
     def inactivate(self, session_id: str, reason: str) -> None:
@@ -170,7 +193,7 @@ class NoisyKVSessionRegistry:
             session.invalidate(reason)
 
     def clear(self) -> None:
-        for session_id, session in self._sessions.items():
-            self._release(session_id)
+        for session in self._sessions.values():
+            self._release(session)
             session.close()
         self._sessions.clear()

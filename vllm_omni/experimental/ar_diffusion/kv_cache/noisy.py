@@ -28,6 +28,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedLayerInputs,
     _layer_idx_tensor,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.session import NoisySessionError
 
 VersionKey = tuple[str, int, int, int]  # req, chunk, step, block
 
@@ -612,19 +613,21 @@ class NoisyKVCache:
         self.bytes_per_version = bytes_per_version
         self.reserved_bytes = self.capacity * bytes_all_layers
 
-    def release_session(self, session_id: str) -> int:
-        """Return every slot a session owns.
+    def release_session(self, session: Any) -> int:
+        """Return every slot a session owns and drop its claim on them.
 
         The retained versions outlive the request that wrote them, so request
         cleanup never frees them; forgetting the session without this leaves the
-        pool permanently short of those slots.
+        pool permanently short of those slots. Clearing the session's own map in
+        the same step keeps it from naming versions the pool no longer holds.
         """
-        owner = _session_owner(session_id)
+        owner = _session_owner(session.session_id)
         keys = [key for key in self.pool.keys if key[0] == owner]
         for key in keys:
             self.transport.discard(key)
         for key in keys:
             self.pool.release(key)
+        session.discard_history()
         return len(keys)
 
 
@@ -695,6 +698,17 @@ class NoisyKVState:
         # session that already discarded this request's history.
         self._generations[req] = session.generation if session is not None else 0
         self._committed_local[req] = -1
+        if session is not None:
+            # The plan that reads a session's history is built for one chunk
+            # shape, so a request that changes the shape cannot reuse it. Refuse
+            # instead of reading a version written under a different geometry.
+            if session.history_chunk_tokens is None:
+                session.history_chunk_tokens = chunk_tokens
+            elif session.history_chunk_tokens != chunk_tokens:
+                raise NoisySessionError(
+                    f"session {session.session_id!r} holds {session.history_chunk_tokens}-token history but "
+                    f"request {req} asks for {chunk_tokens}; reset the session to change the chunk shape"
+                )
         if session is not None and chunk_start > 0:
             # History lives where it was produced; a vertical topology reads it
             # from another rank, so it has to be local before the first cell.
@@ -728,11 +742,11 @@ class NoisyKVState:
         plan = self._plans.get(req)
         if session is None or chunk_start <= 0 or plan is None:
             return []
-        history_chunks = plan.schedule.kv_history_chunks
-        if history_chunks <= 0:
+        schedule = plan.schedule
+        history_chunks = schedule.kv_history_chunks
+        if history_chunks <= 0 and schedule.ordering is not Ordering.SAME_STEP:
             return []
         local_chunk, step, block = task
-        schedule = plan.schedule
         window = list(range(max(0, chunk_start + local_chunk - history_chunks), chunk_start))
         if schedule.ordering is Ordering.SAME_STEP and 0 not in window and 0 < chunk_start:
             # Same-Step reads chunk 0's clean sink from every later chunk, even
@@ -816,14 +830,14 @@ class NoisyKVState:
         if plan is None or session is None:
             return False
         schedule = plan.schedule
-        if schedule.kv_history_chunks <= 0:
-            return False
         chunk, step, _block = version
         absolute = chunk_start + chunk
         if schedule.ordering is Ordering.SAME_STEP and absolute == 0:
-            # Chunk 0's clean sink is read by every later chunk, so it is not
-            # part of the sliding window that may be dropped.
+            # Chunk 0's clean sink is read by every later chunk, so it outlives
+            # the sliding window and does not depend on H.
             return step in self._retention_steps(schedule, 0)
+        if schedule.kv_history_chunks <= 0:
+            return False
         if chunk < max(0, schedule.chunks - schedule.kv_history_chunks):
             return False
         return step in self._retention_steps(schedule, absolute)
@@ -832,7 +846,9 @@ class NoisyKVState:
         """Versions the session holds for the chunks this request can read."""
         schedule = plan.schedule
         history_chunks = schedule.kv_history_chunks
-        if history_chunks <= 0 or chunk_start <= 0:
+        if chunk_start <= 0:
+            return ()
+        if history_chunks <= 0 and schedule.ordering is not Ordering.SAME_STEP:
             return ()
         chunks = list(range(max(0, chunk_start - history_chunks), chunk_start))
         if schedule.ordering is Ordering.SAME_STEP and 0 not in chunks:
@@ -845,55 +861,57 @@ class NoisyKVState:
         )
 
     def _session_history_transfers(
-        self, req: str, plan: CellPlan, chunk_start: int, owner: str
+        self, req: str, plan: CellPlan, session: Any, chunk_start: int
     ) -> tuple[RequestKVTransfer, ...]:
         """History that has to move across ranks before this request reads it.
 
         Every rank derives the same tuple from the schedule: the transport posts
         point-to-point work per rank, so an asymmetric list would deadlock. The
-        local-pool filter is deterministic too -- the same window produces the
-        same copies on every rank that received them.
+        skip rule is the session's delivered watermark, which every rank advances
+        from the same admission, so it stays symmetric.
         """
         schedule = plan.schedule
         world = int(getattr(self._pp_group, "world_size", 1) or 1)
         if world <= 1:
             return ()
+        owner = _session_owner(session.session_id)
         transfers: list[RequestKVTransfer] = []
         for version in self._session_history_versions(plan, chunk_start):
-            _chunk, step, block = version
+            chunk, step, block = version
+            if chunk < session.delivered_until:
+                # An earlier continuation already put this version on every rank
+                # that reads it; sending it again is pure traffic.
+                continue
             src = rank_of_block(step, block, schedule)
             group = group_of_block(block, schedule)
             for dst in range(world):
                 if dst == src or dst % schedule.layer_groups != group:
                     continue
-                # No "does the destination already have it" filter: that answer
-                # differs per rank, and an asymmetric list deadlocks the P2P
-                # exchange. Re-sending an identical version is harmless because
-                # allocation is idempotent per key.
                 transfers.append(RequestKVTransfer(req=req, version=version, src=src, dst=dst, owner=owner))
         return tuple(transfers)
 
     def _prefetch_session_history(self, req: str, plan: CellPlan, session: Any, chunk_start: int) -> None:
         """Make the session's history local before the first cell reads it."""
-        owner = _session_owner(session.session_id)
-        transfers = self._session_history_transfers(req, plan, chunk_start, owner)
-        if not transfers:
-            return
-        transport = self.cache.transport
-        copied = transport.exchange_history(
-            transfers,
-            rank=self._rank,
-            pp_group=self._pp_group,
-            chunk_tokens_by_request=self._chunk_tokens,
-        )
-        if copied:
-            for xfer in transfers:
-                if xfer.dst != self._rank:
-                    continue
-                key = _transfer_key(xfer)
-                if not self.cache.pool.has(key):
-                    raise RuntimeError(f"session history for request {req} did not arrive")
-                session.retained[(key[1], key[2], key[3])] = key
+        transfers = self._session_history_transfers(req, plan, session, chunk_start)
+        if transfers:
+            transport = self.cache.transport
+            copied = transport.exchange_history(
+                transfers,
+                rank=self._rank,
+                pp_group=self._pp_group,
+                chunk_tokens_by_request=self._chunk_tokens,
+            )
+            if copied:
+                for xfer in transfers:
+                    if xfer.dst != self._rank:
+                        continue
+                    key = _transfer_key(xfer)
+                    if not self.cache.pool.has(key):
+                        raise RuntimeError(f"session history for request {req} did not arrive")
+                    session.retained[(key[1], key[2], key[3])] = key
+        # Every retained chunk below this offset now sits on every rank that
+        # reads it, so the next continuation does not have to move it again.
+        session.delivered_until = max(session.delivered_until, chunk_start)
 
     def _retain_for_session(self, req: str) -> None:
         """Move the history a later request needs into session ownership.
@@ -907,7 +925,8 @@ class NoisyKVState:
         if session is None or plan is None:
             return
         schedule = plan.schedule
-        if schedule.kv_history_chunks <= 0:
+        if schedule.kv_history_chunks <= 0 and schedule.ordering is not Ordering.SAME_STEP:
+            # Same-Step keeps its chunk 0 sink even with no sliding window.
             return
         pool = self.cache.pool
         owner = _session_owner(session.session_id)

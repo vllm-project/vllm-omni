@@ -385,9 +385,10 @@ def test_released_session_returns_its_slots_to_the_pool():
     _run_request(state, session, "A", chunk_start=0)
     assert any(key[0].startswith("__noisy_session__::") for key in cache.pool.keys)
 
-    released = cache.release_session("s1")
+    expected = len(session.retained)
+    released = cache.release_session(session)
 
-    assert released == len(session.retained)
+    assert released == expected
     assert not any(key[0].startswith("__noisy_session__::") for key in cache.pool.keys)
     assert state.resident_versions == 0
 
