@@ -1206,6 +1206,7 @@ def iter_omni_server(
             model = resolve_tiny_model_path(model)
         port = params.port
         stage_config_path = stage_config_path_for_run_level(params.stage_config_path, run_level)
+        stage_config_path = os.environ.get("VLLM_OMNI_TEST_DEPLOY_CONFIG", stage_config_path)
 
         server_args = params.server_args or []
         if model != original_model:
