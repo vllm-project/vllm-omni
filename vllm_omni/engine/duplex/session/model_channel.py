@@ -420,6 +420,13 @@ class ModelChannel:
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
             snapshot = session.history_snapshot()
+            if self._ctx.plugin.uses_context_ledger:
+                self._ctx.plugin.observe_history_context(
+                    snapshot=snapshot,
+                    ledger=session.context_ledger,
+                    state=self._ctx.model_state,
+                    runtime_config=session.runtime_config,
+                )
             prompt_session = {
                 **request_context.session_config,
                 # Keep the prompt accessor's nested content identity: Qwen
@@ -461,6 +468,11 @@ class ModelChannel:
             # Never submit the worker's stale result to the model.
             if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
                 raise DuplexFenceMismatchError(session.fence, fence)
+            if self._ctx.plugin.uses_context_ledger and session.history_revision != snapshot.history_revision:
+                raise DuplexRuntimeConfigError(
+                    "Conversation changed during context preparation; retry the response",
+                    code="context_changed",
+                )
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
             if on_append_prepared is not None:
