@@ -824,6 +824,13 @@ class DiffusionWorker:
         else:
             request = req
 
+        # Reject before adapter activation can replace layers used by cached graphs.
+        if (
+            getattr(self.model_runner.pipeline, "audio_graph_runner", None) is not None
+            and request.sampling_params.lora_request is not None
+        ):
+            raise ValueError("Request-level LoRA is unsupported while LTX2 audio CUDA Graph is enabled.")
+
         if self.lora_manager is not None:
             try:
                 self.lora_manager.set_request_adapter(

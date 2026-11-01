@@ -397,10 +397,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             device=self.device,
         )
 
-        # Apply torch.compile if not in eager mode
+        # Apply torch.compile if not in eager mode. LTX2 audio manual graphing
+        # owns this Transformer's execution path and disables compiler-managed
+        # graphing while preserving eager-compatible BF16 precision boundaries.
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
-                if hasattr(self.pipeline, "setup_compile"):
+                if getattr(self.pipeline, "audio_graph_runner", None) is not None:
+                    self.pipeline.setup_audio_cuda_graph_compile()
+                elif hasattr(self.pipeline, "setup_compile"):
                     try:
                         self.pipeline.setup_compile()
                     except Exception as exc:

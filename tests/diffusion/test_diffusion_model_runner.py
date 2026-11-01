@@ -21,6 +21,8 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
+from vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph import LTX2AudioCUDAGraphConfig
+from vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime import LTXAudioRuntime
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
@@ -145,6 +147,127 @@ class _CompileTrackingModel:
     def compile(self, *args, **kwargs):
         self.compile_calls.append((args, kwargs))
         return self
+
+
+def _make_ltx2_graph_pipeline(**overrides):
+    config = {
+        "enforce_eager": True,
+        "diffusion_compile_dynamic": True,
+        "dtype": torch.bfloat16,
+        "enable_cpu_offload": False,
+        "enable_layerwise_offload": False,
+        "enable_distributed_layerwise_offload": False,
+        "quantization_config": None,
+        "lora_path": None,
+    }
+    config.update(overrides)
+    return SimpleNamespace(
+        _audio_cuda_graph_config=LTX2AudioCUDAGraphConfig(enabled=True, max_entries=4),
+        od_config=SimpleNamespace(**config),
+        transformer=object(),
+        device=torch.device("cuda"),
+        audio_graph_runner=SimpleNamespace(transformer=None, clear=Mock()),
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx2_audio_graph_compile_preserves_bf16_precision_boundaries(monkeypatch):
+    prepare_compile = Mock()
+    original = torch.nn.Module()
+    original.prepare_audio_cuda_graph_compile = prepare_compile
+    pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
+    pipeline.transformer = original
+    compiled = object()
+    compile_calls = []
+
+    def compile_transformer(transformer, **kwargs):
+        compile_calls.append((transformer, kwargs))
+        return compiled
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime.regionally_compile",
+        compile_transformer,
+    )
+
+    LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
+
+    prepare_compile.assert_called_once_with()
+    assert compile_calls == [
+        (
+            original,
+            {
+                "dynamic": True,
+                "options": {
+                    "emulate_precision_casts": True,
+                    "triton.cudagraphs": False,
+                    "triton.cudagraph_trees": False,
+                },
+            },
+        )
+    ]
+    assert pipeline.transformer is compiled
+    assert pipeline.audio_graph_runner.transformer is compiled
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx2_audio_graph_compile_failure_keeps_eager_transformer(monkeypatch, caplog):
+    original = torch.nn.Module()
+    original.prepare_audio_cuda_graph_compile = Mock()
+    pipeline = _make_ltx2_graph_pipeline(enforce_eager=False)
+    pipeline.transformer = original
+    pipeline.audio_graph_runner.transformer = original
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_audio_runtime.regionally_compile",
+        Mock(side_effect=RuntimeError("compile failed")),
+    )
+
+    LTXAudioRuntime.setup_audio_cuda_graph_compile(pipeline)
+
+    assert pipeline.transformer is original
+    assert pipeline.audio_graph_runner.transformer is original
+    assert "LTX2 audio compile failed; using eager CUDA Graph" in caplog.text
+    assert "LTX2 audio CUDA Graph enabled (compiled" not in caplog.text
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx2_audio_graph_release_is_model_local_and_keeps_runner():
+    pipeline = _make_ltx2_graph_pipeline()
+    runner = pipeline.audio_graph_runner
+
+    LTXAudioRuntime.release_captured_graphs(pipeline)
+
+    runner.clear.assert_called_once_with()
+    assert pipeline.audio_graph_runner is runner
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"dtype": torch.float16}, "dtype must be bfloat16"),
+        ({"enable_cpu_offload": True}, "CPU offload is unsupported"),
+        ({"enable_layerwise_offload": True}, "layerwise offload is unsupported"),
+        ({"enable_distributed_layerwise_offload": True}, "distributed layerwise offload is unsupported"),
+        ({"quantization_config": object()}, "quantization is unsupported"),
+        ({"lora_path": "adapter"}, "LoRA is unsupported"),
+    ],
+)
+def test_ltx2_audio_graph_rejects_unvalidated_configurations(override, message):
+    pipeline = _make_ltx2_graph_pipeline(**override)
+    with pytest.raises(ValueError, match=message):
+        LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, pipeline.device)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx2_audio_graph_rejects_non_cuda_device():
+    pipeline = _make_ltx2_graph_pipeline()
+    with pytest.raises(ValueError, match="device must be CUDA"):
+        LTXAudioRuntime._validate_audio_cuda_graph_support(pipeline.od_config, torch.device("cpu"))
 
 
 def _make_request():
