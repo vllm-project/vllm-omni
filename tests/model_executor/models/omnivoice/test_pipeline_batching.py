@@ -35,7 +35,10 @@ def test_prepare_request_input_honors_both_seed_entrypoints(monkeypatch, samplin
     pipeline.duration_estimator = SimpleNamespace(estimate_duration=lambda *args: 1)
     pipeline.tokenizer = SimpleNamespace(encode=lambda text: SimpleNamespace(ids=[1]))
     pipeline.device = torch.device("cpu")
-    pipeline.config = SimpleNamespace(num_audio_codebook=1, audio_mask_id=0)
+    pipeline.config = SimpleNamespace(
+        num_audio_codebook=1, audio_mask_id=0, audio_chunk_duration=15.0, audio_chunk_threshold=30.0, frame_rate=25
+    )
+    pipeline._estimate_target_len = lambda *args: 1
     monkeypatch.setattr(pipeline_omnivoice, "_tokenize_with_nonverbal_tags", lambda text, tokenizer: [2])
 
     prepared = pipeline._prepare_request_input("Hello", sampling_params)
