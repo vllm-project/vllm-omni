@@ -17,8 +17,9 @@ from vllm.triton_utils import tl, triton
 libdevice = tl.extra.cuda.libdevice
 
 
-@triton.jit
-def _scaled_softmax_kernel(X, Y, N: tl.constexpr, ROWS: tl.constexpr, SCALE: tl.constexpr, BLOCK: tl.constexpr):
+# Image batches vary the row count; their row masks can share one kernel.
+@triton.jit(do_not_specialize=["ROWS"])
+def _scaled_softmax_kernel(X, Y, N: tl.constexpr, ROWS, SCALE: tl.constexpr, BLOCK: tl.constexpr):
     rows = tl.program_id(0) * 4 + tl.arange(0, 4)
     lane = tl.arange(0, 32)
     xs = ()

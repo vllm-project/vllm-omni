@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from vllm.triton_utils import triton
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import SiglipAttention, SiglipVisionConfig
@@ -22,6 +23,49 @@ def test_scaled_softmax_preserves_bf16_rounding(tokens: int) -> None:
     expected = (scores * scale).softmax(-1, dtype=torch.float32).to(scores.dtype)
     actual = scaled_softmax(scores, scale)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.core_model
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+def test_scaled_softmax_reuses_kernel_across_row_counts(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.model_executor.models.minicpmo_4_5.ops.scaled_softmax import (
+        _scaled_softmax_kernel,
+        scaled_softmax,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(9517)
+    tokens = 1032
+    scale = 72**-0.5
+
+    def check_rows(rows: int) -> None:
+        scores = torch.randn((rows, tokens), device="cuda", dtype=torch.bfloat16, generator=generator) * 8
+        expected = (scores * scale).softmax(-1, dtype=torch.float32).to(scores.dtype)
+        actual = scaled_softmax(scores, scale)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    # Warm this family before observing misses, independent of existing caches.
+    check_rows(19)
+    cache_misses = 0
+    runtime = triton.knobs.runtime
+    previous_hook = runtime.jit_cache_hook
+
+    def record_cache_miss(*, fn, **hook_kwargs) -> bool | None:
+        nonlocal cache_misses
+        if fn.jit_function is _scaled_softmax_kernel:
+            cache_misses += 1
+        if previous_hook is not None:
+            return previous_hook(fn=fn, **hook_kwargs)
+        return None
+
+    # Base allocations preserve pointer alignment. Counts stay int32 while
+    # covering tails, scalar-one specialization and observed image batch sizes.
+    # A hook miss includes persistent-cache loads, not only backend compilation.
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "jit_cache_hook", record_cache_miss)
+        for rows in (1, 2, 19, 32, 33, 16512, 33024, 115584):
+            check_rows(rows)
+
+    assert not cache_misses, f"Changing only row count caused {cache_misses} softmax JIT cache misses"
 
 
 @pytest.mark.core_model
