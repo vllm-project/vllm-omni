@@ -97,6 +97,7 @@ class Qwen3OmniChatFallbackPlugin(DuplexModelPlugin):
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
             supports_turn_commit_only=True,
+            optional_input_modalities=frozenset(),
             supports_realtime_endpoint=True,
             supports_multi_session=False,
             supports_multi_session_same_replica=False,

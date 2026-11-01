@@ -46,6 +46,17 @@ def test_qwen3_plugin_loads_through_the_unified_contract() -> None:
     assert plugin.default_auto_response is True
 
 
+def test_qwen3_fallback_advertises_only_audio_input() -> None:
+    capabilities = Qwen3OmniChatFallbackPlugin(_encode_audio).capabilities(max_sessions=1)
+
+    assert capabilities.required_input_modalities == frozenset({"audio"})
+    assert capabilities.optional_input_modalities == frozenset()
+    assert capabilities.validate_append_modalities(has_audio=True, has_video=True) == (
+        "This duplex model does not accept video_frames"
+    )
+    assert capabilities.validate_append_modalities(has_audio=True, has_video=False) is None
+
+
 def test_qwen3_fallback_policy_adds_interruption_note_until_request_starts() -> None:
     plugin = Qwen3OmniChatFallbackPlugin(_encode_audio)
     state = plugin.create_session_state()

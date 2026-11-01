@@ -923,21 +923,23 @@ class DuplexSessionRunner:
             )
             self._emit_events(events)
             self._settle_playback_committed_answer(events)
-            # A camera commit can arrive after response.done while its audio
-            # is still playing. In that case the final ACK, not another model
-            # terminal event, releases the next observation.
+            # A deferred camera or fallback turn can outlive response.done
+            # while audio plays. The final ACK releases its retained input.
             if (
                 any(isinstance(event, PlaybackAcknowledged) for event in events)
-                and self.session.capabilities.allows_video_without_audio()
+                and (
+                    self.session.capabilities.allows_video_without_audio()
+                    or self.session.capabilities.supports_chat_fallback
+                )
                 and not self.session.capabilities.supports_concurrent_turn_requests
                 and not helpers.response_in_progress(self.session, self.tasks)
                 and self.model_state.deferred_response_create
-                and (pending_observation := self.model_state.committed_audio_payload) is not None
+                and (pending_input := self.model_state.committed_audio_payload) is not None
             ):
                 precreate_response = self.model_state.deferred_precreate_response
                 self.model_state.deferred_response_create = False
                 self.model_state.deferred_precreate_response = False
-                self._promote_deferred_overlap_later(pending_observation, precreate_response)
+                self._promote_deferred_overlap_later(pending_input, precreate_response)
         elif isinstance(command, Heartbeat):
             self._on_heartbeat(command)
         elif isinstance(command, GetSessionStats):

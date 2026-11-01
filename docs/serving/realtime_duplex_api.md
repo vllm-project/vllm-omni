@@ -446,8 +446,9 @@ admission to one session. Its capabilities report
 `implementation_level: chat_fallback`, `supports_chat_fallback: true`, and
 `supports_input_append: false`. It accepts streaming audio appends but starts
 inference only after a committed turn; it does not append to a native model
-request or use listen/speak tokens. Images, reference voices, session resume,
-and tool calls are not supported by this profile. Non-empty `tools` and
+request or use listen/speak tokens. Images, video frames, reference voices,
+session resume, and tool calls are not supported by this profile. Appends with
+`video_frames` are rejected with `invalid_input_modality`. Non-empty `tools` and
 `tool_choice` values are rejected at session admission, session updates, and
 `response.create` with `unsupported_tools`; function-call outputs are also
 rejected rather than acknowledged as executable input.
@@ -473,7 +474,8 @@ as soon as the Thinker emits it. For incremental audio output, select
 chunking on the ordinary chat pipeline. The duplex input still starts inference
 only after commit. These independent text/audio streams have no word alignment;
 ACK-gated history includes assistant text only after complete audio generation
-and playback.
+and playback. An automatic follow-up committed while a response is playing
+starts after generation completes and playback is fully acknowledged.
 
 `qwen3_omni_duplex.yaml` continues to select the engine-managed Qwen plugin,
 including its image input and history grouping described above. The fallback

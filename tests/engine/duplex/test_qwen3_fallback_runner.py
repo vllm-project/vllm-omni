@@ -998,6 +998,205 @@ async def test_promoted_overlap_starts_another_fallback_request() -> None:
         await close_harness(harness)
 
 
+async def _start_fallback_with_pending_playback(harness: Harness) -> DuplexSessionFallbackRequestMessage:
+    first = await harness.start_fallback_turn()
+    await harness.send_fallback_started(first)
+    await harness.send_fallback_output(
+        first,
+        {
+            "text": "first answer",
+            "audio": base64.b64encode(b"\0\0" * 16_000).decode(),
+            "audio_format": "pcm",
+            "sample_rate_hz": 16_000,
+            "audio_duration_ms": 1000,
+        },
+    )
+    return first
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ack_before_done", [False, True])
+@pytest.mark.parametrize("create_response", [None, True])
+async def test_deferred_followup_starts_once_after_completion_and_full_ack(
+    ack_before_done: bool, create_response: bool | None
+) -> None:
+    harness = await open_harness(modalities=("text", "audio"))
+    try:
+        first = await _start_fallback_with_pending_playback(harness)
+        speech = _pcm_f32(0.125)
+        await harness.run(commands.AppendAudio(audio=speech, format="pcm_f32le", sample_rate_hz=16_000, is_speech=True))
+        committed = await harness.run(commands.Commit(create_response=create_response))
+        assert _event(committed, "input_audio_buffer.committed").to_realtime()["event"]["response_create_deferred"]
+        assert harness.fallback_requests == []
+
+        if not ack_before_done:
+            await harness.send_fallback_output(first, {"end_of_turn": True})
+        partial_ack = await harness.run(commands.AckPlayback(response_id=first.request.response_id, played_ms=400))
+        assert _event(partial_ack, "playback.acknowledged").details["committed_ms"] == 400
+        assert harness.fallback_requests == []
+        full_ack = await harness.run(commands.AckPlayback(response_id=first.request.response_id, played_ms=1000))
+        assert _event(full_ack, "playback.acknowledged").details["committed_ms"] == 1000
+        if ack_before_done:
+            assert harness.fallback_requests == []
+            await harness.send_fallback_output(first, {"end_of_turn": True})
+
+        [second] = harness.fallback_requests
+        assert second.request.response_id != first.request.response_id
+        assert base64.b64decode(second.request.input_payload["audio"]) == speech
+        assert [message["content"] for message in second.request.history if message.get("role") == "assistant"] == [
+            "first answer"
+        ]
+        assert harness.session.pending_input_bytes == 0
+        assert harness.runner.model_state.committed_audio_payload is None
+        assert (
+            sum(
+                event.type == "response.created" and event.response_id == second.request.response_id
+                for event in harness.events
+            )
+            == 1
+        )
+        await harness.run(commands.AckPlayback(response_id=first.request.response_id, played_ms=1000))
+        assert len(harness.fallback_requests) == 1
+    finally:
+        await close_harness(harness)
+
+
+@pytest.mark.asyncio
+async def test_followup_committed_during_playback_waits_for_full_ack() -> None:
+    harness = await open_harness(modalities=("text", "audio"))
+    try:
+        first = await _start_fallback_with_pending_playback(harness)
+        await harness.send_fallback_output(first, {"end_of_turn": True})
+        speech = _pcm_f32(0.125)
+        await harness.run(commands.AppendAudio(audio=speech, format="pcm_f32le", sample_rate_hz=16_000, is_speech=True))
+        await harness.run(commands.Commit())
+        assert harness.fallback_requests == []
+
+        await harness.run(commands.AckPlayback(response_id=first.request.response_id, played_ms=400))
+        assert harness.fallback_requests == []
+        await harness.run(commands.AckPlayback(response_id=first.request.response_id, played_ms=1000))
+        [second] = harness.fallback_requests
+        assert base64.b64decode(second.request.input_payload["audio"]) == speech
+    finally:
+        await close_harness(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("discard", ["clear", "cancel"])
+async def test_discarded_followup_is_not_revived_by_late_playback_ack(discard: str) -> None:
+    harness = await open_harness(modalities=("text", "audio"))
+    try:
+        first = await _start_fallback_with_pending_playback(harness)
+        await harness.run(
+            commands.AppendAudio(audio=_pcm_f32(0.125), format="pcm_f32le", sample_rate_hz=16_000, is_speech=True)
+        )
+        await harness.run(commands.Commit(create_response=True))
+        await harness.send_fallback_output(first, {"end_of_turn": True})
+        await harness.run(commands.ClearInput() if discard == "clear" else commands.CancelInput())
+        await harness.run(commands.AckPlayback(response_id=first.request.response_id, played_ms=1000))
+
+        assert harness.fallback_requests == []
+        assert harness.runner.model_state.committed_audio_payload is None
+        assert harness.session.pending_input_bytes == 0
+    finally:
+        await close_harness(harness)
+
+
+@pytest.mark.asyncio
+async def test_manual_followup_stays_manual_after_completion_and_playback_ack() -> None:
+    harness = await open_harness(modalities=("text", "audio"))
+    try:
+        first = await _start_fallback_with_pending_playback(harness)
+        speech = _pcm_f32(0.125)
+        await harness.run(commands.AppendAudio(audio=speech, format="pcm_f32le", sample_rate_hz=16_000, is_speech=True))
+        await harness.run(commands.Commit(create_response=False))
+        await harness.send_fallback_output(first, {"end_of_turn": True})
+        await harness.run(commands.AckPlayback(response_id=first.request.response_id, played_ms=1000))
+
+        assert harness.fallback_requests == []
+        await harness.run(commands.CreateResponse())
+        [second] = harness.fallback_requests
+        assert base64.b64decode(second.request.input_payload["audio"]) == speech
+    finally:
+        await close_harness(harness)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [commands.ClearInput(), commands.CreateResponse()])
+async def test_queued_command_cannot_revive_or_duplicate_followup_released_by_ack(command: DuplexCommand) -> None:
+    harness = await open_harness(modalities=("text", "audio"))
+    try:
+        first = await _start_fallback_with_pending_playback(harness)
+        await harness.run(
+            commands.AppendAudio(audio=_pcm_f32(0.125), format="pcm_f32le", sample_rate_hz=16_000, is_speech=True)
+        )
+        await harness.run(commands.Commit(create_response=True))
+        await harness.send_fallback_output(first, {"end_of_turn": True})
+        harness.submit(commands.AckPlayback(response_id=first.request.response_id, played_ms=1000))
+        harness.submit(command)
+
+        events = await harness.settle()
+
+        expected_requests = 1 if isinstance(command, commands.CreateResponse) else 0
+        assert len(harness.fallback_requests) == expected_requests
+        assert sum(event.type == "response.created" for event in events) == expected_requests
+        assert harness.session.pending_input_bytes == 0
+    finally:
+        await close_harness(harness)
+
+
+@pytest.mark.asyncio
+async def test_new_manual_commit_supersedes_a_deferred_automatic_followup() -> None:
+    harness = await open_harness(modalities=("text", "audio"))
+    try:
+        first = await _start_fallback_with_pending_playback(harness)
+        for value, create_response in ((0.125, True), (0.25, False)):
+            await harness.run(
+                commands.AppendAudio(audio=_pcm_f32(value), format="pcm_f32le", sample_rate_hz=16_000, is_speech=True)
+            )
+            await harness.run(commands.Commit(create_response=create_response))
+            if value == 0.125:
+                await harness.send_fallback_output(first, {"end_of_turn": True})
+
+        await harness.run(commands.AckPlayback(response_id=first.request.response_id, played_ms=1000))
+        assert harness.fallback_requests == []
+        await harness.run(commands.CreateResponse())
+        [second] = harness.fallback_requests
+        audios = _prompt_audio_samples(second)
+        assert len(audios) == 3
+        np.testing.assert_array_equal(audios[1], np.full(16_000, 4096, dtype="<i2"))
+        np.testing.assert_array_equal(audios[2], np.full(16_000, 8192, dtype="<i2"))
+    finally:
+        await close_harness(harness)
+
+
+@pytest.mark.asyncio
+async def test_audio_with_video_frames_is_rejected_without_buffering_input() -> None:
+    harness = await open_harness()
+    try:
+        frame = base64.b64encode(b"\xff\xd8\xff\xe0" + b"\0" * 12).decode()
+        command = translate_realtime_command(
+            {
+                "type": "input_audio_buffer.append",
+                "event_id": "audio-with-video",
+                "audio": base64.b64encode(_pcm_f32(0.125)).decode(),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16_000,
+                "is_speech": True,
+                "video_frames": [frame],
+            }
+        )
+        events = await harness.run(command)
+
+        error = _event(events, "error")
+        assert error.code == "invalid_input_modality"
+        assert not harness.runner.model_state.audio_buffer.has_pending()
+        assert harness.session.pending_input_bytes == 0
+        assert harness.fallback_requests == []
+    finally:
+        await close_harness(harness)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("output_modality", ["text", "audio"])
 @pytest.mark.parametrize("end_of_turn", [False, True])

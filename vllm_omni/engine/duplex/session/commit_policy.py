@@ -31,7 +31,7 @@ def decide_commit_action(snapshot: CommitSnapshot) -> CommitAction:
     if snapshot.auto_responds:
         # A fallback must finish its engine-owned response before another
         # committed response starts. Native auto-response stays model-owned.
-        if snapshot.defer_active_auto_response and snapshot.active_response_id is not None:
+        if snapshot.defer_active_auto_response and snapshot.response_in_progress:
             return CommitAction.DEFER_ACTIVE_RESPONSE
         if snapshot.speech_since_commit:
             return CommitAction.START_AUTO_RESPONSE
