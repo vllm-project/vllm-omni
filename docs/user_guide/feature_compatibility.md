@@ -154,6 +154,50 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
   --ring 2
 ```
 
+### MixFusion (Mixed-Resolution Step Batching)
+
+Best for: **Serving Qwen-Image with concurrent requests at different resolutions**
+
+MixFusion packs mixed-resolution requests into a single denoise step batch
+(ragged latents) instead of splitting them into separate resolution groups,
+raising throughput when traffic mixes resolutions.
+
+```bash
+# Server-level enablement
+vllm serve Qwen/Qwen-Image --omni --port 8091 \
+  --enable-mixfusion \
+  --mixfusion-min-chunk-tokens 256 \
+  --mixfusion-max-chunks 128
+```
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--enable-mixfusion` / `--no-enable-mixfusion` | off | Let the scheduler pack mixed-resolution requests into one step batch |
+| `--mixfusion-min-chunk-tokens` | 256 | Minimum packed-chunk token count below which a candidate is not packed |
+| `--mixfusion-max-chunks` | 128 | Maximum number of chunks in one packed forward |
+
+MixFusion requires a pipeline that declares `supports_mixfusion` (currently
+Qwen-Image only). On any other pipeline, server-level `--enable-mixfusion`
+fails at startup; a request-level `extra_args={"enable_mixfusion": True}` is a
+safe no-op and requests keep batching by resolution.
+
+MixFusion only mixes resolutions in step execution. When server-level
+`--enable-mixfusion` is set, step execution is enabled automatically (a
+warning is logged if it was off), so the command above works without
+`--step-execution`. Request-level `extra_args` in request mode remain a no-op.
+
+Constraints on the packed path:
+
+- **Edit (image-conditioned) requests**: silently fall back to serial ragged
+  execution; the zero_cond_t variant of the editing path raises an error.
+- **Sequence parallelism (SP>1)**: rejected with an error.
+- **Forward hooks (incl. HSDP `fully_shard`) and `do_true_cfg`**: the affected
+  requests silently fall back to serial ragged execution; other requests in
+  the batch are unaffected.
+- **NPU**: the packed varlen kernel is unavailable, so the attention layer
+  serves packed batches through its automatic length-bucketed dense fallback
+  (documents stay isolated; no varlen-kernel speedup, no per-request loop).
+
 ## Limitations
 
 ### Incompatibilities

@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING, Any
 
@@ -39,11 +41,22 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.mixfusion_plan import (
+    MixFusionExpandArg,
+    MixFusionExpandRows,
+    MixFusionRoot,
+    MixFusionRopePrepare,
+)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
+from vllm_omni.diffusion.hooks import module_has_active_hooks
+from vllm_omni.diffusion.hooks.mixfusion import MIXFUSION_PACK_HOOK_NAME
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     QK_NORM_ROPE_TABLE_KEY,
@@ -60,6 +73,12 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.mixfusion.layout import (
+    MixFusionPlan,
+    build_mixfusion_plan,
+    split_sequence_chunks,
+)
+from vllm_omni.diffusion.mixfusion.packed_attention import MIXFUSION_PLAN_KEY
 
 logger = init_logger(__name__)
 
@@ -87,6 +106,11 @@ def _packed_qk_norm_rope_table(
     kernel would not run or the joint sequence ``B*(S_txt+S_img)`` is below the
     gate.
     """
+    if is_forward_context_available() and get_forward_context().mixfusion_step is not None:
+        # The packed path has no fused joint QK-norm-RoPE table: text is
+        # per-request while image rows are per-chunk, so one table cannot
+        # serve both streams.
+        return None
     freqs = torch.cat((txt_freqs, vid_freqs), dim=0)
     if batch_size * freqs.shape[0] < _fused_min_tokens():
         return None
@@ -117,7 +141,12 @@ def _qwen_image_qk_norm_rope(
     ):
         num_kv_heads = k.shape[2]
         rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
-        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
+        if rope_table.dim() == 3:
+            # Per-token freqs (mixfusion): every batch row carries its own
+            # positions, so no shared-table expand is needed.
+            rope_table = rope_table.reshape(tokens, rotary_dim)
+        else:
+            rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
         fused_q, fused_k = fused_qk_norm_rope(
             q.reshape(tokens, num_heads, head_dim),
             k.reshape(tokens, num_kv_heads, head_dim),
@@ -139,6 +168,22 @@ def _qwen_image_qk_norm_rope(
     k = norm_k(k)
     cos = torch.real(freqs).to(q.dtype)
     sin = torch.imag(freqs).to(q.dtype)
+    if cos.dim() == 3:
+        # Per-token freqs (mixfusion): each batch row has its own positions,
+        # but the rope kernels strip a 3-D cos down to cos[0] assuming a shared
+        # table — flatten to per-token rows so every row keeps its own angle.
+        kv_heads = k.shape[2]
+        q = rope(
+            q.reshape(tokens, num_heads, head_dim),
+            cos.reshape(tokens, -1),
+            sin.reshape(tokens, -1),
+        ).reshape(q.shape)
+        k = rope(
+            k.reshape(tokens, kv_heads, head_dim),
+            cos.reshape(tokens, -1),
+            sin.reshape(tokens, -1),
+        ).reshape(k.shape)
+        return q, k
     return rope(q, cos, sin), rope(k, cos, sin)
 
 
@@ -758,6 +803,16 @@ class QwenImageCrossAttention(nn.Module):
         encoder_hidden_states_mask: torch.Tensor | None = None,
         qk_norm_rope_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The packed MixFusion plan travels on the forward context (armed by
+        # the pipeline's `_denoise_step_mixfusion`, filled by the root hook)
+        # so this signature stays free of MixFusion threading. No context / no
+        # armed step (serial forwards, unit tests) means the packed branch
+        # below stays dormant.
+        mixfusion_plan = None
+        if is_forward_context_available():
+            step = get_forward_context().mixfusion_step
+            if step is not None:
+                mixfusion_plan = step.plan
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
         kv_size = self.kv_num_heads * self.head_dim
@@ -825,6 +880,27 @@ class QwenImageCrossAttention(nn.Module):
                 self.rope,
                 self.eps,
             )
+            if mixfusion_plan is not None:
+                # MixFusion chunked layout: image chunks stay stacked on the
+                # local batch dimension while text stays request-level, so
+                # the joint cat below cannot apply. Send the text streams
+                # through the SP-joint channel and the plan through the
+                # metadata; the attention layer recovers each request to
+                # ``text + full image`` at its pre/post boundary (the
+                # all-to-all position) and returns the two stream layouts.
+                attn_metadata = AttentionMetadata(
+                    joint_query=txt_query,
+                    joint_key=txt_key,
+                    joint_value=txt_value,
+                    joint_strategy="front",
+                    extra={MIXFUSION_PLAN_KEY: mixfusion_plan},
+                )
+                img_attn_output, txt_attn_output = self.attn(img_query, img_key, img_value, attn_metadata)
+                img_attn_output = img_attn_output.flatten(2, 3).to(img_query.dtype)
+                txt_attn_output = txt_attn_output.flatten(2, 3).to(txt_query.dtype)
+                img_attn_output = self.to_out(img_attn_output)
+                txt_attn_output = self.to_add_out(txt_attn_output)
+                return img_attn_output, txt_attn_output
             joint_query = torch.cat([txt_query, img_query], dim=1)
             joint_key = torch.cat([txt_key, img_key], dim=1)
             joint_value = torch.cat([txt_value, img_value], dim=1)
@@ -1070,6 +1146,33 @@ class QwenImageTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+@dataclass
+class MixFusionInputs:
+    """Prepared packed-MixFusion inputs for one denoise step.
+
+    Built by :meth:`QwenImageTransformer2DModel.prepare_mixfusion_inputs`
+    from the MixFusion root hook; the hook then hands the chunk-stacked
+    ``hidden_states`` and RoPE tables to :meth:`forward`, which runs the packed
+    layout through the same body as a batched tensor input.
+
+    Only ``hidden_states`` changes across the denoise steps of one generation;
+    the remaining fields depend solely on the request shapes and are reused
+    via the ``cached`` fast path (``key`` records what they were built from).
+    """
+
+    hidden_states: torch.Tensor
+    # Chunk-stacked image stream, already projected by ``img_in``.
+    encoder_hidden_states_mask: torch.Tensor | None  # normalized: None when all-valid
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor]
+    plan: MixFusionPlan
+    image_row_counts: list[int]
+    # Step-invariant layout, kept for the ``cached`` fast path:
+    row_vid_freqs: list[torch.Tensor]
+    text_freqs: list[torch.Tensor]
+    chunk_size: int
+    key: tuple
+
+
 # Note: inheriting from CachedTransformer only when we support caching
 class QwenImageTransformer2DModel(CachedTransformer):
     """
@@ -1138,6 +1241,17 @@ class QwenImageTransformer2DModel(CachedTransformer):
         },
         # Gather output at proj_out
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
+
+    # MixFusion packed-layout plan (the MixFusion counterpart of _sp_plan, see
+    # distributed/mixfusion_plan.py). The pipeline arms a MixFusionStep on the
+    # forward context per packed denoise step; these boundary hooks then run
+    # the chunk-stacked layout without any MixFusion branching in forward().
+    _mixfusion_plan = {
+        "": MixFusionRoot(pack_method="prepare_mixfusion_inputs"),
+        "image_rope_prepare": MixFusionRopePrepare(),
+        "transformer_blocks.*.img_mod": MixFusionExpandRows(),
+        "norm_out": MixFusionExpandArg(arg_index=1),
     }
 
     def __init__(
@@ -1244,6 +1358,201 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Only active when zero_cond_t=True (image editing models)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
 
+    @staticmethod
+    def _mixfusion_chunk_size(hidden_states: list[torch.Tensor]) -> int:
+        chunk_size = int(hidden_states[0].shape[1])
+        for sample in hidden_states[1:]:
+            chunk_size = math.gcd(chunk_size, int(sample.shape[1]))
+        return chunk_size
+
+    def has_active_block_hooks(self) -> bool:
+        """Whether any layerwise-offloadable block carries a registered hook.
+
+        The packed MixFusion path runs blocks on the chunk-stacked layout
+        (several chunks per request stacked on the batch dimension), where
+        hook semantics are unvalidated: layerwise offload would prefetch
+        block weights with a chunk-count step size instead of a block-count
+        one, and HSDP's ``fully_shard`` pre-hooks all-gather weights against
+        a batch dimension that no longer matches the request count. Refuse
+        the packed path when any block is hooked; callers fall back to the
+        standard forward, where the hooks were designed to run.
+        """
+        for attr in self._layerwise_offload_blocks_attrs:
+            for block in getattr(self, attr, []):
+                if module_has_active_hooks(block):
+                    return True
+                # PyTorch-native hooks (e.g. FSDP2 fully_shard's unshard
+                # pre-hook) live in the module's own hook dicts, not the
+                # Omni registry.
+                if getattr(block, "_forward_pre_hooks", None) or getattr(block, "_forward_hooks", None):
+                    return True
+        return False
+
+    def has_active_root_hooks(self) -> bool:
+        """Whether a hook other than MixFusion's is installed on the root module.
+
+        Cache-style hooks (cache-dit / TeaCache) read ``hidden_states`` before
+        and after the root forward to build keys and decide hits. They share
+        this module's registry with the MixFusion root hook, which swaps in the
+        chunk-stacked batch, so their keys would be computed on the wrong
+        layout (and hook order would decide the result). The packed path
+        refuses to coexist with them and falls back to the serial forward.
+        """
+        registry = getattr(self, "_hook_registry", None)
+        if registry is None:
+            return False
+        names = getattr(registry, "_hooks", {})
+        if any(name != MIXFUSION_PACK_HOOK_NAME for name in names):
+            return True
+        # PyTorch-native hooks on the root module (e.g. FSDP2's unshard
+        # pre-hook) are not visible in the Omni registry.
+        return bool(self._forward_pre_hooks) or bool(self._forward_hooks)
+
+    def prepare_mixfusion_inputs(
+        self,
+        hidden_states: list[torch.Tensor],
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
+        img_shapes: list[tuple[int, int, int]] | None = None,
+        txt_seq_lens: list[int] | None = None,
+        attention_kwargs: dict[str, Any] | None = None,
+        cached: MixFusionInputs | None = None,
+    ) -> MixFusionInputs:
+        """Split per-request latents into the packed chunk layout and build its plan.
+
+        This is the entire mixfusion-specific preparation; the MixFusion root
+        hook calls it and hands the packed tensors to :meth:`forward`, which
+        runs the packed layout through the same body as a batched tensor input.
+        The RoPE tables, packing plan and per-request
+        image counts depend only on the request shapes, so the bundle from the
+        previous denoise step can be handed back as ``cached`` to skip the
+        rebuild (only the per-step latents are re-split and re-projected).
+        """
+        if attention_kwargs:
+            # The packed path has no ``attention_kwargs`` channel; refusing
+            # keeps a caller's per-attention arguments from being silently
+            # dropped.
+            raise ValueError(
+                "Qwen MixFusion packed forward does not consume attention_kwargs; "
+                "pass batched tensor hidden_states (the serial path threads "
+                "attention_kwargs into every block) or drop them."
+            )
+        if self.zero_cond_t:
+            raise ValueError("Qwen MixFusion does not support zero_cond_t/editing path yet.")
+        if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
+            raise ValueError("Qwen MixFusion requires sequence parallel disabled.")
+        if self.has_active_block_hooks():
+            raise ValueError(
+                "Qwen MixFusion packed forward runs blocks on the chunk-stacked "
+                "layout, whose hook semantics (e.g. layerwise offload or HSDP "
+                "fully_shard) are unvalidated; fall back to the standard "
+                "forward path."
+            )
+        if not hidden_states:
+            raise ValueError("Qwen MixFusion requires at least one hidden-state tensor.")
+        if img_shapes is None or txt_seq_lens is None:
+            raise ValueError("Qwen MixFusion requires img_shapes and txt_seq_lens.")
+
+        # Normalize the all-valid text mask early: the plan and the shared
+        # forward body follow this convention.
+        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
+            encoder_hidden_states_mask = None
+
+        # Expand each state's latents into one row per requested image so that
+        # every image gets its own prompt row (encoder_hidden_states / temb
+        # are already per-image) and its own chunk mapping.
+        image_rows: list[torch.Tensor] = []
+        image_row_states: list[int] = []
+        total_images = 0
+        for state_idx, sample in enumerate(hidden_states):
+            for img_idx in range(int(sample.shape[0])):
+                image_rows.append(sample[img_idx : img_idx + 1])
+                image_row_states.append(state_idx)
+            total_images += int(sample.shape[0])
+
+        if total_images != int(encoder_hidden_states.shape[0]):
+            raise ValueError(
+                f"Qwen MixFusion prompt rows ({encoder_hidden_states.shape[0]}) do not "
+                f"match total requested images ({total_images})."
+            )
+
+        seq_len_txt = int(encoder_hidden_states.shape[1])
+        if encoder_hidden_states_mask is not None:
+            real_txt_lens = encoder_hidden_states_mask.sum(dim=1).tolist()
+        else:
+            real_txt_lens = [seq_len_txt] * encoder_hidden_states.shape[0]
+
+        # Keep the per-request image counts for the final reassembly.
+        image_row_counts = [int(sample.shape[0]) for sample in hidden_states]
+
+        # RoPE frequency tables are computed per image row on the FULL sequence
+        # (absolute positions preserved); img_shapes / txt_seq_lens are
+        # per-state, images of the same request share the same resolution and
+        # prompt. The hidden states and their freqs are then chunked under the
+        # same partition. All of this is step-invariant, so it is keyed on the
+        # request shapes and reused verbatim from ``cached`` within a
+        # generation's denoise loop.
+        layout_key = (
+            tuple(sample.shape for sample in hidden_states),
+            tuple(encoder_hidden_states.shape),
+            tuple(real_txt_lens),
+            tuple(img_shapes),
+            tuple(txt_seq_lens),
+        )
+        reuse_layout = cached is not None and cached.key == layout_key
+        if reuse_layout:
+            row_vid_freqs = cached.row_vid_freqs
+            text_freqs = cached.text_freqs
+            chunk_size = cached.chunk_size
+        else:
+            chunk_size = self._mixfusion_chunk_size(image_rows)
+            row_vid_freqs = []
+            text_freqs = []
+            for row_idx, sample in enumerate(image_rows):
+                state_idx = image_row_states[row_idx]
+                req_vid_freqs, req_txt_freqs = self.pos_embed(
+                    img_shapes[state_idx], [seq_len_txt], device=sample.device
+                )
+                row_vid_freqs.append(req_vid_freqs)
+                text_freqs.append(req_txt_freqs[:seq_len_txt])
+
+        image_chunks, image_freq_chunks, request_chunk_ranges, chunk_to_request = split_sequence_chunks(
+            image_rows, row_vid_freqs, chunk_size
+        )
+
+        # Rebind to the chunk-stacked image stream so the shared forward body
+        # is layout-agnostic.
+        packed_hidden_states = self.img_in(torch.cat(image_chunks, dim=0))
+
+        if reuse_layout:
+            image_rotary_emb = cached.image_rotary_emb
+            mixfusion_plan = cached.plan
+        else:
+            image_rotary_emb = (torch.stack(image_freq_chunks, dim=0), torch.stack(text_freqs, dim=0))
+            # Packing layout is identical across blocks and steps: build it once
+            # per layout (cu_seqlens / out-gather indices as device tensors) so
+            # the 60 blocks run pure GPU work.
+            mixfusion_plan = build_mixfusion_plan(
+                seq_len_txt=seq_len_txt,
+                chunk_size=chunk_size,
+                request_chunk_ranges=request_chunk_ranges,
+                real_txt_lens=real_txt_lens,
+                chunk_to_request=torch.tensor(chunk_to_request, dtype=torch.long, device=packed_hidden_states.device),
+                device=packed_hidden_states.device,
+            )
+
+        return MixFusionInputs(
+            hidden_states=packed_hidden_states,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            image_rotary_emb=image_rotary_emb,
+            plan=mixfusion_plan,
+            image_row_counts=image_row_counts,
+            row_vid_freqs=row_vid_freqs,
+            text_freqs=text_freqs,
+            chunk_size=chunk_size,
+            key=layout_key,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1256,13 +1565,14 @@ class QwenImageTransformer2DModel(CachedTransformer):
         attention_kwargs: dict[str, Any] | None = None,
         additional_t_cond=None,
         return_dict: bool = True,
-    ) -> torch.Tensor | Transformer2DModelOutput:
+    ) -> torch.Tensor | Transformer2DModelOutput | list[torch.Tensor]:
         """
         The [`QwenTransformer2DModel`] forward method.
 
         Args:
             hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
-                Input `hidden_states`.
+                Input `hidden_states`. When the MixFusion root hook is armed it
+                rewrites this to the chunk-stacked batch before the body runs.
             encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
             encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
@@ -1281,12 +1591,6 @@ class QwenImageTransformer2DModel(CachedTransformer):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-        # if attention_kwargs is not None:
-        #     attention_kwargs = attention_kwargs.copy()
-        #     lora_scale = attention_kwargs.pop("scale", 1.0)
-        # else:
-        #     lora_scale = 1.0
-
         # Set split_text_embed_in_sp = False for dual-stream attention
         # QwenImage uses *dual-stream* (text + image) and runs a *joint attention*.
         # Text embeddings must be replicated across SP ranks for correctness.
@@ -1322,43 +1626,39 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Check for SP auto_pad: create attention mask dynamically if padding was applied
         # In Ulysses mode, attention is computed on the FULL sequence (after All-to-All)
         hidden_states_mask = None  # default
-        ctx = get_forward_context()
-        if (
-            self.parallel_config is not None
-            and self.parallel_config.sequence_parallel_size > 1
-            and self.parallel_config.mask_sp_padding
-            and ctx.sp_original_seq_len is not None
-            and ctx.sp_padding_size > 0
-        ):
-            # Create mask for the full (padded) sequence
-            # valid positions = True, padding positions = False
-            batch_size = hidden_states.shape[0]
-            padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-            hidden_states_mask = torch.ones(
-                batch_size,
-                padded_seq_len,
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-            if hidden_states_mask.all():
-                hidden_states_mask = None
-        elif (
-            self.parallel_config is not None
-            and self.parallel_config.sequence_parallel_size > 1
-            and not self.parallel_config.mask_sp_padding
-            and ctx.sp_original_seq_len is not None
-            and ctx.sp_padding_size > 0
-        ):
-            logger.warning_once(
-                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
-                "Padding tokens are not masked from attention (mask_sp_padding=False), "
-                "which avoids the varlen attention path but may produce minor numerical differences. "
-                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
-                ctx.sp_padding_size,
-                ctx.sp_original_seq_len,
-                self.parallel_config.sequence_parallel_size,
-            )
+        if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
+            # SP-only bookkeeping. ``get_forward_context`` raises when no
+            # context is set, and the packed MixFusion path never runs with SP
+            # enabled, so fetch the context only under SP.
+            ctx = get_forward_context()
+            if self.parallel_config.mask_sp_padding and ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                # Create mask for the full (padded) sequence
+                # valid positions = True, padding positions = False
+                batch_size = hidden_states.shape[0]
+                padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                hidden_states_mask = torch.ones(
+                    batch_size,
+                    padded_seq_len,
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+                if hidden_states_mask.all():
+                    hidden_states_mask = None
+            elif (
+                not self.parallel_config.mask_sp_padding
+                and ctx.sp_original_seq_len is not None
+                and ctx.sp_padding_size > 0
+            ):
+                logger.warning_once(
+                    "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                    "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                    "which avoids the varlen attention path but may produce minor numerical differences. "
+                    "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                    ctx.sp_padding_size,
+                    ctx.sp_original_seq_len,
+                    self.parallel_config.sequence_parallel_size,
+                )
 
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None

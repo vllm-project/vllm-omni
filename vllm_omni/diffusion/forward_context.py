@@ -23,6 +23,31 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class MixFusionStep:
+    """Pipeline-armed record of one packed MixFusion denoise step.
+
+    The pipeline sets only the activation policy (chunk-size bounds from the
+    per-request extras); the MixFusion root hook fills ``plan`` / ``packed`` /
+    ``image_row_counts`` while the forward runs. A new ForwardContext is
+    created per ``execute_model`` call, and the pipeline restores
+    ``mixfusion_step`` in a ``finally``, so nothing here leaks across steps.
+
+    All tensor/plan fields are deliberately opaque (``Any``): the common
+    context module must not import the MixFusion layout types.
+    """
+
+    # Packing policy, read by the pack method (per-request extras defaults).
+    min_chunk_tokens: int = 256
+    max_chunks: int = 128
+    # Filled by the root hook while the packed forward runs:
+    plan: Any = None
+    image_row_counts: list[int] | None = None
+    # (packed hidden states, vid_freqs, txt_freqs) as handed out by the
+    # ``image_rope_prepare`` boundary.
+    packed: tuple[Any, Any, Any] | None = None
+
+
+@dataclass
 class ForwardContext:
     """
     set forward context for diffusion models
@@ -81,6 +106,14 @@ class ForwardContext:
     # every rank's shard the same length and lets attention collectives skip a
     # runtime length all-gather. Pushed on split, popped on gather.
     _sp_equal_pad_stack: list[bool] = field(default_factory=list)
+
+    # MixFusion packed-layout state (see MixFusionStep above). ``mixfusion_step``
+    # is armed by the pipeline for exactly one packed transformer call; the
+    # MixFusion module hooks are inert while it is None.
+    mixfusion_step: MixFusionStep | None = None
+    # Set by the registry when _mixfusion_plan hooks are applied; lets the
+    # pipeline fall back to the serial path when they are missing.
+    mixfusion_hooks_applied: bool = False
 
     @property
     def sp_active(self) -> bool:

@@ -25,6 +25,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import MixFusionStep, get_forward_context
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -278,6 +279,10 @@ class QwenImagePipeline(
     _vae_modules: ClassVar[list[str]] = ["vae"]
 
     supports_step_execution: ClassVar[bool] = True
+    # Opt-in: this pipeline packs mixed-resolution requests into one denoise
+    # step via ragged latents, so the scheduler may relax height/width out of
+    # the batch key when MixFusion is enabled.
+    supports_mixfusion: ClassVar[bool] = True
 
     supports_weight_reload: ClassVar[bool] = True
 
@@ -829,6 +834,24 @@ class QwenImagePipeline(
         state.negative_txt_seq_lens = ctx["negative_txt_seq_lens"]
         # QwenImage always normalizes CFG output (matching forward())
         state.sampling.cfg_normalize = True
+        extra_args = getattr(state.sampling, "extra_args", {}) or {}
+        # Server-level default from od_config; an explicit request value
+        # (True or False) overrides it. od_config may be absent on a bare
+        # pipeline instance (unit tests construct one without __init__).
+        od_config = getattr(self, "od_config", None)
+        if bool(
+            extra_args.get(
+                "enable_mixfusion",
+                bool(getattr(od_config, "enable_mixfusion", False)),
+            )
+        ):
+            state.extra["use_ragged_latents"] = True
+            state.extra["mixfusion_min_chunk_tokens"] = extra_args.get(
+                "mixfusion_min_chunk_tokens", getattr(od_config, "mixfusion_min_chunk_tokens", 256)
+            )
+            state.extra["mixfusion_max_chunks"] = extra_args.get(
+                "mixfusion_max_chunks", getattr(od_config, "mixfusion_max_chunks", 128)
+            )
 
         return state
 
@@ -924,11 +947,178 @@ class QwenImagePipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
+    @staticmethod
+    def _qwen_mixfusion_candidate(
+        latents: list[torch.Tensor],
+        *,
+        min_chunk_tokens: int,
+        max_chunks: int,
+    ) -> tuple[bool, str, int, int]:
+        chunk_size = int(latents[0].shape[1])
+        for sample in latents[1:]:
+            chunk_size = math.gcd(chunk_size, int(sample.shape[1]))
+        chunk_count = sum(int(sample.shape[1]) // chunk_size * int(sample.shape[0]) for sample in latents)
+        if chunk_size < min_chunk_tokens:
+            return False, f"chunk_size={chunk_size} < min_chunk_tokens={min_chunk_tokens}", chunk_size, chunk_count
+        if chunk_count > max_chunks:
+            return False, f"chunk_count={chunk_count} > max_chunks={max_chunks}", chunk_size, chunk_count
+        return True, "ok", chunk_size, chunk_count
+
+    def _denoise_step_serial_ragged(self, input_batch: "InputBatch") -> list[torch.Tensor]:
+        latents = input_batch.latents
+        if not isinstance(latents, list):
+            raise TypeError("_denoise_step_serial_ragged expects list latents.")
+
+        outputs: list[torch.Tensor] = []
+        offset = 0
+        for req_idx, sample_latents in enumerate(latents):
+            # prompt_embeds / guidance / negative prompts are per-image rows, while
+            # latents is one tensor per request (which may hold num_images rows).
+            num_images = int(sample_latents.shape[0])
+            prompt_embeds = input_batch.prompt_embeds[offset : offset + num_images]
+            prompt_embeds_mask = (
+                None
+                if input_batch.prompt_embeds_mask is None
+                else input_batch.prompt_embeds_mask[offset : offset + num_images]
+            )
+            guidance = None if input_batch.guidance is None else input_batch.guidance[offset : offset + num_images]
+            positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
+                latents=sample_latents,
+                timestep=input_batch.timesteps[offset : offset + num_images],
+                guidance=guidance,
+                prompt_embeds=prompt_embeds,
+                prompt_embeds_mask=prompt_embeds_mask,
+                img_shapes=[input_batch.img_shapes[req_idx]],
+                txt_seq_lens=None if input_batch.txt_seq_lens is None else [input_batch.txt_seq_lens[req_idx]],
+                do_true_cfg=input_batch.do_true_cfg,
+                negative_prompt_embeds=(
+                    None
+                    if input_batch.negative_prompt_embeds is None
+                    else input_batch.negative_prompt_embeds[offset : offset + num_images]
+                ),
+                negative_prompt_embeds_mask=(
+                    None
+                    if input_batch.negative_prompt_embeds_mask is None
+                    else input_batch.negative_prompt_embeds_mask[offset : offset + num_images]
+                ),
+                negative_txt_seq_lens=(
+                    None if input_batch.negative_txt_seq_lens is None else [input_batch.negative_txt_seq_lens[req_idx]]
+                ),
+                # image_latents is per-image rows like the prompts: slice this
+                # request's rows so ragged requests keep their condition image.
+                # The dense denoise_step passes them straight through; dropping
+                # them here would silently denoise edits without the condition.
+                image_latents=(
+                    None
+                    if input_batch.image_latents is None
+                    else input_batch.image_latents[offset : offset + num_images]
+                ),
+                extra_transformer_kwargs={
+                    "attention_kwargs": self.attention_kwargs,
+                    "return_dict": False,
+                },
+            )
+            offset += num_images
+            outputs.append(
+                self.predict_noise_maybe_with_cfg(
+                    input_batch.do_true_cfg,
+                    input_batch.true_cfg_scale,
+                    positive_kwargs,
+                    negative_kwargs,
+                    input_batch.cfg_normalize,
+                    output_slice,
+                )
+            )
+        return outputs
+
+    def _denoise_step_mixfusion(self, input_batch: "InputBatch") -> list[torch.Tensor]:
+        latents = input_batch.latents
+        if not isinstance(latents, list):
+            raise TypeError("_denoise_step_mixfusion expects list latents.")
+        if input_batch.do_true_cfg or input_batch.image_latents is not None:
+            return self._denoise_step_serial_ragged(input_batch)
+        # The packed forward drives blocks through the layout-aware
+        # ``block.forward``, which has no ``attention_kwargs`` channel; the
+        # serial path threads them into every block, so honor a caller's
+        # per-attention arguments there instead of silently dropping them.
+        if self.attention_kwargs:
+            return self._denoise_step_serial_ragged(input_batch)
+        if self.parallel_config.sequence_parallel_size > 1:
+            return self._denoise_step_serial_ragged(input_batch)
+        # The packed mixfusion forward calls block.forward directly (not the
+        # module call), bypassing the block forward hooks (e.g. layerwise offload prefetch,
+        # or HSDP fully_shard's unshard pre-hook). The serial path routes
+        # every block through the hooked module call, so it stays correct
+        # under those hooks.
+        if self.transformer.has_active_block_hooks():
+            return self._denoise_step_serial_ragged(input_batch)
+        # Cache-style hooks on the root see the chunk-stacked batch the
+        # MixFusion root hook swaps in, so their keys would be built on the
+        # wrong layout; use the serial path while any of them is installed.
+        if self.transformer.has_active_root_hooks():
+            return self._denoise_step_serial_ragged(input_batch)
+
+        request_extras = input_batch.request_extras or []
+        min_chunk_tokens = 256
+        max_chunks = 128
+        if request_extras:
+            # Aggregate conservatively so no request's limits are violated by the
+            # fused pass: the strictest per-request thresholds govern the batch.
+            min_chunk_tokens = max(int(e.get("mixfusion_min_chunk_tokens", 256)) for e in request_extras)
+            max_chunks = min(int(e.get("mixfusion_max_chunks", 128)) for e in request_extras)
+        accepted, reason, chunk_size, chunk_count = self._qwen_mixfusion_candidate(
+            latents,
+            min_chunk_tokens=min_chunk_tokens,
+            max_chunks=max_chunks,
+        )
+        if not accepted:
+            logger.warning(
+                "Qwen MixFusion disabled for this batch: %s (chunk_size=%d, chunk_count=%d). "
+                "Falling back to per-request denoise.",
+                reason,
+                chunk_size,
+                chunk_count,
+            )
+            return self._denoise_step_serial_ragged(input_batch)
+
+        # The transformer's _mixfusion_plan hooks own all packed-layout work
+        # (chunk split, RoPE tables, plan, output reassembly); the pipeline
+        # only arms the per-step policy on the forward context. The root hook
+        # caches the step-invariant bundle across calls.
+        if not getattr(self.transformer, "_mixfusion_hooks_applied", False):
+            logger.warning_once(
+                "MixFusion hooks are not installed on the transformer; falling back to "
+                "the serial ragged path. Check that enable_mixfusion is set for this model."
+            )
+            return self._denoise_step_serial_ragged(input_batch)
+
+        ctx = get_forward_context()
+        previous = ctx.mixfusion_step
+        ctx.mixfusion_step = MixFusionStep(min_chunk_tokens=min_chunk_tokens, max_chunks=max_chunks)
+        try:
+            # ``img_shapes`` / ``txt_seq_lens`` must be forwarded: packing now
+            # happens inside the root hook, which rebuilds the RoPE tables and
+            # plan from them.
+            return self.transformer(
+                hidden_states=input_batch.latents,  # list; the root hook packs it
+                timestep=input_batch.timesteps.to(device=latents[0].device, dtype=latents[0].dtype) / 1000,
+                guidance=input_batch.guidance,
+                encoder_hidden_states=input_batch.prompt_embeds,
+                encoder_hidden_states_mask=input_batch.prompt_embeds_mask,
+                img_shapes=input_batch.img_shapes,
+                txt_seq_lens=input_batch.txt_seq_lens,
+                return_dict=False,
+            )
+        finally:
+            # cfg paths may call the transformer more than once in one step,
+            # so restore rather than relying on per-step context rebuild.
+            ctx.mixfusion_step = previous
+
     def denoise_step(
         self,
         input_batch: "InputBatch",
         **kwargs: Any,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | list[torch.Tensor] | None:
         """One denoise step: read from *input_batch*, delegate to CFGParallelMixin.
 
         Reuses ``predict_noise_maybe_with_cfg`` so that CFG-parallel,
@@ -941,6 +1131,9 @@ class QwenImagePipeline(
 
         t = input_batch.timesteps
         self._current_timestep = t
+
+        if isinstance(input_batch.latents, list):
+            return self._denoise_step_mixfusion(input_batch)
 
         positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
             latents=input_batch.latents,

@@ -6,6 +6,12 @@ from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
     apply_hsdp_to_model,
 )
+from vllm_omni.diffusion.distributed.mixfusion_plan import (
+    MixFusionExpandArg,
+    MixFusionExpandRows,
+    MixFusionRoot,
+    MixFusionRopePrepare,
+)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelConfig,
     SequenceParallelInput,
@@ -33,6 +39,11 @@ __all__ = [
     "SequenceParallelModelPlan",
     "validate_sp_plan",
     "get_sp_plan_from_model",
+    # MixFusion plan types (consumed by hooks.mixfusion, declared by models)
+    "MixFusionRoot",
+    "MixFusionRopePrepare",
+    "MixFusionExpandRows",
+    "MixFusionExpandArg",
     # Sharding utilities
     "sp_shard",
     "sp_gather",

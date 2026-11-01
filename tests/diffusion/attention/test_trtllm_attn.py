@@ -279,7 +279,9 @@ def test_generic_packed_metadata_preserves_ragged_batch(monkeypatch):
     fake_attention = Mock(return_value=torch.zeros_like(q.reshape(5, h, d)))
 
     monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
-    monkeypatch.setattr(tg, "trtllm_ragged_attention_deepseek", fake_attention)
+    # raising=False: without flashinfer the import guard leaves the symbol
+    # unbound; the mock still shadows the call-time global lookup.
+    monkeypatch.setattr(tg, "trtllm_ragged_attention_deepseek", fake_attention, raising=False)
     monkeypatch.setattr(TrtllmAttentionImpl, "_get_workspace", classmethod(lambda cls, device: torch.empty(0)))
 
     _impl().forward_cuda(q, k, v, metadata)
@@ -291,6 +293,45 @@ def test_generic_packed_metadata_preserves_ragged_batch(monkeypatch):
     assert captured["batch_size"] == 2
     assert captured["seq_lens"].tolist() == [3, 4]
     assert tg.TrtllmAttentionBackend.supports_multi_doc_packed_varlen()
+
+
+@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
+def test_forward_packed_serves_trtllm_with_the_row_layout(monkeypatch):
+    # ``Attention.forward_packed`` must hand TRTLLM a
+    # [1, total_tokens, heads, head_dim] packed row: ``forward_cuda``
+    # unpacks a 4-D query, so the flat 3-D model packing would crash before
+    # the kernel. Drives the real impl through the layer entry point.
+    from vllm_omni.diffusion.attention.layer import Attention
+
+    h, d = 8, 128
+    total = 5
+    q = torch.zeros(total, h, d)
+    k, v = (torch.zeros(total, h, d) for _ in range(2))
+    cu_seqlens = torch.tensor([0, 2, total], dtype=torch.int32)
+    fake_attention = Mock(return_value=torch.zeros(total, h, d))
+
+    monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
+    # raising=False: without flashinfer the import guard leaves the symbol
+    # unbound; the mock still shadows the call-time global lookup.
+    monkeypatch.setattr(tg, "trtllm_ragged_attention_deepseek", fake_attention, raising=False)
+    monkeypatch.setattr(TrtllmAttentionImpl, "_get_workspace", classmethod(lambda cls, device: torch.empty(0)))
+
+    layer = Attention.__new__(Attention)
+    object.__setattr__(layer, "attn_backend", tg.TrtllmAttentionBackend)
+    object.__setattr__(layer, "forward", _impl().forward_cuda)
+    object.__setattr__(layer, "_kv_cache_dtype", None)
+    object.__setattr__(layer, "_disable_kv_quant", False)
+    object.__setattr__(layer, "_kv_cache_skip_steps", None)
+    object.__setattr__(layer, "_kv_cache_skip_layers", None)
+
+    out = layer.forward_packed(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=total)
+
+    captured = fake_attention.call_args.kwargs
+    assert captured["batch_size"] == 2
+    assert captured["seq_lens"].tolist() == [2, 3]
+    assert out.shape == (total, h, d)
+    # The quantization-policy argument is accepted for signature parity.
+    assert tg.TrtllmAttentionBackend.supports_multi_doc_packed_varlen("fp8")
 
 
 @hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
@@ -320,7 +361,9 @@ def test_packed_padding_metadata_trims_without_mask(monkeypatch):
     fake_attention = Mock(return_value=torch.ones(valid_q_tokens, h, d))
 
     monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
-    monkeypatch.setattr(tg, "trtllm_ragged_attention_deepseek", fake_attention)
+    # raising=False: without flashinfer the import guard leaves the symbol
+    # unbound; the mock still shadows the call-time global lookup.
+    monkeypatch.setattr(tg, "trtllm_ragged_attention_deepseek", fake_attention, raising=False)
     monkeypatch.setattr(TrtllmAttentionImpl, "_get_workspace", classmethod(lambda cls, device: torch.empty(0)))
 
     out = _impl().forward_cuda(q, k, v, metadata)
