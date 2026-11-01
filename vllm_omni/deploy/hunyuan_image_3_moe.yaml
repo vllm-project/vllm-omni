@@ -31,13 +31,14 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    gpu_memory_utilization: 0.95
-    # FULL CUDA graphs for decode, no torch.compile: AR TPOT 76 -> 6 ms on
-    # GB200 TP4. Inductor collapsed some temp-0 outputs, so compile stays off.
+    # Inductor warmup needs headroom at TP2; 0.95 OOMs.
+    gpu_memory_utilization: 0.90
+    # Inductor + FULL decode CUDA graphs. emulate_precision_casts keeps eager's
+    # bf16 rounding; without it some temp-0 outputs collapsed.
     enforce_eager: false
     compilation_config:
-      mode: 0
-      cudagraph_mode: FULL_DECODE_ONLY
+      inductor_compile_config:
+        emulate_precision_casts: true
     max_num_batched_tokens: 32768
     devices: "0,1"
     tensor_parallel_size: 2

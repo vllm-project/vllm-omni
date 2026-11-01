@@ -10,12 +10,12 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.75
     trust_remote_code: true
-    # FULL CUDA graphs for decode, no torch.compile: AR TPOT 76 -> 6 ms on
-    # GB200 TP4. Inductor collapsed some temp-0 outputs, so compile stays off.
+    # Inductor + FULL decode CUDA graphs. emulate_precision_casts keeps eager's
+    # bf16 rounding; without it some temp-0 outputs collapsed.
     enforce_eager: false
     compilation_config:
-      mode: 0
-      cudagraph_mode: FULL_DECODE_ONLY
+      inductor_compile_config:
+        emulate_precision_casts: true
     enable_prefix_caching: false
     max_num_batched_tokens: 32768
     devices: "0,1,2,3"
