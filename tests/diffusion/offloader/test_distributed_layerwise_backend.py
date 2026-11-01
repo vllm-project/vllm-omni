@@ -770,6 +770,63 @@ class TestDistributedLayerwiseOffloadHook:
         assert next_block.weight.stride() == (1, 2)
         assert torch.equal(source, torch.arange(4, dtype=torch.float32).view(2, 2))
 
+    def test_rank_local_mmap_accepts_shape_changing_transform(self, patched_offload_runtime):
+        """A rank-local layout may be smaller than its checkpoint tensor.
+
+        MAGI-2 declares an EP-head slice as its mmap transform, so the runtime
+        shape is a strict subset of the checkpoint shape. The non-mmap path
+        (``_shard_and_pin``) already accepts that; rank-local staging must too,
+        because it sizes and packs from the transformed layout.
+        """
+        current_block = nn.Module()
+        next_block = nn.Module()
+        next_block.weight = nn.Parameter(torch.arange(8, dtype=torch.float32).view(8, 1))
+
+        def take_first_quarter(tensor):
+            return tensor[:2]
+
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+            rank_local_mmap=True,
+            tensor_transforms={id(next_block.weight): take_first_quarter},
+        )
+        hook.initialize_hook(current_block)
+
+        assert hook.metadata[torch.float32][0]["shape"] == torch.Size([2, 1])
+        assert hook.metadata[torch.float32][0]["numel"] == 2
+
+        hook.cpu_staging_buffers = [
+            {torch.float32: torch.empty(2)},
+            {torch.float32: torch.empty(2)},
+        ]
+        hook.prefetch_layer(slot=0, non_blocking=False)
+
+        assert torch.equal(next_block.weight.flatten(), torch.tensor([0.0, 1.0]))
+
+    def test_rank_local_mmap_rejects_dtype_changing_transform(self, patched_offload_runtime):
+        """Sources are bucketed and staged by dtype, so a dtype change stays invalid."""
+        current_block = nn.Module()
+        next_block = nn.Module()
+        next_block.weight = nn.Parameter(torch.arange(4, dtype=torch.float32))
+
+        hook = DistributedLayerwiseOffloadHook(
+            next_block=next_block,
+            device=torch.device("cpu"),
+            dp_group=None,
+            dp_size=1,
+            rank=0,
+            pin_memory=False,
+            rank_local_mmap=True,
+            tensor_transforms={id(next_block.weight): lambda tensor: tensor.to(torch.float16)},
+        )
+        with pytest.raises(ValueError, match="mmap weight transform changed tensor dtype"):
+            hook.initialize_hook(current_block)
+
     def test_rank_local_mmap_staging_is_bounded_by_largest_block(self, patched_offload_runtime):
         hooks = []
         for size in (4, 9):
