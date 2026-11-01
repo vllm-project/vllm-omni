@@ -414,9 +414,7 @@ class StagePool:
         :meth:`select_replica_id`.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(
-                request_id, affinity_request_id=affinity_request_id, session_id=session_id
-            )
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
 
         # 0. Sticky by session: its history lives on exactly one replica.
         if session_id is not None:
@@ -482,9 +480,7 @@ class StagePool:
         submit-time router wait without blocking the caller.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(
-                request_id, affinity_request_id=affinity_request_id, session_id=session_id
-            )
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
 
         if session_id is not None:
             holder = self.session_replica_id(session_id)
@@ -1389,9 +1385,7 @@ class StagePool:
         """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
         if self.is_distributed:
             return await self.pick(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
-        return self.select_replica_id(
-            request_id, affinity_request_id=affinity_request_id, session_id=session_id
-        )
+        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id, session_id=session_id)
 
     # ---- Stage-local polling ----
 
