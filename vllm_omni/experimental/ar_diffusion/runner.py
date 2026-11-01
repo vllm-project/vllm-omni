@@ -231,6 +231,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             available_bytes=avail,
             layer_offset=layer_offset,
             blocks_per_rank=blocks_per_rank,
+            # Sessions keep their retained window resident while the next request
+            # runs, so that quota is reserved on top of the live one.
+            session_retention_chunks=self._noisy_sessions.capacity * spec.max_history_chunks,
         )
         logger.info(
             "AR-Diffusion noisy KV: capacity=%d reserved_bytes=%d layers=%d H=%d G=%d R=%d S=%d K=%d",

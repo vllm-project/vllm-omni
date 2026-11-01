@@ -212,19 +212,28 @@ def _cache() -> NoisyKVCache:
     )
 
 
-def _run_request(state: NoisyKVState, session: NoisyKVSession, req: str, chunk_start: int) -> _SeqRecorder:
+def _run_request(
+    state: NoisyKVState,
+    session: NoisyKVSession,
+    req: str,
+    chunk_start: int,
+    *,
+    ordering: Ordering = Ordering.SELF_FORCING,
+    num_denoise_steps: int = 1,
+    step_replicas: int = 1,
+) -> _SeqRecorder:
     plan = build_cell_plan(
         CellSchedule(
             chunks=2,
-            num_denoise_steps=1,
-            step_replicas=1,
+            num_denoise_steps=num_denoise_steps,
+            step_replicas=step_replicas,
             layer_groups=1,
-            ordering=Ordering.SELF_FORCING,
+            ordering=ordering,
             kv_history_chunks=1,
         )
     )
     ctx = ARDiffusionCellContext(
-        spec=CellRunSpec(topology=CellTopology(step_replicas=1, layer_groups=1), rank=0),
+        spec=CellRunSpec(topology=CellTopology(step_replicas=step_replicas, layer_groups=1), rank=0),
         kv=state,
         chunk_start=chunk_start,
         session=session,
@@ -266,3 +275,103 @@ def test_retained_history_is_released_when_the_cache_is_reset():
     state.reset_all()
 
     assert state.resident_versions == 0
+
+
+def test_session_retention_is_reserved_on_top_of_the_live_window():
+    """The retained window and a full live window are resident at the same time.
+
+    Same-Step keeps up to H recent chunks plus a sink and the current write for
+    the request that is running; a session keeps its own H-chunk window pinned
+    across the request boundary. Sizing the pool for only one of them exhausts
+    it partway through the second request of a session.
+    """
+    history = 3
+    layer_groups = 2
+    step_replicas = 1
+    cache = NoisyKVCache(
+        ARDiffusionNoisyKVSpec(
+            num_layers=1,
+            num_kv_heads=1,
+            head_size=1,
+            block_size=4,
+            max_chunk_tokens=4,
+            max_history_chunks=history,
+        ),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=layer_groups,
+        max_batch_size=1,
+        step_replicas=step_replicas,
+        session_retention_chunks=history,
+    )
+    live_window = max(history + 2 + layer_groups, history + step_replicas)
+
+    assert cache.session_retention_chunks == history
+    assert cache.capacity == live_window + history
+
+    # Without sessions the pool must not pay for retention.
+    plain = _cache()
+    assert plain.session_retention_chunks == 0
+    assert plain.capacity == 4
+
+
+@pytest.mark.parametrize(
+    ("ordering", "num_denoise_steps", "step_replicas"),
+    [
+        (Ordering.SELF_FORCING, 1, 1),
+        pytest.param(
+            Ordering.SAME_STEP,
+            2,
+            2,
+            marks=pytest.mark.xfail(
+                reason="Same-Step reads one version per denoise step; multi-version retention is not implemented"
+            ),
+        ),
+        pytest.param(
+            Ordering.LATEST_KV,
+            2,
+            3,
+            marks=pytest.mark.xfail(
+                reason="Latest-KV keeps one version per replica; cross-rank retention is not implemented"
+            ),
+        ),
+    ],
+)
+def test_every_ordering_retains_the_version_the_next_request_reads(ordering, num_denoise_steps, step_replicas):
+    """Retain the version each ordering actually reads as history.
+
+    Self-Forcing conditions on the previous chunk's clean KV; Latest-KV and
+    Same-Step read the last denoise step's KV instead. Retaining the other
+    index re-keys nothing, and the continuation then runs cold without saying
+    so -- the second request still produces a video, just not a continued one.
+    """
+    cache = _cache()
+    state = NoisyKVState(cache)
+    session = NoisyKVSession(session_id="s1")
+
+    _run_request(
+        state,
+        session,
+        "A",
+        chunk_start=0,
+        ordering=ordering,
+        num_denoise_steps=num_denoise_steps,
+        step_replicas=step_replicas,
+    )
+
+    assert session.retained, "ordering retained nothing"
+
+    second = _run_request(
+        state,
+        session,
+        "B",
+        chunk_start=session.committed_chunks,
+        ordering=ordering,
+        num_denoise_steps=num_denoise_steps,
+        step_replicas=step_replicas,
+    )
+
+    # The first cell of the second request reads one retained chunk plus its
+    # own write, so its KV view is twice a cold cell's. Chunk 1 already sees
+    # two chunks either way, which is why this looks at cell 0 only.
+    assert second.seq_lens[(0, 0, 0)] == 8

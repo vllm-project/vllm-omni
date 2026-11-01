@@ -459,6 +459,7 @@ class NoisyKVCache:
         layer_groups: int,
         max_batch_size: int,
         step_replicas: int = 1,
+        session_retention_chunks: int = 0,
         gpu_memory_fraction: float = 1.0,
         available_bytes: int | None = None,
         layer_offset: int = 0,
@@ -476,7 +477,12 @@ class NoisyKVCache:
         # chunk 0 is deduplicated while inside the recent window. The G/step
         # margins below also cover pipeline overlap and transfers.
         per_req = max(spec.max_history_chunks + 2 + layer_groups, spec.max_history_chunks + step_replicas)
-        desired = self.max_batch_size * per_req
+        # A session keeps its retained window resident while the next request runs,
+        # so those versions coexist with a full live window instead of sharing it.
+        # Reserve that quota on top of the live one: without it a continuation
+        # exhausts the pool partway through the second request.
+        self.session_retention_chunks = max(0, int(session_retention_chunks))
+        desired = self.max_batch_size * per_req + self.session_retention_chunks
         bytes_per_version = (
             2
             * chunk_blocks
@@ -610,8 +616,13 @@ class NoisyKVState:
         blocks: list[int] = []
         for chunk in range(max(0, chunk_start + local_chunk - history_chunks), chunk_start):
             key = session.retained.get((chunk, block))
-            if key is None or not pool.has(key):
+            if key is None:
                 continue
+            if not pool.has(key):
+                # Running on without the history would produce a cold video while
+                # still reporting success, which is the one outcome a caller cannot
+                # notice.
+                raise RuntimeError(f"session {session.session_id} lost retained chunk {chunk}")
             blocks.extend(pool.block_ids(pool.slot_of(key))[:num_chunk_blocks])
         return blocks
 
