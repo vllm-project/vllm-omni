@@ -20,7 +20,7 @@ import re
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -52,6 +52,9 @@ from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import (
 )
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 from vllm_omni.utils.speaker_cache import get_speaker_cache
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 try:
     from transformers import HiggsAudioV2TokenizerModel
@@ -118,6 +121,40 @@ class _PreparedOmniVoiceRequest:
     seed: int | None
     chunks: _OmniVoiceChunks | None = None
     reference_rms: float | None = None
+
+
+def _load_omnivoice_config(model: str) -> tuple[str, OmniVoiceConfig]:
+    """Resolve a local model directory and load its OmniVoice config."""
+    model_path = model
+    if not os.path.isdir(model_path):
+        from vllm_omni.transformers_utils.repo_utils import hf_api
+
+        model_path = hf_api().snapshot_download(model_path)
+    with open(os.path.join(model_path, "config.json")) as f:
+        return model_path, OmniVoiceConfig(**json.load(f))
+
+
+def get_omnivoice_pre_process_func(od_config: OmniDiffusionConfig):
+    """Fill the model's default step count before the request is admitted.
+
+    The step scheduler sizes each request from ``num_inference_steps`` and
+    cannot consult the pipeline, so a caller that leaves it unset (e.g. a bare
+    ``OmniDiffusionSamplingParams()``) would fail admission. The pipeline
+    already falls back to ``config.num_step``; apply the same default here so
+    step and non-step execution behave identically.
+    """
+    default_num_step: int | None = None
+
+    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
+        nonlocal default_num_step
+        sampling = request.sampling_params
+        if sampling.num_inference_steps is None and sampling.timesteps is None and sampling.sigmas is None:
+            if default_num_step is None:
+                default_num_step = int(_load_omnivoice_config(od_config.model)[1].num_step)
+            sampling.num_inference_steps = default_num_step
+        return request
+
+    return pre_process_func
 
 
 def get_omnivoice_post_process_func(od_config: OmniDiffusionConfig):
@@ -260,17 +297,8 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         self._initialize_asr(getattr(od_config, "additional_config", None))
         self._inline_reference_cache: OrderedDict[tuple[object, ...], dict[str, object]] = OrderedDict()
 
-        # Resolve model path (HF hub ID → local cache)
-        if not os.path.isdir(self.model_path):
-            from vllm_omni.transformers_utils.repo_utils import hf_api
-
-            self.model_path = hf_api().snapshot_download(self.model_path)
-
-        # Load OmniVoice config
-        config_path = os.path.join(self.model_path, "config.json")
-        with open(config_path) as f:
-            hf_config = json.load(f)
-        self.config = OmniVoiceConfig(**hf_config)
+        # Resolve model path (HF hub ID → local cache) and load OmniVoice config
+        self.model_path, self.config = _load_omnivoice_config(self.model_path)
 
         # Build generator and decoder
         self.generator = OmniVoiceGenerator(self.config, od_config)
