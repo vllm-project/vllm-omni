@@ -29,21 +29,20 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
     ("chunk_period_s", "now", "last_submit", "current_deadline", "delay_s", "next_silence_deadline"),
     [
         # First continuation anchors to the last real submission: unit N was
-        # submitted at t=1.0, audio N produced at 1.4 -> 0.6 s of sleep left.
-        (1.0, 1.4, 1.0, None, 0.6, 3.0),
+        # submitted at t=1.0; the first deadline allows 5 ms for input arrival.
+        (1.0, 1.4, 1.0, None, 0.605, 3.005),
         # Only the remaining budget is slept (audio produced at 1.7).
-        (1.0, 1.7, 1.0, None, 0.3, 3.0),
+        (1.0, 1.7, 1.0, None, 0.305, 3.005),
         # Overdue deadline: no sleep; the chain still advances by the period.
-        (1.0, 2.5, 1.0, None, 0.0, 3.0),
+        (1.0, 2.5, 1.0, None, 0.0, 3.005),
         # No submission yet (None): the first continuation anchors to now.
         (1.0, 0.4, None, None, 1.0, 2.4),
         # Deadlines advance from the current deadline, not from now, so pipeline
         # processing time does not accumulate as timer drift.
         (1.0, 4.2, 3.0, 5.0, 0.8, 6.0),
-        # Two consecutive units that overrun their deadline by 0.2 s keep the
-        # 1 s cadence: no sleep, and the chain advances one period each.
-        (1.0, 2.2, 1.0, None, 0.0, 3.0),
-        (1.0, 3.2, 2.0, 3.0, 0.0, 4.0),
+        # Consecutive late units keep a 1 s cadence without repeatedly adding the grace.
+        (1.0, 2.2, 1.0, None, 0.0, 3.005),
+        (1.0, 3.2, 2.2, 3.005, 0.0, 4.005),
         # A short overshoot (within one period of the current deadline) still
         # chases the stale deadline: immediate submit, chain advances.
         (1.0, 2.5, 1.0, 2.0, 0.0, 3.0),
@@ -54,6 +53,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         (1.0, 5.0, 1.0, None, 0.0, 6.0),
         # Zero chunk period (guarded upstream): total, no sleep.
         (0.0, 10.0, None, None, 0.0, 10.0),
+        # The initial grace does not accumulate over consecutive 80 ms frames.
+        (0.08, 1.08, 1.0, None, 0.005, 1.165),
+        (0.08, 1.17, 1.085, 1.165, 0.0, 1.245),
     ],
 )
 def test_compute_silence_continuation_deadline(
