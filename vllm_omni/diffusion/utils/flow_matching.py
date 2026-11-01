@@ -3,8 +3,20 @@
 
 import math
 
+import numpy as np
 import torch
 from torch import nn
+
+
+def safe_linalg_solve(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    try:
+        return torch.linalg.solve(matrix, rhs)
+    except RuntimeError as exc:
+        if matrix.device.type != "cpu" or "requires compiling PyTorch with LAPACK" not in str(exc):
+            raise
+        # Some ROCm wheels still fail here at runtime even when the LAPACK probe reports support.
+        solved = np.linalg.solve(matrix.detach().cpu().numpy(), rhs.detach().cpu().numpy())
+        return torch.from_numpy(solved).to(device=matrix.device, dtype=matrix.dtype)
 
 
 def swish(x: torch.Tensor) -> torch.Tensor:

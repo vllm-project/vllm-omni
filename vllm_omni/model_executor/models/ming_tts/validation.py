@@ -172,6 +172,9 @@ def validate_ming_tts_config(cfg: Any) -> None:
 
     if cfg.latent_chunk_size <= 0:
         raise ValueError(f"latent_chunk_size must be > 0, got {cfg.latent_chunk_size}.")
+    initial_latent_chunk_size = getattr(cfg, "initial_latent_chunk_size", 0)
+    if initial_latent_chunk_size < 0:
+        raise ValueError(f"initial_latent_chunk_size must be >= 0, got {initial_latent_chunk_size}.")
     if cfg.latent_left_context < 0:
         raise ValueError(f"latent_left_context must be >= 0, got {cfg.latent_left_context}.")
     if cfg.max_decode_steps <= 0:

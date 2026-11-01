@@ -86,12 +86,51 @@ class YourModelForCausalLM(nn.Module):
 - Handle both `"audio"` (incremental) and `"result"` (final combined) event
   types from upstream models.
 
-## Stage config
+## Pipeline and deploy config
 
-Single stage with `worker_type: ar`, `engine_output_type: audio`,
-`final_output: true`, `is_comprehension: true`, and `async_chunk: false` at
-the top level. Omitting any of these causes silent misclassification in the
-serving layer.
+Define the fixed single-stage topology in `pipeline.py`:
+
+```python
+from vllm_omni.config.stage_config import (
+    PipelineConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+)
+
+YOUR_TTS_PIPELINE = PipelineConfig(
+    model_type="your_model_name",
+    default_deploy_config_name="your_model_name.yaml",
+    model_arch="YourModelForCausalLM",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="your_model_name",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            engine_output_type="audio",
+            final_output=True,
+            final_output_type="audio",
+        ),
+    ),
+)
+```
+
+Register it in `vllm_omni/config/pipeline_registry.py`. Keep placement and
+runtime sizing in `vllm_omni/deploy/your_model_name.yaml`:
+
+```yaml
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.8
+```
+
+Do not move `execution_type`, output ownership, tokenizer ownership, or model
+architecture into the deploy YAML; those are pipeline topology.
 
 ## Lint discipline
 
@@ -101,8 +140,5 @@ pre-commit.
 
 ## Reference implementation
 
-Look for any single-stage AR model under
-`vllm_omni/model_executor/models/` — e.g. `moss_tts_nano/` when its
-integration lands. If none is in tree yet, follow the skeleton above and
-cross-check against the `is_comprehension: true` / `async_chunk: false`
-dispatch in `vllm_omni/entrypoints/openai/serving_speech.py`.
+Use `vllm_omni/model_executor/models/moss_tts_nano/pipeline.py` and
+`vllm_omni/deploy/moss_tts_nano.yaml` as the in-tree reference.

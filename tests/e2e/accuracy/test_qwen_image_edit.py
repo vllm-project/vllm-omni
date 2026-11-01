@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import gc
@@ -12,11 +15,12 @@ from PIL import Image
 
 from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
 from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
-from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniServer
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.diffusion]
 
 
 SINGLE_MODEL = "Qwen/Qwen-Image-Edit"
@@ -46,10 +50,9 @@ EDIT_2511_PROMPT = (
     "（帽子紧贴头顶，未贴合部分可调整帽子摆放角度达到完全贴合）， 头部与身体过渡必须自然，无拼接痕迹，"
     "无额外元素出现在头部四周，纯白背景，不要出现绿色圆圈"
 )
-EDIT_2511_ASSET_DIR = Path(__file__).resolve().parent / "assets"
 EDIT_2511_IMAGE_PATHS = [
-    EDIT_2511_ASSET_DIR / "qwen_image_edit_2511_test1.png",
-    EDIT_2511_ASSET_DIR / "qwen_image_edit_2511_test2.png",
+    get_asset_path("qwen_image_edit/qwen_image_edit_2511_test1.png"),
+    get_asset_path("qwen_image_edit/qwen_image_edit_2511_test2.png"),
 ]
 
 PROMPT_SINGLE_IMAGE = "The input is a 2D cartoon bear mascot. Restyle it into a painterly oil artwork with warm colors while preserving the main structure."
@@ -109,7 +112,7 @@ def _run_diffusers_image_edit(
     input_images: list[Image.Image],
     output_path: Path,
 ) -> Image.Image:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: QwenImageEditPipeline | QwenImageEditPlusPipeline | None = None
     try:
         images = input_images[0] if len(input_images) == 1 else input_images
@@ -140,7 +143,7 @@ def _run_diffusers_image_edit(
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 def _load_edit_2511_input_images() -> list[Image.Image]:
@@ -189,7 +192,7 @@ def _run_diffusers_image_edit_2511(
     input_images: list[Image.Image],
     output_path: Path,
 ) -> Image.Image:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: QwenImageEditPlusPipeline | None = None
     try:
         pipe = QwenImageEditPlusPipeline.from_pretrained(
@@ -222,7 +225,7 @@ def _run_diffusers_image_edit_2511(
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 def _vllm_omni_output_single_image(
@@ -253,6 +256,7 @@ def _diffusers_output_single_image(accuracy_artifact_root: Path, qwen_bear_image
     )
 
 
+@pytest.mark.slow
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_single_matches_diffusers(
@@ -278,6 +282,7 @@ def test_qwen_image_edit_single_matches_diffusers(
     )
 
 
+@pytest.mark.slow
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_2511_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:

@@ -6,6 +6,8 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.stage_utils import _map_device_list, resolve_stage_physical_devices, set_stage_devices
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def _make_dummy_torch(call_log):
     class _Props:
@@ -212,6 +214,20 @@ def test_map_device_list_multi_replica_offset_cvd():
 def test_resolve_stage_physical_devices_uses_visible_baseline(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
     assert resolve_stage_physical_devices(1, "1", visible_baseline="3,4,5") == "4"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_resolve_stage_physical_devices_captured_unset_ignores_live_env(monkeypatch: pytest.MonkeyPatch):
+    """Parallel init captures an unset CUDA_VISIBLE_DEVICES as None.
+
+    A sibling thread may then narrow the live env for spawn. The captured
+    None must not fall back to that live value, or logical device 0 would
+    map onto the other stage's GPU.
+    """
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
+    assert resolve_stage_physical_devices(0, "0", visible_baseline=None) == "0"
+    assert resolve_stage_physical_devices(1, "1", visible_baseline=None) == "1"
 
 
 @pytest.mark.core_model

@@ -53,7 +53,7 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
             msprof_tx=False,
-            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             l2_cache=False,
             op_attr=False,
             data_simplification=True,
@@ -71,6 +71,9 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
             activities=npu_activities,
             with_stack=False,
             profile_memory=profiler_config.torch_profiler_with_memory,
+            # Forward the shape-recording flag; without it the NPU profiler
+            # silently ignores ``torch_profiler_record_shapes=True``.
+            record_shapes=profiler_config.torch_profiler_record_shapes,
             # NOTE: torch_npu.profiler.with_modules is equivalent to
             # torch.profiler.with_stack. The with_stack option in
             # torch_npu.profiler introduces significant time overhead.

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Qwen-Image online serving startup script
+# Shared text-to-image online serving startup script
 
 MODEL="${MODEL:-Qwen/Qwen-Image}"
 PORT="${PORT:-8091}"
 
-echo "Starting Qwen-Image server..."
+echo "Starting text-to-image server..."
 echo "Model: $MODEL"
 echo "Port: $PORT"
 

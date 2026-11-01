@@ -12,6 +12,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.ming_tts"
 
 MING_TTS_PIPELINE = PipelineConfig(
     model_type="ming_tts",
+    default_deploy_config_name="ming_tts.yaml",
     model_arch="MingTTSForConditionalGeneration",
     hf_architectures=("MingTTSForConditionalGeneration", "BailingMMNativeForConditionalGeneration"),
     # The dense (0.5B) and MoE (16.8B) share architectures=["BailingMMNativeForConditionalGeneration"]
@@ -63,6 +64,7 @@ MING_TTS_PIPELINE = PipelineConfig(
 # Keep this for auto-detection of deploy config yaml.
 MING_TTS_MOE_PIPELINE = PipelineConfig(
     model_type="ming_tts_moe",
+    default_deploy_config_name="ming_tts_moe.yaml",
     model_arch="MingTTSForConditionalGeneration",
     hf_architectures=("MingTTSForConditionalGeneration", "BailingMMNativeForConditionalGeneration"),
     # Disambiguate from the dense-0.5B ming_tts pipeline

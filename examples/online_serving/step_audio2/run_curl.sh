@@ -110,7 +110,7 @@ output=$(curl -sS -X POST "${API_BASE}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d @- <<EOF
 {
-  "model": "stepfun-ai/Step-Audio2-mini",
+  "model": "stepfun-ai/Step-Audio-2-mini",
   "sampling_params_list": $sampling_params_list,
   "messages": [
     {

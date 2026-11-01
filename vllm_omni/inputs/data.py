@@ -1,35 +1,36 @@
-import copy
-import pprint
-from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias, TypedDict
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from vllm.inputs import PromptType
+import copy
+import math
+import pprint
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
+from typing import Any, TypeAlias, TypeVar, cast
+
+import msgspec
+import torch
+from typing_extensions import NotRequired, TypedDict
+from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
+from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.lora.request import LoRARequest
 
-try:
-    from typing import NotRequired
-except ImportError:
-    # Python < 3.11: use typing_extensions
-    from typing_extensions import NotRequired
-
-
-import torch
-from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
-from vllm.inputs.engine import TokensInput
+DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
 
 
 class OmniTextPrompt(TextPrompt):
-    """Text prompt with optional embeddings and additional information.
+    """Text prompt with optional embeddings and stage payloads.
 
     Extends TextPrompt to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
 
     Attributes:
         prompt_embeds: Optional tensor containing prompt embeddings
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists) to pass along with the prompt
+        additional_information: Legacy optional dictionary containing
+            additional information to pass along with the prompt.
+        model_intermediate_buffer: Optional runner-owned stage payload.
     """
 
     negative_prompt: NotRequired[str]
@@ -39,18 +40,38 @@ class OmniTextPrompt(TextPrompt):
     prompt_embeds: NotRequired[torch.Tensor]
     negative_prompt_embeds: NotRequired[torch.Tensor]
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
+
+
+class OmniInteractionEvent(OmniTextPrompt, total=False):
+    """Prompt-event payload for mid-stream interactions."""
+
+    pass
+
+
+class OmniInteractionPrompt(TypedDict):
+    """Normalized mid-stream interaction payload passed to ``submit_interaction``.
+
+    WebSocket clients payload may omit ``event_id``; the API layer assigns a fallback ID in this case.
+    """
+
+    event_id: str
+    event: OmniInteractionEvent
+    transition_chunks: NotRequired[int]
+    received_at: NotRequired[float]  # Internal engine-clock ingress stamp; never trusted from clients.
 
 
 class OmniTokensPrompt(TokensPrompt):
-    """Tokens prompt with optional embeddings and additional information.
+    """Tokens prompt with optional embeddings and stage payloads.
 
     Extends TokensPrompt to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
 
     Attributes:
         prompt_embeds: Optional tensor containing prompt embeddings
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists) to pass along with the prompt
+        additional_information: Legacy optional dictionary containing
+            additional information to pass along with the prompt.
+        model_intermediate_buffer: Optional runner-owned stage payload.
     """
 
     negative_prompt: NotRequired[str]
@@ -61,10 +82,11 @@ class OmniTokensPrompt(TokensPrompt):
     # New: optional additional information dictionary
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniTokenInputs(TokensInput):
-    """Token inputs with optional embeddings and additional information.
+    """Token inputs with optional embeddings and stage payloads.
 
     Extends TokensInput to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
@@ -72,8 +94,9 @@ class OmniTokenInputs(TokensInput):
     Attributes:
         prompt_embeds: Optional tensor containing prompt embeddings
             aligned with token IDs
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists) to pass along with the inputs
+        additional_information: Legacy optional dictionary containing
+            additional information to pass along with the inputs.
+        model_intermediate_buffer: Optional runner-owned stage payload.
     """
 
     # New: optional prompt embeddings aligned with token ids
@@ -84,18 +107,20 @@ class OmniTokenInputs(TokensInput):
     # New: optional additional information dictionary
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniEmbedsPrompt(EmbedsPrompt):
-    """Embeddings prompt with optional additional information.
+    """Embeddings prompt with optional stage payloads.
 
     Extends EmbedsPrompt to support additional information payloads
     for direct transfer between pipeline stages.
 
     Attributes:
         prompt_embeds: Optional tensor containing prompt embeddings
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists) to pass along with the prompt
+        additional_information: Legacy optional dictionary containing
+            additional information to pass along with the prompt.
+        model_intermediate_buffer: Optional runner-owned stage payload.
     """
 
     # New: optional prompt embeddings aligned with token ids
@@ -105,6 +130,7 @@ class OmniEmbedsPrompt(EmbedsPrompt):
     # New: optional additional information dictionary
     # Values may be torch.Tensor or list
     additional_information: NotRequired[dict[str, Any]]
+    model_intermediate_buffer: NotRequired[dict[str, Any]]
 
 
 class OmniCustomPrompt(TypedDict, total=False):
@@ -112,6 +138,12 @@ class OmniCustomPrompt(TypedDict, total=False):
 
     Allows users to pass pre-tokenized prompt IDs, attention masks, and extra
     arguments directly, bypassing the tokenization stage in the pipeline.
+
+    ``prompt_ids`` / ``negative_prompt_ids`` are honored only by pipelines that
+    declare ``supports_pre_tokenized_prompt_ids = True``. The diffusion engine
+    rejects a request that sets them for any other in-tree pipeline (HTTP 400)
+    instead of silently generating from an empty or text-only condition. A
+    user-supplied custom pipeline is not checked unless it declares the flag.
 
     Attributes:
         prompt_ids: Pre-tokenized prompt token IDs (single or batched)
@@ -143,6 +175,7 @@ def token_inputs_omni(
     cache_salt: str | None = None,
     prompt_embeds: torch.Tensor | None = None,
     additional_information: dict[str, Any] | None = None,
+    model_intermediate_buffer: dict[str, Any] | None = None,
 ) -> OmniTokenInputs:
     """Construct token inputs with optional embeddings and metadata.
 
@@ -154,8 +187,9 @@ def token_inputs_omni(
         prompt: Optional prompt string
         cache_salt: Optional cache salt for prefix caching
         prompt_embeds: Optional tensor containing prompt embeddings
-        additional_information: Optional dictionary containing additional
-            information (tensors or lists)
+        additional_information: Legacy optional dictionary containing
+            additional information (tensors or lists).
+        model_intermediate_buffer: Optional runner-owned stage payload.
 
     Returns:
         OmniTokenInputs instance with the provided data
@@ -170,6 +204,8 @@ def token_inputs_omni(
         inputs["prompt_embeds"] = prompt_embeds
     if additional_information is not None:
         inputs["additional_information"] = additional_information
+    if model_intermediate_buffer is not None:
+        inputs["model_intermediate_buffer"] = model_intermediate_buffer
 
     return inputs
 
@@ -184,11 +220,18 @@ class OmniDiffusionSamplingParams:
     to manage numerous individual parameters.
     """
 
+    # Whether final outputs should be watermarked (when configured).
+    watermarking: bool | None = None
+
     # Additional text-related parameters
     max_sequence_length: int | None = None
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
     output_type: str | None = None
+
+    # Request-scoped quality intent. ``None`` delegates the default behavior
+    # to the model; explicit levels select a model-owned quality policy.
+    quality: str | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -227,7 +270,7 @@ class OmniDiffusionSamplingParams:
     # Original dimensions (before VAE scaling)
     height: int | None = None
     width: int | None = None
-    fps: int | None = None  # Integer FPS kept for request compatibility and output encoding.
+    fps: float | None = None  # Request/output-encoding FPS; fractional rates are supported.
     frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
     height_not_provided: bool = False
     width_not_provided: bool = False
@@ -245,9 +288,10 @@ class OmniDiffusionSamplingParams:
     # Scheduler parameters – ``None`` means "not explicitly set by the caller";
     # each pipeline's ``forward()`` decides its own model-specific default.
     num_inference_steps: int | None = None
-    guidance_scale: float = 0.0
+    guidance_scale: float | None = None
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
+    guidance_scale_2_provided: bool = False
     guidance_rescale: float = 0.0
     strength: float | None = None  # I2I: Z-Image specific now, uses to control denoising start timestep
     decode_timestep: float | list[float] | None = None
@@ -318,6 +362,45 @@ class OmniDiffusionSamplingParams:
     # results
     output: torch.Tensor | None = None
 
+    # Internal control-plane event used by asynchronous APIs. When enabled,
+    # the diffusion engine emits a non-terminal output when the scheduler
+    # first admits this request for execution.
+    emit_request_lifecycle: bool = False
+
+    # Opt-in playback feedback for a single interactive video stream. The
+    # engine starts another chunk only while generated media is below this
+    # many seconds ahead of the client's reported playback position.
+    streaming_buffer_seconds: float | None = None
+    streaming_max_output_bytes: int = 64 * 1024 * 1024
+    streaming_idle_timeout_s: float = 30.0
+    # AsyncOmni releases each output only after its consumer resumes iteration.
+    streaming_output_ack: bool = False
+
+    def __post_init__(self) -> None:
+        buffer = self.streaming_buffer_seconds
+        if buffer is not None and (
+            isinstance(buffer, bool)
+            or not isinstance(buffer, (int, float))
+            or not math.isfinite(buffer)
+            or not 0 < buffer <= 10
+        ):
+            raise ValueError("streaming_buffer_seconds must be finite and in (0, 10]")
+        if (
+            isinstance(self.streaming_max_output_bytes, bool)
+            or not isinstance(self.streaming_max_output_bytes, int)
+            or not 0 < self.streaming_max_output_bytes <= 2**63 - 1
+        ):
+            raise ValueError("streaming_max_output_bytes must be a positive integer")
+        if (
+            isinstance(self.streaming_idle_timeout_s, bool)
+            or not isinstance(self.streaming_idle_timeout_s, (int, float))
+            or not math.isfinite(self.streaming_idle_timeout_s)
+            or self.streaming_idle_timeout_s <= 0
+        ):
+            raise ValueError("streaming_idle_timeout_s must be finite and positive")
+        if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
+            raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
+
     @property
     def batch_size(self):
         # This class is changed to only represent a single prompt request
@@ -353,5 +436,55 @@ class OmniDiffusionSamplingParams:
     def clone(self) -> "OmniDiffusionSamplingParams":
         return copy.deepcopy(self)
 
+    @classmethod
+    def from_params(cls, params: Any) -> "OmniDiffusionSamplingParams":
+        """Normalize caller params for diffusion stages.
+
+        Existing Omni params are returned unchanged. Plain vLLM SamplingParams
+        copy seed and matching extra_args fields; remaining extra_args stay nested.
+        Unsupported types raise TypeError.
+        """
+        if isinstance(params, cls):
+            return params
+        if isinstance(params, SamplingParams):
+            extra = dict(getattr(params, "extra_args", None) or {})
+            known = set(cls.__dataclass_fields__)
+            mapped = {k: extra.pop(k) for k in list(extra) if k in known}
+            if extra:
+                mapped["extra_args"] = extra
+            seed = getattr(params, "seed", None)
+            if seed is not None:
+                mapped.setdefault("seed", seed)
+            mapped["watermarking"] = params.watermarking
+            return cls(**mapped)
+        raise TypeError(
+            "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
+            f"got {type(params).__name__!r}."
+        )
+
+    @classmethod
+    def from_dict(cls, params: dict[str, Any]) -> "OmniDiffusionSamplingParams":
+        """Reconstruct params from a dict decoded after IPC, handling LoRA."""
+        lora_request = params.get("lora_request")
+        if lora_request is not None and not isinstance(lora_request, LoRARequest):
+            params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
+        return cls(**params)
+
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams
+
+StageParamsT = TypeVar("StageParamsT")
+
+
+def disable_watermarking(params_list: Sequence[StageParamsT]) -> list[StageParamsT]:
+    """Copy each stage's sampling params with watermarking disabled."""
+    disabled_params_list: list[StageParamsT] = []
+    for params in params_list:
+        if isinstance(params, OmniSamplingParams):
+            disabled = copy.copy(params)
+            disabled.watermarking = False
+            # copy.copy preserves the concrete type, which mypy loses through the isinstance narrowing
+            disabled_params_list.append(cast(StageParamsT, disabled))
+        else:
+            disabled_params_list.append(params)
+    return disabled_params_list

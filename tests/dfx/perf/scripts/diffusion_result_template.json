@@ -21,10 +21,12 @@
       "num-input-images": 0,
       "enable-negative-prompt": false,
       "baseline": {
-        "throughput_qps": 0,
-        "latency_mean": 0,
-        "peak_memory_mb_max": 0,
-        "peak_memory_mb_mean": 0
+        "H100": {
+          "throughput_qps": 0,
+          "latency_mean": 0,
+          "peak_memory_mb_max": 0,
+          "peak_memory_mb_mean": 0
+        }
       }
     },
     "result": {

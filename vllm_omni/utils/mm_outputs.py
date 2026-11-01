@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Utilities for handling multimodal outputs / building multimodal output
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 import torch
 from vllm.logger import init_logger
@@ -17,12 +20,26 @@ _CLIENT_MM_ROOT_KEYS: frozenset[str] = frozenset(
         "model_outputs",
         "sr",
         "audio",
+        # The codec frames a code2wav stage decoded, beside the audio they cover.
+        "codec_frames",
         "image",
         "images",
         "video",
         "videos",
         "trajectory_latents",
         "latents",
+    }
+)
+
+_CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
+    {
+        "audio_text_total_chars",
+        "duplex_epoch",
+        "duplex_turn_id",
+        "llm_output_text_utf8",
+        "segment_end",
+        "tts_is_last_chunk",
+        "turn_end",
     }
 )
 
@@ -39,13 +56,20 @@ def partition_flat_payload(
         root = key.split(".", 1)[0]
         if root in _CLIENT_MM_ROOT_KEYS:
             client_mm[key] = value
+        elif root == "meta" and "." in key and key.split(".", 1)[1] in _CLIENT_MM_META_KEYS:
+            # Small final-output metadata needed by serving (for example
+            # transcript text attached to audio) must ride with client MM
+            # output. Keep it in inter-stage too so downstream stages that read
+            # metadata from the full payload are not starved.
+            inter_stage[key] = value
+            client_mm[key] = value
         else:
             inter_stage[key] = value
     return inter_stage, client_mm
 
 
 def partition_payload_list(
-    payloads: list[dict[str, object]],
+    payloads: Sequence[Mapping[str, object]],
 ) -> tuple[list[dict[str, object] | None] | None, list[dict[str, object] | None] | None]:
     inter_stage_list: list[dict[str, object] | None] = []
     client_mm_list: list[dict[str, object] | None] = []
@@ -87,6 +111,60 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     return mm_cpu
 
 
+def snapshot_mm_payload(multimodal_outputs: dict) -> dict[str, object]:
+    """Snapshot a multimodal payload without moving it off its device.
+
+    Request-end full-payload producers retain these tensors across decode
+    steps. CUDA graph outputs and runner input buffers may be reused on the
+    next step, so retaining views is not sufficient: CUDA tensors must be
+    copied first. Compatible per-request tensor lists are packed with one
+    ``torch.cat`` and restored as views, avoiding one tiny copy kernel per
+    active request.
+    """
+    if not multimodal_outputs:
+        return {}
+    return {key: _snapshot_payload_value(value) for key, value in multimodal_outputs.items()}
+
+
+def _snapshot_payload_value(value):
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        return tensor.clone() if tensor.device.type != "cpu" else tensor
+    if isinstance(value, dict):
+        return {key: _snapshot_payload_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        if not value:
+            return value
+        first = value[0]
+        if (
+            len(value) > 1
+            and isinstance(first, torch.Tensor)
+            and first.ndim > 0
+            and first.layout == torch.strided
+            and all(
+                isinstance(item, torch.Tensor)
+                and item.ndim == first.ndim
+                and item.layout == first.layout
+                and item.device == first.device
+                and item.dtype == first.dtype
+                and tuple(item.shape[1:]) == tuple(first.shape[1:])
+                for item in value
+            )
+        ):
+            packed = torch.cat([item.detach() for item in value], dim=0)
+            output = []
+            offset = 0
+            for item in value:
+                length = item.shape[0]
+                output.append(packed.narrow(0, offset, length))
+                offset += length
+            return output
+        return [_snapshot_payload_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_snapshot_payload_value(item) for item in value)
+    return value
+
+
 def _to_cpu(value):
     """Recursively detach + move tensors to CPU; preserve dict/list nesting."""
     if isinstance(value, torch.Tensor):
@@ -105,8 +183,46 @@ def _to_cpu(value):
     return value
 
 
+def split_mapping_outputs(
+    outputs: Mapping[str, object],
+    num_reqs: int,
+    copy_tensor: Callable[[torch.Tensor], torch.Tensor],
+) -> list[dict[str, object]]:
+    """Split a generation stage's batched output mapping into one payload per request."""
+    batch_payloads: list[dict[str, object]] = [{} for _ in range(num_reqs)]
+    for key, out in outputs.items():
+        if isinstance(out, list):
+            if len(out) != num_reqs:
+                raise ValueError(
+                    f"Multimodal output list for key '{key}' has length {len(out)} "
+                    f"but expected {num_reqs} (one entry per request)."
+                )
+            for req_payload, req_item in zip(batch_payloads, out, strict=True):
+                req_payload[key] = copy_tensor(req_item)
+        elif isinstance(out, torch.Tensor):
+            # TODO (Alex): For now, we copy all tensors to all requests, because previously
+            # we used this to pass primitives by wrapping them as 0-d tensors. This is probably
+            # not optimal and should be revisited, but we need to ensure it doesn't cause issues
+            # for cases like max_num_seqs > 1 on audio producing models
+            for req_payload in batch_payloads:
+                req_payload[key] = copy_tensor(out)
+        elif isinstance(out, (int, float, bool)):
+            # primitives are constant across all requests in the batch, e.g., sampling rate
+            for req_payload in batch_payloads:
+                req_payload[key] = out
+        else:
+            logger.warning("Unsupported multimodal output type for key '%s': %s", key, type(out))
+    return batch_payloads
+
+
 def to_payload_element(
-    element: object, idx: int, start: int, end: int, pass_lists_through: bool = False, seq_len: int | None = None
+    element: object,
+    idx: int,
+    start: int,
+    end: int,
+    pass_lists_through: bool = False,
+    seq_len: int | None = None,
+    scheduled_seq_len: int | None = None,
 ):
     """Build an mm payload element corresponding to one request index
     from an element containing 0 or more CPU tensors.
@@ -120,21 +236,43 @@ def to_payload_element(
             passthrough data; this should be False in normal cases, but True
             if we need to avoid splitting nonempty lists prior to calling
             postprocess, which is the case for prefix cache.
-        seq_len: Optional sequence length (i.e., dim 0 of hidden states).
-            When set, a tensor whose first dimension equals seq_len is
-            sliced per request. The prefix cache passthrough also passes
-            the total scheduled token count here so 1D (seq_len,) metadata
-            that is intentionally not cached is still split per request.
+        seq_len: Optional hidden-aligned batch length (``hidden_states.shape[0]``).
+            When a tensor's first dimension equals this value, it is sliced
+            per request using ``start:end``.
+        scheduled_seq_len: Optional scheduler-aligned batch length
+            (``scheduler_output.total_num_scheduled_tokens``). Some full-payload
+            mm tensors (e.g. batched ``codes.audio`` with tail-only hidden states)
+            are laid out by scheduled tokens instead of the hidden tail shape.
+            When omitted, ``seq_len`` is reused for backward compatibility.
     """
-    # Cached per-token tensors are merged elsewhere; here a first dim
-    # equal to seq_len means a per-request slice is required.
-    if seq_len is not None and isinstance(element, torch.Tensor) and element.shape[0] == seq_len:
+    if scheduled_seq_len is None:
+        scheduled_seq_len = seq_len
+
+    # Cached per-token tensors are merged elsewhere; here a first dim equal to
+    # either the hidden-aligned or scheduler-aligned batch length means a
+    # per-request slice is required.
+    if (
+        isinstance(element, torch.Tensor)
+        and element.ndim > 0
+        and (
+            (seq_len is not None and element.shape[0] == seq_len)
+            or (scheduled_seq_len is not None and element.shape[0] == scheduled_seq_len)
+        )
+    ):
         return element[start:end].contiguous()
     # Every other case is shared between prefix cache (passthrough data)
     # and running a model without prefix caching.
     elif isinstance(element, dict):
         return {
-            sk: to_payload_element(sv, idx, start, end, pass_lists_through=pass_lists_through, seq_len=seq_len)
+            sk: to_payload_element(
+                sv,
+                idx,
+                start,
+                end,
+                pass_lists_through=pass_lists_through,
+                seq_len=seq_len,
+                scheduled_seq_len=scheduled_seq_len,
+            )
             for sk, sv in element.items()
         }
     elif isinstance(element, list):

@@ -20,21 +20,18 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-class BaseState:
-    """Base class for hook state containers."""
-
-    def reset(self) -> None:  # pragma: no cover - default is no-op
-        pass
-
-
 class StateManager:
-    """Manage per-context hook state instances."""
+    """Manage per-context hook state instances.
 
-    def __init__(self, state_cls: Callable[[], BaseState], init_args: tuple = (), init_kwargs: dict | None = None):
+    State classes (e.g. TeaCacheState, MagCacheState) are plain classes;
+    they only need to be constructible with the given init args.
+    """
+
+    def __init__(self, state_cls: Callable[..., Any], init_args: tuple = (), init_kwargs: dict | None = None):
         self._state_cls = state_cls
         self._init_args = init_args
         self._init_kwargs = init_kwargs or {}
-        self._states: dict[str, BaseState] = {}
+        self._states: dict[str, Any] = {}
         self._context: str = "default"
 
     @property
@@ -45,7 +42,7 @@ class StateManager:
     def set_context(self, name: str) -> None:
         self._context = name or "default"
 
-    def get_state(self) -> BaseState:
+    def get_state(self) -> Any:
         if self._context not in self._states:
             self._states[self._context] = self._state_cls(*self._init_args, **self._init_kwargs)
         return self._states[self._context]
@@ -332,17 +329,3 @@ class HookRegistry:
         hook = self._hooks.get(name)
         if hook is not None:
             hook.reset_state(self.module)
-
-    def reset(self) -> None:
-        """Reset all hooks and clear the registry.
-
-        This removes all hooks from the registry and resets each hook's state.
-        Also restores module.forward to its original implementation.
-        """
-        for name, hook in list(self._hooks.items()):
-            hook.reset_state(self.module)
-        self._hooks.clear()
-
-        if hasattr(self.module, "_omni_original_forward"):
-            self.module.forward = self.module._omni_original_forward  # type: ignore[attr-defined]
-            delattr(self.module, "_omni_original_forward")

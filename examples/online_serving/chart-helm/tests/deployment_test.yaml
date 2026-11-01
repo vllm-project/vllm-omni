@@ -78,6 +78,26 @@ tests:
           path: spec.template.spec.containers[0].command
           content: "--enable-layerwise-offload"
 
+  - it: should include deploy config in command
+    set:
+      omniArgs:
+        deployConfigPath: "/configs/deploy.yaml"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command[8]
+          value: "--deploy-config"
+      - equal:
+          path: spec.template.spec.containers[0].command[9]
+          value: "/configs/deploy.yaml"
+
+  - it: should reject removed stage config value
+    set:
+      omniArgs:
+        stageConfigsPath: "/configs/legacy.yaml"
+    asserts:
+      - failedTemplate:
+          errorMessage: "omniArgs.stageConfigsPath has been removed; use omniArgs.deployConfigPath"
+
   - it: should use full command override when image.command is set
     set:
       image:

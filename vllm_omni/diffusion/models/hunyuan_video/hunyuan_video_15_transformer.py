@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -23,13 +23,18 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_joint_qkv_norm_rope,
+    pack_qk_norm_rope_table,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
 
@@ -415,6 +420,7 @@ class HunyuanVideo15Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         hidden_states_mask: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Ensure contiguous for FP8 quantized linear layers
         hidden_states = hidden_states.contiguous()
@@ -427,15 +433,28 @@ class HunyuanVideo15Attention(nn.Module):
         key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
         value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        ctx = get_forward_context()
+        # One launch for video RMSNorm + RoPE, text RMSNorm and the
+        # [video | text] cat when the forward supplied the packed table and
+        # the CUDA kernel accepts the geometry; the eager chain stays for SP
+        # (text goes through joint_* metadata) and unsupported inputs. The
+        # fused op reproduces the CUDA RMSNorm reduction: same bits either way.
+        use_fused_qk_norm_rope = (
+            qk_norm_rope_table is not None
+            and encoder_hidden_states is not None
+            and not ctx.sp_active
+            and _fused_cuda_supported(query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
+        )
+        if not use_fused_qk_norm_rope:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
 
-        if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
-            cos = cos.to(query.dtype)
-            sin = sin.to(query.dtype)
-            query = self.rope(query, cos, sin)
-            key = self.rope(key, cos, sin)
+            if image_rotary_emb is not None:
+                cos, sin = image_rotary_emb
+                cos = cos.to(query.dtype)
+                sin = sin.to(query.dtype)
+                query = self.rope(query, cos, sin)
+                key = self.rope(key, cos, sin)
 
         if encoder_hidden_states is not None:
             encoder_hidden_states = encoder_hidden_states.contiguous()
@@ -450,11 +469,28 @@ class HunyuanVideo15Attention(nn.Module):
             encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
 
-            encoder_query = self.norm_added_q(encoder_query)
-            encoder_key = self.norm_added_k(encoder_key)
+            if use_fused_qk_norm_rope:
+                # Joint Q/K/V in attention's input layout, video first.
+                query, key, value = fused_joint_qkv_norm_rope(
+                    query,
+                    key,
+                    value,
+                    encoder_query,
+                    encoder_key,
+                    encoder_value,
+                    self.norm_q.weight,
+                    self.norm_k.weight,
+                    self.norm_added_q.weight,
+                    self.norm_added_k.weight,
+                    qk_norm_rope_table,
+                    self.norm_q.variance_epsilon,
+                    cuda_rms_norm=True,
+                )
+            else:
+                encoder_query = self.norm_added_q(encoder_query)
+                encoder_key = self.norm_added_k(encoder_key)
 
         attn_metadata = None
-        ctx = get_forward_context()
         if ctx.sp_active and encoder_hidden_states is not None:
             # Under Ulysses SP, encoder tokens are passed via joint_*
             # metadata so they can be head-sliced separately from the
@@ -471,7 +507,7 @@ class HunyuanVideo15Attention(nn.Module):
                 attn_metadata.attn_mask = hidden_states_mask
             hidden_states = self.attn(query, key, value, attn_metadata)
         else:
-            if encoder_hidden_states is not None:
+            if encoder_hidden_states is not None and not use_fused_qk_norm_rope:
                 query = torch.cat([query, encoder_query], dim=1)
                 key = torch.cat([key, encoder_key], dim=1)
                 value = torch.cat([value, encoder_value], dim=1)
@@ -553,6 +589,7 @@ class HunyuanVideo15TransformerBlock(nn.Module):
         attention_mask: torch.Tensor | None = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] | None = None,
         hidden_states_mask: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
         norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
@@ -565,6 +602,7 @@ class HunyuanVideo15TransformerBlock(nn.Module):
             attention_mask=attention_mask,
             image_rotary_emb=freqs_cis,
             hidden_states_mask=hidden_states_mask,
+            qk_norm_rope_table=qk_norm_rope_table,
         )
 
         hidden_states = hidden_states + attn_output * gate_msa.unsqueeze(1)
@@ -814,7 +852,13 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
 
         ctx = get_forward_context()
         hidden_states_mask = None
-        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+        if (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
             padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
             hidden_states_mask = torch.ones(
                 batch_size,
@@ -823,10 +867,40 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 device=hidden_states.device,
             )
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
-
-            # if mask is all true, set it to None
             if hidden_states_mask.all():
                 hidden_states_mask = None
+        elif (
+            self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+            and not self.parallel_config.mask_sp_padding
+            and ctx.sp_original_seq_len is not None
+            and ctx.sp_padding_size > 0
+        ):
+            logger.warning_once(
+                "SP auto-padding applied %d token(s) (seq_len=%d, ulysses_degree=%d). "
+                "Padding tokens are not masked from attention (mask_sp_padding=False), "
+                "which avoids the varlen attention path but may produce minor numerical differences. "
+                "Set parallel_config.mask_sp_padding=True to restore strict masking.",
+                ctx.sp_padding_size,
+                ctx.sp_original_seq_len,
+                self.parallel_config.sequence_parallel_size,
+            )
+
+        # One packed table per forward for the fused QK RMSNorm + RoPE +
+        # [video | text] cat in every block; SP routes text through joint_*
+        # metadata and keeps the eager chain.
+        qk_norm_rope_table = None
+        if get_sequence_parallel_world_size() == 1 and image_rotary_emb[0].shape[0] == hidden_states.shape[1]:
+            # Text rows get the identity rotation (cos = 1, sin = 0): text
+            # tokens are normalised but not rotated, and the kernel applies
+            # it exactly (x * 1 - pair * 0).
+            qk_norm_rope_table = pack_qk_norm_rope_table(
+                *image_rotary_emb,
+                hidden_states.shape[0],
+                dtype=hidden_states.dtype,
+                identity_rows=encoder_hidden_states.shape[1],
+                cuda_rms_norm=True,
+            )
 
         for block in self.transformer_blocks:
             hidden_states, encoder_hidden_states = block(
@@ -836,6 +910,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 encoder_attention_mask,
                 image_rotary_emb,
                 hidden_states_mask=hidden_states_mask,
+                qk_norm_rope_table=qk_norm_rope_table,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)

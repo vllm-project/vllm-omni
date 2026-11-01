@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for chat endpoint speaker validation."""
 
 import asyncio
@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.openai.utils import (
+from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
     validate_requested_speaker,
 )
@@ -87,8 +87,8 @@ def test_create_chat_completion_converts_value_error_to_error_response(mocker: M
     serving_chat.chat_template = None
     serving_chat.chat_template_content_format = "string"
     serving_chat.default_chat_template_kwargs = {}
-    serving_chat.openai_serving_render = mocker.MagicMock()
-    serving_chat.openai_serving_render.validate_chat_template.return_value = None
+    serving_chat.online_renderer = mocker.MagicMock()
+    serving_chat.online_renderer.validate_chat_template.return_value = None
     serving_chat._effective_chat_template_kwargs = mocker.MagicMock(return_value={})
     serving_chat._preprocess_chat = mocker.AsyncMock(
         side_effect=ValueError("Invalid speaker 'uncle_fu'. Supported: ethan, vivian")

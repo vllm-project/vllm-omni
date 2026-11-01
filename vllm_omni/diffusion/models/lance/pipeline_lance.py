@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """LancePipeline — Lance (ByteDance) packaged for the vLLM-Omni diffusion engine.
 
 Lance is BAGEL-lineage (Qwen2-MoT unified AR+diffusion), so the transformer
@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -59,9 +60,14 @@ from vllm_omni.diffusion.models.bagel.pipeline_bagel import (
     BagelPipeline,
     add_special_tokens,
 )
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
+from vllm_omni.model_executor.models.utils import normalize_decoded_video_frames
 
 from .lance_transformer import (
     LanceBagel,
@@ -400,11 +406,22 @@ class LancePipeline(BagelPipeline):
                 )
             )
 
-        if quant_config is None and not (od_config.enable_layerwise_offload or od_config.parallel_config.use_hsdp):
+        if quant_config is None and not (
+            resolve_offload_strategy(od_config) is OffloadStrategy.LAYER_WISE or od_config.parallel_config.use_hsdp
+        ):
             self.to(self.device)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # The language model is registered before ``self.bagel``. vLLM therefore
+        # treats the latter's embedding as an alias and skips its checkpoint key.
+        # Route that one key through the first registered name; the other Lance
+        # weights keep their ``bagel.`` prefix and the existing strict load scope.
+        alias = "bagel.language_model.model.embed_tokens.weight"
+        canonical = "language_model.model.embed_tokens.weight"
+        return super().load_weights(((canonical if name == alias else name, weight) for name, weight in weights))
 
     # ------------------------------------------------------------------ #
     # Lance-specific component builders
@@ -836,8 +853,10 @@ class LancePipeline(BagelPipeline):
         frames = [Image.fromarray(f) for f in frames_np]
         logger.info("Lance t2v: decoded %d frames at %dx%d", len(frames), frames[0].width, frames[0].height)
         return DiffusionOutput(
-            output=frames[0],
-            custom_output={"video_frames": frames, "video_shape": video_shape},
+            output={
+                "payload": {"video": frames},
+                "metadata": {"video": {"shape": video_shape}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1069,13 +1088,11 @@ class LancePipeline(BagelPipeline):
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
-        # Put the PIL image into ``custom_output`` too — the orchestrator
-        # serializes ``custom_output`` across the IPC boundary but strips
-        # the bare ``output`` field, so consumers that only see
-        # ``outputs[0].output`` (e.g. gradio_demo) get ``None`` otherwise.
         return DiffusionOutput(
-            output=img,
-            custom_output={"image": img, "image_shape": image_shape},
+            output={
+                "payload": {"image": img},
+                "metadata": {"image": {"shape": image_shape}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1361,8 +1378,10 @@ class LancePipeline(BagelPipeline):
         frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], out_shape)
         frames = [Image.fromarray(f) for f in frames_np]
         return DiffusionOutput(
-            output=frames[0],
-            custom_output={"video_frames": frames, "video_shape": out_shape},
+            output={
+                "payload": {"video": frames},
+                "metadata": {"video": {"shape": out_shape}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1452,6 +1471,8 @@ class LancePipeline(BagelPipeline):
                     frames_bgr.append(_cv2.cvtColor(f, _cv2.COLOR_BGR2RGB))
                 cap.release()
                 video_raw = _np.stack(frames_bgr, axis=0)
+        elif isinstance(video_input, (list, tuple)):
+            video_raw, origin_fps = normalize_decoded_video_frames(video_input, default_fps=origin_fps_default)
         elif isinstance(video_input, _np.ndarray):
             video_raw = video_input
             origin_fps = origin_fps_default
@@ -1622,8 +1643,10 @@ class LancePipeline(BagelPipeline):
         frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], video_shape)
         frames = [Image.fromarray(f) for f in frames_np]
         return DiffusionOutput(
-            output=frames[0],
-            custom_output={"video_frames": frames, "video_shape": video_shape},
+            output={
+                "payload": {"video": frames},
+                "metadata": {"video": {"shape": video_shape}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1705,8 +1728,10 @@ class LancePipeline(BagelPipeline):
         text_output = text_output.lstrip("\n")
         logger.info("Lance x2t_video: generated %d tokens", token_ids.shape[0])
         return DiffusionOutput(
-            output=text_output,
-            custom_output={"text_output": text_output},
+            output={
+                "payload": {"text": text_output},
+                "metadata": {"text": {"text_output": text_output}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
@@ -1801,8 +1826,10 @@ class LancePipeline(BagelPipeline):
         text_output = text_output.lstrip("\n")
         logger.info("Lance x2t_image: generated %d tokens", token_ids.shape[0])
         return DiffusionOutput(
-            output=text_output,
-            custom_output={"text_output": text_output},
+            output={
+                "payload": {"text": text_output},
+                "metadata": {"text": {"text_output": text_output}},
+            },
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 

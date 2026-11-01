@@ -21,26 +21,25 @@ InfiniBand/RoCE NICs).
 
 ## Configuration
 
-Define the connector in runtime:
+Define the connector at the top level of the deploy YAML:
 
 ```yaml
-runtime:
-  connectors:
-    rdma_connector:
-      name: MooncakeTransferEngineConnector
-      extra:
-        host: "auto"                  # Auto-detect local RDMA IP
-        zmq_port: 50051               # ZMQ base port (see "Port Offset Scheme" below)
-        protocol: "rdma"              # "rdma" or "tcp"
-        device_name: ""               # RDMA device (e.g., "mlx5_0"), empty for auto-detect
-        memory_pool_size: 4294967296  # 4 GB (CPU); use 2147483648 (2 GB) for GPU
-        memory_pool_device: "cpu"     # "cpu" for pinned memory (recommended), "cuda" for GPUDirect RDMA
+connectors:
+  rdma_connector:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"                  # Auto-detect local RDMA IP
+      zmq_port: 50051               # ZMQ base port (see "Port Offset Scheme" below)
+      protocol: "rdma"              # "rdma" or "tcp"
+      device_name: ""               # RDMA device (e.g., "mlx5_0"), empty for auto-detect
+      memory_pool_size: 4294967296  # 4 GB (CPU); use 2147483648 (2 GB) for GPU
+      memory_pool_device: "cpu"     # "cpu" for pinned memory (recommended), "cuda" for GPUDirect RDMA
 ```
 
 Wire stages to the connector:
 
 ```yaml
-stage_args:
+stages:
   - stage_id: 0
     output_connectors:
       to_stage_1: rdma_connector
@@ -415,7 +414,7 @@ A receiver connector:
 - allocates receive buffers from its own pool
 - requests metadata or transfer service from the sender
 
-The role is not inferred dynamically. It is injected by the stage configuration layer:
+The role is not inferred dynamically. It is injected from the deploy connector wiring:
 
 - incoming edge for a stage -> `role="receiver"`
 - outgoing edge for a stage -> `role="sender"`

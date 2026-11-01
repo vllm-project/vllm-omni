@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
 
@@ -10,22 +10,190 @@ class DiffusionModelMetadata:
     # config/model plumbing can read it without importing concrete pipelines.
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
+    supports_mixed_reference_inputs: bool = False
+    # Multipart controls are exposed as ``control_reference`` plus
+    # ``control_type`` by the video API.  A pipeline that opts in receives the
+    # persisted upload through ``extra_args[control_type]["control_path"]``.
+    supported_control_upload_types: tuple[str, ...] = ()
+    attention_mask_free: bool = False
+    final_output_type: str | None = None
+    # Whether ``/v1/videos`` accepts source media plus per-token video/audio
+    # noise masks for latent initialization. Unknown pipelines must remain
+    # opted out so uploaded files never reach a model that cannot consume them.
+    supports_latent_mask_editing: bool = False
+    # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
+    # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
+    supports_timeline_guides: bool = False
+    # Whether the pipeline keeps finished clips' latents under
+    # ``extra_args["latent_cache_key"]`` and accepts ``extra_args["continue_from"]``
+    # to continue one; the video API tags requests with their job id.
+    supports_latent_continuation: bool = False
+    # Whether ``/v1/images/segmentations`` may serve this model: it takes one
+    # image plus text/box prompts and returns a ``segmentation`` payload.
+    supports_segmentation: bool = False
+    # Whether ``/v1/videos/segmentations`` may serve this model: it takes one
+    # video path plus text prompts and returns a ``video_segmentation`` payload.
+    supports_video_segmentation: bool = False
 
 
+# ``extra_args`` keys that only name a request (the video API's job-id tag for
+# ``supports_latent_continuation``) and never change its forward schedule, so
+# requests differing only in them may share a DLO data-parallel wave.
+REQUEST_IDENTITY_EXTRA_ARGS = frozenset({"latent_cache_key"})
+
+
+# FLUX.2 Klein supports up to four reference images.
+FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
+# Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
+QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
+JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
+# Boogu-Image editing (TI2I) supports a single reference image for now.
+BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
+    "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
+    "Sam3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        supports_segmentation=True,
+        supports_video_segmentation=True,
+    ),
+    "Flux2KleinPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=FLUX2_KLEIN_MAX_INPUT_IMAGES,
+    ),
     "QwenImageEditPlusPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
+    ),
+    # Qwen-Image 2.1 handles both text-to-image (no image) and
+    # image-conditioned requests through the same pipeline class.
+    "QwenImage21Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=QWEN_IMAGE_21_MAX_INPUT_IMAGES,
     ),
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
     ),
+    # Shared by the Base (text-to-image) and Edit (TI2I) checkpoints, which use
+    # the same ``BooguImagePipeline`` class. Text-to-image requests simply carry
+    # no reference image.
+    "BooguImagePipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=BOOGU_IMAGE_MAX_INPUT_IMAGES,
+    ),
+    "JoyImageEditPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
+    ),
+    "MiniMaxH3Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=9,
+        supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
+        supports_latent_mask_editing=True,
+        supports_timeline_guides=True,
+        supports_latent_continuation=True,
+        final_output_type="video",
+        # H3 represents alignment padding as a second packed sequence.  The
+        # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
+        attention_mask_free=True,
+    ),
+    # The modular alias is served by MiniMaxH3Pipeline and has the same
+    # Ref2VA request contract and packed-sequence layout. Every field must stay
+    # in sync with it: the repository root ``model_index.json`` declares this
+    # alias, so serving the checkpoint by repo id resolves here rather than to
+    # ``MiniMaxH3Pipeline``.
+    "MiniMaxH3ModularPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=9,
+        supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
+        supports_latent_mask_editing=True,
+        supports_timeline_guides=True,
+        supports_latent_continuation=True,
+        final_output_type="video",
+        attention_mask_free=True,
+    ),
+    # TaoMate-H3 is a text-prompted streaming model on the MiniMax-H3 packed
+    # layout; alignment padding is a second packed document, as for H3.
+    "TaoMateH3Pipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        attention_mask_free=True,
+    ),
+    "Magi2Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
+    # Joint text/image-to-video-and-audio, same shape as MiniMaxH3Pipeline
+    # above (an MP4 with both tracks) — declared "video" for the same reason:
+    # the final container is a video file, so /v1/videos* is the right API
+    # surface even though the model also produces audio.
+    "Kandinsky6TI2VAPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
+    "WanPipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
+    "WanImageToVideoPipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
+    "WanVACEPipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
+    "WanS2VPipeline": DiffusionModelMetadata(
+        attention_mask_free=True,
+        final_output_type="video",
+    ),
+    "WanT2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "WanI2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LTX2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LTX2DistilledPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LTX2T2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LTX2I2VDMD2Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HeliosPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HeliosPyramidPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HunyuanVideo15Pipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HunyuanVideo15ImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LingBotVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "LongCatVideoAvatarPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "MagiHumanPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "DreamIDOmniPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(
+        supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
+        final_output_type="video",
+    ),
+    "Cosmos3OmniPipeline": DiffusionModelMetadata(
+        supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
+        final_output_type="video",
+    ),
+    "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "SanaWmPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=1,
+        final_output_type="video",
+    ),
+}
+
+_DIFFUSION_MODEL_METADATA_ALIASES = {
+    "WanDMDPipeline": "WanPipeline",
+    "LTX2TwoStagePipeline": "LTX2Pipeline",
+    "LTX2DistilledOneStagePipeline": "LTX2DistilledPipeline",
+    "LTX2DistilledTwoStagePipeline": "LTX2DistilledPipeline",
+    "LingBotWorldCausalDMDPipeline": "LingBotVideoPipeline",
+    "BooguImageTurboPipeline": "BooguImagePipeline",
 }
 
 
@@ -34,4 +202,25 @@ def get_diffusion_model_metadata(model_class_name: str | None) -> DiffusionModel
     # pipelines do not accidentally inherit limits meant for other models.
     if model_class_name is None:
         return DiffusionModelMetadata()
-    return _DIFFUSION_MODEL_METADATA.get(model_class_name, DiffusionModelMetadata())
+    metadata = _DIFFUSION_MODEL_METADATA.get(model_class_name)
+    if metadata is not None:
+        return metadata
+    canonical_name = _DIFFUSION_MODEL_METADATA_ALIASES.get(model_class_name)
+    if canonical_name is not None:
+        return _DIFFUSION_MODEL_METADATA[canonical_name]
+    # Some checkpoints report the HF architecture name diff from internal pipeline class name
+    # (e.g. HunyuanImage3ForCausalMM, WanVACEPipeline, OmniVoice ...).
+    from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+    entry = _DIFFUSION_MODELS.get(model_class_name)
+    if entry is not None:
+        # Unpack instead of indexing so a future change to the registry tuple
+        # shape fails loudly instead of silently reading the wrong element.
+        _, _, pipeline_cls_name = entry
+        # Note: the registry ``cls_name`` and the metadata keys are two separate
+        # key spaces. Aliases whose pipeline class has no metadata entry (e.g.
+        # Wan22VACEPipeline, OmniVoicePipeline) still fall back to the defaults;
+        # that is not a regression, it just means no capability override.
+        canonical_name = _DIFFUSION_MODEL_METADATA_ALIASES.get(pipeline_cls_name, pipeline_cls_name)
+        return _DIFFUSION_MODEL_METADATA.get(canonical_name, DiffusionModelMetadata())
+    return DiffusionModelMetadata()

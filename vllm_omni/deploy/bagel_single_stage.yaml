@@ -9,7 +9,7 @@
 #       --deploy-config vllm_omni/deploy/bagel_single_stage.yaml
 #
 # Or programmatically:
-#   Omni(model="...", deploy_config_path="vllm_omni/deploy/bagel_single_stage.yaml")
+#   Omni(model="...", deploy_config="vllm_omni/deploy/bagel_single_stage.yaml")
 
 pipeline: bagel_single_stage
 async_chunk: false
@@ -24,3 +24,11 @@ stages:
     devices: "0"
     default_sampling_params:
       seed: 52
+
+platforms:
+  xpu:
+    stages:
+      - stage_id: 0
+        # Stock pins devices "0", which fails the device-count check at TP=2.
+        devices: "0,1"
+        tensor_parallel_size: 2

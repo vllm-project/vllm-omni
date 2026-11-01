@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Fish Speech S2 Pro pipeline topology (frozen).
 
 Stage 0: slow_ar     — text → RVQ codec tokens (LLM autoregressive).
@@ -20,6 +20,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.fish_speech"
 
 FISH_SPEECH_PIPELINE = PipelineConfig(
     model_type="fish_qwen3_omni",
+    default_deploy_config_name="fish_qwen3_omni.yaml",
     model_arch="FishSpeechSlowARForConditionalGeneration",
     stages=(
         StagePipelineConfig(
@@ -35,6 +36,9 @@ FISH_SPEECH_PIPELINE = PipelineConfig(
                 # <|im_end|> — stop when the model emits end-of-turn.
                 "stop_token_ids": [151645],
             },
+            # talker_mtp adds the sampled codebook embeddings to this step's
+            # inputs_embeds; a replay pads the unbuilt rows (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

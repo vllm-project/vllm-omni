@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 import queue
@@ -14,17 +14,31 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.diffusion_engine as diffusion_engine_module
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, _move_tensor_tree_to_cpu
+import vllm_omni.diffusion.utils.pipeline_utils as pipeline_utils_module
+from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.data import (
+    DIFFUSION_REQUEST_LIFECYCLE_KEY,
+    DIFFUSION_REQUEST_STARTED,
+    DiffusionOutput,
+    OmniDiffusionConfig,
+)
+from vllm_omni.diffusion.diffusion_engine import (
+    DiffusionEngine,
+    DiffusionExecutionMode,
+    _move_tensor_tree_to_cpu,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     NewRequestData,
+    _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput as RealDiffusionSchedulerOutput,
 )
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @dataclass
@@ -52,6 +66,8 @@ class MockScheduler:
     def __init__(self):
         self._waiting_queue = []
         self._step_id = 0
+        # Match RequestScheduler API used by request-batch admission wait.
+        self.max_num_running_reqs = 5
 
     def add_request(self, request):
         self._waiting_queue.append(request)
@@ -59,6 +75,46 @@ class MockScheduler:
 
     def has_requests(self):
         return len(self._waiting_queue) > 0
+
+    def get_execution_wait_timeout(self, now):
+        return 0.0
+
+    def pending_finished_request_ids(self):
+        return set()
+
+    def num_waiting_requests(self) -> int:
+        return len(self._waiting_queue)
+
+    def num_running_requests(self) -> int:
+        return 0
+
+    def get_admission_wait_decision(
+        self,
+        *,
+        now: float,
+        dp_concurrent: bool = False,
+    ) -> _AdmissionWaitDecision:
+        del dp_concurrent
+        return _AdmissionWaitDecision(
+            should_wait=True,
+            deadline=now + 0.5,
+            stable_window_s=0.05,
+            max_batch=self.max_num_running_reqs,
+        )
+
+    def should_end_admission_wait(
+        self,
+        decision: _AdmissionWaitDecision,
+        *,
+        now: float,
+        stable_since: float,
+    ) -> bool:
+        waiting = self.num_waiting_requests()
+        return (
+            waiting >= decision.max_batch
+            or (waiting > 0 and now - stable_since >= decision.stable_window_s)
+            or (decision.deadline is not None and now >= decision.deadline)
+        )
 
     def schedule(self) -> DiffusionSchedulerOutput:
         if not self._waiting_queue:
@@ -76,6 +132,32 @@ class MockScheduler:
     def update_from_output(self, sched_output, runner_output):
         # assume all new req finished
         return [req.request_id for req in sched_output.scheduled_new_reqs]
+
+    def get_request_state(self, request_id):
+        return None
+
+    def pop_request_state(self, request_id):
+        return None
+
+    def finish_requests(self, request_id, status):
+        pass
+
+    def close(self):
+        pass
+
+    def initialize(self, od_config):
+        pass
+
+
+def _make_admission_engine(pre_process_func) -> DiffusionEngine:
+    engine = object.__new__(DiffusionEngine)
+    engine.scheduler = MockScheduler()
+    engine.pre_process_func = pre_process_func
+    engine._out_streams = {}
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._closed = False
+    return engine
 
 
 class _BatchCapablePipeline:
@@ -113,11 +195,36 @@ def _make_request_mode_sched_output(*request_ids: str) -> RealDiffusionScheduler
     )
 
 
+@pytest.mark.cpu
+def test_request_started_output_is_emitted_only_for_opted_in_requests() -> None:
+    sched_output = _make_request_mode_sched_output("tracked", "untracked")
+    sched_output.scheduled_new_reqs[0].req.sampling_params.emit_request_lifecycle = True
+    engine = object.__new__(DiffusionEngine)
+    emitted = []
+    engine._put_output = lambda request_id, output: emitted.append((request_id, output))
+
+    engine._emit_request_started_outputs(sched_output)
+
+    assert len(emitted) == 1
+    request_id, output = emitted[0]
+    assert request_id == "tracked"
+    assert output.request_started is True
+    assert output.finished is False
+    [formatted] = engine.postprocess_output(sched_output.scheduled_new_reqs[0].req, output)
+    assert formatted.custom_output == {
+        DIFFUSION_REQUEST_LIFECYCLE_KEY: DIFFUSION_REQUEST_STARTED,
+    }
+    assert formatted.finished is False
+
+
 class TestRequestBatchCapability:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-    def test_supports_request_batch_uses_registered_model_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        od_config = SimpleNamespace(model_class_name="BatchPipeline", custom_pipeline_args=None)
+    @pytest.mark.parametrize("custom_pipeline_args", [None, {}, {"components_path": "/tmp/anima-components"}])
+    def test_supports_request_batch_uses_registered_model_class(
+        self, monkeypatch: pytest.MonkeyPatch, custom_pipeline_args: dict[str, Any] | None
+    ) -> None:
+        od_config = SimpleNamespace(model_class_name="BatchPipeline", custom_pipeline_args=custom_pipeline_args)
 
         monkeypatch.setattr(
             diffusion_engine_module.DiffusionModelRegistry,
@@ -126,6 +233,59 @@ class TestRequestBatchCapability:
         )
 
         assert diffusion_engine_module.supports_request_batch(od_config) is True
+
+    def test_engine_rejects_multi_seq_diffusers_using_adapter_capability(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args=None,
+            diffusion_load_format="diffusers",
+            streaming_output=False,
+            max_num_seqs=2,
+        )
+        registry_load = mocker.Mock(
+            side_effect=lambda model_class_name: (
+                _SingleRequestPipeline if model_class_name == "DiffusersAdapterPipeline" else _BatchCapablePipeline
+            )
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            registry_load,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        with pytest.raises(ValueError, match="max_num_seqs=1"):
+            engine._resolve_execution_mode(od_config)
+
+        registry_load.assert_called_once_with("DiffusersAdapterPipeline")
+
+    def test_engine_prefers_batch_capable_custom_pipeline_over_diffusers_adapter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args={"pipeline_class": _BatchCapablePipeline},
+            diffusion_load_format="diffusers",
+            streaming_output=False,
+            max_num_seqs=2,
+        )
+        registry_load = mocker.Mock(return_value=_SingleRequestPipeline)
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            registry_load,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
+        registry_load.assert_not_called()
 
     def test_supports_request_batch_uses_custom_pipeline_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
         od_config = SimpleNamespace(
@@ -148,7 +308,7 @@ class TestRequestBatchCapability:
         )
 
         monkeypatch.setattr(
-            diffusion_engine_module,
+            pipeline_utils_module,
             "resolve_obj_by_qualname",
             lambda qualname: _BatchCapablePipeline if qualname == "test.module.BatchPipeline" else None,
         )
@@ -209,7 +369,7 @@ class TestRequestBatchCapability:
         def fail_resolve(qualname):
             raise ImportError(qualname)
 
-        monkeypatch.setattr(diffusion_engine_module, "resolve_obj_by_qualname", fail_resolve)
+        monkeypatch.setattr(pipeline_utils_module, "resolve_obj_by_qualname", fail_resolve)
         registry_load = mocker.Mock(return_value=_BatchCapablePipeline)
         monkeypatch.setattr(
             diffusion_engine_module.DiffusionModelRegistry,
@@ -221,15 +381,18 @@ class TestRequestBatchCapability:
             diffusion_engine_module.supports_request_batch(od_config)
         registry_load.assert_not_called()
 
-    def test_engine_disables_batch_dispatch_for_single_request_pipeline(
+    @pytest.mark.parametrize("custom_pipeline_args", [None, {}, {"components_path": "/tmp/anima-components"}])
+    def test_engine_uses_request_batch_mode_for_single_request_pipeline(
         self,
         monkeypatch: pytest.MonkeyPatch,
         mocker: MockerFixture,
+        custom_pipeline_args: dict[str, Any] | None,
     ) -> None:
         od_config = SimpleNamespace(
             model_class_name="SinglePipeline",
-            custom_pipeline_args=None,
+            custom_pipeline_args=custom_pipeline_args,
             streaming_output=False,
+            max_num_seqs=1,
         )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(return_value="per-request"),
@@ -255,15 +418,99 @@ class TestRequestBatchCapability:
             "_try_load_model_cls",
             lambda model_class_name: _SingleRequestPipeline,
         )
-        monkeypatch.setattr(DiffusionEngine, "_dummy_run", lambda self: None)
 
         engine = DiffusionEngine(od_config)
-        output = engine.execute_fn(_make_request_mode_sched_output("req-a", "req-b"))
+        output = engine.execute_fn(_make_request_mode_sched_output("req-a"))
 
+        assert engine.execution_mode == DiffusionExecutionMode.REQUEST_BATCH
         assert engine.supports_request_batch is False
-        assert output == "per-request"
-        fake_executor.execute_request.assert_called_once()
-        fake_executor.execute_batch.assert_not_called()
+        assert output == "batch"
+        fake_executor.execute_batch.assert_called_once()
+        fake_executor.execute_request.assert_not_called()
+
+    def test_engine_rejects_multi_seq_request_batch_for_single_request_pipeline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="SinglePipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+            max_num_seqs=2,
+        )
+        fake_executor_cls = mocker.Mock()
+
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _SingleRequestPipeline,
+        )
+
+        with pytest.raises(ValueError, match="max_num_seqs=1"):
+            DiffusionEngine(od_config)
+        fake_executor_cls.assert_not_called()
+
+    def test_engine_allows_independent_dlo_dp_requests_for_single_request_pipeline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="SinglePipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+            max_num_seqs=2,
+            request_batch_max_wait_ms=0,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        fake_executor = SimpleNamespace(
+            execute_request=mocker.Mock(return_value="per-request"),
+            execute_batch=mocker.Mock(return_value="batch"),
+            execute_step=mocker.Mock(return_value="step"),
+        )
+        fake_executor_cls = mocker.Mock(return_value=fake_executor)
+
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _SingleRequestPipeline,
+        )
+
+        engine = DiffusionEngine(od_config)
+
+        assert engine.execution_mode == DiffusionExecutionMode.REQUEST_BATCH
+        assert engine.supports_request_batch is False
+        assert engine.dp_concurrent is True
+        assert engine.scheduler.max_num_running_reqs == 2
+        assert od_config.request_batch_max_wait_ms == 0
+        fake_executor_cls.assert_called_once_with(od_config)
 
     @pytest.mark.parametrize("request_ids", [("req-a",), ("req-a", "req-b")])
     def test_engine_enables_batch_dispatch_for_request_batch_pipeline(
@@ -276,6 +523,7 @@ class TestRequestBatchCapability:
             model_class_name="BatchPipeline",
             custom_pipeline_args=None,
             streaming_output=False,
+            max_num_seqs=2,
         )
         fake_executor = SimpleNamespace(
             execute_request=mocker.Mock(return_value="per-request"),
@@ -301,15 +549,161 @@ class TestRequestBatchCapability:
             "_try_load_model_cls",
             lambda model_class_name: _BatchCapablePipeline,
         )
-        monkeypatch.setattr(DiffusionEngine, "_dummy_run", lambda self: None)
 
         engine = DiffusionEngine(od_config)
         output = engine.execute_fn(_make_request_mode_sched_output(*request_ids))
 
+        assert engine.execution_mode == DiffusionExecutionMode.REQUEST_BATCH
         assert engine.supports_request_batch is True
         assert output == "batch"
         fake_executor.execute_batch.assert_called_once()
         fake_executor.execute_request.assert_not_called()
+
+    def test_make_engine_runs_startup_warmup(self, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="SinglePipeline",
+            custom_pipeline_args=None,
+            engine_backend="default",
+            streaming_output=False,
+        )
+        fake_executor = SimpleNamespace(
+            execute_request=mocker.Mock(),
+            execute_batch=mocker.Mock(),
+            execute_step=mocker.Mock(),
+        )
+        fake_executor_cls = mocker.Mock(return_value=fake_executor)
+        warmup = mocker.Mock()
+
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _SingleRequestPipeline,
+        )
+        monkeypatch.setattr(DiffusionEngine, "run_startup_warmup", warmup)
+
+        engine = DiffusionEngine.make_engine(od_config)
+
+        assert isinstance(engine, DiffusionEngine)
+        warmup.assert_called_once_with()
+
+
+class TestDiffusionCompileConfig:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    def test_config_defaults_to_dynamic_regional_compile(self) -> None:
+        config = OmniDiffusionConfig(model="test")
+
+        assert config.diffusion_compile_granularity == "regional"
+        assert config.diffusion_compile_dynamic is True
+
+    def test_from_kwargs_preserves_compile_controls(self) -> None:
+        config = OmniDiffusionConfig.from_kwargs(
+            model="test",
+            diffusion_compile_granularity="full",
+            diffusion_compile_dynamic=False,
+        )
+
+        assert config.diffusion_compile_granularity == "full"
+        assert config.diffusion_compile_dynamic is False
+
+    def test_config_rejects_invalid_compile_granularity(self) -> None:
+        with pytest.raises(ValueError, match="diffusion_compile_granularity"):
+            OmniDiffusionConfig(model="test", diffusion_compile_granularity="block")
+
+    def test_config_rejects_non_boolean_compile_dynamic(self) -> None:
+        with pytest.raises(TypeError, match="diffusion_compile_dynamic"):
+            OmniDiffusionConfig(model="test", diffusion_compile_dynamic="false")
+
+    @pytest.mark.parametrize(
+        "kwargs, feature",
+        [
+            ({"parallel_config": {"ulysses_degree": 2}, "num_gpus": 2}, "sequence parallelism"),
+            (
+                {
+                    "parallel_config": {"use_hsdp": True, "hsdp_shard_size": 2},
+                    "num_gpus": 2,
+                },
+                "HSDP",
+            ),
+            ({"enable_cpu_offload": True}, "CPU offload"),
+            ({"enable_layerwise_offload": True}, "layerwise offload"),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "module",
+                        "components": ["dit"],
+                    }
+                },
+                "CPU offload",
+            ),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "layer",
+                        "components": ["dit"],
+                    }
+                },
+                "layerwise offload",
+            ),
+            (
+                {
+                    "diffusion_offload_config": {
+                        "mode": "layer",
+                        "components": ["dit"],
+                        "layer_options": {"dit": {"weight_transfer": "allgather"}},
+                    }
+                },
+                "distributed layerwise offload",
+            ),
+        ],
+    )
+    def test_full_compile_rejects_incompatible_features(self, kwargs, feature) -> None:
+        with pytest.raises(ValueError, match=feature):
+            OmniDiffusionConfig(
+                model="test",
+                diffusion_compile_granularity="full",
+                **kwargs,
+            )
+
+    def test_raw_parallel_mapping_is_normalized_before_allgather_cache_validation(self) -> None:
+        with pytest.raises(ValueError, match="rank-local cache decisions"):
+            OmniDiffusionConfig(
+                model="test",
+                num_gpus=2,
+                parallel_config={"data_parallel_size": 2},
+                cache_backend="tea_cache",
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["dit"],
+                    "layer_options": {"dit": {"weight_transfer": "allgather"}},
+                },
+            )
+
+    def test_auto_dp_is_resolved_before_encoder_prompt_cache_validation(self) -> None:
+        with pytest.raises(ValueError, match="rank-local cache hits"):
+            OmniDiffusionConfig(
+                model="test",
+                num_gpus=2,
+                parallel_config={"data_parallel_size": None},
+                enable_prompt_embed_cache=True,
+                diffusion_offload_config={
+                    "mode": "layer",
+                    "components": ["text_encoder"],
+                    "layer_options": {"text_encoder": {"weight_transfer": "allgather"}},
+                },
+            )
 
 
 class TestRequestBatchAdmission:
@@ -318,6 +712,11 @@ class TestRequestBatchAdmission:
     def test_config_rejects_negative_request_batch_max_wait_ms(self) -> None:
         with pytest.raises(ValueError, match="request_batch_max_wait_ms"):
             OmniDiffusionConfig(model="test", request_batch_max_wait_ms=-1.0)
+
+    @pytest.mark.parametrize("bad_wait", [float("nan"), float("inf"), float("-inf")])
+    def test_config_rejects_nonfinite_request_batch_max_wait_ms(self, bad_wait: float) -> None:
+        with pytest.raises(ValueError, match="request_batch_max_wait_ms"):
+            OmniDiffusionConfig(model="test", request_batch_max_wait_ms=bad_wait)
 
     def test_config_normalizes_request_batch_max_wait_ms_to_float(self) -> None:
         config = OmniDiffusionConfig(model="test", request_batch_max_wait_ms=5)
@@ -386,7 +785,7 @@ class TestRequestBatchAdmission:
 
         start = time.monotonic()
         with engine._cv:
-            engine._wait_for_request_batch_admission_locked()
+            engine._wait_for_admission_if_needed_locked()
         waited_s = time.monotonic() - start
 
         # Stable-window exit (~50ms), not the full 1000ms deadline.
@@ -451,9 +850,7 @@ def test_move_tensor_tree_returns_non_tensor_values_unchanged() -> None:
     assert moved is value
 
 
-@pytest.mark.diffusion
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_move_tensor_tree_moves_nested_cuda_tensors_to_cpu() -> None:
     tensor = torch.arange(8, dtype=torch.float32, device="cuda")
     other = torch.arange(4, dtype=torch.int64, device="cuda")
@@ -470,23 +867,122 @@ def test_move_tensor_tree_moves_nested_cuda_tensors_to_cpu() -> None:
     assert moved["items"][1][0] == "keep"
 
 
+async def _consume_final_output(generator):
+    final_output = None
+    async for output in generator:
+        final_output = output
+    if final_output is None:
+        raise RuntimeError("Diffusion execution finished without output.")
+    return final_output
+
+
+@pytest.mark.cpu
 @pytest.mark.asyncio
-async def test_async_add_req_and_wait_for_response():
+@pytest.mark.parametrize("output_wait", [0.0, 4.0])
+async def test_step_streaming_excludes_output_wait_from_execution_time(
+    output_wait: float, mocker: MockerFixture
+) -> None:
+    clock = [0.0]
+    mocker.patch.object(diffusion_engine_module.time, "perf_counter", side_effect=lambda: clock[0])
+    output = DiffusionOutput(stage_durations={"denoise": 10.0}, output_ready_wait_time=output_wait)
+    formatted_output = SimpleNamespace(metrics={})
+    request = SimpleNamespace(scheduler_queue_wait_ms=None)
+
+    async def output_stream(request_id):
+        # Ten seconds of execution followed by output materialization.
+        clock[0] = 10.0 + output_wait
+        yield output
+
+    engine = mocker.Mock(
+        pre_process_func=None,
+        _scheduler_num_waiting_reqs=0,
+        _check_and_start_background_loop=mocker.AsyncMock(),
+        _prepare_request_for_admission=mocker.Mock(return_value=request),
+        _add_prepared_request=mocker.Mock(return_value="timed-request"),
+        get_output_stream=output_stream,
+        postprocess_output=mocker.Mock(return_value=[formatted_output]),
+    )
+
+    results = [batch async for batch in DiffusionEngine.step_streaming(engine, request)]
+
+    assert results == [[formatted_output]]
+    assert formatted_output.metrics["diffusion_engine_exec_time_ms"] == pytest.approx(10_000.0)
+    assert formatted_output.metrics["output_ready_wait_time_ms"] == pytest.approx(output_wait * 1000)
+    assert formatted_output.metrics["postprocess_time_ms"] == 0.0
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("entrypoint", ["add_request", "async_add_req_and_stream_response"])
+@pytest.mark.asyncio
+async def test_engine_admission_preprocesses_request_once(entrypoint: str, mocker: MockerFixture) -> None:
+    raw_request = OmniDiffusionRequest(
+        prompt="raw",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="admission",
+    )
+    prepared_request = OmniDiffusionRequest(
+        prompt="prepared",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="admission",
+        prepared_layout=object(),
+    )
+    preprocess_calls = []
+
+    def preprocess(request):
+        preprocess_calls.append(request)
+        return prepared_request
+
+    engine = _make_admission_engine(preprocess)
+
+    if entrypoint == "async_add_req_and_stream_response":
+        output = DiffusionOutput(output="prepared", finished=True)
+
+        async def output_stream(request_id):
+            assert request_id == prepared_request.request_id
+            yield output
+
+        mocker.patch.object(engine, "get_output_stream", side_effect=output_stream)
+        assert [result async for result in engine.async_add_req_and_stream_response(raw_request)] == [output]
+    else:
+        engine.add_request(raw_request)
+
+    assert preprocess_calls == [raw_request]
+    assert engine.scheduler._waiting_queue == [prepared_request]
+
+
+@pytest.mark.cpu
+@pytest.mark.asyncio
+async def test_async_add_req_and_stream_response():
     engine = object.__new__(DiffusionEngine)
     engine.scheduler = MockScheduler()
-    engine._out_queue = {}
-    engine.abort_queue: queue.Queue[str] = queue.Queue()
+    engine._out_streams = {}
+    engine._unclaimed_async_outputs = {}
+    engine._shutdown_output_futures = {}
+    abort_queue: queue.Queue[str] = queue.Queue()
+    engine.abort_queue = abort_queue
     engine._rpc_queue = queue.Queue()
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
     engine._init_lock = asyncio.Lock()
     engine._closed = False
-    engine.od_config = SimpleNamespace(streaming_output=False)
+    # Enable admission wait so concurrent adds land in one schedule wave;
+    # otherwise the first request can execute alone (~1s) and the rest in a
+    # second wave (~2s), failing the latency-spread assertion.
+    engine.od_config = SimpleNamespace(
+        streaming_output=False,
+        request_batch_max_wait_ms=500.0,
+    )
     engine._loop_started = False
     engine.main_loop = None
-    engine.supports_request_batch = False
+    engine.supports_request_batch = True
+    engine.step_execution = False
+    engine.execution_mode = DiffusionExecutionMode.REQUEST_BATCH
 
-    engine._finalize_finished_request = lambda rid, out, err: out.result
+    def _finalize(rid, out, err=None, **kwargs):
+        # Stream consumers stop on ``finished``; keep result_data for assertions.
+        return SimpleNamespace(result_data=out.result.result_data, finished=True, async_output_id=None)
+
+    engine._finalize_finished_request = _finalize
 
     def mock_execute_batch(sched_output):
         request_ids = sched_output.scheduled_request_ids
@@ -510,9 +1006,9 @@ async def test_async_add_req_and_wait_for_response():
     await engine._check_and_start_background_loop()
 
     async def run_task(rid):
-        req = SimpleNamespace(request_id=rid)
+        req = SimpleNamespace(request_id=rid, sampling_params=OmniDiffusionSamplingParams())
         start = time.time()
-        res = await engine.async_add_req_and_wait_for_response(req)
+        res = await _consume_final_output(engine.async_add_req_and_stream_response(req))
         return rid, res, time.time() - start
 
     task_ids = [f"req_{i}" for i in range(5)]
@@ -531,3 +1027,241 @@ async def test_async_add_req_and_wait_for_response():
     eps = 0.5
     latencies = [r[2] for r in results]
     assert max(latencies) - min(latencies) < eps
+
+
+class _PreTokenizedIdsPipeline:
+    supports_pre_tokenized_prompt_ids = True
+
+
+class TestPreTokenizedPromptContract:
+    """Issue #7855: ids a pipeline never reads must be rejected at admission, not run silently."""
+
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    @staticmethod
+    def _engine(*, supported: bool | None) -> DiffusionEngine:
+        engine = _make_admission_engine(None)
+        engine.od_config = SimpleNamespace(model_class_name="TextOnlyPipeline", enable_prefix_caching=False)
+        engine._supports_pre_tokenized_prompt_ids = supported
+        return engine
+
+    @staticmethod
+    def _request(prompt) -> OmniDiffusionRequest:
+        return OmniDiffusionRequest(
+            prompt=prompt,
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_id="ids-req",
+        )
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            {"prompt_ids": [101, 102, 103]},
+            {"prompt": "a cat", "prompt_ids": [101, 102, 103]},
+            {"prompt": "a cat", "negative_prompt_ids": [7, 8]},
+            {"prompt_ids": [[101, 102, 103]]},
+        ],
+        ids=["ids-only", "text-plus-ids", "negative-ids", "batched-ids"],
+    )
+    def test_rejects_ids_for_pipeline_without_support(self, prompt) -> None:
+        from vllm_omni.errors import OmniClientError
+
+        engine = self._engine(supported=False)
+
+        with pytest.raises(OmniClientError, match="does not support pre-tokenized prompt ids") as excinfo:
+            engine.add_request(self._request(prompt))
+
+        assert excinfo.value.status_code == 400
+        assert "TextOnlyPipeline" in excinfo.value.message
+        assert engine.scheduler._waiting_queue == []
+
+    @pytest.mark.parametrize("key", ["prompt_ids", "negative_prompt_ids"])
+    @pytest.mark.parametrize(
+        "token_ids",
+        [torch.tensor([101, 102]), torch.tensor([0]), torch.tensor(0), torch.tensor([[101, 102]])],
+        ids=["multiple-tokens", "zero-token", "scalar-zero", "batched-tokens"],
+    )
+    @pytest.mark.parametrize(
+        "entrypoint", ["add_request", "async_add_req_and_stream_response", "add_req_and_wait_for_response"]
+    )
+    def test_rejects_tensor_ids_for_pipeline_without_support(self, key, token_ids, entrypoint) -> None:
+        from vllm_omni.errors import OmniClientError
+
+        engine = self._engine(supported=False)
+
+        with pytest.raises(OmniClientError, match=key) as excinfo:
+            getattr(engine, entrypoint)(self._request({"prompt": "a cat", key: token_ids}))
+
+        assert excinfo.value.status_code == 400
+        assert engine.scheduler._waiting_queue == []
+
+    @pytest.mark.parametrize("key", ["prompt_ids", "negative_prompt_ids"])
+    @pytest.mark.parametrize(
+        "token_ids",
+        [torch.empty(0, dtype=torch.long), torch.empty((1, 0), dtype=torch.long)],
+        ids=["empty", "batched-empty"],
+    )
+    def test_admits_empty_tensor_ids(self, key, token_ids) -> None:
+        engine = self._engine(supported=False)
+
+        engine.add_request(self._request({"prompt": "a cat", key: token_ids}))
+
+        assert len(engine.scheduler._waiting_queue) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["prompt_ids", "negative_prompt_ids"])
+    @pytest.mark.parametrize("token_ids", [torch.tensor([101, 102]), torch.tensor([0])], ids=["multiple", "zero"])
+    async def test_step_streaming_rejects_tensor_ids(self, key, token_ids, mocker: MockerFixture) -> None:
+        from vllm_omni.errors import OmniClientError
+
+        engine = self._engine(supported=False)
+        mocker.patch.object(engine, "_check_and_start_background_loop", new_callable=mocker.AsyncMock)
+
+        with pytest.raises(OmniClientError, match=key) as excinfo:
+            await anext(engine.step_streaming(self._request({"prompt": "a cat", key: token_ids})))
+
+        assert excinfo.value.status_code == 400
+        assert engine.scheduler._waiting_queue == []
+
+    @pytest.mark.parametrize("supported", [True, None], ids=["declared-support", "unknown-custom"])
+    @pytest.mark.parametrize("key", ["prompt_ids", "negative_prompt_ids"])
+    def test_custom_pipeline_tensor_ids_bypass_rejection(self, supported, key) -> None:
+        engine = self._engine(supported=supported)
+
+        engine.add_request(self._request({key: torch.tensor([0, 101])}))
+
+        assert len(engine.scheduler._waiting_queue) == 1
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "a cat",
+            {"prompt": "a cat"},
+            {"prompt": "a cat", "prompt_ids": []},
+            {"prompt_token_ids": [5, 6, 7]},
+            {"prompt": "", "prompt_embeds": torch.zeros(1, 4)},
+            [1, 2, 3],
+        ],
+        ids=["str", "text-dict", "empty-ids-field", "native-token-ids", "embeds", "bare-list"],
+    )
+    def test_admits_prompts_outside_the_custom_ids_contract(self, prompt) -> None:
+        engine = self._engine(supported=False)
+
+        engine.add_request(self._request(prompt))
+
+        assert len(engine.scheduler._waiting_queue) == 1
+
+    def test_admits_ids_for_pipeline_that_declares_support(self) -> None:
+        engine = self._engine(supported=True)
+
+        engine.add_request(self._request({"prompt_ids": [101, 102, 103]}))
+
+        assert len(engine.scheduler._waiting_queue) == 1
+
+    def test_skips_check_when_capability_is_unknown(self) -> None:
+        engine = self._engine(supported=None)
+
+        engine.add_request(self._request({"prompt_ids": [101]}))
+
+        assert len(engine.scheduler._waiting_queue) == 1
+
+    @pytest.mark.parametrize(
+        "entrypoint", ["add_request", "async_add_req_and_stream_response", "add_req_and_wait_for_response"]
+    )
+    def test_every_admission_entrypoint_validates(self, entrypoint: str) -> None:
+        from vllm_omni.errors import OmniClientError
+
+        engine = self._engine(supported=False)
+
+        with pytest.raises(OmniClientError, match="pre-tokenized prompt ids"):
+            getattr(engine, entrypoint)(self._request({"prompt_ids": [1]}))
+
+    def test_capability_is_read_from_registered_pipeline_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda name: {"IdsPipeline": _PreTokenizedIdsPipeline, "TextPipeline": _SingleRequestPipeline}.get(name),
+        )
+
+        ids_config = SimpleNamespace(model_class_name="IdsPipeline", custom_pipeline_args=None)
+        text_config = SimpleNamespace(model_class_name="TextPipeline", custom_pipeline_args=None)
+        unknown_config = SimpleNamespace(model_class_name="Missing", custom_pipeline_args=None)
+
+        assert pipeline_utils_module.supports_pre_tokenized_prompt_ids(ids_config) is True
+        assert pipeline_utils_module.supports_pre_tokenized_prompt_ids(text_config) is False
+        assert pipeline_utils_module.supports_pre_tokenized_prompt_ids(unknown_config) is False
+
+    def test_diffusers_adapter_capability_shadows_native_pipeline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda name: _SingleRequestPipeline if name == "DiffusersAdapterPipeline" else _PreTokenizedIdsPipeline,
+        )
+        od_config = SimpleNamespace(
+            model_class_name="IdsPipeline", custom_pipeline_args=None, diffusion_load_format="diffusers"
+        )
+
+        assert pipeline_utils_module.supports_pre_tokenized_prompt_ids(od_config) is False
+
+
+class _UndeclaredCustomPipeline:
+    pass
+
+
+class _OptOutCustomPipeline:
+    supports_pre_tokenized_prompt_ids = False
+
+
+class TestPreTokenizedPromptCustomPipelines:
+    """Custom pipelines are user-owned: undeclared means unknown, not unsupported."""
+
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    @pytest.mark.parametrize(
+        ("pipeline_cls", "expected"),
+        [
+            (_UndeclaredCustomPipeline, None),
+            (_PreTokenizedIdsPipeline, True),
+            (_OptOutCustomPipeline, False),
+        ],
+        ids=["undeclared-unknown", "declared-true", "declared-false"],
+    )
+    def test_custom_pipeline_capability_is_tri_state(self, pipeline_cls, expected) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args={"pipeline_class": pipeline_cls},
+        )
+
+        assert pipeline_utils_module.supports_pre_tokenized_prompt_ids(od_config) is expected
+
+    def test_registered_pipeline_without_flag_is_false_not_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda name: _UndeclaredCustomPipeline,
+        )
+        od_config = SimpleNamespace(model_class_name="QwenImagePipeline", custom_pipeline_args=None)
+
+        assert pipeline_utils_module.supports_pre_tokenized_prompt_ids(od_config) is False
+
+    def test_undeclared_custom_pipeline_admits_rl_rollout_ids(self) -> None:
+        """The verl-omni rollout path sends {"prompt_ids": ...} to a custom pipeline."""
+        engine = _make_admission_engine(None)
+        engine.od_config = SimpleNamespace(
+            model_class_name="QwenImagePipeline",
+            custom_pipeline_args={"pipeline_class": _UndeclaredCustomPipeline},
+            enable_prefix_caching=False,
+        )
+        engine._supports_pre_tokenized_prompt_ids = pipeline_utils_module.supports_pre_tokenized_prompt_ids(
+            engine.od_config
+        )
+
+        engine.add_request(
+            OmniDiffusionRequest(
+                prompt={"prompt_ids": list(range(50))},
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+                request_id="rollout",
+            )
+        )
+
+        assert len(engine.scheduler._waiting_queue) == 1

@@ -21,6 +21,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
 # ---------------------------------------------------------------------------
 # Bootstrap minimal vLLM stubs so the parser can be imported
 # ---------------------------------------------------------------------------
@@ -784,8 +787,8 @@ class TestExtractReasoningStreaming:
         """When buffered text turns out not to be a marker prefix, it is
         emitted as reasoning on the next call."""
         # "reason<" is buffered because "<" could start a marker.
-        # Next delta ">" doesn't form a marker, so the buffer is
-        # flushed as reasoning.
+        # Next delta ">" doesn't form a marker, so the buffer ("<") is
+        # prepended to the next delta and flushed as reasoning: "<> more".
         parser = multi_token_parser
         deltas_and_ids = [
             (TS, [100]),
@@ -794,7 +797,7 @@ class TestExtractReasoningStreaming:
             ("> more", [8]),  # ">" doesn't complete any marker
         ]
         r, c = _stream_extract(parser, deltas_and_ids)
-        assert r == "reason> more"
+        assert r == "reason<> more"
         assert c == ""
 
     def test_multi_token_end_with_reasoning_before_buffer(self, multi_token_parser):
@@ -837,7 +840,7 @@ class TestExtractReasoningStreaming:
             ("> not a marker", [8]),
         ]
         r, c = _stream_extract(parser, deltas_and_ids)
-        assert r == "reason> not a marker"
+        assert r == "reason<> not a marker"
         assert c == ""
 
 

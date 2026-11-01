@@ -1,0 +1,24 @@
+{
+  "_class_name": "Flux2Transformer2DModel",
+  "_diffusers_version": "0.37.0.dev0",
+  "_name_or_path": "/raid/yiyi/klein-4b-distilled-diffusers/transformer",
+  "attention_head_dim": 16,
+  "axes_dims_rope": [
+    4,
+    4,
+    4,
+    4
+  ],
+  "eps": 1e-06,
+  "guidance_embeds": false,
+  "in_channels": 64,
+  "joint_attention_dim": 96,
+  "mlp_ratio": 3.0,
+  "num_attention_heads": 2,
+  "num_layers": 2,
+  "num_single_layers": 2,
+  "out_channels": null,
+  "patch_size": 1,
+  "rope_theta": 2000,
+  "timestep_guidance_channels": 32
+}

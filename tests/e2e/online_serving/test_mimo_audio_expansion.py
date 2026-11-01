@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-E2E expansion tests for MiMo-Audio online serving (nightly Omni · Function Test with H100).
+E2E expansion tests for MiMo-Audio online serving (nightly Omni · Function Test with H100 · Single-GPU).
 """
 
 import os
@@ -77,7 +77,7 @@ def get_max_batch_size(size_type="few"):
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_text_001(omni_server, openai_client) -> None:
+def test_text_to_text_001(omni_server, online_client) -> None:
     """
     Test text input processing and text-only output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -95,13 +95,13 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.skip(reason="CI failed 8571")
-def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
+def test_audio_to_text_audio_001(omni_server, online_client) -> None:
     """
     Test audio and text input processing and text/audio output generation via OpenAI API.
     Deploy Setting: default yaml
@@ -126,4 +126,4 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
         },
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)

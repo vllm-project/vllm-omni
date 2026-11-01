@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -28,7 +31,7 @@ class TestFlux2TransformerWeightLoading:
     """Test Flux2Transformer weight loading functionality"""
 
     @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_weight_loading_tp2(self, setup_tp_group):
         """Verify weights load correctly with TP=2"""
         # Prepare test data
@@ -140,7 +143,7 @@ class TestFlux2PackedModuleMapping:
     """Test Flux2 packed module mapping functionality"""
 
     @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_packed_module_mapping(self, setup_tp_group):
         """Verify to_qkv packing matches HF checkpoint"""
         model = Flux2Transformer2DModel(
@@ -218,7 +221,7 @@ class TestFlux2PackedModuleMapping:
         )
 
     @pytest.mark.core_model
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
     def test_packed_mapping_edge_cases(self, setup_tp_group):
         """Test edge cases for packed mapping"""
         model = Flux2Transformer2DModel(
@@ -253,3 +256,28 @@ class TestFlux2PackedModuleMapping:
         assert len(loaded_params) == 2, "Should load two weights"
         assert "x_embedder.weight" in loaded_params
         assert any("to_qkv" in p for p in loaded_params), "to_q should be mapped to to_qkv"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+class TestFlux2TransformerLayerwiseOffload:
+    def test_layerwise_offload_blocks_attrs(self):
+        assert Flux2Transformer2DModel._layerwise_offload_blocks_attrs == [
+            "transformer_blocks",
+            "single_transformer_blocks",
+        ]
+
+    def test_get_blocks_from_dit(self):
+        from vllm_omni.diffusion.offloader.block_discovery import get_blocks_from_dit
+
+        # Block discovery only needs the ModuleList structure, not production dims.
+        model = Flux2Transformer2DModel(
+            num_layers=2,
+            num_single_layers=2,
+            num_attention_heads=2,
+            attention_head_dim=4,
+            joint_attention_dim=16,
+        )
+        attr_names, blocks = get_blocks_from_dit(model)
+        assert attr_names == ["transformer_blocks", "single_transformer_blocks"]
+        assert len(blocks) == 4

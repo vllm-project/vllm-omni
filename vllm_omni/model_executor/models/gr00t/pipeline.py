@@ -10,6 +10,7 @@ from vllm_omni.config.stage_config import (
 
 GR00T_N1D7_PIPELINE = PipelineConfig(
     model_type="Gr00tN1d7",
+    default_deploy_config_name="Gr00tN1d7.yaml",
     model_arch="Gr00tN1d7Pipeline",
     hf_architectures=("Gr00tN1d7",),
     stages=(

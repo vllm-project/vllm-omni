@@ -1,4 +1,4 @@
-# Online serving Example of vLLM-Omni for MiMo-Audio
+# MiMo-Audio: Online serving
 
 ## 🛠️ Installation
 

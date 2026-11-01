@@ -6,6 +6,8 @@ import torch
 
 from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import SenseNovaU1Pipeline
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 
 def _pipeline_without_init() -> SenseNovaU1Pipeline:
     return object.__new__(SenseNovaU1Pipeline)
