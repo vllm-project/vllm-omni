@@ -335,6 +335,35 @@ class DummyQwenImagePipeline(nn.Module, QwenImageLoraLoaderMixin):
 
 
 class TestQwenImageLoraLoaderMixin:
+    def test_load_unprefixed_default_adapter(self, mocker: MockerFixture):
+        pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
+        to_out = pipeline.transformer.blocks[0].attn.to_out
+        original_weight = to_out.weight.detach().clone()
+        state_dict, delta = make_dummy_lora_state_dict(
+            "blocks.0.attn.to_out.0",
+            lora_a_suffix="lora_A.default.weight",
+            lora_b_suffix="lora_B.default.weight",
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.lora.loader.get_converter_by_pipeline",
+            return_value=_convert_non_diffusers_qwen_lora_to_diffusers,
+        )
+
+        pipeline.load_lora_weights(state_dict, "adapter0")
+        assert_close(to_out.weight, original_weight + delta)
+
+    def test_load_lora_rejects_zero_matches(self):
+        pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
+        original_params = {name: param.detach().clone() for name, param in pipeline.transformer.named_parameters()}
+        state_dict, _ = make_dummy_lora_state_dict("transformer.blocks.99.attn.to_out")
+
+        with pytest.raises(ValueError, match="No LoRA weights matched"):
+            pipeline.load_lora_weights(state_dict, "adapter0")
+
+        assert pipeline.lora_loaded == {}
+        assert not pipeline.lora_is_fused
+        assert_params_equal(pipeline.transformer, original_params)
+
     def test_load_lora_weights(self, mocker: MockerFixture):
         pipeline = DummyQwenImagePipeline(NUM_LAYERS, HEAD_DIM)
         original_params = {name: param.clone() for name, param in pipeline.transformer.named_parameters()}
@@ -379,17 +408,20 @@ class TestQwenImageLoraLoaderMixin:
         # validate lora_loaded map is updated
         assert "adapter0" not in pipeline.lora_loaded
 
-    def test_load_diffusers_lora_applies_non_unit_alpha(self, mocker: MockerFixture):
+    @pytest.mark.parametrize(
+        ("prefix", "adapter_suffix"), [("", ""), ("transformer.", ".default")], ids=["unprefixed", "prefixed"]
+    )
+    def test_load_diffusers_lora_applies_non_unit_alpha(self, mocker: MockerFixture, prefix: str, adapter_suffix: str):
         pipeline = DummyQwenImagePipeline(1, HEAD_DIM)
         to_out = pipeline.transformer.blocks[0].attn.to_out
         original_weight = to_out.weight.detach().clone()
-        base_key = "blocks.0.attn.to_out.0"
+        base_key = f"{prefix}blocks.0.attn.to_out.0"
         lora_a = torch.randn(RANK, HEAD_DIM)
         lora_b = torch.randn(HEAD_DIM, RANK)
         alpha = torch.tensor(6.0)
         state_dict = {
-            f"{base_key}.lora_A.weight": lora_a,
-            f"{base_key}.lora_B.weight": lora_b,
+            f"{base_key}.lora_A{adapter_suffix}.weight": lora_a,
+            f"{base_key}.lora_B{adapter_suffix}.weight": lora_b,
             f"{base_key}.alpha": alpha,
         }
         mocker.patch(
