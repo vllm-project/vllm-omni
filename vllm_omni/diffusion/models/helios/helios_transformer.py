@@ -812,6 +812,7 @@ class HeliosTransformer3DModel(nn.Module):
         # 5. Output norm & projection
         self.norm_out = HeliosOutputNorm(inner_dim, eps)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
+        self.cache_cross_attention = True
         self._conditioning_owner = object()
         self._conditioning_revision = 0
         self._conditioning_dependencies = ()
@@ -830,7 +831,12 @@ class HeliosTransformer3DModel(nn.Module):
         self._conditioning_revision += 1
 
     def _cache_enabled(self) -> bool:
-        return not self.training and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+        return (
+            self.cache_cross_attention
+            and not self.training
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        )
 
     def _conditioning_projection_revision(self):
         # Track all projection parameters, including norm/quantization/adapter
