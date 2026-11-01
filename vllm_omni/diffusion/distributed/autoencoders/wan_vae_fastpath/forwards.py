@@ -387,13 +387,21 @@ def _conv_verdict_key(conv: nn.Module, x: torch.Tensor, cache_frames: int) -> tu
 
 
 def _first_frame_conv2d(
-    conv: WanCausalConv3d, x: torch.Tensor, bias: torch.Tensor | None
+    conv: WanCausalConv3d,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+    next_cache: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Convolve ``[0, 0, x]`` with the last temporal weight slice, retaining the cache.
 
-    Called only for CUDA inference without history. The identity holds for
+    Called only for CUDA/XPU inference without history. The identity holds for
     finite operands, but Conv2d may round differently, so only the tolerance-
     based channels_last level uses it.
+
+    ``next_cache`` is the already-assembled history when the caller fused the
+    temporal assembly into an earlier kernel (``x`` is then the last frame of
+    that assembly); the fused and unfused encoders must pick the same kernel,
+    or fp16 posteriors differ by an ulp.
     """
     cfg = getattr(conv, CFG_ATTR, None)
     if (
@@ -410,10 +418,11 @@ def _first_frame_conv2d(
         or tuple(conv._padding) != ((1, 1, 1, 1, 2, 0) if conv.kernel_size == (3, 3, 3) else (0, 0, 0, 0, 2, 0))
     ):
         return None
-    pair = dm.cat_time_5d(x, None, conv._padding[4], keep_cache_frames=CACHE_T)
-    if pair is None:
-        return None
-    _, next_cache = pair
+    if next_cache is None:
+        pair = dm.cat_time_5d(x, None, conv._padding[4], keep_cache_frames=CACHE_T)
+        if pair is None:
+            return None
+        _, next_cache = pair
     # Materialize only the current weight slice; retaining a packed copy could
     # become stale after weight loading or keep offloaded weights on the GPU.
     weight = conv.weight[:, :, 2].contiguous(memory_format=torch.channels_last)
@@ -574,7 +583,16 @@ def _run_norm_act_cached_conv(
                     assembled, cache_list[index] = pair
                     del cache, payload
                     fold_bias = return_bias and _may_defer_conv_bias(norm, x)
-                    out = _conv_with_spatial_padding(conv, assembled, None if fold_bias else conv.bias, verdicts, key)
+                    conv_bias = None if fold_bias else conv.bias
+                    first_frame = None
+                    # The unfused path declines this shortcut when ``cat_time_5d`` would not
+                    # allocate a channels-last assembly, so mirror that layout test on the norm input.
+                    if payload is None and assembled.shape[2] == conv._padding[4] + 1 and suggests_channels_last(x):
+                        first_frame = _first_frame_conv2d(conv, assembled[:, :, -1:], conv_bias, cache_list[index])
+                    if first_frame is not None:
+                        out = first_frame[0]
+                    else:
+                        out = _conv_with_spatial_padding(conv, assembled, conv_bias, verdicts, key)
                     if not return_bias:
                         return out
                     return out, _deferred_conv_bias(conv, out) if fold_bias else None
