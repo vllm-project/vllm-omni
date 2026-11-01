@@ -165,7 +165,7 @@ def try_qk_norm_rope_exact(
     q_output = torch.empty_like(q)
     k_output = torch.empty_like(k)
     # The first two launch dimensions are part of the exactness contract on
-    # the validated SM90 and SM103 targets: changing the warp-to-row mapping
+    # the validated SM90, SM103, and SM120 targets: changing the warp-to-row mapping
     # changes the FP32 RMS reduction order.
     heads_per_program = 8
     grid = (tokens, triton.cdiv(heads, heads_per_program), 2)
