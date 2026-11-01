@@ -8,6 +8,7 @@ import pytest
 import torch
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops import topk_topp_sampler
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
@@ -15,6 +16,14 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import dr
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _VOCAB = 64
+
+
+@pytest.fixture(autouse=True)
+def _cpu_sampling_backend(monkeypatch):
+    # These fixtures use CPU tensors even on CUDA hosts. Keep upstream's
+    # backend discovery from dispatching them to FlashInfer or Triton.
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    monkeypatch.setattr(topk_topp_sampler, "HAS_TRITON", False)
 
 
 def _generators(n: int, seed: int) -> dict[int, torch.Generator]:
@@ -119,3 +128,54 @@ def test_mixed_greedy_rows_match_v1_and_keep_the_generator():
         _mrv2_sample(follow, temperature=warm, top_k=top_k, top_p=top_p, generators=held),
         _mrv2_sample(follow, temperature=warm, top_k=top_k, top_p=top_p, generators=fresh),
     )
+
+
+@pytest.mark.parametrize("num_logprobs", [-1, 0])
+def test_talker_sampler_uses_upstream_logprobs_contract(mocker, num_logprobs):
+    """Exercise the adapter entry point used by MRv2 startup profiling."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    from vllm.v1.worker.gpu.sample.sampler import Sampler as Mrv2Sampler
+
+    from vllm_omni.model_executor.models.minicpmo_4_5 import minicpmo_4_5_omni_tts as tts
+
+    # Spec rejects removed upstream methods rather than silently creating them.
+    base = mocker.Mock(spec=object.__new__(Mrv2Sampler))
+    base.get_logprobs_dims.side_effect = lambda rows: Mrv2Sampler.get_logprobs_dims(base, rows)
+    base.sampling_states = SimpleNamespace(
+        max_num_logprobs=lambda rows: num_logprobs,
+        temperature=SimpleNamespace(gpu=torch.zeros(2)),
+        apply_temperature=mocker.Mock(),
+        apply_min_p=mocker.Mock(),
+        get_top_k_top_p=lambda expanded, rows: (None, None),
+    )
+    base.logprob_token_ids_state = SimpleNamespace(max_num_token_ids=lambda rows: 0)
+    base.compute_nans = False
+    base.needs_logits_processing = np.zeros(2, dtype=bool)
+    base.req_states = SimpleNamespace(prefill_len=SimpleNamespace(gpu=torch.ones(2)))
+    batch = SimpleNamespace(
+        expanded_idx_mapping=torch.arange(2),
+        idx_mapping_np=np.arange(2),
+        idx_mapping=torch.arange(2),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        cu_num_logits=torch.arange(3),
+        num_reqs=2,
+    )
+    mocker.patch.object(
+        tts,
+        "get_num_sampled_and_rejected",
+        return_value=(torch.ones(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32)),
+    )
+    logits = torch.tensor([[0.0, 1.0, 2.0], [2.0, 1.0, 0.0]])
+    sampler = tts.MiniCPMO45TalkerSampler(base, SimpleNamespace())
+    output = sampler._sample_like_v1(logits, batch)
+    if num_logprobs == -1:
+        base.assert_not_called()
+        assert output.sampled_token_ids.tolist() == [[2], [0]]
+        assert output.num_sampled.tolist() == [1, 1]
+        assert output.logprobs_tensors is None
+    else:
+        # logprobs=0 still asks for the sampled token's logprob.
+        base.assert_called_once_with(logits, batch)
+        assert output is base.return_value

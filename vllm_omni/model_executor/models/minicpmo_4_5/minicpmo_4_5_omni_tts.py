@@ -686,7 +686,7 @@ class MiniCPMO45TalkerSampler(OmniSampler):
             # Speculative rows are rejected for this Talker. Keep the stock
             # sampler if a batch ever arrives with a different layout.
             return self.base_sampler(logits, input_batch)
-        if self.base_sampler.returns_logprobs(idx_np):
+        if self.base_sampler.get_logprobs_dims(idx_np) is not None:
             return self.base_sampler(logits, input_batch)
 
         num_nans = get_num_nans(logits) if self.base_sampler.compute_nans else None

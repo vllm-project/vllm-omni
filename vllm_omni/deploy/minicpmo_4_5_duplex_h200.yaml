@@ -36,3 +36,8 @@ stages:
       duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions: true
       # Stage 0: Pinned memory async H2D copy for streaming audio chunks
       duplex_audio_encoder_pinned_h2d: true
+
+# This tuned profile explicitly retains the V1 execution path.
+platforms:
+  cuda:
+    model_runner: v1

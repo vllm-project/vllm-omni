@@ -3246,10 +3246,11 @@ class TestPlatformOverrides:
         [
             ("qwen3_tts_mrv2.yaml", "qwen3_tts", "v2", True),
             ("moss_tts_local.yaml", "moss_tts_local", "v2", True),
-            ("minicpmo_4_5.yaml", "minicpmo_4_5", "v1", False),
-            ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v1", False),
+            ("minicpmo_4_5.yaml", "minicpmo_4_5", "v2", True),
+            ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", True),
             ("minicpmo_4_5_duplex_mrv2.yaml", "minicpmo_4_5", "v2", True),
-            ("minicpmo_4_5_turn_mrv2.yaml", "minicpmo_4_5", "v1", True),
+            ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v1", False),
+            ("minicpmo_4_5_turn_mrv2.yaml", "minicpmo_4_5", "v2", True),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -3259,7 +3260,6 @@ class TestPlatformOverrides:
         deploy = load_deploy_config(Path(get_deploy_config_path(filename)))
         deploy = _apply_platform_overrides(deploy, platform=platform)
         expect_v2 = platform == "cuda" and cuda_v2
-        # The turn MRv2 overlay selects V2 per stage, retaining the V1 global default.
         assert deploy.model_runner == (cuda_default_runner if platform == "cuda" else "v1")
 
         # The selection must reach the live worker-dispatch consumer, not just
