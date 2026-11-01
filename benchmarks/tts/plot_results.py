@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Plot universal TTS benchmark results.
 
 Reads JSON files saved by ``bench_tts.py`` (via ``vllm bench serve --omni``)
@@ -217,9 +220,9 @@ def print_comparison_table(all_runs: list[list[dict]], labels: list[str]) -> Non
         ("Throughput (a-s/s)", "audio_throughput", ".2f"),
     ]
     quality_metrics = [
-        ("WER (%)", "seed_tts_mean_wer", ".1f"),
-        ("SIM", "seed_tts_mean_sim", ".3f"),
-        ("UTMOS", "seed_tts_mean_utmos", ".2f"),
+        ("WER", "seed_tts_content_error_mean", ".3f"),
+        ("SIM", "seed_tts_sim_mean", ".3f"),
+        ("UTMOS", "seed_tts_utmos_mean", ".2f"),
     ]
 
     for task in tasks:

@@ -42,6 +42,10 @@ class OmniNPUWorkerBase(NPUWorker):
                 local_rank=self.local_rank,
             )
 
+    def get_stage_post_warmup_memory_stats(self) -> None:
+        """NPU workers do not provide the optional CUDA warmup snapshot."""
+        return None
+
     def profile(
         self,
         is_start: bool = True,

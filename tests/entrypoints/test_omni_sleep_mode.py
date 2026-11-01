@@ -348,15 +348,33 @@ class TestOmniArSleepMode:
     @pytest.mark.omni
     @pytest.mark.asyncio(loop_scope="class")
     @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
-    async def test_partial_wake_blocks_generate(self, ar_engine: AsyncOmni):
-        """#4473 Repro B: generate() rejected while kv_cache stays asleep."""
+    async def test_partial_wake_holds_generate_until_full_wake(self, ar_engine: AsyncOmni):
+        """#8678: generate() waits out a partial wake instead of erroring.
+
+        After wake_up(tags=["weights"]) + resume_generation(), a generate()
+        parks at the admission gate until the kv_cache tag is woken too, so
+        the documented abort-retry client no longer churns on
+        ``partially or fully asleep`` rejections.
+        """
         try:
             await ar_engine.sleep(stage_ids=[0], level=1)
             await ar_engine.wake_up(stage_ids=[0], tags=["weights"])
             await ar_engine.resume_generation(stage_ids=[0])
-            with pytest.raises(RuntimeError, match="partially or fully asleep"):
-                async for _ in ar_engine.generate("test", sampling_params=SamplingParams(max_tokens=4)):
-                    pass
+
+            async def consume() -> Any:
+                output = None
+                async for item in ar_engine.generate("test", sampling_params=SamplingParams(max_tokens=4)):
+                    output = item
+                return output
+
+            task = asyncio.create_task(consume())
+            # Still parked at the admission gate while kv_cache sleeps.
+            await asyncio.sleep(1.0)
+            assert not task.done(), "generate() should wait while the engine is partially asleep"
+
+            await ar_engine.wake_up(stage_ids=[0], tags=["kv_cache"])
+            output = await asyncio.wait_for(task, timeout=120)
+            assert output is not None, "generate after full wake produced no output"
         finally:
             await _ensure_awake(ar_engine, [0])
 
@@ -519,7 +537,9 @@ async def bagel_diffusion_engine():
     engine = AsyncOmni(
         model=MODEL_BAGEL,
         deploy_config=_bagel_diffusion_deploy_config(),
-        init_timeout=600,
+        # A cold ROCm AITER build can consume almost the entire default
+        # 600-second orchestrator startup budget before the stage reports ready.
+        init_timeout=1200,
         enable_sleep_mode=True,
     )
     yield engine
@@ -530,7 +550,11 @@ async def bagel_diffusion_engine():
 @pytest.mark.omni
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 class TestBagelDiffusionSleepMode:
-    """BAGEL diffusion sleep/wake on a class-scoped TP=2 BagelPipeline."""
+    """BAGEL diffusion sleep/wake on a class-scoped TP=2 BagelPipeline.
+
+    AMD nightly runs these three methods separately from the intentionally
+    skipped coordinated-sleep class below.
+    """
 
     @pytest.mark.asyncio(loop_scope="class")
     async def test_diffusion_sleep_handshake(self, bagel_diffusion_engine: AsyncOmni):

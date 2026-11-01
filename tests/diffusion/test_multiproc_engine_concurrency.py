@@ -559,6 +559,30 @@ class TestRequestModeDispatch:
 
         executor.collective_rpc.assert_not_called()
 
+    def test_dlo_dp_wave_ignores_request_identity_extra_args(self):
+        """The video API tags each job with its own latent_cache_key; that must not split a wave."""
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=True,
+        )
+        executor.collective_rpc = Mock(return_value=[_tagged_output("A"), _tagged_output("B")])
+        scheduler_output = _make_sched_output("A", "B")
+        for new_req in scheduler_output.scheduled_new_reqs:
+            new_req.req.sampling_params.extra_args = {"task": "t2va", "latent_cache_key": f"video_{new_req.request_id}"}
+
+        result = executor.execute_request(scheduler_output)
+
+        assert [output.result.error for output in result.runner_outputs] == ["A", "B"]
+        # Any other difference can change the forward schedule and is still rejected.
+        scheduler_output = _make_sched_output("A", "B")
+        for new_req, task in zip(scheduler_output.scheduled_new_reqs, ("t2va", "fl2va"), strict=True):
+            new_req.req.sampling_params.extra_args = {"task": task, "latent_cache_key": f"video_{new_req.request_id}"}
+        with pytest.raises(ValueError, match="identical extra_args"):
+            executor.execute_request(scheduler_output)
+
     def test_dlo_dp_partial_reply_times_out_and_fails_closed(self, monkeypatch):
         from vllm_omni.diffusion.executor import multiproc_executor as executor_module
 

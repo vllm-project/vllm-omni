@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.commands import AppendAudio, Commit, DuplexCommand
+from vllm_omni.engine.duplex.config import apply_session_stats_capability
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexStagePort,
@@ -58,7 +59,9 @@ from vllm_omni.engine.duplex.messages import (
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
+from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
+from vllm_omni.inputs.data import disable_watermarking
 
 if TYPE_CHECKING:
     import janus
@@ -493,6 +496,8 @@ class DuplexSessionManager:
             raise TypeError("duplex plugin must return sampling parameters as a tuple")
         if len(configured) != len(defaults):
             raise ValueError("duplex plugin must return one sampling parameter per stage")
+        if not session.config.watermarking:
+            configured = tuple(disable_watermarking(configured))
         return configured
 
     @staticmethod
@@ -544,6 +549,17 @@ class DuplexSessionManager:
     def _admission_count(self) -> int:
         return len(set(self.runners) | set(self._closing) | self._admitting)
 
+    def _session_perf_ledger(self) -> SessionPerfLedger:
+        names = getattr(self.stage_port, "duplex_stage_names", None)
+        stage_names = list(names()) if callable(names) else []
+        stage_count = self.stage_port.stage_count
+        return SessionPerfLedger(
+            stages=[
+                (stage_id, stage_names[stage_id] if stage_id < len(stage_names) else f"stage{stage_id}")
+                for stage_id in range(stage_count)
+            ]
+        )
+
     async def open(self, message: OpenDuplexSessionMessage) -> None:
         from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
 
@@ -579,7 +595,10 @@ class DuplexSessionManager:
                 raise
             except ValueError as exc:
                 raise DuplexRuntimeConfigError(str(exc)) from exc
-            capabilities = self.plugin.capabilities(max_sessions=max_sessions)
+            collect_stats = bool(getattr(self.runtime_config, "collect_stats", False))
+            capabilities = apply_session_stats_capability(
+                self.plugin.capabilities(max_sessions=max_sessions), collect_stats
+            )
             session = DuplexEngineSession(
                 session_id=session_id,
                 config=config,
@@ -589,6 +608,7 @@ class DuplexSessionManager:
                 _runtime_config=dict(runtime_config),
                 num_stages=self.stage_port.stage_count,
                 log_stats=self.log_stats,
+                perf=self._session_perf_ledger() if collect_stats else None,
             )
             # Validates the plugin's sampling policy for this runtime config before admission.
             self.sampling_params_for(session)

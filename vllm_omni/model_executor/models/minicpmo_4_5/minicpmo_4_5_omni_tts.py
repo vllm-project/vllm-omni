@@ -2042,7 +2042,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # runner neutralizes vLLM's MinTokensLogitsProcessor), so the request
         # floor must reach it. What is read here is the *resolved* request
         # parameter, not the raw caller object: the serving layer merges the
-        # deploy defaults into it first (serving_chat._apply_request_overrides)
+        # deploy defaults into it first (serving_chat._merge_llm_sampling_params)
         # and the offline entrypoint substitutes the stage defaults when the
         # caller passes no params at all (omni_base.resolve_sampling_params_list),
         # so the deployment minimum arrives as a positive ``min_tokens``.

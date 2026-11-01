@@ -5,7 +5,8 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": "H100",
+            "rocm": "MI325"
           },
           "num_cards": 3
         }
@@ -20,7 +21,11 @@
           "2": {"num_replicas": 2, "devices": "1,2"}
       },
       "extra_cli_args": [
-        "--async-chunk"
+        "--async-chunk",
+        "--stage-init-timeout",
+        "1200",
+        "--init-timeout",
+        "1500"
       ]
     },
     "benchmark_params": [
