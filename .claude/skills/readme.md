@@ -26,6 +26,9 @@ self-check.
 
 - [`add-diffusion-model`](add-diffusion-model/SKILL.md): guides integration of
   a new diffusion model into `vllm-omni`
+- [`add-omni-model`](add-omni-model/SKILL.md): integrates a new multi-stage
+  thinker/talker/code2wav omni model, from the HF reference through pipeline,
+  stage hand-off processors, deploy YAML, parity ladder, tests, and recipe
 - [`add-recipe`](add-recipe/SKILL.md): creates or updates in-repository model
   recipes with verified task/input/output contracts, concrete hardware,
   shared feature-guide links, exact commands, and qualification evidence
@@ -44,6 +47,10 @@ self-check.
 - [`find-simplifications`](find-simplifications/SKILL.md): finds evidence-backed
   opportunities to remove or merge dead, duplicated, speculative,
   over-generalized, or unnecessarily defensive vLLM-Omni code
+- [`omni-perf-opt`](omni-perf-opt/SKILL.md): guides multi-stage omni serving
+  optimization, including stage attribution, TTFT / AUDIO_TTFP / AUDIO_RTF
+  tuning, async_chunk codec chunking, CUDA graphs, MRv2, replicas, and
+  quality-gated A/B evidence
 - [`precheck-pr`](precheck-pr/SKILL.md): self-checks a branch before creating a
   PR by validating title format, dead code, simplification opportunities,
   accuracy and performance claims, and merge readiness
@@ -57,6 +64,9 @@ self-check.
 - [`review-pr`](review-pr/SKILL.md): provides a frozen-snapshot, contract-aware
   workflow for maintainers and reviewers; contributors should use
   `precheck-pr` for self-review
+- [`vllm-omni`](vllm-omni/SKILL.md): entry skill for multi-stage omni models;
+  covers deploy YAML, serving, debugging, benchmarking, and the code map, and
+  routes model integration and performance work to the dedicated skills
 - [`vllm-omni-npu-model-runner-upgrade`](vllm-omni-npu-upgrade/SKILL.md):
   upgrades NPU model runners to align with the latest vllm-ascend
   `NPUModelRunner`
