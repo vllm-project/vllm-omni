@@ -96,12 +96,8 @@ Failed jobs: 1/2
     **Recommended:** run CI-aligned jobs from the repo root via [`tools/run_merge_jobs.sh`](https://github.com/vllm-project/vllm-omni/blob/main/tools/run_merge_jobs.sh). The script reads [`.buildkite/cuda/test-merge.yml`](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-merge.yml), generates per-step bash wrappers, runs pytest, and tees logs under `logs/merge_jobs/` (see [CI job runners](#ci-job-runners-l2l4-logs-timing-and-timeouts)). Requires `bash`, `python3`, and PyYAML (`pip install pyyaml`).
 
     ```bash
-    # All L3 and L1 jobs (default: every pytest step in test-merge.yml)
+    # All L3 jobs (default: every pytest step in test-merge.yml)
     bash tools/run_merge_jobs.sh
-
-    # Skip L1-style "Simple Test" steps in test-merge.yml (group or "Simple ·" labels)
-    bash tools/run_merge_jobs.sh --skip-simple
-    bash tools/run_merge_jobs.sh --skip-simple --model-type omni
 
     # Preview extracted commands without running
     bash tools/run_merge_jobs.sh --dry-run
@@ -146,7 +142,7 @@ Failed jobs: 1/2
     bash tools/nightly/run_nightly_jobs.sh --test-type local --model-type tts
     ```
 
-    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml) on CI.
+    Perf steps (label contains ``Perf Test``) run before other jobs; Excel output is written under ``logs/``. Diffusion nightly steps may also appear in [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml) on CI. **Simple · CPU Coverage Test** in [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-nightly.yml) runs when ``NIGHTLY=1`` (``pytest -m 'core_model and cpu'`` plus a Cobertura XML artifact).
 
     **Ad hoc:** run a single test file or marker expression manually:
 
@@ -183,19 +179,22 @@ Failed jobs: 1/2
     pytest -s -v dfx/stability/scripts/run_stability_wan22.py -m slow
 
     # Reliability: Qwen3-Omni (H100 × 2)
-    pytest -s -v dfx/reliability/test_reliability_qwen3_omni.py -m slow
+    pytest -s -v dfx/reliability/test_qwen3_omni.py -m "slow and cards_2"
 
     # Reliability: Wan2.2 (H100)
-    pytest -s -v dfx/reliability/test_reliability_wan22.py -m slow
+    pytest -s -v dfx/reliability/test_wan22.py -m "slow and cards_1"
 
     # Reliability: HunyuanImage DiT (H100 × 4)
-    pytest -s -v dfx/reliability/test_reliability_hunyuan_image.py -m slow
+    pytest -s -v dfx/reliability/test_hunyuan_image.py -m "slow and cards_4"
+
+    # Reliability: MiniCPM-o 4.5 (H100). SIGTERM serve-root only, plus partial isolation.
+    pytest -s -v dfx/reliability/test_minicpmo_4_5.py -m "slow and cards_1"
 
     ```
 
     The latest L5 CI jobs are in [test-weekly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/cuda/test-weekly.yml):
 
-    - **Reliability** (+ invalid-parameter), **Perf Test** (Omni vLLM Text / Multi-Replica), and **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Scheduled upload of those env-gated steps still requires `main`.
+    - **Reliability** (+ invalid-parameter) and **Perf Test** (Omni vLLM Text / Multi-Replica) → `WEEKLY=1` (or PR label `weekly-test`). Scheduled upload of those env-gated steps still requires `main`.
     - **E2E Tests** (slow Omni / TTS / Diffusion sweeps) → `NON_CRITICAL=1` (pipeline upload also accepts `WEEKLY=1` / `weekly-test`; the group `if` still needs `NON_CRITICAL`)
 
 You can find more information about markers in [Test Writing Guide — Markers for Tests](./test_writing_guide.md#markers-for-tests).

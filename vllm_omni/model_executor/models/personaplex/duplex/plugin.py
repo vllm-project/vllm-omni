@@ -117,20 +117,24 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         if not defaults:
             return defaults
         configured = list(defaults)
+        # The final (Code2Wav) request lives for the whole session. CUMULATIVE
+        # output makes the output processor re-concatenate every earlier
+        # waveform on each frame, so per-frame cost grows with session length.
+        # PersonaPlexDataPlaneSession.audio_output_is_delta relies on this.
+        final = configured[-1]
+        if len(configured) > 1 and isinstance(final, SamplingParams):
+            final = final.clone()
+            final.output_kind = RequestOutputKind.DELTA
+            configured[-1] = final
         stage0 = defaults[0]
         if isinstance(stage0, SamplingParams):
             # Greedy, one temporal token per frame: the native stepper takes
             # argmax for the text head and the depformer.
-            stage0 = deepcopy(stage0) if stage0.skip_clone else stage0.clone()
+            stage0 = stage0.clone()
             stage0.temperature = 0.0
             stage0.top_k = 1
             stage0.max_tokens = 1
             configured[0] = stage0
-        if len(defaults) > 1 and isinstance(defaults[1], SamplingParams):
-            stage1 = defaults[1]
-            stage1 = deepcopy(stage1) if stage1.skip_clone else stage1.clone()
-            stage1.output_kind = RequestOutputKind.DELTA
-            configured[1] = stage1
         return tuple(configured)
 
     def plan_append(
@@ -146,34 +150,33 @@ class PersonaPlexDuplexPlugin(DuplexModelPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        del sampling_params
+        del session_config, sampling_params, turn_seq, final
         decode_pcm_f32le_payload(payload, sample_rate_hz=SAMPLE_RATE, exact_samples=FRAME_SIZE, model="PersonaPlex")
         normalized_payload = dict(payload)  # type: ignore[call-overload]
         # One scheduler slot per frame; the first append of an epoch also
         # carries the voice/persona prefill (a new epoch is a new Stage 0
         # request with fresh KV, so the worker replays it).
-        prompt_slots = 1 + (prefill_slot_count(runtime_config) if seq <= 1 else 0)
+        first_append = seq <= 1
+        prompt_slots = 1 + (prefill_slot_count(runtime_config) if first_append else 0)
+        # Only what the Stage 0 worker reads: the append identity and the PCM,
+        # and the runtime config (voice, persona) for the first append's prefill.
+        # The worker merges each update into the request's buffer.
+        duplex: dict[str, object] = {
+            "data_plane": True,
+            "session_id": fence.session_id,
+            "epoch": fence.epoch,
+            "seq": seq,
+            "payload": normalized_payload,
+        }
+        if first_append:
+            duplex["runtime_config"] = dict(runtime_config)
         return DuplexAppendPlan(
             prompt={
                 "prompt_token_ids": [0] * prompt_slots,
                 "model_intermediate_buffer": {
                     "request_id": request_id,
                     "global_request_id": [fence.session_id],
-                    "duplex": {
-                        "data_plane": True,
-                        "fence": fence,
-                        "session_id": fence.session_id,
-                        "epoch": fence.epoch,
-                        "turn_id": fence.turn_id,
-                        "seq": seq,
-                        "turn_seq": turn_seq,
-                        "mode": "append_audio_chunk",
-                        "payload": normalized_payload,
-                        "final": final,
-                        "session_config": dict(session_config),
-                        "runtime_config": dict(runtime_config),
-                        "scheduler_token_budget": prompt_slots,
-                    },
+                    "duplex": duplex,
                 },
             }
         )

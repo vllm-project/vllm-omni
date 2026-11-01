@@ -4,6 +4,7 @@
 import threading
 import uuid
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -361,3 +362,31 @@ def test_core_without_v1_adapter_fails_closed():
     core.scheduler = _CodecScheduler(requests={})
     with pytest.raises(RuntimeError, match="queue"):
         core.omni_flush_codec_prefix("epoch-one", 4)
+
+
+@pytest.mark.parametrize("readonly", [False, True])
+def test_batch_mapping_normalization_preserves_order_values_and_input(build_adapter, readonly):
+    adapter, connector = build_adapter(stage_id=0)
+    audio = torch.arange(8)
+    flat = {"codes.audio": audio, "meta.epoch": 2}
+    source = MappingProxyType(flat) if readonly else flat
+    received = []
+
+    def batch_processor(_adapter, outputs, _requests, _finished):
+        received.extend(outputs)
+        return [None]
+
+    adapter.custom_process_next_stage_input_batch_func = batch_processor
+    adapter.save_async_batch([{"multimodal_output": source, "request": _request(), "is_segment_finished": True}])
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert len(received) == 1
+    nested = received[0]
+    assert list(nested) == ["codes", "meta"]
+    assert nested["codes"]["audio"] is audio
+    assert nested["meta"] == {"epoch": 2}
+    assert list(source) == ["codes.audio", "meta.epoch"]
+    assert source["codes.audio"] is audio
+    assert source["meta.epoch"] == 2
+    connector.put.assert_called_once()
+    assert connector.put.call_args.kwargs["data"].meta.is_segment_finished.item() is True

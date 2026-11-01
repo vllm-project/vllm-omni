@@ -24,6 +24,12 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      # Opt in to the stateful streaming decoder on CUDA.
+      # New ICL reference lengths trigger lazy graph capture and may increase
+      # first-packet latency; warm up with representative references before measuring.
+      # Continuous incremental history differs from legacy window recomputation
+      # and may change WER. Validate quality on your workload before enabling.
+      decode_streaming: false
       talker_first_audio: true
       codec_streaming: true
       connector_get_sleep_s: 0.01
@@ -61,8 +67,10 @@ connectors:
       #     decode_chunk_frames + decode_left_context_frames (325 by default).
       #     Extra stateless shapes may be added (union, not intersection) with:
       #       decode_cudagraph_capture_sizes: [97, 400]
-      # Graph batch size defaults to 1. Add larger buckets only when needed:
-      #   decode_cudagraph_batch_sizes: [1, 2, 4]
+      # Graph batch size defaults to 1. Use [1, 2, 4] to cover batches up to
+      # decode_batch_max_size (B3 pads to B4). Extra buckets increase warmup
+      # time and graph memory for either backend.
+      # decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
 
@@ -86,6 +94,14 @@ stages:
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
+    # Serving-side runaway ceiling for requests without max_new_tokens:
+    # max(codec_budget_min_frames, codec_budget_frames_per_text_token *
+    # input text tokens) codec frames, capped by max_tokens below. Each key
+    # takes a number (all tasks) or a per-task mapping; a rate of 0 disables
+    # the ceiling. Defaults shown:
+    # additional_config:
+    #   codec_budget_frames_per_text_token: {Base: 12, CustomVoice: 40, VoiceDesign: 40}
+    #   codec_budget_min_frames: {Base: 192, CustomVoice: 400, VoiceDesign: 400}
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -154,5 +170,9 @@ platforms:
           cudagraph_mode: PIECEWISE
   xpu:
     model_runner: v1
+    stages:
+      - stage_id: 1
+        # Level Zero cannot capture the Code2Wav graph.
+        enforce_eager: true
   musa:
     model_runner: v1

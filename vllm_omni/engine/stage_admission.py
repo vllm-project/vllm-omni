@@ -23,12 +23,13 @@ profile/allocate interleaving is safe.
 ``OmniGPUWorkerBase.determine_available_memory`` reserves the profiled CUDA graph
 pool out of each stage's own budget while ``VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS``
 is on, so with that default ``capacity(g)·utilization(s)`` already covers the graphs
-the runner captures through ``cudagraph_dispatcher`` and the term below over-reserves
-for them. It remains the only cover for graphs captured after that profiling — the
-talker MTP graphs in ``GPUARModelRunner.capture_model`` and model
-``capture_auxiliary_graphs`` hooks — and for every graph when the estimate is
-disabled. It is an upper bound for those as long as post-profiling capture
-stays under ``_DEFAULT_GRAPH_RESERVE_BYTES``.
+the runner captures through ``cudagraph_dispatcher``, the talker MTP graphs and, on
+stages that size a KV cache, the graphs of models with both
+``capture_auxiliary_graphs`` and ``release_auxiliary_graphs``, and the term below
+over-reserves for them. It remains the only cover for graphs a model captures on its
+own after that profiling or on a stage without a KV cache, and for every graph when
+the estimate is disabled. It is an upper bound for those as long as post-profiling
+capture stays under ``_DEFAULT_GRAPH_RESERVE_BYTES``.
 
 The arithmetic (``evaluate``) is pure and unit-testable. Plan-walking
 (``check_admission``) takes injectable callables for device resolution and total

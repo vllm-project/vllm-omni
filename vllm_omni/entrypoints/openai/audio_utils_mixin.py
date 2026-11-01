@@ -52,16 +52,25 @@ def _float32_to_pcm16_bytes(audio: np.ndarray) -> bytes:
     Match libsndfile's clipped float32 -> int32 -> PCM16 conversion, including
     rounding at the int32 boundary before dropping its low 16 bits. Directly
     rounding or truncating audio * 32768 produces different output samples.
-    Build a C-contiguous temporary so planar stereo input is interleaved once.
+    Convert planar input in contiguous channel order, then interleave int16
+    samples so only the final, smaller buffer needs strided writes.
     """
-    scaled = np.fmax(audio, np.float32(-1), order="C")
+    planar = audio.ndim == 2 and not audio.flags.c_contiguous and audio.T.flags.c_contiguous
+    samples = audio.T if planar else audio
+    scaled = np.fmax(samples, np.float32(-1), order="C")
     # Largest float32 below 1 keeps the int32 conversion in range.
     np.minimum(scaled, np.float32(1 - 2**-24), out=scaled)
     scaled *= 2147483648.0
     np.rint(scaled, out=scaled)
     pcm32 = scaled.astype(np.int32)
     pcm32 >>= 16
-    return pcm32.astype("<i2").tobytes()
+    pcm16 = pcm32.astype("<i2")
+    if planar:
+        interleaved = np.empty(audio.shape, dtype="<i2")
+        for index, channel in enumerate(pcm16):
+            interleaved[:, index] = channel
+        pcm16 = interleaved
+    return pcm16.tobytes()
 
 
 class AudioMixin:

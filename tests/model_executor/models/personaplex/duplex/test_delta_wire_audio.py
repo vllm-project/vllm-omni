@@ -49,7 +49,7 @@ def _pcm_bytes(event: dict[str, object], response_format: str) -> bytes:
 
 @pytest.mark.parametrize("sessions", [1, 2])
 @pytest.mark.parametrize("response_format", ["pcm", "wav"])
-@pytest.mark.parametrize("finish", ["stop", "abort"])
+@pytest.mark.parametrize("finish", ["stop", "stop_audio", "abort"])
 @pytest.mark.parametrize("layout", ["flat", "strided_row"])
 def test_wire_to_encoded_audio_preserves_interleaved_streams(sessions, response_format, finish, layout):
     processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False, output_modality=OutputModality.AUDIO)
@@ -102,16 +102,29 @@ def test_wire_to_encoded_audio_preserves_interleaved_streams(sessions, response_
             aborted, outputs = processor.abort_requests_collecting_outputs([state.request_id], internal=True)
             assert aborted == [state.request_id]
         else:
+            terminal_audio = None
+            if finish == "stop_audio":
+                # A true final DELTA may still carry PCM. It must not replay
+                # the earlier segment chunks when the processor consolidates.
+                pcm16 = torch.arange(-960, 960, dtype=torch.int16)
+                expected[state.request_id].append(pcm16.numpy().astype("<i2").tobytes())
+                terminal_audio = {"model_outputs": pcm16.float() / 32768, "sr": torch.tensor(24000)}
             terminal = OmniEngineCoreOutput(
                 request_id=state.request_id,
                 new_token_ids=[],
                 finish_reason=FinishReason.STOP,
+                multimodal_output=terminal_audio,
             )
             decoded = decoder.decode(encoder.encode(OmniEngineCoreOutputs(outputs=[terminal])))
             outputs = processor.process_outputs(decoded.outputs).request_outputs
         assert state.request_id not in processor.request_states
         terminal_events = list(projector.project({"data_plane_outputs": outputs}, context=context))
-        assert terminal_events == []
+        if finish == "stop_audio":
+            assert len(terminal_events) == 1
+            assert terminal_events[0]["audio_duration_ms"] == 80
+            actual[state.request_id].append(_pcm_bytes(terminal_events[0], response_format))
+        else:
+            assert terminal_events == []
         assert b"".join(actual[state.request_id]) == b"".join(expected[state.request_id])
         projector.close_stream(state.request_id)
 

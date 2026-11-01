@@ -8,6 +8,7 @@ import pytest
 import torch
 from vllm.config import VllmConfig
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from tests.core.test_prefix_cache import make_manager, run_step
 from vllm_omni.config.model import OmniModelConfig
@@ -30,14 +31,31 @@ class _PostSampleModel(torch.nn.Module):
         self.post_sample_talker_mtp = hook
 
 
-def test_sampled_append_identity_is_fixed_before_model_hook():
+def _runner(*request_ids: str) -> GPUARModelRunner:
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.requests = {
+        request_id: CachedRequestState(
+            req_id=request_id,
+            prompt_token_ids=[],
+            mm_features=[],
+            sampling_params=None,
+            generator=None,
+            block_ids=([],),
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+        for request_id in request_ids
+    }
+    return runner
+
+
+def test_sampled_append_identity_is_fixed_before_model_hook():
+    runner = _runner("live", "plain", "prefill")
     duplex = {"data_plane": True, "epoch": 2, "seq": 4}
     runner.model_intermediate_buffer = {
         "live": {"duplex": duplex},
         "prefill": {"duplex": {"data_plane": True, "epoch": 3, "seq": 5}},
     }
-    runner._update_intermediate_buffer = lambda *_: None
 
     def hook(**kwargs):
         assert kwargs["req_ids"] == ["live"]
@@ -57,11 +75,12 @@ def test_sampled_append_identity_is_fixed_before_model_hook():
     assert [value.tolist() for value in result["meta"]["duplex_generated_seq"]] == [[4], [0], [0]]
     assert result["codes"]["audio"][0].shape == (1, 8)
     assert result["codes"]["audio"][2].numel() == 0
+    assert runner.requests["live"].additional_information_cpu is runner.model_intermediate_buffer["live"]
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
 def test_invalid_or_unsampled_rows_never_publish_generation_identity(mocker, async_scheduling):
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner = _runner("r")
     runner.use_async_scheduling = async_scheduling
     runner.model_intermediate_buffer = {"r": {"duplex": {"data_plane": True, "epoch": 2, "seq": 4}}}
     hook = mocker.Mock()
@@ -80,9 +99,8 @@ def test_invalid_or_unsampled_rows_never_publish_generation_identity(mocker, asy
 
 @pytest.mark.parametrize("identity", [{}, {"epoch": 1}, {"epoch": -1, "seq": 2}, {"epoch": 2, "seq": 0}])
 def test_missing_or_uncommitted_identity_preserves_existing_metadata(identity):
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner = _runner("r")
     runner.model_intermediate_buffer = {"r": {"duplex": {"data_plane": True, **identity}}}
-    runner._update_intermediate_buffer = lambda *_: None
     runner.model = _PostSampleModel(lambda **_: torch.arange(8).reshape(1, 8))
     result = runner._run_post_sample_talker_mtp(
         req_ids=["r"],
@@ -110,12 +128,11 @@ def test_generation_identity_survives_client_metadata_partition_without_codec_ro
 
 @pytest.mark.parametrize("prefix_cache", [False, True])
 def test_batched_worker_payload_and_wire_keep_generation_identity_per_request(prefix_cache):
-    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner = _runner("a", "b")
     runner.model_intermediate_buffer = {
         "a": {"duplex": {"data_plane": True, "epoch": 2, "seq": 4}},
         "b": {"duplex": {"data_plane": True, "epoch": 3, "seq": 7}},
     }
-    runner._update_intermediate_buffer = lambda *_: None
     runner.model = _PostSampleModel(lambda **_: torch.arange(16).reshape(2, 8))
     # This payload test needs only the output-type field, not a model-hub
     # lookup or a fully initialized serving configuration.

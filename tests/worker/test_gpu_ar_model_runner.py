@@ -5,11 +5,12 @@ import asyncio
 import copy
 import re
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
+from threading import Barrier, Event, get_ident
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -51,8 +52,8 @@ def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -
     return runner
 
 
-def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, object]]:
-    received: dict[str, object] = {}
+def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, Any]]:
+    received: dict[str, Any] = {}
 
     def post_sample_talker_mtp(*, input_ids, hidden_states, req_ids, req_infos):
         received.update(
@@ -215,6 +216,25 @@ def test_post_sample_talker_mtp_rejects_invalid_selected_token_shape(
         )
 
 
+def test_post_sample_talker_mtp_before_bookkeeping_gathers_the_kept_rows() -> None:
+    runner, received = _mtp_runner(
+        async_scheduling=False,
+        buffers={"discarded-prefill": {"duplex": {"data_plane": True}}, "ready": {"duplex": {"data_plane": True}}},
+    )
+    multimodal = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["discarded-prefill", "ready"],
+        valid_sampled_token_ids=None,
+        sampled_token_ids=torch.tensor([[101], [102]], dtype=torch.long),
+        invalid_req_indices=[0],
+        sample_hidden_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        multimodal_outputs=None,
+    )
+    assert received["req_ids"] == ["ready"] and received["input_ids"].tolist() == [102]
+    assert received["hidden_states"].tolist() == [[3.0, 4.0]]
+    assert multimodal["codes"]["audio"][1].tolist() == [[11, 12, 13]] and multimodal["codes"]["audio"][0].numel() == 0
+
+
 def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatch):
     requested = {"temperature": 0.7, "top_p": 0.8, "top_k": 17}
     request = OpenAICreateSpeechRequest.model_validate(
@@ -250,7 +270,6 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     serving.model_config = SimpleNamespace(async_chunk=True)
     serving._tts_model_type = "higgs_audio_v3"
     serving._get_tts_adapter = lambda: Adapter()
-    serving._track_ref_audio_artifact_warmup = lambda *args, **kwargs: None
     serving._speech_output_policies = {}
 
     _, stage_sampling_params, _ = asyncio.run(serving._prepare_speech_generation(request, request_id="speech-test"))
@@ -264,7 +283,6 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
         device=torch.device("cpu"),
         vocab_size=1024,
         block_sizes=[1],
-        kernel_block_sizes=[1],
         # vLLM 0.26: one entry per KV cache group; max_model_len=8 with
         # block_sizes=[1] means one group of 8 blocks.
         max_num_blocks_per_req=[8],
@@ -293,6 +311,8 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     runner.input_batch = input_batch
+    runner.requests = {}
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
@@ -479,24 +499,19 @@ def test_omni_async_gpu_model_runner_output_builds_lazily_once():
 
 def test_omni_async_gpu_model_runner_output_reraises_background_exception():
     async_output = object.__new__(OmniAsyncGPUModelRunnerOutput)
-    joined = []
-
-    class FakeThread:
-        def join(self):
-            joined.append("join")
-
-    async_output._background_thread = FakeThread()
-    async_output._background_exception = RuntimeError("background failed")
+    async_output._background_future = Future()
+    async_output._background_future.set_exception(RuntimeError("background failed"))
 
     with pytest.raises(RuntimeError, match="background failed"):
         async_output.get_output()
 
-    assert joined == ["join"]
-    assert async_output._background_thread is None
+    with pytest.raises(RuntimeError, match="background failed"):
+        async_output.get_output()
 
 
 def _make_async_output_runner(engine_output_type: str = "audio"):
     runner = object.__new__(GPUARModelRunner)
+    runner._omni_output_executor = None
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     model_config = SimpleNamespace(
@@ -689,10 +704,17 @@ def test_async_omni_output_guard_requires_safe_conditions():
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
 
-def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
+@pytest.mark.parametrize("ming3", [False, True])
+def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch, ming3):
     runner = _make_async_output_runner(engine_output_type="latent")
-    runner.model.omni_pooler_payload_include_hidden = False
-    runner._pooler_payload_include_hidden_flag = False
+    if ming3:
+        from vllm_omni.model_executor.models.ming3_audio.ming3_audio import BailingMoeV3AudioForConditionalGeneration
+
+        runner.model = BailingMoeV3AudioForConditionalGeneration
+        runner._pooler_payload_include_hidden_flag = getattr(runner.model, "omni_pooler_payload_include_hidden", True)
+    else:
+        runner.model.omni_pooler_payload_include_hidden = False
+        runner._pooler_payload_include_hidden_flag = False
 
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -731,6 +753,46 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
     assert "hidden" not in output.inter_stage_outputs[0]
     assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], torch.tensor([[7, 8], [9, 10]], dtype=torch.long))
     assert output.multimodal_outputs is None
+
+
+def test_build_omni_output_serves_live_hidden_for_a_step_the_cache_did_not_save(monkeypatch):
+    """A buffered decode step has no cache step id: its payload carries the
+    live rows, exactly like a stage without the cache."""
+    runner = _make_async_output_runner(engine_output_type="latent")
+
+    runner.omni_prefix_cache = Mock()
+    monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
+    monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
+    monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
+
+    hidden = torch.tensor([[1.0, 1.5], [2.0, 2.5]])
+    output = GPUARModelRunner._build_omni_model_runner_output_from_snapshot(
+        runner,
+        scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2, num_scheduled_tokens={"r1": 1, "r2": 1}),
+        hidden_states=hidden,
+        staged_hidden_states_cpu=None,
+        multimodal_outputs=None,
+        req_ids_output_copy=["r1", "r2"],
+        req_id_to_index_output_copy={"r1": 0, "r2": 1},
+        valid_sampled_token_ids=[[11], [12]],
+        logprobs_lists=None,
+        prompt_logprobs_dict={},
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+        kv_extracted_req_ids=None,
+        num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
+        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
+        prefix_cache_step_id=None,
+    )
+
+    runner.omni_prefix_cache.materialize.assert_not_called()
+    runner.omni_prefix_cache.discard_step.assert_not_called()
+    assert output.inter_stage_outputs is not None
+    for payload, row in zip(output.inter_stage_outputs, hidden):
+        assert torch.equal(payload["hidden"], row.unsqueeze(0))
 
 
 def test_build_omni_output_splits_mm_by_scheduled_tokens_when_hidden_is_tail_only(monkeypatch):
@@ -888,6 +950,7 @@ def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
 def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch, query_start_loc_attr):
     runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace()
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     runner.execute_model_state = ExecuteModelState(
@@ -906,6 +969,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         None,
         {},
         None,
+        prefix_cache_step_id=7,
     )
     runner.kv_connector_output = None
     runner.input_batch = SimpleNamespace(
@@ -1318,6 +1382,7 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
         kv_extracted_req_ids=None,
         num_scheduled_tokens_np=np.array([1, 1, 1], dtype=np.int32),
         query_start_loc_cpu=torch.tensor([0, 1, 2], dtype=torch.long),
+        prefix_cache_step_id=7,
     )
 
     assert torch.equal(output.inter_stage_outputs[0]["codes.audio"], combined_mm["codes.audio"]["r1"])
@@ -1751,7 +1816,7 @@ class TestMergeModelKvTransferMetadata:
                 return {"talker_codes": [7], "seen_tokens": num_computed_tokens}
 
         original_meta = {"a": 1}
-        original = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
+        original: dict[str, dict[str, Any]] = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
         runner = self._runner_with_model(_Model())
 
         merged = runner._merge_model_kv_transfer_metadata(original)
@@ -1799,6 +1864,7 @@ class TestDownstreamPayloadMemoization:
 
     def _runner(self, stages):
         runner = object.__new__(GPUARModelRunner)
+        runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
         runner._downstream_payload_cache = {}
         runner._request_final_stage_id = lambda rid: stages[rid]
         return runner
@@ -1859,6 +1925,7 @@ class TestPreferModelSamplerNoneFallback:
 
     def _runner(self, model_sample_result, default_result):
         runner = object.__new__(GPUARModelRunner)
+        runner.requests = {}
         runner.input_batch = SimpleNamespace(
             sampling_metadata="smd",
             update_async_output_token_ids=lambda: None,
@@ -2092,7 +2159,7 @@ def test_token_only_output_keeps_prefix_cache_merge(token_only_builder, mocker):
     merge = mocker.patch.object(
         runner, "_prepare_prefix_cache_pooler_payload_sources", return_value=(None, None, cached)
     )
-    output = runner._build_omni_model_runner_output_from_snapshot(**kwargs)
+    output = runner._build_omni_model_runner_output_from_snapshot(**kwargs, prefix_cache_step_id=7)
 
     merge.assert_called_once()
     assert output.inter_stage_outputs[0]["codes.audio"].tolist() == [31]
@@ -2175,6 +2242,7 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
         async_copy_ready_event=object(),
     )
     constructor = mocker.patch.object(gpu_ar_model_runner, "OmniAsyncGPUModelRunnerOutput", return_value=async_output)
+    runner._omni_output_executor = None
 
     assert runner.sample_tokens(None) is async_output
     runner.query_start_loc.cpu.fill_(99)
@@ -2188,3 +2256,107 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
     assert output.req_id_to_index == {"r1": 0, "r2": 1}
     torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
     torch.testing.assert_close(output.inter_stage_outputs[1]["hidden"], hidden[1:])
+
+
+def test_shutdown_drops_cached_sampled_token_override(mocker):
+    """The cached bound model method must not keep the model alive after shutdown."""
+    runner = object.__new__(GPUARModelRunner)
+    runner.omni_prefix_cache = None
+    runner._sampled_token_ids_cpu_override = mocker.Mock()
+    mocker.patch.object(runner, "_clear_duplex_sampling")
+    upstream = mocker.patch.object(gpu_ar_model_runner.OmniGPUModelRunner, "shutdown")
+
+    runner.shutdown()
+
+    assert runner._sampled_token_ids_cpu_override is None
+    upstream.assert_called_once()
+
+
+def test_async_output_reuses_worker_and_survives_builder_failure(mocker):
+    mocker.patch.object(torch.cuda, "current_stream", return_value=Mock())
+    mocker.patch.object(torch.cuda, "stream", side_effect=lambda stream: nullcontext())
+    mocker.patch.object(torch, "Event", side_effect=Mock)
+    device = mocker.patch.object(torch.cuda, "set_device")
+    order = []
+    threads = []
+    started, release = Event(), Event()
+
+    def builder(index):
+        threads.append(get_ident())
+        order.append(index)
+        if index == 0:
+            started.set()
+            assert release.wait(5)
+        if index == 1:
+            raise RuntimeError("failed step")
+        return OmniModelRunnerOutput(req_ids=[str(index)], req_id_to_index={str(index): 0})
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        outputs = []
+        try:
+            for index in range(3):
+                outputs.append(
+                    OmniAsyncGPUModelRunnerOutput(
+                        model_runner_output_builder=lambda index=index: builder(index),
+                        output_executor=executor,
+                        cuda_device="cuda:0",
+                        sampled_token_ids=torch.tensor([[7]]),
+                        logprobs_tensors=None,
+                        invalid_req_indices=[],
+                        async_output_copy_stream=Mock(),
+                        vocab_size=10,
+                    )
+                )
+            assert started.wait(5)
+            assert order == [0]
+        finally:
+            release.set()
+        assert outputs[0].get_output().sampled_token_ids == [[7]]
+        with pytest.raises(RuntimeError, match="failed step"):
+            outputs[1].get_output()
+        assert outputs[2].get_output().req_ids == ["2"]
+        with pytest.raises(RuntimeError, match="failed step"):
+            outputs[1].get_output()
+    assert order == [0, 1, 2]
+    assert len(set(threads)) == 1
+    assert threads[0] != get_ident()
+    assert device.call_count == 3
+
+
+def test_shutdown_drains_output_builder_before_releasing_runner_state(mocker):
+    runner = object.__new__(GPUARModelRunner)
+    runner.omni_prefix_cache = None
+    runner._omni_output_executor = ThreadPoolExecutor(max_workers=1)
+    started, release = Event(), Event()
+    order = []
+
+    def build():
+        started.set()
+        assert release.wait(5)
+        order.append("built")
+
+    runner._omni_output_executor.submit(build)
+    draining = Event()
+    shutdown_executor = runner._omni_output_executor.shutdown
+
+    def drain(**kwargs):
+        draining.set()
+        shutdown_executor(**kwargs)
+
+    mocker.patch.object(runner._omni_output_executor, "shutdown", side_effect=drain)
+    mocker.patch.object(runner, "_clear_duplex_sampling", side_effect=lambda: order.append("clear"))
+    mocker.patch.object(
+        gpu_ar_model_runner.OmniGPUModelRunner, "shutdown", side_effect=lambda: order.append("shutdown")
+    )
+    with ThreadPoolExecutor(max_workers=1) as closer:
+        try:
+            assert started.wait(5)
+            stopped = closer.submit(runner.shutdown)
+            assert draining.wait(5)
+            assert not stopped.done()
+            assert order == []
+        finally:
+            release.set()
+        stopped.result(timeout=5)
+    assert order == ["built", "clear", "shutdown"]
+    assert runner._omni_output_executor is None

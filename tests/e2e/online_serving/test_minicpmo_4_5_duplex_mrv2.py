@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Real-weight MRv2 duplex concurrency guard, additional to the V1 CI jobs."""
+"""Real-weight duplex concurrency guard for CUDA MRv2 and ROCm V1 fallback."""
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -29,8 +30,12 @@ _SERVER = OmniServerParams(
     server_args=["--trust-remote-code"],
 )
 
+# ``minicpmo_4_5_duplex_mrv2.yaml`` opts CUDA into MRv2, while its production
+# platform override deliberately resolves every ROCm stage to V1. The AMD READY
+# lane executes the resolver contract before selecting these real-weight cases.
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
 @pytest.mark.parametrize("sessions", [1, 2, 4])
 def test_mrv2_duplex_overlapping_turns(omni_server, tmp_path: Path, sessions: int):
@@ -43,22 +48,31 @@ def test_mrv2_duplex_overlapping_turns(omni_server, tmp_path: Path, sessions: in
     )
     args.sessions = sessions
     args.turns = 2
-    args.turn_duration_ms = [args.first_turn_ms] * args.turns
+    # Keep the complete response-required utterance. The 1.4 s active slice
+    # can end mid-utterance, so the native policy may legitimately keep listening.
+    args.turn_duration_ms = [0] * args.turns
+    # Native model turns need not map one-to-one to physical input commits.
+    # Still require a completed text/audio answer for each input, and drain
+    # and acknowledge any additional model responses before the next input.
+    args.allow_extra_responses = True
     args.synchronized_start = True
     args.disconnect_session_index = None
     args.takeover_session_index = None
     result = asyncio.run(run_multi_session(args))
-    assert result["ok"] is True, result
+    assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["session_count"] == sessions
     assert result["identity_isolation_ok"] is True
     assert not result["failures"]
-    for session in result["sessions"]:
+    session_results = result["sessions"]
+    assert isinstance(session_results, list), result
+    for session in session_results:
         assert session["audio_delta_count"] > 0, session
-        assert session["done_count"] == args.turns, session
+        assert session["done_count"] >= args.turns, session
+        assert session["turn_outcomes"] == ["speak"] * args.turns, session
         assert session["error_count"] == 0, session
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
 def test_mrv2_duplex_new_session_during_long_response(omni_server):
     # Unequal prompts and a delayed second session prevent identical clients
@@ -90,7 +104,7 @@ def test_mrv2_duplex_new_session_during_long_response(omni_server):
     assert str(first["transcript"]).strip() != str(second["transcript"]).strip()
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", [pytest.param(_SERVER, id="mrv2-real-weights")], indirect=True)
 def test_mrv2_duplex_server_answers_image_chat_from_the_image(omni_server, openai_client):
     """The duplex Thinker also serves /v1/chat/completions: its image features must reach the prompt."""

@@ -15,7 +15,7 @@ selected by `PipelineConfig.duplex_plugin`. The serving path is:
        plugin.plan_append: one 80 ms frame -> one resumable Stage 0 append
   -> PersonaPlex Talker (Stage 0, lockstep temporal transformer + depformer)
   -> streaming PersonaPlex Code2Wav (Stage 1, Mimi)
-  -> plugin.data_plane: PCM DELTA + cumulative text -> wire deltas
+  -> plugin.data_plane: DELTA audio passed through, cumulative text sliced -> deltas
   -> response.output_audio.delta + response.output_audio_transcript.delta
 ```
 
@@ -132,9 +132,12 @@ it still uses synthetic stage output and a recording socket.
 
 Engine policy:
 
-- `configure_sampling_params`: clone Stage 0 defaults and select greedy
-  sampling (`temperature=0`, `top_k=1`, `max_tokens=1`); clone Stage 1 defaults
-  and select PCM DELTA output. Original defaults remain unchanged.
+- `configure_sampling_params`: Stage 0 greedy (`temperature=0`, `top_k=1`,
+  `max_tokens=1`); the final stage (Code2Wav) gets
+  `output_kind=RequestOutputKind.DELTA` on a clone of its defaults. Any stage
+  in between is untouched. The Code2Wav request lives for the whole session,
+  and CUMULATIVE output would make the output processor re-concatenate every
+  earlier waveform on each 80 ms frame.
 - `plan_append`: validates exactly one 1920-sample 24 kHz `pcm_f32le` frame
   (through `model_executor/common/duplex/payload.py`) and reserves one
   scheduler slot per frame plus, on the first append of an epoch (`seq == 1`),
@@ -231,19 +234,36 @@ aborted scheduler request resets and returns only that session's encoder.
 
 ### Stage 1 streaming decoder
 
-`PersonaPlexCode2Wav` runs eager (`enforce_eager: true` in the deploy) and
-maintains an independent streaming Mimi decoder for every active request,
-keyed by the Stage 1 request id and released by `on_requests_finished`. Each
-Stage 0 segment emits de-delayed agent codebooks; Stage 1 decodes only the new
-code frames and emits only the new PCM suffix. Connector chunk boundaries
-retain the final raw code frame needed to de-delay the next chunk.
+`PersonaPlexCode2Wav` serves every session from one shared streaming Mimi
+decoder with one row per session plus a scratch row for a request without an
+id. A Stage 1 request id leases a row on its first chunk, and
+`on_requests_finished` resets and releases it. Each Stage 0 segment emits
+de-delayed agent codebooks; Stage 1 decodes only the new code frames, one
+`decode_frame` call per frame index across all rows, and emits only the new PCM
+suffix. The stage keeps `enforce_eager: true`, since vLLM's own capture records
+nothing for it; with `mimi_cuda_graphs` in its `hf_overrides` each
+`decode_frame` call replays a CUDA graph captured at load. Stage 1 keeps Mimi
+weights in float32 and, by default (`mimi_decode_tf32`), enables TF32 for
+decoder GEMMs before that capture. Connector chunk boundaries retain the
+final raw code frame needed to de-delay the next chunk.
 
 ### Data-plane projector
 
-`PersonaPlexDataPlaneSession` specializes `CumulativeAudioTextDataPlane` with
-a 24 kHz default rate and consumes Stage 1 PCM deltas and cumulative text.
-The framework retains request lifetime and terminal-state management, while
-the model projector yields one internal result per new PCM emission:
+`PersonaPlexDataPlaneSession` is the `CumulativeAudioTextDataPlane` of
+`model_executor/common/duplex/data_plane.py` with a 24 kHz default rate and
+`audio_output_is_delta = True`. Because Code2Wav runs with DELTA output, each
+Stage 1 output already carries only the new audio, so the projector passes it
+through instead of slicing it against a sample cursor. In DELTA mode the
+output processor does not consolidate, so audio from several engine steps can
+arrive together as a list of chunks; the projector joins them into one
+waveform before it counts and encodes the samples.
+
+Text keeps the cumulative path: one text cursor per request, and only the new
+suffix is emitted. Stage 1 runs with `skip_tokenizer_init` and its outputs
+carry only `model_outputs` and `sr`, so in practice the text is empty and no
+transcript deltas are sent. The PersonaPlex specialization retains sample totals and commits both audio
+and transcript cursors only after successful encoding. Delivery ledgers remain
+owned by the session runner. It yields one internal result per new chunk:
 
 ```python
 {
@@ -319,8 +339,8 @@ and `session.resume` are rejected on this model.
   restart and late finish of a superseded request.
 - `tests/engine/duplex/test_session_runner_personaplex.py`: the session
   runner with the real plugin -- one submission per frame, prefill on the
-  first append only, half frames buffered, wrong rate refused, Code2Wav PCM
-  DELTA and cumulative text projected as 24 kHz wire deltas, cancel restarting the epoch,
+  first append only, half frames buffered, wrong rate refused, DELTA
+  Code2Wav output passed through as 24 kHz deltas, cancel restarting the epoch,
   close aborting the request.
 - `tests/model_executor/executor_common/`: the shared toolbox (PCM helpers, payload
   validation, fixed-frame buffer, cumulative data plane, request-output

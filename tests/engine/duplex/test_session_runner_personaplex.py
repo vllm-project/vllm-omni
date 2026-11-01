@@ -7,8 +7,8 @@ Same harness as ``test_session_runner.py`` (recording stage port, typed
 commands through the manager, stage outputs pushed by hand), plugin swapped:
 this pins the lockstep contract -- one Stage 0 submission per 80 ms frame,
 prefill slots only on the first append of an epoch, auto-response implied by
-``supports_client_commit=False``, cumulative Code2Wav output projected as
-24 kHz deltas, and a cancel restarting the epoch.
+``supports_client_commit=False``, DELTA Code2Wav output passed through as
+24 kHz audio deltas, and a cancel restarting the epoch.
 """
 
 from __future__ import annotations
@@ -107,7 +107,10 @@ def frame(samples: int = FRAME_SIZE, *, value: float = 0.05) -> commands.AppendA
 
 
 def code2wav_output(request_id: str, *, samples: int, text: str) -> SimpleNamespace:
-    """A cumulative Stage 1 (Code2Wav) output the way the orchestrator hands it to the runner."""
+    """A DELTA Stage 1 (Code2Wav) output the way the orchestrator hands it to the runner.
+
+    ``samples`` is the new chunk only; ``text`` stays cumulative.
+    """
     return SimpleNamespace(
         request_id=request_id,
         finished=False,

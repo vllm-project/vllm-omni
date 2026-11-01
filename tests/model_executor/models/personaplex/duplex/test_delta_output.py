@@ -4,6 +4,7 @@
 
 import numpy as np
 import pytest
+import torch
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
@@ -54,14 +55,14 @@ def _project(plane, output):
 
 @pytest.mark.parametrize("kind", list(RequestOutputKind))
 @pytest.mark.parametrize("skip_clone", [False, True])
-def test_stage1_delta_selection_isolated_from_sampling_defaults(kind, skip_clone):
+def test_final_stage_delta_selection_isolated_from_sampling_defaults(kind, skip_clone):
     plugin = PersonaPlexDuplexPlugin(_Sink().encode)
-    defaults = (SamplingParams(), SamplingParams(output_kind=kind, skip_clone=skip_clone), object())
+    defaults = (SamplingParams(), object(), SamplingParams(output_kind=kind, skip_clone=skip_clone))
     configured = plugin.configure_sampling_params(runtime_config={}, defaults=defaults)
-    assert configured[1].output_kind == RequestOutputKind.DELTA
-    assert configured[1] is not defaults[1]
-    assert defaults[1].output_kind == kind
-    assert configured[2] is defaults[2]
+    assert configured[-1].output_kind == RequestOutputKind.DELTA
+    assert configured[-1] is not defaults[-1]
+    assert defaults[-1].output_kind == kind
+    assert configured[1] is defaults[1]
 
 
 @pytest.mark.parametrize("defaults", [(), (object(),), (object(), object())])
@@ -116,14 +117,20 @@ def test_empty_pcm_does_not_encode_header_only_wav_and_retains_text():
     assert calls == []
 
 
-def test_deferred_audio_chunks_are_coalesced_within_an_emission_only():
+@pytest.mark.parametrize("container", [list, tuple])
+@pytest.mark.parametrize("tensor_chunks", [False, True])
+def test_deferred_audio_chunks_are_coalesced_within_an_emission_only(container, tensor_chunks):
     sink = _Sink()
     plane = PersonaPlexDataPlaneSession(sink.encode)
     chunks = [np.full(960, 0.25, dtype=np.float32), np.ones(1920, dtype=np.float32)]
+    expected = np.concatenate(chunks)
+    if tensor_chunks:
+        chunks = [torch.from_numpy(chunk) for chunk in chunks]
+    chunks = container(chunks)
     for _ in range(2):
         [event] = _project(plane, _output("req", chunks))
         assert event["audio_duration_ms"] == 120
-        np.testing.assert_array_equal(sink.chunks[-1], np.concatenate(chunks))
+        np.testing.assert_array_equal(sink.chunks[-1], expected)
     assert len(sink.chunks) == 2
 
 

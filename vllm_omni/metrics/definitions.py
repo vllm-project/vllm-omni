@@ -133,6 +133,10 @@ VLLM_TTFT_MS = "vllm_ttft_ms"
 VLLM_TPOT_MS = "vllm_tpot_ms"
 VLLM_ITL_MS = "vllm_itl_ms"
 VLLM_ITLS_MS = "vllm_itls_ms"
+VLLM_QUEUED_MS = "vllm_queued_ms"
+VLLM_PREFILL_MS = "vllm_prefill_ms"
+VLLM_DECODE_MS = "vllm_decode_ms"
+VLLM_NUM_PREEMPTIONS = "vllm_num_preemptions"
 NUM_TOKENS_IN = "num_tokens_in"
 NUM_TOKENS_OUT = "num_tokens_out"
 AUDIO_SAMPLE_RATE = "audio_sample_rate"
@@ -153,6 +157,11 @@ REQUESTS_SUCCESS = METRIC_PREFIX + "requests_success"
 # Token counters — aggregated across all pipeline stages per request.
 PROMPT_TOKENS = METRIC_PREFIX + "prompt_tokens"
 GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
+
+# Session placement families are registered only when the opt-in policy emits.
+DUPLEX_RESERVED_SESSIONS = METRIC_PREFIX + "duplex_reserved_sessions"
+DUPLEX_ADMISSION_REJECTED = METRIC_PREFIX + "duplex_admission_rejected"
+DUPLEX_ADMISSION_REJECT_REASONS = frozenset({"global_capacity_exhausted", "replica_capacity_exhausted", "unknown"})
 
 
 # ============================================================================
@@ -215,6 +224,13 @@ DENOISE_STEP_LATENCY_S = METRIC_PREFIX + DENOISE_STEP_LATENCY + "_s"
 DIFFUSION_KV_LOAD_S = METRIC_PREFIX + "diffusion_kv_load_s"
 IMAGE_TTFP_S = METRIC_PREFIX + "image_ttfp_s"
 STAGE_IN_QUEUE_S = METRIC_PREFIX + "stage_in_queue_s"
+
+
+# ============================================================================
+# Generation-stage post-warmup memory family (per-stage + per-replica)
+# ============================================================================
+STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES = METRIC_PREFIX + "stage_post_warmup_memory_allocated_bytes"
+STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES = METRIC_PREFIX + "stage_post_warmup_memory_reserved_bytes"
 
 
 # ============================================================================

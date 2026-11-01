@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
-import numpy as np
-
 from vllm_omni.engine.duplex.plugin import DuplexDataPlaneContext
-from vllm_omni.model_executor.common.duplex.data_plane import CumulativeAudioTextDataPlane, _RequestCursor
+from vllm_omni.model_executor.common.duplex.data_plane import (
+    CumulativeAudioTextDataPlane,
+    _join_audio_chunks,
+    _RequestCursor,
+)
 from vllm_omni.model_executor.common.request_outputs import (
     audio_sample_count,
     audio_value,
@@ -30,6 +32,8 @@ class PersonaPlexDataPlaneSession(CumulativeAudioTextDataPlane):
     """
 
     default_sample_rate_hz = SAMPLE_RATE
+    # The plugin runs Code2Wav with DELTA output (see configure_sampling_params).
+    audio_output_is_delta = True
 
     def _project_output(self, output: object, *, context: DuplexDataPlaneContext) -> dict[str, object] | None:
         output, completion = unwrap_request_output(output)
@@ -38,12 +42,7 @@ class PersonaPlexDataPlaneSession(CumulativeAudioTextDataPlane):
             request_id = None
         state = self._requests.setdefault(request_id, _RequestCursor()) if request_id is not None else _RequestCursor()
         multimodal = multimodal_output(output, completion)
-        audio = audio_value(multimodal)
-        if isinstance(audio, list):
-            # Coalesce only this emission's deferred CPU chunks, never history.
-            audio = (
-                np.concatenate([np.asarray(chunk, dtype=np.float32).reshape(-1) for chunk in audio]) if audio else None
-            )
+        audio = _join_audio_chunks(audio_value(multimodal))
         samples = audio_sample_count(audio) or 0
         text = text_value(multimodal, completion)
         delta_text = text_delta(text, state.text)

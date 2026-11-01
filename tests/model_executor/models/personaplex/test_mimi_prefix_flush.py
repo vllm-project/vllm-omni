@@ -34,6 +34,7 @@ from tests.engine.duplex.test_audio_drain_transport import transport as _transpo
 from tests.engine.duplex.test_session_runner_personaplex import code2wav_output, frame
 from tests.engine.test_codec_prefix_flush import _CodecTransferState, _manager, _request
 from tests.entrypoints.duplex.test_audio_send_completion import _next_audio
+from tests.helpers.mark import hardware_marks
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.data_entry_keys import OmniPayloadStruct
 from vllm_omni.engine.duplex import commands
@@ -71,7 +72,10 @@ def _mimi_reference_precision(device: str) -> Generator[None, None, None]:
 
 @pytest.fixture(
     scope="module",
-    params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)],
+    params=[
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ],
 )
 def weighted_decoder(
     request: pytest.FixtureRequest,

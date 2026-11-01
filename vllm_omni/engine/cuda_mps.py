@@ -34,24 +34,34 @@ def physical_gpu_uuid(device: str) -> str:
         nvml.nvmlShutdown()
 
 
+def resolve_operator_pipe_directory(pipe_directory: str | None) -> str | None:
+    """None inherits the parent; an explicit empty value selects a private daemon."""
+    return (os.environ.get("CUDA_MPS_PIPE_DIRECTORY") if pipe_directory is None else pipe_directory) or None
+
+
+class CudaMPSUnavailableError(RuntimeError):
+    """MPS cannot be used on this host; any private daemon has been cleaned up."""
+
+
 class CudaMPSServer:
     """Own a private control socket; never stop an operator's existing daemon."""
 
     def __init__(self, gpu_uuid: str, *, pipe_directory: str | None = None) -> None:
         control = shutil.which("nvidia-cuda-mps-control")
         if control is None:
-            raise RuntimeError("cuda_mps requires nvidia-cuda-mps-control on PATH")
+            raise CudaMPSUnavailableError("cuda_mps requires nvidia-cuda-mps-control on PATH")
         self._control = control
         self._directory: Path | None = None
         self._closed = False
-        # None inherits the parent; an explicit empty stage value selects a
-        # private daemon even when the parent names an operator-managed one.
-        self.operator_pipe_directory = (
-            os.environ.get("CUDA_MPS_PIPE_DIRECTORY") if pipe_directory is None else pipe_directory
-        ) or None
+        self.operator_pipe_directory = resolve_operator_pipe_directory(pipe_directory)
         if self.operator_pipe_directory:
             self.env = {"CUDA_MPS_PIPE_DIRECTORY": self.operator_pipe_directory, "CUDA_VISIBLE_DEVICES": gpu_uuid}
-            self._run(input="get_server_list\n")
+            try:
+                self._run(input="get_server_list\n")
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise CudaMPSUnavailableError(
+                    f"operator-managed MPS at {self.operator_pipe_directory} is not reachable: {exc}"
+                ) from exc
             logger.info("Using operator-managed MPS at %s for %s", self.operator_pipe_directory, gpu_uuid)
             return
 
@@ -66,13 +76,18 @@ class CudaMPSServer:
         try:
             self._run("-d")
             self._run(input="get_server_list\n")
-        except BaseException:
+        except BaseException as exc:
             # A failed/timed-out launcher may already have forked the daemon.
             # Always address our private socket; keep it if cleanup also fails.
+            # Only report "unavailable" once nothing is left running: if cleanup
+            # fails the daemon may be orphaned, so startup must fail loudly.
             try:
                 self.close()
             except Exception:
                 logger.exception("MPS startup cleanup failed; control files remain at %s", root)
+                raise exc from None
+            if isinstance(exc, (OSError, subprocess.SubprocessError)):
+                raise CudaMPSUnavailableError(f"private MPS daemon failed to start: {exc}") from exc
             raise
         logger.info("Started private MPS for %s at %s", gpu_uuid, self.env["CUDA_MPS_PIPE_DIRECTORY"])
 

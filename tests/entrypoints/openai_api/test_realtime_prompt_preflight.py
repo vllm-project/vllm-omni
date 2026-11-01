@@ -19,6 +19,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.helpers.serving_chat import build_serving_chat
 from vllm_omni.entrypoints.openai.realtime.connection import (
+    RESPONSE_CANCEL_NOT_ACTIVE,
     SAMPLE_RATE_HZ,
     OpenAIFullDuplexConnection,
     _ResolvedResponse,
@@ -112,7 +113,7 @@ def _make_connection(
             chat_template_content_format="auto",
             _effective_chat_template_kwargs=lambda _request: {},
             _preprocess_chat=preprocess_chat,
-            _fix_minicpmo45_audio_stream_output_kinds=lambda params, _modalities: params,
+            _fix_audio_stream_output_kinds=lambda params, _modalities: params,
         ),
     )
     return connection, renderer
@@ -216,6 +217,74 @@ async def test_preflight_truncates_by_rendered_token_count() -> None:
     assert items == [first, second]
     assert prompt_items == [second]
     assert engine_input is renderer.engine_inputs[-1]
+
+
+@pytest.mark.asyncio
+async def test_input_images_map_to_chat_multimodal_prompt() -> None:
+    websocket = _FakeWebSocket()
+    connection, renderer = _make_connection(websocket=websocket)
+    png_data_url = "data:image/png;base64," + base64.b64encode(b"png-frame").decode("ascii")
+    jpeg_data_url = "data:image/jpeg;base64," + base64.b64encode(b"jpeg-frame").decode("ascii")
+    event = types.ConversationItemCreateEvent.model_validate_json(
+        json.dumps(
+            {
+                "type": "conversation.item.create",
+                "event_id": "evt_create_image",
+                "item": {
+                    "id": "camera",
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Watch the camera."},
+                        {"type": "input_image", "image_url": png_data_url, "detail": "low"},
+                        {"type": "input_image", "image_url": jpeg_data_url},
+                    ],
+                },
+            }
+        )
+    )
+
+    assert isinstance(event.item, types.RealtimeConversationItemUserMessage)
+    await connection._handle_item_create(event)
+    item = connection.session.items[-1]
+
+    await connection._build_full_prompt(instructions="Describe changes.", items=[item])
+
+    message = renderer.conversations[0][-1]
+    assert message["role"] == "user"
+    assert message["content"] == [
+        {"type": "text", "text": "Watch the camera."},
+        {"type": "image_url", "image_url": {"url": png_data_url, "detail": "low"}},
+        {"type": "image_url", "image_url": {"url": jpeg_data_url}},
+    ]
+
+
+@pytest.mark.parametrize("image_url", [None, ""])
+def test_input_image_requires_an_image_url(image_url: str | None) -> None:
+    connection, _renderer = _make_connection()
+    item = types.RealtimeConversationItemUserMessage(
+        id="camera",
+        type="message",
+        role="user",
+        content=[{"type": "input_image", "image_url": image_url}],
+    )
+
+    with pytest.raises(ValueError, match="input_image"):
+        connection._validate_input_item(item)
+
+
+def test_assistant_output_audio_is_rejected() -> None:
+    connection, _renderer = _make_connection()
+    item = types.RealtimeConversationItemAssistantMessage(
+        id="assistant-audio",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[{"type": "output_audio", "audio": base64.b64encode(b"\x00\x00").decode("ascii")}],
+    )
+
+    with pytest.raises(ValueError, match="assistant audio"):
+        connection._validate_input_item(item)
 
 
 @pytest.mark.asyncio
@@ -754,3 +823,89 @@ async def test_rejected_response_create_does_not_cancel_active_response() -> Non
     assert not connection._response_cancel_event.is_set()
     assert len(websocket.messages) == 1
     assert "exceeds the model's input token limit" in websocket.messages[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active_response_id", [None, "resp_active"])
+async def test_cancel_without_matching_active_response_uses_openai_error_code(active_response_id: str | None) -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    if active_response_id is not None:
+        connection.session.active_response = SimpleNamespace(
+            response_id=active_response_id, request_id=f"rt-{active_response_id}"
+        )
+
+    await connection._handle_response_cancel(
+        types.ResponseCancelEvent(type="response.cancel", event_id="evt_cancel", response_id="resp_finished")
+    )
+
+    (event,) = _websocket_events(websocket)
+    assert event["type"] == "error"
+    assert event["error"]["code"] == RESPONSE_CANCEL_NOT_ACTIVE
+    assert event["error"]["event_id"] == "evt_cancel"
+    assert not connection._response_cancel_event.is_set()
+    if active_response_id is None:
+        assert connection.session.active_response is None
+    else:
+        assert connection.session.active_response.response_id == active_response_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_updates", "expected_wm_vals", "expected_error_codes", "expected_num_updated"),
+    [
+        ([], [], [], 0),
+        ([{"watermarking": False}, {"instructions": "Be brief."}], [False], [], 2),
+        ([{"watermarking": None}], [], ["invalid_request_error"], 0),
+    ],
+)
+async def test_realtime_watermarking_follows_session_updates(
+    session_updates,
+    expected_wm_vals,
+    expected_error_codes,
+    expected_num_updated,
+) -> None:
+    """Ensure responses use the session's latest valid watermarking setting and invalid updates are not applied."""
+    submitted_wm_vals: list[bool] = []
+
+    async def generate(**kwargs: Any):
+        if "watermarking" in kwargs:
+            submitted_wm_vals.append(kwargs["watermarking"])
+        yield SimpleNamespace(final_output_type="text", outputs=[])
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=[],
+        generate=generate,
+    )
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    for session in session_updates:
+        event = types.SessionUpdateEvent.model_validate(
+            {"type": "session.update", "session": {"type": "realtime", **session}}
+        )
+        await connection._dispatch_event(event)
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["text"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+    events = _websocket_events(websocket)
+    assert events and events[-1]["response"]["status"] == "completed"
+
+    actual_error_codes = [event["error"]["code"] for event in events if event["type"] == "error"]
+    actual_num_updated = sum(event["type"] == "session.updated" for event in events)
+
+    # Ensure the watermark value submitted to generate is correct
+    assert submitted_wm_vals == expected_wm_vals
+    # Ensure that we have the right numbers of errors vs successful updates
+    assert actual_error_codes == expected_error_codes
+    assert actual_num_updated == expected_num_updated
