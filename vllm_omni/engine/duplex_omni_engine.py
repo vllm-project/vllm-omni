@@ -42,6 +42,7 @@ from vllm_omni.engine.duplex.plugin import (
 )
 from vllm_omni.engine.messages import EngineQueueMessage
 from vllm_omni.engine.orchestrator import OrchestratorBase
+from vllm_omni.tracing import capture_trace_headers
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.commands import DuplexCommand
@@ -199,6 +200,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         *,
         output_buffer: DuplexOutputBuffer,
         timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
+        trace_headers: dict[str, str] | None = None,
     ) -> DuplexControlResultMessage:
         control_id = uuid.uuid4().hex
         return self._execute_control(
@@ -207,6 +209,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
                 session_id=session_id,
                 session_config=session_config,
                 output_buffer=output_buffer,
+                trace_headers=capture_trace_headers(trace_headers),
             ),
             control_id=control_id,
             operation="open",
@@ -223,9 +226,12 @@ class DuplexOmniEngine(AsyncOmniEngine):
         timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         loop = asyncio.get_running_loop()
+        trace_headers = capture_trace_headers()
         return await loop.run_in_executor(
             None,
-            lambda: self._open_session(session_id, session_config, output_buffer=output_buffer, timeout=timeout),
+            lambda: self._open_session(
+                session_id, session_config, output_buffer=output_buffer, timeout=timeout, trace_headers=trace_headers
+            ),
         )
 
     def _close_session(
