@@ -7,8 +7,10 @@ Unit tests for patch.py
 
 import asyncio
 import base64
+import io
 import json
 import time
+import wave
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -122,6 +124,7 @@ class MockResponse:
     def __init__(self, status, chunks, delay_between_chunks=0):
         self.status = status
         self.reason = "OK" if status == 200 else "Error"
+        self.headers: dict[str, str] = {}
         self._chunks = chunks
         self._delay = delay_between_chunks
         self.content = self
@@ -440,6 +443,66 @@ async def test_bundled_first_text_chunk_uses_stage0_token_timings(mocker: Mocker
     assert output.itl == pytest.approx([0.010, 0.011, 0.012])
     assert output.text_latency - output.ttft == pytest.approx(0.033)
     assert output.tpot_measured is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_format", ["tagged_content", "tagged_audio", "openai"])
+async def test_chat_audio_stream_protocols(mocker: MockerFixture, wire_format: str) -> None:
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(24000)
+        writer.writeframes(b"\x01\x00" * 480)
+    encoded_audio = base64.b64encode(wav_buffer.getvalue()).decode()
+    text_chunk: dict[str, object] = {"choices": [{"delta": {"content": "Hello"}}]}
+    audio_chunk: dict[str, object] = {"choices": [{"delta": {"audio": {"id": "audio-test", "data": encoded_audio}}}]}
+    if wire_format != "openai":
+        text_chunk["modality"] = "text"
+        audio_chunk["modality"] = "audio"
+    if wire_format == "tagged_content":
+        audio_chunk["choices"] = [{"delta": {"content": encoded_audio}}]
+    chunks = [
+        create_sse_chunk({"choices": [{"delta": {"role": "assistant"}}]}),
+        create_sse_chunk(text_chunk),
+        create_sse_chunk(audio_chunk),
+        create_sse_chunk(
+            {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+    session = mocker.AsyncMock()
+    session.post = mocker.MagicMock(return_value=MockResponse(200, chunks))
+
+    output = await async_request_openai_chat_omni_completions(_seed_tts_request_func_input(), session)
+
+    assert output.success is True
+    assert output.generated_text == "Hello"
+    assert output.ttft > 0
+    assert output.audio_frames == 480
+    assert output.audio_duration == pytest.approx(0.02)
+    assert output.audio_ttfp > 0
+    assert output.audio_rtf > 0
+
+
+@pytest.mark.asyncio
+async def test_chat_requested_audio_requires_decodable_frames(mocker: MockerFixture) -> None:
+    chunks = [
+        create_sse_chunk({"choices": [{"delta": {"content": "Hello"}}]}),
+        create_sse_chunk({"choices": [{"delta": {"audio": {"id": "audio-test", "data": ""}}}]}),
+        b"data: [DONE]\n\n",
+    ]
+    session = mocker.AsyncMock()
+    session.post = mocker.MagicMock(return_value=MockResponse(200, chunks))
+
+    output = await async_request_openai_chat_omni_completions(_seed_tts_request_func_input(), session)
+
+    assert output.success is False
+    assert output.error == "Audio was requested but no decodable audio frames were received"
+    assert output.audio_ttfp == 0
 
 
 @pytest.mark.asyncio

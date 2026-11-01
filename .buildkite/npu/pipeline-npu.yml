@@ -3,6 +3,10 @@
 steps:
   - label: ":github: Resolve skip-ci & upload pipeline"
     key: upload-ci-pipeline
+    # Honor the old label while existing PRs migrate to the neutral name.
+    if: >-
+      build.branch == "main" || !(build.pull_request.labels includes "backend-comparison-test" ||
+      build.pull_request.labels includes "sglang-omni-test")
     commands:
       - "python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/bootstrap-upload-steps.yml"
     agents:

@@ -1,0 +1,10 @@
+# Match the CI image's source-only context; version is supplied by the image.
+.git
+.venv*
+.worktrees
+build
+dist
+__pycache__
+*.py[cod]
+*.egg-info
+tests/dfx/perf/results
