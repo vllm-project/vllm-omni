@@ -35,11 +35,13 @@ def _dpkg_query(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         'if [ "${DPKG_QUERY_ERROR:-0}" = 1 ]; then exit 2; fi\n'
         'case "$3" in "${DPKG_APT_ROOT:-/no-fixture}"/*)\n'
         '  if [ "${DPKG_METADATA_OWNED:-1}" = 1 ]; then printf "os-package: %s\\n" "$3"; exit 0; fi\n'
-        "  exit 1;;\n"
+        '  printf "dpkg-query: no path found matching pattern %s\\n" "$3" >&2; exit 1;;\n'
         "esac\n"
         'if [ "${DPKG_PAYLOAD_OWNED:-0}" = 1 ]; then\n'
         '  printf "os-package: %s\\n" "$3"; exit "${DPKG_OWNER_CODE:-0}"\n'
         "fi\n"
+        'if [ "${DPKG_QUERY_WARNING:-0}" = 1 ]; then printf "dpkg-query: warning: files list missing\\n" >&2; fi\n'
+        'printf "dpkg-query: no path found matching pattern %s\\n" "$3" >&2\n'
         "exit 1\n"
     )
     tool.chmod(0o755)
@@ -161,7 +163,9 @@ def test_outside_metadata_cannot_be_silently_discarded(
     assert orphans == ""
 
 
-@pytest.mark.parametrize("decision", ["unowned", "metadata-unowned", "payload-owned", "partial-owner", "query-error"])
+@pytest.mark.parametrize(
+    "decision", ["unowned", "metadata-unowned", "payload-owned", "partial-owner", "query-error", "incomplete-database"]
+)
 def test_os_manifests_must_prove_metadata_and_payload_ownership(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, decision: str
 ) -> None:
@@ -180,6 +184,8 @@ def test_os_manifests_must_prove_metadata_and_payload_ownership(
             monkeypatch.setenv("DPKG_OWNER_CODE", "1")
     elif decision == "query-error":
         monkeypatch.setenv("DPKG_QUERY_ERROR", "1")
+    elif decision == "incomplete-database":
+        monkeypatch.setenv("DPKG_QUERY_WARNING", "1")
     roots, orphans = _prepare(tmp_path, monkeypatch, outside)
     receipt = json.loads(capsys.readouterr().out)
     if decision == "unowned":

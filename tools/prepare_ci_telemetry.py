@@ -75,7 +75,10 @@ def _os_owner(path: Path, receipts: list[tuple[str, int, str, str]]) -> bool | N
     # response as unowned, and query each exact path rather than a wildcard.
     if result.returncode in (0, 1) and result.stdout.strip():
         return True
-    if result.returncode == 1 and not result.stdout.strip():
+    # Missing package .list files also return 1, but cannot establish absence
+    # of an owner. Accept only the complete normal diagnostic for this path.
+    no_match = f"dpkg-query: no path found matching pattern {path}"
+    if result.returncode == 1 and not result.stdout.strip() and result.stderr.strip() == no_match:
         return False
     return None
 
