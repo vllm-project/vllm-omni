@@ -1504,6 +1504,14 @@ class Cosmos3OmniDiffusersPipeline(
                     branch_caches[cache_key] = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
         return _to_sampling_dtype(prediction)
 
+    def _begin_cache_evaluation(self, branches: tuple[str, ...]) -> None:
+        # Register the global execution plan on every CFG rank. This keeps
+        # history resets aligned even when branch ownership changes or a rank
+        # performs only the mixin's idle-rank shape forward. No branch voting.
+        begin = getattr(self, "_cache_begin_step", None)
+        if callable(begin):
+            begin(branches)
+
     def combine_multi_branch_cfg_noise(
         self,
         predictions: list[torch.Tensor | tuple[torch.Tensor, ...]],
@@ -3225,6 +3233,7 @@ class Cosmos3OmniDiffusersPipeline(
                     # the cond branch. Every rank remains on the same iteration and
                     # collective schedule.
                     step_scale = guidance_scale if _cfg_active_at(t) else 1.0
+                    self._begin_cache_evaluation(("cond", "uncond"))
                     self._kv_load_und(kv_state, is_negative=cfg_rank_is_negative)
                     noise_pred = self.predict_noise_maybe_with_cfg(
                         do_true_cfg=True,
@@ -3265,6 +3274,9 @@ class Cosmos3OmniDiffusersPipeline(
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
                     cfg_active = _cfg_active_at(t)
+                    self._begin_cache_evaluation(
+                        ("cond", "uncond") if cfg_active or keep_uncond_for_cache else ("cond",)
+                    )
 
                     if not self._kv_load_und(kv_state, is_negative=False):
                         self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
@@ -3328,6 +3340,7 @@ class Cosmos3OmniDiffusersPipeline(
                     self._set_denoise_step_metadata(step_index, timesteps, step_scheduler)
                     self._set_mixed_precision_step(step_index, len(timesteps))
                     timestep = t.unsqueeze(0)
+                    self._begin_cache_evaluation(("cond",))
                     self._kv_load_und(kv_state, is_negative=False)
                     noise_pred = self._predict_noise_via_pp_driver(
                         _cache_context="cond",
@@ -3561,6 +3574,12 @@ class Cosmos3OmniDiffusersPipeline(
                 # follow a reference which skips it only at exactly 1 opt in.
                 needs_text_cfg = step_guidance != 1.0 if text_cfg_below_one else step_guidance > 1.0
                 needs_control_cfg = step_control != 1.0
+                branches = ("cond",)
+                if needs_control_cfg:
+                    branches += ("cond_no_control",)
+                if needs_text_cfg:
+                    branches += ("uncond",)
+                self._begin_cache_evaluation(branches)
 
                 branches_kwargs = None
                 cond_full_kwargs = dict(
