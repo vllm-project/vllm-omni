@@ -976,6 +976,9 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_tile_size: int | None = None
+    vae_tile_overlap: int | None = None
+    vae_tile_batch_size: int = 1
     # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
     # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
     # converts decoder convolution weights to channels-last memory format and
@@ -1246,6 +1249,12 @@ class OmniDiffusionConfig:
             raise ValueError(f"dlo_chunk_size_mb must be a positive integer, got {self.dlo_chunk_size_mb!r}")
 
         parse_reference_kv_config(self.kv_offload_config)
+        if self.vae_tile_size is not None and (type(self.vae_tile_size) is not int or self.vae_tile_size <= 0):
+            raise ValueError("vae_tile_size must be a positive integer when set")
+        if self.vae_tile_overlap is not None and (type(self.vae_tile_overlap) is not int or self.vae_tile_overlap < 0):
+            raise ValueError("vae_tile_overlap must be a nonnegative integer when set")
+        if type(self.vae_tile_batch_size) is not int or self.vae_tile_batch_size < 1:
+            raise ValueError("vae_tile_batch_size must be a positive integer")
         if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
             raise ValueError(
                 f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"

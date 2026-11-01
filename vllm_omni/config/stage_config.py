@@ -138,6 +138,12 @@ def build_stage_runtime_overrides(
 
         result[key] = value
 
+    # This optional knob must preserve explicit 1 and deterministic per-stage
+    # precedence regardless of the caller's dictionary insertion order.
+    tile_batch_override = cli_overrides.get(f"stage_{stage_id}_vae_tile_batch_size")
+    if tile_batch_override is not None and "vae_tile_batch_size" not in internal_keys:
+        result["vae_tile_batch_size"] = tile_batch_override
+
     return result
 
 
@@ -648,6 +654,7 @@ class StageDeployConfig:
     step_execution: bool | None = None
     vae_use_slicing: bool | None = None
     vae_use_tiling: bool | None = None
+    vae_tile_batch_size: int | None = None
     vae_fast_path: str | None = None
     vae_encode_fast_path: str | None = None
     boundary_ratio: float | None = None
@@ -688,6 +695,10 @@ class StageDeployConfig:
 
     def __post_init__(self) -> None:
         _normalize_stage_backend_fields(self)
+        if self.vae_tile_batch_size is not None and (
+            type(self.vae_tile_batch_size) is not int or self.vae_tile_batch_size < 1
+        ):
+            raise ValueError("vae_tile_batch_size must be a positive integer")
 
 
 @dataclass(frozen=True)
