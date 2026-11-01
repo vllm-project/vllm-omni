@@ -245,7 +245,7 @@ def test_ras_speech_vocabulary_history_ignores_only_reference_tokens():
     torch.testing.assert_close(result.sum(dim=-1), torch.ones(2))
 
 
-def test_ras_dynamic_compile_matches_eager_across_batch_and_history_shapes():
+def test_ras_dynamic_dynamo_tracing_matches_eager_across_shapes():
     compiled = torch.compile(dspark.ras_probabilities, backend="eager", dynamic=True, fullgraph=True)
     for batch, width in [(2, 4), (4, 7), (3, 11)]:
         logits = torch.arange(batch * width, dtype=torch.float32).reshape(batch, width) / 10
@@ -334,7 +334,7 @@ def test_converter_cli_forwards_paths_without_loading_weights(monkeypatch, tmp_p
     )
     source, destination = tmp_path / "input", tmp_path / "output"
     monkeypatch.setattr(sys, "argv", ["convert_cosyvoice3_dspark.py", str(source), str(destination)])
-    path = Path(__file__).resolve().parents[4] / "tools/convert_cosyvoice3_dspark.py"
+    path = Path(__file__).resolve().parents[4] / "vllm_omni/entrypoints/convert_cosyvoice3_dspark.py"
     tool_spec = importlib.util.spec_from_file_location("cosyvoice3_converter_cli", path)
     assert tool_spec is not None and tool_spec.loader is not None
     tool = importlib.util.module_from_spec(tool_spec)
@@ -342,3 +342,17 @@ def test_converter_cli_forwards_paths_without_loading_weights(monkeypatch, tmp_p
     convert.assert_not_called()
     tool.main()
     convert.assert_called_once_with(source, destination)
+
+
+def test_checkout_converter_reuses_packaged_main(monkeypatch):
+    main = Mock()
+    monkeypatch.setitem(sys.modules, "vllm_omni.entrypoints.convert_cosyvoice3_dspark", SimpleNamespace(main=main))
+    path = Path(__file__).resolve().parents[4] / "tools/convert_cosyvoice3_dspark.py"
+    tool_spec = importlib.util.spec_from_file_location("cosyvoice3_checkout_converter", path)
+    assert tool_spec is not None and tool_spec.loader is not None
+    tool = importlib.util.module_from_spec(tool_spec)
+    tool_spec.loader.exec_module(tool)
+    assert tool.main is main
+    main.assert_not_called()
+    tool.main()
+    main.assert_called_once_with()

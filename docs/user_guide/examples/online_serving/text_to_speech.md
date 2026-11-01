@@ -192,11 +192,11 @@ Compilation occurs on first use, so warm up representative request batches and m
 CosyVoice3 can use vLLM's DSpark drafter on the Talker stage with Model Runner V2 and tensor parallel size 1. This is opt-in and requires a compatible CosyVoice3 DSpark checkpoint; do not configure the drafter on Code2Wav. Convert the checkpoint's unified vocabulary to the speech vocabulary before serving:
 
 ```bash
-python tools/convert_cosyvoice3_dspark.py \
+python -m vllm_omni.entrypoints.convert_cosyvoice3_dspark \
   /path/to/dspark-checkpoint /path/to/draft-speech
 ```
 
-Run the converter from a repository checkout with vLLM-Omni installed. The conversion writes a new directory and records source and converted file hashes; it refuses to overwrite an existing directory. Keep its input embedding and output-head weights: the target Qwen decoder has a text embedding, not the drafter's speech-vocabulary embedding. Add the following fields to stage 0 in a copy of the deploy configuration, retaining the other stage and connector settings:
+This packaged entry point works with wheel installations. A repository checkout with vLLM-Omni installed can also use `python tools/convert_cosyvoice3_dspark.py` with the same arguments. The conversion writes a new directory and records source and converted file hashes; it refuses to overwrite an existing directory. Keep its input embedding and output-head weights: the target Qwen decoder has a text embedding, not the drafter's speech-vocabulary embedding. Add the following fields to stage 0 in a copy of the deploy configuration, retaining the other stage and connector settings:
 
 ```yaml
 model_runner: v2
