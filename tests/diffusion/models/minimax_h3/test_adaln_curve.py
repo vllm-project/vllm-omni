@@ -100,7 +100,7 @@ def test_native_curve_model_loads_table_and_uses_it_for_time_embeddings(curve_mo
 
 def test_native_curve_model_rejects_unknown_weights(curve_model):
     with pytest.raises(ValueError, match="unsupported.*curve"):
-        curve_model.load_weights([("adaln_t_tabel", torch.zeros(3, 2))])
+        curve_model.load_weights([("adaln_t_table_unknown", torch.zeros(3, 2))])
 
 
 @pytest.mark.parametrize("parameter", ["time_embedder.table", "blocks.0.adaln_proj.linear.weight"])

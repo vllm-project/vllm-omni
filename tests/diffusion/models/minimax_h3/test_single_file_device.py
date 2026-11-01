@@ -16,7 +16,7 @@ from torch import nn
 
 from tests.helpers.mark import hardware_marks
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cuda, pytest.mark.parallel]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel]
 
 
 def _load_worker(rank, checkpoint_dir, rendezvous):
@@ -36,10 +36,11 @@ def _load_worker(rank, checkpoint_dir, rendezvous):
     from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3DiTModel
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.platforms import current_omni_platform
 
     torch.set_num_threads(2)
     device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
+    current_omni_platform.set_device(device)
     checkpoint = Path(checkpoint_dir) / "hybrid[beta5].safetensors"
     arch = dict(
         num_layers=1,

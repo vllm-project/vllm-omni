@@ -260,9 +260,7 @@ def test_pipeline_loads_selected_file_for_each_task(
         assert base_download_calls == []
     else:
         assert len(base_download_calls) == 1
-        expected_model = (
-            "Contoso/H3-Components" if base_source == "custom-remote" else "MiniMaxAI/MiniMax-H3"
-        )
+        expected_model = "Contoso/H3-Components" if base_source == "custom-remote" else "MiniMaxAI/MiniMax-H3"
         assert base_download_calls[0]["model_name_or_path"] == expected_model
         assert base_download_calls[0]["revision"] == expected_revision
     result = build_checkpoint_binding_plan(
