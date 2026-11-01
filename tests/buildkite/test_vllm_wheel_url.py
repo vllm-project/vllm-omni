@@ -4,6 +4,7 @@
 """Exercise the Docker install commands without downloading packages or building images."""
 
 import os
+import runpy
 import shlex
 import subprocess
 import sys
@@ -51,7 +52,7 @@ def test_cuda_wheel_url_encodes_local_version(tmp_path: Path, dockerfile: str, v
         assert args[args.index("-r") + 1] == "/tmp/vllm-otel-roots.txt"
 
 
-def test_bootstrap_telemetry_solve_keeps_unselected_exporters(tmp_path: Path) -> None:
+def test_bootstrap_telemetry_solve_keeps_unselected_exporters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # The newer common exporter can force an SDK upgrade while an older,
     # unselected Prometheus exporter still requires the old SDK. Both reverse
     # constraints must participate in the normal combined dependency solve.
@@ -71,20 +72,24 @@ def test_bootstrap_telemetry_solve_keeps_unselected_exporters(tmp_path: Path) ->
     collection = next(
         shlex.split(line.removeprefix("RUN "))
         for line in text.splitlines()
-        if line.startswith("RUN python3 -c 'import importlib.metadata")
+        if line.startswith("RUN python3 tools/prepare_ci_telemetry.py")
     )
-    assert collection[:2] == ["python3", "-c"]
-    assert collection[3:] == [">", "/tmp/vllm-otel-roots.txt"]
-    # -S confines discovery to these real dist-info fixtures and the stdlib;
-    # no installed developer packages or editable finders enter this probe.
-    result = subprocess.run(
-        [sys.executable, "-S", "-c", collection[2]],
-        cwd=tmp_path,
-        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert set(result.stdout.splitlines()) == telemetry
-    assert len(result.stdout.splitlines()) == len(telemetry)
+    assert collection[:6] == [
+        "python3",
+        "tools/prepare_ci_telemetry.py",
+        "--roots",
+        "/tmp/vllm-otel-roots.txt",
+        "--orphans",
+        "/tmp/vllm-otel-orphans.txt",
+    ]
+    prepare = runpy.run_path(str(REPO_ROOT / collection[1]))["prepare"]
+    roots, orphans = tmp_path / "roots.txt", tmp_path / "orphans.txt"
+    # Discovery reads only these real dist-info fixtures; installed developer
+    # packages and editable finders cannot enter this probe.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(sys, "path", [str(tmp_path)])
+        prepare(roots, orphans)
+    assert set(roots.read_text().splitlines()) == telemetry
+    assert len(roots.read_text().splitlines()) == len(telemetry)
+    assert orphans.read_text() == ""
     assert "RUN uv pip check --system" in text
