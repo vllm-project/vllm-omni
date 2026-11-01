@@ -102,7 +102,7 @@ class NoisyKVSessionRegistry:
     def __init__(
         self,
         capacity: int = 1,
-        on_release: Callable[[str], None] | None = None,
+        on_release: Callable[[str], int] | None = None,
     ) -> None:
         if capacity < 1:
             raise ValueError(f"session capacity must be positive, got {capacity}")
@@ -117,8 +117,11 @@ class NoisyKVSessionRegistry:
         never frees them; without this the pool stays short of those slots for
         every reset, close and eviction.
         """
-        if self.on_release is not None:
-            self.on_release(session_id)
+        if self.on_release is None:
+            return
+        released = self.on_release(session_id)
+        if released:
+            logger.info("Noisy KV session %s released %d retained versions", session_id, released)
 
     def __len__(self) -> int:
         return len(self._sessions)
