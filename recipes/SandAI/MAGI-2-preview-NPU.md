@@ -6,8 +6,10 @@
 - Model: `sand-ai/MAGI-2-preview`
 - Runtime: Native vLLM-Omni `Magi2Pipeline`; no SandAI runtime import
 - Task and mode: Online text-to-video-and-audio (T2VA)
-- Hardware: Four NPU devices, 112 GiB per device
-- Deployment: Resident BF16, TP1/SP4 (Ulysses), eager execution
+- Hardware: Four NPU devices, 112 GiB per device; or eight 910B3 devices,
+  64 GiB per device
+- Deployment: Resident BF16, TP1/SP4 (Ulysses) at 112 GiB, TP1/SP8 at 64 GiB;
+  eager execution
 - Maintainer: Community
 
 ## Supported model contract
@@ -23,7 +25,7 @@ below. It does not expand the qualification scope of the separate
 | Video | `272p`: 448x256, 125 frames, 12.5 fps, 10 seconds |
 | Audio | Generated with the video; 44.1 kHz stereo |
 | Sampling | 100 denoising steps, seed 42, one request |
-| Deployment | Four devices; TP=1, SP=4; BF16; `--enforce-eager` |
+| Deployment | Four 112 GiB devices: TP=1, SP=4. Eight 64 GiB 910B3 devices: TP=1, SP=8. BF16, `--enforce-eager` |
 | Refiner | The separate 1080p refiner is not included |
 
 ## References
@@ -53,7 +55,7 @@ these commands do not install or replace that stack. Make `ffmpeg` and
 export REPO_DIR=/path/to/vllm-omni
 export MODEL_PATH=/path/to/MAGI-2-preview
 export OUTPUT_DIR=/path/to/validation-output
-export NPU_DEVICES=0,1,2,3  # Replace with an allocated, idle four-device group.
+export NPU_DEVICES=0,1,2,3  # Four idle devices; use eight (0-7) with SP8 on 64 GiB devices.
 export PORT=8091
 mkdir -p "$OUTPUT_DIR"
 ```
@@ -72,6 +74,73 @@ mkdir -p "$OUTPUT_DIR"
 Native auxiliary-component CPU staging remains active. The launch disables
 pinned CPU staging with `pin_cpu_memory=false`; it does not enable
 transformer layerwise offload.
+
+### 64 GiB-class devices (8 x 910B3)
+
+The profile above assumes 112 GiB per device. On the smaller 910B3 device the
+resident SP4 layout does **not** fit: with `TP=1/SP=4` the transformer reaches
+60.49 GiB of the 60.96 GiB usable HBM and fails while loading the remaining
+shard (`torch.OutOfMemoryError: NPU out of memory`). Widening to eight devices
+(`TP=1/SP=8`) halves the per-rank MoE-head shard and completes the request
+without an allocation failure.
+
+| Item | Value |
+| --- | --- |
+| Accelerator | Ascend 910B3 |
+| Per-device memory | 65,536 MB (64 GiB); 60.96 GiB usable |
+| Device count | 8 |
+| Host | `ascend131`, openEuler 22.03 LTS-SP1, aarch64 |
+| Host memory | 2,014 GiB total; 256 cores |
+| Scope | One bounded online T2VA configuration, not a throughput benchmark |
+
+Launch with the eight-device topology. Keep every other flag identical to the
+four-device command in [Online serving](#online-serving); only `--num-gpus`
+and `--ulysses-degree` change:
+
+```bash
+vllm serve "$MODEL_PATH" --omni --model-class-name Magi2Pipeline \
+  --num-gpus 8 --tensor-parallel-size 1 --ulysses-degree 8 \
+  --enforce-eager --host 127.0.0.1 --port "$PORT" \
+  --stage-init-timeout 3600 --init-timeout 3600 \
+  --stage-overrides '{"0":{"pin_cpu_memory":false}}'
+```
+
+`TP=1/SP=4` is not a viable fallback on this device class; use eight devices.
+Memory-reducing features are outside what this recipe qualifies.
+
+#### Validation record
+
+Measured on vLLM-Omni commit `7476b8b8e` with the released checkpoint
+`2dea51b64db47ee5b4402d36fd90829a0c58913b`, one request, devices 0-7:
+
+| Check | Result |
+| --- | --- |
+| Startup | `/health` returned 200; device mapping `0->0 … 7->7` |
+| Response | HTTP 200, `content-type: video/mp4`, 2,078,762 bytes |
+| Wall time | 336.7 s for the 272p / 100-step request |
+| Video | 125 frames, 448x256, 12.5 fps, duration 10.00 s |
+| Audio | AAC 44.1 kHz stereo |
+| Decode | `ffmpeg -f null -` completed without error |
+| Sampling | `steps=100 seed=42`, as recorded by `serving_video.py` |
+
+The four-device run used for comparison failed before serving any request, so
+it produced no media artifact. Both runs used the same container, checkpoint
+and request body; only `--num-gpus` and `--ulysses-degree` differed.
+
+#### Environment note for this validation
+
+The run used the `quay.io/atlas-ci/vllm-ascend:v0.32.0` base image (vLLM
+0.32.0, vLLM-Ascend `450e55698`, PyTorch 2.10.0+cpu, torch_npu 2.10.0.post4,
+transformers 5.19.0, CANN 9.1.0) with this checkout on `PYTHONPATH` and the
+vLLM-Omni dependency set supplied out-of-band, because the box cannot reach
+the package index. That image is not one of the qualified images listed above;
+treat it as an additional data point rather than a replacement.
+
+Exporting `PYTHONPATH` without preserving the image's CANN entries breaks the
+first operator compile, not the model load: the server still reports `/health`
+200 and then fails the request with `AOE failed to call InitCannKB` and
+`Failed to init tbe`. Prefix the checkout path as the four-device command
+below does instead of replacing `PYTHONPATH` outright.
 
 ## Software environment
 
@@ -159,7 +228,7 @@ establish visual accuracy or prove that all denoising steps ran.
 | Feature | NPU profile in this recipe | Guide |
 | --- | --- | --- |
 | Online T2VA | 272p, 100 steps, one request | [Video examples](../../examples/online_serving/text_to_video/README.md) |
-| Ulysses sequence parallel | Four-device resident SP4 with TP1 | [Sequence parallel](../../docs/user_guide/diffusion/parallelism/sequence_parallel.md) |
+| Ulysses sequence parallel | Resident SP4 with TP1 on 112 GiB devices; SP8 with TP1 on 64 GiB 910B3 devices | [Sequence parallel](../../docs/user_guide/diffusion/parallelism/sequence_parallel.md) |
 | Auxiliary CPU staging | Active; pinned staging disabled | [CPU offload](../../docs/user_guide/diffusion/cpu_offload.md) |
 | Offline / I2VA / 540p | Not qualified by this NPU run | [Shared example](../../examples/offline_inference/text_to_video/text_to_video.py) |
 | Other TP/SP/DP/CFG/HSDP/DLO layouts | Not qualified by this NPU run | [Parallelism](../../docs/user_guide/diffusion/parallelism/overview.md) |
