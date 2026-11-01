@@ -259,7 +259,7 @@ def test_mrv2_thinker_returns_drafter_layers_with_hidden_states(mocker):
     # The turn Thinker keeps the runner's samplers, so drafts get verified.
     assert model.mrv2_custom_sampler(object()) is None
 
-    hidden, aux = torch.randn(3, 4), [torch.randn(3, 4), torch.randn(3, 4)]
+    hidden, aux = torch.randn(3, 4), [torch.randn(3, 4) for _ in range(3)]
     model.thinker.forward = mocker.Mock(return_value=hidden)
     assert model(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2])) is hidden
 
@@ -270,6 +270,10 @@ def test_mrv2_thinker_returns_drafter_layers_with_hidden_states(mocker):
     out_hidden, out_aux = model(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]))
     assert out_hidden is hidden
     assert out_aux is aux
+    # A Thinker tuple that isn't (hidden, one tensor per drafter layer) fails loudly.
+    model.thinker.forward = mocker.Mock(return_value=(aux[0], hidden))
+    with pytest.raises(RuntimeError, match="3 target layers"):
+        model(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]))
 
 
 def test_v1_thinker_refuses_drafter_layers(mocker):

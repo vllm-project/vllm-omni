@@ -137,6 +137,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
     requires_raw_input_tokens = True
     # Set when a drafter (EAGLE-3, DFlash, DSpark) reads Thinker layers.
     _returns_aux_hidden_states = False
+    _num_aux_hidden_states = 0
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -774,6 +775,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             )
         super().set_aux_hidden_state_layers(layers)
         self._returns_aux_hidden_states = True
+        self._num_aux_hidden_states = len(set(layers))
 
     def get_multimodal_embeddings(self, **kwargs):
         # Delegate to the active stage submodule when it implements MM encoding.
@@ -860,6 +862,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             aux_hidden_states = None
             if self._returns_aux_hidden_states:
                 text_hidden_states, aux_hidden_states = thinker_output
+                if not isinstance(aux_hidden_states, (list, tuple)) or len(aux_hidden_states) != (
+                    self._num_aux_hidden_states
+                ):
+                    raise RuntimeError(
+                        f"MiniCPM-o Thinker returned {type(aux_hidden_states).__name__} for the drafter's "
+                        f"{self._num_aux_hidden_states} target layers"
+                    )
             elif isinstance(thinker_output, tuple):
                 _, text_hidden_states = thinker_output
             else:
