@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
+from vllm_omni.diffusion.models.utils import load_vae_scale_factor, vae_scale_factor_from_vae
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -65,11 +66,11 @@ def get_qwen_image_layered_pre_process_func(
     else:
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
+    vae_scale_factor = load_vae_scale_factor(model_path, config_key="temporal_downsample", exponent_offset=0)
     vae_config_path = os.path.join(model_path, "vae/config.json")
     with open(vae_config_path) as f:
         vae_config = json.load(f)
-        vae_scale_factor = 2 ** len(vae_config["temporal_downsample"]) if "temporal_downsample" in vae_config else 8
-        latent_channels = vae_config.get("z_dim", 16)
+    latent_channels = vae_config.get("z_dim", 16)
 
     # QwenImage latents are turned into 2x2 patches and packed.
     # This means the latent width and height has to be divisible
@@ -281,7 +282,11 @@ class QwenImageLayeredPipeline(
         )
 
         # Pipeline configuration & processing parameters
-        self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
+        self.vae_scale_factor = vae_scale_factor_from_vae(
+            getattr(self, "vae", None),
+            config_key="temperal_downsample",
+            exponent_offset=0,
+        )
         self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 16
         # QwenImage latents are turned into 2x2 patches and packed.
         # This means the latent width and height has to be divisible
