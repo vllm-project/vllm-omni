@@ -3064,12 +3064,35 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         # 1. positive prefix len
         positive_reuse_len, negative_reuse_len = self._get_kv_reuse_len(model_kwargs, batch_size)
+        if positive_reuse_len <= 0:
+            return input_ids, 0
+
+        # Sampled tokens can extend beyond the prefix actually computed by
+        # AR. Every decoder layer must have KV for the prefix we remove.
+        for layer in self.model.model.layers:
+            layer_kv = ar_kv_data.get(layer.layer_idx)
+            if layer_kv is None or layer_kv.get("key") is None or layer_kv.get("value") is None:
+                raise ValueError(f"AR KV cache is missing key/value tensors for layer {layer.layer_idx}")
+            positive_reuse_len = min(positive_reuse_len, layer_kv["key"].shape[0], layer_kv["value"].shape[0])
+        if positive_reuse_len <= 0:
+            raise ValueError("AR KV cache does not contain a computed prefix")
+        if any(
+            image_slice.stop > positive_reuse_len
+            for image_slices in model_kwargs["tokenizer_output"].joint_image_slices or []
+            for image_slice in image_slices
+        ):
+            raise ValueError("AR KV cache does not cover the conditional images")
+        if (
+            self.do_classifier_free_guidance
+            and not getattr(self.model.config, "cfg_distilled", False)
+            and negative_reuse_len is not None
+            and positive_reuse_len <= negative_reuse_len
+        ):
+            raise ValueError("AR KV cache does not cover the negative CFG prefill boundary")
         logger.info(
             f"Handling AR KV reuse with positive_reuse_len={positive_reuse_len}, "
             f"negative_reuse_len={negative_reuse_len}"
         )
-        if positive_reuse_len <= 0:
-            return input_ids, 0
 
         # 2. inject positive kv
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
