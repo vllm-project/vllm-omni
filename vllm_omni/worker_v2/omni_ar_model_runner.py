@@ -26,7 +26,11 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.worker.gpu.eplb_utils import step_eplb_after
+from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.utils import get_drafter_hidden_states
+from vllm.v1.worker.workspace import use_workspace_lane
 
 from vllm_omni.data_entry_keys import OmniPayload, flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
@@ -103,6 +107,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
         self._async_mm_snapshot_cursor = 0
         self._last_multimodal_snapshot_slot: int | None = None
 
+    def load_model(self, *args: Any, **kwargs: Any) -> None:
+        super().load_model(*args, **kwargs)
+        if self.num_speculative_steps > 0 and self.is_last_pp_rank and self.rejection_sampler is None:
+            raise ValueError(
+                "MRv2 AR speculative decoding requires a rejection sampler; check the model's custom sampler"
+            )
+
     def _ensure_kv_transfer_manager(self) -> OmniKVTransferManager:
         if self.kv_transfer_manager is None:
             self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
@@ -168,6 +179,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if self.execute_model_state is None:
             return None
 
+        execution_state = self.execute_model_state
         input_batch = self.execute_model_state.input_batch
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
@@ -323,6 +335,9 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         # Postprocess AFTER creating async output (so copy_event is
         # recorded before postprocess, matching upstream pattern).
+        mm_inputs = None
+        if self.speculator is not None and self.speculator.supports_mm_inputs and self.model_state.supports_mm_inputs:
+            mm_inputs = self.model_state.gather_mm_embeddings(input_batch, draft_lookahead=1)
         self.postprocess_sampled(
             input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
@@ -330,6 +345,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             num_rejected,
             input_batch.query_start_loc,
         )
+        self._update_speculative_drafts(execution_state, num_sampled, num_rejected, mm_inputs)
         model_runner_output.kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.ec_connector_output = ec_connector_output
 
@@ -337,6 +353,45 @@ class OmniARModelRunner(OmniGPUModelRunner):
         if materialize_native:
             return self._materialize_native_output(async_output)
         return async_output
+
+    def _update_speculative_drafts(self, state, num_sampled, num_rejected, mm_inputs=None) -> None:
+        """Preserve upstream MRv2 proposal and scheduler feedback after Omni sampling."""
+        if self.num_speculative_steps == 0:
+            return
+        batch = state.input_batch
+        count = state.num_spec_tokens_to_schedule
+        if self.speculator is not None:
+            assert self.sampler is not None
+            if isinstance(self.speculator, DraftModelSpeculator):
+                self.speculator.observe_verification(batch.idx_mapping, num_sampled, num_rejected)
+            hidden = get_drafter_hidden_states(self.model, state.hidden_states)
+            if isinstance(self.sampler, GPUWatermarkSampler):
+                self.speculator.prepare_watermarking(self.sampler, batch.idx_mapping)
+            with use_workspace_lane(self._draft_workspace_lane):
+                drafts = self.speculator.propose(
+                    batch,
+                    state.attn_metadata,
+                    state.slot_mappings_by_layer,
+                    hidden,
+                    state.aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    num_speculative_tokens=count,
+                    dp_sync_state=state.dp_sync_state,
+                    mm_inputs=mm_inputs,
+                )
+            if count < self.num_speculative_steps:
+                drafts[:, count:] = -1
+            self.req_states.draft_tokens[batch.idx_mapping] = drafts
+            if self.adaptive_verification is not None:
+                self.adaptive_verification.record_confidences(self.speculator.draft_token_confidence_probs, batch)
+        self.draft_tokens_handler.set_draft_tokens(batch, self.req_states.draft_tokens[batch.idx_mapping, :count])
+        if self.pp_handler is not None:
+            self.pp_handler.broadcast_drafts(self.req_states.draft_tokens, batch)
 
     def _retain_multimodal_outputs(self, outputs: dict[str, Any]) -> dict[str, Any]:
         if not bool(getattr(self.model_config, "async_chunk", False)) or not outputs:

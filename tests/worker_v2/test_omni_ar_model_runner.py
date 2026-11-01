@@ -3,7 +3,7 @@
 
 """Unit tests for OmniARModelRunner v2: async output staging, snapshot ownership, payload slicing."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -196,6 +196,8 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
         runner.model.omni_pooler_payload_include_hidden = include_hidden
     runner.model.mrv2_sampling_context = sampling_context
     runner.sampler = None
+    runner.speculator = None
+    runner.num_speculative_steps = 0
     runner.sample = MagicMock(return_value=sampler_out)
     runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
     logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
@@ -228,6 +230,75 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     torch.testing.assert_close(built.prompt_token_id_logprobs_dict["req"], torch.tensor([[2.0, 1.0], [4.0, 3.0]]))
     assert runner._resolve_global_request_id("req") == "global-req"  # from the intermediate buffer
     assert runner._resolve_global_request_id("unknown") == "unknown"  # fallback to the local id
+
+
+@pytest.mark.parametrize(
+    "steps,last_rank,has_verifier",
+    [(0, True, False), (7, False, False), (7, True, True), (7, True, False)],
+)
+def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    calls = []
+
+    def load(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        self.num_speculative_steps = steps
+        self.is_last_pp_rank = last_rank
+        self.rejection_sampler = object() if has_verifier else None
+
+    monkeypatch.setattr(omni_ar_model_runner.OmniGPUModelRunner, "load_model", load)
+    if steps and last_rank and not has_verifier:
+        with pytest.raises(ValueError, match="requires a rejection sampler"):
+            runner.load_model(load_dummy_weights=True)
+    else:
+        runner.load_model(load_dummy_weights=True)
+    assert calls == [((), {"load_dummy_weights": True})]
+
+
+@pytest.mark.parametrize("scheduled", [0, 3, 7])
+def test_speculative_proposal_preserves_aux_and_publishes_scheduled_drafts(monkeypatch, scheduled):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    runner.num_speculative_steps = 7
+    runner._draft_workspace_lane = object()
+    runner.model = object()
+    runner.pp_handler = None
+    runner.adaptive_verification = None
+    proposed = torch.arange(14).reshape(2, 7)
+    runner.speculator = SimpleNamespace(propose=MagicMock(return_value=proposed.clone()))
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(
+            temperature=SimpleNamespace(gpu=torch.ones(3)), seeds=SimpleNamespace(gpu=torch.zeros(3))
+        )
+    )
+    runner.req_states = SimpleNamespace(
+        draft_tokens=torch.full((3, 7), -9), last_sampled_tokens=object(), next_prefill_tokens=object()
+    )
+    runner.draft_tokens_handler = SimpleNamespace(set_draft_tokens=MagicMock())
+    batch = SimpleNamespace(idx_mapping=torch.tensor([2, 0]))
+    aux = [torch.ones(4, 2) for _ in range(3)]
+    state = SimpleNamespace(
+        input_batch=batch,
+        num_spec_tokens_to_schedule=scheduled,
+        hidden_states=torch.zeros(4, 2),
+        aux_hidden_states=aux,
+        attn_metadata=object(),
+        slot_mappings_by_layer=object(),
+        dp_sync_state=None,
+    )
+    monkeypatch.setattr(omni_ar_model_runner, "use_workspace_lane", lambda lane: nullcontext())
+    monkeypatch.setattr(omni_ar_model_runner, "get_drafter_hidden_states", lambda model, hidden: hidden)
+    accepted, rejected = torch.tensor([2, 3]), torch.tensor([5, 4])
+    runner._update_speculative_drafts(state, accepted, rejected)
+    args = runner.speculator.propose.call_args.args
+    assert args[0] is batch and args[3] is state.hidden_states and args[4] is aux
+    assert args[5] is accepted and args[6] is rejected
+    expected = proposed.clone()
+    expected[:, scheduled:] = -1
+    torch.testing.assert_close(runner.req_states.draft_tokens[batch.idx_mapping], expected)
+    assert (runner.req_states.draft_tokens[1] == -9).all()
+    published_batch, published = runner.draft_tokens_handler.set_draft_tokens.call_args.args
+    assert published_batch is batch
+    torch.testing.assert_close(published, expected[:, :scheduled])
 
 
 def test_async_output_preserves_fixed_token_scores_on_host(monkeypatch) -> None:
