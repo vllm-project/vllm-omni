@@ -27,8 +27,66 @@ def _values(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
 
 
 def _method(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(svdquant, "_assert_supported", lambda: None)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
     return svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(rank=8))
+
+
+def _mxfp4_method(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
+    return svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(rank=8, precision="mxfp4"))
+
+
+def test_mxfp4_tp_loaders_shard_block32_scales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    column = _linear_without_init(ColumnParallelLinear, tp_rank=1)
+    method = _mxfp4_method(monkeypatch)
+    method.create_weights(
+        column,
+        input_size_per_partition=128,
+        output_partition_sizes=[32],
+        input_size=128,
+        output_size=64,
+        params_dtype=torch.bfloat16,
+        weight_loader=column.weight_loader,
+    )
+
+    loaded_tensors = {
+        "qweight": _values((64, 64), torch.int8),
+        "wscales": _values((4, 64), torch.uint8),
+        "proj_up": _values((64, 8), torch.bfloat16),
+    }
+    for name, loaded in loaded_tensors.items():
+        parameter = getattr(column, name)
+        parameter.weight_loader(parameter, loaded)
+        expected = loaded.narrow(parameter.output_dim, 32, 32)
+        torch.testing.assert_close(parameter, expected)
+    assert not hasattr(column, "wcscales")
+    assert not hasattr(column, "wtscale")
+
+    row = _linear_without_init(RowParallelLinear, tp_rank=1)
+    method.create_weights(
+        row,
+        input_size_per_partition=64,
+        output_partition_sizes=[64],
+        input_size=128,
+        output_size=64,
+        params_dtype=torch.bfloat16,
+        weight_loader=row.weight_loader,
+    )
+
+    loaded_tensors = {
+        "qweight": _values((64, 64), torch.int8),
+        "wscales": _values((4, 64), torch.uint8),
+        "proj_down": _values((128, 8), torch.bfloat16),
+        "smooth_factor": _values((128,), torch.bfloat16),
+    }
+    for name, loaded in loaded_tensors.items():
+        parameter = getattr(row, name)
+        parameter.weight_loader(parameter, loaded)
+        shard_size = parameter.shape[parameter.input_dim]
+        expected = loaded.narrow(parameter.input_dim, shard_size, shard_size)
+        torch.testing.assert_close(parameter, expected)
 
 
 def test_column_parallel_loader_shards_svdquant_outputs(
