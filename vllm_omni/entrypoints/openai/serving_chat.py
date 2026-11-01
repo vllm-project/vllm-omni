@@ -3020,6 +3020,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # when the pipeline produced no audio for this request.
         for output in omni_outputs.outputs:
             mm_output = getattr(output, "multimodal_output", None) or {}
+            # Waveform producers use (..., channels, samples). A producer using
+            # (..., samples, channels) must declare it, since e.g. (2, 1) can
+            # represent either a stereo frame or two mono samples.
+            audio_layout = mm_output.get("audio_layout", "channels_first")
+            if audio_layout not in ("channels_first", "channels_last"):
+                return self._create_error_response(f"Invalid audio layout '{audio_layout}'."), set()
             audio_data = mm_output.get("audio")
             if isinstance(audio_data, list):
                 if not audio_data:
@@ -3027,7 +3033,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 elif stream:
                     audio_tensor = audio_data[-1]
                 else:
-                    audio_tensor = torch.cat(audio_data, dim=-1)
+                    time_axis = -2 if audio_layout == "channels_last" and audio_data[0].ndim > 1 else -1
+                    audio_tensor = torch.cat(audio_data, dim=time_axis)
             else:
                 audio_tensor = audio_data
             if audio_tensor is None or audio_tensor.numel() == 0:
@@ -3048,11 +3055,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 continue
             audio_tensor = audio_tensor.detach().cpu().float().numpy()
 
-            # Remove singleton batch/mono axes while preserving stereo's
-            # channel and sample axes, including a single-frame waveform.
+            # Remove singleton batch axes, then the channels-first mono axis.
+            # A channels-last first axis is time and may contain just one frame.
             while audio_tensor.ndim > 2 and audio_tensor.shape[0] == 1:
                 audio_tensor = audio_tensor.squeeze(axis=0)
-            if audio_tensor.ndim == 2 and audio_tensor.shape[0] == 1:
+            if audio_layout == "channels_first" and audio_tensor.ndim == 2 and audio_tensor.shape[0] == 1:
                 audio_tensor = audio_tensor.squeeze(axis=0)
 
             # Prefer the talker-reported sample rate when present. Qwen3-Omni
@@ -3077,6 +3084,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # leave that choice's header available for its first waveform.
                 pcm_obj = CreateAudio(
                     audio_tensor=audio_tensor,
+                    audio_layout=audio_layout,
                     sample_rate=sample_rate,
                     response_format="pcm",
                     speed=1.0,
@@ -3103,6 +3111,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 audio_request = CreateAudio(
                     audio_tensor=audio_tensor,
+                    audio_layout=audio_layout,
                     sample_rate=sample_rate,
                     response_format=audio_format,
                     speed=1.0,

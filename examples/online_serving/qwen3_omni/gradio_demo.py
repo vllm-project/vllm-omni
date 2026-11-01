@@ -269,6 +269,10 @@ def run_inference_api(
     if not user_prompt.strip() and not audio_file and not image_file and not video_file:
         yield "Please provide at least a text prompt or multimodal input.", None
 
+    if stream:
+        # Clear the previous response before incremental updates use gr.skip().
+        yield "", None
+
     try:
         # Build message content list
         content_list = []

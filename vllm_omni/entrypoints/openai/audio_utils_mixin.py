@@ -119,7 +119,7 @@ class AudioMixin:
     """Mixin class to add audio-related utilities."""
 
     def create_audio(self, audio_obj: CreateAudio) -> AudioResponse:
-        """Convert audio tensor to bytes in the specified format."""
+        """Encode audio after normalizing its explicit or legacy channel layout."""
 
         audio_tensor = audio_obj.audio_tensor
         sample_rate = audio_obj.sample_rate
@@ -138,7 +138,10 @@ class AudioMixin:
                 "Only mono (1D) and stereo (2D) are supported."
             )
 
-        if audio_tensor.ndim == 2 and audio_tensor.shape[0] == 2:
+        if audio_tensor.ndim == 2 and (
+            audio_obj.audio_layout == "channels_first"
+            or (audio_obj.audio_layout is None and audio_tensor.shape[0] == 2)
+        ):
             # Convert from [channels, samples] to [samples, channels]
             audio_tensor = audio_tensor.T
 

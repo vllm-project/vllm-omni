@@ -275,6 +275,10 @@ def run_inference_api(
         yield "Please provide at least a text prompt or multimodal input.", None
         return
 
+    if stream:
+        # Clear the previous response before incremental updates use gr.skip().
+        yield "", None
+
     try:
         # Build message content list
         content_list = []

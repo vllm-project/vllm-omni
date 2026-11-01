@@ -509,9 +509,18 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
 
 
 class CreateAudio(BaseModel):
+    """Internal waveform encoding request with an optional explicit channel axis.
+
+    Two-dimensional inputs use either (channels, frames) or (frames, channels).
+    Without a declared layout, existing callers retain the legacy convention:
+    a first dimension of two means channels-first; otherwise channels-last.
+    """
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     audio_tensor: np.ndarray
+    # None retains legacy shape-based inference for existing serving callers.
+    audio_layout: Literal["channels_first", "channels_last"] | None = None
     sample_rate: int = 24000
     output_sample_rate: int | None = None
     response_format: str = "wav"
