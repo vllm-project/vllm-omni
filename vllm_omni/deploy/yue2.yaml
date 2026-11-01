@@ -1,5 +1,5 @@
 # YuE2-3B deploy: single-stage native-AR text-to-music (~3.6B bf16 + VAE).
-# Target 1x 24 GB card; verified on a single RTX 4090.
+# Four-slot CUDA configuration; validate memory on the target card/workload.
 #
 # The architectures pin is required: the checkpoint's config.json names
 # "YuE2ForCausalLM" with an auto_map that only makes sense under
@@ -13,22 +13,23 @@ dtype: bfloat16
 
 stages:
   - stage_id: 0
+    # A finishing song keeps its slot during side-stream synthesis,
+    # emitting HOLD tokens until its audio is ready.
     max_num_seqs: 4
-    # Measured on a 24 GB RTX 4090 with 4 concurrent requests pinned to the
-    # 9000-frame cap (worst case): the engine reserves ~15.8 GiB at 0.70 and
-    # peak usage during the terminal NAR/VAE finishing pass reaches 20.9 GiB,
-    # leaving ~3 GiB of headroom. 0.85 reserves ~19.4 GiB and the same
-    # workload OOMs inside the finishing pass.
+    # Reserve synthesis headroom: NAR K/V, acoustic graph buffers and VAE
+    # activations are allocated beyond the engine budget. The earlier 4090
+    # memory measurement predates async/compiled synthesis; 0.70 is a starting
+    # point, not a guarantee for 9000 frames or long ABC prefixes. Lower it if
+    # the target workload needs more synthesis memory (see the model recipe).
     gpu_memory_utilization: 0.70
-    # Phase 1 keeps the backbone eager: the model-owned sampler runs after the
-    # forward, and the terminal NAR/VAE pass runs inside the finishing step.
-    # CUDA-graph capture of the standard Qwen3 backbone is a perf follow-up.
+    # Keep AR capture off by default. Sampler/NAR graphs still need
+    # separate synthesis headroom.
     enforce_eager: true
-    # Prefix caching stays off: the omni prefix-cache save snapshots the
-    # step's mm payload before the model-owned sampler runs, but YuE2
-    # appends the decoded waveform inside sample() (the terminal NAR/VAE
-    # pass), so the cached payload would ship empty audio. Re-enable once
-    # the runner saves post-sample.
+    # Prefix caching works (the runner builds the song from the live
+    # outputs) but stays off by default: YuE2 prompts are short next to
+    # the song, so a hit saves little, and on a hit the same seed gives a
+    # different song than on a miss (a tail-only prefill is not bitwise
+    # equal to a full one, so sampling drifts after a few frames).
     enable_prefix_caching: false
     max_num_batched_tokens: 24576
     max_model_len: 24576
@@ -42,14 +43,17 @@ stages:
     hf_overrides:
       architectures: ["Yue2ForCausalLM"]
     default_sampling_params:
-      # Placeholder values: the model's own sampler overrides everything from
-      # extra_args. Their presence turns on has_sampling_extra_args, which is
-      # what threads the per-request yue2_* keys into the model's forward.
+      # Defaults for callers that omit model-owned sampling options. The
+      # opt-in prepare_runner_inputs hook reads each request's extra_args;
+      # it does not depend on the forward's has_sampling_extra_args flag.
       extra_args:
         yue2_phase: "semantic"
         yue2_seed: 831001
         yue2_max_audio_frames: 200
+        yue2_max_hold_steps: 4096
       detokenize: false
-      # Engine-side backstop; the model stops on its own end token first.
-      max_tokens: 9000
+      stop_token_ids: [151848, 151852]  # ABC_END, MUSIC_END
+      # 200 frames + 4096 synthesis holds + the final end token. Callers
+      # changing the frame budget must also reserve this token headroom.
+      max_tokens: 4297
       temperature: 1.0

@@ -66,6 +66,18 @@ def test_classifier_accepts_explicit_context_length_code(status: int) -> None:
     assert eval_mod._is_prompt_too_long_error(_http_error(status, body))
 
 
+@pytest.mark.parametrize("status", [400, 500])
+@pytest.mark.parametrize("json_error", [False, True])
+def test_classifier_accepts_current_judge_input_length_error(status: int, json_error: bool) -> None:
+    message = "Input length (83158) exceeds model's maximum context length (65536)"
+    body = json.dumps({"error": {"message": message}}) if json_error else message
+    assert eval_mod._is_prompt_too_long_error(_http_error(status, body))
+
+
+def test_classifier_does_not_reduce_unrelated_context_length_error() -> None:
+    assert not eval_mod._is_prompt_too_long_error(_http_error(400, "Invalid maximum context length configuration"))
+
+
 def test_classifier_does_not_match_unrelated_json_fields() -> None:
     body = json.dumps({"error": {"message": "Model worker failed"}, "debug": OVERFLOW})
     assert not eval_mod._is_prompt_too_long_error(_http_error(500, body))
@@ -187,8 +199,8 @@ def _http_judge(limit: int = 4) -> Iterator[tuple[DuplexJudge, list[int]]]:
                 response = {"error": {"message": OVERFLOW}}
             else:
                 status = 200
-                score = json.dumps({"content_score": 4, "temporal_score": 4, "is_relevant": 1})
-                response = {"choices": [{"message": {"content": score}}]}
+                score = json.dumps({"content_score": 1, "temporal_score": 1, "is_relevant": 1})
+                response = {"choices": [{"message": {"content": score}, "finish_reason": "stop"}]}
             encoded = json.dumps(response).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -280,3 +292,61 @@ def test_success_keeps_frames_and_reports_zero_retries(tmp_path: Path, monkeypat
     assert result["content"]["frame_count"] == 16
     assert result["content"]["frame_budget_retries"] == 0
     assert eval_mod.summarize_scores(tmp_path / "scores")["rtd"]["frame_reduction_samples"] == 0
+
+
+@pytest.mark.parametrize("policy", ["error", "reduce"])
+def test_upstream_video_fallback_keeps_frame_reduction_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
+) -> None:
+    sample, response_path, score_path = _sample_inputs(tmp_path, monkeypatch, with_sentence=False)
+    calls: list[tuple[str, int]] = []
+
+    class Judge:
+        def content(self, prompt, video_path, *, frames, mode):
+            calls.append((mode, len(frames) if frames is not None else 0))
+            if mode == "video_url":
+                raise _http_error(400, "Input length exceeds model's maximum context length")
+            if len(frames) > 4:
+                raise _http_error(400, OVERFLOW)
+            return '{"content_score": 1}'
+
+    if policy == "error":
+        with pytest.raises(requests.HTTPError):
+            eval_mod.evaluate_sample(sample, response_path, score_path, Judge(), judge_frame_overflow=policy)
+        assert calls == [("video_url", 0), ("frame-sample", 16)]
+        assert not score_path.exists()
+    else:
+        result = eval_mod.evaluate_sample(sample, response_path, score_path, Judge(), judge_frame_overflow=policy)
+        assert calls == [("video_url", 0), ("frame-sample", 16), ("frame-sample", 8), ("frame-sample", 4)]
+        assert result["content"]["judge_input_fallback"] == "frame-sample"
+        assert result["content"]["frame_count_initial"] == 16
+        assert result["content"]["frame_count"] == 4
+        assert result["content"]["frame_budget_retries"] == 2
+        trace = [json.loads(line) for line in score_path.with_suffix(".judge.jsonl").read_text().splitlines()]
+        assert trace == [{"raw_response": '{"content_score": 1}'}]
+
+
+def test_recovered_response_retains_schema_trace_and_old_score_quarantine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sample, response_path, score_path = _sample_inputs(tmp_path, monkeypatch, with_sentence=False)
+    score_path.parent.mkdir(parents=True, exist_ok=True)
+    score_path.write_text('{"old": true}')
+    calls: list[int] = []
+
+    class Judge:
+        def content(self, prompt, video_path, *, frames, mode):
+            calls.append(len(frames))
+            if len(frames) > 4:
+                raise _http_error(400, OVERFLOW)
+            return '{"unrelated": 1}'
+
+    with pytest.raises(ValueError):
+        eval_mod.evaluate_sample(
+            sample, response_path, score_path, Judge(), judge_video_mode="frame-sample", judge_frame_overflow="reduce"
+        )
+    assert calls == [16, 8, 4]
+    assert not score_path.exists()
+    assert len(list(score_path.parent.glob(f"{score_path.name}.*.previous"))) == 1
+    trace = [json.loads(line) for line in score_path.with_suffix(".judge.jsonl").read_text().splitlines()]
+    assert trace == [{"raw_response": '{"unrelated": 1}'}]

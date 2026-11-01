@@ -28,7 +28,9 @@ import torch
 from vllm_omni import Omni
 from vllm_omni.model_executor.models.yue2.yue2 import (
     ABC_SAMPLING,
+    CONTEXT,
     KEY_MAX_AUDIO_FRAMES,
+    KEY_MAX_HOLD_STEPS,
     KEY_MIN_TOKENS,
     KEY_PENALTY_WINDOW,
     KEY_PHASE,
@@ -41,10 +43,12 @@ from vllm_omni.model_executor.models.yue2.yue2 import (
     KEY_TOP_P,
     SEMANTIC_SAMPLING,
     STOP_TOKEN_IDS,
+    SYNTHESIS_HOLD_STEPS,
 )
 from vllm_omni.tokenizers.yue2_prompt import (
     abc_ids_from_generated,
     abc_prefix_ids,
+    semantic_frames,
     semantic_prefix_ids,
 )
 from vllm_omni.tokenizers.yue2_tokenizer import YuE2TextTokenizer
@@ -71,7 +75,13 @@ def sampling_params(engine, *, phase, seed, max_frames, prompt_ids):
         # conditioning prefix from the scheduled tokens alone.
         KEY_PREFIX_IDS: list(prompt_ids),
     }
-    params.max_tokens = preset["max_tokens"] if phase == "abc" else max_frames + 1
+    if phase == "abc":
+        params.max_tokens = preset["max_tokens"]
+    else:
+        # The song is synthesized on a side stream while the request is held;
+        # leave max_tokens headroom for the hold tokens.
+        params.max_tokens = min(max_frames + 1 + SYNTHESIS_HOLD_STEPS, CONTEXT - len(prompt_ids))
+        params.extra_args[KEY_MAX_HOLD_STEPS] = max(0, params.max_tokens - max_frames - 1)
     params.stop_token_ids = list(STOP_TOKEN_IDS)
     params.detokenize = False
     return params
@@ -144,6 +154,9 @@ def main() -> None:
         payload = {
             "prompt_token_ids": prompt_ids,
             "generated_token_ids": generated_ids,
+            # Codec frames only: without the end token and the hold tokens
+            # the request emits while its song is synthesized.
+            "semantic_frames": semantic_frames(generated_ids),
             "seed": args.seed,
             "cot": args.cot,
             "max_frames": args.max_frames,

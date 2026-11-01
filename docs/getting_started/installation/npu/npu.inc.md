@@ -71,10 +71,15 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 
 # --8<-- [start:installation-main]
 
-You can also install vLLM-Omni from the latest main branch if you want to use the latest features or bug fixes. Use the aligned vLLM-Ascend v0.30.0 image described above, and check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for the status of the latest vLLM-Omni commit on NPU.
+You can also install vLLM-Omni from source if you want to use the latest features
+or bug fixes. This alignment checkout targets vLLM 0.32.0 and requires a
+matching vLLM-Ascend runtime validated on your NPU. The v0.30.0 Ascend images
+above do not establish compatibility with this vLLM 0.32.0 checkout. Check
+[issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for aligned
+versions and NPU validation before selecting a development image.
 
 ```bash
-# Inside the vLLM-Ascend v0.30.0 container, install vLLM-Omni from main
+# Inside a container with matching vLLM and vLLM-Ascend, install Omni from source
 cd /vllm-workspace
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni

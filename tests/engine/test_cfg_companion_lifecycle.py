@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Deterministic tests for the CFG-companion output lifecycle.
 
 Regression suite for the companion-output race behind the nightly Bagel
@@ -94,6 +94,9 @@ class _FakePool:
     def release_bindings(self, request_ids):
         pass
 
+    def schedule_release_request_resources(self, request_ids):
+        pass
+
 
 def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
     orch = Orchestrator.__new__(Orchestrator)
@@ -113,6 +116,7 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
 def _req_state(final_stage_id: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         final_stage_id=final_stage_id,
+        yield_stage_id=None,
         stage_submit_ts={},
         sampling_params_list=[SimpleNamespace(output_kind=None)] * (final_stage_id + 1),
         streaming=SimpleNamespace(enabled=False, segment_finished=False),

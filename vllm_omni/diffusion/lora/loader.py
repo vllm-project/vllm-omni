@@ -23,6 +23,11 @@ lora_convert_mapping: dict[str, Callable] = {
     "QwenImagePipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
     "QwenImageEditPipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
     "QwenImageEditPlusPipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
+    # 2.1's single-stream blocks keep the same leaf names the converter's
+    # protected n-grams cover (`attn.to_q/to_k/to_v`, `img_mlp`, ...), so the
+    # 2.0 converter applies. Non-diffusers LoRAs that target the fused `to_qkv`
+    # projection are not supported (the converter would split it into `to.qkv`).
+    "QwenImage21Pipeline": _convert_non_diffusers_qwen_lora_to_diffusers,
     "Wan22Pipeline": _convert_non_diffusers_wan_lora_to_diffusers,
     "Wan22I2VPipeline": _convert_non_diffusers_wan_lora_to_diffusers,
 }

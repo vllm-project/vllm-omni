@@ -1,0 +1,539 @@
+{
+  "id": "9c89e51f-eaea-4fec-9a22-c6161e90b62f",
+  "revision": 0,
+  "last_node_id": 9,
+  "last_link_id": 9,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "VLLMOmniGenerateMusic",
+      "pos": [
+        1310,
+        80
+      ],
+      "size": [
+        390,
+        771
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model_specific_params",
+          "name": "model_specific_params",
+          "shape": 7,
+          "type": "MUSIC_PARAMS",
+          "link": 2
+        },
+        {
+          "localized_name": "url",
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "caption",
+          "name": "instructions",
+          "type": "STRING",
+          "widget": {
+            "name": "instructions"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "lyrics",
+          "name": "lyrics",
+          "type": "STRING",
+          "widget": {
+            "name": "lyrics"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "max_duration_seconds",
+          "name": "max_duration_seconds",
+          "type": "FLOAT",
+          "widget": {
+            "name": "max_duration_seconds"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "seed",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "response_format",
+          "name": "response_format",
+          "type": "COMBO",
+          "widget": {
+            "name": "response_format"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateMusic"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1",
+        "m-a-p/YuE2-3B",
+        "Upbeat Japanese light-rock band style with clear, youthful male vocals singing in English. Bright electric guitars lead the arrangement, with clean melodic riffs, lightly overdriven rhythm chords, melodic electric bass, punchy live drums, and crisp cymbals. Guitar, bass, and drums only, without piano or keyboards. Energetic and warm, with a carefree summer atmosphere. Lively verses build into a catchy, soaring chorus with male backing harmonies and a short melodic guitar solo. Polished production that preserves the natural feel of a live band.",
+        "[Verse]\nMorning light across the window\nCity waking down below\nI can hear the streets are calling\nFeels like somewhere we should go\n\n[Chorus]\nRun with me into the sunlight\nLeave the shadows far behind\nWe don't need to know tomorrow\nTonight the whole world feels alive\n\n[Verse]\nRadio playing through the open door\nLaughing like we did before\nEvery mile becomes a memory\nAnd I just want a little more\n\n[Chorus]\nRun with me into the sunlight\nLeave the shadows far behind\nWe don't need to know tomorrow\nTonight the whole world feels alive",
+        300.0,
+        0,
+        "fixed",
+        "wav"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "SaveAudioAdvanced",
+      "pos": [
+        1750,
+        80
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 7
+        },
+        {
+          "localized_name": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "format",
+          "name": "format",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "quality",
+          "name": "format.quality",
+          "type": "COMBO",
+          "widget": {
+            "name": "format.quality"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "audioUI",
+          "name": "audioUI",
+          "type": "AUDIO_UI",
+          "widget": {
+            "name": "audioUI"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveAudioAdvanced"
+      },
+      "widgets_values": [
+        "audio/vLLM-Omni-YuE2-Music-Cover",
+        "mp3",
+        "V0"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "MarkdownNote",
+      "title": "YuE2 Music Cover Guide",
+      "pos": [
+        0,
+        80
+      ],
+      "size": [
+        480,
+        800
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## YuE2 Music Cover\n\nThis template uses native **SheetSage2 Audio to ABC** locally to transcribe a source recording, then sends the score to remote **YuE2**. Caption controls the new arrangement; Lyrics supplies the words to sing.\n\n### Parameters\n\n| Parameter | Description |\n|---|---|\n| url | vLLM-Omni service URL including `/v1`. Default: `http://localhost:8000/v1`. |\n| model | Served model name. Default: `m-a-p/YuE2-3B`. Match the running service. |\n| caption | Required music description, sent as `instructions`. Describe genre, instruments, mood, vocal language and arrangement. |\n| lyrics | Required words to sing, sent as `input`. Use section tags such as `[Verse]`, `[Chorus]` and `[Bridge]`. |\n| max_duration_seconds | Duration cap, default 300 seconds. YuE2 accepts 8–360 seconds; converted at 25 frames/s, rounded down. Generation may end earlier. |\n| seed | Random seed, default 0. Keep all inputs and runtime settings unchanged for repeatability. |\n| control_after_generate | Seed behavior: fixed, randomize, increment or decrement. Template default: fixed. |\n| response_format | API audio format: WAV, MP3, FLAC or Opus. Template default: WAV. Save Audio independently exports MP3. |\n| cot | `off`: no ABC; `melody`: supplied melody score; `full`: supplied score with chord annotations. |\n| abc | ABC score text, not a file path. Required for `melody/full`; keep empty for `off`. |\n\n### Setup and Usage\n\n1. Download [sheetsage2_bf16.safetensors](https://huggingface.co/Comfy-Org/YuE2/resolve/main/audio_encoders/sheetsage2_bf16.safetensors) using the missing-model dialog or the link. Place it in `models/audio_encoders/` and select it in Load Audio Encoder.\n2. Upload your source recording in Load Audio. SheetSage2 runs on the local ComfyUI device and requires sufficient memory.\n3. Keep SheetSage2 `mode` and YuE2 Params `cot` matched: `melody` omits chord symbols; `full` includes chord annotations. This template defaults to `melody`.\n4. Set the remote service URL/model, edit Caption and Lyrics, then queue. Save Audio previews the result and exports MP3.\n\n### Prompt Writing Guide\n\nDescribe the desired arrangement and vocal language in Caption. Supply Lyrics separately: SheetSage2 does not recover the original lyric words. For a language change, keep the source ABC and replace Lyrics; syllables may not align exactly with the source melody.\n\n### API Limits\n\nOnly ABC text is sent to YuE2; the source recording stays in ComfyUI. The result is score-conditioned music generation and does not guarantee the original accompaniment or singer's voice. The online API returns audio only, without generated ABC or truncation metadata.\n\n\nReference: [YuE2 Agentic Music Editing](https://map-yue2.github.io/#agentic-music-editing)."
+      ],
+      "widgets_values_named": {
+        "text": "## YuE2 Music Cover\n\nThis template uses native **SheetSage2 Audio to ABC** locally to transcribe a source recording, then sends the score to remote **YuE2**. Caption controls the new arrangement; Lyrics supplies the words to sing.\n\n### Parameters\n\n| Parameter | Description |\n|---|---|\n| url | vLLM-Omni service URL including `/v1`. Default: `http://localhost:8000/v1`. |\n| model | Served model name. Default: `m-a-p/YuE2-3B`. Match the running service. |\n| caption | Required music description, sent as `instructions`. Describe genre, instruments, mood, vocal language and arrangement. |\n| lyrics | Required words to sing, sent as `input`. Use section tags such as `[Verse]`, `[Chorus]` and `[Bridge]`. |\n| max_duration_seconds | Duration cap, default 300 seconds. YuE2 accepts 8–360 seconds; converted at 25 frames/s, rounded down. Generation may end earlier. |\n| seed | Random seed, default 0. Keep all inputs and runtime settings unchanged for repeatability. |\n| control_after_generate | Seed behavior: fixed, randomize, increment or decrement. Template default: fixed. |\n| response_format | API audio format: WAV, MP3, FLAC or Opus. Template default: WAV. Save Audio independently exports MP3. |\n| cot | `off`: no ABC; `melody`: supplied melody score; `full`: supplied score with chord annotations. |\n| abc | ABC score text, not a file path. Required for `melody/full`; keep empty for `off`. |\n\n### Setup and Usage\n\n1. Download [sheetsage2_bf16.safetensors](https://huggingface.co/Comfy-Org/YuE2/resolve/main/audio_encoders/sheetsage2_bf16.safetensors) using the missing-model dialog or the link. Place it in `models/audio_encoders/` and select it in Load Audio Encoder.\n2. Upload your source recording in Load Audio. SheetSage2 runs on the local ComfyUI device and requires sufficient memory.\n3. Keep SheetSage2 `mode` and YuE2 Params `cot` matched: `melody` omits chord symbols; `full` includes chord annotations. This template defaults to `melody`.\n4. Set the remote service URL/model, edit Caption and Lyrics, then queue. Save Audio previews the result and exports MP3.\n\n### Prompt Writing Guide\n\nDescribe the desired arrangement and vocal language in Caption. Supply Lyrics separately: SheetSage2 does not recover the original lyric words. For a language change, keep the source ABC and replace Lyrics; syllables may not align exactly with the source melody.\n\n### API Limits\n\nOnly ABC text is sent to YuE2; the source recording stays in ComfyUI. The result is score-conditioned music generation and does not guarantee the original accompaniment or singer's voice. The online API returns audio only, without generated ABC or truncation metadata.\n"
+      },
+      "color": "#333",
+      "bgcolor": "#535353"
+    },
+    {
+      "id": 4,
+      "type": "VLLMOmniYuE2Params",
+      "pos": [
+        920,
+        80
+      ],
+      "size": [
+        340,
+        112
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "cot",
+          "name": "cot",
+          "type": "COMBO",
+          "widget": {
+            "name": "cot"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "abc",
+          "name": "abc",
+          "type": "STRING",
+          "widget": {
+            "name": "abc"
+          },
+          "link": 9
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "model_specific_params",
+          "name": "model_specific_params",
+          "type": "MUSIC_PARAMS",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniYuE2Params"
+      },
+      "widgets_values": [
+        "melody",
+        ""
+      ]
+    },
+    {
+      "id": 6,
+      "type": "LoadAudio",
+      "pos": [
+        530,
+        80
+      ],
+      "size": [
+        340,
+        140
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "audioUI",
+          "name": "audioUI",
+          "type": "AUDIO_UI",
+          "widget": {
+            "name": "audioUI"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "AUDIOUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO",
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadAudio"
+      },
+      "widgets_values": [
+        "YuE2-Text-to-Music.mp3"
+      ],
+      "title": "Ref Audio"
+    },
+    {
+      "id": 7,
+      "type": "AudioEncoderLoader",
+      "pos": [
+        530,
+        270
+      ],
+      "size": [
+        340,
+        75
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio_encoder_name",
+          "name": "audio_encoder_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio_encoder_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO_ENCODER",
+          "name": "AUDIO_ENCODER",
+          "type": "AUDIO_ENCODER",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "AudioEncoderLoader",
+        "models": [
+          {
+            "name": "sheetsage2_bf16.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/YuE2/resolve/main/audio_encoders/sheetsage2_bf16.safetensors",
+            "directory": "audio_encoders"
+          }
+        ]
+      },
+      "widgets_values": [
+        "sheetsage2_bf16.safetensors"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "SheetSage2AudioToABC",
+      "pos": [
+        530,
+        395
+      ],
+      "size": [
+        340,
+        87
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio_encoder",
+          "name": "audio_encoder",
+          "type": "AUDIO_ENCODER",
+          "link": 5
+        },
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 4
+        },
+        {
+          "localized_name": "mode",
+          "name": "mode",
+          "type": "COMBO",
+          "widget": {
+            "name": "mode"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "abc",
+          "name": "abc",
+          "shape": 6,
+          "type": "STRING",
+          "links": [
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SheetSage2AudioToABC"
+      },
+      "widgets_values": [
+        "melody"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "PreviewAny",
+      "pos": [
+        920,
+        245
+      ],
+      "size": [
+        340,
+        607
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "source",
+          "name": "source",
+          "type": "*",
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "STRING",
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            9
+          ]
+        }
+      ],
+      "title": "Preview ABC",
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "widgets_values": [],
+      "widgets_values_named": {}
+    }
+  ],
+  "links": [
+    [
+      4,
+      6,
+      0,
+      8,
+      1,
+      "AUDIO"
+    ],
+    [
+      5,
+      7,
+      0,
+      8,
+      0,
+      "AUDIO_ENCODER"
+    ],
+    [
+      2,
+      4,
+      0,
+      1,
+      0,
+      "MUSIC_PARAMS"
+    ],
+    [
+      8,
+      8,
+      0,
+      9,
+      0,
+      "STRING"
+    ],
+    [
+      9,
+      9,
+      0,
+      4,
+      1,
+      "STRING"
+    ],
+    [
+      7,
+      1,
+      0,
+      2,
+      0,
+      "AUDIO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 1,
+      "offset": [
+        275,
+        240
+      ]
+    }
+  },
+  "version": 0.4
+}

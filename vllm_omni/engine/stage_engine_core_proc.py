@@ -11,12 +11,14 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import signal
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
-from vllm.logger import init_logger
+from vllm.config import VllmConfig
+from vllm.logger import configure_logging, init_logger
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )
@@ -38,6 +40,7 @@ from vllm_omni.engine.stage_init_utils import (
     maybe_apply_cfg_scheduler_patches,
     set_death_signal,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -80,20 +83,23 @@ def _signal_exit_code(signum: int) -> int:
 
 
 def _bind_first_audio_sink(model_executor: Any, output_queue: Any, scheduler: Any) -> bool:
-    """Let a TP1 in-process runner that decodes first audio deliver it as its own output."""
-    if not isinstance(model_executor, UniProcExecutor):
+    """Bind in-process first audio to the generic engine output sink."""
+    from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink, supports_in_process_first_audio
+
+    if not supports_in_process_first_audio(model_executor.vllm_config, type(model_executor)):
         return False
     worker = getattr(getattr(model_executor, "driver_worker", None), "worker", None)
     model_runner = getattr(worker, "model_runner", None)
     model_state = getattr(model_runner, "model_state", None)
     model = getattr(model_runner, "model", None)
-    if getattr(model, "first_frame_decoder", None) is None or not hasattr(model_state, "set_first_audio_sink"):
-        return False
-    from vllm_omni.worker_v2.first_audio_sender import engine_output_queue_sink
-
-    assert model_state is not None
-    model_state.set_first_audio_sink(engine_output_queue_sink(output_queue, scheduler))
-    return True
+    decodes_audio = getattr(model, "first_frame_decoder", None) is not None or (
+        getattr(model, "stream_decoder", None) is not None and bool(getattr(model, "stream_first_audio", False))
+    )
+    if decodes_audio and hasattr(model_state, "set_first_audio_sink"):
+        assert model_state is not None
+        model_state.set_first_audio_sink(engine_output_queue_sink(output_queue, scheduler))
+        return True
+    return False
 
 
 def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> bool:
@@ -114,6 +120,17 @@ def _bind_native_data_plane_ready_sink(model_executor: Any, scheduler: Any) -> b
     return True
 
 
+def _extend_handshake_timeout(timeout_s: float) -> None:
+    """Let this engine core wait at least ``timeout_s`` for the front-end's init message.
+
+    ``EngineCoreProc.startup_handshake`` reads the module global at call time,
+    and a stage process hosts exactly one engine core.
+    """
+    minutes = math.ceil(timeout_s / 60)
+    if minutes > _vllm_engine_core_module.HANDSHAKE_TIMEOUT_MINS:
+        _vllm_engine_core_module.HANDSHAKE_TIMEOUT_MINS = minutes
+
+
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
 
@@ -123,10 +140,35 @@ class StageEngineCoreProc(EngineCoreProc):
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        current_omni_platform.prepare_stage_engine()
         super().__init__(*args, **kwargs)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+
+    def _handle_client_request(self, request_type: EngineCoreRequestType, request: Any) -> None:
+        super()._handle_client_request(request_type, request)
+        if request_type == EngineCoreRequestType.ABORT:
+            # The eager abort queue can run before earlier ADDs are drained.
+            # Only this FIFO dispatch fences those appends and permits ID reuse.
+            release_overflowed = getattr(self.scheduler, "release_overflowed_requests", None)
+            if release_overflowed is not None:
+                release_overflowed(request)
+
+    def omni_release_request_resources(self, request_ids: list[str]) -> None:
+        """Release this stage's inter-stage transfer resources for *request_ids*.
+
+        Invoked over the UTILITY channel by the orchestrator once every stage
+        has finished with the request. Idempotent and safe for unknown ids.
+        """
+        adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
+        if adapter is None:
+            return
+        for request_id in request_ids or ():
+            try:
+                adapter.release_shm_resources(request_id)
+            except Exception as e:
+                logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
@@ -145,6 +187,7 @@ class StageEngineCoreProc(EngineCoreProc):
         omni_stage_id: int | None = None,
         omni_replica_id: int = 0,
         omni_parallel_stage_init: bool = False,
+        omni_handshake_timeout_s: float | None = None,
         **kwargs: Any,
     ) -> None:
         """Launch StageEngineCoreProc busy loop in background process.
@@ -161,8 +204,17 @@ class StageEngineCoreProc(EngineCoreProc):
           - ``omni_replica_id``: cluster-unique replica id within the
             stage (assigned by :class:`OmniMasterServer`). Used for
             logging / metrics only.
+          - ``omni_handshake_timeout_s``: how long to wait for the
+            front-end's init message. A launcher that spawns every stage
+            first and then completes their handshakes one by one answers a
+            later stage only after the earlier stages are ready, which can
+            exceed vLLM's fixed 5-minute wait.
         """
         signal_callback: SignalCallback | None = None
+        vllm_config: VllmConfig = kwargs["vllm_config"]
+        if logging_config := getattr(vllm_config, "logging_config", None):
+            configure_logging(logging_config)
+
         maybe_register_config_serialize_by_value()
 
         # Register vllm-omni reasoning parsers (e.g. step_audio) in this
@@ -209,6 +261,11 @@ class StageEngineCoreProc(EngineCoreProc):
                 "[StageEngineCoreProc] Patched EngineCoreRequest -> OmniEngineCoreRequest: %s",
                 _vllm_engine_core_module.EngineCoreRequest,
             )
+
+            # Multi-API launches answer pre-spawned stages in launch order, so
+            # this stage may wait for earlier ones before its handshake reply.
+            if omni_handshake_timeout_s is not None:
+                _extend_handshake_timeout(omni_handshake_timeout_s)
 
             # CFG pairing scheduler patches must land before EngineCore builds
             # its Scheduler; gated on the stage's logits_processors and its

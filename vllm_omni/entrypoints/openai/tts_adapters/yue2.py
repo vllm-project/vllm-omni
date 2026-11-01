@@ -36,6 +36,7 @@ from vllm_omni.model_executor.models.yue2.yue2 import (
     CONTEXT,
     FRAMES_PER_SECOND,
     KEY_MAX_AUDIO_FRAMES,
+    KEY_MAX_HOLD_STEPS,
     KEY_MIN_TOKENS,
     KEY_PENALTY_WINDOW,
     KEY_PHASE,
@@ -48,6 +49,7 @@ from vllm_omni.model_executor.models.yue2.yue2 import (
     KEY_TOP_P,
     SEMANTIC_SAMPLING,
     STOP_TOKEN_IDS,
+    SYNTHESIS_HOLD_STEPS,
 )
 from vllm_omni.tokenizers.yue2_prompt import semantic_prefix_ids
 
@@ -161,7 +163,9 @@ class Yue2Adapter(ARTTSAdapter):
         lyrics = request.input or ""
         prefix = semantic_prefix_ids(encode, instructions, lyrics, cot, abc_ids=abc_ids)
         max_frames = int(request.max_new_tokens or _DEFAULT_MAX_FRAMES)
-        if len(prefix) + max_frames > CONTEXT:
+        # +1: the song is delivered on the step after its last frame (the
+        # model acts on its draws one step late), which also needs a slot.
+        if len(prefix) + max_frames + 1 > CONTEXT:
             return_err = (
                 f"YuE2 prompt is {len(prefix)} tokens and the {max_frames}-frame budget "
                 f"exceeds the {CONTEXT}-token context. Shorten the lyrics/style or "
@@ -209,7 +213,12 @@ class Yue2Adapter(ARTTSAdapter):
         }
         # The model needs one decode step beyond the last frame to deliver the
         # terminal NAR/VAE pass, so do not cap the engine at exactly max_frames.
-        params.max_tokens = max_frames + 1
+        # Synthesize on a side stream while other songs keep decoding; the
+        # request may emit up to SYNTHESIS_HOLD_STEPS hold tokens meanwhile
+        # (see the model), so max_tokens leaves that much headroom.
+        prompt_len = len(prompt["prompt_token_ids"])
+        params.max_tokens = min(max_frames + 1 + SYNTHESIS_HOLD_STEPS, CONTEXT - prompt_len)
+        params.extra_args[KEY_MAX_HOLD_STEPS] = max(0, params.max_tokens - max_frames - 1)
         params.stop_token_ids = list(STOP_TOKEN_IDS)
         params.detokenize = False
         return sampling_params_list

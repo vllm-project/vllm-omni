@@ -1,6 +1,18 @@
 (function (root) {
   'use strict';
   const profiles = root.OmniRealtimeProfiles;
+
+  function assistantItemText(item) {
+    if (!item || item.role !== 'assistant' || !Array.isArray(item.content)) return '';
+    const parts = [];
+    for (const part of item.content) {
+      if (!part) continue;
+      if (typeof part.transcript === 'string' && part.transcript.trim()) parts.push(part.transcript.trim());
+      else if (typeof part.text === 'string' && part.text.trim()) parts.push(part.text.trim());
+    }
+    return parts.join('');
+  }
+
   profiles['aura-ptt'] = () => ({
     title: 'AURA Realtime',
     eyebrow: 'Push-to-talk duplex',
@@ -71,6 +83,34 @@
       if (event.type === 'response.listen') return { kind: 'listen' };
       if (event.type === 'playback.acknowledged') {
         return { kind: 'ack', committedMs: (event.event || event).committed_ms || 0 };
+      }
+      const itemText = assistantItemText(event.item);
+      if (itemText && (event.type === 'conversation.item.done' || event.type === 'conversation.item.added')) {
+        return {
+          kind: 'text-final',
+          role: 'assistant',
+          channel: 'audio',
+          text: itemText,
+          responseId: event.response_id || event.item.id || null,
+        };
+      }
+      if (event.type === 'response.output_text.delta' && event.delta) {
+        return {
+          kind: 'text',
+          role: 'assistant',
+          channel: 'text',
+          text: event.delta,
+          responseId: event.response_id || event.response?.id || null,
+        };
+      }
+      if (event.type === 'response.output_text.done' && (event.text || event.transcript)) {
+        return {
+          kind: 'text-final',
+          role: 'assistant',
+          channel: 'text',
+          text: event.text || event.transcript,
+          responseId: event.response_id || event.response?.id || null,
+        };
       }
       return profiles.event(event);
     },

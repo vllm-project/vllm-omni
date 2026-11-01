@@ -11,12 +11,18 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar
+from uuid import uuid4
 
 import requests
 
-from .omni_duplex_eval_clock import normalize_response_items, validate_clock
+from .omni_duplex_eval_clock import (
+    has_response_chunks,
+    normalize_response_chunks,
+    normalize_response_items,
+    validate_clock,
+)
 from .omni_duplex_eval_dataset import DuplexSample
-from .omni_duplex_eval_judge import DuplexJudge
+from .omni_duplex_eval_judge import DuplexJudge, JudgeResponseError
 from .omni_duplex_eval_media import extract_jpeg, materialize_media, video_duration
 from .omni_duplex_eval_metrics import (
     PROTOCOL_PIN,
@@ -30,6 +36,8 @@ from .omni_duplex_eval_metrics import (
     temporal_window,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _read(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -37,7 +45,12 @@ def _read(path: Path) -> Any:
 
 def _write(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = path.with_name(f"{path.name}.{uuid4().hex}.part")
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _text(items: list[dict[str, Any]]) -> str:
@@ -45,7 +58,6 @@ def _text(items: list[dict[str, Any]]) -> str:
 
 
 _T = TypeVar("_T")
-logger = logging.getLogger(__name__)
 
 
 def _uniform_subsample(values: list[_T], count: int) -> list[_T]:
@@ -75,7 +87,9 @@ def _is_prompt_too_long_error(exc: requests.HTTPError) -> bool:
         if not isinstance(message, str):
             return False
     normalized = message.lower()
-    return "prompt" in normalized and "longer than the maximum model length" in normalized
+    return ("prompt" in normalized and "longer than the maximum model length" in normalized) or (
+        "input length" in normalized and "exceeds" in normalized and "maximum context length" in normalized
+    )
 
 
 def _judge_frames_with_overflow_retry(
@@ -107,6 +121,24 @@ def _judge_frames_with_overflow_retry(
             )
 
 
+def _gt_references(answers: list[object]) -> list[str]:
+    """Mirror the official evaluator's reference handling.
+
+    Drop empty strings (order-preserving, strip-based) then deduplicate while
+    keeping the first occurrence, as ``non_empty_strings`` followed by
+    ``load_reference_texts`` does in OpenBMB/Omni-DuplexEval. Numbering an
+    empty or repeated answer would deviate from the pinned content prompt.
+    """
+    references = []
+    for answer in answers:
+        if answer is None:
+            continue
+        text = str(answer).strip()
+        if text:
+            references.append(text)
+    return list(dict.fromkeys(references))
+
+
 def evaluate_sample(
     sample: DuplexSample,
     response_path: Path,
@@ -121,6 +153,53 @@ def evaluate_sample(
 ) -> dict[str, Any]:
     if judge_frame_overflow not in ("error", "reduce"):
         raise ValueError("judge_frame_overflow must be 'error' or 'reduce'")
+
+    score_path.parent.mkdir(parents=True, exist_ok=True)
+    if score_path.exists():
+        # A failed retry must not leave an older score eligible for aggregation.
+        # Keep the .previous suffix: summaries and accuracy CI scan *.json.
+        score_path.replace(score_path.with_name(f"{score_path.name}.{uuid4().hex}.previous"))
+    trace_path = score_path.with_suffix(".judge.jsonl")
+    trace_path.write_text("", encoding="utf-8")
+
+    def judge_result(call: Callable[[], str], required: tuple[str, ...]) -> dict[str, Any]:
+        try:
+            raw_response = call()
+        except JudgeResponseError as exc:
+            with trace_path.open("a", encoding="utf-8") as trace:
+                trace.write(
+                    json.dumps(
+                        {"raw_response": exc.raw_response, "finish_reason": exc.finish_reason, "error": str(exc)},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            raise
+        with trace_path.open("a", encoding="utf-8") as trace:
+            trace.write(json.dumps({"raw_response": raw_response}, ensure_ascii=False) + "\n")
+        return parse_judge_json(raw_response, required=required)
+
+    def judge_frames_result(
+        call: Callable[[list[bytes]], str], frames: list[bytes], required: tuple[str, ...]
+    ) -> dict[str, Any]:
+        used_frames = frames
+        retries = 0
+
+        def invoke() -> str:
+            nonlocal used_frames, retries
+            raw_response, used_frames, retries = _judge_frames_with_overflow_retry(
+                call, frames, allow_reduction=judge_frame_overflow == "reduce"
+            )
+            return raw_response
+
+        parsed = judge_result(invoke, required)
+        return {
+            **parsed,
+            "frame_count_initial": len(frames),
+            "frame_count": len(used_frames),
+            "frame_budget_retries": retries,
+        }
+
     raw = _read(response_path)
     meta = (
         _read(response_path.with_name(response_path.stem + ".meta.json"))
@@ -128,7 +207,6 @@ def evaluate_sample(
         else {}
     )
     validate_clock(meta, allow_invalid=allow_invalid_clock)
-    items = normalize_response_items(raw)
     result: dict[str, Any] = {
         "id": sample.id,
         "family": sample.family,
@@ -140,6 +218,7 @@ def evaluate_sample(
         "judge_frame_overflow": judge_frame_overflow,
     }
     if sample.family == "rtd":
+        items = normalize_response_items(raw)
         video_path = materialize_media(sample.video, score_path.parent / ".media", sample.id, ".mp4")
         duration = sample.video_duration or video_duration(video_path)
         temporal_rows = []
@@ -159,12 +238,11 @@ def evaluate_sample(
                 )
                 continue
             frames = _extract_frames(video_path, _times(*window, fps=judge_fps))
-            temporal_response, used_frames, retries = _judge_frames_with_overflow_retry(
+            parsed = judge_frames_result(
                 partial(judge.temporal, build_temporal_prompt(*window, item["sentence"], sample.question_text)),
                 frames,
-                allow_reduction=judge_frame_overflow == "reduce",
+                ("temporal_score", "is_relevant"),
             )
-            parsed = parse_judge_json(temporal_response)
             temporal_rows.append(
                 {
                     **item,
@@ -175,25 +253,43 @@ def evaluate_sample(
                     "window_end": window[1],
                     "error": None,
                     **parsed,
-                    "frame_count_initial": len(frames),
-                    "frame_count": len(used_frames),
-                    "frame_budget_retries": retries,
                 }
             )
-        content_prompt = build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2])
+        content_prompt = build_content_prompt(
+            _text(items), sample.question_text, _gt_references([sample.answer1, sample.answer2])
+        )
         if judge_video_mode == "frame-sample":
             content_frames = _extract_frames(video_path, _content_frame_times(duration))
-            content_response, used_content_frames, retries = _judge_frames_with_overflow_retry(
-                partial(judge.content, content_prompt, video_path, mode=judge_video_mode),
+            content = judge_frames_result(
+                lambda selected: judge.content(content_prompt, video_path, frames=selected, mode=judge_video_mode),
                 content_frames,
-                allow_reduction=judge_frame_overflow == "reduce",
+                ("content_score",),
             )
-            content = parse_judge_json(content_response)
-            content["frame_count_initial"] = len(content_frames)
-            content["frame_count"] = len(used_content_frames)
-            content["frame_budget_retries"] = retries
         else:
-            content = parse_judge_json(judge.content(content_prompt, video_path, frames=None, mode=judge_video_mode))
+            try:
+                content = judge_result(
+                    lambda: judge.content(content_prompt, video_path, frames=None, mode=judge_video_mode),
+                    ("content_score",),
+                )
+            except Exception as exc:
+                # Preserve upstream video_url recovery. Frame reduction remains
+                # separately opt-in, including frames chosen by this fallback.
+                if judge_video_mode != "video_url" or not _is_judge_context_length_error(exc):
+                    raise
+                logger.warning(
+                    "Judge rejected the full video for %s (context length exceeded); "
+                    "retrying the content prompt in frame-sample mode",
+                    sample.id,
+                )
+                content_frames = _extract_frames(video_path, _content_frame_times(duration))
+                if not content_frames:
+                    raise
+                content = judge_frames_result(
+                    lambda selected: judge.content(content_prompt, video_path, frames=selected, mode="frame-sample"),
+                    content_frames,
+                    ("content_score",),
+                )
+                content["judge_input_fallback"] = "frame-sample"
         result.update(
             {
                 "temporal": {"sentences": temporal_rows, "summary": summarize_temporal_results(temporal_rows)},
@@ -205,22 +301,29 @@ def evaluate_sample(
             raise ValueError(f"missing proactive-reminder task type for split {sample.split!r}")
         task = sample.task_type
         times = _reminder_times(sample)
+        chunks = normalize_response_chunks(raw)
+        # Chunks keep their own boundary whitespace; legacy sentence items are stripped.
+        separator = "" if has_response_chunks(raw) else " "
         event_rows = []
         if task == "correction" or not times:
-            response = _text(items)
-            parsed = parse_judge_json(
-                judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1))
+            response = separator.join(chunk["text"] for chunk in chunks).strip()
+            parsed = judge_result(
+                lambda: judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1)),
+                ("success_score",),
             )
             event_rows.append({"response_segment": response, **parsed})
         else:
             for start in times:
                 lo, hi = reminder_window(start, window_size)
-                response = " ".join(item["sentence"] for item in items if lo <= item["start"] <= hi)
+                response = separator.join(
+                    chunk["text"] for chunk in chunks if lo <= chunk["current_time"] <= hi
+                ).strip()
                 if not response:
                     event_rows.append({"start_time": start, "response_segment": "", "success_score": 0})
                 else:
-                    parsed = parse_judge_json(
-                        judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1))
+                    parsed = judge_result(
+                        lambda: judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1)),
+                        ("success_score",),
                     )
                     event_rows.append({"start_time": start, "response_segment": response, **parsed})
         scores = [int(row.get("success_score", 0)) for row in event_rows]
@@ -238,6 +341,23 @@ def _times(start: float, end: float, *, fps: int) -> list[float]:
     return (
         [start + (end - start) / 2] if count == 1 else [start + i * (end - start) / (count - 1) for i in range(count)]
     )
+
+
+def _is_judge_context_length_error(exc: BaseException) -> bool:
+    """True when the judge rejected the request because its input was too long.
+
+    The judge client raises ``requests.HTTPError`` with the HTTP response
+    attached, e.g. HTTP 400
+    ``Input length (83158) exceeds model's maximum context length (65536)``.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    text = str(getattr(response, "text", "") or "").lower()
+    if "context length" in text:
+        return True
+    # Other OpenAI-compatible judges phrase the same rejection differently.
+    return "input length" in text and "exceed" in text
 
 
 def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
