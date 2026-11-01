@@ -585,9 +585,26 @@ steps:
     timeout_in_minutes: 60
     artifact_paths:
       - coverage-core-model-cpu-*.xml.gz
+      # Outside pytest rootpath, on the shared Kubernetes /workspace volume.
+      - /workspace/build/native-cpu-phase-probe.*/native-phase-probe-*/events.jsonl
+      - /workspace/build/native-cpu-phase-probe.*/native-phase-probe-*/checkpoint.json
+      - /workspace/build/native-cpu-phase-probe.*/native-phase-probe-*/summary.json
     commands:
       - |
         set +e
+        if [ "$${VLLM_OMNI_NATIVE_PHASE_PROBE:-0}" = "1" ]; then
+          PROBE_OUTPUT="$$(mktemp -d /workspace/build/native-cpu-phase-probe.XXXXXX)"
+          if [ -n "$${PROBE_OUTPUT}" ]; then
+            export NATIVE_PHASE_PROBE_OUTPUT_DIR="$${PROBE_OUTPUT}"
+            export NATIVE_PHASE_PROBE_PARENT_PID=$$$$
+            export NATIVE_PHASE_PROBE_SLOW_SECONDS=1.0
+            export NATIVE_PHASE_PROBE_MAX_EVENTS=2000
+            export NATIVE_PHASE_PROBE_MAX_BYTES=2097152
+            export NATIVE_PHASE_PROBE_CHECKPOINT_REPORTS=1000
+          else
+            echo "native-phase-probe: output unavailable; original pytest continues" >&2
+          fi
+        fi
         REPORT="coverage-core-model-cpu-$${BUILDKITE_STEP_ID:-local}.xml"
         pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}
         EXIT=$$?

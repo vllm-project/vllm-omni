@@ -12,6 +12,8 @@ Root pytest entrypoint for the vLLM-Omni test suite.
 
 from __future__ import annotations
 
+import os
+
 # Before ``pytest_plugins`` and before any other test path imports vLLM, pin op
 # registration order (see :func:`tests.model_executor.helpers.bootstrap_vllm_layer_custom_op_modules`).
 # Subdir ``conftest`` hooks can run after other tests are collected/imported, which is
@@ -30,6 +32,20 @@ pytest_plugins = (
     "tests.helpers.fixtures.pytest_run_args",
     "tests.helpers.fixtures.runtime",
 )
+
+
+def pytest_configure(config):
+    # Opt in only for the existing CPU shell's direct pytest child. Consume the
+    # registration token so nested pytest sessions cannot create extra observers.
+    if (
+        os.environ.get("VLLM_OMNI_NATIVE_PHASE_PROBE") == "1"
+        and os.environ.get("NATIVE_PHASE_PROBE_PARENT_PID") == str(os.getppid())
+        and "NATIVE_PHASE_PROBE_OUTPUT_DIR" in os.environ
+    ):
+        os.environ.pop("NATIVE_PHASE_PROBE_PARENT_PID", None)
+        from tests.helpers import native_phase_probe
+
+        config.pluginmanager.register(native_phase_probe, "native-phase-probe")
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):

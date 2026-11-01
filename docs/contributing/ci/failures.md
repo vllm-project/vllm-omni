@@ -88,6 +88,29 @@ For resilience behavior under injected process signals/OOM pressure (validation 
 
 For instructions on running tests locally (including specific test files, functions, and markers), see the [Running Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/test_execution_guide/#running-tests) section in the Test Execution guide.
 
+### Diagnosing an incomplete nightly CPU coverage run
+
+Set `VLLM_OMNI_NATIVE_PHASE_PROBE=1` on a CUDA nightly build to enable bounded
+pytest phase and garbage-collection timing metadata in the existing CPU coverage
+step. This preserves its serial test command, selection, assertions, coverage
+reports and deadline. Other steps remain uninstrumented. The observer records
+test file/function names and hashes parameterized node IDs; it does not record
+test payloads, captured output, exception contents or stacks.
+
+The step creates a private directory outside pytest's root on the shared
+`/workspace` volume. Its artifact globs collect `events.jsonl`, periodic
+`checkpoint.json` and, when the session finishes, `summary.json`. Files are
+bounded to 2 MiB per observer. Event limits can omit later slow phases; aggregate
+checkpoints describe only the observed prefix. A checkpoint or a summary is not
+proof of complete coverage or passing tests. Verify actual artifact receipt
+after a timeout; loss of the pod or agent can prevent upload.
+
+The observer adds timing overhead. Compare instrumented and uninstrumented runs
+explicitly, and do not infer a common cause from matching timeout symptoms.
+Registration is limited to the CPU step's direct pytest child; nested pytest
+sessions do not inherit an active registration token. Without the opt-in flag,
+the observer is not imported or registered.
+
 ## Step 4: Raise an Issue or Fix It
 
 ### If the failure is pre-existing (not caused by your PR)
