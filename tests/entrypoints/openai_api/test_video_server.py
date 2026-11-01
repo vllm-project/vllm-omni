@@ -1532,6 +1532,8 @@ def test_h3_regenerate_forwards_a_maskless_draft(test_client, mocker: MockerFixt
     multi_modal_data = engine.captured_prompt["multi_modal_data"]
     assert engine.captured_latent_edit_source_bytes == {"source_video": b"draft-video"}
     assert "video_noise_mask" not in multi_modal_data and "audio_noise_mask" not in multi_modal_data
+    # A 2K regenerate is never continued, so its job is not tagged for the latent cache.
+    assert "latent_cache_key" not in engine.captured_sampling_params_list[0].extra_args
 
 
 def test_latent_edit_fields_are_rejected_for_models_without_capability(test_client):

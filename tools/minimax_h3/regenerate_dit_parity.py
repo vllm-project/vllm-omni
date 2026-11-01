@@ -173,7 +173,7 @@ def run_vllm_omni(args: argparse.Namespace) -> dict[float, torch.Tensor]:
             world_size=1,
             rank=0,
             local_rank=0,
-            distributed_init_method=f"file://{tempfile.mktemp()}",
+            distributed_init_method=f"file://{Path(tempfile.mkdtemp()) / 'dist_init'}",
             backend="nccl",
             timeout=timedelta(seconds=120),
         )

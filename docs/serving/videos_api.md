@@ -393,6 +393,10 @@ curl -s http://localhost:8091/v1/videos/sync \
   -o regenerated.mp4
 ```
 
+The output is refined at the upscaled size, so `latent_upscale` must land on
+the 32-pixel grid (`align` 32, the default). A regenerated video is not cached
+for `continue_from`: continue the draft, then regenerate the result.
+
 ### MiniMax H3 Timeline Guides
 
 MiniMax H3 accepts ordered timeline guides: a still image or a clip, optionally

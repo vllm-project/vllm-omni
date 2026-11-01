@@ -153,8 +153,10 @@ def test_adapter_refuses_dit_offload_and_other_partitions(tmp_path, monkeypatch)
     _write_bundle(tmp_path)
     adapter = _load(tmp_path)
 
-    def offload(strategy, *components):
-        return SimpleNamespace(strategy=strategy, offloads=lambda component: component in components)
+    def offload(strategy, *components, cache_backend=None):
+        return SimpleNamespace(
+            strategy=strategy, offloads=lambda component: component in components, cache_backend=cache_backend
+        )
 
     monkeypatch.setattr(regenerate, "resolve_offload", lambda config: config)
     adapter.check_serving_contract(partition="fl2va", od_config=offload(OffloadStrategy.NONE))
@@ -163,6 +165,14 @@ def test_adapter_refuses_dit_offload_and_other_partitions(tmp_path, monkeypatch)
         adapter.check_serving_contract(partition="ref2va", od_config=offload(OffloadStrategy.NONE))
     with pytest.raises(ValueError, match="DiT cannot use"):
         adapter.check_serving_contract(partition="fl2va", od_config=offload(OffloadStrategy.LAYER_WISE, "dit"))
+    # Cache-DiT is planned and refused per request; a step cache installed at startup is refused here.
+    adapter.check_serving_contract(
+        partition="fl2va", od_config=offload(OffloadStrategy.NONE, cache_backend="cache_dit")
+    )
+    with pytest.raises(ValueError, match="--cache-backend tea_cache"):
+        adapter.check_serving_contract(
+            partition="fl2va", od_config=offload(OffloadStrategy.NONE, cache_backend="tea_cache")
+        )
 
 
 def test_prepare_edit_video_cover_crops_instead_of_stretching(monkeypatch, tmp_path):
@@ -336,6 +346,25 @@ def test_pipeline_refuses_requests_outside_the_regenerate_contract(tmp_path):
         pipeline._prepare_encoder_conditioning_inputs(
             _draft_conditioning(), _sampling(canny={}), control_media={"control_path": "/tmp/hint.mp4"}
         )
+    with pytest.raises(OmniClientError, match="not cached for continue_from"):
+        pipeline._prepare_encoder_conditioning_inputs(_draft_conditioning(), _sampling(latent_cache_key="video_gen_x"))
+
+
+def test_regenerate_refuses_targets_and_caches_its_refine_cannot_run(tmp_path):
+    from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentUpscaleTarget
+
+    _write_bundle(tmp_path)
+    pipeline, _ = _regenerate_pipeline(_load(tmp_path))
+    # align=16 can land on an odd latent size, which the always-on refine cannot patchify.
+    pipeline._resolve_latent_upscale = lambda extra, *, latent_h, latent_w: MiniMaxH3LatentUpscaleTarget(
+        latent_height=49, latent_width=85, scale=2.0
+    )
+    with pytest.raises(OmniClientError, match="divisible by 2"):
+        pipeline._prepare_encoder_conditioning_inputs(_draft_conditioning(), _sampling())
+    pipeline, _ = _regenerate_pipeline(_load(tmp_path))
+    pipeline.od_config.cache_backend = "tea_cache"
+    with pytest.raises(OmniClientError, match="--cache-backend tea_cache"):
+        pipeline._prepare_encoder_conditioning_inputs(_draft_conditioning(), _sampling())
     pipeline._regenerate = None
     with pytest.raises(OmniClientError, match="--lora-path"):
         pipeline._prepare_encoder_conditioning_inputs(_draft_conditioning(), _sampling())

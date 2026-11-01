@@ -204,6 +204,13 @@ class MiniMaxH3RegenerateAdapter:
                 "Open-H3-Regenerate is fused while the checkpoint streams in, so the DiT cannot use "
                 f"{offload.strategy.value} offload. Offload the text encoder only, or nothing."
             )
+        cache_backend = str(getattr(od_config, "cache_backend", None) or "none").lower()
+        if cache_backend not in ("none", "cache_dit"):
+            # A step cache installed at startup would let the three refine steps
+            # reuse residuals; Cache-DiT is planned per request and refused there.
+            raise ValueError(
+                f"Open-H3-Regenerate requires uncached denoising; serve without --cache-backend {cache_backend}"
+            )
 
     def check_request(self, sampling: Any) -> int:
         """Validate a request against the release's sampler; return its step count."""

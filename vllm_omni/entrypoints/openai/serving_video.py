@@ -571,8 +571,9 @@ class OmniOpenAIServingVideo:
                 loggable = {**loggable, **redacted}
             logger.info("Applied extra_params: %s", loggable)
 
-        if self.supports_latent_continuation:
+        if self.supports_latent_continuation and (request.extra_params or {}).get("regenerate") is not True:
             # Server-owned: the job id is the only key a later continue_from can name.
+            # A regenerate job is refined at 2K, off the base canvas, and is never cached.
             gen_params.extra_args["latent_cache_key"] = reference_id
 
         self._apply_lora(request.lora, gen_params)

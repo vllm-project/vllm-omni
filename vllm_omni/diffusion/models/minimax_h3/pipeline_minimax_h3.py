@@ -3560,6 +3560,9 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("Open-H3-Regenerate does not support step execution")
         if resolve_continuation_request(extra) is not None:
             raise OmniClientError("Open-H3-Regenerate does not support continue_from")
+        if extra.get(LATENT_CACHE_KEY) is not None:
+            # The 2K output leaves the base canvas a later continue_from would need.
+            raise OmniClientError("Open-H3-Regenerate outputs are not cached for continue_from; drop latent_cache_key")
         if not self.load_vae_encoder:
             raise OmniClientError("Open-H3-Regenerate needs a local VAE encoder")
         num_steps = self._regenerate.check_request(sampling)
@@ -3595,6 +3598,12 @@ class MiniMaxH3Pipeline(
             extra if extra.get("latent_upscale") is not None else {"latent_upscale": REGENERATE_DEFAULT_UPSCALE}
         )
         target = self._resolve_latent_upscale(upscale_extra, latent_h=latent_h, latent_w=latent_w)
+        if target is not None and (target.latent_height % 2 or target.latent_width % 2):
+            # Regenerate always refines the upscaled draft, which patchifies 2x2.
+            raise OmniClientError(
+                "Open-H3-Regenerate refines the upscaled draft, so latent_upscale must give a latent height and "
+                "width divisible by 2 (32 pixels); use align=32 or a compatible target size"
+            )
         self._validate_refine_token_budget(
             task=conditioning.task,
             target=target,
@@ -3613,6 +3622,9 @@ class MiniMaxH3Pipeline(
         )
         if quality_plan.cache_dit is not None:
             raise OmniClientError("Open-H3-Regenerate requires uncached denoising; set quality=lossless")
+        cache_backend = str(getattr(self.od_config, "cache_backend", None) or "none").lower()
+        if cache_backend not in ("none", "cache_dit"):
+            raise OmniClientError(f"Open-H3-Regenerate does not support --cache-backend {cache_backend}")
         self._cache_dit_runtime.prepare(None)
         self._prepare_adaln_adapter(sampling)
         return {
