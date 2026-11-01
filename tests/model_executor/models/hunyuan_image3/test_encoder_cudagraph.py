@@ -93,7 +93,7 @@ def test_stage_custom_manager_platform_fallback(monkeypatch, mocker, enabled, cu
     monkeypatch.setattr(runner, "get_model", lambda: model)
     monkeypatch.setattr(gpu_model_runner.current_omni_platform, "is_cuda", lambda: cuda)
     monkeypatch.setattr(GPUModelRunner, "_create_encoder_cudagraph_manager", lambda self: None)
-    log = mocker.patch.object(gpu_model_runner.logger, "warning")
+    log = mocker.patch.object(gpu_model_runner.logger, "warning_once")
     runner.vllm_config, runner.device, runner.dtype = object(), torch.device("cpu"), torch.float32
     result = runner._create_encoder_cudagraph_manager()
     if enabled and cuda:
