@@ -4,32 +4,45 @@
 
 import sys
 from dataclasses import replace
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 from PIL import Image
-from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
+from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem, PlaceholderRange
 from vllm.multimodal.parse import MultiModalDataItems
+from vllm.transformers_utils.configs.bagel import BagelConfig
 from vllm.v1.attention.backends import utils
 
-from vllm_omni.model_executor.models.bagel.bagel import Img2ImgProcessorItems, OmniBagelMultiModalProcessor
+from vllm_omni.model_executor.models.bagel.bagel import (
+    Img2ImgProcessorItems,
+    OmniBagelMultiModalProcessor,
+    OmniBagelProcessingInfo,
+)
 from vllm_omni.utils.mm_prefix import apply_img2img_mm_prefix_patch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
-def bagel_feature():
+def bagel_feature(mocker):
     processor = object.__new__(OmniBagelMultiModalProcessor)
-    processor.info = SimpleNamespace(
-        get_hf_config=lambda: SimpleNamespace(
-            vit_config=SimpleNamespace(image_size=980, patch_size=14),
-            latent_patch_size=2,
-            vae_config={"downsample": 8},
-            max_latent_size=64,
-        ),
-        get_tokenizer=lambda: SimpleNamespace(get_vocab=lambda: {"<|fim_middle|>": 42}),
+    info = object.__new__(OmniBagelProcessingInfo)
+    config = BagelConfig(
+        vit_config={"image_size": 980, "patch_size": 14},
+        latent_patch_size=2,
+        vae_config={"downsample": 8},
+        max_latent_size=64,
     )
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"<unk>": 0, "<|fim_middle|>": 1}, unk_token="<unk>")),
+        unk_token="<unk>",
+    )
+    mocker.patch.object(info, "get_hf_config", return_value=config)
+    mocker.patch.object(info, "get_tokenizer", return_value=tokenizer)
+    processor.info = info
     mm_items = MultiModalDataItems({"img2img": Img2ImgProcessorItems([Image.new("RGB", (1024, 672))])})
     update = processor._get_prompt_updates(mm_items, {}, {})[0].resolve(0)
     assert update.modality == "img2img"
@@ -39,7 +52,11 @@ def bagel_feature():
     # Includes the VAE and ViT markers, with one non-embedding separator.
     assert position.extract_embeds_range() == [(0, 2689), (2691, 7592)]
     return MultiModalFeatureSpec(
-        data=object(), modality="img2img", identifier="encoder-id", mm_position=position, mm_hash="processor-id"
+        data=MultiModalKwargsItem({}),
+        modality="img2img",
+        identifier="encoder-id",
+        mm_position=position,
+        mm_hash="processor-id",
     )
 
 
