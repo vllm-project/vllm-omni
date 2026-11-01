@@ -1049,6 +1049,36 @@ def test_qwen_image_21_accuracy_shared_helper_routing(monkeypatch: pytest.Monkey
 @pytest.mark.parametrize(
     "changed_path,selected",
     [
+        ("vllm_omni/diffusion/models/mammoth_moda2/pipeline_mammothmoda2_dit.py", True),
+        ("vllm_omni/model_executor/stage_input_processors/mammoth_moda2.py", True),
+        ("vllm_omni/diffusion/offloader/distributed_layerwise_backend.py", True),
+        ("tests/e2e/offline_inference/test_mammoth_moda2_expansion.py", True),
+        ("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py", True),
+        ("vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py", False),
+    ],
+)
+def test_mammoth_moda2_changes_select_two_gpu_function_step(
+    monkeypatch: pytest.MonkeyPatch, changed_path: str, selected: bool
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
+    # A Wan change keeps a model job matched so the no-match fallback cannot mask routing.
+    changed_files = [changed_path, "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"]
+    rendered = _render_test_pipeline(doc, changed_files, pipeline_path=NIGHTLY_YAML)
+    steps = [
+        step
+        for step in _iter_steps(rendered)
+        if any(
+            "tests/e2e/offline_inference/test_mammoth_moda2_expansion.py" in command
+            for command in step.get("commands", [])
+        )
+    ]
+    assert len(steps) == int(selected)
+
+
+@pytest.mark.parametrize(
+    "changed_path,selected",
+    [
         ("vllm_omni/diffusion/models/qwen_image_21/pipeline_qwen_image_21.py", True),
         ("vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py", True),
         ("vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py", True),

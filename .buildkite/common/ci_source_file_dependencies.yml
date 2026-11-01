@@ -210,6 +210,15 @@ x-lingbot-video: &lingbot_video
 x-lingbot-world: &lingbot_world
   - vllm_omni/diffusion/models/lingbot_world/
 
+x-mammoth-moda2: &mammoth_moda2
+  - vllm_omni/diffusion/models/mammoth_moda2/
+  - vllm_omni/model_executor/models/mammoth_moda2/
+  - vllm_omni/model_executor/stage_input_processors/mammoth_moda2.py
+  - vllm_omni/transformers_utils/configs/mammoth_moda2.py
+  - vllm_omni/tokenizers/mammoth_moda2_tokenizer.py
+  - vllm_omni/model_extras/mammothmodal2_preview.py
+  - vllm_omni/deploy/mammoth_moda2.yaml
+
 
 source_file_dependencies:
   # Hardware presets and shared test helpers. Not a job key — do not attach this
@@ -649,6 +658,12 @@ source_file_dependencies:
     - *qwen_image_21
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
+
+  diffusion_mammoth_moda2_function:
+    - *mammoth_moda2
+    - tests/e2e/offline_inference/test_mammoth_moda2_expansion.py
+    - tests/helpers/mammoth_moda2_worker.py
+    - vllm_omni/diffusion/offloader/
 
   diffusion_text_to_image_doc:
     - *qwen_image
