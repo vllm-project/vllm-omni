@@ -189,6 +189,12 @@ Notes:
   The [Ref2VA experiment records](https://github.com/InferMatrixLab/InferRSI/issues/293)
   retain requests that exceeded the default deadline; they are failed attempts,
   not completed latency measurements.
+- NPU shutdown allows 60 seconds for graceful diffusion-worker exit and
+  90 seconds for the enclosing Orchestrator join, including bounded worker
+  termination phases. Both waits return early when cleanup completes. Record
+  actual worker exit codes as well as server exit: a server can exit zero after
+  an outer timeout while worker cleanup is still pending. These shutdown
+  budgets do not affect inference timing.
 - H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
 - Keep `--ring 1` when switching to RainFusion attention (below): the
   block-sparse kernel ranks key blocks over the whole sequence, so ring

@@ -67,11 +67,14 @@ from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.inputs.preprocess import build_omni_renderer
 from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
 _REQUEST_QUEUE_MAXSIZE = 256
+# Enclose the NPU workers' 60-second grace and bounded terminate/kill phases.
+_NPU_SHUTDOWN_JOIN_TIMEOUT_S = 90.0
 # Output messages one serving-loop wakeup takes before yielding the event loop.
 _OUTPUT_DRAIN_MAX_BATCH = 256
 _ConfigResolutionResult = OmniConfigResolution | tuple[str | None, list[Any], str | None]
@@ -955,14 +958,15 @@ class OmniEngineBase:
                 logger.exception("[OmniEngine] Failed to close correlated RPC client")
 
         orchestrator_stopped = False
+        join_timeout = _NPU_SHUTDOWN_JOIN_TIMEOUT_S if current_omni_platform.is_npu() else SHUTDOWN_JOIN_TIMEOUT_S
         try:
             if self.is_alive():
-                self.orchestrator_thread.join(timeout=SHUTDOWN_JOIN_TIMEOUT_S)
+                self.orchestrator_thread.join(timeout=join_timeout)
             orchestrator_stopped = not self.is_alive()
             if not orchestrator_stopped:
                 logger.error(
                     "[OmniEngine] Orchestrator did not stop within %.1f seconds; continuing cleanup",
-                    SHUTDOWN_JOIN_TIMEOUT_S,
+                    join_timeout,
                 )
         except Exception:
             logger.exception("[OmniEngine] Failed to join Orchestrator thread")
