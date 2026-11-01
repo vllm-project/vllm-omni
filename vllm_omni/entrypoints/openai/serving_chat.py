@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
@@ -165,6 +166,10 @@ from vllm_omni.utils.speakers import (
 )
 
 logger = init_logger(__name__)
+
+# Profiling aid for benchmarks/batch_chat_completion_bench.py: logs per-request
+# preprocess timing when enabled (see batch_serving._BENCH_PHASE_LOG).
+_BENCH_PHASE_LOG = os.environ.get("VLLM_OMNI_BENCH_PHASE_LOG", "").lower() in ("1", "true", "yes")
 
 
 async def _identity_async(value: Any) -> Any:
@@ -738,6 +743,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
+            _t_pre0 = time.perf_counter()
             if not self.use_harmony:
                 error_check_ret = self.online_renderer.validate_chat_template(
                     request_chat_template=request.chat_template,
@@ -770,6 +776,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 should_include_tools = tool_dicts is not None
                 conversation, engine_prompts = self.online_renderer._make_request_with_harmony(
                     request, should_include_tools
+                )
+            if _BENCH_PHASE_LOG:
+                logger.info(
+                    "[BENCH-PHASE] single preprocess=%.1fms",
+                    (time.perf_counter() - _t_pre0) * 1000,
                 )
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
