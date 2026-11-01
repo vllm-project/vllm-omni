@@ -60,6 +60,7 @@ from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPEL
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
 from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
+from vllm_omni.model_executor.models.funaudiochat.pipeline import FUN_AUDIO_CHAT_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
 from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
 from vllm_omni.model_executor.models.glm_tts.pipeline import GLM_TTS_PIPELINE
@@ -196,6 +197,19 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lingv3_tts": MING3_TTS_PIPELINE,
     "mammoth_moda2": MAMMOTH_MODA2_PIPELINE,
     "mammoth_moda2_ar": MAMMOTH_MODA2_AR_PIPELINE,
+    "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
+    "voxcpm2": VOXCPM2_PIPELINE,
+    "auk": AUK_PIPELINE,
+    "cosyvoice3": COSYVOICE3_PIPELINE,
+    "funaudiochat": FUN_AUDIO_CHAT_PIPELINE,
+    "audex_tts": AUDEX_TTS_PIPELINE,
+    "audex_tta": AUDEX_TTA_PIPELINE,
+    "audex_thinker_only": AUDEX_THINKER_ONLY_PIPELINE,
+    "audex_s2s": AUDEX_S2S_PIPELINE,
+    # Alias: the Nemotron-Labs-Audex-2B repo-root config.json reports
+    # ``model_type: nemotron_labs_audex``; bare ``vllm-omni serve <repo>``
+    # auto-detects through it and must land on the default (TTS) pipeline.
+    "nemotron_labs_audex": AUDEX_TTS_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,
     "ming3_audio_tts": MING3_AUDIO_TTS_PIPELINE,
     "ming3_tts": MING3_TTS_PIPELINE,
