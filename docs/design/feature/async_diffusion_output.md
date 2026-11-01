@@ -92,6 +92,13 @@ After (async D2H):
 
 ### Key Components
 
+After emitting a scheduler wave's outputs, the engine drops its local
+`runner_output` reference before executing the next wave. It does not clear
+the shared result or its tensors. Output streams and the worker's asynchronous
+packing queue retain ownership until their consumers finish. In particular,
+an in-flight D2H copy may legitimately overlap the next generation and retain
+the previous video; the engine must not force that storage to be released.
+
 1. **AsyncDiffusionOutput** (`data.py`): Protocol envelope for `result_mq`. `kind` field routes messages:
    - `COMPUTE_DONE` — forward finished, GPU can start next request
    - `OUTPUT_READY` — D2H/SHM packing finished, final output available

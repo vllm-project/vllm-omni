@@ -10,8 +10,8 @@
 ## Table of Contents
 
 - [Overview](#overview)
-  - [Symbols](#symbols)
-  - [What is a cell?](#what-is-a-cell)
+    - [Symbols](#symbols)
+    - [What is a cell?](#what-is-a-cell)
 - [Scope](#scope)
 - [Architecture](#architecture)
 - [Cell schedule](#cell-schedule)
@@ -37,7 +37,6 @@ Noisy KV is the same-request multi-chunk path on Omni's existing **layer PP**.
 | `G` | `layer_groups` | Layer groups per step replica; `world = S·G` |
 | `B`, `K` | `blocks`, `blocks_per_rank` | DiT blocks; contiguous blocks per rank in a group |
 | `H` | `kv_history_chunks` | History window — free (`≥0`) on every topology, independent of both the ordering and the clean step |
-| `has_clean` | derived | Clean@0 at step `D` — Self-Forcing / Latest-KV always, Same-Step never (ordering property, independent of `H`) |
 | Cell `(c,s,b)` | — | Schedule task + KV version (+ `req` when batched) |
 | Tick | — | One cell on one rank (one block forward) |
 | `R` | `max_batch_size` | Max micro-batch requests per rank per tick |
@@ -66,23 +65,22 @@ Three orderings; Latest-KV and Same-Step share the diagonal (vertical) topology:
 | --- | --- | --- |
 | **Self-Forcing** (`Ordering.SELF_FORCING`) | Finish one chunk before the next | Clean `(c', D, b)` only |
 | **Latest-KV** (`Ordering.LATEST_KV`) | Diagonal cell overlap | Newest finished `(c', s*, b)` with completion tick strictly earlier |
-| **Same-Step** (`Ordering.SAME_STEP`) | Same diagonal placement | Matching step `(c', s, b)` only; always local (no KV P2P); **no clean** |
+| **Same-Step** (`Ordering.SAME_STEP`) | Same diagonal placement | Matching step `(c', s, b)`; fixed clean sink from chunk 0 |
 
 `S = 1` is native layer PP. Vertical schedules use `S ∈ {D, D+1}`:
-`S = D` (no clean; Same-Step) or `S = D+1` (one weight replica per noisy step
+`S = D` (Same-Step; first-chunk sink uses the last replica) or `S = D+1` (one weight replica per noisy step
 plus clean). Activations still follow PP (`next_rank` after the block that
 feeds the next group). KV is keyed **per block** `b`: publish / transfer /
 wait when that cell finishes; a remote reader of `b` does not wait for the
 producer's other local blocks.
 
-CausVidWan accepts only Self-Forcing / Latest-KV (not Same-Step) and
-`S ∈ {1, D+1}` (not `S=D`). Pair schedule with topology: Self-Forcing →
+CausVidWan accepts Self-Forcing / Latest-KV only. Pair schedule with topology: Self-Forcing →
 `S=1` layer PP only (`deploy/causvid_wan_self_forcing.yaml`); Latest-KV →
 vertical `S=D+1` (`deploy/causvid_wan_latest_kv.yaml`). Clean is an ordering
 property, independent of the history window (Self-Forcing and Latest-KV always,
-Same-Step never); `has_clean` is not a knob.
+Same-Step runs it for chunk 0 only).
 
-#102 acceptance: reproducible basic function + recorded config. No FPS /
+Acceptance for #102: reproducible basic function + recorded config. No FPS /
 speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
 
 ## Scope
@@ -95,8 +93,8 @@ speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
 `cell_schedule` (request `extra_args`) must match the deployment topology:
 `S=1` → Self-Forcing, vertical `S=D+1` → Latest-KV (CausVidWan derives the
 default from `step_replicas` and rejects a mismatched explicit choice);
-Same-Step (`S=D`) stays a schedule-level primitive, not on CausVidWan. It is
-not a session property.
+Same-Step (`S=D`) is a generic schedule primitive with a fixed first-chunk clean
+sink; CausVidWan does not expose it. It is not a session property.
 Optional session only keeps clean KV across generations
 ([Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)).
 
@@ -148,16 +146,16 @@ src = (c', s*, b)
 
 # Same-Step: same step × block → same rank → local only
 src = (c', s_task, b)   # only if P(c', s_task, b) < current_tick
-# no KV transfers under Same-Step
+# no ordinary-history KV transfers under Same-Step; sink is an exception
 ```
 
 Invariants:
 
 - `S ∈ {1, D, D+1}`
-- Same-Step ⇒ `S = D` (no clean; `S=1` only when `D=1`); Self-Forcing ⇒ `S = 1` (layer PP); Latest-KV ⇒ `S = D+1` (clean)
+- Same-Step ⇒ `S = D` (no per-chunk clean; `S=1` only when `D=1`); Self-Forcing ⇒ `S = 1` (layer PP); Latest-KV ⇒ `S = D+1` (clean)
 - No Latest-KV edge inside the same micro-batch / tick
 - Cross-rank KV ready before use (Latest-KV / Self-Forcing when remote)
-- Same-Step history never needs KV P2P (co-located with the consumer)
+- Ordinary Same-Step history never needs KV P2P; the clean sink is distributed once
 - Finite `H` + `last_use` bounds residency
 - Consumer of `b` never waits on producer's `b' ≠ b` (activation edges are separate)
 
@@ -193,6 +191,21 @@ Implemented in `experimental/ar_diffusion/kv_cache/noisy.py`.
 Per-tick KV traffic ≈ history depth × one block × tokens × heads × dim per
 remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`.
 
+### Same-Step with a first-chunk clean sink
+
+`Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
+The topology stays `S=D`. Chunk 0 runs one extra clean forward on the last
+replica, then its clean KV is distributed once to the readers before later
+chunks start. When the clean successor is on the same rank, the executor carries
+the final latent directly into that pass, without adapter-local latent storage.
+Subsequent chunks use the normal Same-Step schedule. A single-chunk
+request skips the unused clean forward and sink distribution.
+
+Each chunk reads the fixed clean sink plus its most recent `H` Same-Step
+history chunks, deduplicating chunk 0 while it is in the window. `H=0` keeps
+the sink. This mode currently admits one request at a time; checkpoint quality
+requires separate validation.
+
 ## Configuration
 
 | Layer | Key | Meaning |
@@ -201,8 +214,8 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` (schedule primitive; CausVidWan rejects `same_step`) |
-| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (`has_clean` is derived and rejected as a key) |
+| Request `extra_args` | `cell_schedule` | CausVidWan: `self_forcing` \| `latest_kv`; Same-Step is schedule-level only |
+| | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (clean scheduling follows the ordering and multi-chunk shape) |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML.
 Last-noisy finish rank: `S=1` → `G-1`; vertical `S ∈ {D, D+1}` → `D·G-1`
@@ -219,7 +232,7 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 | Combination | Status |
 | --- | --- |
 | No session + Self-Forcing / Latest-KV | Supported (opt-in; CausVid) |
-| No session + Same-Step | Schedule supported; not on CausVidWan |
+| No session + Same-Step | Generic schedule primitive with a clean sink; not exposed by CausVidWan |
 | Session + legacy loop | Supported (unchanged) |
 | Session + Cell path | Designed; not required for #102 |
 
@@ -227,14 +240,12 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 `H` defaults to model `max_history_chunks` (not `0`) — that adds the history
 window (and its KV reuse) versus the previous unset→`H=0` behavior; set
 `kv_history_chunks: 0` to run without history. The clean step is unaffected:
-`self_forcing` always runs it (ordering property). `has_clean` is rejected as
-a request `extra_args` key.
+`self_forcing` always runs it (ordering property).
 
 **S=1 without the clean step is intentionally gone:** `self_forcing` always
-runs the clean step regardless of `H`, `same_step` is not offered on
-CausVidWan, and the S=1 Latest-KV path was removed with the `S=D+1`
-restriction. `kv_history_chunks: 0` only removes the history window, not the
-clean step.
+runs the clean step regardless of `H`. Same-Step (`S=D`, including `S=1`
+when `D=1`) runs clean only for chunk 0. `kv_history_chunks: 0` removes recent
+history but retains the Same-Step sink.
 
 Capability: `SupportsARDiffusionCellPipeline` —
 `ar_diffusion_noisy_kv_spec()`, `bind_ar_diffusion_cell_context()`.

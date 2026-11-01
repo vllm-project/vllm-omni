@@ -36,7 +36,9 @@ Committers have write access and merge rights. They typically have deep expertis
 - [@alex-jw-brooks](https://github.com/alex-jw-brooks): Frontend, Configuration, and Entrypoint Support
 - [@amy-why-3459](https://github.com/amy-why-3459): Omni Modality Model and World Model Support
 - [@david6666666](https://github.com/david6666666): Quantization and Community Relationship
+- [@FayeSpica](https://github.com/FayeSpica): Ascend NPU platform and CI
 - [@gcanlin](https://github.com/gcanlin): Hardware plugin, NPU integration, and TTS Model Support
+- [@haic0](https://github.com/haic0): ROCm / MI300 CI and AMD platform coverage
 - [@Isotr0py](https://github.com/Isotr0py): Diffusion and Quantization
 - [@linyueqian](https://github.com/linyueqian): TTS and Omni Support
 - [@lishunyang12](https://github.com/lishunyang12): Quantization and Configuration
@@ -45,10 +47,12 @@ Committers have write access and merge rights. They typically have deep expertis
 - [@RuixiangMa](https://github.com/RuixiangMa): Diffusion models, parallel, cache, and docs
 - [@SamitHuang](https://github.com/SamitHuang): RL, Diffusion, and cache
 - [@Sy0307](https://github.com/Sy0307): TTS Model and AR Engine Support
+- [@timzsu](https://github.com/timzsu): Diffusion model integration / LoRA (BAGEL, GR00T), TTS streaming (CosyVoice)
 - [@tzhouam](https://github.com/tzhouam): Engine and New Model Support
 - [@wtomin](https://github.com/wtomin): Diffusion models, parallel, and docs
 - [@xuechendi](https://github.com/xuechendi): Diffusion and Intel GPU Support
 - [@ZeldaHuang](https://github.com/ZeldaHuang): Omni Support
+- [@ZhengWG](https://github.com/ZhengWG): Omni prefix cache, AR/omni engine core, multimodal serving
 - [@ZJY0516](https://github.com/ZJY0516): Diffusion attention backend, kernel fusion, and CustomOp
 - [@yuanheng-zhao](https://github.com/yuanheng-zhao): Diffusion cache, offload, and Omni Support
 

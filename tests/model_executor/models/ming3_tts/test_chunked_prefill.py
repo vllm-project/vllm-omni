@@ -26,6 +26,10 @@ class _Backbone(torch.nn.Module):
         self.fm_dtype = torch.float32
         self._request_generators = {}
         self._pending_postprocess_updates = {}
+        self._decode_state = {}
+
+    def set_initial_history(self, request_id, history):
+        self._decode_state[request_id] = (history, None)
 
     def embed_input_ids(self, ids):
         return self.embedding(ids)
@@ -109,20 +113,21 @@ def test_chunked_prefill_matches_full(reference_draws, mode, device):
     full = _run(wrapper, ids, full_info, [0, len(ids)])
     generator = wrapper.model._request_generators.get("request")
     rng_state = generator.get_state() if generator is not None else None
+    full_history = wrapper.model._decode_state["request"][0].clone()
     wrapper.on_requests_finished({"request"})
     split_info = initial_info.copy()
     # Single-token chunks cross every speaker/audio boundary, including the tail.
     actual = _run(wrapper, ids, split_info, range(len(ids) + 1))
     torch.testing.assert_close(actual, full, rtol=0, atol=0)
-    torch.testing.assert_close(split_info[state_keys.KEY_LATENT_HISTORY], full_info[state_keys.KEY_LATENT_HISTORY])
+    torch.testing.assert_close(wrapper.model._decode_state["request"][0], full_history)
     # Recomputing a prefix must reuse the same sampled reference, not advance RNG.
     split_info[state_keys.KEY_DECODE_STEP] = 7
-    saved_history = torch.ones_like(split_info[state_keys.KEY_LATENT_HISTORY])
-    split_info[state_keys.KEY_LATENT_HISTORY] = saved_history
+    saved_history = torch.ones_like(full_history)
+    wrapper.model._decode_state["request"] = (saved_history, None)
     replay = _run(wrapper, ids, split_info, [0, len(ids)])
     torch.testing.assert_close(replay, full, rtol=0, atol=0)
     assert split_info[state_keys.KEY_DECODE_STEP] == 7
-    torch.testing.assert_close(split_info[state_keys.KEY_LATENT_HISTORY], saved_history)
+    torch.testing.assert_close(wrapper.model._decode_state["request"][0], saved_history)
     assert len(reference_draws) == (2 if "prompt_waveform" in initial_info else 0)
     if rng_state is not None:
         assert torch.equal(wrapper.model._request_generators["request"].get_state(), rng_state)
@@ -148,3 +153,31 @@ def test_interleaved_prefill_requests_are_isolated_and_cancelled(reference_draws
     assert set(wrapper._prefill_conditioning) == {"other"}
     wrapper.on_requests_finished({"other"})
     assert not wrapper._prefill_conditioning and not wrapper.model._request_generators
+
+    # Completion uses the runner ID while cached state can use the API ID.
+    # Keep an unrelated live request and both seeded RNG streams isolated.
+    ids, live_info = _prompt("clone")
+    _run(wrapper, ids, live_info, [0, 1])
+    live = wrapper._prefill_conditioning["request"]
+    for index in range(32):
+        runner_id, api_id = f"cancel-{index}", f"api-{index}"
+        _, info = _prompt("clone")
+        info.update(request_id=runner_id, ming3_request_id=api_id, tts_local_seed=43)
+        _, _, update = wrapper.preprocess(ids[:1], None, **info, _omni_is_prefill=True)
+        assert api_id in wrapper._prefill_conditioning
+        assert update[state_keys.KEY_REQUEST_ID] == api_id
+        assert runner_id in wrapper.model._request_generators
+        flow_rng = wrapper.model._get_request_generator(update, torch.device("cpu"))
+        assert torch.equal(flow_rng.get_state(), torch.Generator().manual_seed(43).get_state())
+        wrapper._prefetched_prompt_outputs[api_id] = (1, live.prompt_embeds)
+        wrapper._prefetched_speakers[api_id] = [live.speaker_embeds]
+        wrapper.model._pending_postprocess_updates[api_id] = {}
+        wrapper.on_requests_finished({runner_id})
+        wrapper.on_requests_finished({runner_id})
+        assert set(wrapper._prefill_conditioning) == {"request"}
+        assert set(wrapper.model._decode_state) == {"request"}
+        assert set(wrapper.model._request_generators) == {"request"}
+        assert not wrapper._prefetched_prompt_outputs and not wrapper._prefetched_speakers
+        assert not wrapper._request_state_ids and not wrapper.model._pending_postprocess_updates
+    assert wrapper._prefill_conditioning["request"] is live
+    wrapper.on_requests_finished({"request"})

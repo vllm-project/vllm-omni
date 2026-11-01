@@ -336,6 +336,107 @@ def test_auxiliary_default_state_has_omni_lifecycle_but_preserves_upstream_state
         assert state is upstream_state
 
 
+@pytest.mark.parametrize("lifecycle", [False, True])
+def test_hybrid_omni_stage_keeps_recurrent_state_and_omni_lifecycle(monkeypatch, lifecycle):
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
+
+    class HybridConfig(OmniModelConfig):
+        is_hybrid = True
+
+    upstream = MagicMock(side_effect=AssertionError("hybrid Omni stage used the upstream state"))
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", upstream)
+    monkeypatch.setattr(OmniMambaHybridModelState, "__init__", lambda *_args: None)
+    model = SimpleNamespace(**({"have_multimodal_outputs": True} if lifecycle else {}))
+    state = init_omni_model_state(
+        SimpleNamespace(model_config=object.__new__(HybridConfig)), model, None, torch.device("cpu")
+    )
+    assert isinstance(state, OmniModelState) and isinstance(state, MambaHybridModelState)
+    mro = type(state).__mro__
+    # Omni hooks wrap the hybrid state's add_request/prepare_attn via super().
+    assert mro.index(OmniModelState) < mro.index(MambaHybridModelState) < mro.index(DefaultModelState)
+    assert callable(state.run_preprocess) and callable(state.postprocess_state)
+
+
+def test_hybrid_model_keeps_its_mrv2_state_factory():
+    """Drama 3 is hybrid and owns create_mrv2_model_state.
+
+    The generic hybrid state has no Ascend attention metadata, so the NPU
+    runner exits before it is ready. The model's factory must win.
+    """
+    from vllm.v1.worker.gpu.model_states.interface import ModelState
+
+    class HybridConfig(OmniModelConfig):
+        is_hybrid = True
+
+    class DramaState(ModelState):
+        uses_ascend_attn_metadata = True
+
+        def prepare_inputs_embeds(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def prepare_inputs(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def prepare_dummy_inputs(self, *args, **kwargs):
+            raise NotImplementedError
+
+        def prepare_attn(self, *args, **kwargs):
+            raise NotImplementedError
+
+    sentinel = object.__new__(DramaState)
+    seen = {}
+
+    class DramaModel:
+        have_multimodal_outputs = True
+
+        def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+            seen["device"] = device
+            return sentinel
+
+    state = init_omni_model_state(
+        SimpleNamespace(model_config=object.__new__(HybridConfig)),
+        DramaModel(),
+        None,
+        torch.device("cpu"),
+    )
+    assert state is sentinel
+    assert seen["device"] == torch.device("cpu")
+    assert state.uses_ascend_attn_metadata is True
+
+
+@pytest.mark.parametrize("remove_by_id", [False, True])
+def test_hybrid_state_constructs_and_reuses_request_slots(remove_by_id):
+    from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_inputs_embeds_size=lambda: 8,
+            dtype=torch.float32,
+            max_model_len=32,
+            enable_prompt_embeds=False,
+            uses_mrope=False,
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=16),
+        cache_config=SimpleNamespace(mamba_cache_mode="none", use_kda_recoverssm=False),
+    )
+    # Exercise both real parent constructors and their lifecycle methods.
+    state = OmniMambaHybridModelState(config, torch.nn.Linear(8, 8), None, torch.device("cpu"))
+    for index, req_id in enumerate(("finished", "peer")):
+        state.add_request(index, SimpleNamespace(req_id=req_id, mm_features=[]))
+    state.num_accepted_tokens_gpu.copy_(torch.tensor([7, 3], dtype=torch.int32))
+    state.intermediate_buffer.buffers[0]["old_audio"] = torch.ones(4)
+    state.remove_request("finished" if remove_by_id else 0)
+    assert state.intermediate_buffer.buffers[0] == {}
+    assert state.intermediate_buffer.req_id_to_index == {"peer": 1}
+    state.add_request(0, SimpleNamespace(req_id="replacement", mm_features=[]))
+    state.apply_staged_writes()
+    assert state.num_accepted_tokens_gpu.tolist() == [1, 3]
+    assert state.intermediate_buffer.buffers == [{"req_id": "replacement"}, {"req_id": "peer"}]
+    assert state.intermediate_buffer.req_id_to_index == {"replacement": 0, "peer": 1}
+
+
 def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
     runner = _make_runner()
     calls = []
@@ -452,6 +553,9 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
         runner_kind
     ]
     runner = object.__new__(runner_cls)
+    if runner_kind == "generation":
+        # __new__ bypasses initialization; model an idle step before this dummy.
+        runner._prev_step_idle = True
     runner._staged_writes = staged_writes.StagedWrites()
     hidden = torch.ones(1, 2)
     runner.model = MagicMock(
@@ -524,5 +628,7 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     assert isinstance(runner.execute_model_state, ExecuteModelState)
     assert runner.execute_model_state.input_batch is input_batch
     assert runner.execute_model_state.cudagraph_stats is None
-    if runner_kind != "generation":
+    if runner_kind == "generation":
+        assert not runner._prev_step_idle
+    else:
         runner.prepare_dummy_attn.assert_called_once_with(input_batch, True)

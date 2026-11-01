@@ -111,6 +111,7 @@ class _Request:
         self.stop_reason = None
         self.trace_headers = None
         self.num_nans_in_logits = 0
+        self.additional_information = None
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
@@ -157,6 +158,7 @@ def _make_scheduler_stub(requests: list[_Request]) -> SimpleNamespace:
         _new_prompt_len_snapshot={},
         _hold_payloadless_outputs=False,
         _pooling_output_decoder=None,
+        _outputs_awaiting_stage_payload={},
         finished_req_ids=set(),
         finished_req_ids_dict=defaultdict(set),
         kv_cache_manager=SimpleNamespace(take_events=lambda: None),
@@ -258,7 +260,10 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     np.testing.assert_array_equal(token_rows[:, 0], [7])
 
 
-@pytest.mark.parametrize("failure,num_logprobs", [("logprobs", 1), ("logits", 1), ("logits", None)])
+@pytest.mark.parametrize(
+    "failure,num_logprobs",
+    [("logprobs", 1), ("logits", 1), ("logits", None), ("model", None), ("model_and_logits", None)],
+)
 def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure, num_logprobs) -> None:
     """A bad runner response must not bring down unrelated batch requests."""
     bad = _Request("bad")
@@ -280,7 +285,10 @@ def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure, 
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=[[7], [8]],
-        invalid_logits_req_ids={"bad"} if failure == "logits" else set(),
+        invalid_logits_req_ids={"bad"} if failure in ("logits", "model_and_logits") else set(),
+        request_errors={"bad": "Non-finite Ming3 flow-head output in decode step."}
+        if failure in ("model", "model_and_logits")
+        else None,
         logprobs=_logprobs(
             [[9, 1], [8, 2]],
             [[-0.9, -1.0], [-0.8, -1.0]],
@@ -303,7 +311,12 @@ def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure, 
     assert update_calls == ["good"]
     assert bad.status is RequestStatus.FINISHED_ERROR
     assert bad.stop_reason is not None
-    assert ("no finite logits" if failure == "logits" else "misaligned") in bad.stop_reason
+    expected_reason = (
+        "Non-finite Ming3"
+        if failure.startswith("model")
+        else ("no finite logits" if failure == "logits" else "misaligned")
+    )
+    assert expected_reason in bad.stop_reason
     assert "bad" not in scheduler.requests
     assert output_by_id["bad"].finish_reason is FinishReason.ERROR
     assert output_by_id["bad"].new_token_ids == []

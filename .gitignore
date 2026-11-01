@@ -295,7 +295,3 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
-
-# Local Transformers/PyTorch inference experiment for Ming3.
-/examples/offline_inference/ming3_audio/transformers_thinker_talker.py
-/vllm_omni/model_executor/models/ming3_audio/hf_talker.py
