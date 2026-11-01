@@ -79,6 +79,12 @@ outputs = omni.generate(
 
 For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or more concrete `.safetensors` files. The weights are fused into the base model once at init; subsequent `generate()` calls do not need a `LoRARequest`.
 
+With tensor parallelism, the fusion loader selects each rank's portion of the
+adapter delta to match the base linear weights. Packed QKV and merged column
+projections are split per projection before being packed for each rank.
+Replicated weights and row-parallel biases keep the full delta. Unloading an
+adapter uses the same partitioning.
+
 ##### Supported pipelines
 
 For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_weights(...)` during worker initialization.
