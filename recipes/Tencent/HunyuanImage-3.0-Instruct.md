@@ -70,6 +70,71 @@ python examples/offline_inference/x_to_text/x_to_text.py \
 The AR-only default uses four GPUs. Pass `--deploy-config` to override the
 layout.
 
+### AR image encoder CUDA graphs
+
+Encoder graphs are off by default. To enable SigLIP2 CUDA graphs, copy
+`vllm_omni/deploy/hunyuan_image3_ar.yaml` and add the following settings to
+stage 0:
+
+```yaml
+enforce_eager: false
+compilation_config:
+  cudagraph_mm_encoder: true
+  encoder_cudagraph_token_budgets: [1024, 2048]
+  encoder_cudagraph_max_vision_items_per_batch: 2
+```
+
+Pass the copied file with `--deploy-config`. With Instruct revision `2ec2c78`,
+these settings capture 2 SigLIP2 graphs. VAE encoding and sampling always use
+the model's ordinary eager path, including with automatically inferred budgets.
+Use `cudagraph_mm_encoder: false` with otherwise identical
+settings to measure the effect of encoder graphs.
+
+SigLIP2 positional interpolation runs before replay. The budgets count padded
+SigLIP2 patches per batch, not VAE latent positions. Only budgets that upstream
+packing can select are captured: with `[1024, 3500, 4096]` and 1024-patch images,
+vLLM 0.32 runs each image with the 1024 graph instead of padding two images to
+3500 tokens. Unsupported patch counts and images above every budget run eagerly.
+Increasing the vision batch limit or token budgets can increase capture time
+and memory use. Check graph counts when changing the checkpoint or processor.
+
+Torch SDPA vision attention stays eager because its variable-length path is
+not graph-safe. The startup log reports encoder manager initialization and captured graph
+counts. The switch does not change the DiT encoder or the default deploy
+configuration.
+
+With automatic KV cache sizing and CUDA graph memory profiling enabled, the
+AR stage reserves graph memory before allocating the KV cache. More graph
+memory leaves less space for KV cache at the same `gpu_memory_utilization`.
+Startup also captures the encoder graphs once for profiling and again for
+serving. Check the startup log for the graph reserve and available KV cache;
+explicit KV cache sizing bypasses this automatic reserve.
+
+Reference measurements used 4×A100-SXM4-80GB, TP=4, DP=1, BF16, vLLM 0.32.0,
+Instruct revision `2ec2c78`, and Omni base `ee37ec0` with this patch applied.
+Communication used the defaults, with encoder TP mode `weights`, one
+concurrent request, prefix caching disabled,
+`gpu_memory_utilization: 0.75`, and `max_num_batched_tokens: 32768`.
+
+With these settings, SigLIP2 graphs saved about 8.5 ms in median single image
+encoding time in both runs (rank 0, including eager VAE). Two image inputs
+showed no consistent benefit, and a repeatable end-to-end speedup was not
+established.
+
+| Encoder graph configuration | Encoder graphs | Total graph reserve per GPU | Available KV cache per GPU |
+| --- | ---: | ---: | ---: |
+| Disabled | 0 | 70 MiB | 13.00 GiB |
+| SigLIP2 only | 2 | 172 MiB | 12.90 GiB |
+
+The extra graph reserve is 102 MiB per GPU. The total reserve includes decoder
+graphs and is used for automatic KV cache sizing; it is not peak process
+memory. Each startup captured the encoder graphs twice, taking about 0.07 s
+per pass on rank 0 in this setup.
+
+Full measurements and validation limits are in
+[#8437](https://github.com/vllm-project/vllm-omni/pull/8437).
+Benchmark your workload before enabling encoder graphs.
+
 ### Shared T2I/IT2I offline examples
 
 Text-to-image and image-editing route through the shared task examples, with
@@ -139,7 +204,7 @@ the same checkpoint, parallelism, and image settings.
 Start the DiT-only server with one of the following CLI-only configurations.
 These commands use explicit CLI flags for all parallelism and runtime settings.
 
-**TP=4 + FP8**
+##### TP=4 + FP8
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -152,7 +217,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + SP=2**
+##### TP=2 + FP8 + SP=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
@@ -166,7 +231,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
   --enable-diffusion-pipeline-profiler
 ```
 
-**TP=2 + FP8 + CFG=2**
+##### TP=2 + FP8 + CFG=2
 
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \

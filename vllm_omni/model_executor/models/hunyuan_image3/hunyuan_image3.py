@@ -1736,6 +1736,19 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 "will be incorrect. Check that model.layers[*].self_attn.rotary_emb exists."
             )
 
+    def create_encoder_cudagraph_manager(self, vllm_config, device, dtype):
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if self.vision_model.encoder.layers[0].self_attn.attn.attn_backend == AttentionBackendEnum.TORCH_SDPA:
+            logger.warning(
+                "HunyuanImage3 encoder CUDA graphs require graph-safe vision attention; using eager encoding."
+            )
+            return None
+
+        from .encoder_cudagraph import HunyuanImage3EncoderCudaGraphManager
+
+        return HunyuanImage3EncoderCudaGraphManager(vllm_config, device, dtype, self)
+
     def _parse_and_validate_image_input(
         self,
         **kwargs: dict[str, Any],
@@ -1945,31 +1958,36 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         if image_input is None:
             return []
 
-        vae_cfg_factor = 1
         pixel_values = image_input["pixel_values"]
         vit_pixel_values = pixel_values["vit_pixel_values"]
         vit_pixel_attention_mask = pixel_values["vit_pixel_attention_mask"]
         vit_spatial_shapes = pixel_values["vit_spatial_shapes"]
-        vae_pixel_values = pixel_values["vae_pixel_values"]
-        vae_generator_seed = pixel_values.get("vae_generator_seed")
-        vae_generator = None
-        if vae_generator_seed is not None and vae_generator_seed.numel() > 0:
-            vae_generator = torch.Generator(device=vae_pixel_values[0].device).manual_seed(
-                int(vae_generator_seed.reshape(-1)[0].item())
-            )
-
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
+        vae_token_embeddings = self._encode_vae_tokens(
+            pixel_values["vae_pixel_values"], pixel_values.get("vae_generator_seed")
+        )
+        return self._combine_image_embeddings(vit_embeddings, vae_token_embeddings)
+
+    def _encode_vae_tokens(self, images: list[torch.Tensor], seed: torch.Tensor | None = None) -> list[torch.Tensor]:
+        """Encode and sample VAE inputs in image order for both vision paths."""
+        generator = None
+        if seed is not None and seed.numel() > 0:
+            generator = torch.Generator(device=images[0].device).manual_seed(int(seed.reshape(-1)[0].item()))
 
         # VAE encode + patch_embed per image — each cond image is at its own
         # `reso_group` bucket so shapes are ragged across the image-batch dim.
         vae_token_embeddings = []
-        for vae_image_i in vae_pixel_values:
-            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor, generator=vae_generator)
+        for image in images:
+            t_i, latents_i = self._vae_encode(image.unsqueeze(0), generator=generator)
             t_emb = self.time_embed(t_i[0])
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)
+        return vae_token_embeddings
 
+    def _combine_image_embeddings(
+        self, vit_embeddings: torch.Tensor, vae_token_embeddings: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
         assert vit_embeddings is not None and vit_embeddings.shape[0] == len(vae_token_embeddings), (
             f"Number of ViT embeddings ({vit_embeddings.shape[0]}) does not match "
             f"number of VAE token embeddings ({len(vae_token_embeddings)}). "
