@@ -148,6 +148,9 @@ def validator(model_dir: str, tmp_path_factory: pytest.TempPathFactory) -> Itera
     """One Turbo adapter shared by the tests that only check requests, which change none of its state.
 
     Building a server loads the reference encoders; the CPU job has no time for one per case.
+    It leaves the process-wide speaker cache alone, so the tests that count its entries do
+    not depend on it: building only fetches the cache (``clean_speaker_cache`` gives those
+    tests a new one), and ``shutdown`` clears only voices this server uploaded, which is none.
     """
     with pytest.MonkeyPatch.context() as patch:
         # The server reads the uploaded voices' directory once, when it is built.
