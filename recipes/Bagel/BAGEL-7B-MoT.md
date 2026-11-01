@@ -35,7 +35,9 @@ parameters through the pipeline-declared `extra_args` contract.
 - Default deploy configs:
   [`vllm_omni/deploy/bagel.yaml`](../../vllm_omni/deploy/bagel.yaml),
   [`vllm_omni/deploy/bagel_think.yaml`](../../vllm_omni/deploy/bagel_think.yaml),
-  [`vllm_omni/deploy/bagel_single_stage.yaml`](../../vllm_omni/deploy/bagel_single_stage.yaml)
+  [`vllm_omni/deploy/bagel_single_stage.yaml`](../../vllm_omni/deploy/bagel_single_stage.yaml),
+  and
+  [`vllm_omni/deploy/bagel_allgather_kv4.yaml`](../../vllm_omni/deploy/bagel_allgather_kv4.yaml)
 
 ## Hardware Support
 
@@ -172,8 +174,8 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT \
 
 #### Step Execution and Continuous Batching
 
-BAGEL supports step execution for image generation with all three in-repo
-deploy configs:
+BAGEL supports step execution for image generation with the three non-SP
+in-repo deploy configs:
 
 - `bagel.yaml`: the flag applies to the Stage 1 diffusion engine; Stage 0
   remains on the normal autoregressive path.
@@ -182,6 +184,9 @@ deploy configs:
 - `bagel_single_stage.yaml`: image requests use step execution in Stage 0.
   Explicit text-output requests keep the existing complete-request path, so
   `text2text` and `img2text` behavior is unchanged.
+
+The fourth config, `bagel_allgather_kv4.yaml`, enables sequence parallelism and
+cannot be combined with `--step-execution`.
 
 Start with one active request when validating correctness. For example, the
 following command uses the single-stage topology:
