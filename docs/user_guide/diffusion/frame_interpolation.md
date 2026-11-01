@@ -28,6 +28,18 @@ Frame interpolation is currently supported for:
 
 - `WanPipeline` (Wan2.2 text-to-video)
 - `WanImageToVideoPipeline`
+- `HeliosPipeline` / `HeliosPyramidPipeline` (Helios T2V/I2V/V2V)
+
+## Helios Chunked Semantics
+
+Helios generates video in chunks. Interpolation runs worker-side inside
+`post_decode` while each decoded chunk still lives on the worker accelerator,
+so every streamed chunk is interpolated independently. Within a chunk the
+frame count follows the same `(N - 1) * 2**exp + 1` formula, and the actually
+generated frames pass through unchanged (they are bit-preserved through the
+interpolator's range normalization for the VAE's half-precision output).
+Every chunk carries the same `video_fps_multiplier` metadata; the final
+chunk's metadata drives the output FPS in the API response.
 
 ## Request Parameters
 
@@ -42,13 +54,15 @@ The video APIs `/v1/videos` and `/v1/videos/sync` accept:
 
 ## Execution Flow
 
-For supported Wan2.2 pipelines, the execution order is:
+For supported pipelines, the execution order is:
 
 1. Diffusion worker finishes denoising and decodes the raw video tensor.
 2. Worker-side model-specific post-processing runs.
 3. If frame interpolation is enabled, RIFE interpolates the decoded video
    tensor on the worker side and records a FPS multiplier in
-   `metadata.video.video_fps_multiplier`.
+   `metadata.video.video_fps_multiplier`. For Helios this happens inside
+   `post_decode`, per decoded chunk, before the output is shipped to the
+   engine; for Wan2.2 it happens in the pipeline's post-process function.
 4. The API server receives the already-interpolated video and only performs
    MP4 export.
 
