@@ -33,7 +33,6 @@ from tests.helpers.serving_chat import (
     make_text_omni_output,
     parse_sse_chunks,
 )
-from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -389,17 +388,7 @@ async def test_streaming_wav_header_is_only_in_first_chunk(choice_order, empty_a
         result.finished = finished
         return result
 
-    def create_audio_choice(omni_res, role, request, stream=False, wav_header_sent=None):
-        return OmniOpenAIServingChat._create_audio_choice(
-            serving_chat,
-            omni_res,
-            role,
-            request,
-            stream=stream,
-            wav_header_sent=wav_header_sent,
-        )
-
-    serving_chat._create_audio_choice = create_audio_choice
+    del serving_chat._create_audio_choice
 
     async def result_generator():
         first_index = choice_order[0]
@@ -489,17 +478,7 @@ async def test_audio_chunk_without_waveform_keeps_stream_alive(mocker):
     empty_audio = _make_audio_omni_output()
     empty_audio.outputs[0].multimodal_output = {"audio": []}
 
-    def create_audio_choice(omni_res, role, request, stream=False, wav_header_sent=None):
-        return OmniOpenAIServingChat._create_audio_choice(
-            serving_chat,
-            omni_res,
-            role,
-            request,
-            stream=stream,
-            wav_header_sent=wav_header_sent,
-        )
-
-    serving_chat._create_audio_choice = create_audio_choice
+    del serving_chat._create_audio_choice
 
     async def result_generator():
         yield make_text_omni_output(text="hi", token_ids=[10], finish_reason=None)

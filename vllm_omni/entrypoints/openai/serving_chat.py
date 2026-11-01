@@ -3079,18 +3079,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if isinstance(audio_format, ErrorResponse):
                 return audio_format, set()
 
-            if stream and audio_format == "wav":
+            stream_wav = stream and audio_format == "wav"
+            audio_request = CreateAudio(
+                audio_tensor=audio_tensor,
+                audio_layout=audio_layout,
+                sample_rate=sample_rate,
+                response_format="pcm" if stream_wav else audio_format,
+                speed=1.0,
+                base64_encode=not stream_wav,
+            )
+            audio_response: AudioResponse = self.create_audio(audio_request)
+
+            if stream_wav:
                 # Stream a separate WAV file for each choice. Empty PCM must
                 # leave that choice's header available for its first waveform.
-                pcm_obj = CreateAudio(
-                    audio_tensor=audio_tensor,
-                    audio_layout=audio_layout,
-                    sample_rate=sample_rate,
-                    response_format="pcm",
-                    speed=1.0,
-                    base64_encode=False,
-                )
-                audio_response: AudioResponse = self.create_audio(pcm_obj)
                 pcm_bytes = audio_response.audio_data
                 assert isinstance(pcm_bytes, bytes)
                 if pcm_bytes and output.index not in wav_header_sent:
@@ -3109,33 +3111,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if audio_response.audio_metadata is not None:
                     audio_response.audio_metadata = audio_response.audio_metadata.model_copy(update={"format": "wav"})
             else:
-                audio_request = CreateAudio(
-                    audio_tensor=audio_tensor,
-                    audio_layout=audio_layout,
-                    sample_rate=sample_rate,
-                    response_format=audio_format,
-                    speed=1.0,
-                    base64_encode=True,
-                )
-
-                audio_response = self.create_audio(audio_request)
                 encoded_audio = audio_response.audio_data
                 assert isinstance(encoded_audio, str)
                 audio_base64 = encoded_audio
-
-            # Generate unique ID for the audio
-            audio_id = f"audio-{uuid.uuid4().hex[:16]}"
-
-            # Set expiration time (e.g., 24 hours from now) as Unix timestamp
-            expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
-
-            # Create OpenAIChatCompletionAudio object with all required fields
-            audio_obj = OpenAIChatCompletionAudio(
-                id=audio_id,
-                data=audio_base64,
-                expires_at=expires_at,
-                transcript="",  # Empty transcript if not available
-            )
 
             if stream:
                 stream_choices.append(
@@ -3150,6 +3128,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     )
                 )
             else:
+                audio_obj = OpenAIChatCompletionAudio(
+                    id=f"audio-{uuid.uuid4().hex[:16]}",
+                    data=audio_base64,
+                    expires_at=int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp()),
+                    transcript="",
+                )
                 choices.append(
                     OmniChatCompletionResponseChoice(
                         index=output.index,
