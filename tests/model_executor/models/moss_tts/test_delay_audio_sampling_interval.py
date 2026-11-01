@@ -20,7 +20,10 @@ def test_delay_active_interval_matches_mask(n_vq: int) -> None:
 
 
 @pytest.mark.parametrize("stacked", [False, True])
-@pytest.mark.parametrize("audio_lengths,delayed_lengths", [(0, -1), (1, -1), (4, -1), (4, 2), (4, 4)])
+@pytest.mark.parametrize(
+    "audio_lengths,delayed_lengths",
+    [(0, -1), (1, -1), (4, -1), (4, 2), (4, 4), (-2, -2), (4, -2), (7, -1), (4, 7), (2, 3)],
+)
 @torch.inference_mode()
 def test_delay_audio_sampling_avoids_mask_discovery(
     monkeypatch: pytest.MonkeyPatch, stacked: bool, audio_lengths: int, delayed_lengths: int
@@ -41,14 +44,14 @@ def test_delay_audio_sampling_avoids_mask_discovery(
         raise AssertionError("Delay sampling must not inspect a tensor mask on the host")
 
     with monkeypatch.context() as patch:
-        patch.setattr(torch.Tensor, "__bool__", forbidden)
-        patch.setattr(torch.Tensor, "nonzero", forbidden)
+        for method in ("__bool__", "nonzero", "item", "__int__", "tolist"):
+            patch.setattr(torch.Tensor, method, forbidden)
         result = model._sample_audio_codes(
             torch.randn(1, 8), dict(audio_lengths=audio_lengths, delayed_lengths=delayed_lengths)
         )
-    active_start, active_end = max(0, delayed_lengths), min(4, audio_lengths)
-    expected_active = torch.zeros(4, dtype=torch.bool)
-    expected_active[active_start:active_end] = True
+    idx = torch.arange(model.n_vq)
+    post_mask = torch.ones_like(idx, dtype=torch.bool) if delayed_lengths == -1 else idx >= delayed_lengths
+    expected_active = (idx < audio_lengths) & post_mask
     assert result.shape == (4,)
     assert result.dtype == torch.long
     assert torch.equal(result.ne(32), expected_active)

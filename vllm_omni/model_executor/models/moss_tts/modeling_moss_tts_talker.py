@@ -555,6 +555,8 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         """
         device = last_h.device
         n_vq = self.n_vq
+        # _initial_state/_advance_state keep these counters as Python ints.
+        # Callers must not store device tensors here: int(tensor) would sync.
         audio_lengths = int(state.get("audio_lengths", 0))
         delayed_lengths = int(state.get("delayed_lengths", -1))
 
