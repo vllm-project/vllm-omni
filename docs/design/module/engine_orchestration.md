@@ -137,6 +137,15 @@ physical EngineCore abort succeeds.
 Changes that cross into stage runtime or public error behavior require review
 from that contract's owners.
 
+Explicit engine shutdown waits for the Orchestrator before releasing the
+stage runtime. The join is bounded at 90 seconds on NPU and 30 seconds on
+other platforms, returning early when the thread exits. The NPU budget
+encloses diffusion workers' 60-second graceful phase and bounded escalation;
+an outer deadline shorter than that phase can abandon actual process cleanup
+even after every worker reports its Python shutdown callback complete.
+If the Orchestrator remains alive, runtime release is still deferred until
+it exits rather than racing its cleanup.
+
 Multimodal cache-miss feedback invalidates only the reported hashes in the
 owning sender cache before request error delivery. Downstream caches are
 updated under the preprocessing lock; stage 0 feedback crosses to the frontend

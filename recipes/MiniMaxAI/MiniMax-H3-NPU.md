@@ -235,6 +235,55 @@ Online INT8 quantization can be combined with distributed layerwise offload
 while AllGather is enabled. Keep AllGather enabled for SP>1; use
 `--dlo-no-use-allgather` only when collective communication is unavailable.
 
+### Measured 5-second Ref2VA profile (8 Ascend 910B1 NPUs)
+
+A repeated A/B/B/A experiment on eight 64-GiB Ascend 910B1 devices measured
+**407.27 ± 15.51 s → 108.12 ± 2.07 s HTTP E2E** (73.45% lower, 3.77× inverse-latency
+speedup) for the following lossy Cache-DiT profile. Each arm has two independent
+servers with two warmups and three measured requests per server; uncertainty is
+sample SD across server means, not a confidence interval. This is the fastest
+passing configuration in this bounded search, not a global optimum.
+
+```bash
+export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=14400
+export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=30000
+vllm serve "${MODEL}" --omni --host 127.0.0.1 --port "${PORT}" \
+  --trust-remote-code --init-timeout 1800 --stage-init-timeout 1800 \
+  --task-type ref2va --num-gpus 8 --usp 8 --ring 1 --text-encoder-tp-size 8 \
+  --vae-parallel-mode tile --vae-use-tiling --vae-patch-parallel-size 8 \
+  --enable-distributed-layerwise-offload --disable-log-stats \
+  --diffusion-attention-backend FLASH_ATTN --cache-backend cache_dit \
+  --cache-config '{"Fn_compute_blocks":1,"Bn_compute_blocks":0,"max_warmup_steps":4,"residual_diff_threshold":0.48,"max_continuous_cached_steps":8,"enable_taylorseer":false,"scm_steps_mask_policy":null}'
+```
+
+Use the common NPU environment setup above. Send nominal five-second requests
+with 50 steps, seed 0 and concurrency 1, and omit request `quality` to preserve
+the startup profile. Explicit `high` or `lossless` can override it. The portable
+benchmark client uses `--quality server-default --seconds 5 --steps 50 --seeds 0
+--warmups 2 --repeats 3 --timeout 14400`; see the linked report for the full command.
+The baseline omits cache arguments and sends `quality=lossless`. Both arms use
+BF16, 1344×768, 24 fps, 124 actual frames and identical decoded audio volume.
+Profiling and cache summaries are disabled during timing.
+
+All 26 requests and 14 quality comparisons passed the frozen gates. Across nine
+candidate outputs: SSIM 0.975969–0.984037, PSNR 38.62–43.80 dB, LPIPS
+0.018710–0.025843, audio spectral cosine 0.813411–0.987086, and audio RMS ratio
+0.692242–1.093770. The family-reference audio cosine is close to the 0.80 gate;
+this is a material lossy tradeoff, not semantic or lip-sync quality certification.
+Mean sampled whole-server per-device peak HBM rose 25.085 → 25.863 GiB (+3.10%).
+All 32 workers exited zero without forced signals. Baseline teardown used matched
+diagnostic 60/90-second budgets; candidate teardown used native production budgets.
+
+Measured source: baseline `c7f56f0155953c7d4a77276a2f4fcbd844ab0da2`, candidate
+`098b51f6b96dd160a0959e74e8822422527ff06d`. Cache-DiT originates in
+[PR #5853](https://github.com/vllm-project/vllm-omni/pull/5853); parameter selection
+is campaign work. Optional device reference KV is **not enabled** in this result,
+and its separate pilot gain must not be added. The
+[complete report](https://github.com/InferMatrixLab/InferRSI/tree/amy/h3-ref2va-evidence/evidence/h3-ref2va-ascend-293/results/final-5s)
+includes environment/input hashes, raw samples, quality gates, reproduction,
+source attribution and rejected candidates. Fifteen-second qualification is
+pending a separate delivery; do not extrapolate this result to it.
+
 ### Optional optimizations
 
 The following sections list only the **increment or replacement** relative to
