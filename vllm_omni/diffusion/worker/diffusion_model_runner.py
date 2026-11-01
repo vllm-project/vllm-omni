@@ -38,6 +38,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedErr
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
+from vllm_omni.diffusion.diffusion_kv.offload import OffloadedKVPage
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionMetadata,
     DiffusionPagedAttentionRow,
@@ -526,6 +527,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
     def remove_diffusion_kv_requests(self, request_ids: Sequence[str | tuple[str, int]]) -> int:
         return self.diffusion_kv_backend.remove_diffusion_kv_requests(request_ids)
+
+    def save_diffusion_kv_pages(self, pages: Sequence[OffloadedKVPage]) -> dict[bytes, int]:
+        return self.diffusion_kv_backend.save_diffusion_kv_pages(pages)
 
     def refresh_diffusion_kv_block_table_layout(self) -> None:
         self.diffusion_kv_backend.refresh_block_table_layout()

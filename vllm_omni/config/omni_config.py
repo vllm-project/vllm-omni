@@ -838,6 +838,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
     enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
+    enable_diffusion_kv_page_offload: bool = False
+    diffusion_kv_offload_max_bytes: int | None = Field(default=None, ge=1, strict=True)
     enable_prompt_embed_cache: bool = False
     prompt_embed_cache_size: int = Field(default=32, ge=1)
     enable_session_state_manager: bool = False
@@ -1058,6 +1060,25 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
         validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
+        if not isinstance(self.enable_diffusion_kv_page_offload, bool):
+            raise TypeError(
+                f"enable_diffusion_kv_page_offload must be a bool, got {type(self.enable_diffusion_kv_page_offload)!r}"
+            )
+        if self.diffusion_kv_offload_max_bytes is not None and self.diffusion_kv_offload_max_bytes <= 0:
+            raise ValueError("diffusion_kv_offload_max_bytes must be positive when set")
+        if self.enable_diffusion_kv_page_offload:
+            # Checked before the generic prefix-caching rule so the error names
+            # the flag the user actually has to turn off.
+            if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+                raise ValueError(
+                    "enable_diffusion_kv_page_offload=True requires diffusion_kv_mode='paged_scheduler'; "
+                    "set diffusion_kv_mode='paged_scheduler' or disable enable_diffusion_kv_page_offload"
+                )
+            if not self.enable_prefix_caching:
+                raise ValueError(
+                    "enable_diffusion_kv_page_offload=True requires enable_prefix_caching=True; "
+                    "offloaded pages are stable prefix pages"
+                )
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
             raise ValueError(
                 "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "

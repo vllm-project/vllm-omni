@@ -911,6 +911,12 @@ class OmniDiffusionConfig:
     # Maximum number of native BlockTable rows one public request can own
     # (sequences plus independent contexts). The model adapter defines it.
     diffusion_kv_max_rows_per_request: int | None = None
+    # Move stable prefix pages left behind by completed requests to host
+    # memory and restore them on a later prefix hit.
+    enable_diffusion_kv_page_offload: bool = False
+    # Host byte budget for the offloaded KV pages. ``None`` keeps every
+    # offloaded page resident until it is invalidated explicitly.
+    diffusion_kv_offload_max_bytes: int | None = None
 
     # Optional override for the diffusion model runner class (import path).
     # Precedence in the worker: this override > the runner declared by the
@@ -1278,6 +1284,33 @@ class OmniDiffusionConfig:
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a bool")
+        if not isinstance(self.enable_diffusion_kv_page_offload, bool):
+            raise TypeError(
+                f"enable_diffusion_kv_page_offload must be a bool, got {type(self.enable_diffusion_kv_page_offload)!r}"
+            )
+        if self.diffusion_kv_offload_max_bytes is not None and (
+            type(self.diffusion_kv_offload_max_bytes) is not int or self.diffusion_kv_offload_max_bytes <= 0
+        ):
+            raise ValueError("diffusion_kv_offload_max_bytes must be a positive integer when set")
+        if self.enable_diffusion_kv_page_offload:
+            # Checked before the generic prefix-caching rules so the error
+            # names the flag the user actually has to turn off.
+            if self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+                raise ValueError(
+                    "enable_diffusion_kv_page_offload=True requires diffusion_kv_mode='paged_scheduler'; "
+                    "set diffusion_kv_mode='paged_scheduler' or disable enable_diffusion_kv_page_offload"
+                )
+            if not self.enable_prefix_caching:
+                raise ValueError(
+                    "enable_diffusion_kv_page_offload=True requires enable_prefix_caching=True; "
+                    "offloaded pages are stable prefix pages"
+                )
+            if self.enable_sleep_mode:
+                raise ValueError(
+                    "Diffusion KV page offload cannot be combined with sleep mode: "
+                    "sleep discards KV pages without invalidating offloaded pages; "
+                    "disable enable_diffusion_kv_page_offload or enable_sleep_mode"
+                )
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
             raise ValueError(
                 "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
