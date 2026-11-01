@@ -150,8 +150,9 @@ class DuplexSessionManager:
         self.semantic_vad_backend_provider = SmartTurnBackendProvider(
             model_path=getattr(runtime_config, "semantic_vad_model_path", None)
         )
-        #: A single thread that runs every session's turn detection and scoring with shared Silero model.
-        self.turn_detection_batcher = TurnDetectionBatcher()
+        #: A single thread that runs every session's turn detection, batching Silero
+        #: across sessions; Smart Turn work goes to the session executor.
+        self.turn_detection_batcher = TurnDetectionBatcher(self.executor)
         self.runners: dict[str, DuplexSessionRunner] = {}
         self._outputs: dict[str, DuplexOutputBuffer] = {}
         self._output_failed: set[str] = set()

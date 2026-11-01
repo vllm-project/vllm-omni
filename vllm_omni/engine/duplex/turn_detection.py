@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal, TypeVar, cast
 
 import numpy as np
 import pybase64 as base64
@@ -36,10 +36,13 @@ from vllm_omni.engine.duplex.vad import (
     SileroVADBackendProvider,
     SileroVADConfig,
     StreamingVADResult,
+    TurnScoreRequest,
     run_frame_steps,
 )
 
 logger = init_logger(__name__)
+
+_T = TypeVar("_T")
 
 __all__ = [
     "PendingTurnDetectionUpdate",
@@ -544,9 +547,7 @@ class SemanticTurnDetector:
     def process_segments(
         self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None
     ) -> list[TurnDetectionSegment]:
-        return run_frame_steps(
-            self.segment_steps(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz), self._vad._score_frame
-        )
+        return self._run_steps(self.segment_steps(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz))
 
     def segment_steps(
         self, audio: str | bytes, *, fmt: str, sample_rate_hz: int | None
@@ -569,9 +570,9 @@ class SemanticTurnDetector:
         completed turn followed by new speech, matching the legacy Realtime API.
         """
         samples = self._vad.decode_base64(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
-        frames = run_frame_steps(_frame_steps(self, samples), self._vad._score_frame)
+        frames = self._run_steps(_frame_steps(self, samples))
         if not frames:
-            return run_frame_steps(self._sample_steps(samples), self._vad._score_frame)
+            return self._run_steps(self._sample_steps(samples))
 
         results = [result for _, result in frames]
         last = results[-1]
@@ -617,7 +618,10 @@ class SemanticTurnDetector:
         not raise: it is logged and the pause counts as incomplete, so the
         eagerness limit still ends the turn.
         """
-        scorer = self._require_turn_scorer()
+        if self._turn_scorer is None:
+            # With the first chunk, so a missing model fails early and the first
+            # pause does not wait for it; the driver loads it off the scoring thread.
+            yield TurnScoreRequest(is_loading=True)
         self._audio.append(samples)
         inner = yield from self._vad.frame_steps(samples)
         was_active = self._turn_active
@@ -650,7 +654,7 @@ class SemanticTurnDetector:
                 try:
                     window = self._turn_window()
                     evaluations = 1
-                    probability = float(scorer(window))
+                    probability = float(cast("float", (yield TurnScoreRequest(window))))
                 except Exception:
                     # Degrade to the eagerness silence limit rather than drop
                     # or prematurely commit the turn.
@@ -711,12 +715,21 @@ class SemanticTurnDetector:
         turn_samples = (self._vad.processed_ms - self._turn_start_ms) * 16
         return self._audio.last(turn_samples + self._vad.scratch_bytes // 4)
 
-    def _require_turn_scorer(self) -> Callable[[np.ndarray], float]:
-        """Load Smart Turn with the first chunk, off the endpoint path."""
+    def load_turn_scorer(self) -> None:
+        """Load the shared Smart Turn model (slow, may block); serves a loading :class:`TurnScoreRequest`."""
         if self._turn_scorer is None:
             provider = self._smart_turn_provider or SmartTurnBackendProvider()
             self._turn_scorer = provider.get().predict
-        return self._turn_scorer
+
+    def score_turn(self, window: np.ndarray) -> float:
+        """Smart Turn's completion probability for ``window`` (slow); serves :class:`TurnScoreRequest`."""
+        return self._turn_scorer(window)
+
+    def _run_steps(self, steps: FrameSteps[_T]) -> _T:
+        """Drive ``steps`` in line, Smart Turn work included."""
+        return run_frame_steps(
+            steps, self._vad._score_frame, load_turn_scorer=self.load_turn_scorer, score_turn=self.score_turn
+        )
 
 
 TurnDetector = ServerTurnDetector | SemanticTurnDetector

@@ -76,19 +76,62 @@ class StreamingVADResult:
 
 _T = TypeVar("_T")
 
-#: Endpointing written as a coroutine over Silero frames: it yields each 512-sample
-#: frame that needs a score, receives the raw probability, and returns its result.
-#: Whoever drives it decides how frames are scored -- one at a time
+
+@dataclass(frozen=True, slots=True)
+class FrameScoreRequest:
+    """One 512-sample Silero frame a detector needs scored; the driver sends back its raw speech probability."""
+
+    frame: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class TurnScoreRequest:
+    """Smart Turn work a ``semantic_vad`` detector needs done.
+
+    With ``is_loading`` the driver calls the detector's ``load_turn_scorer``;
+    otherwise it sends back ``score_turn(window)``.
+    """
+
+    window: np.ndarray | None = None
+    is_loading: bool = False
+
+
+#: Turn detection written as a coroutine over scoring requests: it yields a
+#: :class:`FrameScoreRequest` for each frame that needs a Silero score and, for
+#: ``semantic_vad``, a :class:`TurnScoreRequest` for Smart Turn work, receiving
+#: each one's result, and returns its result.
+#: Whoever drives it decides where scoring happens -- in line
 #: (:func:`run_frame_steps`) or batched across sessions (the duplex VAD batcher).
-FrameSteps = Generator[np.ndarray, float, _T]
+#: Smart Turn work is too slow to share a thread with every session's frame
+#: scoring, so a driver runs it where it may block; what it raises is thrown in.
+FrameSteps = Generator[FrameScoreRequest | TurnScoreRequest, object, _T]
 
 
-def run_frame_steps(steps: FrameSteps[_T], score: Callable[[np.ndarray], float]) -> _T:
-    """Drive ``steps`` to completion, scoring each frame it asks for with ``score``."""
+def run_frame_steps(
+    steps: FrameSteps[_T],
+    score: Callable[[np.ndarray], float],
+    *,
+    load_turn_scorer: Callable[[], None] | None = None,
+    score_turn: Callable[[np.ndarray], float] | None = None,
+) -> _T:
+    """Drive ``steps`` to completion in line, scoring each frame it asks for with ``score``.
+
+    ``load_turn_scorer`` and ``score_turn`` serve a ``semantic_vad`` detector's Smart Turn requests.
+    """
     try:
-        frame = next(steps)
+        request = next(steps)
         while True:
-            frame = steps.send(score(frame))
+            if isinstance(request, FrameScoreRequest):
+                request = steps.send(score(request.frame))
+                continue
+            if not isinstance(request, TurnScoreRequest):
+                raise TypeError(f"turn detection yielded an unknown request: {type(request).__name__}")
+            try:
+                result = load_turn_scorer() if request.is_loading else score_turn(request.window)
+            except Exception as exc:
+                request = steps.throw(exc)
+            else:
+                request = steps.send(result)
     except StopIteration as stop:
         return stop.value
 
@@ -504,7 +547,7 @@ class SileroStreamingVAD:
             offset += self._WINDOW_SAMPLES
             frame_start = self._processed_samples
             self._processed_samples += self._WINDOW_SAMPLES
-            probability = min(1.0, max(0.0, float((yield frame))))
+            probability = min(1.0, max(0.0, float((yield FrameScoreRequest(frame)))))
             max_probability = max(max_probability, probability)
 
             if self._speech_active:
