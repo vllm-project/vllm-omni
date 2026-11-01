@@ -4,7 +4,7 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inf
 
 
 ## Setup
-Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+See the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation for your hardware.
 
 ## Run examples
 

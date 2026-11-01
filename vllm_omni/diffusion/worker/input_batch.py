@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Diffusion input-batch structures following the MRV2-style vLLM layout.
 
 Request states remain the only persistent source of truth. Static tensors are
@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from vllm_omni.diffusion.interaction.modality_handlers.prompt import prompt_update_versions
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 
@@ -66,19 +67,26 @@ def _select_states(
         raise ValueError("Cannot build InputBatch from empty states.")
 
     if idx_mapping is None:
+        # The identity mapping is known on the host; build the device copy as
+        # a launch and the host copy from NumPy rather than reading the device
+        # tensor back. This runs on every step of every stepwise request, and
+        # a device-to-host read here would stall the host until the queued
+        # denoise work drained, so it must not be a synchronising operation.
         device = states[0].latents.device if states[0].latents is not None else None
         idx_mapping = torch.arange(len(states), dtype=torch.int32, device=device)
+        idx_mapping_np = np.arange(len(states), dtype=np.int32)
     else:
         if idx_mapping.ndim != 1:
             raise ValueError("idx_mapping must be a 1D tensor.")
         idx_mapping = idx_mapping.to(dtype=torch.int32)
+        idx_mapping_np = idx_mapping.detach().cpu().numpy()
 
     selected_states: list[StepRequestState] = []
-    for batch_idx, state_idx in enumerate(idx_mapping.tolist()):
+    for batch_idx, state_idx in enumerate(idx_mapping_np.tolist()):
         if state_idx < 0 or state_idx >= len(states):
             raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
         selected_states.append(states[state_idx])
-    return selected_states, idx_mapping, idx_mapping.detach().cpu().numpy()
+    return selected_states, idx_mapping, idx_mapping_np
 
 
 def _prepare_request_ids(states: Sequence[StepRequestState]) -> list[str]:
@@ -535,12 +543,17 @@ def _same_composition(
     cached_batch: InputBatch | None,
     request_ids: list[str],
     idx_mapping_np: np.ndarray,
+    states: Sequence[StepRequestState],
 ) -> bool:
     if cached_batch is None:
         return False
     if cached_batch.request_ids != request_ids:
         return False
-    return np.array_equal(cached_batch.idx_mapping_np, idx_mapping_np)
+    if not np.array_equal(cached_batch.idx_mapping_np, idx_mapping_np):
+        return False
+    # Midway prompt updates (typically for video generation) can change prompt_embeds without changing ids/mapping.
+    # In this case, each request state manages the embedding's "version". Use it to determine if cache is still valid.
+    return cached_batch._prompt_update_versions == prompt_update_versions(states)
 
 
 def _scatter_batch_tensor_by_mapping(
@@ -615,6 +628,10 @@ class InputBatch:
     negative_txt_seq_lens: list[int] | None = None
     states: Sequence[StepRequestState] = field(default_factory=tuple)
 
+    # For midway prompt updates (typically for video generation) that changes embeddings without changing ids,
+    # Keep a snapshot of the current per-request versions of prompt embeddings for later runtime comparison
+    _prompt_update_versions: tuple[int, ...] = ()
+
     def __post_init__(self) -> None:
         if len(self.request_ids) != int(self.idx_mapping.numel()):
             raise ValueError("`request_ids` and `idx_mapping` must have the same length.")
@@ -653,6 +670,7 @@ class InputBatch:
         self.img_shapes = _prepare_img_shapes(states)
         self.txt_seq_lens = _prepare_seq_lens(states, "txt_seq_lens")
         self.negative_txt_seq_lens = _prepare_seq_lens(states, "negative_txt_seq_lens")
+        self._prompt_update_versions = prompt_update_versions(states)
 
     def _repack_dynamic_fields(
         self,
@@ -693,7 +711,7 @@ class InputBatch:
         selected_states, idx_mapping, idx_mapping_np = _select_states(states, idx_mapping)
         request_ids = _prepare_request_ids(selected_states)
 
-        if _same_composition(cached_batch, request_ids, idx_mapping_np):
+        if _same_composition(cached_batch, request_ids, idx_mapping_np, selected_states):
             assert cached_batch is not None
             cached_batch._repack_dynamic_fields(selected_states)
             return cached_batch
@@ -733,6 +751,7 @@ class InputBatch:
                 "negative_txt_seq_lens",
             ),
             states=tuple(selected_states),
+            _prompt_update_versions=prompt_update_versions(selected_states),
         )
 
 

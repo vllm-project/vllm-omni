@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Online tests for Covo-Audio-Chat model.
 """
@@ -37,7 +37,7 @@ test_params = [
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_audio_to_audio_001(omni_server, openai_client) -> None:
+def test_audio_to_audio_001(omni_server, online_client) -> None:
     """
     Input Modal: text + audio
     Output Modal: audio
@@ -58,4 +58,4 @@ def test_audio_to_audio_001(omni_server, openai_client) -> None:
         "stream": False,
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)

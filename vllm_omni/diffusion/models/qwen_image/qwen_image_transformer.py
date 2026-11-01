@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from functools import lru_cache
+from collections import OrderedDict
+from collections.abc import Callable, Iterable
 from math import prod
 from typing import TYPE_CHECKING, Any
 
@@ -45,9 +45,101 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    QK_NORM_ROPE_TABLE_KEY,
+    _fused_cuda_supported,
+    fused_joint_qkv_norm_rope,
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+    pack_qk_norm_rope_table,
+)
+from vllm_omni.diffusion.layers.qwen_select01_modulation import (
+    can_use_qwen_select01_triton,
+    fused_layernorm_select01,
+    fused_residual_layernorm_select01,
+    select01_modulation_native,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+# Default token gate: fuse only when B*S >= this; below it host launch overhead
+# dominates (#7780). VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides it for both
+# the joint and the per-stream path (0 = always fuse; a very large value disables
+# fusion), read at forward time.
+_FUSED_MIN_TOKENS = 2048
+
+
+def _fused_min_tokens() -> int:
+    return fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS)
+
+
+def _packed_qk_norm_rope_table(
+    vid_freqs: torch.Tensor,
+    txt_freqs: torch.Tensor,
+    batch_size: int,
+    activation_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Pack text/image frequencies into a text-first ``[B*S, D]`` FP32 table.
+
+    Same coefficients and token gate as the per-stream fusion, including the
+    ``VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS`` override. ``None`` when the CUDA
+    kernel would not run or the joint sequence ``B*(S_txt+S_img)`` is below the
+    gate.
+    """
+    freqs = torch.cat((txt_freqs, vid_freqs), dim=0)
+    if batch_size * freqs.shape[0] < _fused_min_tokens():
+        return None
+    return pack_qk_norm_rope_table(
+        freqs.real, freqs.imag, batch_size, dtype=torch.float32, activation_dtype=activation_dtype
+    )
+
+
+def _qwen_image_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    norm_q: nn.Module,
+    norm_k: nn.Module,
+    freqs: torch.Tensor,
+    rope: RotaryEmbedding,
+    eps: float,
+    *,
+    use_fused: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    head_dim = q.shape[-1]
+    rotary_dim = freqs.shape[-1] * 2
+    batch, seq_len, num_heads, _ = q.shape
+    tokens = batch * seq_len
+    if (
+        use_fused
+        and tokens >= _fused_min_tokens()
+        and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True)
+    ):
+        num_kv_heads = k.shape[2]
+        rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
+        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
+        fused_q, fused_k = fused_qk_norm_rope(
+            q.reshape(tokens, num_heads, head_dim),
+            k.reshape(tokens, num_kv_heads, head_dim),
+            norm_q.weight,
+            norm_k.weight,
+            rope_table,
+            eps,
+            interleaved=True,
+        )
+        return (
+            fused_q.reshape(batch, seq_len, num_heads, head_dim),
+            fused_k.reshape(batch, seq_len, num_kv_heads, head_dim),
+        )
+
+    # Eager path: BF16/activation-dtype RotaryEmbedding on every device.
+    # CUDA used to call FP32 complex multiply here; that matches the Diffusers
+    # helper in unit tests but drops Omni vs Diffusers pipeline PSNR (#7494).
+    q = norm_q(q)
+    k = norm_k(k)
+    cos = torch.real(freqs).to(q.dtype)
+    sin = torch.imag(freqs).to(q.dtype)
+    return rope(q, cos, sin), rope(k, cos, sin)
 
 
 def _normalize_qwen_image_weight_name(name: str) -> str:
@@ -67,6 +159,32 @@ def _resolve_qwen_image_lookup_name(
             continue
         return lookup_name.replace(weight_name, param_name), shard_id
     return lookup_name, None
+
+
+_ROPE_FREQS_CACHE_SIZE = 16
+_RopeFreqsCache = OrderedDict[tuple[object, ...], torch.Tensor]
+
+
+def _cached_rope_freqs(
+    cache: _RopeFreqsCache,
+    key: tuple[object, ...],
+    compute: Callable[[], torch.Tensor],
+) -> torch.Tensor:
+    """Bounded per-module cache for rope frequency tables.
+
+    A method-level ``functools.lru_cache`` keys on ``self`` and keeps the module
+    and its device tensors alive after the engine shuts down (#8016).
+    """
+    freqs = cache.get(key)
+    if freqs is not None:
+        cache.move_to_end(key)
+        return freqs
+
+    freqs = compute()
+    cache[key] = freqs
+    if len(cache) > _ROPE_FREQS_CACHE_SIZE:
+        cache.popitem(last=False)
+    return freqs
 
 
 class ImageRopePrepare(nn.Module):
@@ -252,6 +370,7 @@ class QwenEmbedLayer3DRope(nn.Module):
         )
 
         self.scale_rope = scale_rope
+        self._freqs_cache: _RopeFreqsCache = OrderedDict()
 
     def rope_params(self, index, dim, theta=10000):
         """
@@ -302,8 +421,14 @@ class QwenEmbedLayer3DRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
+        return _cached_rope_freqs(
+            self._freqs_cache,
+            ("video", frame, height, width, idx),
+            lambda: self._build_video_freqs(frame, height, width, idx),
+        )
+
+    def _build_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -321,8 +446,14 @@ class QwenEmbedLayer3DRope(nn.Module):
         freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
         return freqs.clone().contiguous()
 
-    @lru_cache(maxsize=16)
     def _compute_condition_freqs(self, frame, height, width):
+        return _cached_rope_freqs(
+            self._freqs_cache,
+            ("condition", frame, height, width),
+            lambda: self._build_condition_freqs(frame, height, width),
+        )
+
+    def _build_condition_freqs(self, frame, height, width):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -367,6 +498,7 @@ class QwenEmbedRope(nn.Module):
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
+        self._freqs_cache: _RopeFreqsCache = OrderedDict()
 
     def rope_params(self, index: torch.Tensor, dim: int, theta: int = 10000):
         """
@@ -416,8 +548,14 @@ class QwenEmbedRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
+        return _cached_rope_freqs(
+            self._freqs_cache,
+            (frame, height, width, idx),
+            lambda: self._build_video_freqs(frame, height, width, idx),
+        )
+
+    def _build_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -618,6 +756,7 @@ class QwenImageCrossAttention(nn.Module):
         txt_freqs: torch.Tensor,
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
@@ -637,31 +776,60 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
         txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-        img_query = self.norm_q(img_query)
-        img_key = self.norm_k(img_key)
-        txt_query = self.norm_added_q(txt_query)
-        txt_key = self.norm_added_k(txt_key)
-
-        img_cos = vid_freqs.real.to(img_query.dtype)
-        img_sin = vid_freqs.imag.to(img_query.dtype)
-        txt_cos = txt_freqs.real.to(txt_query.dtype)
-        txt_sin = txt_freqs.imag.to(txt_query.dtype)
-
-        img_query = self.rope(img_query, img_cos, img_sin)
-        img_key = self.rope(img_key, img_cos, img_sin)
-        txt_query = self.rope(txt_query, txt_cos, txt_sin)
-        txt_key = self.rope(txt_key, txt_cos, txt_sin)
-
         seq_len_txt = encoder_hidden_states.shape[1]
-        joint_query = torch.cat([txt_query, img_query], dim=1)
-        joint_key = torch.cat([txt_key, img_key], dim=1)
-        joint_value = torch.cat([txt_value, img_value], dim=1)
+        sp_active = self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1
+        use_sp_joint_attention = sp_active and not get_forward_context().split_text_embed_in_sp
+        # One launch for both streams, writing the joint [B, S_txt+S_img, H, D]
+        # Q/K/V attention consumes — no per-stream launches and no cats. Any
+        # sequence parallelism keeps the per-stream chain: `vid_freqs` is
+        # sharded by `_sp_plan` while `txt_freqs` stays replicated, so a joint
+        # table built from the two would not line up with the local tokens.
+        use_fused_joint = (
+            self.qk_norm
+            and qk_norm_rope_table is not None
+            and not sp_active
+            and _fused_cuda_supported(img_query, img_key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
+        )
+        if use_fused_joint:
+            joint_query, joint_key, joint_value = fused_joint_qkv_norm_rope(
+                txt_query,
+                txt_key,
+                txt_value,
+                img_query,
+                img_key,
+                img_value,
+                self.norm_added_q.weight,
+                self.norm_added_k.weight,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                qk_norm_rope_table,
+                self.eps,
+            )
+        else:
+            img_query, img_key = _qwen_image_qk_norm_rope(
+                img_query,
+                img_key,
+                self.norm_q,
+                self.norm_k,
+                vid_freqs,
+                self.rope,
+                self.eps,
+                use_fused=self.qk_norm,
+            )
+            txt_query, txt_key = _qwen_image_qk_norm_rope(
+                txt_query,
+                txt_key,
+                self.norm_added_q,
+                self.norm_added_k,
+                txt_freqs,
+                self.rope,
+                self.eps,
+            )
+            joint_query = torch.cat([txt_query, img_query], dim=1)
+            joint_key = torch.cat([txt_key, img_key], dim=1)
+            joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        if (
-            self.parallel_config is not None
-            and self.parallel_config.sequence_parallel_size > 1
-            and not get_forward_context().split_text_embed_in_sp
-        ):
+        if use_sp_joint_attention:
             attn_metadata = AttentionMetadata(
                 joint_query=txt_query,
                 joint_key=txt_key,
@@ -788,41 +956,11 @@ class QwenImageTransformerBlock(nn.Module):
 
         self.zero_cond_t = zero_cond_t
 
-    def _modulate(self, mod_params, index=None):
+    def _modulate(self, mod_params):
         """Apply modulation to input tensor"""
         # shift: b d, scale: b d, gate: b d
         shift, scale, gate = mod_params.chunk(3, dim=-1)
-
-        if index is not None:
-            # Assuming mod_params batch dim is 2*actual_batch (chunked into 2 parts)
-            # So shift, scale, gate have shape [2*actual_batch, d]
-            actual_batch = shift.size(0) // 2
-            shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]  # each: [actual_batch, d]
-            scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
-            gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
-
-            # index: [b, l] where b is actual batch size
-            # Expand to [b, l, 1] to match feature dimension
-            index_expanded = index.unsqueeze(-1)  # [b, l, 1]
-
-            # Expand chunks to [b, 1, d] then broadcast to [b, l, d]
-            shift_0_exp = shift_0.unsqueeze(1)  # [b, 1, d]
-            shift_1_exp = shift_1.unsqueeze(1)  # [b, 1, d]
-            scale_0_exp = scale_0.unsqueeze(1)
-            scale_1_exp = scale_1.unsqueeze(1)
-            gate_0_exp = gate_0.unsqueeze(1)
-            gate_1_exp = gate_1.unsqueeze(1)
-
-            # Use torch.where to select based on index
-            shift_result = torch.where(index_expanded == 0, shift_0_exp, shift_1_exp)
-            scale_result = torch.where(index_expanded == 0, scale_0_exp, scale_1_exp)
-            gate_result = torch.where(index_expanded == 0, gate_0_exp, gate_1_exp)
-        else:
-            shift_result = shift.unsqueeze(1)
-            scale_result = scale.unsqueeze(1)
-            gate_result = gate.unsqueeze(1)
-
-        return scale_result, shift_result, gate_result
+        return scale.unsqueeze(1), shift.unsqueeze(1), gate.unsqueeze(1)
 
     def forward(
         self,
@@ -848,8 +986,22 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1, modulate_index)
-        img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
+        use_fused_select01 = modulate_index is not None and can_use_qwen_select01_triton(hidden_states)
+        if use_fused_select01:
+            img_modulated, img_gate1 = fused_layernorm_select01(
+                hidden_states,
+                img_mod1,
+                modulate_index,
+                self.img_norm1.eps,
+                self.img_norm1.layernorm.weight,
+                self.img_norm1.layernorm.bias,
+            )
+        elif modulate_index is not None:
+            img_scale1, img_shift1, img_gate1 = select01_modulation_native(img_mod1, modulate_index)
+            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
+        else:
+            img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1)
+            img_modulated = self.img_norm1(hidden_states, img_scale1, img_shift1)
 
         # Process text stream - norm1 + modulation
         txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
@@ -868,18 +1020,36 @@ class QwenImageTransformerBlock(nn.Module):
             txt_freqs=image_rotary_emb[1],
             hidden_states_mask=hidden_states_mask,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
+            qk_norm_rope_table=(joint_attention_kwargs or {}).get(QK_NORM_ROPE_TABLE_KEY),
         )
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
 
         # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
+        hidden_states_before_attn = hidden_states
+        if not use_fused_select01:
+            hidden_states = hidden_states + img_gate1 * img_attn_output
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2, modulate_index)
-        img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        if use_fused_select01:
+            img_modulated2, hidden_states, img_gate2 = fused_residual_layernorm_select01(
+                img_attn_output,
+                hidden_states_before_attn,
+                img_gate1,
+                img_mod2,
+                modulate_index,
+                self.img_norm2.eps,
+                self.img_norm2.layernorm.weight,
+                self.img_norm2.layernorm.bias,
+            )
+        elif modulate_index is not None:
+            img_scale2, img_shift2, img_gate2 = select01_modulation_native(img_mod2, modulate_index)
+            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
+        else:
+            img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2)
+            img_modulated2 = self.img_norm2(hidden_states, img_scale2, img_shift2)
 
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
@@ -1192,6 +1362,16 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
+
+        # One packed table per forward for the joint QK RMSNorm + RoPE + cat of
+        # every block. Never mutate the caller-owned dict: rebind to a copy.
+        qk_norm_rope_table = _packed_qk_norm_rope_table(
+            image_rotary_emb[0], image_rotary_emb[1], hidden_states.shape[0], hidden_states.dtype
+        )
+        if qk_norm_rope_table is not None:
+            attention_kwargs = {**(attention_kwargs or {}), QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
+        elif attention_kwargs is not None:
+            attention_kwargs = {k: v for k, v in attention_kwargs.items() if k != QK_NORM_ROPE_TABLE_KEY}
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(

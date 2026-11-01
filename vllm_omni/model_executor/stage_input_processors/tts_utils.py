@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Shared TTS utility functions for speaker and language extraction.
 
@@ -12,36 +12,6 @@ from typing import Any
 # =============================================================================
 # Speaker helpers
 # =============================================================================
-
-
-def extract_speaker_from_runtime_info(
-    runtime_additional_information: list[dict[str, Any]] | None,
-) -> str | None:
-    """Extract speaker from per-request runtime info dicts.
-
-    Iterates through the list of per-request info dicts and returns the first
-    non-empty speaker string found, normalized to lowercase.
-
-    Args:
-        runtime_additional_information: List of per-request additional info
-            dicts, as passed to the model's forward() method.
-
-    Returns:
-        The speaker string (lowercase, stripped), or None if not present.
-    """
-    if not runtime_additional_information:
-        return None
-    for info in runtime_additional_information:
-        vt = info.get("speaker")
-        if vt is None:
-            continue
-        if isinstance(vt, (list, tuple)) and len(vt) > 0:
-            vt = vt[0]
-        if isinstance(vt, str) and vt.strip():
-            return vt.lower().strip()
-        if vt is not None:
-            return str(vt).lower().strip()
-    return None
 
 
 def extract_speaker_from_request(request: Any) -> str | None:
@@ -104,32 +74,39 @@ def extract_speaker_from_prompt(
 
 
 # =============================================================================
-# Language helpers
+# Code2Wav emit-mode helpers (independent of prompt construction)
 # =============================================================================
 
 
-def extract_language_from_runtime_info(
-    runtime_additional_information: list[dict[str, Any]] | None,
-) -> str | None:
-    """Extract language from per-request runtime info dicts.
-    Args:
-        runtime_additional_information: List of per-request additional info
-            dicts, as passed to the model's forward() method.
+def extract_full_utterance_decode_from_request(request: Any) -> bool | None:
+    """Extract ``full_utterance_decode`` from a request's additional_information.
+
+    This is a *response / Code2Wav emit* intent flag. It must not be confused
+    with ``non_streaming_mode``, which only controls Qwen3-TTS prompt
+    construction and is independent of HTTP/WebSocket streaming (#4198).
 
     Returns:
-        The language string (e.g. "Chinese", "English", "Auto"), or None.
+        True/False when explicitly set, otherwise None.
     """
-    if not runtime_additional_information:
+    additional_information = getattr(request, "additional_information", None)
+    if additional_information is None:
         return None
-    for info in runtime_additional_information:
-        lang = info.get("language")
-        if lang is None:
-            continue
-        if isinstance(lang, (list, tuple)) and len(lang) > 0:
-            return lang
-        if isinstance(lang, str) and lang.strip():
-            return [lang.strip()]
+    entries = getattr(additional_information, "entries", None)
+    if not isinstance(entries, dict):
+        return None
+    entry = entries.get("full_utterance_decode")
+    if entry is None:
+        return None
+    list_data = getattr(entry, "list_data", None)
+    if isinstance(list_data, list) and list_data:
+        raw = list_data[0]
+        return raw if isinstance(raw, bool) else None
     return None
+
+
+# =============================================================================
+# Language helpers
+# =============================================================================
 
 
 def extract_language_from_request(request: Any) -> str | None:

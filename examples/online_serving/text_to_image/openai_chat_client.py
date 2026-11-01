@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Qwen-Image OpenAI-compatible image generation client.
+Shared OpenAI-compatible text-to-image generation client.
 
 Usage:
     python openai_chat_client.py --prompt "A beautiful landscape" --output output.png
@@ -39,7 +39,7 @@ def generate_image(
         height: Image height in pixels
         width: Image width in pixels
         steps: Number of diffusion steps
-        true_cfg_scale: Qwen-Image CFG scale
+        true_cfg_scale: True CFG scale for models that support it
         seed: Random seed
         negative_prompt: Negative prompt
         num_outputs_per_prompt: Number of images to generate
@@ -70,7 +70,7 @@ def generate_image(
         payload["num_inference_steps"] = steps
     if true_cfg_scale is not None:
         payload["true_cfg_scale"] = true_cfg_scale
-    if negative_prompt:
+    if negative_prompt is not None:
         payload["negative_prompt"] = negative_prompt
     if seed is not None:
         payload["seed"] = seed
@@ -115,15 +115,15 @@ def generate_image(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Qwen-Image chat client")
+    parser = argparse.ArgumentParser(description="Shared text-to-image client")
     parser.add_argument("--prompt", "-p", default="a cup of coffee on the table", help="Text prompt")
-    parser.add_argument("--output", "-o", default="qwen_image_output.png", help="Output file")
+    parser.add_argument("--output", "-o", default="text_to_image_output.png", help="Output file")
     parser.add_argument("--server", "-s", default="http://localhost:8091", help="Server URL")
-    parser.add_argument("--height", type=int, default=1024, help="Image height")
-    parser.add_argument("--width", type=int, default=1024, help="Image width")
-    parser.add_argument("--steps", type=int, default=50, help="Inference steps")
-    parser.add_argument("--cfg-scale", type=float, default=4.0, help="True CFG scale")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--height", type=int, help="Image height; defaults to the model setting")
+    parser.add_argument("--width", type=int, help="Image width; defaults to the model setting")
+    parser.add_argument("--steps", type=int, help="Inference steps; defaults to the model setting")
+    parser.add_argument("--cfg-scale", type=float, help="True CFG scale when supported")
+    parser.add_argument("--seed", type=int, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 
     parser.add_argument("--lora-path", default=None, help="Server-local LoRA adapter folder (PEFT format)")

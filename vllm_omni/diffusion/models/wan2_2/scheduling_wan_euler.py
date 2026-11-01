@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -109,6 +109,42 @@ class WanEulerScheduler:
         self.set_shift(self._shift)
         self._step_index = None
         self._begin_index = None
+
+    def sigma_for_timestep(
+        self,
+        timestep: float | torch.Tensor,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """Return the flow sigma nearest to a (possibly distilled) timestep."""
+        timestep_t = torch.as_tensor(timestep, device=self.timesteps.device, dtype=self.timesteps.dtype)
+        if timestep_t.numel() != 1:
+            raise ValueError(f"Expected a scalar timestep, got shape {tuple(timestep_t.shape)}")
+        index = torch.argmin(torch.abs(self.timesteps - timestep_t))
+        return self.sigmas[index].to(device=device or self.timesteps.device, dtype=dtype)
+
+    def predict_clean(
+        self,
+        model_output: torch.Tensor,
+        sample: torch.Tensor,
+        timestep: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert a flow/noise prediction into the corresponding clean latent."""
+        sample_fp32 = sample.to(torch.float32)
+        sigma = self.sigma_for_timestep(timestep, device=sample.device, dtype=torch.float32)
+        return sample_fp32 - sigma * model_output.to(torch.float32)
+
+    def add_noise(
+        self,
+        clean_sample: torch.Tensor,
+        noise: torch.Tensor,
+        timestep: float | torch.Tensor,
+    ) -> torch.Tensor:
+        """Re-noise a clean latent at a distilled flow timestep."""
+        sigma = self.sigma_for_timestep(timestep, device=noise.device, dtype=torch.float32)
+        noisy = (1.0 - sigma) * clean_sample.to(torch.float32) + sigma * noise.to(torch.float32)
+        return noisy.to(noise.dtype)
 
     def scale_model_input(self, sample: torch.Tensor, timestep: int | None = None) -> torch.Tensor:  # noqa: ARG002
         return sample

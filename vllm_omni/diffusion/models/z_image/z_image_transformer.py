@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # _sp_plan definition adapted from HuggingFace diffusers library (_cp_plan)
 
 # Copyright 2025 Alibaba Z-Image Team and The HuggingFace Team. All rights reserved.
@@ -50,12 +50,20 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+    pack_qk_norm_rope_table,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
 
+LEARNED_PADDING = "learned"
+ZERO_MASKED_PADDING = "zero_masked"
 logger = init_logger(__name__)
 
 
@@ -81,6 +89,8 @@ class UnifiedPrepare(nn.Module):
         cap_sin: torch.Tensor,
         x_item_seqlens: list[int],
         cap_item_seqlens: list[int],
+        x_attn_mask: torch.Tensor,
+        cap_attn_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Combine x and cap tensors into unified sequences.
 
@@ -110,8 +120,9 @@ class UnifiedPrepare(nn.Module):
         unified_cos = pad_sequence(unified_cos, batch_first=True, padding_value=0.0)
         unified_sin = pad_sequence(unified_sin, batch_first=True, padding_value=0.0)
         unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(unified_item_seqlens):
-            unified_attn_mask[i, :seq_len] = 1
+        for i, (x_len, cap_len) in enumerate(zip(x_item_seqlens, cap_item_seqlens)):
+            unified_attn_mask[i, :x_len] = x_attn_mask[i, :x_len]
+            unified_attn_mask[i, x_len : x_len + cap_len] = cap_attn_mask[i, :cap_len]
 
         return unified, unified_cos, unified_sin, unified_attn_mask
 
@@ -323,6 +334,7 @@ class ZImageAttention(nn.Module):
         attention_mask: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        qk_norm_rope_table: torch.Tensor | None = None,
     ):
         qkv, _ = self.to_qkv(hidden_states)
         qkv = _restore_linear_output_shape(qkv, hidden_states)
@@ -334,10 +346,35 @@ class ZImageAttention(nn.Module):
         key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
         value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        # The forward packs a table only for BF16 D=128 inputs; the fused op
+        # then reproduces the CUDA RMSNorm reduction of norm_q/norm_k, so in
+        # eager mode it is bit-identical to the chain below. Compiled graphs
+        # use the same custom op; their reference is Inductor's RMSNorm, which
+        # reduces in a different order.
+        if (
+            qk_norm_rope_table is not None
+            and self.norm_q.weight.dtype == self.norm_k.weight.dtype == query.dtype
+            and _fused_cuda_supported(query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
+        ):
+            batch_size, seq_len, num_heads, head_dim = query.shape
+            num_kv_heads = key.shape[2]
+            query, key = fused_qk_norm_rope(
+                query.reshape(batch_size * seq_len, num_heads, head_dim),
+                key.reshape(batch_size * seq_len, num_kv_heads, head_dim),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                qk_norm_rope_table,
+                self.norm_q.variance_epsilon,
+                interleaved=True,
+                cuda_rms_norm=True,
+            )
+            query = query.view(batch_size, seq_len, num_heads, head_dim)
+            key = key.view(batch_size, seq_len, num_kv_heads, head_dim)
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
 
-        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
+            query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
@@ -463,6 +500,7 @@ class ZImageTransformerBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         adaln_input: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
     ):
         if self.modulation:
             assert adaln_input is not None
@@ -476,6 +514,7 @@ class ZImageTransformerBlock(nn.Module):
                 attention_mask=attn_mask,
                 cos=cos,
                 sin=sin,
+                qk_norm_rope_table=qk_norm_rope_table,
             )
             x = x + gate_msa * self.attention_norm2(attn_out)
 
@@ -492,6 +531,7 @@ class ZImageTransformerBlock(nn.Module):
                 attention_mask=attn_mask,
                 cos=cos,
                 sin=sin,
+                qk_norm_rope_table=qk_norm_rope_table,
             )
             x = x + self.attention_norm2(attn_out)
 
@@ -590,6 +630,18 @@ class RopeEmbedder:
         return torch.cat(cos_result, dim=-1), torch.cat(sin_result, dim=-1)
 
 
+def _packed_qk_norm_rope_table(cos: torch.Tensor, sin: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
+    """Repeat cos[0]/sin[0] for all batches, matching RotaryEmbedding.
+
+    Sequence-parallel inputs already contain this rank's shard. ``None``
+    below the token threshold or outside the CUDA-matching contract (BF16,
+    D=128). The default threshold of zero preserves fusion for all sizes.
+    """
+    if cos.shape[0] * cos.shape[1] < fused_qk_norm_rope_min_tokens(0):
+        return None
+    return pack_qk_norm_rope_table(cos[0], sin[0], cos.shape[0], dtype=dtype, cuda_rms_norm=True)
+
+
 class ZImageTransformer2DModel(CachedTransformer):
     """Z-Image Transformer model for image generation.
 
@@ -611,6 +663,15 @@ class ZImageTransformer2DModel(CachedTransformer):
 
         Note: Our "Sequence Parallelism" (SP) corresponds to "Context Parallelism" (CP) in diffusers.
     """
+
+    # Fused projections and their checkpoint shard names (mirrors
+    # stacked_params_mapping in load_weights). ``w13`` is the Z-Image FFN
+    # fusion of ``w1``/``w3``; declared here so quantized-checkpoint adapters
+    # can resolve shard keys without a framework-level default entry.
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "w13": ["w1", "w3"],
+    }
 
     _repeated_blocks = ["ZImageTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["layers"]
@@ -662,6 +723,8 @@ class ZImageTransformer2DModel(CachedTransformer):
         axes_dims=[32, 48, 48],
         axes_lens=[1024, 512, 512],
         quant_config: "QuantizationConfig | None" = None,
+        alignment_padding_mode: str = LEARNED_PADDING,
+        multi_frame_output: bool = True,
     ) -> None:
         super().__init__()
         # NOTE: `DiffusersPipelineLoader.load_model()` initializes this module
@@ -676,6 +739,12 @@ class ZImageTransformer2DModel(CachedTransformer):
         self.dim = dim
         self.n_heads = n_heads
 
+        if alignment_padding_mode not in {LEARNED_PADDING, ZERO_MASKED_PADDING}:
+            raise ValueError(f"Unsupported Z-Image alignment padding mode: {alignment_padding_mode!r}")
+        if type(multi_frame_output) is not bool:
+            raise ValueError("multi_frame_output must be boolean.")
+        self.alignment_padding_mode = alignment_padding_mode
+        self.multi_frame_output = multi_frame_output
         self.rope_theta = rope_theta
         self.t_scale = t_scale
         self.gradient_checkpointing = False
@@ -771,8 +840,12 @@ class ZImageTransformer2DModel(CachedTransformer):
             ),
         )
 
-        self.x_pad_token = nn.Parameter(torch.empty((1, dim)))
-        self.cap_pad_token = nn.Parameter(torch.empty((1, dim)))
+        if alignment_padding_mode == LEARNED_PADDING:
+            self.x_pad_token = nn.Parameter(torch.empty((1, dim)))
+            self.cap_pad_token = nn.Parameter(torch.empty((1, dim)))
+        else:
+            self.register_parameter("x_pad_token", None)
+            self.register_parameter("cap_pad_token", None)
 
         self.layers = nn.ModuleList(
             [
@@ -814,6 +887,8 @@ class ZImageTransformer2DModel(CachedTransformer):
                 .permute(6, 0, 3, 1, 4, 2, 5)
                 .reshape(self.out_channels, F, H, W)
             )
+            if not self.multi_frame_output:
+                x[i] = x[i][:, :1]
         return x
 
     @staticmethod
@@ -831,6 +906,8 @@ class ZImageTransformer2DModel(CachedTransformer):
         all_cap_feats: list[torch.Tensor],
         patch_size: int,
         f_patch_size: int,
+        all_image_ref: list[torch.Tensor | None] | None = None,
+        all_cap_feats_2: list[torch.Tensor | None] | None = None,
     ):
         pH = pW = patch_size
         pF = f_patch_size
@@ -843,10 +920,16 @@ class ZImageTransformer2DModel(CachedTransformer):
         all_cap_pos_ids = []
         all_cap_pad_mask = []
         all_cap_feats_out = []
+        all_cap_feats_2_out = []
 
-        for i, (image, cap_feat) in enumerate(zip(all_image, all_cap_feats)):
+        if all_image_ref is None:
+            all_image_ref = [None] * len(all_image)
+        if all_cap_feats_2 is None:
+            all_cap_feats_2 = [None] * len(all_image)
+
+        for image, cap_feat, cap_feat_2, image_ref in zip(all_image, all_cap_feats, all_cap_feats_2, all_image_ref):
             ### Process Caption
-            cap_ori_len = len(cap_feat)
+            cap_ori_len = len(cap_feat) + (len(cap_feat_2) if cap_feat_2 is not None else 0)
             cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
             # padded position ids
             cap_padded_pos_ids = self.create_coordinate_grid(
@@ -866,13 +949,17 @@ class ZImageTransformer2DModel(CachedTransformer):
                 )
             )
             # padded feature
-            cap_padded_feat = torch.cat(
-                [cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)],
-                dim=0,
-            )
-            all_cap_feats_out.append(cap_padded_feat)
+            if cap_feat_2 is None:
+                all_cap_feats_out.append(torch.cat([cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)], dim=0))
+            else:
+                all_cap_feats_out.append(cap_feat)
+                all_cap_feats_2_out.append(
+                    torch.cat([cap_feat_2, torch.zeros_like(cap_feat_2[-1:]).repeat(cap_padding_len, 1)])
+                )
 
             ### Process Image
+            if image_ref is not None:
+                image = torch.cat([image, image_ref], dim=1)
             C, F, H, W = image.size()
             all_image_size.append((F, H, W))
             F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
@@ -922,6 +1009,7 @@ class ZImageTransformer2DModel(CachedTransformer):
             all_cap_pos_ids,
             all_image_pad_mask,
             all_cap_pad_mask,
+            all_cap_feats_2_out,
         )
 
     def forward(
@@ -931,6 +1019,8 @@ class ZImageTransformer2DModel(CachedTransformer):
         cap_feats: list[torch.Tensor],
         patch_size=2,
         f_patch_size=1,
+        ref_x: list[torch.Tensor | None] | None = None,
+        cap_feats_2: list[torch.Tensor] | None = None,
     ):
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
@@ -948,7 +1038,8 @@ class ZImageTransformer2DModel(CachedTransformer):
             cap_pos_ids,
             x_inner_pad_mask,
             cap_inner_pad_mask,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+            cap_feats_2,
+        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size, ref_x, cap_feats_2)
 
         # x embed & refine
         x_item_seqlens = [len(_) for _ in x]
@@ -962,9 +1053,14 @@ class ZImageTransformer2DModel(CachedTransformer):
         adaln_input = t.type_as(x)
         # Use torch.where instead of x[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
         x_pad_mask = torch.cat(x_inner_pad_mask)
+        x_padding = (
+            self.x_pad_token.expand(x.shape[0], -1)
+            if self.alignment_padding_mode == LEARNED_PADDING
+            else torch.zeros_like(x)
+        )
         x = torch.where(
             x_pad_mask.unsqueeze(1).expand_as(x),
-            self.x_pad_token.expand(x.shape[0], -1),
+            x_padding,
             x,
         )
         x = list(x.split(x_item_seqlens, dim=0))
@@ -978,22 +1074,37 @@ class ZImageTransformer2DModel(CachedTransformer):
         x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
         for i, seq_len in enumerate(x_item_seqlens):
             x_attn_mask[i, :seq_len] = 1
+            if self.alignment_padding_mode == ZERO_MASKED_PADDING:
+                x_attn_mask[i, :seq_len].masked_fill_(x_inner_pad_mask[i], False)
 
+        x_qk_norm_rope_table = _packed_qk_norm_rope_table(x_cos, x_sin, x.dtype)
         for layer in self.noise_refiner:
-            x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
+            x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input, qk_norm_rope_table=x_qk_norm_rope_table)
 
         # cap embed & refine
         cap_item_seqlens = [len(_) for _ in cap_feats]
+        cap_feats = torch.cat(cap_feats, dim=0)
+        cap_feats = self.cap_embedder(cap_feats)
+        if cap_feats_2:
+            cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
+            if len(cap_feats) != len(cap_feats_2):
+                raise ValueError("Primary and direct caption conditions must have equal batch size.")
+            cap_feats = [torch.cat([primary, direct], dim=0) for primary, direct in zip(cap_feats, cap_feats_2)]
+            cap_item_seqlens = [len(item) for item in cap_feats]
+            cap_feats = torch.cat(cap_feats, dim=0)
         assert all(_ % SEQ_MULTI_OF == 0 for _ in cap_item_seqlens)
         cap_max_item_seqlen = max(cap_item_seqlens)
 
-        cap_feats = torch.cat(cap_feats, dim=0)
-        cap_feats = self.cap_embedder(cap_feats)
         # Use torch.where instead of cap_feats[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
         cap_pad_mask = torch.cat(cap_inner_pad_mask)
+        cap_padding = (
+            self.cap_pad_token.expand(cap_feats.shape[0], -1)
+            if self.alignment_padding_mode == LEARNED_PADDING
+            else torch.zeros_like(cap_feats)
+        )
         cap_feats = torch.where(
             cap_pad_mask.unsqueeze(1).expand_as(cap_feats),
-            self.cap_pad_token.expand(cap_feats.shape[0], -1),
+            cap_padding,
             cap_feats,
         )
         cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
@@ -1007,19 +1118,38 @@ class ZImageTransformer2DModel(CachedTransformer):
         cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
         for i, seq_len in enumerate(cap_item_seqlens):
             cap_attn_mask[i, :seq_len] = 1
+            if self.alignment_padding_mode == ZERO_MASKED_PADDING:
+                cap_attn_mask[i, :seq_len].masked_fill_(cap_inner_pad_mask[i], False)
 
+        cap_qk_norm_rope_table = _packed_qk_norm_rope_table(cap_cos, cap_sin, cap_feats.dtype)
         for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
+            cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin, qk_norm_rope_table=cap_qk_norm_rope_table)
 
         # Prepare unified tensors via UnifiedPrepare module
         # This enables _cp_plan to shard outputs via split_output=True
         unified, unified_cos, unified_sin, unified_attn_mask = self.unified_prepare(
-            x, x_cos, x_sin, cap_feats, cap_cos, cap_sin, x_item_seqlens, cap_item_seqlens
+            x,
+            x_cos,
+            x_sin,
+            cap_feats,
+            cap_cos,
+            cap_sin,
+            x_item_seqlens,
+            cap_item_seqlens,
+            x_attn_mask,
+            cap_attn_mask,
         )
-
         # Main transformer blocks
+        unified_qk_norm_rope_table = _packed_qk_norm_rope_table(unified_cos, unified_sin, unified.dtype)
         for layer in self.layers:
-            unified = layer(unified, unified_attn_mask, unified_cos, unified_sin, adaln_input)
+            unified = layer(
+                unified,
+                unified_attn_mask,
+                unified_cos,
+                unified_sin,
+                adaln_input,
+                qk_norm_rope_table=unified_qk_norm_rope_table,
+            )
 
         # Final layer
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)

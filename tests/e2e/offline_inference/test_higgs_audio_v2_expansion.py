@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E Offline expansion tests for higgs-audio v2.
 
 Mirrors examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py:
 build Stage-0 prompt_token_ids with the model's own processor + plain-text
 chat template, drive the engine via ``Omni.generate``, and inspect the
-Stage-1 PCM payload directly. The OmniRunnerHandler.send_audio_speech_request
+Stage-1 PCM payload directly. The OfflineOmniClient.send_audio_speech_request
 helper applies a Qwen-style ChatML wrap that is not valid for higgs, so this
 test bypasses it (same approach as test_voxtral_tts.py).
 

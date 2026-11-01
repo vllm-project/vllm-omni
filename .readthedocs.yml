@@ -11,10 +11,15 @@ build:
     post_checkout:
       - git fetch --unshallow || true
     pre_install:
+      # `pre_install` runs before RTD upgrades pip, and the seeded pip 23.1
+      # rejects the `typing_extensions` wheel torch needs (fixed in pip 23.2).
+      - python -m pip install --upgrade pip
       # Pre-install CPU torch so the subsequent `pip install .[docs]` does not
       # pull ~2 GB of CUDA 13 libs (cuBLAS/cuDNN/NCCL/...) that exceed RTD's
-      # 1 GB memory cap and time out the mkdocs build.
-      - python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+      # 1 GB memory cap and time out the mkdocs build. Wheel-only: `--index-url`
+      # replaces PyPI, so an sdist fallback cannot reach its build deps. The
+      # quotes keep YAML from reading `:all:` as a mapping key.
+      - "python -m pip install --only-binary=:all: --index-url https://download.pytorch.org/whl/cpu torch"
 
 mkdocs:
   configuration: mkdocs.yml

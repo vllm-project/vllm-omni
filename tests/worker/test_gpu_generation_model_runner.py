@@ -1,6 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import contextlib
+import inspect
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
+from vllm.config import CacheConfig, CUDAGraphMode
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
+import vllm_omni.worker.gpu_generation_model_runner as gen_runner_module
 from vllm_omni.worker.gpu_generation_model_runner import (
     ExecuteModelState,
     GPUGenerationModelRunner,
@@ -9,15 +20,36 @@ from vllm_omni.worker.gpu_generation_model_runner import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+class _StopExecutionError(Exception):
+    """Halts execute_model at the model boundary."""
+
+
+@pytest.mark.parametrize("randomize_inputs", [False, True])
+def test_generation_profile_accepts_upstream_randomize_inputs(randomize_inputs):
+    """Release workers can pass the profiling flag to codec-stage runners."""
+    runner = object.__new__(GPUGenerationModelRunner)
+    runner.supports_mm_inputs = False
+    runner.max_num_tokens = 128
+    runner.encoder_cache = {"temporary": object()}
+    runner._dummy_run = Mock(return_value=(torch.zeros(1), None))
+    runner._sync_device = Mock()
+
+    runner.profile_run(randomize_inputs=randomize_inputs)
+
+    runner._dummy_run.assert_called_once_with(128, is_profile=True, randomize_inputs=randomize_inputs)
+    runner._sync_device.assert_called_once_with()
+    assert runner.encoder_cache == {}
+
+
 class _DummyInputBatch:
-    def __init__(self):
-        self.req_ids = ["req-1"]
-        self.req_id_to_index = {"req-1": 0}
-        self.num_reqs = 1
+    def __init__(self, num_reqs: int = 1):
+        self.req_ids = [f"req-{i + 1}" for i in range(num_reqs)]
+        self.req_id_to_index = {rid: i for i, rid in enumerate(self.req_ids)}
+        self.num_reqs = num_reqs
         self.vocab_size = 10
 
 
-def _make_runner(multimodal_outputs):
+def _make_runner(multimodal_outputs, num_reqs: int = 1):
     runner = object.__new__(GPUGenerationModelRunner)
     runner.execute_model_state = ExecuteModelState(
         None,
@@ -34,7 +66,7 @@ def _make_runner(multimodal_outputs):
         None,
     )
     runner.kv_connector_output = None
-    runner.input_batch = _DummyInputBatch()
+    runner.input_batch = _DummyInputBatch(num_reqs)
     runner.use_async_scheduling = False
     runner.device = torch.device("cpu")
     runner.supports_mm_inputs = False
@@ -84,3 +116,334 @@ def test_sample_tokens_dict_output():
     assert "audio" in output.multimodal_outputs[0]
     assert "unused" not in output.multimodal_outputs[0]
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
+
+
+def test_host_copy_still_makes_other_outputs_contiguous_host_tensors():
+    for tensor in (torch.randn(4, 2).t(), torch.randn(3, requires_grad=True)):
+        host = gen_runner_module._HostCopyBatch(pin_memory=False).copy(tensor)
+        assert host.device.type == "cpu" and host.is_contiguous() and not host.requires_grad
+        assert torch.equal(host, tensor.detach())
+
+
+class _StubSchedulerOutput:
+    def __init__(self, total_num_scheduled_tokens):
+        self.total_num_scheduled_tokens = total_num_scheduled_tokens
+        self.num_scheduled_tokens = {"req-1": total_num_scheduled_tokens}
+        self.finished_req_ids = set()
+        self.kv_connector_metadata = None
+        self.scheduled_encoder_inputs = {}
+        self.scheduled_spec_decode_tokens = {}
+        self.num_common_prefix_blocks = 0
+        self.scheduled_new_reqs = []
+        self.scheduled_cached_reqs = SimpleNamespace(req_ids=[])
+        self.free_encoder_mm_hashes = []
+        self.new_block_ids_to_zero = None
+
+
+def _make_guard_runner():
+    # Stubbed far enough that a span escaping the guard reaches the real
+    # `_prepare_inputs`, i.e. fails the way the reported crash does.
+    runner = object.__new__(GPUGenerationModelRunner)
+    # Set by __init__, which object.__new__ skips.
+    runner._prev_step_idle = False
+    runner._failed_optional_model_hooks = set()
+    runner.execute_model_state = None
+    runner.routed_experts_initialized = False
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(async_chunk=False)
+    runner.cache_config = CacheConfig()
+    runner.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
+    runner.input_batch = _DummyInputBatch()
+    runner.model = object()
+    runner.parallel_config = SimpleNamespace(
+        distributed_executor_backend=None,
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+    runner._dummy_run_calls = []
+    runner._dummy_run = lambda n: runner._dummy_run_calls.append(n)
+    runner._update_states = lambda scheduler_output: None
+    runner.synchronize_input_prep = contextlib.nullcontext
+    runner.attach_omni_connector_output = lambda result: result
+    return runner
+
+
+def _make_idle_poll(monkeypatch):
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+    runner = _make_guard_runner()
+    runner.model_config.async_chunk = True
+    runner._prev_step_idle = True
+    runner.input_batch = _DummyInputBatch(0)
+    runner._update_states = Mock(return_value=None)
+    runner.synchronize_input_prep = Mock(side_effect=contextlib.nullcontext)
+    runner.model = SimpleNamespace(run_idle_prefetch=Mock(), on_requests_added=Mock(), on_requests_finished=Mock())
+    scheduler_output = _StubSchedulerOutput(0)
+    scheduler_output.num_scheduled_tokens = {}
+    return runner, scheduler_output
+
+
+def test_unchanged_idle_poll_preserves_connector_and_prefetch_work(monkeypatch):
+    runner, scheduled = _make_idle_poll(monkeypatch)
+    runner._omni_connector = object()
+    runner.register_chunk_recv = Mock()
+    runner.recv_full_payload_inputs = Mock()
+    runner._pending_full_payload_send = {}
+    scheduled.pending_input_registrations = ["new-input"]
+    scheduled.pending_request_prewarms = ["new-input"]
+
+    assert runner.execute_model(scheduled) is EMPTY_MODEL_RUNNER_OUTPUT
+    runner._update_states.assert_not_called()
+    runner.synchronize_input_prep.assert_not_called()
+    runner.register_chunk_recv.assert_called_once_with("new-input")
+    runner.recv_full_payload_inputs.assert_called_once_with(scheduled)
+    runner.model.on_requests_added.assert_called_once_with(["new-input"])
+    runner.model.run_idle_prefetch.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "first_idle",
+        "batch",
+        "new",
+        "cached",
+        "finished",
+        "encoder_free",
+        "zero_blocks",
+        "block_copies",
+        "encoder_input",
+        "spec",
+        "dp",
+        "pp",
+    ],
+)
+def test_idle_input_updates_are_not_skipped_on_state_changes(monkeypatch, change):
+    runner, scheduled = _make_idle_poll(monkeypatch)
+    if change == "first_idle":
+        runner._prev_step_idle = False
+    elif change == "batch":
+        runner.input_batch = _DummyInputBatch(1)
+    elif change == "new":
+        scheduled.scheduled_new_reqs = [object()]
+    elif change == "cached":
+        scheduled.scheduled_cached_reqs.req_ids = ["req-1"]
+    elif change == "finished":
+        scheduled.finished_req_ids = {"req-1"}
+    elif change == "encoder_free":
+        scheduled.free_encoder_mm_hashes = ["image"]
+    elif change == "zero_blocks":
+        scheduled.new_block_ids_to_zero = [0]
+    elif change == "block_copies":
+        scheduled.kv_cache_block_copies = [(0, 1)]
+    elif change == "encoder_input":
+        scheduled.scheduled_encoder_inputs = {"req-1": [0]}
+    elif change == "spec":
+        scheduled.scheduled_spec_decode_tokens = {"req-1": [1]}
+    elif change == "dp":
+        runner.parallel_config.data_parallel_size = 2
+    elif change == "pp":
+        runner.parallel_config.pipeline_parallel_size = 2
+
+    assert runner.execute_model(scheduled) is EMPTY_MODEL_RUNNER_OUTPUT
+    runner._update_states.assert_called_once_with(scheduled)
+    runner.synchronize_input_prep.assert_called_once_with()
+    if change == "finished":
+        runner.model.on_requests_finished.assert_called_once_with({"req-1"})
+    if change == "first_idle":
+        runner.model.run_idle_prefetch.assert_not_called()
+
+
+@pytest.mark.parametrize("total", [-1, -512, 0])
+def test_execute_model_skips_non_positive_scheduled_span(monkeypatch, total):
+    """#5196: a negative span is truthy, so it used to reach `_prepare_inputs`,
+    whose `assert total_num_scheduled_tokens > 0` killed the stage EngineCore."""
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+    runner = _make_guard_runner()
+
+    output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(total))
+
+    assert output is EMPTY_MODEL_RUNNER_OUTPUT
+    assert runner._dummy_run_calls == []
+
+
+@pytest.mark.parametrize("total", [-1, 0])
+def test_execute_model_zero_tokens_runs_dp_dummy_run(monkeypatch, total):
+    """A 0-token step under external_launcher + DP>1 must `_dummy_run(1)` so
+    `coordinate_batch_across_dp` stays in sync (it used to be shadowed by an
+    unconditional early return and never ran -> DP hang risk)."""
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+    runner = _make_guard_runner()
+    runner.parallel_config = SimpleNamespace(
+        distributed_executor_backend="external_launcher",
+        data_parallel_size=2,
+    )
+
+    output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(total))
+
+    assert output is EMPTY_MODEL_RUNNER_OUTPUT
+    assert runner._dummy_run_calls == [1]
+
+
+def test_execute_model_zero_tokens_kv_connector_no_forward(monkeypatch):
+    """With a KV-transfer group, a 0-token step must go through
+    `kv_connector_no_forward` (also shadowed by the old early return)."""
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: True)
+    runner = _make_guard_runner()
+    sentinel = object()
+    calls: list[object] = []
+
+    def _no_forward(scheduler_output, vllm_config):
+        calls.append(scheduler_output)
+        return sentinel
+
+    runner.kv_connector_no_forward = _no_forward
+    runner.vllm_config = object()
+
+    output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(0))
+
+    assert output is sentinel
+    assert len(calls) == 1
+
+
+def test_execute_model_zero_tokens_ec_producer_takes_encoder_path(monkeypatch):
+    """AR lock-step: the EC-producer block sits ABOVE the zero-token block
+    (matching GPUARModelRunner), so a 0-token step on an EC producer returns
+    the empty ENCODER output. Before the C1 reorder, the unconditional early
+    return won and produced EMPTY_MODEL_RUNNER_OUTPUT instead — this is the
+    one cell whose behaviour the reorder changed."""
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: True)
+    monkeypatch.setattr(gen_runner_module, "get_ec_transfer", lambda: SimpleNamespace(is_consumer=False))
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+    sentinel = object()
+    monkeypatch.setattr(gen_runner_module, "make_empty_encoder_model_runner_output", lambda so: sentinel)
+    runner = _make_guard_runner()
+    runner.encoder_cache = {}
+    runner.maybe_get_ec_connector_output = lambda scheduler_output, encoder_cache: contextlib.nullcontext()
+    encoder_calls = []
+    runner._execute_mm_encoder = lambda so: encoder_calls.append(so)
+
+    output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(0))
+
+    assert output is sentinel
+    assert len(encoder_calls) == 1
+    assert runner._dummy_run_calls == []
+
+
+class TestSampleTokensBatched:
+    """RFC #5450 C5: `sample_tokens` must slice per request for num_reqs > 1.
+    The tensor branch's asserts used to force num_reqs == 1 and the list
+    branch built a length-1 payload misaligned with `req_ids`."""
+
+    def test_tensor_output_sliced_per_request(self):
+        multimodal_outputs = torch.arange(12, dtype=torch.float32).reshape(2, 2, 3)
+        runner = _make_runner(multimodal_outputs, num_reqs=2)
+
+        output = GPUGenerationModelRunner.sample_tokens(runner)
+
+        assert len(output.multimodal_outputs) == 2
+        assert torch.equal(output.multimodal_outputs[0]["model_outputs"], multimodal_outputs[0])
+        assert torch.equal(output.multimodal_outputs[1]["model_outputs"], multimodal_outputs[1])
+
+    def test_list_output_one_entry_per_request(self):
+        entries = [torch.zeros(2, 1), torch.ones(2, 1)]
+        runner = _make_runner(list(entries), num_reqs=2)
+
+        output = GPUGenerationModelRunner.sample_tokens(runner)
+
+        assert len(output.multimodal_outputs) == 2
+        assert torch.equal(output.multimodal_outputs[0]["model_outputs"], entries[0])
+        assert torch.equal(output.multimodal_outputs[1]["model_outputs"], entries[1])
+
+    def test_tensor_output_batch_mismatch_raises(self):
+        runner = _make_runner(torch.randn(1, 2, 3), num_reqs=2)
+
+        with pytest.raises(ValueError, match="leading dim 1 .* 2 requests"):
+            GPUGenerationModelRunner.sample_tokens(runner)
+
+    def test_list_output_batch_mismatch_raises(self):
+        runner = _make_runner([torch.randn(2, 1)], num_reqs=2)
+
+        with pytest.raises(ValueError, match="length 1 .* 2 requests"):
+            GPUGenerationModelRunner.sample_tokens(runner)
+
+
+@pytest.mark.parametrize("exact_shape, expected_len", [(True, 3), (False, 4)])
+def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape, expected_len):
+    """#6712: the cudagraph dispatcher rounds a 3-token batch up to a capture
+    size of 4, so ``_preprocess`` returns a 4-element ``input_ids`` while
+    ``seq_token_counts`` stays ``[3]``. Models opting into
+    ``requires_exact_input_shape`` must receive the trimmed view; everything
+    else must keep the padded buffer.
+    """
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+
+    runner = _make_guard_runner()
+    runner.model = SimpleNamespace(
+        has_preprocess=True,
+        requires_request_ids=False,
+        requires_exact_input_shape=exact_shape,
+    )
+    runner.num_prompt_logprobs = None
+    runner.vllm_config = None
+    runner.parallel_config = SimpleNamespace(
+        distributed_executor_backend=None,
+        data_parallel_size=1,
+        use_ubatching=False,
+        num_ubatches=1,
+    )
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_prepare_inputs", lambda self, so, nst: (None, None, 1))
+    monkeypatch.setattr(
+        GPUGenerationModelRunner,
+        "_determine_batch_execution_and_padding",
+        lambda self, **kw: (
+            CUDAGraphMode.PIECEWISE,
+            SimpleNamespace(num_tokens=4, num_reqs=1),
+            False,
+            None,
+            None,
+        ),
+    )
+    monkeypatch.setattr(GPUGenerationModelRunner, "_get_slot_mappings", lambda self, **kw: (None, None))
+    # Use the installed upstream contract: a permissive **kwargs stub would
+    # hide removed runner arguments such as cascade_attn_prefix_lens.
+    metadata_signature = inspect.signature(GPUGenerationModelRunner._build_attention_metadata)
+
+    def _build_attention_metadata(self, **kwargs):
+        metadata_signature.bind(self, **kwargs)
+        return None, None
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_build_attention_metadata", _build_attention_metadata)
+    monkeypatch.setattr(
+        GPUGenerationModelRunner,
+        "_maybe_attach_attention_metadata_extensions",
+        lambda self, **kw: None,
+    )
+    monkeypatch.setattr(gen_runner_module, "set_forward_context", lambda *a, **kw: contextlib.nullcontext())
+
+    def _fake_preprocess(self, so, num_input_tokens, itensors=None):
+        return (torch.zeros(num_input_tokens, dtype=torch.int32), None, None, None, {}, None)
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_preprocess", _fake_preprocess)
+
+    seen = {}
+
+    def _capture(self, **kwargs):
+        seen["input_ids"] = kwargs["input_ids"]
+        seen["counts"] = kwargs["model_kwargs"]["seq_token_counts"]
+        raise _StopExecutionError
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_run_generation_model", _capture)
+
+    with pytest.raises(_StopExecutionError):
+        GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(3))
+
+    assert seen["input_ids"].numel() == expected_len
+    assert seen["counts"] == [3]
+    if exact_shape:
+        assert sum(seen["counts"]) == seen["input_ids"].numel()

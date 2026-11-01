@@ -46,9 +46,11 @@
   "median_audio_duration_s": 0,
   "p99_audio_duration_s": 0,
   "baseline": {
-    "mean_ttft_ms": 0,
-    "mean_audio_ttfp_ms": 0,
-    "mean_audio_rtf": 0
+    "H100": {
+      "mean_ttft_ms": 0,
+      "mean_audio_ttfp_ms": 0,
+      "mean_audio_rtf": 0
+    }
   },
   "random_input_len": 0,
   "random_output_len": 0

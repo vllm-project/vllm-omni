@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Request normalization shared by LTX pipeline variants."""
+"""Request normalization and validation shared by LTX pipeline variants."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from typing import Any, Literal
 
 import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+
+from .ltx2_guidance import LTXGuidanceSpec, LTXModalityGuidance
+from .ltx2_recipes import LTXPipelineRecipe
 
 
 @dataclass
@@ -24,8 +30,7 @@ class LTXRequestInputs:
     num_frames: int
     frame_rate: float
     num_inference_steps: int
-    guidance_scale: float
-    guidance_rescale: float
+    guidance: LTXGuidanceSpec
     num_videos_per_prompt: int
     generator: torch.Generator | list[torch.Generator] | None
     latents: torch.Tensor | None
@@ -38,6 +43,247 @@ class LTXRequestInputs:
     decode_noise_scale: float | list[float] | None
     output_type: str
     max_sequence_length: int
+    audio_latents_normalized: bool = False
+    image_crf: int | None = None
+
+    @property
+    def guidance_scale(self) -> float:
+        """Compatibility view for callers that only understand video CFG."""
+        return self.guidance.video.cfg_scale
+
+
+LTXCheckpointKind = Literal["distilled", "regular"]
+
+
+@dataclass(frozen=True)
+class LTX2AudioResourceLimits:
+    """Request bounds, allowing only the required causal-grid round-up."""
+
+    max_duration_seconds: float = 20.1
+    max_latent_frames: int = 512
+
+    @classmethod
+    def from_additional_config(cls, additional_config: Mapping[str, Any] | None) -> LTX2AudioResourceLimits:
+        if additional_config is None:
+            return cls()
+        if not isinstance(additional_config, Mapping):
+            raise TypeError("additional_config must be a mapping or None")
+        if "ltx2_audio_limits" not in additional_config:
+            return cls()
+        raw = additional_config["ltx2_audio_limits"]
+        if not isinstance(raw, Mapping):
+            raise TypeError("additional_config.ltx2_audio_limits must be a mapping")
+
+        unknown = set(raw) - {"max_duration_seconds", "max_latent_frames"}
+        if unknown:
+            names = ", ".join(sorted(str(name) for name in unknown))
+            raise ValueError(f"Unknown LTX2 audio resource limit option(s): {names}")
+
+        max_duration_seconds = raw.get("max_duration_seconds", cls.max_duration_seconds)
+        if isinstance(max_duration_seconds, bool) or not isinstance(max_duration_seconds, (int, float)):
+            raise TypeError("LTX2 audio max_duration_seconds must be a finite and positive number")
+        max_duration_seconds = float(max_duration_seconds)
+        if not math.isfinite(max_duration_seconds) or max_duration_seconds <= 0:
+            raise ValueError("LTX2 audio max_duration_seconds must be a finite and positive number")
+
+        max_latent_frames = raw.get("max_latent_frames", cls.max_latent_frames)
+        if type(max_latent_frames) is not int or max_latent_frames < 1:
+            raise ValueError("LTX2 audio max_latent_frames must be a positive integer")
+        return cls(
+            max_duration_seconds=max_duration_seconds,
+            max_latent_frames=max_latent_frames,
+        )
+
+    def validate_resolved_duration(
+        self,
+        *,
+        num_frames: int,
+        frame_rate: float,
+        expected_frame_rate: float,
+    ) -> float:
+        """Validate the final LTX clock after causal-grid alignment."""
+        if not math.isfinite(frame_rate) or not math.isclose(
+            frame_rate,
+            expected_frame_rate,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(f"LTX text-to-audio requires frame_rate={expected_frame_rate:g}, got {frame_rate!r}.")
+        duration_s = num_frames / frame_rate
+        if not math.isfinite(duration_s) or duration_s <= 0:
+            raise ValueError("LTX text-to-audio resolved duration must be finite and positive.")
+
+        max_target_frames = self.max_duration_seconds * frame_rate
+        max_intervals = max(1, math.ceil((max_target_frames - 1) / 8))
+        max_resolved_frames = max_intervals * 8 + 1
+        if num_frames > max_resolved_frames:
+            raise ValueError(
+                "LTX text-to-audio resolved duration exceeds the request limit after causal-grid alignment: "
+                f"got {num_frames} frames, maximum is {max_resolved_frames} frames "
+                f"for max_duration_seconds={self.max_duration_seconds:g}."
+            )
+        return duration_s
+
+    def validate_requested_duration(self, duration_s: float) -> None:
+        """Validate the user-requested duration before causal-grid alignment."""
+        if not math.isfinite(duration_s) or duration_s <= 0:
+            raise ValueError("LTX text-to-audio requested duration must be finite and positive.")
+        if duration_s > self.max_duration_seconds:
+            raise ValueError(
+                "LTX text-to-audio requested duration exceeds the deployment limit: "
+                f"got {duration_s:.6g}s, max_duration_seconds={self.max_duration_seconds:g}."
+            )
+
+    def validate_latent_frames(self, latent_frames: int) -> None:
+        if latent_frames < 1 or latent_frames > self.max_latent_frames:
+            raise ValueError(
+                "LTX text-to-audio latent frames are outside the deployment budget: "
+                f"got {latent_frames}, allowed range is 1..{self.max_latent_frames}."
+            )
+
+
+def resolve_ltx_audio_num_frames(
+    *,
+    audio_length: float | None,
+    num_frames: int | None,
+    frame_rate: float,
+    default_num_frames: int,
+    temporal_compression_ratio: int = 8,
+) -> int:
+    """Resolve T2A duration onto LTX's causal ``ratio * k + 1`` clock."""
+    if not math.isfinite(frame_rate) or frame_rate <= 0:
+        raise ValueError("LTX text-to-audio `frame_rate` must be finite and positive.")
+    if audio_length is not None and num_frames is not None:
+        raise ValueError("`audio_length` and `num_frames` are mutually exclusive.")
+    if audio_length is not None:
+        if not math.isfinite(audio_length) or audio_length <= 0:
+            raise ValueError("LTX text-to-audio `audio_length` must be finite and positive.")
+        target_num_frames = audio_length * frame_rate
+        if not math.isfinite(target_num_frames):
+            raise ValueError("LTX text-to-audio duration clock must be finite.")
+        interval_count = max(1, math.ceil((target_num_frames - 1) / temporal_compression_ratio))
+        return interval_count * temporal_compression_ratio + 1
+
+    raw_num_frames = default_num_frames if num_frames is None else num_frames
+    if type(raw_num_frames) is not int:
+        raise ValueError(f"LTX text-to-audio `num_frames` must be an integer, got {raw_num_frames!r}.")
+    resolved = raw_num_frames
+    if resolved < 1 or (resolved - 1) % temporal_compression_ratio:
+        raise ValueError(
+            f"LTX text-to-audio `num_frames` must be {temporal_compression_ratio} * k + 1, got {resolved}."
+        )
+    return resolved
+
+
+def validate_ltx_checkpoint(
+    scheduler_config: Mapping[str, Any],
+    *,
+    expected_kind: LTXCheckpointKind | None,
+    pipeline_name: str,
+) -> None:
+    """Ensure scheduler metadata matches the checkpoint required by a profile."""
+    if expected_kind is None:
+        return
+
+    if expected_kind == "distilled":
+        if scheduler_config.get("use_dynamic_shifting", True) or scheduler_config.get("shift_terminal") is not None:
+            raise ValueError(
+                f"{pipeline_name} requires a merged distilled LTX2 checkpoint; "
+                "the loaded scheduler metadata describes a non-distilled checkpoint."
+            )
+        return
+
+    if not scheduler_config.get("use_dynamic_shifting", False) or scheduler_config.get("shift_terminal") is None:
+        raise ValueError(
+            f"{pipeline_name} requires a regular non-distilled LTX checkpoint; "
+            "the loaded scheduler metadata describes a distilled checkpoint."
+        )
+
+
+def validate_pipeline_request(
+    request_inputs: LTXRequestInputs,
+    *,
+    pipeline_recipe: LTXPipelineRecipe,
+    vae_spatial_compression_ratio: int,
+    vae_temporal_compression_ratio: int,
+    pipeline_name: str,
+    min_video_latent_spatial_size: tuple[int, int] | None = None,
+    request_sigmas: list[float] | None = None,
+    request_phase_sigmas: tuple[list[float] | None, ...] | None = None,
+) -> None:
+    """Validate the request capabilities declared by an execution recipe."""
+    alignment = vae_spatial_compression_ratio * pipeline_recipe.max_spatial_downscale
+    if request_inputs.height % alignment != 0 or request_inputs.width % alignment != 0:
+        raise ValueError(
+            f"{pipeline_name} resolution must be divisible by {alignment}, got "
+            f"{request_inputs.width}x{request_inputs.height}."
+        )
+
+    if min_video_latent_spatial_size is not None:
+        min_latent_height, min_latent_width = min_video_latent_spatial_size
+        latent_height = request_inputs.height // vae_spatial_compression_ratio
+        latent_width = request_inputs.width // vae_spatial_compression_ratio
+        if latent_height < min_latent_height or latent_width < min_latent_width:
+            raise ValueError(
+                f"{pipeline_name} DiffVAE requires video latent spatial dimensions of at least "
+                f"{min_latent_width}x{min_latent_height} for neighborhood attention, got "
+                f"{latent_width}x{latent_height} from request resolution "
+                f"{request_inputs.width}x{request_inputs.height}."
+            )
+
+    if request_inputs.num_frames < 1 or (request_inputs.num_frames - 1) % vae_temporal_compression_ratio != 0:
+        raise ValueError(
+            f"{pipeline_name} `num_frames` must be {vae_temporal_compression_ratio} * k + 1, "
+            f"got {request_inputs.num_frames}."
+        )
+
+    if not pipeline_recipe.allow_request_latents and (
+        request_inputs.latents is not None or request_inputs.audio_latents is not None
+    ):
+        raise ValueError(f"{pipeline_name} does not accept request-provided video or audio latents.")
+
+    if not pipeline_recipe.allow_request_sigmas and request_sigmas is not None:
+        raise ValueError(f"{pipeline_name} uses fixed phase sigma schedules.")
+    if request_sigmas is not None and len(request_sigmas) < 2:
+        raise ValueError("A custom LTX sigma schedule must contain at least two values.")
+
+    has_phase_sigmas = request_phase_sigmas is not None and any(item is not None for item in request_phase_sigmas)
+    if request_sigmas is not None and has_phase_sigmas:
+        raise ValueError("Use either `sigmas` or per-stage sigma schedules, not both.")
+    if has_phase_sigmas and not pipeline_recipe.allow_request_phase_sigmas:
+        raise ValueError(f"{pipeline_name} does not accept per-stage sigma schedules.")
+    if request_phase_sigmas is not None and len(request_phase_sigmas) != len(pipeline_recipe.phases):
+        raise ValueError(
+            f"{pipeline_name} has {len(pipeline_recipe.phases)} phases but received "
+            f"{len(request_phase_sigmas)} per-stage sigma schedules."
+        )
+    for index, phase_sigmas in enumerate(request_phase_sigmas or ()):
+        if phase_sigmas is not None and len(phase_sigmas) < 2:
+            raise ValueError(f"`stage_{index + 1}_sigmas` must contain at least two values.")
+
+    if (
+        request_sigmas is None
+        and (request_phase_sigmas is None or request_phase_sigmas[0] is None)
+        and pipeline_recipe.fixed_num_inference_steps
+        and (request_inputs.num_inference_steps != pipeline_recipe.num_inference_steps)
+    ):
+        raise ValueError(
+            f"{pipeline_name} uses {pipeline_recipe.num_inference_steps} fixed Stage 1 denoise steps; "
+            f"got {request_inputs.num_inference_steps}."
+        )
+
+    negative_prompt = request_inputs.negative_prompt
+    has_negative_prompt = (
+        any(bool(value) for value in negative_prompt) if isinstance(negative_prompt, list) else bool(negative_prompt)
+    )
+    if not pipeline_recipe.allow_negative_prompt and (
+        has_negative_prompt or request_inputs.negative_prompt_embeds is not None
+    ):
+        raise ValueError(f"{pipeline_name} uses positive-only guidance and does not accept negative conditioning.")
+
+    first_phase = pipeline_recipe.phases[0]
+    if not first_phase.allow_guidance_override and request_inputs.guidance != first_phase.guidance:
+        raise ValueError(f"{pipeline_name} uses fixed positive-only guidance and cannot override it.")
 
 
 def _unwrap_request_tensor(value: Any) -> Any:
@@ -65,22 +311,232 @@ def _get_audio_latents_from_sampling(sampling: Any) -> torch.Tensor | None:
     return sampling.extra_args.get("audio_latents")
 
 
+def _get_extra_arg(sampling: Any, *names: str) -> Any:
+    extra_args = sampling.extra_args or {}
+    for name in names:
+        value = extra_args.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalize_image_crf(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("`image_crf` must be an integer from 0 through 51.")
+    if not 0 <= value <= 51:
+        raise ValueError("`image_crf` must be an integer from 0 through 51.")
+    return value
+
+
+def _normalize_stg_blocks(value: Any, default: tuple[int, ...]) -> tuple[int, ...]:
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return (value,)
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"STG blocks must be an integer or a list of integers, got {value!r}.")
+    return tuple(int(item) for item in value)
+
+
+def _resolve_negative_prompts(
+    prompts: list[Any],
+    fallback: str | list[str],
+) -> str | list[str]:
+    if not prompts:
+        return fallback
+    if isinstance(fallback, list) and len(fallback) != len(prompts):
+        raise ValueError(
+            f"`negative_prompt` has batch size {len(fallback)}, but the request batch has size {len(prompts)}."
+        )
+
+    resolved = []
+    for index, item in enumerate(prompts):
+        request_value = None if isinstance(item, str) else item.get("negative_prompt")
+        if request_value is not None:
+            resolved.append(request_value)
+        else:
+            resolved.append(fallback[index] if isinstance(fallback, list) else fallback)
+    return resolved
+
+
+def _resolve_modality_guidance(
+    sampling: Any,
+    modality: str,
+    default: LTXModalityGuidance,
+) -> LTXModalityGuidance:
+    cfg_aliases = (f"{modality}_cfg_scale", f"{modality}_cfg_guidance_scale")
+    stg_aliases = (f"{modality}_stg_scale", f"{modality}_stg_guidance_scale")
+    modality_aliases = (
+        ("video_modality_scale", "a2v_guidance_scale")
+        if modality == "video"
+        else ("audio_modality_scale", "v2a_guidance_scale")
+    )
+    cfg_scale = _get_extra_arg(sampling, *cfg_aliases)
+    stg_scale = _get_extra_arg(sampling, *stg_aliases)
+    modality_scale = _get_extra_arg(sampling, *modality_aliases)
+    rescale_scale = _get_extra_arg(sampling, f"{modality}_rescale_scale")
+    stg_blocks = _get_extra_arg(sampling, f"{modality}_stg_blocks")
+    return replace(
+        default,
+        cfg_scale=default.cfg_scale if cfg_scale is None else float(cfg_scale),
+        stg_scale=default.stg_scale if stg_scale is None else float(stg_scale),
+        modality_scale=default.modality_scale if modality_scale is None else float(modality_scale),
+        rescale_scale=default.rescale_scale if rescale_scale is None else float(rescale_scale),
+        stg_blocks=_normalize_stg_blocks(stg_blocks, default.stg_blocks),
+    )
+
+
+def _resolve_guidance_spec(
+    sampling: Any,
+    default: LTXGuidanceSpec,
+    *,
+    guidance_scale: float | None,
+) -> LTXGuidanceSpec:
+    video = _resolve_modality_guidance(sampling, "video", default.video)
+    audio = _resolve_modality_guidance(sampling, "audio", default.audio)
+
+    common_cfg = sampling.guidance_scale if sampling.guidance_scale_provided else guidance_scale
+    if common_cfg is not None:
+        video = replace(video, cfg_scale=float(common_cfg))
+        audio = replace(audio, cfg_scale=float(common_cfg))
+
+    return LTXGuidanceSpec(video=video, audio=audio)
+
+
 class LTXRequestMixin:
     """Normalize serving requests without coupling them to a model version."""
 
     supports_request_batch = False
-    supports_guidance_rescale = False
+
+    @staticmethod
+    def _validate_forward_options(
+        *,
+        timesteps: list[int] | None,
+        guidance_rescale: float | None,
+        noise_scale: float,
+        return_dict: bool,
+        attention_kwargs: dict[str, Any] | None,
+    ) -> None:
+        if timesteps is not None:
+            raise ValueError("LTX does not support `timesteps`; use `sigmas` for a custom schedule.")
+        if guidance_rescale not in (None, 0.0):
+            raise ValueError(
+                "LTX does not support the common `guidance_rescale`; use `video_rescale_scale` and "
+                "`audio_rescale_scale`."
+            )
+        if noise_scale != 0.0:
+            raise ValueError("LTX only supports `noise_scale=0.0`.")
+        if return_dict is not True:
+            raise ValueError("LTX only supports `return_dict=True`.")
+        if attention_kwargs is not None:
+            raise ValueError("LTX does not support public `attention_kwargs`.")
+
+    @torch.no_grad()
+    def forward(
+        self,
+        req: DiffusionRequestBatch,
+        *,
+        image: Any | None = None,
+        image_crf: int | None = None,
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_frames: int | None = None,
+        frame_rate: float | None = None,
+        num_inference_steps: int | None = None,
+        sigmas: list[float] | None = None,
+        stage_1_sigmas: list[float] | None = None,
+        stage_2_sigmas: list[float] | None = None,
+        timesteps: list[int] | None = None,
+        guidance_scale: float | None = None,
+        guidance_rescale: float | None = None,
+        noise_scale: float = 0.0,
+        num_videos_per_prompt: int | None = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        audio_latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        decode_timestep: float | list[float] = 0.0,
+        decode_noise_scale: float | list[float] | None = None,
+        output_type: str = "np",
+        return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
+        max_sequence_length: int | None = None,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        """Validate and normalize the public LTX request surface."""
+        self._validate_forward_options(
+            timesteps=timesteps,
+            guidance_rescale=guidance_rescale,
+            noise_scale=noise_scale,
+            return_dict=return_dict,
+            attention_kwargs=attention_kwargs,
+        )
+        if image is not None and not self.support_image_input:
+            raise ValueError(f"{self.__class__.__name__} does not support `image` input.")
+
+        return self._forward_request(
+            req,
+            image=image,
+            image_crf=image_crf,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            stage_1_sigmas=stage_1_sigmas,
+            stage_2_sigmas=stage_2_sigmas,
+            guidance_scale=guidance_scale,
+            num_videos_per_prompt=num_videos_per_prompt,
+            generator=generator,
+            latents=latents,
+            audio_latents=audio_latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            output_type=output_type,
+            max_sequence_length=max_sequence_length,
+        )
 
     @staticmethod
     def _resolve_request_sigmas(
         req: DiffusionRequestBatch,
         fallback: list[float] | None,
     ) -> list[float] | None:
-        request_sigmas = [sampling.sigmas for sampling in req.sampling_params_list]
+        request_sigmas = [
+            sampling.sigmas if sampling.sigmas is not None else _get_extra_arg(sampling, "sigmas")
+            for sampling in req.sampling_params_list
+        ]
         first = request_sigmas[0] if request_sigmas else None
         if any(item != first for item in request_sigmas[1:]):
             raise ValueError("Batched LTX requests must use identical custom sigmas.")
         return first if first is not None else fallback
+
+    @staticmethod
+    def _resolve_request_phase_sigmas(
+        req: DiffusionRequestBatch,
+        stage_1_fallback: list[float] | None,
+        stage_2_fallback: list[float] | None,
+    ) -> tuple[list[float] | None, list[float] | None] | None:
+        resolved: list[list[float] | None] = []
+        for name, fallback in (("stage_1_sigmas", stage_1_fallback), ("stage_2_sigmas", stage_2_fallback)):
+            values = [_get_extra_arg(sampling, name) for sampling in req.sampling_params_list]
+            first = values[0] if values else None
+            if any(item != first for item in values[1:]):
+                raise ValueError(f"Batched LTX requests must use identical `{name}` values.")
+            resolved.append(first if first is not None else fallback)
+        return tuple(resolved) if any(item is not None for item in resolved) else None
 
     def check_inputs(
         self,
@@ -128,8 +584,7 @@ class LTXRequestMixin:
         num_frames: int | None,
         frame_rate: float | None,
         num_inference_steps: int | None,
-        timesteps: list[int] | None,
-        guidance_scale: float,
+        guidance_scale: float | None,
         num_videos_per_prompt: int | None,
         generator: torch.Generator | list[torch.Generator] | None,
         latents: torch.Tensor | None,
@@ -142,38 +597,57 @@ class LTXRequestMixin:
         decode_noise_scale: float | list[float] | None,
         output_type: str,
         max_sequence_length: int | None,
-        guidance_rescale: float = 0.0,
+        image_crf: int | None = None,
     ) -> LTXRequestInputs:
         sampling_params_list = req.sampling_params_list
+        for sampling in sampling_params_list:
+            if sampling.timesteps is not None:
+                raise ValueError("LTX does not support `timesteps`; use `sigmas` for a custom schedule.")
+            if sampling.guidance_rescale:
+                raise ValueError(
+                    "LTX does not support the common `guidance_rescale`; use `video_rescale_scale` and "
+                    "`audio_rescale_scale`."
+                )
+            if _get_extra_arg(sampling, "flow_shift") is not None:
+                raise ValueError("LTX does not support `flow_shift`; use `sigmas` for a custom schedule.")
+
+        request_image_crfs = [_get_extra_arg(item, "image_crf") for item in sampling_params_list]
+        first_image_crf = request_image_crfs[0] if request_image_crfs else None
+        if any(item != first_image_crf for item in request_image_crfs[1:]):
+            raise ValueError("Batched LTX requests must use identical `image_crf` values.")
+        image_crf = _normalize_image_crf(first_image_crf if first_image_crf is not None else image_crf)
+
         sampling = sampling_params_list[0]
         prompt = [item if isinstance(item, str) else (item.get("prompt") or "") for item in req.prompts] or prompt
-        if all(isinstance(item, str) or item.get("negative_prompt") is None for item in req.prompts):
-            negative_prompt = None
-        elif req.prompts:
-            negative_prompt = [
-                "" if isinstance(item, str) else (item.get("negative_prompt") or "") for item in req.prompts
-            ]
-
-        height = sampling.height or height or self.one_stage_recipe.height
-        width = sampling.width or width or self.one_stage_recipe.width
-        num_frames = sampling.num_frames or num_frames or self.one_stage_recipe.num_frames
-        frame_rate = sampling.resolved_frame_rate or frame_rate or self.one_stage_recipe.frame_rate
-        num_inference_steps = (
-            sampling.num_inference_steps or num_inference_steps or self.one_stage_recipe.num_inference_steps
+        negative_prompt = _resolve_negative_prompts(
+            req.prompts,
+            negative_prompt if negative_prompt is not None else self.pipeline_recipe.negative_prompt,
         )
-        if timesteps is None:
-            num_inference_steps = max(int(num_inference_steps), 2)
-        elif len(timesteps) < 2:
-            raise ValueError("`timesteps` must contain at least 2 values for FlowMatchEulerDiscreteScheduler.")
+
+        height = sampling.height or height or self.pipeline_recipe.height
+        width = sampling.width or width or self.pipeline_recipe.width
+        num_frames = sampling.num_frames or num_frames or self.pipeline_recipe.num_frames
+        frame_rate = sampling.resolved_frame_rate or frame_rate or self.pipeline_recipe.frame_rate
+        num_inference_steps = (
+            sampling.num_inference_steps or num_inference_steps or self.pipeline_recipe.num_inference_steps
+        )
+        num_inference_steps = max(int(num_inference_steps), 2)
 
         num_videos_per_prompt = (
             sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else num_videos_per_prompt or 1
         )
         max_sequence_length = sampling.max_sequence_length or max_sequence_length or self.tokenizer_max_length
-        if sampling.guidance_scale_provided:
-            guidance_scale = sampling.guidance_scale
-        if self.supports_guidance_rescale and sampling.guidance_rescale is not None:
-            guidance_rescale = sampling.guidance_rescale
+        guidance_specs = [
+            _resolve_guidance_spec(
+                item,
+                self.pipeline_recipe.request_guidance,
+                guidance_scale=guidance_scale,
+            )
+            for item in sampling_params_list
+        ]
+        guidance = guidance_specs[0]
+        if any(item != guidance for item in guidance_specs[1:]):
+            raise ValueError("Batched LTX requests must use identical video/audio guidance parameters.")
 
         if self.supports_request_batch:
             if generator is None:
@@ -235,6 +709,10 @@ class LTXRequestMixin:
             ]
             if any(value is not None for value in request_negative_masks):
                 negative_prompt_attention_mask = torch.stack(request_negative_masks)  # type: ignore[arg-type]
+            if prompt_embeds is not None:
+                prompt = None
+            if negative_prompt_embeds is not None:
+                negative_prompt = None
 
         if sampling.decode_timestep is not None:
             decode_timestep = sampling.decode_timestep
@@ -251,8 +729,7 @@ class LTXRequestMixin:
             num_frames=int(num_frames),
             frame_rate=float(frame_rate),
             num_inference_steps=int(num_inference_steps),
-            guidance_scale=guidance_scale,
-            guidance_rescale=guidance_rescale,
+            guidance=guidance,
             num_videos_per_prompt=int(num_videos_per_prompt),
             generator=generator,
             latents=latents,
@@ -265,4 +742,5 @@ class LTXRequestMixin:
             decode_noise_scale=decode_noise_scale,
             output_type=output_type,
             max_sequence_length=int(max_sequence_length),
+            image_crf=image_crf,
         )

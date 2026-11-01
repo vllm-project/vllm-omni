@@ -45,7 +45,6 @@ curl -o dragon.png -X POST http://localhost:8000/v1/images/generations \
   }'
 ```
 
-
 **Using Python:**
 
 ```python
@@ -123,7 +122,7 @@ response = client.images.generate(
 
 ### Endpoint
 
-```
+```text
 POST /v1/images/generations
 Content-Type: application/json
 ```
@@ -133,7 +132,7 @@ Content-Type: application/json
 #### OpenAI Standard Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `prompt` | string | **required** | Text description of the desired image |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `n` | integer | 1 | Number of images to generate (1-10) |
@@ -144,7 +143,7 @@ Content-Type: application/json
 #### vllm-omni Extension Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `negative_prompt` | string | null | Text describing what to avoid in the image |
 | `num_inference_steps` | integer | model defaults | Number of diffusion steps |
 | `guidance_scale` | float | model defaults | Classifier-free guidance scale (typically 0.0-20.0) |
@@ -267,6 +266,7 @@ curl http://localhost:8000/v1/images/generations \
 ### Out of Memory
 
 If you encounter OOM errors:
+
 1. Reduce image size: `"size": "512x512"`
 2. Reduce inference steps: `"num_inference_steps": 25`
 3. Generate fewer images: `"n": 1`

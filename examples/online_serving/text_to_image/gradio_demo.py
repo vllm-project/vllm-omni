@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Qwen-Image Gradio Demo for online serving.
+Shared text-to-image Gradio demo for online serving.
 
 Usage:
     python gradio_demo.py [--server http://localhost:8091] [--port 7860]
@@ -77,9 +77,9 @@ def generate_image(
 def create_demo(server_url: str):
     """Create Gradio demo interface."""
 
-    with gr.Blocks(title="Qwen-Image Demo") as demo:
-        gr.Markdown("# Qwen-Image Online Generation")
-        gr.Markdown("Generate images using Qwen-Image model")
+    with gr.Blocks(title="Text-to-Image Demo") as demo:
+        gr.Markdown("# Text-to-Image Online Generation")
+        gr.Markdown("Generate images using the model configured on the server")
 
         with gr.Row():
             with gr.Column(scale=1):
@@ -115,7 +115,6 @@ def create_demo(server_url: str):
                         label="Inference Steps",
                         minimum=10,
                         maximum=100,
-                        # Default steps aligned with run_curl_text_to_image.sh to 100
                         value=100,
                         step=5,
                     )
@@ -173,7 +172,7 @@ def create_demo(server_url: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Qwen-Image Gradio Demo")
+    parser = argparse.ArgumentParser(description="Shared text-to-image Gradio demo")
     parser.add_argument("--server", default="http://localhost:8091", help="Server URL")
     parser.add_argument("--port", type=int, default=7860, help="Gradio port")
     parser.add_argument("--share", action="store_true", help="Create public link")

@@ -27,7 +27,7 @@ parallel, cache, quantized, or expert-kernel backends.
 - Dense checkpoint: <https://huggingface.co/robbyant/lingbot-video-dense-1.3b>
 - MoE checkpoint: <https://huggingface.co/robbyant/lingbot-video-moe-30b-a3b>
 - Upstream project: <https://github.com/Robbyant/lingbot-video>
-- Related offline example: [`examples/offline_inference/text_to_video/text_to_video_lingbot.py`](../../examples/offline_inference/text_to_video/text_to_video_lingbot.py)
+- Related offline example: [`examples/offline_inference/text_to_video/text_to_video.py`](../../examples/offline_inference/text_to_video/text_to_video.py)
 - Related online video API docs: [`docs/serving/videos_api.md`](../../docs/serving/videos_api.md)
 
 ## Hardware Support
@@ -52,7 +52,7 @@ The MoE path is validated with BF16 expert weights.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
+python examples/offline_inference/text_to_video/text_to_video.py \
   --model robbyant/lingbot-video-dense-1.3b \
   --prompt "a robotic arm picks up a red block" \
   --output lingbot_t2v.mp4 \
@@ -70,7 +70,7 @@ python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-python examples/offline_inference/text_to_video/text_to_video_lingbot.py \
+python examples/offline_inference/text_to_video/text_to_video.py \
   --model robbyant/lingbot-video-moe-30b-a3b \
   --prompt "a robotic arm picks up a red block" \
   --output lingbot_moe_t2v.mp4 \

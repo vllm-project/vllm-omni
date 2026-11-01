@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import copy
 from dataclasses import MISSING, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter
+from transformers import PretrainedConfig
 from vllm.config import ModelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -16,6 +21,8 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 import vllm_omni.model_executor.models as me_models
 
 logger = init_logger(__name__)
+
+_QWEN3_TTS_TASK_TYPES = frozenset({"CustomVoice", "VoiceDesign", "Base"})
 
 
 class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
@@ -91,6 +98,7 @@ class OmniModelConfig(ModelConfig):
          hf_text_config: The sub text_config of the model's hf_config (default: None)
          stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
          async_chunk: If set to True, perform async chunk
+         session_mode: Request lifecycle mode, either turn-based or duplex
          model_stage: Stage type identifier, e.g., "thinker" or "talker"
              (default: "thinker")
          model_arch: Model architecture name
@@ -98,11 +106,11 @@ class OmniModelConfig(ModelConfig):
          worker_type: Model Type, e.g., "ar" or "generation"
          engine_output_type: Optional output type specification for the engine.
              Used to route outputs to appropriate processors (e.g., "image",
-             "audio", "latents"). If None, output type is inferred.
+             "audio", "latent", "token_ids"). If None, output type is inferred.
          stage_connector_config: Stage connector configuration dictionary.
              Contains "name" (connector name), "extra" (extra connector config).
-         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
-             If not specified, will be inferred from model path.
+         task_type: Model-defined startup task type. Each model validates its
+             supported values and applies the corresponding behavior.
 
 
     The correct way to initialize this class is via vLLM config, as most
@@ -118,13 +126,27 @@ class OmniModelConfig(ModelConfig):
     """
 
     stage_id: int = 0
+    # Match the upstream derived field while its value is replaced per stage.
+    hf_text_config: PretrainedConfig = field(init=False)
     async_chunk: bool = False
+    session_mode: str = "turn"
+    retains_state_across_chunks: bool = False
+    supports_pending_generation: bool = False
+    supports_running_prefix_cache_reset: bool = True
+    recompute_preemption: Literal["allow", "fail"] = "allow"
+    use_v2_model_runner: bool = False
+    supports_native_mrv2_data_plane: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
+    duplex_max_sessions: int = 1
     model_stage: str = "thinker"
     model_arch: str | None = None
     worker_type: str | None = None
     engine_output_type: str | None = None
+    # Optional dotted path of a per-stage pooling-output decoder applied
+    # worker-side before IPC. Read by the AR scheduler.
+    pooling_output_decoder: str | None = None
+    final_output: bool = False
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_config: dict[str, Any] = field(
@@ -134,11 +156,37 @@ class OmniModelConfig(ModelConfig):
         }
     )
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
     omni_kv_config: dict | None = None
     codec_frame_rate_hz: float | None = None
     task_type: str | None = None
     enable_sleep_mode: bool = False
     has_sampling_extra_args: bool = False
+    # Key names (not values) of the stage's default sampling ``extra_args``.
+    # Engine-core code runs before any request arrives, so this is the only
+    # place it can learn which request-shaping conventions a stage uses (e.g.
+    # ``cfg_role`` for classifier-free-guidance request pairs).
+    sampling_extra_args_keys: tuple[str, ...] = ()
+    requires_full_payload_input: bool = False
+    scheduling_metadata_adapter: str | None = None
+
+    def compute_hash(self) -> str:
+        """Compute the hash for the Omni Model config to be used for the compile cache."""
+        from vllm_omni.distributed.omni_connectors.utils.config import connector_hash_factors
+
+        # Remove hash factors on a copy of the object, then use the mutated copy to get the hash.
+        # This is a workaround to vLLM's ModelConfig not having a clean way of changing its config
+        # factors. See: https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/config/model.py#L434
+        hashed = copy.copy(self)
+
+        # connector config are handled here to ensure UUIDs don't cause compile cache misses
+        hashed.stage_connector_config = connector_hash_factors(self.stage_connector_config)
+        if self.omni_kv_config and self.omni_kv_config.get("connector_config"):
+            # Create a copy of the omni kv config dict, since the hashed object is a shallow copy
+            hashed.omni_kv_config = dict(self.omni_kv_config)
+            hashed.omni_kv_config["connector_config"] = connector_hash_factors(self.omni_kv_config["connector_config"])
+
+        return super(OmniModelConfig, hashed).compute_hash()
 
     @property
     def registry(self):
@@ -146,7 +194,10 @@ class OmniModelConfig(ModelConfig):
 
     @property
     def architectures(self) -> list[str]:
-        if self.model_arch is not None:
+        # Falsy (None or "") means "no stage override": fall back to the
+        # checkpoint config's own architectures. The stage-config builder
+        # emits None; "" is tolerated for legacy callers.
+        if self.model_arch:
             return [self.model_arch]
         return super().architectures
 
@@ -171,6 +222,14 @@ class OmniModelConfig(ModelConfig):
                 return override
         return super().embedding_size
 
+    def get_inputs_embeds_size(self) -> int:
+        if self.hf_config_name is not None:
+            stage_config = getattr(self.hf_config, self.hf_config_name, None)
+            override = getattr(stage_config, "embedding_size", None)
+            if override is not None:
+                return override
+        return super().get_inputs_embeds_size()
+
     def get_model_arch_config(self):
         # For multi-stage omni models, use a stage-aware convertor so that
         # only the correct stage's quantization config is surfaced.
@@ -185,7 +244,7 @@ class OmniModelConfig(ModelConfig):
             return convertor.convert()
         return super().get_model_arch_config()
 
-    def draw_hf_text_config(self):
+    def draw_hf_text_config(self) -> PretrainedConfig:
         # transformers' get_text_config method is used to get the text config from thinker_config.
         # to handle the case that each model stage has their own text config,
         # we need to draw the text config from the corresponding model stage.
@@ -202,6 +261,14 @@ class OmniModelConfig(ModelConfig):
                 "falling back to default get_hf_text_config"
             )
             return get_hf_text_config(self.hf_config)
+
+    def _validate_startup_task_type(self) -> None:
+        """Validate startup-only task selectors owned by an AR model."""
+        if self.model_arch != "Qwen3TTSTalkerForConditionalGenerationARVLLM" or self.task_type is None:
+            return
+        if self.task_type not in _QWEN3_TTS_TASK_TYPES:
+            supported = ", ".join(sorted(_QWEN3_TTS_TASK_TYPES))
+            raise ValueError(f"Qwen3-TTS --task-type must be one of {supported}; got {self.task_type!r}")
 
     def _patch_qwen3_tts(self):
         """Patches the value of `position_id_per_seconds` in Qwen3's
@@ -270,6 +337,7 @@ class OmniModelConfig(ModelConfig):
             omni_cfg._patch_qwen3_tts()
 
         omni_cfg._maybe_override_text_config()
+        omni_cfg._validate_startup_task_type()
 
         if omni_cfg.hf_config is not None:
             omni_cfg.hf_config.architectures = omni_cfg.architectures

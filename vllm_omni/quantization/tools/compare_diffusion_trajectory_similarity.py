@@ -259,17 +259,14 @@ def _extract_inner_output(outputs: Any) -> Any:
         if len(outputs) != 1:
             raise ValueError(f"Expected one request output, got {len(outputs)}.")
         outputs = outputs[0]
-    inner = getattr(outputs, "request_output", None)
+    inner = outputs
     if inner is not None:
         return inner
     return outputs
 
 
 def _request_peak_memory_mb(result: Any) -> float | None:
-    diffusion_output = getattr(result, "request_output", None)
-    peak_memory_mb = getattr(diffusion_output, "peak_memory_mb", None)
-    if peak_memory_mb is None:
-        peak_memory_mb = getattr(result, "peak_memory_mb", None)
+    peak_memory_mb = getattr(result, "peak_memory_mb", None)
     if peak_memory_mb is None:
         return None
     return float(peak_memory_mb)

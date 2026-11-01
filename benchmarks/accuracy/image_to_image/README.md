@@ -16,9 +16,9 @@ What changed:
   `/v1/images/edits` endpoint to produce benchmark outputs in the expected
   directory structure.
 - The evaluator keeps the same VIEScore-style decomposition:
-  - `semantics_score`
-  - `quality_score`
-  - `overall_score = sqrt(semantics_score * quality_score)`
+    - `semantics_score`
+    - `quality_score`
+    - `overall_score = sqrt(semantics_score * quality_score)`
 - Judge calls are routed to a local OpenAI-compatible model served by
   `vllm-omni`, not a remote provider.
 

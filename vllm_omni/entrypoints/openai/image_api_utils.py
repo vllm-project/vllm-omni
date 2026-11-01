@@ -1,11 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-Shared helper utilities for OpenAI-compatible image generation API.
+Shared media utilities for OpenAI-compatible image APIs.
 
-This module provides common helper functions for the image generation endpoint.
-All functions work with plain Python types to maintain separation from the
-FastAPI HTTP layer.
+PUT HERE:
+  - Pure media helpers with no FastAPI Request / app-state / job semantics:
+    size parsing, image encode/base64, layered-layer validation.
+
+DO NOT PUT HERE:
+  - ``/v1/images*`` request/engine/job helpers — those go in ``images.helpers``.
+
+LONGEVITY:
+  - This root utils file is a **temporary shared home**.
+  - TODO(#5227, P1.2): tidy up / absorb into the images family (e.g. ``images/media.py``
+    or equivalent) in the P1.2 image modality PR; do not treat this file as the
+    long-term owner.
+  - ``images.helpers`` is the longer home for endpoint-specific logic through
+    P0.2/P0.3 until P1.2 further splits it.
+
+See ``openai/README.md`` and ``images/README.md`` (utils vs helpers, no overlap).
 """
 
 import base64
@@ -101,13 +114,14 @@ def encode_image_base64_with_compression(
     """
     buffer = io.BytesIO()
     image = prepare_image_for_output_format(image, format)
+    pil_format = "jpeg" if format == "jpg" else format
     save_kwargs = {}
     if format in ("jpg", "jpeg", "webp"):
         save_kwargs["quality"] = output_compression
     elif format == "png":
         save_kwargs["compress_level"] = max(0, min(9, 9 - output_compression // 11))
 
-    image.save(buffer, format=format, **save_kwargs)
+    image.save(buffer, format=pil_format, **save_kwargs)
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode("utf-8")
 

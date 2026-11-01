@@ -1,20 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 import os
-import re
 import subprocess
 import threading
-import time
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tests.dfx.reliability.helpers import list_remote_process_pids_by_pattern, post_chat_completions_raw
-from tests.helpers.mark import hardware_marks
+from tests.helpers.hardware import _safe_filename_token, hardware_json_value
+from tests.helpers.hardware import get_runtime_resource_label as get_runtime_resource_label
+from tests.helpers.mark import get_hardware_mark_list, hardware_marks
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
-from vllm_omni.platforms import current_omni_platform
 
 
 def _named_pytest_marks(names: list[str]) -> list[pytest.MarkDecorator]:
@@ -86,17 +88,20 @@ def resolve_pytest_marks(mark_field: Any) -> list[pytest.MarkDecorator]:
     raise ValueError(f"mark must be a list; got {type(mark_field).__name__}")
 
 
-def _mark_names(mark_field: Any) -> set[str]:
-    if isinstance(mark_field, list):
-        return {str(item) for item in mark_field if isinstance(item, str)}
-    return set()
-
-
 def is_diffusion_perf_config(cfg: dict[str, Any]) -> bool:
-    """True for perf JSON cases intended for ``run_diffusion_benchmark.py``."""
-    if cfg.get("server_type") is not None:
-        return True
-    return "diffusion" in _mark_names(cfg.get("mark"))
+    """True for perf JSON cases intended for ``run_diffusion_benchmark.py``.
+
+    Schema split (not marks / endpoints):
+
+    - ``benchmark_params[].dataset`` → diffusion client (``run_diffusion_benchmark.py``)
+    - ``benchmark_params[].dataset_name`` → ``vllm bench serve --omni`` (``run_benchmark.py``)
+    """
+    for params in cfg.get("benchmark_params") or []:
+        if not isinstance(params, dict):
+            continue
+        if "dataset" in params and "dataset_name" not in params:
+            return True
+    return False
 
 
 def _marks_by_test_name(configs: list[dict[str, Any]]) -> dict[str, list[pytest.MarkDecorator]]:
@@ -107,7 +112,7 @@ def create_unique_server_pytest_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
 ) -> list[Any]:
-    """Like :func:`create_unique_server_params`, but wrap each row in ``pytest.param`` with JSON marks."""
+    """Like :func:`_create_unique_server_params`, but wrap each row in ``pytest.param`` with JSON marks."""
     marks_by_name = _marks_by_test_name(configs)
     return [
         pytest.param(
@@ -115,34 +120,8 @@ def create_unique_server_pytest_params(
             marks=marks_by_name.get(row[0], []),
             id=row[0],
         )
-        for row in create_unique_server_params(configs, stage_configs_dir)
+        for row in _create_unique_server_params(configs, stage_configs_dir)
     ]
-
-
-def create_benchmark_pytest_params(
-    benchmark_configs: list[dict[str, Any]],
-    server_to_benchmark_mapping: dict[str, dict],
-) -> list[Any]:
-    """Like :func:`create_benchmark_indices`, but wrap each index in ``pytest.param`` with JSON marks."""
-    marks_by_name = _marks_by_test_name(benchmark_configs)
-    params: list[Any] = []
-    seen: set[str] = set()
-    for config in benchmark_configs:
-        test_name = config["test_name"]
-        if test_name in seen:
-            continue
-        seen.add(test_name)
-        params_list = get_benchmark_params_for_server(test_name, server_to_benchmark_mapping)
-        id_suffixes = _unique_benchmark_param_id_suffixes(params_list)
-        for idx, id_suffix in enumerate(id_suffixes):
-            params.append(
-                pytest.param(
-                    (test_name, idx),
-                    marks=marks_by_name.get(test_name, []),
-                    id=f"{test_name}-{id_suffix}",
-                )
-            )
-    return params
 
 
 def create_paired_benchmark_pytest_params(
@@ -178,7 +157,7 @@ def create_paired_omni_benchmark_pytest_params(
     """Paired params for ``run_benchmark.py`` (omni/tts)."""
     mapping = create_test_parameter_mapping(configs)
     marks_by_name = _marks_by_test_name(configs)
-    server_entries = [(row, row[0]) for row in create_unique_server_params(configs, stage_configs_dir)]
+    server_entries = [(row, row[0]) for row in _create_unique_server_params(configs, stage_configs_dir)]
     params_by_test_name = {
         test_name: get_benchmark_params_for_server(test_name, mapping) for _, test_name in server_entries
     }
@@ -260,7 +239,7 @@ def _build_serve_args(serve_args: Any) -> list[str]:
     return args
 
 
-def create_unique_server_params(
+def _create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
 ) -> list[tuple[str, str, str | None, str | None, tuple[str, ...], bool]]:
@@ -314,17 +293,6 @@ def create_unique_server_params(
     return unique_params
 
 
-def configs_with_platform_stage_configs(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Resolve stage config for XPU vs CUDA/ROCm."""
-    out: list[dict[str, Any]] = []
-    for config in configs:
-        config_copy = json.loads(json.dumps(config))
-        if current_omni_platform.is_xpu():
-            config_copy["server_params"]["stage_config_name"] = "xpu/qwen3_omni_ci.yaml"
-        out.append(config_copy)
-    return out
-
-
 def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str, list[str] | None]:
     mapping: dict[str, list[str] | None] = {}
     for cfg in configs:
@@ -338,9 +306,8 @@ def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str,
 def create_reliability_omni_server_params(
     configs: list[dict[str, Any]], stage_configs_dir: Path
 ) -> list[OmniServerParams]:
-    adjusted_configs = configs_with_platform_stage_configs(configs)
-    unique_params = create_unique_server_params(adjusted_configs, stage_configs_dir)
-    server_args_by_name = extract_server_args_by_test_name(adjusted_configs)
+    unique_params = _create_unique_server_params(configs, stage_configs_dir)
+    server_args_by_name = extract_server_args_by_test_name(configs)
     return [
         OmniServerParams(
             model=model,
@@ -357,25 +324,17 @@ def supports_video_generation(model_name: str) -> bool:
     return any(key in lower for key in ("wan", "video", "i2v", "t2v"))
 
 
-def supports_chat_generation(model_name: str) -> bool:
-    return not supports_video_generation(model_name)
-
-
 def parse_stage_devices(stage_config_path: str) -> str:
-    text = Path(stage_config_path).read_text(encoding="utf-8")
-    raw_devices: list[str] = re.findall(r"^\s*devices:\s*\"?([0-9,\s]+)\"?\s*$", text, flags=re.MULTILINE)
-    devices: set[int] = set()
-    for item in raw_devices:
-        for token in item.split(","):
-            token = token.strip()
-            if token:
-                devices.add(int(token))
-    if not devices:
-        raise ValueError(f"No runtime.devices found in stage config: {stage_config_path}")
-    return ",".join(str(x) for x in sorted(devices))
+    """Devices for the runtime platform, ignoring other ``platforms:`` blocks."""
+    from tests.dfx.reliability.helpers import stage_config_device_spec
+    from vllm_omni.platforms import current_omni_platform
+
+    device_name = current_omni_platform.device_name
+    platform = device_name.lower() if isinstance(device_name, str) and device_name.strip() else None
+    return stage_config_device_spec(stage_config_path, platform)
 
 
-def resolve_oom_device_spec(config: dict[str, Any], stage_config_path: str | None) -> str:
+def resolve_oom_device_spec(config: Mapping[str, Any], stage_config_path: str | None) -> str:
     explicit = config.get("device")
     if explicit is not None:
         return str(explicit)
@@ -387,48 +346,6 @@ def resolve_oom_device_spec(config: dict[str, Any], stage_config_path: str | Non
 def assert_fault_exception(exc: Exception, error_keywords: tuple[str, ...]) -> None:
     text = str(exc).lower()
     assert any(key in text for key in error_keywords), f"unexpected error under fault injection: {exc}"
-
-
-def wait_chat_request_ready(host: str, port: int, model: str, timeout_sec: int = 180) -> None:
-    """Poll a minimal chat request until success."""
-    deadline = time.time() + timeout_sec
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
-            "stream": False,
-            "modalities": ["text"],
-        }
-    )
-    last_error: str | None = None
-    while time.time() < deadline:
-        try:
-            status, body = post_chat_completions_raw(host, port, payload)
-            if status == 200:
-                return
-            last_error = f"http={status} body={body[:200]!r}"
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
-        time.sleep(2)
-    raise TimeoutError(f"runtime-teardown warmup request did not succeed within {timeout_sec}s: {last_error}")
-
-
-def assert_no_extra_worker_processes(
-    baseline_pids: set[int],
-    worker_pattern: str,
-    timeout_sec: int = 60,
-) -> None:
-    """Ensure no extra worker PIDs remain after teardown."""
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        current = set(list_remote_process_pids_by_pattern(worker_pattern))
-        extra = current - baseline_pids
-        if not extra:
-            return
-        time.sleep(2)
-    current = set(list_remote_process_pids_by_pattern(worker_pattern))
-    extra = sorted(current - baseline_pids)
-    assert not extra, f"orphan worker processes remain after container teardown: {extra}"
 
 
 def create_test_parameter_mapping(configs: list[dict[str, Any]]) -> dict[str, dict]:
@@ -475,16 +392,6 @@ def create_benchmark_indices(
 OMNI_RESULT_TEMPLATE_PATH = Path(__file__).resolve().parent / "perf" / "scripts" / "result_omni_template.json"
 
 
-def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
-    """Make a single path segment safe for result filenames on common filesystems."""
-    if value is None:
-        return default
-    s = str(value).strip()
-    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
-        s = s.replace(bad, "_")
-    return s if s else default
-
-
 def _benchmark_param_id_suffix(param: dict[str, Any], *, idx: int) -> str:
     """Derive a readable pytest id suffix from one ``benchmark_params`` entry."""
     name = param.get("name")
@@ -520,107 +427,10 @@ def _unique_benchmark_param_id_suffixes(params_list: list[dict[str, Any]]) -> li
     return unique
 
 
-def extract_mark_resource_label(mark_field: Any) -> str:
-    """Return a filename-safe hardware label from ``mark.hardware_marks.res`` values.
-
-    Example: ``{"cuda": "H100"}`` -> ``"H100"``; multiple platforms join with ``-``.
-
-    Prefer :func:`get_runtime_resource_label` for perf result filenames so labels
-    reflect the machine that actually ran the benchmark.
-    """
-    if isinstance(mark_field, list):
-        for item in mark_field:
-            if isinstance(item, dict) and "hardware_marks" in item:
-                return extract_mark_resource_label(item)
-        return "na"
-    if not isinstance(mark_field, dict):
-        return "na"
-    hw = mark_field.get("hardware_marks")
-    if not isinstance(hw, dict):
-        return "na"
-    res = hw.get("res")
-    if not isinstance(res, dict) or not res:
-        return "na"
-    labels = [_safe_filename_token(value) for value in res.values()]
-    return "-".join(labels) if labels else "na"
-
-
-_KNOWN_RUNTIME_RESOURCE_TOKENS: tuple[str, ...] = (
-    "H100",
-    "H800",
-    "H200",
-    "H20",
-    "L40S",
-    "L40",
-    "L4",
-    "A100",
-    "A800",
-    "A10G",
-    "A10",
-    "A30",
-    "MI325",
-    "MI300",
-    "MI250",
-    "B60",
-    "S5000",
-    "910B4",
-    "910B",
-    "910",
-    "310P",
-    "A2",
-    "A3",
-)
-_RUNTIME_RESOURCE_LABEL: str | None = None
-
-
-def _normalize_runtime_device_label(raw: str) -> str:
-    """Map a platform device name to a short filename-safe resource token."""
-    if not raw or not str(raw).strip():
-        return "na"
-    upper = str(raw).upper()
-    for token in _KNOWN_RUNTIME_RESOURCE_TOKENS:
-        if token.upper() in upper:
-            return _safe_filename_token(token)
-    compact = re.sub(r"[^a-zA-Z0-9]+", "", str(raw))
-    for prefix in ("NVIDIA", "AMD", "ASCEND", "HUAWEI"):
-        if compact.upper().startswith(prefix):
-            compact = compact[len(prefix) :]
-            break
-    return _safe_filename_token(compact[:48]) if compact else "na"
-
-
-def _read_runtime_device_name(*, device_id: int = 0) -> str | None:
-    """Device name from the active Omni platform."""
-    if current_omni_platform.device_count() <= device_id:
-        return None
-    get_name = getattr(current_omni_platform, "get_device_name", None)
-    if not callable(get_name):
-        return None
-    raw = get_name(device_id)
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    return None
-
-
-def get_runtime_resource_label(*, device_id: int = 0, refresh: bool = False) -> str:
-    """Return a filename-safe hardware label detected on the running machine."""
-    global _RUNTIME_RESOURCE_LABEL
-    if not refresh and _RUNTIME_RESOURCE_LABEL is not None:
-        return _RUNTIME_RESOURCE_LABEL
-    raw = _read_runtime_device_name(device_id=device_id)
-    label = _normalize_runtime_device_label(raw) if raw else "na"
-    if not refresh:
-        _RUNTIME_RESOURCE_LABEL = label
-    return label
-
+# ``get_runtime_resource_label`` and ``hardware_json_value`` live in
+# ``tests.helpers.hardware`` and are re-exported above.
 
 _FILENAME_OMIT_RESOURCE_LABELS = frozenset({"H100"})
-
-
-def hardware_json_value(resource_label: str | None) -> str:
-    """Hardware token stored in perf result JSON (empty when unknown)."""
-    token = _safe_filename_token(resource_label)
-    return "" if token == "na" else token
 
 
 def resource_label_for_filename(resource_label: str | None) -> str:
@@ -631,34 +441,41 @@ def resource_label_for_filename(resource_label: str | None) -> str:
     return token
 
 
-def extract_configs_resource_label(configs: list[dict[str, Any]]) -> str:
-    """Return runtime hardware label for perf result filenames."""
-    del configs
-    return get_runtime_resource_label()
+def is_hardware_nested_baseline(baseline: dict[str, Any]) -> bool:
+    """True for ``{"H100": {"metric": ...}, "A3": {...}}`` baselines.
+
+    Detection is structural + hardware-label allowlist (not metric-name hints):
+
+    - every top-level value is a non-empty dict (per-hardware metric map);
+    - every top-level key is in :func:`tests.helpers.mark.get_hardware_mark_list`
+      (``[hardware-resource]`` markers from ``pyproject.toml``).
+
+    Metric names under each hardware bucket are unconstrained.
+    Runtime device aliases (:data:`tests.helpers.hardware._RUNTIME_DEVICE_ALIASES`) are unrelated.
+    """
+    if not baseline:
+        return False
+    if not all(isinstance(value, dict) and bool(value) for value in baseline.values()):
+        return False
+    allowed = {label.upper() for label in get_hardware_mark_list()}
+    return all((token := str(key).strip()) and token.upper() in allowed for key in baseline.keys())
 
 
 def resolve_baseline_value(
     baseline_raw: Any,
     *,
     sweep_index: int | None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
 ) -> Any:
-    """Pick the baseline threshold for this sweep step."""
+    """Pick the baseline threshold for one metric at this sweep step.
+
+    Accepts a sweep-aligned list/tuple (indexed by ``sweep_index``) or a scalar.
+    """
     if baseline_raw is None:
-        return 100000
+        return None
     if isinstance(baseline_raw, dict):
-        if max_concurrency is not None:
-            for key in (max_concurrency, str(max_concurrency)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        if request_rate is not None:
-            for key in (request_rate, str(request_rate)):
-                if key in baseline_raw:
-                    return baseline_raw[key]
-        raise KeyError(
-            f"baseline dict has no key for max_concurrency={max_concurrency!r} "
-            f"or request_rate={request_rate!r}; keys={list(baseline_raw.keys())!r}"
+        raise TypeError(
+            "per-metric baseline dict keyed by concurrency/request-rate is not supported; "
+            "use a sweep-aligned list or a scalar under each hardware bucket"
         )
     if isinstance(baseline_raw, (list, tuple)):
         if sweep_index is None:
@@ -669,22 +486,62 @@ def resolve_baseline_value(
     return baseline_raw
 
 
-def _baseline_thresholds_for_step(
-    baseline_data: dict[str, Any],
+def resolve_baseline_for_sweep(
+    baseline_config: dict[str, Any] | None,
     *,
     sweep_index: int | None = None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
 ) -> dict[str, Any]:
-    """Resolve baseline config to one threshold per metric for this iteration."""
-    return {
-        metric_name: resolve_baseline_value(
-            baseline_raw,
-            sweep_index=sweep_index,
-            max_concurrency=max_concurrency,
-            request_rate=request_rate,
+    """Resolve sweep-dependent baselines while keeping every hardware bucket.
+
+    Expects hardware-nested input only::
+
+        {"H100": {"throughput_qps": [a, b, c]}, "A3": {"throughput_qps": [x, y, z]}}
+
+    with ``sweep_index=2`` (e.g. concurrency 32) becomes::
+
+        {"H100": {"throughput_qps": c}, "A3": {"throughput_qps": z}}
+
+    Per-metric values may be a sweep-aligned list or a scalar.
+    """
+    if not baseline_config:
+        return {}
+    if not is_hardware_nested_baseline(baseline_config):
+        allowed = sorted(get_hardware_mark_list())
+        unknown = [
+            str(key).strip()
+            for key in baseline_config.keys()
+            if str(key).strip().upper() not in {label.upper() for label in allowed}
+        ]
+        nested_shape = all(isinstance(value, dict) and bool(value) for value in baseline_config.values())
+        if nested_shape and unknown:
+            raise ValueError(
+                "baseline top-level keys must be [hardware-resource] pytest markers from "
+                "pyproject.toml (tool.pytest.ini_options.markers). "
+                f"Unknown hardware label(s): {unknown!r}. "
+                f"Known markers: {allowed!r}. "
+                "Add a marker such as '\"A100: [hardware-resource] Tests that require A100 GPU\"' "
+                "to pyproject.toml, then retry."
+            )
+        raise ValueError(
+            "baseline must be hardware-nested with [hardware-resource] marker names as "
+            "top-level keys, e.g. "
+            '{"H100": {"throughput_qps": [...]}, "A3": {"custom_metric": 1.0}}. '
+            f"got top-level keys={list(baseline_config.keys())!r}; "
+            f"known markers={allowed!r}. "
+            "If you need a new hardware bucket, add it to pyproject.toml markers with "
+            "the [hardware-resource] tag."
         )
-        for metric_name, baseline_raw in baseline_data.items()
+
+    return {
+        hardware: {
+            metric_name: resolve_baseline_value(
+                baseline_raw,
+                sweep_index=sweep_index,
+            )
+            for metric_name, baseline_raw in metrics.items()
+        }
+        for hardware, metrics in baseline_config.items()
+        if isinstance(metrics, dict)
     }
 
 
@@ -697,26 +554,54 @@ def run_benchmark(
     *,
     baseline_config: dict[str, Any] | None = None,
     sweep_index: int | None = None,
-    request_rate: Any | None = None,
-    max_concurrency: Any | None = None,
     random_input_len: Any | None = None,
     random_output_len: Any | None = None,
     resource_label: str | None = None,
+    num_warmups: int = 2,
+    benchmark_params_name: str | None = None,
+    accuracy_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
-    After ``vllm bench`` writes the JSON, ``result["baseline"]`` holds the resolved per-metric thresholds
-    (when ``baseline_config`` is provided). If the benchmark exits without writing a result file,
-    ``result_omni_template.json`` is used as a fallback.
+    After ``vllm bench`` writes the JSON, ``result["baseline"]`` stores the
+    sweep-resolved baseline (when ``baseline_config`` is provided). Hardware-nested
+    maps keep every hardware bucket, but each metric is reduced to the value for
+    this concurrency / request-rate step. If the benchmark exits without writing a
+    result file, ``result_omni_template.json`` is used as a fallback.
+
+    ``benchmark_params_name`` (the ``name`` field from ``benchmark_params``) is
+    persisted in the result JSON and filename so multiple generation configs
+    under one ``test_name`` stay distinguishable (e.g. Wan USP2 832x480 vs
+    1280x720).
     """
-    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+    started_at = datetime.now()
+    current_dt = started_at.strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
     ro = _safe_filename_token(random_output_len)
     hw = resource_label_for_filename(resource_label)
+    name_token = _safe_filename_token(benchmark_params_name) if benchmark_params_name else ""
+    if name_token == "na":
+        name_token = ""
+    name_parts = [f"result_{test_name}"]
     if hw:
-        result_filename = f"result_{test_name}_{hw}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
-    else:
-        result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
+        name_parts.append(hw)
+    if name_token:
+        name_parts.append(name_token)
+    name_parts.extend(
+        [
+            str(dataset_name),
+            str(flow),
+            str(num_prompt),
+            f"in{ri}",
+            f"out{ro}",
+            current_dt,
+        ]
+    )
+    result_filename = "_".join(name_parts) + ".json"
+    result_dir = os.environ.get("BENCHMARK_DIR", "tests/dfx/perf/results")
+    result_path = os.path.join(result_dir, result_filename)
+    # A failed CLI invocation must never reuse an earlier run's result.
+    Path(result_path).unlink(missing_ok=True)
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -724,10 +609,10 @@ def run_benchmark(
         + args
         + [
             "--num-warmups",
-            "2",
+            str(num_warmups),
             "--save-result",
             "--result-dir",
-            os.environ.get("BENCHMARK_DIR", "tests"),
+            result_dir,
             "--result-filename",
             result_filename,
         ]
@@ -752,7 +637,7 @@ def run_benchmark(
     stderr_thread.start()
     stdout_thread.join()
     stderr_thread.join()
-    process.wait()
+    returncode = process.wait()
 
     if "--result-dir" in command:
         index = command.index("--result-dir")
@@ -774,11 +659,10 @@ def run_benchmark(
             result = json.load(f)
 
     if baseline_config:
-        result["baseline"] = _baseline_thresholds_for_step(
+        # Keep every hardware bucket; resolve list metrics to this sweep step.
+        result["baseline"] = resolve_baseline_for_sweep(
             baseline_config,
             sweep_index=sweep_index,
-            request_rate=request_rate,
-            max_concurrency=max_concurrency,
         )
     else:
         result["baseline"] = {}
@@ -787,8 +671,62 @@ def run_benchmark(
     if random_output_len is not None:
         result["random_output_len"] = random_output_len
     result["Hardware"] = hardware_json_value(resource_label)
+    result["branch"] = os.environ.get("BUILDKITE_BRANCH", "")
+    result["test_name"] = test_name
+    if benchmark_params_name:
+        result["name"] = benchmark_params_name
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
+    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
+        from tests.e2e.accuracy.helpers import _acc_result_filename
+
+        def argument(name: str, default: str = "") -> str:
+            return args[args.index(name) + 1] if name in args else default
+
+        model_id = result.get("model_id") or argument("--model")
+        dataset = "omni_duplex_eval"
+        accuracy_dir = Path(os.environ.get("ACC_BENCH_RESULT_DIR", "tests/e2e/accuracy/omni_duplex_eval/results"))
+        accuracy_dir.mkdir(parents=True, exist_ok=True)
+        accuracy_path = accuracy_dir / _acc_result_filename(model_id, dataset, when=started_at)
+        # Persist before quality assertions, including partial or failed judging.
+        duplex = result.get("omni_duplex_eval")
+        accuracy = duplex.get("accuracy") if isinstance(duplex, dict) else None
+        if not isinstance(accuracy, dict):
+            accuracy = {"status": "failed", "error": "benchmark did not produce an accuracy result"}
+        accuracy_path.write_text(
+            json.dumps(
+                {
+                    "test_name": test_name,
+                    "name": benchmark_params_name,
+                    "model_id": model_id,
+                    "dataset": dataset,
+                    "dataset_path": argument("--dataset-path", dataset_name),
+                    "date": result.get("date") or current_dt,
+                    "Hardware": result["Hardware"],
+                    "baseline": accuracy_baseline or {},
+                    "branch": result["branch"],
+                    "num_prompts": num_prompt,
+                    "max_concurrency": int(argument("--max-concurrency")) if "--max-concurrency" in args else None,
+                    "benchmark_exit_code": returncode,
+                    "generation": {
+                        "completed": result.get("completed", 0),
+                        "failed": result.get("failed", 0),
+                        **({k: v for k, v in duplex.items() if k != "accuracy"} if isinstance(duplex, dict) else {}),
+                    },
+                    "accuracy": accuracy,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"Accuracy result saved to {accuracy_path}")
+        from vllm_omni.platforms import current_omni_platform
+
+        # Preserve the accuracy job's torch_npu shutdown exception while
+        # requiring complete artifacts and scores in the caller's assertions.
+        allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
+        assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
     return result
 
 

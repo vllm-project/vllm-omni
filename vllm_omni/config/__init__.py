@@ -1,8 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Configuration module for vLLM-Omni.
 """
 
-from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.lora import LoRAConfig
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.config.omni_config import (
@@ -22,7 +24,6 @@ from vllm_omni.config.omni_config import (
     VllmOmniGenerationStageConfig,
     VllmOmniOrchestratorConfig,
 )
-from vllm_omni.config.pipeline_registry import register_pipeline
 from vllm_omni.config.stage_config import (
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
@@ -35,12 +36,24 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.config.yaml_util import (
     create_config,
     load_yaml_config,
     merge_configs,
     to_dict,
 )
+
+# StageConfigFactory / register_pipeline pull pipeline_registry, which eagerly
+# imports PI0_PIPELINE → diffusion.data. Keep those lazy so
+# `from vllm_omni.config.lora import LoRAConfig` (used while data.py is still
+# loading) cannot close a circular import through DiffusionOutput.
+_LAZY_ATTRS = {
+    "OmniConfigResolution": ("vllm_omni.config.resolver", "OmniConfigResolution"),
+    "StageConfigFactory": ("vllm_omni.config.config_factory", "StageConfigFactory"),
+    "register_pipeline": ("vllm_omni.config.pipeline_registry", "register_pipeline"),
+    "resolve_omni_config": ("vllm_omni.config.resolver", "resolve_omni_config"),
+}
 
 __all__ = [
     # Legacy model-level configs.
@@ -53,6 +66,8 @@ __all__ = [
     "VllmOmniGenerationStageConfig",
     "VllmOmniDiffusionStageConfig",
     "StageConfigType",
+    "OmniConfigResolution",
+    "resolve_omni_config",
     # Structured Omni sub-configs.
     "OmniStageCacheConfig",
     "OmniStageConnectorConfig",
@@ -71,6 +86,7 @@ __all__ = [
     "StageConfigFactory",
     "StageDeployConfig",
     "StageType",
+    "WatermarkConfig",
     "StageExecutionType",
     "StagePipelineConfig",
     "load_deploy_config",
@@ -82,3 +98,19 @@ __all__ = [
     "merge_configs",
     "to_dict",
 ]
+
+
+def __getattr__(name: str):
+    spec = _LAZY_ATTRS.get(name)
+    if spec is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = spec
+    import importlib
+
+    value = getattr(importlib.import_module(module_name), attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(__all__) | set(globals()))

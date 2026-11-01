@@ -1,6 +1,9 @@
 # Text-To-Image
 
-This example demonstrates how to deploy Qwen-Image model for online image generation service using vLLM-Omni.
+This example demonstrates online text-to-image generation with vLLM-Omni. The
+startup script and Python clients default to Qwen-Image, but `MODEL` can select
+any supported text-to-image model. The existing curl helper remains a concrete
+Qwen-Image request through the standard Images API.
 
 ## Start Server
 
@@ -115,7 +118,23 @@ python gradio_demo.py
 
 ## LoRA
 
-This example supports Peft-compatible LoRA (Low-Rank Adaptation) adapters for diffusion models. The LoRA adapter path must be readable on the **server** machine (usually a local path or a mounted directory).
+This example supports both startup-time distilled LoRAs and request-time
+PEFT-compatible adapters. The LoRA path must be readable on the **server**
+machine (usually a local path or a mounted directory).
+
+### Start Server with a Distilled LoRA
+
+```bash
+vllm serve Qwen/Qwen-Image-2512 \
+  --omni \
+  --port 8091 \
+  --lora-backend distill \
+  --lora-path /path/to/Qwen-Image-2512-Lightning-4steps.safetensors
+```
+
+The distilled LoRA is fused once during server initialization and applies to
+every request. Use the checkpoint's few-step sampling settings, for example
+`num_inference_steps=4` and `true_cfg_scale=1.0`.
 
 ### Using Python Client with LoRA
 
@@ -226,8 +245,8 @@ count, use `size` and `n` rather than `height`, `width`, or
 | `height`                 | int   | None    | Image height in pixels         |
 | `width`                  | int   | None    | Image width in pixels          |
 | `size`                   | str   | None    | Image size (e.g., "1024x1024") |
-| `num_inference_steps`    | int   | 50      | Number of denoising steps      |
-| `true_cfg_scale`         | float | 4.0     | Qwen-Image CFG scale           |
+| `num_inference_steps`    | int   | model   | Number of denoising steps      |
+| `true_cfg_scale`         | float | model   | True CFG scale when supported  |
 | `seed`                   | int   | None    | Random seed (reproducible)     |
 | `negative_prompt`        | str   | None    | Negative prompt                |
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |

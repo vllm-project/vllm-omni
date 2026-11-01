@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2024 xDiT team.
 # Adapted from
 # https://github.com/xdit-project/xDiT/blob/main/xfuser/envs.py
@@ -12,6 +15,7 @@ if TYPE_CHECKING:
     MASTER_PORT: int | None = None
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
+    VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
@@ -25,6 +29,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
+    # Minimum rotary-table span (B*S positions) at which consumers of the shared
+    # fused_qk_norm_rope op take the fused path instead of their eager chain;
+    # "0" = always fuse; unset = each consumer's own measured default. Raw
+    # string or None; validated by fused_qk_norm_rope_min_tokens().
+    "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS": lambda: os.environ.get("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", None),
 }
 
 

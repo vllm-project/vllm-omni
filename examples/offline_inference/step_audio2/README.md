@@ -29,7 +29,7 @@ Step-Audio2 is a two-stage audio model:
 **Notes:**
 - Single GPU mode requires high VRAM due to both stages sharing memory
 - Multi GPU mode separates Stage 0 (Thinker) and Stage 1 (Token2Wav) across GPUs
-- VRAM usage can be adjusted via `gpu_memory_utilization` in stage config
+- VRAM usage can be adjusted via `gpu_memory_utilization` in the deploy config
 
 ## Performance Benchmark
 
@@ -197,11 +197,6 @@ This mode:
 ### Advanced Options
 
 ```bash
-# Use custom stage configuration
-python end2end.py --query-type audio_to_text \
-    --model stepfun-ai/Step-Audio-2-mini \
-    --stage-configs-path /path/to/custom_config.yaml
-
 # Use custom deploy configuration
 python end2end.py --query-type audio_to_text \
     --model stepfun-ai/Step-Audio-2-mini \

@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import time
 from collections.abc import Mapping
-from copy import copy, deepcopy
+from copy import copy
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -28,8 +31,8 @@ from vllm.v1.outputs import (
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerAttnMetadata
-from vllm.v1.worker.mamba_utils import preprocess_mamba
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -43,10 +46,17 @@ from vllm_ascend.worker.model_runner_v1 import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
+from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
+from vllm_omni.model_executor.models.interfaces import supports_multi_frame_decode
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
-from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+from vllm_omni.worker.omni_connector_model_runner_mixin import (
+    OmniConnectorModelRunnerMixin,
+    needs_omni_connector,
+)
+from vllm_omni.worker.sampling_utils import call_model_sampler, sanitize_min_tokens_stop_ids
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -99,11 +109,24 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
     multimodal_outputs: Any # Omni-Specific
+    # Omni: prefix-cache step id; its context must be consumed exactly
+    # once (materialize or discard_step) in sample_tokens.
+    prefix_cache_step_id: int | None = None
 
-class NPUARModelRunner(OmniNPUModelRunner):
+class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
 
+    # vllm-ascend's ascend-graph wrapper reads this flag from the runner, but
+    # the vllm-ascend build this image ships never sets it -- the static-shape
+    # capture path would raise AttributeError without a default here.
+    enable_hamming_sparse: bool = False
+
     def __init__(self, *args, **kwargs):
+        from vllm_omni.platforms.npu.attention import static_shape_decode
+
+        # Before parent init: vLLM's selector uses current_platform
+        # (vllm-ascend), not NPUOmniPlatform.get_attn_backend_cls.
+        static_shape_decode.install_into_ascend_backend()
         super().__init__(*args, **kwargs)
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
@@ -112,7 +135,214 @@ class NPUARModelRunner(OmniNPUModelRunner):
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
+        if needs_omni_connector(self.model_config):
+            self.init_omni_connectors(
+                model_config=self.model_config,
+                kv_transfer_manager=self.kv_transfer_manager,
+            )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._init_duplex_sampling_state()
+        #  -------------------------------------- Omni-new -------------------------------------------------
+
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
+        self._resolve_duplex_sampling_hook(force=True)
+
+    @contextlib.contextmanager
+    def _narrow_decode_query_len(self):
+        """One query row per decode graph, for the duration of the block.
+
+        Multi-frame replay reads one row of its graph, and a K-query replay costs
+        ~0.6 ms more than a one-query one. Without the multi-frame loop engaged
+        (``narrow_replay_enabled`` false) this is a no-op, so the wide capture
+        path stays exactly as before."""
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        saved = int(getattr(self, "uniform_decode_query_len", 1) or 1)
+        if saved <= 1 or not talker_multiframe.narrow_replay_enabled(self):
+            yield
+            return
+        logger.info("[minicpmo] the Talker's decode graphs are one query row wide, not %d", saved)
+        dispatcher = getattr(self, "cudagraph_dispatcher", None)
+        dispatcher_saved = getattr(dispatcher, "uniform_decode_query_len", None)
+        self.uniform_decode_query_len = 1
+        if dispatcher_saved is not None:
+            dispatcher.uniform_decode_query_len = 1
+        try:
+            yield
+        finally:
+            self.uniform_decode_query_len = saved
+            if dispatcher_saved is not None:
+                dispatcher.uniform_decode_query_len = dispatcher_saved
+
+    def _check_and_update_cudagraph_mode(self, *args, **kwargs):
+        """Register the dispatcher's decode keys one query row wide, not K."""
+        with self._narrow_decode_query_len():
+            return super()._check_and_update_cudagraph_mode(*args, **kwargs)
+
+    def _capture_cudagraphs(self, *args, **kwargs):
+        """Capture static-shape decode graphs per KV capacity bucket.
+
+        Each bucket needs its own pass: the default path leaves the capacity unset
+        and would file the graphs under a key decode never looks up. Signature is
+        fully forwarded ("*args/**kwargs") because the upstream parent takes an
+        extra ``profiler`` argument that this override must not swallow."""
+        from vllm.config import CUDAGraphMode
+
+        from vllm_omni.platforms.npu.attention import static_shape_decode
+
+        runtime_mode = kwargs.get("cudagraph_runtime_mode")
+        if runtime_mode is None and len(args) >= 2:
+            runtime_mode = args[1]
+        buckets: tuple[int, ...] = ()
+        if runtime_mode == CUDAGraphMode.FULL:
+            buckets = static_shape_decode.buckets_for(
+                static_shape_decode.capacity_for(
+                    self.vllm_config.model_config.max_model_len,
+                    self.vllm_config.cache_config.block_size,
+                ),
+                self.vllm_config.cache_config.block_size,
+            )
+        if not buckets:
+            return super()._capture_cudagraphs(*args, **kwargs)
+        with self._narrow_decode_query_len():
+            for capacity in sorted(buckets, reverse=True):
+                logger.info("[minicpmo] capturing static-shape decode graphs at kv_capacity=%d", capacity)
+                with static_shape_decode.capturing_bucket(capacity):
+                    super()._capture_cudagraphs(*args, **kwargs)
+
+    def propose_draft_token_ids(self, valid_sampled_token_ids, *args, **kwargs):
+        """Carry the Talker's frame count to the scheduler, not a prediction.
+
+        Stage 1 declares a speculative_config so that vLLM knows the request
+        advances by K tokens per step -- that is what grows the block table and
+        reserves the KV slots `talker_multiframe` writes into. The drafter
+        itself has nothing to say: the Talker's vLLM-level vocabulary is
+        `continue` and `stop`, the frames are generated sequentially inside one
+        `execute_model`, and the model's own stop row is what ends the request.
+        So the draft is `continue` repeated, and the rejection sampler accepts
+        it exactly up to the frame the codec sequence ended on.
+
+        The frame count comes from `drafts_this_step`, which reads the runner's
+        own `num_spec_tokens` -- the value vLLM derives from the deploy
+        config's speculative_config. Reading it off the model instead would
+        depend on wrappers we do not control.
+
+        NOTE: the NPU draft call site passes ``sampled_token_ids`` first
+        (vllm-ascend ``NPUModelRunner.propose_draft_token_ids``); the upstream
+        GPU signature has ``scheduler_output`` first instead.
+        """
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        frames = talker_multiframe.drafts_this_step(self)
+        if frames > 1:
+            # How many draft positions each request actually ran with in this
+            # step -- the scheduler's own account, and the only reliable way to
+            # tell a truncated K-frame row apart from an ordinary one-token
+            # result (prefill, or a step the loop intentionally sat out). The
+            # vllm-ascend call site passes (sampling_metadata, scheduler_output,
+            # spec_decode_metadata, ...) positionally after the sampled ids.
+            scheduler_output = next((a for a in args if hasattr(a, "scheduled_spec_decode_tokens")), None)
+            scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+            req_ids = list(getattr(self.input_batch, "req_ids", []) or [])
+            scheduled_draft_counts = [len(scheduled.get(req_id, ())) for req_id in req_ids[: self.input_batch.num_reqs]]
+            # Fold a short row only on a request that has already run the
+            # multi-frame loop, tracked per-request in `_kstep_drafted_reqs`.
+            # A cold-start row -- length 1, the request never multi-frame --
+            # must draft or the K-step deadlocks on "no drafts emitted"; a
+            # short row on a *live* multi-frame request is a codec stop fired
+            # mid-span and must fold, or the step that re-drafts it walks the
+            # dead speaker through frames that no longer belong to its audio.
+            # One batch can mix both kinds of row, which is why the flag is
+            # per-request history and not a batch-level toggle: a batch flag
+            # either deadlocks the cold start or re-drafts a live short row
+            # the step after a fold (observed 09-30: spans 4,5,5,5,6 refused
+            # as non-uniform right after a fold cleared the flag).
+            drafted_reqs = getattr(self, "_kstep_drafted_reqs", None)
+            if drafted_reqs is None:
+                drafted_reqs = self._kstep_drafted_reqs = set()
+            # A finished request leaves req_ids; drop it here. Without this a
+            # stop-truncated step would leave its request in the set forever,
+            # but re-drafting is deferred only while live short rows remain,
+            # so the non-uniform raise stays unreachable.
+            drafted_reqs.intersection_update(req_ids)
+            rows = valid_sampled_token_ids if isinstance(valid_sampled_token_ids, list) else []
+            has_live_short_row = any(
+                count > 0
+                and isinstance(row, list)
+                and len(row) < frames
+                and req_id in drafted_reqs
+                for count, row, req_id in zip(scheduled_draft_counts, rows, req_ids)
+            )
+            if not isinstance(valid_sampled_token_ids, list):
+                # The padded-drafter branch passes the verify output tensor;
+                # `constant_drafts` can only read list rows, so if we ever
+                # get here the K-step silently degrades to single frames
+                # every step. Name the branch so the first scene is the last.
+                logger.error(
+                    "[kstep] propose received %s (expected list); "
+                    "constant_drafts will emit no drafts this step "
+                    "(use_ngram_gpu=%s, padded_drafter_disabled=%s)",
+                    type(valid_sampled_token_ids).__name__,
+                    self.speculative_config.use_ngram_gpu()
+                    if self.speculative_config is not None
+                    else None,
+                    self.speculative_config.disable_padded_drafter_batch
+                    if self.speculative_config is not None
+                    else None,
+                )
+            drafts = talker_multiframe.constant_drafts(
+                valid_sampled_token_ids,
+                frames,
+                self.input_batch.num_reqs,
+                scheduled_draft_counts,
+                fold_short_rows=has_live_short_row,
+            )
+            if any(drafts):
+                # This batch just booked a multi-frame step: every request in
+                # it has now run multi-frame, so a later short row on any of
+                # them must fold until it drains (see the note above).
+                drafted_reqs.update(req_ids)
+            if not any(drafts):
+                # An all-empty batch is the fold, not a fault. `constant_drafts`
+                # returns empty for three expected reasons -- a request that
+                # sampled nothing, a *live* multi-frame request whose codec stop
+                # fired mid-span, or a batch mixing drafted with undrafted rows
+                # -- and each of those names itself once at INFO through
+                # `_log_fold_once`. The one genuine degradation, the
+                # padded-drafter tensor path, names itself above. What is left
+                # here is the per-step dump of WHICH row folded and at what
+                # shape, so it rides at debug: it fires on every folded step,
+                # so the description is only built when debug is on.
+                # Type-safe throughout: the padded-drafter branch passes a
+                # tensor, and `tensor or []` raises the ambiguous-truth error.
+                if logger.isEnabledFor(logging.DEBUG):
+                    if isinstance(valid_sampled_token_ids, list):
+                        rows = valid_sampled_token_ids
+                        _desc = (
+                            f"rows={len(rows)}"
+                            f" types={[type(r).__name__ for r in rows[:8]]}"
+                            f" lens={[len(r) for r in rows[:8] if isinstance(r, list)]}"
+                            f" scheduled={scheduled_draft_counts[:8]}"
+                            f" head={repr(rows)[:400]}"
+                        )
+                    else:
+                        seen = valid_sampled_token_ids
+                        shape = tuple(seen.shape) if hasattr(seen, "shape") else "?"
+                        _desc = f"rows=<{type(seen).__name__} shape={shape}>"
+                    logger.debug(
+                        "[kstep] no drafts emitted: frames=%s num_reqs=%s %s",
+                        frames,
+                        self.input_batch.num_reqs,
+                        _desc,
+                    )
+            return drafts
+        return super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)
+
+    def _update_states(self, scheduler_output: SchedulerOutput):
+        deferred_state_corrections_fn = super()._update_states(scheduler_output)
+        self._update_duplex_sampling_states(scheduler_output)
+        return deferred_state_corrections_fn
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -129,6 +359,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
     #  -------------------------------------- Omni-new -------------------------------------------------
     def capture_model(self) -> int:
+        # num_spec_tokens comes from the deploy config's speculative_config,
+        # which vLLM applies when the runner is built.
         npugraph_memory_bytes = super().capture_model()
         self._capture_talker_mtp_graphs()
         return npugraph_memory_bytes
@@ -153,6 +385,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         num_scheduled_tokens_np=np.ones(bsz, dtype=np.int32),
                         max_num_scheduled_tokens=1,
                         use_cascade_attn=False,
+                        force_uniform_decode=True,
                     )
                     n = batch_desc.num_tokens
                     ids = self.talker_mtp_input_ids.gpu[:n]
@@ -185,57 +418,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
             ) from e
         finally:
             set_cudagraph_capturing_enabled(False)
-
-    def _model_needs_full_prefix_hidden_states(self) -> bool:
-        """See gpu_ar_model_runner._model_needs_full_prefix_hidden_states."""
-        model = getattr(self, "model", None)
-        return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
-
-    def _maybe_update_prefix_cache(
-        self,
-        hidden_states: torch.Tensor,
-        multimodal_outputs: dict,
-        num_tokens_unpadded: int,
-        num_tokens_padded: int,
-    ):
-        if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-            if multimodal_outputs is not None and not isinstance(multimodal_outputs, Mapping):
-                logger.warning_once(
-                    "prefix caching expects mm outputs to be a dict, but got %s",
-                    type(multimodal_outputs),
-                )
-
-            hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
-            self.omni_prefix_cache.update_omni_tensor_prefix_cache(
-                hidden_states=hs_for_cache,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
-                num_tokens_padded=num_tokens_padded,
-            )
-
-    def _maybe_get_combined_prefix_cache_tensors(
-        self,
-        hidden_states: torch.Tensor,
-        multimodal_outputs: dict,
-        num_scheduled_tokens: dict[str, int],
-    ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
-        combined_hidden_states, combined_multimodal_outputs = None, None
-        if self.omni_prefix_cache is not None:
-            if self._model_needs_full_prefix_hidden_states():
-                combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
-                    query_start_loc=self.query_start_loc.cpu,
-                    input_batch=self.input_batch,
-                    hidden_states=hidden_states,
-                    num_scheduled_tokens=num_scheduled_tokens,
-                )
-            combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
-                query_start_loc=self.query_start_loc.cpu,
-                input_batch=self.input_batch,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
-                num_scheduled_tokens=num_scheduled_tokens,
-            )
-        return combined_hidden_states, combined_multimodal_outputs
 
     @staticmethod
     def _resolve_req_hidden_states(
@@ -279,6 +461,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
         if not isinstance(info, dict):
             return None
         val = info.get("omni_final_stage_id")
+        if val is None:
+            return None
         try:
             return int(val)
         except (TypeError, ValueError):
@@ -336,13 +520,13 @@ class NPUARModelRunner(OmniNPUModelRunner):
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
-        if self.vllm_config.model_config.enable_return_routed_experts:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
-                capturer.finalize_pending_copy()
-        if self.ascend_config.profiling_chunk_config.enabled:
-            self._sync_device()
-            self._execution_start_time = time.perf_counter()
+        profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
+        if profiling_chunk_config.enabled and profiling_chunk_config.need_timing:
+            if getattr(scheduler_output, "disable_profiling_timing", False):
+                profiling_chunk_config.need_timing = False
+            else:
+                self._sync_device()
+                self._execution_start_time = time.perf_counter()
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
@@ -380,36 +564,36 @@ class NPUARModelRunner(OmniNPUModelRunner):
             request_id_resolver=self._resolve_global_request_id,
         )
         #  -------------------------------------- Omni-new -------------------------------------------------
-        # self._draft_token_ids is None when `input_fits_in_drafter=False`
-        # and there is no draft tokens scheduled. so it need to update the
-        # spec_decoding info in scheduler_output with async_scheduling.
-        # use deepcopy to avoid the modification has influence on the
-        # scheduler_output in engine core process.
-        # TODO(Ronald1995): deepcopy is expensive when there is a large
-        # number of requests, optimize it later.
-        if ((
-            self.use_async_scheduling
-            and self.num_spec_tokens
-            and self._draft_token_ids is None  # type: ignore[has-type]
-        ) or (
-            # NOTE: This branch specifically triggers a deepcopy during the prefill phase
-            # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios.
-            # It does not affect other use cases. This is a temporary workaround and
-            # will be removed once upstream vLLM provides native support for PCP + MM.
-            self.pcp_size > 1
-            and self.supports_mm_inputs
-            and get_pp_group().is_first_rank
-            and not self.model_config.is_encoder_decoder
-        )):
-            scheduler_output = deepcopy(scheduler_output)
+        if hasattr(self, "_omni_connector"):
+            for request in getattr(scheduler_output, "pending_input_registrations", []):
+                self.register_chunk_recv(request)
+            self.recv_full_payload_inputs(scheduler_output)
+            if self._pending_full_payload_send:
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
+
+        # Exactly once per real scheduler_output, before _update_states.
+        self._prefix_cache_step_begin(scheduler_output)
 
         #  -------------------------------------- Omni-new -------------------------------------------------
+        if self.speculative_config is not None and self.speculative_config.use_ngram_gpu():
+            num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
+            spec_decode_tokens_copy = scheduler_output.scheduled_spec_decode_tokens.copy()
+            scheduler_output = replace(
+                scheduler_output,
+                num_scheduled_tokens=num_scheduled_tokens_copy,
+                scheduled_spec_decode_tokens=spec_decode_tokens_copy,
+            )
+
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             if kv_connector_metadata is not None:
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
         #  -------------------------------------- Omni-new -------------------------------------------------
 
+        self._begin_omni_aux_output_step(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
@@ -422,6 +606,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 #  -------------------------------------- Omni-new -------------------------------------------------
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
+                    self._start_dump_data(scheduled_tokens=scheduler_output.num_scheduled_tokens)
                     with self.maybe_get_ec_connector_output(
                         scheduler_output,
                         encoder_cache=self.encoder_cache,
@@ -431,13 +616,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         kv_ids = self.kv_extracted_req_ids
                         self.kv_extracted_req_ids = None
 
+                        self._finalize_dump_data()
                         output = make_empty_encoder_model_runner_output(scheduler_output)
                         if kv_ids:
                             output = copy(output)
                             output.kv_extracted_req_ids = kv_ids
-                        return output
+                        return self.attach_omni_connector_output(output)
 
-                if not num_scheduled_tokens:
+                # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
+                if num_scheduled_tokens <= 0:
                     if (
                         self.parallel_config.distributed_executor_backend == "external_launcher"
                         and self.parallel_config.data_parallel_size > 1
@@ -448,7 +635,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         # returns True. before returning early here we call
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
-                        self._dummy_run(1)
+                        self._dummy_run(1, skip_gdn_state_update=True)
 
                     kv_ids = self.kv_extracted_req_ids
                     self.kv_extracted_req_ids = None
@@ -462,7 +649,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         output = copy(output)
                         output.kv_extracted_req_ids = kv_ids
 
-                    return output
+                    return self.attach_omni_connector_output(output)
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.num_prompt_logprobs, (
                         "--kv-sharing-fast-prefill produces incorrect "
@@ -470,6 +657,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         "it when the requests need prompt logprobs"
                     )
 
+                self._start_dump_data(scheduled_tokens=scheduler_output.num_scheduled_tokens)
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
@@ -486,8 +674,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 )
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
-                if self.pcp_size > 1:
-                    num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
                 if self.cascade_attn_enabled and not self.parallel_config.enable_dbo:
@@ -514,14 +700,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
-                logger.debug(
-                    "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
-                    "should_ubatch: %s, num_tokens_across_dp: %s",
-                    cudagraph_mode,
-                    batch_desc,
-                    should_ubatch,
-                    num_tokens_across_dp,
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
+                        "should_ubatch: %s, num_tokens_across_dp: %s",
+                        cudagraph_mode,
+                        batch_desc,
+                        should_ubatch,
+                        num_tokens_across_dp,
+                    )
 
                 num_tokens_padded = batch_desc.num_tokens
                 num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
@@ -532,6 +719,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     num_reqs_padded,
                     self.parallel_config.num_ubatches,
                 )
+
+                if self.dynamic_eplb:
+                    self.update_eplb_heat_collection_status(num_tokens_padded)
 
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
@@ -546,7 +736,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()
                         deferred_state_corrections_fn = None
-                    preprocess_mamba(
+                    mamba_bufs = self._get_mamba_bufs()
+                    preprocess_bufs = mamba_bufs.preprocess
+                    mamba_utils.preprocess_mamba(
                         scheduler_output,
                         self.kv_cache_config,
                         self.cache_config,
@@ -554,8 +746,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         self.input_batch,
                         self.requests,
                         self.compilation_config.static_forward_context,
-                        self.model.get_mamba_state_copy_func(),
-                        self._get_mamba_copy_bufs(),
+                        self._get_mamba_state_copy_funcs(),
+                        preprocess_bufs,
                     )
                     # preprocess_mamba resets num_accepted_tokens_cpu to 1
                     # for requests whose state was copied to a new block.
@@ -564,13 +756,23 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     self.num_accepted_tokens.np[:num_reqs] = self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                     self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
+                    if mamba_bufs.postprocess_align is not None:
+                        mamba_utils.stage_postprocess_inputs_to_gpu(
+                            mamba_bufs.postprocess_align,
+                            scheduler_output,
+                            self.input_batch.req_ids,
+                            num_reqs,
+                            self.requests,
+                            self.mamba_state_idx,
+                        )
+
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
                 if (
                     cudagraph_mode == CUDAGraphMode.FULL
                     or (enable_sp() and not self.model_config.use_mla)
-                    and self.pcp_size * self.dcp_size == 1
+                    and self.dcp_size == 1
                 ):
                     # Currently, Graph Mode and SP will both pad num_tokens,
                     # Another possible condition is num_tokens_padded != num_tokens_unpadded
@@ -585,9 +787,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     )
 
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded
-                    if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
-                    else total_num_scheduled_tokens,
+                    num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
                     num_reqs=num_reqs,
                     num_reqs_padded=num_reqs_padded,
@@ -609,9 +809,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 ec_connector_output,
             ) = self._preprocess(
                 scheduler_output,
-                num_tokens_padded
-                if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
-                else total_num_scheduled_tokens,
+                num_tokens_padded,
                 intermediate_tensors,
             )
 
@@ -635,35 +833,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
 
-        # Set cudagraph mode to none if calc_kv_scales is true.
-        # KV scales calculation involves dynamic operations that are incompatible
-        # with CUDA graph capture.
-        if self.calculate_kv_scales:  # type: ignore[has-type]
-            cudagraph_mode = CUDAGraphMode.NONE
-            # Mark KV scales as calculated after the first forward pass
-            self.calculate_kv_scales = False  # type: ignore[has-type]
-        # prevent debugger is None
-        if self.debugger is not None:
-            dbg_cfg = getattr(self.debugger, "config", None)
-            dump_level = str(getattr(dbg_cfg, "level", "L1")).upper() if dbg_cfg is not None else "L1"
-            if dump_level in ("L0", "MIX"):
-                self.debugger.start(model=self.model)
-            else:
-                self.debugger.start()
-        if self.ascend_config.enable_async_exponential:
-            self.sampler.do_async_exponential(
-                b_s=logits_indices.shape[0],
-                head_dim=self.model_config.get_vocab_size(),
-                generators=self.input_batch.sampling_metadata.generators,
-            )
-
         # Encoder-decoder models can only compile the pure decode steps where no
         # encoder inputs are present. Use eager for the first pass.
         num_encoder_reqs = len(scheduler_output.scheduled_encoder_inputs)
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
-        clear_kv_metadata = self.speculative_config is None
+        defer_kv_connector_finalize = self.speculative_config is not None and (
+            get_pp_group().is_last_rank or self.broadcast_pp_output
+        )
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -675,16 +853,19 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 batch_descriptor=batch_desc,
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 model_instance=self.model,
-                max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
+                has_sinks=self._has_sinks,
+                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
                 **(
-                    {"defer_finalize": not clear_kv_metadata}
+                    {"defer_finalize": defer_kv_connector_finalize}
                 ),
             ) as kv_connector_output,
         ):
+            if self.cache_config.mamba_cache_mode == "align":
+                mamba_utils.do_mamba_copy_block(preprocess_bufs)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
@@ -694,6 +875,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
             flush_pending_metadata = getattr(self.model, "flush_pending_metadata", None)
             if callable(flush_pending_metadata):
                 flush_pending_metadata(req_ids[:num_reqs])
+
+            # [Omni] Hand the model the batch's req_ids in logits order, for
+            # models that gate logits per request. Mirrors gpu_ar_model_runner.
+            # Only valid without spec decode: there logits_indices carries several
+            # rows per request, so row i no longer corresponds to req_ids[i].
+            if spec_decode_metadata is None:
+                set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
+                if callable(set_batch_req_ids):
+                    set_batch_req_ids(req_ids[:num_reqs])
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
@@ -710,20 +900,11 @@ class NPUARModelRunner(OmniNPUModelRunner):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
-            if self.pcp_size > 1:
-                # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
-                # ignores the padding from CUDA Graph.
-                hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states)
-                if aux_hidden_states is not None:
-                    aux_hidden_states = [
-                        self.pcp_manager.get_restore_hidden_states(aux_hidden_states_pcp)
-                        for aux_hidden_states_pcp in aux_hidden_states
-                    ]
 
             #  -------------------------------------- Omni-new -------------------------------------------------
-            self._maybe_update_prefix_cache(
-                hidden_states=hidden_states,
-                multimodal_outputs=multimodal_outputs,
+            prefix_cache_step_id = self._prefix_cache_save_step(
+                hidden_states,
+                multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
             )
@@ -736,9 +917,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
-                    if self.debugger is not None:
-                        self.debugger.stop()
-                        self.debugger.step()
+                    self._finalize_dump_data()
+                    if self.dynamic_eplb:
+                        self.eplb_updator.forward_end(self.eplb_heat_collection_status)
                     return hidden_states
                 if self.is_pooling_model:
                     # Return the pooling output.
@@ -746,9 +927,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         hidden_states, num_scheduled_tokens, num_scheduled_tokens_np, kv_connector_output
                     )
                     output.kv_connector_output = kv_connector_output
-                    if self.debugger is not None:
-                        self.debugger.stop()
-                        self.debugger.step()
+                    self._finalize_dump_data()
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
@@ -805,6 +984,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 cudagraph_stats,
                 batch_desc,
                 multimodal_outputs, # Omni-specific
+                prefix_cache_step_id,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -812,9 +992,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
-
-        if self.vllm_config.model_config.enable_return_routed_experts and hasattr(self, "_positions_cpu"):
-            self._omni_routed_experts_d2h(scheduler_output)
 
         return None
 
@@ -838,9 +1015,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                sampler_output = model_sample(
+                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                self._apply_duplex_sampling(logits, prepared_sampling_metadata)
+                sampler_output = call_model_sampler(
+                    self.model,
+                    model_sample,
                     logits,
-                    self._sampling_metadata_for_model_sampler(sampling_metadata),
+                    prepared_sampling_metadata,
+                    input_batch=self.input_batch,
+                    requests=getattr(self, "requests", None),
                 )
                 if sampler_output is not None:
                     return sampler_output
@@ -855,8 +1038,11 @@ class NPUARModelRunner(OmniNPUModelRunner):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        profiling_chunk_config = self.ascend_config.scheduler_config.profiling_chunk_config
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+        pp = get_pp_group()
+        use_pp_spec_decode = self.speculative_config is not None and pp.world_size > 1
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
@@ -869,21 +1055,16 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
-            # receive sampled token ids from the last PP rank when using
-            # async scheduling + pipeline parallelism so downstream code
-            # (e.g., PCP input preparation) can access them.
-            if self.use_async_scheduling and get_pp_group().world_size > 1:
-                self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
-            return output
+            return self.attach_omni_connector_output(output)
 
         # Unpack ephemeral state.
         (
@@ -900,7 +1081,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
             cudagraph_stats,
             batch_desc,
             multimodal_outputs, # Omni-Specific
+            prefix_cache_step_id,
         ) = self.execute_model_state
+        pending_aux_output = self._prepare_omni_aux_output()
         # Clear ephemeral state.
         self.execute_model_state = None
         hidden_seq_len = int(hidden_states.shape[0])
@@ -932,6 +1115,26 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 self.input_batch.sampling_metadata.logitsprocs,
                 logits.shape[-1],
             )
+            # K-step only, and both halves matter: the model class has to
+            # implement the multi-frame path (``supports_multi_frame_decode``)
+            # *and* this deployment has to arm it -- stage 1's speculative_config
+            # is what sets ``num_spec_tokens``. With the loop off, vLLM's
+            # min_tokens layer behaves as it does on any other stage and must
+            # keep working, so it is only cleared when both hold.
+            #
+            # Why clear it at all: this layer censors the stop token itself, and
+            # its release condition is a spec-decoding bookkeeping counter we do
+            # not control -- a request whose count never advances can never
+            # stop. The model already masks the codec EOS by its own frame count
+            # (talker_codec_sample), so the vLLM-level layer is redundant here.
+            if supports_multi_frame_decode(self.model) and int(
+                getattr(self, "num_spec_tokens", 0) or 0
+            ) > 0:
+                from vllm_omni.platforms.npu.worker import talker_multiframe
+
+                talker_multiframe.neutralize_kstep_min_tokens(
+                    self.input_batch.sampling_metadata.logitsprocs
+                )
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
@@ -964,7 +1167,26 @@ class NPUARModelRunner(OmniNPUModelRunner):
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
+        output_spec_token_ids = None
+        use_padded_batch = False
+        early_pp_padded_drafter = False
+        if self.speculative_config:
+            use_padded_batch = (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+                or self.speculative_config.uses_extract_hidden_states()
+                or self.speculative_config.use_ngram_gpu()
+            ) and not self.speculative_config.disable_padded_drafter_batch
+            early_pp_padded_drafter = use_pp_spec_decode and not self.use_async_scheduling and use_padded_batch
+            if early_pp_padded_drafter:
+                self._draft_token_ids = None
+                self._draft_token_req_ids = None
+                with record_function_or_nullcontext("draft_token"):
+                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+
         (
+            num_nans_in_logits,
+            num_nans_device,
             logprobs_lists,
             valid_sampled_token_ids,
             prompt_logprobs_dict,
@@ -980,18 +1202,17 @@ class NPUARModelRunner(OmniNPUModelRunner):
             spec_decode_metadata,
         )
 
+
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
-                use_padded_batch = (
-                    self.speculative_config
-                    and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
-                    and not self.speculative_config.disable_padded_drafter_batch
-                )
-                if use_padded_batch:
+                if not early_pp_padded_drafter:
+                    self._draft_token_ids = None
+                    self._draft_token_req_ids = None
+                if use_padded_batch and not early_pp_padded_drafter:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
+                if not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
@@ -1002,11 +1223,22 @@ class NPUARModelRunner(OmniNPUModelRunner):
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
 
-        routed_experts_lists = None
-        if self.model_config.enable_return_routed_experts:
-            capturer = self.routed_experts_capturer
-            if capturer is not None and hasattr(self.input_batch, "num_tokens_no_spec"):
-                routed_experts_lists = self._omni_extract_routed_experts(scheduler_output)
+            draft_token_ids = self._draft_token_ids if use_pp_spec_decode else None
+            if draft_token_ids is not None:
+                if isinstance(draft_token_ids, torch.Tensor):
+                    num_draft_reqs = draft_token_ids.shape[0]
+                    draft_ids_list = draft_token_ids[:num_draft_reqs].cpu().tolist()
+                    draft_req_ids = self._draft_token_req_ids
+                else:
+                    draft_ids_list = draft_token_ids
+                    draft_req_ids = self.input_batch.req_ids
+                if draft_ids_list and draft_req_ids:
+                    draft_by_req_id = dict(zip(draft_req_ids, draft_ids_list))
+                    output_spec_token_ids = [draft_by_req_id.get(req_id, []) for req_id in req_ids_output_copy]
+
+        aux_output = self._finish_omni_aux_output(
+            pending_aux_output, scheduler_output, sampler_output.sampled_token_ids, invalid_req_indices
+        )
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
@@ -1020,9 +1252,20 @@ class NPUARModelRunner(OmniNPUModelRunner):
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         audio_sparse_output = engine_output_type == "audio" and sparse_mm_req_ids is not None
+        _omni_cache_on = self.omni_prefix_cache is not None
         needs_scheduled_hidden_payload = needs_pooler_payload and (
-            self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states()
+            not _omni_cache_on or not self._model_needs_full_prefix_hidden_states()
         )
+        if prefix_cache_step_id is not None and (
+            not needs_pooler_payload or self._model_mm_outputs_written_in_sample()
+        ):
+            # No consumer for this step's merge, or the model wrote its mm
+            # outputs in sample() after the snapshot: consume the step context
+            # by id (exactly-once contract) and build from the live outputs.
+            # The cache write still lands.
+            assert self.omni_prefix_cache is not None
+            self.omni_prefix_cache.discard_step(prefix_cache_step_id)
+            prefix_cache_step_id = None
         if needs_scheduled_hidden_payload:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
@@ -1050,16 +1293,12 @@ class NPUARModelRunner(OmniNPUModelRunner):
             combined_hidden_states = None
             combined_multimodal_outputs = None
             mm_cpu = None
-            if self.omni_prefix_cache is not None:
+            if _omni_cache_on:
                 (
                     combined_hidden_states,
                     combined_multimodal_outputs,
-                ) = self._maybe_get_combined_prefix_cache_tensors(
-                    hidden_states,
-                    multimodal_outputs,
-                    scheduler_output.num_scheduled_tokens,
-                )
-            if self.omni_prefix_cache is None or combined_multimodal_outputs is None:
+                ) = self._prefix_cache_materialize(prefix_cache_step_id, list(req_ids_output_copy))
+            if not _omni_cache_on or combined_multimodal_outputs is None:
                 mm_cpu = build_mm_cpu(
                     flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
                 )
@@ -1159,15 +1398,26 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 pooler_output.append(flatten_payload(payload))
 
         pooler_output = pooler_output or []
-        if self._async_chunk:
+        if self._async_chunk and stage_sends_async_output(self.model_config):
             pooler_inter, pooler_client = partition_payload_list(pooler_output)
         else:
             # Non-async-chunk ships the full payload to the next stage via
             # inter_stage_outputs (the NPU runner has no separate full-payload
             # accumulate). #4527's (None, pooler_output) starved it. (PR #4792)
             pooler_inter, pooler_client = pooler_output, pooler_output
+
+        # [Omni] Full-payload send-side accumulation. Mirrors gpu_ar_model_runner.py.
+        if pooler_inter and self._should_accumulate_full_payload_output():
+            with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
+                for i, rid in enumerate(req_ids_output_copy):
+                    req_state = self.requests.get(rid)
+                    if req_state is not None and pooler_inter[i]:
+                        self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
+
         inter_stage_outputs = self._build_multimodal_outputs(pooler_inter)
-        multimodal_outputs = self._build_multimodal_outputs(pooler_client)
+        multimodal_outputs = (
+            inter_stage_outputs if pooler_client is pooler_inter else self._build_multimodal_outputs(pooler_client)
+        )
         model_runner_output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -1180,22 +1430,28 @@ class NPUARModelRunner(OmniNPUModelRunner):
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            num_nans_in_logits=num_nans_in_logits,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
-        model_runner_output.routed_experts = routed_experts_lists
+        model_runner_output.aux_output_connector_output = aux_output
+        model_runner_output.spec_token_ids = output_spec_token_ids
+        with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
+            model_runner_output.omni_connector_output = self.get_omni_connector_output()
         #  -------------------------------------- Omni-new -------------------------------------------------
 
-        if self.ascend_config.profiling_chunk_config.enabled and hasattr(self, "_execution_start_time"):
+        if (
+            profiling_chunk_config.enabled
+            and profiling_chunk_config.need_timing
+            and hasattr(self, "_execution_start_time")
+        ):
             self._sync_device()
             model_runner_output.execution_time_ms = (time.perf_counter() - self._execution_start_time) * 1000.0
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB update"):
-                self.eplb_updator.forward_end()
+                self.eplb_updator.forward_end(self.eplb_heat_collection_status)
 
-        if self.debugger is not None:
-            self.debugger.stop()
-            self.debugger.step()
+        self._finalize_dump_data()
 
         if self.need_accepted_tokens:
             assert self.sampling_done_event is not None
@@ -1206,14 +1462,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
-        # In async scheduling + PP, broadcast sampled token ids from the
-        # last PP rank so other PP ranks can receive them without going
-        # through the scheduler/engine IPC path.
-        if self.use_async_scheduling:
-            pp = get_pp_group()
-            if pp.world_size > 1 and pp.is_last_rank:
-                self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
-
         if not self.use_async_scheduling:
             return model_runner_output
         async_output = AsyncGPUModelRunnerOutput(
@@ -1223,6 +1471,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
             vocab_size=self.input_batch.vocab_size,
+            num_nans=num_nans_device,
         )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,

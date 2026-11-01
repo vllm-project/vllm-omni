@@ -1,14 +1,130 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
+import torch
 from pytest_mock import MockerFixture
+from transformers import LlamaConfig
+from vllm.config import ModelConfig, VllmConfig
+from vllm.inputs.engine import tokens_input
+from vllm.pooling_params import PoolingParams
+from vllm.renderers import renderer_from_config
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class _SyntheticSyncQueueShutDownError(Exception):
+    pass
+
+
+def test_abort_is_noop_for_empty_request_ids(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+
+    engine.abort([])
+
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_abort_is_noop_after_shutdown_starts(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = True
+    engine.request_queue = mocker.Mock()
+
+    engine.abort(["req-1"])
+
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_abort_tolerates_queue_close_race_during_shutdown(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        _SyntheticSyncQueueShutDownError,
+    )
+
+    def close_queue_during_abort(*args, **kwargs):
+        del args, kwargs
+        engine._shutdown_called = True
+        raise _SyntheticSyncQueueShutDownError
+
+    engine.request_queue.sync_q.put.side_effect = close_queue_during_abort
+
+    engine.abort(["req-1"])
+
+
+def test_abort_tolerates_legacy_janus_close_error_during_shutdown(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        None,
+    )
+
+    def close_queue_during_abort(*args, **kwargs):
+        del args, kwargs
+        engine._shutdown_called = True
+        raise RuntimeError("Operation on the closed queue is forbidden")
+
+    engine.request_queue.sync_q.put.side_effect = close_queue_during_abort
+
+    engine.abort(["req-1"])
+
+
+def test_abort_surfaces_unrelated_legacy_runtime_error_during_shutdown(
+    mocker: MockerFixture,
+):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        None,
+    )
+
+    def fail_during_abort(*args, **kwargs):
+        del args, kwargs
+        engine._shutdown_called = True
+        raise RuntimeError("unrelated queue failure")
+
+    engine.request_queue.sync_q.put.side_effect = fail_during_abort
+
+    with pytest.raises(RuntimeError, match="unrelated queue failure"):
+        engine.abort(["req-1"])
+
+
+def test_abort_surfaces_unexpected_closed_queue(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+    mocker.patch(
+        "vllm_omni.engine.async_engine_utils._JANUS_SYNC_QUEUE_SHUTDOWN",
+        _SyntheticSyncQueueShutDownError,
+    )
+    engine.request_queue.sync_q.put.side_effect = _SyntheticSyncQueueShutDownError
+
+    with pytest.raises(_SyntheticSyncQueueShutDownError):
+        engine.abort(["req-1"])
 
 
 def _make_engine_core_request(request_id: str = "req-1") -> EngineCoreRequest:
@@ -23,6 +139,32 @@ def _make_engine_core_request(request_id: str = "req-1") -> EngineCoreRequest:
         cache_salt=None,
         data_parallel_rank=None,
     )
+
+
+def test_build_add_request_message_normalizes_watermark_opt_out():
+    """Ensure disabling watermark is handled consistently across multistage pipelines."""
+    engine = object.__new__(AsyncOmniEngine)
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm"),
+        StageRuntimeInfo(final_output=True, final_output_type="audio", stage_type="diffusion"),
+        StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm"),
+    ]
+    params = [SamplingParams(watermarking=False), OmniDiffusionSamplingParams(watermarking=True), PoolingParams()]
+
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt=_make_engine_core_request(),
+        sampling_params_list=params,
+        final_stage_id=1,
+    )
+
+    # Since we disabled watermarking on one stage, all stages should disabled watermark, but the
+    # original request params should not be mutated, since doing so could mutate model default
+    # sampling params and leak into future requests. Pooling stages never watermark.
+    llm_params, diffusion_params, pooling_params = msg.sampling_params_list
+    assert not llm_params.watermarking and not diffusion_params.watermarking
+    assert pooling_params is params[2]
+    assert [params[0].watermarking, params[1].watermarking] == [False, True]
 
 
 def test_build_add_request_message_preserves_additional_information(mocker: MockerFixture):
@@ -62,6 +204,140 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
     output_processor.add_request.assert_not_called()
+
+
+def test_build_add_request_message_preserves_kv_hints_after_omni_payload_upgrade(mocker):
+    from vllm.v1.engine.input_processor import InputProcessor
+    from vllm.v1.kv_hints import KvHintsEnvelope
+
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    processor = mocker.create_autospec(InputProcessor, instance=True)
+    hints = KvHintsEnvelope("1", "hint-message", [])
+
+    def process(**kwargs):
+        request = _make_engine_core_request()
+        request.kv_hints = kwargs["kv_hints"]
+        return request
+
+    processor.process_inputs.side_effect = process
+    engine.input_processor = processor
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt={"prompt_token_ids": [1], "additional_information": {"speaker": "voice"}},
+        sampling_params_list=[params],
+        kv_hints=hints,
+    )
+    assert processor.process_inputs.call_args.kwargs["kv_hints"] is hints
+    assert isinstance(msg.prompt, OmniEngineCoreRequest)
+    assert msg.prompt.kv_hints is hints
+    assert msg.prompt.additional_information is not None
+
+
+def test_build_add_request_message_injects_global_id_before_prompt_transform(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("speech",)
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+    engine.output_processors = [mocker.Mock()]
+
+    seen_global_ids: list[list[str]] = []
+
+    def transform(prompt, _sampling_params):
+        seen_global_ids.append(prompt["additional_information"]["global_request_id"])
+        return prompt
+
+    engine.prompt_transform_func = transform
+    prompt = {"prompt_token_ids": [1, 1, 1]}
+
+    message = engine._build_add_request_message(
+        request_id="req-1",
+        prompt=prompt,
+        sampling_params_list=[params],
+        final_stage_id=0,
+        arrival_time=0.0,
+    )
+
+    assert seen_global_ids == [["req-1"]]
+    assert message.original_prompt["additional_information"]["global_request_id"] == ["req-1"]
+
+
+def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("speech",)
+
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+
+    output_processor = mocker.Mock()
+    engine.output_processors = [output_processor]
+
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    prompt = {
+        "prompt_token_ids": [1, 1, 1],
+        "model_intermediate_buffer": {
+            "ids": {"tts": [11, 12]},
+            "hidden_states": {"tts": hidden},
+        },
+    }
+
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt=prompt,
+        sampling_params_list=[params],
+        final_stage_id=0,
+        arrival_time=0.0,
+    )
+
+    request = msg.prompt
+    assert isinstance(request, OmniEngineCoreRequest)
+    assert request.additional_information is not None
+    assert request.additional_information.entries["global_request_id"].list_data == ["req-1"]
+    assert request.additional_information.entries["omni_final_stage_id"].scalar_data == 0
+    assert isinstance(request.model_intermediate_buffer, dict)
+    info = request.model_intermediate_buffer
+    assert info["ids"]["tts"] == [11, 12]
+    assert torch.equal(info["hidden_states"]["tts"], hidden)
+
+
+def test_cfg_companion_suppresses_payload_but_forces_kv_transfer(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: [
+        ExpandedPrompt(
+            prompt={"prompt": "negative"},
+            role="cfg_text",
+            request_id_suffix="__cfg_text",
+        )
+    ]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request("req__cfg_text")
+    engine.request_queue = mocker.Mock()
+
+    engine._enqueue_cfg_companions(
+        parent_id="req",
+        original_prompt={"prompt": "positive"},
+        stage0_params=params,
+        sampling_params_list=[params],
+    )
+
+    message = engine.request_queue.sync_q.put.call_args.args[0]
+    metadata = deserialize_additional_information(message.prompt.additional_information)
+    assert metadata["omni_final_stage_id"] == 0
+    assert metadata["omni_force_kv_transfer"] is True
 
 
 def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixture):
@@ -135,6 +411,41 @@ def _replica(input_addr: str) -> ReplicaInfo:
     )
 
 
+@pytest.mark.parametrize(
+    ("stage1_vllm_config", "returns_payload"),
+    [
+        (None, False),  # Currently this is the case for diffusion
+        (SimpleNamespace(model_config=SimpleNamespace(stage_id=1, requires_full_payload_input=True)), True),
+    ],
+)
+def test_run_request_entry_stage_returns_payload_only_for_a_full_payload_next_stage(
+    mocker: MockerFixture, stage1_vllm_config: SimpleNamespace | None, returns_payload: bool
+):
+    """Ensure a run request's entry stage returns its payload only when the next stage takes a full payload."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.default_sampling_params_list = [params, params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.stage_pools = [
+        StagePool(0, [_FakeStageClient()]),
+        StagePool(1, [_FakeStageClient()], stage_vllm_config=stage1_vllm_config),
+    ]
+    input_processor = mocker.Mock()
+    input_processor.process_inputs.return_value = _make_engine_core_request()
+    engine.input_processor = input_processor
+
+    msg = engine._build_add_request_message(
+        request_id="req-1",
+        prompt={"prompt_token_ids": [1, 1, 1]},
+        sampling_params_list=[params, params],
+        final_stage_id=1,
+        yield_stage_id=0,
+    )
+
+    assert returns_stage_payload(msg.prompt.additional_information) is returns_payload
+
+
 def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
@@ -169,6 +480,139 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     assert seen_uuids[0].startswith("stage0:rep0:")
     assert seen_uuids[1].startswith("stage0:rep1:")
     assert seen_uuids[0].removeprefix("stage0:rep0:") == seen_uuids[1].removeprefix("stage0:rep1:")
+
+
+def _two_replica_engine_recording_uuids(mocker: MockerFixture) -> tuple[AsyncOmniEngine, list[str]]:
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.model = "test-model"
+    engine.default_sampling_params_list = [params]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.supported_tasks = ("generate",)
+    engine.stage_pools = [StagePool(0, [_FakeStageClient(), _FakeStageClient()])]
+
+    seen_uuids: list[str] = []
+
+    def process_inputs(**kwargs):
+        seen_uuids.append(kwargs["prompt"]["multi_modal_uuids"]["image"][0])
+        return _make_engine_core_request(kwargs["request_id"])
+
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.side_effect = process_inputs
+    return engine, seen_uuids
+
+
+def test_mm_uuid_scoping_leaves_caller_prompt_untouched(mocker: MockerFixture):
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    prompt = {
+        "prompt": "describe",
+        "multi_modal_data": {"image": "image-a"},
+        "multi_modal_uuids": {"image": ["user-uuid"]},
+    }
+
+    engine._build_add_request_message(
+        request_id="req-1", prompt=prompt, sampling_params_list=[params], final_stage_id=0
+    )
+
+    assert seen_uuids == ["stage0:rep0:user-uuid"]
+    assert prompt["multi_modal_uuids"] == {"image": ["user-uuid"]}
+
+
+def test_mm_uuid_scoping_keys_reused_prompt_by_its_own_media(mocker: MockerFixture):
+    # Callers may build each request from a dict that already went through the
+    # engine. Every request must still be keyed by its own media, otherwise the
+    # sender cache omits the new media and the replica serves the old one.
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    template = {"prompt": "describe", "multi_modal_data": {"image": "image-a"}}
+
+    engine._build_add_request_message(
+        request_id="req-0", prompt=template, sampling_params_list=[params], final_stage_id=0
+    )
+    for i, image in enumerate(("image-b", "image-c", "image-d"), start=1):
+        prompt = dict(template)
+        prompt["multi_modal_data"] = {"image": image}
+        engine._build_add_request_message(
+            request_id=f"req-{i}", prompt=prompt, sampling_params_list=[params], final_stage_id=0
+        )
+
+    assert "multi_modal_uuids" not in template
+    # Round-robin: requests 0/2 land on replica 0, requests 1/3 on replica 1.
+    assert [uuid.split(":")[1] for uuid in seen_uuids] == ["rep0", "rep1", "rep0", "rep1"]
+    assert len(set(seen_uuids)) == 4
+    assert all(uuid.count("stage0:") == 1 for uuid in seen_uuids)
+
+
+def test_shared_mm_uuid_scoping_preserves_media_and_user_uuids(mocker: MockerFixture):
+    hash_kwargs = mocker.patch("vllm.multimodal.hasher.MultiModalHasher.hash_kwargs", return_value="audio-hash")
+    audio = ([0.1, 0.2], 16000)
+    prompt = {
+        "multi_modal_data": {"audio": audio, "image": [None, None], "video": None},
+        "multi_modal_uuids": {"image": ["cached-image", None], "other": ["untouched"]},
+    }
+
+    scoped = scope_stage_replica_mm_uuids(
+        prompt, stage_id=2, replica_id=3, model_id="stage-model", mm_hasher_algorithm="sha256"
+    )
+
+    hash_kwargs.assert_called_once_with("sha256", model_id="stage-model", audio=audio)
+    assert scoped is not prompt
+    assert scoped["multi_modal_data"] is prompt["multi_modal_data"]
+    assert scoped["multi_modal_uuids"] == {
+        "audio": ["stage2:rep3:audio-hash"],
+        "image": ["stage2:rep3:cached-image", None],
+        "other": ["untouched"],
+    }
+    assert prompt["multi_modal_uuids"] == {"image": ["cached-image", None], "other": ["untouched"]}
+
+
+def test_shared_mm_uuid_scoping_reuses_cache_only_within_one_receiver(mocker: MockerFixture):
+    mocker.patch("vllm.multimodal.hasher.MultiModalHasher.hash_kwargs", return_value="same-media")
+    prompt = {"multi_modal_data": {"audio": "same-audio"}}
+    sender_cache: set[str] = set()
+    cache_hits = []
+    for stage_id, replica_id in [(0, 0), (0, 1), (0, 0), (1, 0)]:
+        scoped = scope_stage_replica_mm_uuids(
+            prompt, stage_id=stage_id, replica_id=replica_id, model_id="model", mm_hasher_algorithm="blake3"
+        )
+        key = scoped["multi_modal_uuids"]["audio"][0]
+        cache_hits.append(key in sender_cache)
+        sender_cache.add(key)
+
+    assert cache_hits == [False, False, True, False]
+    assert "multi_modal_uuids" not in prompt
+
+
+@pytest.mark.parametrize(
+    "prompt", ["plain text", {}, {"multi_modal_data": {}}, {"multi_modal_data": {"image": "image"}}]
+)
+def test_async_mm_uuid_wrapper_delegates_all_prompts(mocker: MockerFixture, prompt):
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "engine-model"
+    helper = mocker.patch("vllm_omni.engine.async_omni_engine.scope_stage_replica_mm_uuids")
+    mocker.patch.object(engine, "_resolve_mm_hasher_algorithm", return_value="sha256")
+
+    scoped = engine._ensure_stage_replica_mm_uuids(prompt, stage_id=0, replica_id=1)
+
+    assert scoped is helper.return_value
+    helper.assert_called_once_with(
+        prompt, stage_id=0, replica_id=1, model_id="engine-model", mm_hasher_algorithm="sha256"
+    )
+
+
+def test_async_mm_uuid_wrapper_preserves_stage0_hash_config(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "engine-model"
+    engine.stage_vllm_configs = [
+        SimpleNamespace(model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_hasher_algorithm="sha256")))
+    ]
+    hash_kwargs = mocker.patch("vllm.multimodal.hasher.MultiModalHasher.hash_kwargs", return_value="image-hash")
+
+    scoped = engine._ensure_stage_replica_mm_uuids({"multi_modal_data": {"image": "image"}}, stage_id=0, replica_id=1)
+
+    hash_kwargs.assert_called_once_with("sha256", model_id="engine-model", image="image")
+    assert scoped["multi_modal_uuids"] == {"image": ["stage0:rep1:image-hash"]}
 
 
 @pytest.mark.asyncio
@@ -215,6 +659,16 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     assert stage_pool.get_bound_replica_id("req-2") == 1
     assert await stage_pool.pick("req-1") == 0
     assert await stage_pool.pick("req-2") == 1
+
+    # Replica 0 leaves the hub after req-1's keys were scoped to it: a submit pinned to
+    # those keys fails instead of sending them to replica 1, while routing moves on.
+    stage_pool.attach_hub(_FakeHub([_replica(addr1)]))
+    with pytest.raises(StageUnavailableError):
+        await stage_pool.submit_initial(
+            "req-1", mocker.Mock(sampling_params_list=[params]), _make_engine_core_request(), expected_replica_id=0
+        )
+    assert stage_pool.get_bound_replica_id("req-1") is None
+    assert await stage_pool.pick("req-1") == 1
 
 
 def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mocker: MockerFixture):
@@ -298,3 +752,126 @@ def test_build_add_request_message_releases_preselected_replica_on_preprocess_er
         )
 
     assert stage_pool.get_bound_replica_id("req-error") is None
+
+
+def test_cfg_companion_build_failure_admits_nothing(mocker: MockerFixture):
+    """A guided request is all-or-nothing.
+
+    Admitting the parent before its companion is built leaves an orphan: a
+    model whose guidance is mandatory never completes the pair, so the request
+    holds scheduler and KV capacity for the scheduler's whole hold budget and
+    then produces no audio. The build has to raise before anything is enqueued.
+    """
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = mocker.Mock(side_effect=ValueError("cannot build the null twin"))
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.request_queue = mocker.Mock()
+
+    with pytest.raises(ValueError, match="null twin"):
+        engine._build_cfg_companions(
+            parent_id="req",
+            original_prompt={"prompt": "positive"},
+            stage0_params=params,
+            sampling_params_list=[params],
+        )
+
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_cfg_companion_processing_failure_admits_nothing(mocker: MockerFixture):
+    """The same holds when expansion succeeds but input processing does not."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: [
+        ExpandedPrompt(
+            prompt={"prompt": "negative"},
+            role="cfg_text",
+            request_id_suffix="__cfg_text",
+        )
+    ]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.side_effect = RuntimeError("tokenizer rejected the prompt")
+    engine.request_queue = mocker.Mock()
+
+    with pytest.raises(RuntimeError, match="tokenizer rejected"):
+        engine._build_cfg_companions(
+            parent_id="req",
+            original_prompt={"prompt": "positive"},
+            stage0_params=params,
+            sampling_params_list=[params],
+        )
+
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_cfg_companion_build_returns_messages_without_enqueueing(mocker: MockerFixture):
+    """Construction and admission are separate steps."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: [
+        ExpandedPrompt(
+            prompt={"prompt": "negative"},
+            role="cfg_text",
+            request_id_suffix="__cfg_text",
+        )
+    ]
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.input_processor.process_inputs.return_value = _make_engine_core_request("req__cfg_text")
+    engine.request_queue = mocker.Mock()
+
+    companions = engine._build_cfg_companions(
+        parent_id="req",
+        original_prompt={"prompt": "positive"},
+        stage0_params=params,
+        sampling_params_list=[params],
+    )
+
+    assert len(companions) == 1
+    assert companions[0].companion_id == "req__cfg_text"
+    assert companions[0].parent_id == "req"
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_cfg_expansion_returning_nothing_is_not_an_error(mocker: MockerFixture):
+    """An unguided request expands to no companions and admits normally."""
+    engine = object.__new__(AsyncOmniEngine)
+    params = SamplingParams(max_tokens=8)
+    engine.prompt_expand_func = lambda *_args: []
+    engine.supported_tasks = ("generate",)
+    engine.input_processor = mocker.Mock()
+    engine.request_queue = mocker.Mock()
+
+    assert (
+        engine._build_cfg_companions(
+            parent_id="req",
+            original_prompt={"prompt": "positive"},
+            stage0_params=params,
+            sampling_params_list=[params],
+        )
+        == []
+    )
+    engine.request_queue.sync_q.put.assert_not_called()
+
+
+def test_input_processor_preserves_request_id(tmp_path: Path):
+    """Ensure stage requests keep the orchestrator request id; this ensures that requests
+    going through paths hitting vLLM's process_inputs, e.g., _build_next_stage_request,
+    don't change the request ID, which is important for keeping the orchestrator and engine
+    request IDs aligned.
+    """
+    req_id = "req-1"
+    LlamaConfig(architectures=["LlamaForCausalLM"]).save_pretrained(tmp_path)
+    vllm_config = VllmConfig(model_config=ModelConfig(model=str(tmp_path), skip_tokenizer_init=True))
+    processor = InputProcessor(vllm_config, renderer_from_config(vllm_config))
+    request = processor.process_inputs(
+        req_id,
+        tokens_input([1, 2, 3]),
+        SamplingParams(max_tokens=1),
+        ("generate",),
+    )
+
+    assert request.request_id == req_id

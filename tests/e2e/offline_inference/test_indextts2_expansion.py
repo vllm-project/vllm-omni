@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """E2E offline inference tests for IndexTTS2 two-stage pipeline.
 
 Stage 0 (GPT AR) → Stage 1 (S2Mel + BigVGAN). Output is 22050 Hz mono WAV.
@@ -8,12 +8,11 @@ Covers: basic TTS.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
@@ -29,8 +28,7 @@ _OMNI_RUNNER_PARAM = (
     STAGE_CONFIG,
 )
 
-ASSETS_DIR = Path(__file__).resolve().parents[2] / "assets" / "indextts2"
-REF_AUDIO = str(ASSETS_DIR / "ref_audio.wav")
+REF_AUDIO = str(get_asset_path("indextts2/ref_audio.wav"))
 
 pytestmark = [
     pytest.mark.slow,
@@ -55,9 +53,12 @@ def _sample_rate_from_mm(mm: dict) -> int:
     sr = mm.get("sr")
     if isinstance(sr, list):
         sr = sr[-1] if sr else None
-    if hasattr(sr, "item"):
-        return int(sr.item())
-    return int(sr) if sr is not None else SAMPLE_RATE
+    if sr is None:
+        return SAMPLE_RATE
+    item = getattr(sr, "item", None)
+    if callable(item):
+        return int(item())
+    return int(sr)
 
 
 def _build_request(text: str, ref_audio: str, **extra) -> dict:

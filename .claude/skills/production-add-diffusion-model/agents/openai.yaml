@@ -1,0 +1,4 @@
+interface:
+  display_name: "Production Add Diffusion Model"
+  short_description: "Productionize vLLM-Omni diffusion models"
+  default_prompt: "Use $production-add-diffusion-model to take this integrated diffusion model from Day-0 support to evidence-backed production readiness."

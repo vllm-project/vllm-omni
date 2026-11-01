@@ -15,6 +15,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from .utils import VIDEO_RES_SIZE_INFO
+
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
 ACTION_MODE_INVERSE_DYNAMICS = "inverse_dynamics"
@@ -36,45 +38,24 @@ EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
     "bridge_orig_lerobot": 7,
     "droid_lerobot": 8,
     "robomind-franka": 8,
+    "embodiment_b": 9,
+    # Backward-compatible alias for the pre-generator Cosmos Framework name.
     "galbot": 9,
     "robomind-franka-dual": 12,
     "robomind-ur": 13,
     "agibotworld": 15,
+    "embodiment_c_gripper": 15,
+    "embodiment_c_gripper_ext": 15,
+    # Backward-compatible aliases for the pre-generator Cosmos Framework names.
     "agibot_gear_gripper": 15,
     "agibot_gear_gripper_ext": 15,
+    "xdof_yam": 16,
+    "molmoact2_yam": 16,
+    "abc_yam": 16,
     "fractal": 20,
-}
-
-
-VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
-    "256": {
-        "1,1": (256, 256),
-        "4,3": (320, 256),
-        "3,4": (256, 320),
-        "16,9": (320, 192),
-        "9,16": (192, 320),
-    },
-    "480": {
-        "1,1": (640, 640),
-        "4,3": (736, 544),
-        "3,4": (544, 736),
-        "16,9": (832, 480),
-        "9,16": (480, 832),
-    },
-    "704": {
-        "1,1": (960, 960),
-        "4,3": (1088, 832),
-        "3,4": (832, 1088),
-        "16,9": (1280, 704),
-        "9,16": (704, 1280),
-    },
-    "720": {
-        "1,1": (960, 960),
-        "4,3": (1104, 832),
-        "3,4": (832, 1104),
-        "16,9": (1280, 720),
-        "9,16": (720, 1280),
-    },
+    "drawanything": 21,
+    "behavior1k_lerobot": 22,
+    "maniparena": 23,
 }
 
 

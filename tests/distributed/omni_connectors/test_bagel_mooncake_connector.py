@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 End-to-end test for Bagel text2img with the Mooncake inter-stage connector.
@@ -22,9 +22,10 @@ import pytest
 from PIL import Image
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniRunner
+from tests.helpers.runtime import OmniRunner, get_open_port
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
 
@@ -52,15 +53,6 @@ PIXEL_TOLERANCE = 10
 
 # Default test prompt
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
-
-
-def _find_free_port() -> int:
-    """Find and return a free ephemeral port by binding to port 0."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-    return port
 
 
 def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
@@ -95,8 +87,8 @@ def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
     for req_output in omni_outputs:
         if images := getattr(req_output, "images", None):
             return images[0]
-        if hasattr(req_output, "request_output") and req_output.request_output:
-            stage_out = req_output.request_output
+        if isinstance(req_output, OmniRequestOutput) and req_output:
+            stage_out = req_output
             if hasattr(stage_out, "images") and stage_out.images:
                 return stage_out.images[0]
     return None
@@ -276,9 +268,9 @@ def test_bagel_text2img_mooncake_connector(run_level):
             "mooncake_master is not available or cannot execute (missing shared libraries like libibverbs)"
         )
     MOONCAKE_HOST = "127.0.0.1"
-    MOONCAKE_RPC_PORT = _find_free_port()
-    MOONCAKE_HTTP_PORT = _find_free_port()
-    MOONCAKE_METRICS_PORT = _find_free_port()
+    MOONCAKE_RPC_PORT = get_open_port()
+    MOONCAKE_HTTP_PORT = get_open_port()
+    MOONCAKE_METRICS_PORT = get_open_port()
 
     mooncake_master_proc = None
     temp_config_file = None
@@ -313,7 +305,7 @@ def test_bagel_text2img_mooncake_connector(run_level):
         temp_config_file = _resolve_deploy_config(temp_config_file, run_level)
         with OmniRunner(
             "ByteDance-Seed/BAGEL-7B-MoT",
-            stage_configs_path=temp_config_file,
+            deploy_config=temp_config_file,
             stage_init_timeout=300,
         ) as runner:
             generated_image = _generate_bagel_image(runner.omni)

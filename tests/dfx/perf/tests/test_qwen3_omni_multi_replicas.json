@@ -5,12 +5,13 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": "H100"
+            "cuda": "H100",
+            "rocm": "MI325"
           },
           "num_cards": 3
         }
       },
-      "full_model",
+      "slow",
       "omni"
     ],
     "server_params": {
@@ -20,7 +21,11 @@
           "2": {"num_replicas": 2, "devices": "1,2"}
       },
       "extra_cli_args": [
-        "--async-chunk"
+        "--async-chunk",
+        "--stage-init-timeout",
+        "1200",
+        "--init-timeout",
+        "1500"
       ]
     },
     "benchmark_params": [
@@ -28,6 +33,7 @@
         "dataset_name": "random",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
+        "extra_body": {"speaker": "ethan"},
         "num_prompts": [128, 128, 128, 128],
         "max_concurrency": [8, 16, 24, 32],
         "random_input_len": 2500,
@@ -35,16 +41,16 @@
         "ignore_eos": true,
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
-            "mean_ttft_ms": [130.5751, 278.6469, 324.7249, 911.6085],
-            "mean_tpot_ms": [7.9854, 11.1209, 16.1507, 20.7485],
-            "mean_audio_ttfp_ms": [486.486, 954.1791, 1289.6514, 2196.8275],
-            "mean_audio_rtf": [0.1896, 0.3962, 0.4098, 0.7322]
+            "H100": {
+                "mean_tpot_ms": [7.6955, 10.6457, 12.7363, 15.1608]
+            }
         }
       },
       {
         "dataset_name": "random-mm",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
+        "extra_body": {"speaker": "ethan"},
         "num_prompts": [10],
         "request_rate": [0.1],
         "random_input_len": 100,
@@ -60,16 +66,13 @@
           "(0, 60, 3)": 1.0
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-            "mean_ttft_ms": [340.5122],
-            "mean_audio_ttfp_ms": [463.0752],
-            "mean_audio_rtf": [0.1153]
-        }
+        "baseline": {}
       },
       {
         "dataset_name": "random-mm",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
+        "extra_body": {"speaker": "ethan"},
         "num_prompts": [40],
         "request_rate": [0.5],
         "random_input_len": 100,
@@ -87,16 +90,13 @@
           "(720, 1280, 2)": 0.5
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-            "mean_ttft_ms": [236.926],
-            "mean_audio_ttfp_ms": [395.2182],
-            "mean_audio_rtf": [0.1259]
-        }
+        "baseline": {}
       },
       {
         "dataset_name": "random-mm",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
+        "extra_body": {"speaker": "ethan"},
         "num_prompts": [100],
         "request_rate": [1.0],
         "random_input_len": 100,
@@ -116,11 +116,7 @@
           "(0, 60, 3)": 0.33
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-            "mean_ttft_ms": [470.6126],
-            "mean_audio_ttfp_ms": [665.5474],
-            "mean_audio_rtf": [0.166]
-        }
+        "baseline": {}
       }
     ]
   }

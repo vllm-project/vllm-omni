@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+
+    from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+    from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -26,6 +33,16 @@ class DiffusionRequestStatus(enum.IntEnum):
     @staticmethod
     def is_finished(status: DiffusionRequestStatus) -> bool:
         return status >= DiffusionRequestStatus.FINISHED_COMPLETED
+
+
+@dataclass(frozen=True)
+class _AdmissionWaitDecision:
+    """Internal scheduler policy for delaying the next admission wave."""
+
+    should_wait: bool
+    deadline: float | None = None
+    stable_window_s: float = 0.0
+    max_batch: int = 1
 
 
 @dataclass(frozen=True, eq=True)
@@ -55,6 +72,19 @@ class StepBatchSamplingParamsKey:
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False
 
+    # Request-scoped execution policy. A batch must use one quality mode
+    # because model acceleration hooks are shared by the whole worker batch.
+    quality: str | None = None
+
+    # Step-mode engines can admit a model-specific full-forward fallback. Do
+    # not mix it with state-driven denoising in one scheduler wave.
+    use_step_execution: bool = True
+
+    # Pipeline-specific structure populated during preprocessing. This keeps
+    # model-owned settings that must be homogeneous (for example BAGEL CFG
+    # scales and renormalization) out of the generic sampling-params schema.
+    condition_key: tuple[Any, ...] | None = None
+
     # Output count. Requests with different num_outputs_per_prompt produce
     # differently shaped outputs and cannot share a batch.
     num_outputs_per_prompt: int = 1
@@ -70,9 +100,10 @@ class RequestBatchSamplingParamsKey:
     """Request level Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
 
     Only request-batch-wide fields belong here. Request-local values such as
-    seeds, generators, latent tensors, timesteps, and pipeline-specific
+    seeds, generators, latent tensors, timesteps, and request-local
     ``extra_args`` are read per request from
-    ``DiffusionRequestBatch.sampling_params_list``.
+    ``DiffusionRequestBatch.sampling_params_list``. Structural ``extra_args``
+    that affect batching are listed explicitly below.
     """
 
     # Spatial / temporal shape.
@@ -89,6 +120,7 @@ class RequestBatchSamplingParamsKey:
     guidance_scale: float = 0.0
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
+    guidance_scale_2_provided: bool = False
     guidance_rescale: float = 0.0
     true_cfg_scale: float | None = None
     cfg_normalize: bool = False
@@ -108,6 +140,21 @@ class RequestBatchSamplingParamsKey:
     layers: int = 4
     use_en_prompt: bool = False
 
+    # Request-scoped execution policy. Keep accelerated and reference-path
+    # requests in separate worker batches. ``None`` delegates the default to
+    # the model and must remain distinct from explicit ``lossless``.
+    quality: str | None = None
+
+    # Wan scheduler structure is carried through extra_args. Requests using
+    # different solvers or flow shifts must not share a request batch.
+    sample_solver: str | None = None
+    flow_shift: float | None = None
+
+    # Pipeline-specific condition structure populated during preprocessing.
+    # It prevents independently valid requests with incompatible conditions
+    # from being admitted to the same request batch.
+    condition_key: tuple[Any, ...] | None = None
+
     # LoRA identity.
     lora_int_id: int | None = None
     lora_scale: float = 1.0
@@ -120,8 +167,10 @@ class SchedulerRequestState:
     request_id: str
     req: OmniDiffusionRequest
     sampling_params_key: StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None = None
+    diffusion_kv_requests: tuple[DiffusionKVRequest, ...] = ()
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
+    queued_at: float = 0.0
 
     def is_finished(self) -> bool:
         return DiffusionRequestStatus.is_finished(self.status)
@@ -138,10 +187,39 @@ class NewRequestData:
 
     request_id: str
     req: OmniDiffusionRequest
+    diffusion_kv_metadata: DiffusionKVMetadata | None = None
 
     @classmethod
-    def from_state(cls, state: SchedulerRequestState) -> NewRequestData:
-        return cls(request_id=state.request_id, req=state.req)
+    def from_state(
+        cls,
+        state: SchedulerRequestState,
+        *,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
+    ) -> NewRequestData:
+        return cls(
+            request_id=state.request_id,
+            req=state.req,
+            diffusion_kv_metadata=diffusion_kv_metadata,
+        )
+
+
+def validate_new_request_data_identity(new_req: NewRequestData) -> None:
+    """Ensure an envelope and its forwarded request describe the same request."""
+    forwarded_request_id = new_req.req.request_id
+    if new_req.request_id != forwarded_request_id:
+        raise ValueError(
+            "Diffusion request identity mismatch: "
+            f"envelope request_id={new_req.request_id!r}, "
+            f"forwarded request_id={forwarded_request_id!r}"
+        )
+
+    metadata = new_req.diffusion_kv_metadata
+    if metadata is not None and metadata.request_id != forwarded_request_id:
+        raise ValueError(
+            "Diffusion request identity mismatch: "
+            f"metadata request_id={metadata.request_id!r}, "
+            f"forwarded request_id={forwarded_request_id!r}"
+        )
 
 
 @dataclass
@@ -177,6 +255,27 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
     # next request to background-prefetch KV
     kv_prefetch_job: KVPrefetchJob | None = None
+    kv_connector_metadata: KVConnectorMetadata | None = None
+    kv_transfer_request_ids: set[str] = field(default_factory=set)
+    # None preserves the synchronous path; an empty set means submit/poll
+    # without waiting. Transfer IDs above are submitted only once.
+    kv_required_request_ids: set[str] | None = None
+    kv_poll_only: bool = False
+    # Keep background transfers out of the current request's Mooncake batch.
+    kv_prefetch_connector_metadata: KVConnectorMetadata | None = None
+    kv_prefetch_request_ids: set[str] = field(default_factory=set)
+    # Connector lifecycle uses per-sequence IDs, not public request IDs.
+    kv_finished_request_ids: set[str] = field(default_factory=set)
+    # A single host-selected boundary decision is delivered to every Worker.
+    step_resumes: dict[str, Literal["interaction", "timeout"]] = field(default_factory=dict)
+    interaction_boundaries: dict[str, InteractionBoundaryContext] = field(default_factory=dict)
+
+    @property
+    def has_sync_kv_loads(self) -> bool:
+        # vLLM defers async submission until post_forward. The synchronous
+        # receive loop must start its loads in pre_forward before polling.
+        required = self.kv_required_request_ids
+        return bool(self.kv_transfer_request_ids if required is None else required)
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:
@@ -194,4 +293,10 @@ class DiffusionSchedulerOutput:
 
     @property
     def is_empty(self) -> bool:
-        return self.num_scheduled_reqs == 0
+        return (
+            self.num_scheduled_reqs == 0
+            and self.kv_connector_metadata is None
+            and self.kv_prefetch_connector_metadata is None
+            and not self.kv_required_request_ids
+            and not self.kv_poll_only
+        )

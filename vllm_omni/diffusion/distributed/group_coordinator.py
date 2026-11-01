@@ -199,9 +199,15 @@ class GroupCoordinator:
         return input_
 
     def all_gather(
-        self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False
+        self,
+        input_: torch.Tensor,
+        dim: int = 0,
+        separate_tensors: bool = False,
+        group: ProcessGroup | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
-        world_size = self.world_size
+        if group is None:
+            group = self.device_group
+        world_size = torch.distributed.get_world_size(group)
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
@@ -214,7 +220,7 @@ class GroupCoordinator:
         input_size[0] *= world_size
         output_tensor = torch.empty(input_size, dtype=input_.dtype, device=input_.device)
         # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor, input_.contiguous(), group=self.device_group)
+        torch.distributed.all_gather_into_tensor(output_tensor, input_.contiguous(), group=group)
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
@@ -378,6 +384,7 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
+        source_rank_in_group = src
         src = self.ranks[src]
 
         rank = self.rank
@@ -388,7 +395,7 @@ class GroupCoordinator:
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
             # all happening on CPU. Therefore, we can use the CPU group.
-            self.broadcast_object(metadata_list, src=src)
+            self.broadcast_object(metadata_list, src=source_rank_in_group)
             async_handles = []
             for tensor in tensor_list:
                 if tensor.numel() == 0:
@@ -405,7 +412,7 @@ class GroupCoordinator:
                 async_handle.wait()
 
         else:
-            metadata_list = self.broadcast_object(None, src=src)
+            metadata_list = self.broadcast_object(None, src=source_rank_in_group)
             tensor_dict = {}
             async_handles = []
             for key, value in metadata_list:
@@ -985,6 +992,18 @@ class PipelineGroupCoordinator(GroupCoordinator):
     def _pipeline_isend_skip(self, tensor: torch.tensor):
         return torch.distributed.isend(tensor, dst=self.skip_rank, group=self.skip_device_group)
 
+    def destroy(self):
+        groups = [*self.device_groups, *self.cpu_groups, self.skip_device_group]
+        seen = {id(self.device_group), id(self.cpu_group)}
+        for group in groups:
+            if group is not None and id(group) not in seen:
+                torch.distributed.destroy_process_group(group)
+                seen.add(id(group))
+        self.device_groups = []
+        self.cpu_groups = []
+        self.skip_device_group = None
+        super().destroy()
+
 
 class SequenceParallelGroupCoordinator(GroupCoordinator):
     def __init__(
@@ -1002,6 +1021,7 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
 
         ulysses_group = kwargs.get("ulysses_group", None)
         ring_group = kwargs.get("ring_group", None)
+        allgather_group = kwargs.get("allgather_group", None)
         if ulysses_group is None:
             raise RuntimeError(
                 "Please pass argument 'ulysses_group' when calling init func of SequenceParallelGroupCoordinator"
@@ -1010,10 +1030,29 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
             raise RuntimeError(
                 "Please pass argument 'ring_group' when calling init func of SequenceParallelGroupCoordinator"
             )
+        if allgather_group is None:
+            raise RuntimeError(
+                "Please pass argument 'allgather_group' when calling init func of SequenceParallelGroupCoordinator"
+            )
         self.ulysses_group = ulysses_group
         self.ring_group = ring_group
+        self.allgather_group = allgather_group
 
         self.ulysses_world_size = torch.distributed.get_world_size(self.ulysses_group)
         self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
+        self.allgather_world_size = torch.distributed.get_world_size(self.allgather_group)
+        self.allgather_rank = torch.distributed.get_rank(self.allgather_group)
+
+    def destroy(self):
+        groups = [self.ulysses_group, self.ring_group, self.allgather_group]
+        seen = {id(self.device_group), id(self.cpu_group)}
+        for group in groups:
+            if group is not None and id(group) not in seen:
+                torch.distributed.destroy_process_group(group)
+                seen.add(id(group))
+        self.ulysses_group = None
+        self.ring_group = None
+        self.allgather_group = None
+        super().destroy()

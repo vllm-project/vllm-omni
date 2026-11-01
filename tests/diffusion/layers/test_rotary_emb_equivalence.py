@@ -13,6 +13,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
 
 def _apply_rotary_emb_helios_original(
     hidden_states: torch.Tensor,

@@ -53,7 +53,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
   --deploy-config /path/to/your_qwen3_omni_overrides.yaml
 ```
 
-#### Runtime tuning
+### Runtime tuning
 
 Prefer CLI overrides for day-to-day tuning:
 
@@ -73,9 +73,31 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     "1": {"max_num_seqs": 4},
     "2": {"max_num_seqs": 4}
   }'
+
+# Replay the thinker's image and audio encoders from CUDA graphs (video stays eager)
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": true}}}'
 ```
 
-#### Stage-based launch (one stage per process)
+With the encoder graphs on, the thinker captures one graph per token budget
+(64 to 256 image tokens, 13 to 104 audio tokens, i.e. up to 8 seconds of audio,
+and up to 4 items per replay by default). A step's images, or its audio
+clips, replay together when one captured graph holds them all; otherwise they
+run through the eager encoder in one call, as do audio clips that are all
+shorter than one second. Set `encoder_cudagraph_token_budgets`
+and `encoder_cudagraph_max_vision_items_per_batch` in the same
+`compilation_config` to change them (for audio, each listed budget rounds down
+to whole 13-token chunks and stops at 104 tokens); each captured budget adds
+graph memory on the thinker's GPU. Audio graphs are CUDA only; audio also stays eager with model runner v2,
+with `mm_encoder_tp_mode: data`, and when no listed budget reaches 13 tokens;
+to keep the image graphs and run audio eagerly in other setups, start with
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": true}, "additional_config": {"audio_encoder_cudagraph": false}}}'
+```
+
+### Stage-based launch (one stage per process)
 
 Use three terminals (one per stage). Start with the default commands below, then
 add `--max-num-seqs` only if you need explicit per-stage concurrency control.
@@ -135,7 +157,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 
 If you use custom deploy YAML, add `--deploy-config` to each stage command.
 
-#### Verification
+### Verification
 
 After server startup, run a multimodal example client:
 
@@ -185,7 +207,7 @@ python examples/online_serving/qwen3_omni/openai_realtime_client.py \
   --output-wav realtime_output.wav
 ```
 
-#### Benchmark with `vllm bench`
+### Benchmark with `vllm bench`
 
 After the server is up, you can run online serving benchmarks with
 `vllm bench serve --omni`.
@@ -240,8 +262,54 @@ vllm bench serve \
   --percentile-metrics ttft,tpot,itl,e2el
 ```
 
-#### Notes
+### Notes
 
 - `/v1/realtime` is unsupported while `async_chunk` is enabled.
 - The default deploy uses `SharedMemoryConnector`; this is for single-host
   stage wiring.
+
+## XPU
+
+### 5x Intel Arc Pro B70 (32 GB)
+
+Offline end-to-end text query returning both text and speech. The 62 GiB of
+BF16 thinker weights need four cards, so the `xpu:` block of
+`vllm_omni/deploy/qwen3_omni_moe.yaml` runs the thinker at TP=4 on cards 0-3
+and the talker and code2wav on card 4. It is the registry default here, so
+`--deploy-config` is not needed.
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- torch: 2.13.0+xpu
+- vLLM: 0.29.0 (`98dff2a8`)
+- vLLM-Omni: `main` at `4c7a98c2`
+
+#### Command
+
+The raised timeouts absorb the first decode step, which JIT-compiles the
+Triton MoE kernels.
+
+```bash
+VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 \
+python examples/offline_inference/qwen3_omni/end2end.py \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --query-type text \
+  --stage-init-timeout 1800 \
+  --init-timeout 1800 \
+  --output-wav qwen3omni_output
+```
+
+#### Verification
+
+`qwen3omni_output/` holds one `.txt` answer and the matching `.wav`. Confirm
+the transcript of the audio tracks the text response.
+
+#### Notes
+
+- Runtime: about 260 s for a single text query.
+- The thinker MoE layers have no tuned Triton config for this shape and log
+  `Using default MoE config. Performance might be sub-optimal!`.
+- Known limitations: only `--query-type text` was qualified. The audio, image,
+  and video query types and online serving are out of scope for this profile.
