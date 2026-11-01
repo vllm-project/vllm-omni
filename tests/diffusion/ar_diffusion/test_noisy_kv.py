@@ -399,9 +399,7 @@ def test_same_step_all_live_history_versions_fit_capacity(groups):
             task = plan.task(tick, rank)
             if task is not None:
                 contexts = state.prepare(tuple((req, task) for req in ("A", "B")))
-                assert all(
-                    context[0].seq_len == (len(plan.sources(task, rank)) + 1) * 4 for context in contexts
-                )
+                assert all(context[0].seq_len == (len(plan.sources(task, rank)) + 1) * 4 for context in contexts)
         for transfer in plan.transfers(tick):
             for req in ("A", "B"):
                 key = (req, *transfer.version)
