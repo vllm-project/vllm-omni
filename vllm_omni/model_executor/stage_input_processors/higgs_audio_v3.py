@@ -82,29 +82,28 @@ def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
     return torch.cat(out_l, dim=0)
 
 
-def _filter_real_code_frames(audio_codes_qt: torch.Tensor) -> torch.Tensor:
-    """Keep only frames where ALL codebook values are in [0, 1023].
+def _valid_code_prefix(audio_codes_qt: torch.Tensor) -> torch.Tensor:
+    """Keep complete codec frames preceding the first stream special/pad.
 
-    Input shape: [num_codebooks, num_frames].
-    Called AFTER delay pattern reversal.
+    Called after de-delay. A mixed frame containing EOC in just one codebook
+    is not decodable audio. Replacing that EOC with code 0 creates a valid but
+    unrelated codec vector, which can produce a sentence-tail noise burst.
+    Keep a prefix rather than compacting frames so streaming offsets remain
+    in the original de-delayed frame coordinates.
     """
-    if audio_codes_qt.numel() == 0:
-        return audio_codes_qt
-    # Transpose to [num_frames, num_codebooks] for per-frame filtering
-    frames = audio_codes_qt.t()
-    valid = (frames >= 0).all(dim=1) & (frames < _NUM_REAL_CODES).all(dim=1)
-    return frames[valid].t().contiguous()
+    invalid = ((audio_codes_qt < 0) | (audio_codes_qt >= _NUM_REAL_CODES)).any(dim=0)
+    positions = invalid.nonzero(as_tuple=True)[0]
+    if positions.numel():
+        return audio_codes_qt[:, : int(positions[0])]
+    return audio_codes_qt
 
 
 def _whole_utterance_codec_codes(audio_rows: torch.Tensor) -> torch.Tensor:
     """Convert complete delayed [T, Q] rows to flat codebook-major CPU codes."""
     codes = _revert_delay_pattern(audio_rows.to(device="cpu", dtype=torch.long).t().contiguous())
-    # Substitute special/padding codes after de-delay. Clamping would map EOC
-    # to a valid codec entry and introduce audible artifacts.
-    codes = torch.where((codes < 0) | (codes >= _NUM_REAL_CODES), 0, codes)
-    # Preserve the existing removal of the residual ramp-down frame.
-    if codes.shape[-1] >= 2:
-        codes = codes[:, :-1]
+    # EOC ramp-down can leave more than one incomplete frame. Do not
+    # synthesize replacement codes or drop a valid final frame blindly.
+    codes = _valid_code_prefix(codes)
     return codes.reshape(-1).contiguous()
 
 
@@ -223,10 +222,12 @@ def talker2code2wav_async_chunk(
       ``[emitted_frames - L, target_emit + H]`` de-delayed frames; that
       corresponds to AR rows
       ``[emitted_frames - L, target_emit + H + Q - 1]``. Apply de-delay,
-      replace out-of-range codes with 0, and emit codebook-major flat.
-    * Stage 1 honors ``meta.left_context_size = L`` (trim front) and
-      ``meta.right_holdback_size = H`` (trim end). Net new audio per call
-      is ``(target_emit - emitted_frames) * hop_length`` samples.
+      retain only the complete real-code prefix, and emit codebook-major
+      flat. Exclude invalid frames from both audio and right context.
+    * Stage 1 trims the actual left context and right holdback recorded in
+      the payload metadata. Invalid tail frames can reduce the right context
+      and new audio below the configured window sizes. Net new audio per
+      call is ``actual_chunk * hop_length`` samples.
     """
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
@@ -314,8 +315,6 @@ def _flush_async_chunk(
             )
         return None
 
-    actual_chunk = pending
-
     desired_left_context = min(left_context_size_config, emitted)
 
     # Window in AR-row space: span the de-delayed frames
@@ -356,25 +355,22 @@ def _flush_async_chunk(
             codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
             meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
         )
-    # Replace BOC=1024/EOC=1025 (and any negative pads) with 0; matches the
-    # sync-path substitution. Clamp would turn 1025 into 1023 which is a
-    # VALID codec code and decodes to audible artifacts.
-    de_delayed = torch.where(
-        (de_delayed >= _NUM_REAL_CODES) | (de_delayed < 0),
-        torch.zeros_like(de_delayed),
-        de_delayed,
-    )
-
-    # On the FINAL chunk only: trim the trailing residual frame (the last
-    # de-delayed frame still carries EOC-substituted codes from ramp-down
-    # which decode to a brief noise artifact). Mirrors the sync-path trim.
-    if finished and window_row_end_exclusive == n_rows and de_delayed.shape[-1] >= 2:
-        de_delayed = de_delayed[:, :-1]
-        actual_chunk = max(actual_chunk - 1, 0)
+    # Never let ramp-down specials reach the codec, even as right context
+    # on a non-final chunk. The finish notification can follow the EOC rows.
+    de_delayed = _valid_code_prefix(de_delayed)
+    actual_chunk = min(pending, max(0, de_delayed.shape[-1] - desired_left_context))
+    if actual_chunk == 0:
+        if finished:
+            emitted_frames.pop(request_id, None)
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
+        return None
 
     codec_codes = de_delayed.reshape(-1)
     left_context_emitted = desired_left_context
-    right_holdback_emitted = H
+    right_holdback_emitted = de_delayed.shape[-1] - desired_left_context - actual_chunk
 
     emitted_frames[request_id] = emitted + actual_chunk
     if finished:
