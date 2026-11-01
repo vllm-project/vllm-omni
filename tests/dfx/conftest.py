@@ -545,6 +545,78 @@ def resolve_baseline_for_sweep(
     }
 
 
+def _cli_argument(args: list[str], name: str, default: str = "") -> str:
+    return args[args.index(name) + 1] if name in args else default
+
+
+def _cli_int_argument(args: list[str], name: str) -> int | None:
+    if name not in args:
+        return None
+    return int(args[args.index(name) + 1])
+
+
+def _write_omniinteract_accuracy_result(
+    result: dict[str, Any],
+    *,
+    args: list[str],
+    test_name: str,
+    dataset_name: str,
+    num_prompt: int,
+    returncode: int,
+    started_at: datetime,
+    current_dt: str,
+    benchmark_params_name: str | None,
+    accuracy_baseline: dict[str, Any] | None,
+) -> Path:
+    from tests.e2e.accuracy.helpers import (
+        _OMNIINTERACT_DATASET,
+        _acc_result_filename,
+        flatten_omniinteract_accuracy_metrics,
+        omniinteract_accuracy_result_dir,
+        write_dfx_accuracy_result,
+    )
+
+    model_id = result.get("model_id") or _cli_argument(args, "--model")
+    subset = _cli_argument(args, "--omniinteract-subsets") or None
+    suite = f"{_OMNIINTERACT_DATASET}_{subset}" if subset else _OMNIINTERACT_DATASET
+    accuracy_path = omniinteract_accuracy_result_dir() / _acc_result_filename(
+        str(model_id),
+        suite,
+        when=started_at,
+    )
+    omni = result.get("omniinteract")
+    accuracy = omni.get("accuracy") if isinstance(omni, dict) else None
+    if not isinstance(accuracy, dict):
+        accuracy = {"status": "failed", "error": "benchmark did not produce an accuracy result"}
+    else:
+        accuracy = flatten_omniinteract_accuracy_metrics(accuracy)
+    generation: dict[str, Any] = {
+        "completed": result.get("completed", 0),
+        "failed": result.get("failed", 0),
+    }
+    if isinstance(omni, dict):
+        generation.update({key: value for key, value in omni.items() if key != "accuracy"})
+    write_dfx_accuracy_result(
+        accuracy_path,
+        test_name=test_name,
+        name=subset or benchmark_params_name,
+        model_id=str(model_id),
+        dataset=_OMNIINTERACT_DATASET,
+        dataset_path=_cli_argument(args, "--dataset-path", dataset_name),
+        date=str(result.get("date") or current_dt),
+        hardware=str(result["Hardware"]),
+        baseline=accuracy_baseline or {},
+        branch=str(result["branch"]),
+        num_prompts=num_prompt,
+        max_concurrency=_cli_int_argument(args, "--max-concurrency"),
+        benchmark_exit_code=returncode,
+        generation=generation,
+        accuracy=accuracy,
+    )
+    print(f"Accuracy result saved to {accuracy_path}")
+    return accuracy_path
+
+
 def run_benchmark(
     args: list[str],
     test_name: str,
@@ -678,47 +750,43 @@ def run_benchmark(
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
-        from tests.e2e.accuracy.helpers import _acc_result_filename
+        from tests.e2e.accuracy.helpers import (
+            _DUPLEX_EVAL_DEFAULT_ACC_DIR,
+            _acc_result_filename,
+            dfx_accuracy_result_dir,
+            write_dfx_accuracy_result,
+        )
 
-        def argument(name: str, default: str = "") -> str:
-            return args[args.index(name) + 1] if name in args else default
-
-        model_id = result.get("model_id") or argument("--model")
+        # Intentional parallel of _write_omniinteract_accuracy_result: no flatten; NPU exit stays after the write.
+        model_id = result.get("model_id") or _cli_argument(args, "--model")
         dataset = "omni_duplex_eval"
-        accuracy_dir = Path(os.environ.get("ACC_BENCH_RESULT_DIR", "tests/e2e/accuracy/omni_duplex_eval/results"))
-        accuracy_dir.mkdir(parents=True, exist_ok=True)
-        accuracy_path = accuracy_dir / _acc_result_filename(model_id, dataset, when=started_at)
+        accuracy_dir = dfx_accuracy_result_dir(_DUPLEX_EVAL_DEFAULT_ACC_DIR)
+        accuracy_path = accuracy_dir / _acc_result_filename(str(model_id), dataset, when=started_at)
         # Persist before quality assertions, including partial or failed judging.
         duplex = result.get("omni_duplex_eval")
         accuracy = duplex.get("accuracy") if isinstance(duplex, dict) else None
         if not isinstance(accuracy, dict):
             accuracy = {"status": "failed", "error": "benchmark did not produce an accuracy result"}
-        accuracy_path.write_text(
-            json.dumps(
-                {
-                    "test_name": test_name,
-                    "name": benchmark_params_name,
-                    "model_id": model_id,
-                    "dataset": dataset,
-                    "dataset_path": argument("--dataset-path", dataset_name),
-                    "date": result.get("date") or current_dt,
-                    "Hardware": result["Hardware"],
-                    "baseline": accuracy_baseline or {},
-                    "branch": result["branch"],
-                    "num_prompts": num_prompt,
-                    "max_concurrency": int(argument("--max-concurrency")) if "--max-concurrency" in args else None,
-                    "benchmark_exit_code": returncode,
-                    "generation": {
-                        "completed": result.get("completed", 0),
-                        "failed": result.get("failed", 0),
-                        **({k: v for k, v in duplex.items() if k != "accuracy"} if isinstance(duplex, dict) else {}),
-                    },
-                    "accuracy": accuracy,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        write_dfx_accuracy_result(
+            accuracy_path,
+            test_name=test_name,
+            name=benchmark_params_name,
+            model_id=str(model_id),
+            dataset=dataset,
+            dataset_path=_cli_argument(args, "--dataset-path", dataset_name),
+            date=str(result.get("date") or current_dt),
+            hardware=str(result["Hardware"]),
+            baseline=accuracy_baseline or {},
+            branch=str(result["branch"]),
+            num_prompts=num_prompt,
+            max_concurrency=_cli_int_argument(args, "--max-concurrency"),
+            benchmark_exit_code=returncode,
+            generation={
+                "completed": result.get("completed", 0),
+                "failed": result.get("failed", 0),
+                **({k: v for k, v in duplex.items() if k != "accuracy"} if isinstance(duplex, dict) else {}),
+            },
+            accuracy=accuracy,
         )
         print(f"Accuracy result saved to {accuracy_path}")
         from vllm_omni.platforms import current_omni_platform
@@ -727,6 +795,19 @@ def run_benchmark(
         # requiring complete artifacts and scores in the caller's assertions.
         allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
         assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
+    if dataset_name == "omniinteract" and "--omniinteract-evaluate" in args:
+        _write_omniinteract_accuracy_result(
+            result,
+            args=args,
+            test_name=test_name,
+            dataset_name=dataset_name,
+            num_prompt=num_prompt,
+            returncode=returncode,
+            started_at=started_at,
+            current_dt=current_dt,
+            benchmark_params_name=benchmark_params_name,
+            accuracy_baseline=accuracy_baseline,
+        )
     return result
 
 
