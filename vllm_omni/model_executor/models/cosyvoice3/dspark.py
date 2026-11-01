@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -56,7 +55,8 @@ def ras_probabilities(
 ) -> torch.Tensor:
     """Marginalize the ordinary sampler's initial draw and one RAS redraw.
 
-    ``recent_tokens`` contains generated tokens only, with -1 for absent history.
+    ``recent_tokens`` contains stage-vocabulary generated tokens only, with -1
+    for absent history, validated by ``ras_verification_logits`` before compile.
     The nucleus uses full-distribution top-p before the top-k cap. A repeated
     first draw is replaced from the full tempered distribution excluding that
     token, rather than from the nucleus. Temperature-zero rows remain greedy.
@@ -66,6 +66,7 @@ def ras_probabilities(
     sorted_probs, sorted_ids = full.sort(dim=-1, descending=True, stable=True)
     ranks = torch.arange(logits.shape[-1], device=logits.device)
     keep = sorted_probs.cumsum(dim=-1) - sorted_probs < top_ps.unsqueeze(1)
+    keep |= ranks.unsqueeze(0) == 0
     keep &= (top_ks.unsqueeze(1) <= 0) | (ranks.unsqueeze(0) < top_ks.unsqueeze(1))
     nucleus = sorted_probs.masked_fill(~keep, 0)
     nucleus = nucleus / nucleus.sum(dim=-1, keepdim=True)
@@ -149,6 +150,11 @@ def ras_verification_logits(
         input_ids,
         expanded_local_pos,
         win_size,
+    )
+    # Keep the check outside compiled math: Inductor can elide _assert_async.
+    torch._assert_async(
+        ((history == -1) | ((history >= 0) & (history < logits.shape[-1]))).all(),
+        "CosyVoice3 RAS history must contain stage speech-token IDs or -1, not unified-vocabulary IDs",
     )
     probabilities = sampler._cosyvoice3_ras_probabilities(
         logits, states.temperature.gpu[rows], top_k, top_p, history, win_size=win_size, tau_r=tau_r
@@ -256,11 +262,3 @@ def convert_checkpoint(source: Path, destination: Path) -> None:
     }
     (destination / "conversion-manifest.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt), flush=True)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", type=Path)
-    parser.add_argument("destination", type=Path)
-    arguments = parser.parse_args()
-    convert_checkpoint(arguments.source, arguments.destination)

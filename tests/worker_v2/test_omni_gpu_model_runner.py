@@ -564,7 +564,10 @@ def test_dummy_forward_uses_upstream_execution_state(
     runner._staged_writes = staged_writes.StagedWrites()
     hidden = torch.ones(1, 2)
     aux_hidden = [hidden + 1, hidden + 2] if aux_outputs else None
-    runner.use_aux_hidden_state_outputs = aux_outputs
+    # These are Omni-owned tuples, not the drafter's outer target-layer tuple.
+    runner.use_aux_hidden_state_outputs = False
+    if runner_kind != "generation":
+        runner._last_aux_output = [torch.full_like(hidden, -99)]
     runner.model = MagicMock(
         return_value=OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
         if runner_kind == "generation"
@@ -637,11 +640,18 @@ def test_dummy_forward_uses_upstream_execution_state(
     assert isinstance(runner.execute_model_state, ExecuteModelState)
     assert runner.execute_model_state.input_batch is input_batch
     assert runner.execute_model_state.cudagraph_stats is None
-    assert runner.execute_model_state.aux_hidden_states is aux_hidden
+    assert runner.execute_model_state.aux_hidden_states is None
+    if runner_kind != "generation":
+        assert runner._last_aux_output is aux_hidden
     if runner_kind == "generation":
         assert not runner._prev_step_idle
     else:
         runner.prepare_dummy_attn.assert_called_once_with(input_batch, True)
+    if aux_outputs:
+        runner.model.return_value = hidden
+        runner.execute_model(scheduled, dummy_run=True, valid_dummy_state_slots=True)
+        assert runner._last_aux_output is None
+        assert runner.execute_model_state.aux_hidden_states is None
 
 
 @pytest.mark.parametrize("cg_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
@@ -699,3 +709,12 @@ def test_drafter_target_layers_reach_execute_state(cg_mode, monkeypatch):
         runner.model.assert_not_called()
     else:
         runner.cudagraph_manager.run_fullgraph.assert_not_called()
+
+    previous_state = runner.execute_model_state
+    current_aux = [aux[0] + 1]
+    runner.model.return_value = (hidden, current_aux)
+    runner.cudagraph_manager.run_fullgraph.return_value = (hidden, current_aux)
+    runner.execute_model(scheduled, dummy_run=True, valid_dummy_state_slots=True)
+    assert runner.execute_model_state.aux_hidden_states is current_aux
+    assert runner._last_aux_output is None
+    assert previous_state.aux_hidden_states is aux

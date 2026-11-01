@@ -6,6 +6,7 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -157,6 +158,107 @@ def test_ras_top_k_one_still_redraws_repeated_token():
     assert result[0, 1] > result[0, 2] > 0
 
 
+@pytest.mark.parametrize("top_p", [-1.0, 0.0, 1e-50])
+@pytest.mark.parametrize("history", [[-1] * 10, [0] * 10])
+def test_ras_empty_nucleus_keeps_rank_zero_before_optional_redraw(top_p, history):
+    logits = torch.tensor([[4.0, 1.0, 0.0]])
+    result = dspark.ras_probabilities(
+        logits, torch.ones(1), torch.tensor([3]), torch.tensor([top_p]), torch.tensor([history])
+    )
+    assert torch.isfinite(result).all()
+    torch.testing.assert_close(result.sum(dim=-1), torch.ones(1))
+    if history[0] == -1:
+        torch.testing.assert_close(result, torch.tensor([[1.0, 0.0, 0.0]]))
+    else:
+        torch.testing.assert_close(result, torch.tensor([[0.0, 0.7310586, 0.2689414]]))
+
+
+@pytest.mark.parametrize("bad_token", [-2, dspark.STAGE_VOCAB_SIZE, dspark.UNIFIED_SPEECH_OFFSET + 3])
+@pytest.mark.parametrize("source", ["committed", "draft"])
+def test_ras_rejects_foreign_generated_history_but_excludes_reference_prompt(monkeypatch, bad_token, source):
+    # Real Talker vocabulary sizes, text/reference prompt, persistent history,
+    # current anchor and draft prefix. Only generated IDs are checked.
+    table = torch.tensor([[151936, dspark.UNIFIED_SPEECH_OFFSET + 7, 7, 8, 0]])
+    inputs = torch.tensor([8, 9])
+    if source == "committed":
+        table[0, 2] = bad_token
+    else:
+        inputs[1] = bad_token
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.worker.gpu.sample.logits_processor.interface",
+        SimpleNamespace(LogitsContext=SimpleNamespace),
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.v1.worker.gpu.sample.penalties", SimpleNamespace(PenaltiesState=type("P", (), {}))
+    )
+    probabilities = Mock(side_effect=dspark.ras_probabilities)
+    sampler = SimpleNamespace(
+        logits_processors=[],
+        sampling_states=SimpleNamespace(
+            get_top_k_top_p=lambda *_: (None, None), temperature=SimpleNamespace(gpu=torch.ones(1))
+        ),
+        req_states=SimpleNamespace(
+            all_token_ids=SimpleNamespace(gpu=table), prompt_len=SimpleNamespace(gpu=torch.tensor([2]))
+        ),
+        _cosyvoice3_ras_probabilities=probabilities,
+    )
+    with pytest.raises(RuntimeError, match="stage speech-token IDs"):
+        dspark.ras_verification_logits(
+            sampler,
+            torch.zeros(2, dspark.STAGE_VOCAB_SIZE),
+            torch.tensor([0, 0]),
+            torch.tensor([0]),
+            np.array([0]),
+            torch.tensor([3, 4]),
+            inputs,
+            torch.tensor([0, 1]),
+            np.array([5]),
+            default_top_p=0.8,
+            default_top_k=20,
+            win_size=10,
+            tau_r=0.1,
+        )
+    probabilities.assert_not_called()
+
+
+def test_ras_speech_vocabulary_history_ignores_only_reference_tokens():
+    table = torch.tensor([[151936, dspark.UNIFIED_SPEECH_OFFSET + 7, 7, 8, 0]])
+    history = dspark.verification_history(
+        table,
+        torch.tensor([2]),
+        torch.tensor([0, 0]),
+        torch.tensor([3, 4]),
+        torch.tensor([8, 9]),
+        torch.tensor([0, 1]),
+        10,
+    )
+    assert history[:, :4].tolist() == [[8, 7, -1, -1], [9, 8, 7, -1]]
+    result = dspark.ras_probabilities(
+        torch.zeros(2, dspark.STAGE_VOCAB_SIZE),
+        torch.ones(2),
+        torch.full((2,), 20),
+        torch.full((2,), 0.8),
+        history,
+    )
+    assert torch.isfinite(result).all()
+    torch.testing.assert_close(result.sum(dim=-1), torch.ones(2))
+
+
+def test_ras_dynamic_compile_matches_eager_across_batch_and_history_shapes():
+    compiled = torch.compile(dspark.ras_probabilities, backend="eager", dynamic=True, fullgraph=True)
+    for batch, width in [(2, 4), (4, 7), (3, 11)]:
+        logits = torch.arange(batch * width, dtype=torch.float32).reshape(batch, width) / 10
+        args = (
+            logits,
+            torch.ones(batch),
+            torch.full((batch,), 3),
+            torch.full((batch,), 0.8),
+            torch.full((batch, 10), -1),
+        )
+        torch.testing.assert_close(compiled(*args), dspark.ras_probabilities(*args))
+
+
 @pytest.mark.parametrize("gap", [20.0, 35.0, 80.0])
 def test_ras_redraw_retains_mass_when_initial_float_probability_rounds_to_one(gap):
     logits = torch.tensor([[gap, 0.0, -1.0]])
@@ -198,6 +300,8 @@ def test_vocabulary_remap_preserves_reachable_columns_and_noise_embedding(monkey
     torch.testing.assert_close(converted["embed_tokens.weight"][:4], weights["embed_tokens.weight"][4:8])
     torch.testing.assert_close(converted["embed_tokens.weight"][4], weights["embed_tokens.weight"][9])
     torch.testing.assert_close(converted["lm_head.weight"], weights["lm_head.weight"][[1, 2]])
+    assert converted["embed_tokens.weight"].data_ptr() != weights["embed_tokens.weight"].data_ptr()
+    assert converted["lm_head.weight"].data_ptr() != weights["lm_head.weight"].data_ptr()
     torch.testing.assert_close(
         converted["markov_head.markov_w2.weight"], weights["markov_head.markov_w2.weight"][[1, 2]]
     )
@@ -221,3 +325,20 @@ def test_config_keeps_trained_auxiliary_layers_not_draft_layer_count():
     assert config["vocab_size"] == 6761
     assert config["draft_vocab_size"] == 6500
     assert config["sample_from_anchor"] is False and config["block_size"] == 7
+
+
+def test_converter_cli_forwards_paths_without_loading_weights(monkeypatch, tmp_path):
+    convert = Mock()
+    monkeypatch.setitem(
+        sys.modules, "vllm_omni.model_executor.models.cosyvoice3.dspark", SimpleNamespace(convert_checkpoint=convert)
+    )
+    source, destination = tmp_path / "input", tmp_path / "output"
+    monkeypatch.setattr(sys, "argv", ["convert_cosyvoice3_dspark.py", str(source), str(destination)])
+    path = Path(__file__).resolve().parents[4] / "tools/convert_cosyvoice3_dspark.py"
+    tool_spec = importlib.util.spec_from_file_location("cosyvoice3_converter_cli", path)
+    assert tool_spec is not None and tool_spec.loader is not None
+    tool = importlib.util.module_from_spec(tool_spec)
+    tool_spec.loader.exec_module(tool)
+    convert.assert_not_called()
+    tool.main()
+    convert.assert_called_once_with(source, destination)

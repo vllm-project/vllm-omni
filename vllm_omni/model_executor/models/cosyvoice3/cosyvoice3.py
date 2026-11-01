@@ -922,8 +922,11 @@ class CosyVoice3Model(
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
     def get_language_model(self) -> "nn.Module":
-        """Return the language model for upstream MoE detection."""
+        """Expose the decoder for upstream MoE detection and draft-layer setup."""
         if getattr(self, "_dspark_config", None) is not None:
+            # This Qwen decoder's text embedding is not a speech embedding.
+            # Converted drafts must retain their own embed_tokens and lm_head
+            # weights; upstream DSpark honors their loaded own-weight flags.
             return self.talker.llm
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()
@@ -932,9 +935,8 @@ class CosyVoice3Model(
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         if self.model_stage != "cosyvoice3_talker":
             raise ValueError("CosyVoice3 auxiliary hidden states belong to the Talker stage")
+        # MRv2 separates drafter target layers from Omni-owned auxiliary outputs.
         self.talker.llm.model._set_aux_hidden_state_layers(layers)
-        self._returns_tuple = True
-        self.supports_mrv2_full_graph_aux_outputs = True
 
     def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
         return (2, 12, 21)
@@ -1644,9 +1646,6 @@ class CosyVoice3Model(
         from the captured forward would replay dummy prompt tensors on every
         decode step. The runner calls this adapter with the current step's kwargs.
         """
-        if getattr(self, "_dspark_config", None) is not None and isinstance(hidden_states, tuple):
-            # The runner keeps auxiliary layers separately for the drafter.
-            hidden_states = hidden_states[0]
         multimodal_outputs = {}
 
         step_conditioning = getattr(self, "_mrv2_step_conditioning", None)
@@ -1712,7 +1711,7 @@ class CosyVoice3Model(
         inputs_embeds: torch.Tensor | None = None,
         additional_information: dict[str, object] | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | OmniOutput:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | OmniOutput:
         if self.model_stage == "cosyvoice3_talker":
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
