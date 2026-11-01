@@ -16,12 +16,14 @@ from vllm_omni.diffusion.models.longcat_video.longcat_video_avatar_transformer i
     replace_linear_with_quantized,
 )
 from vllm_omni.diffusion.models.longcat_video.pipeline_longcat_video_avatar import (
+    LongCatVideoAvatarPipeline,
     _avatar_model_allow_patterns,
     _build_multi_speaker_ref_target_masks,
     _default_at2v_shape,
     _infer_asset_root_from_path,
     _prepare_multi_speaker_audio_arrays,
     _resolve_num_segments,
+    get_longcat_video_avatar_post_process_func,
     prepare_longcat_video_avatar_model_for_omni,
 )
 
@@ -202,6 +204,92 @@ def test_longcat_video_avatar_multi_speaker_add_audio_arrays_are_sequential():
 
     assert left_out.tolist() == [1, 1, 1, 0, 0]
     assert right_out.tolist() == [0, 0, 0, 2, 2]
+
+
+def _write_tone(path, seconds: float, freq: float, sample_rate: int = 44100, channels: int = 2):
+    import soundfile as sf
+
+    t = np.arange(int(sample_rate * seconds), dtype=np.float32) / sample_rate
+    tone = (0.1 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+    sf.write(path, np.stack([tone] * channels, axis=-1) if channels > 1 else tone, sample_rate)
+    return str(path)
+
+
+@pytest.mark.parametrize("audio_type", ["para", "add"])
+def test_longcat_video_avatar_driving_audio_is_not_padded_to_video_length(tmp_path, audio_type: str):
+    """A video longer than the speech must not gain a silent tail in its audio track.
+
+    AVC continuation overshoots the audio, so the muxed track has to stay at the
+    real speech length instead of being padded out to the generated duration.
+    """
+    speech_s = 2.0
+    inputs = {
+        "audio_paths": {
+            "person1": _write_tone(tmp_path / "p1.wav", speech_s, 220),
+            "person2": _write_tone(tmp_path / "p2.wav", speech_s, 330),
+        },
+        "audio_type": audio_type,
+    }
+
+    waveform, sample_rate = LongCatVideoAvatarPipeline._driving_audio_waveform(
+        LongCatVideoAvatarPipeline, inputs, video_duration=10.0
+    )
+
+    # "para" overlaps both speakers, "add" chains them end to end.
+    expected_s = speech_s if audio_type == "para" else speech_s * 2
+    assert waveform is not None
+    assert waveform.shape[-1] / sample_rate == pytest.approx(expected_s, abs=0.01)
+
+
+def test_longcat_video_avatar_driving_audio_keeps_source_rate_and_channels(tmp_path):
+    """The mux must not inherit the 16 kHz mono layout the Whisper embeddings use."""
+    inputs = {
+        "audio_paths": {"person1": _write_tone(tmp_path / "p1.wav", 2.0, 220, sample_rate=44100, channels=2)},
+        "audio_type": "para",
+    }
+
+    waveform, sample_rate = LongCatVideoAvatarPipeline._driving_audio_waveform(
+        LongCatVideoAvatarPipeline, inputs, video_duration=10.0
+    )
+
+    assert sample_rate == 44100
+    assert waveform.shape[0] == 2
+
+
+def test_longcat_video_avatar_driving_audio_is_cropped_to_video_length(tmp_path):
+    inputs = {
+        "audio_paths": {"person1": _write_tone(tmp_path / "p1.wav", 5.0, 220)},
+        "audio_type": "para",
+    }
+
+    waveform, sample_rate = LongCatVideoAvatarPipeline._driving_audio_waveform(
+        LongCatVideoAvatarPipeline, inputs, video_duration=2.0
+    )
+
+    assert waveform.shape[-1] / sample_rate == pytest.approx(2.0, abs=0.01)
+
+
+def test_longcat_video_avatar_post_process_emits_driving_audio():
+    post_process = get_longcat_video_avatar_post_process_func(None)
+    frames = torch.zeros((2, 4, 6, 3), dtype=torch.uint8)
+    audio = np.ones(8, dtype=np.float32)
+
+    outputs = post_process((frames, audio, 44100))
+
+    assert len(outputs["video"][0]) == 2
+    assert outputs["audio"] is audio
+    assert outputs["audio_sample_rate"] == 44100
+
+
+def test_longcat_video_avatar_post_process_without_audio_stays_video_only():
+    post_process = get_longcat_video_avatar_post_process_func(None)
+    frames = torch.zeros((2, 4, 6, 3), dtype=torch.uint8)
+
+    outputs = post_process((frames, None, None))
+
+    assert len(outputs["video"][0]) == 2
+    assert "audio" not in outputs
+    assert "audio_sample_rate" not in outputs
 
 
 def test_longcat_video_avatar_multi_speaker_masks_use_explicit_bboxes():
