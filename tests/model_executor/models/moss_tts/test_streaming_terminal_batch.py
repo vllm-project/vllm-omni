@@ -27,7 +27,7 @@ class CausalCodec(nn.Module):
     def reset_decoder_state_slots(self, slots):
         self.state[slots] = 0
 
-    def decode_streaming_batch(self, codes, lengths, slots, valid_rows):
+    def decode_streaming_batch(self, codes, lengths, slots, valid_rows, slot0=None):
         audio = codes.sum(0).float().cumsum(-1) + self.state[slots, None]
         self.state[slots] = audio[:, -1]
         return SimpleNamespace(audio=audio[:, None], audio_lengths=lengths)
