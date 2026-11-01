@@ -1512,3 +1512,12 @@ class TestDense4DMaskRouting:
         # above cannot become dead code after a platform check regresses.
         monkeypatch.setattr(flash_attn_mod.current_omni_platform, "is_npu", lambda: is_npu)
         assert FlashAttentionBackend.supports_dense_4d_mask() is is_npu
+
+
+@pytest.mark.parametrize("per_role", [False, True])
+def test_quant_conflict_validation_accepts_sparse_specs(per_role):
+    from vllm_omni.diffusion.data import BlockSparseAttentionSpec, validate_kv_cache_dtype_vs_attention_specs
+
+    sparse = BlockSparseAttentionSpec(name="block_sparse")
+    config = AttentionConfig(per_role={"self": sparse}) if per_role else AttentionConfig(default=sparse)
+    validate_kv_cache_dtype_vs_attention_specs("fp8", config)

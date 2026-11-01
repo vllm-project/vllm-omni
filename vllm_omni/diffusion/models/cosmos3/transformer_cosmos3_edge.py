@@ -151,6 +151,8 @@ class Cosmos3EdgeCausalAttention(nn.Module):
             num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=True,
+            role="cosmos3.und",
+            role_category="self",
             softmax_scale=1.0 / (self.head_dim**0.5),
             num_kv_heads=self.num_kv_heads,
             skip_sequence_parallel=True,

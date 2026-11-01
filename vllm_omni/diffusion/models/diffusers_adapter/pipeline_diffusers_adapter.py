@@ -22,7 +22,7 @@ import torch
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from torch import nn
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import BlockSparseAttentionSpec, DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import (
     BasePipelineUtils,
     get_pipeline_utils_for_config,
@@ -242,6 +242,15 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def _raise_unsupported_features(self) -> None:
         """Raise an error for incompatible feature switches."""
+        attention_config = self.od_config.diffusion_attention_config
+        specs = [("default", attention_config.default), *attention_config.per_role.items()]
+        for role, spec in specs:
+            if isinstance(spec, BlockSparseAttentionSpec):
+                raise ValueError(
+                    f"Diffusers adapter does not support block_sparse attention ({role}); "
+                    "select a supported dense configuration or use a native model integration."
+                )
+
         if self.od_config.diffusion_offload_config is not None:
             raise NotImplementedError(
                 "diffusion_offload_config is not supported with the diffusers backend. "
