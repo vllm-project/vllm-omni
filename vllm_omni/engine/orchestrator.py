@@ -1643,7 +1643,7 @@ class OrchestratorBase:
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
             release_owners=True,
-            trace_error=getattr(output, "error_type", None) or "stage_error",
+            trace_error=resolved_error_type or "stage_error",
         )
 
     def _update_stage_replica_waiting(self, stage_id: int, replica_id: int, n_waiting: int) -> None:
