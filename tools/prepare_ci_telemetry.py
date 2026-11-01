@@ -29,14 +29,12 @@ _OLD_EXPORTERS = (
 
 def _metadata_files(distribution: metadata.Distribution) -> list[Path]:
     root = Path(distribution.locate_file(""))
-    text = distribution.read_text("METADATA")
-    if text is not None:
-        candidates = root.glob("*.dist-info/METADATA")
-    else:
-        text = distribution.read_text("PKG-INFO")
-        candidates = (
-            candidate / "PKG-INFO" if candidate.is_dir() else candidate for candidate in root.glob("*.egg-info")
-        )
+    # Mirror Distribution.metadata, including legacy single-file egg-info.
+    text = distribution.read_text("METADATA") or distribution.read_text("PKG-INFO") or distribution.read_text("")
+    candidates = list(root.glob("*.dist-info/METADATA"))
+    candidates.extend(
+        candidate / "PKG-INFO" if candidate.is_dir() else candidate for candidate in root.glob("*.egg-info")
+    )
     return [candidate for candidate in candidates if text is not None and candidate.read_text() == text]
 
 

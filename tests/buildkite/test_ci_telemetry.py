@@ -164,7 +164,16 @@ def test_outside_metadata_cannot_be_silently_discarded(
 
 
 @pytest.mark.parametrize(
-    "decision", ["unowned", "metadata-unowned", "payload-owned", "partial-owner", "query-error", "incomplete-database"]
+    "decision",
+    [
+        "unowned",
+        "single-file-metadata",
+        "metadata-unowned",
+        "payload-owned",
+        "partial-owner",
+        "query-error",
+        "incomplete-database",
+    ],
 )
 def test_os_manifests_must_prove_metadata_and_payload_ownership(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, decision: str
@@ -172,8 +181,11 @@ def test_os_manifests_must_prove_metadata_and_payload_ownership(
     _old_family(tmp_path)
     outside = tmp_path / "os-site"
     outside.mkdir()
-    legacy = _distribution(outside, "cryptography", "41.0.7")
-    (legacy / "RECORD").unlink()
+    if decision == "single-file-metadata":
+        (outside / "PyGObject-3.48.2.egg-info").write_text("Metadata-Version: 2.1\nName: PyGObject\nVersion: 3.48.2\n")
+    else:
+        legacy = _distribution(outside, "cryptography", "41.0.7")
+        (legacy / "RECORD").unlink()
     _distribution(tmp_path, "cryptography", "44.0.0")
     monkeypatch.setenv("DPKG_APT_ROOT", str(outside))
     if decision == "metadata-unowned":
@@ -188,7 +200,7 @@ def test_os_manifests_must_prove_metadata_and_payload_ownership(
         monkeypatch.setenv("DPKG_QUERY_WARNING", "1")
     roots, orphans = _prepare(tmp_path, monkeypatch, outside)
     receipt = json.loads(capsys.readouterr().out)
-    if decision == "unowned":
+    if decision in {"unowned", "single-file-metadata"}:
         assert COMMON not in roots
         assert orphans == COMMON + "\n"
         assert receipt["outside_unknown_metadata_os_owned"] is True
