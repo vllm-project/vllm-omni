@@ -399,7 +399,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
-            if current_omni_platform.supports_torch_inductor():
+            if getattr(self.pipeline, "owns_cuda_graph_execution", False):
+                # Model-owned graphs have their own startup preparation and
+                # failure contract. Do not simultaneously enable generic compile
+                # or turn a capture failure into a warning/eager retry.
+                self.pipeline.setup_model_owned_cuda_graphs()
+            elif current_omni_platform.supports_torch_inductor():
                 if hasattr(self.pipeline, "setup_compile"):
                     try:
                         self.pipeline.setup_compile()

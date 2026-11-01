@@ -18,12 +18,15 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
 from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import halo_exchange
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 
+_AUTO_GRAPH_ENTRY = object()
+
 
 @dataclass(frozen=True)
 class SpatialContext:
     group: dist.ProcessGroup
     rank: int
     units: tuple[int, ...]
+    fused_normalization: bool = False
 
     def split(self, x: torch.Tensor) -> torch.Tensor:
         scale = x.shape[-2] // sum(self.units)
@@ -48,7 +51,12 @@ class SpatialContext:
         global_mean = moments[0] / moments[1]
         centered = (variance + (mean - global_mean).square()) * count
         dist.all_reduce(centered, group=self.group)
-        normalized = grouped.sub_(global_mean).mul_(torch.rsqrt(centered / moments[1] + norm.eps)).reshape_as(x)
+        inverse = torch.rsqrt(centered / moments[1] + norm.eps)
+        if self.fused_normalization and grouped.device.type == "cuda" and grouped.is_contiguous():
+            from .vae_norm import apply_spatial_norm
+
+            return apply_spatial_norm(grouped, global_mean, inverse, norm, tuple(x.shape), x.dtype)
+        normalized = grouped.sub_(global_mean).mul_(inverse).reshape_as(x)
         normalized.mul_(norm.weight.float().view(1, -1, 1, 1, 1))
         normalized.add_(norm.bias.float().view(1, -1, 1, 1, 1))
         return normalized.to(x.dtype)
@@ -91,6 +99,7 @@ class TemporalContext:
     tile_spatial: bool = False
     spatial: SpatialContext | None = None
     history: dict[nn.Module, torch.Tensor] = field(default_factory=dict)
+    fixed_history: bool = False
 
 
 def _frame_norm_silu(norm: nn.GroupNorm, x: torch.Tensor, context: TemporalContext | None = None) -> torch.Tensor:
@@ -127,8 +136,14 @@ class CausalConv3d(nn.Conv3d):
                 head = context.history[self]
             x = torch.cat((head, x), dim=2)
             if context is not None and context.cache_temporal:
-                # Copy the halo so it does not retain a whole chunk's storage.
-                context.history[self] = x[:, :, -self.temporal_padding :].clone()
+                tail = x[:, :, -self.temporal_padding :]
+                if context.fixed_history:
+                    # Graph phases share these prepared addresses. Each first
+                    # phase overwrites the entire history for the new request.
+                    context.history[self].copy_(tail)
+                else:
+                    # Copy the halo so it does not retain a whole chunk's storage.
+                    context.history[self] = tail.clone()
                 if not context.first:
                     x = x[:, :, self.stride[0] - 1 :]
         if context is not None:
@@ -313,10 +328,27 @@ class SeedVR2VAE(nn.Module, DistributedVaeMixin):
         super().__init__()
         self.use_tiling = False
         self._spatial_group: dist.ProcessGroup | None = None
+        self.decoder_graphs = None
+        self.fused_spatial_normalization = False
         self.encoder = Encoder3d(channels, groups, latent_channels)
         self.decoder = Decoder3d(channels, groups, latent_channels)
 
+    def release_captured_graphs(self) -> None:
+        if self.decoder_graphs is not None:
+            self.decoder_graphs.close()
+            self.decoder_graphs = None
+        self.fused_spatial_normalization = False
+
+    def _apply(self, fn, recurse=True):
+        self.release_captured_graphs()
+        return super()._apply(fn, recurse=recurse)
+
+    def load_state_dict(self, *args, **kwargs):
+        self.release_captured_graphs()
+        return super().load_state_dict(*args, **kwargs)
+
     def set_parallel_size(self, parallel_size: int, mode: str = "tile") -> None:
+        self.release_captured_graphs()
         if mode == "spatial_shard_width":
             raise ValueError("SeedVR2 VAE supports height sharding; select spatial_shard_height or tile")
         if parallel_size > 1:
@@ -334,7 +366,7 @@ class SeedVR2VAE(nn.Module, DistributedVaeMixin):
             size = dist.get_world_size(group)
             if latent_height >= size:
                 units = tuple((i + 1) * latent_height // size - i * latent_height // size for i in range(size))
-                spatial = SpatialContext(group, dist.get_rank(group), units)
+                spatial = SpatialContext(group, dist.get_rank(group), units, self.fused_spatial_normalization)
         return TemporalContext(tile_spatial=self.use_tiling, spatial=spatial)
 
     def encode(self, x: torch.Tensor, *, chunk_size: int | None = None) -> DiagonalGaussianDistribution:
@@ -358,7 +390,19 @@ class SeedVR2VAE(nn.Module, DistributedVaeMixin):
             encoded = context.spatial.gather(encoded)
         return DiagonalGaussianDistribution(encoded)
 
-    def decode(self, z: torch.Tensor, *, chunk_size: int | None = None) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, *, chunk_size: int | None = None, _graph_entry=_AUTO_GRAPH_ENTRY) -> torch.Tensor:
+        graphs = self.decoder_graphs
+        if graphs is not None:
+            entry = (
+                graphs.begin_request(tuple(z.shape[2:]), chunk_size=chunk_size)
+                if _graph_entry is _AUTO_GRAPH_ENTRY
+                else _graph_entry
+            )
+            if entry is not None:
+                return graphs.replay(entry, z)
+        return self._decode_eager(z, chunk_size=chunk_size)
+
+    def _decode_eager(self, z: torch.Tensor, *, chunk_size: int | None = None) -> torch.Tensor:
         if chunk_size is None and self.use_tiling:
             chunk_size = 2
         if chunk_size is not None and chunk_size < 1:
