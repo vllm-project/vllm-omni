@@ -237,3 +237,36 @@ or reliability experiments; there is no acceleration claim or performance gate
 here. Human listening is a separate, explicitly recorded acceptance step. The
 current generic output queues lack explicit hard capacities/complete downstream
 backpressure; successful model/lifecycle tests do not resolve that limitation.
+
+### Fixed protocol-case HNR calibration
+
+The PCM/SSE equality scenario uses the fixed text "Hello, this is a simple
+speech synthesis test.", seed 44, temperature 0.3, top-p 0.95, top-k 50 and
+repetition penalty 1.2. Its HNR floor is **0.5 dB for those two requests only**.
+Other scenarios and the shared default retain 1.0 dB. ASR and exact sample
+comparison across raw PCM, SSE and complete WAV remain required.
+
+The same 32 kHz, libsndfile PCM16 measurement on the original checkpoint
+(`27b5a5f5f541a1db3a51d6fd1b0fc7147b92cd01`) with official reference source
+`12fac06eb8fa53bad8b3941d3cb11e9c869477c4` gave:
+
+| Path | Measured HNR (dB) |
+| --- | ---: |
+| Official Transformers, FP32 AR/decoder | 0.55369 |
+| Official Transformers, default BF16 AR / FP32 decoder | 0.67694 |
+| Native FP32, chunk size 4 | 0.55378 |
+
+The official FP32 value and native PCM bytes were each repeatable across three
+runs. The floor rounds the independent official diagnostic reference down to
+0.1 dB; it is not a statistical confidence interval. The original ten reference
+texts all exceeded 1.0 dB, so that corpus alone did not cover this fixed-case
+false rejection. This input is a diagnostic anchor, not an unseen holdout.
+
+The reference uses its original `infer` path in a separate Transformers 4.57.1
+environment. Its BF16 checkpoint parameters are converted in memory to FP32
+for the matching-precision comparison; original files and sampling semantics
+are unchanged. Natural official streaming states are a different contract and
+were not assumed waveform-equivalent. CPU regressions continue to reject
+silence, constant signals and white noise at the calibrated floor, including
+32 kHz noise. These measurements calibrate this protocol case; they do not
+establish a universal Soprano quality floor or a subjective quality score.

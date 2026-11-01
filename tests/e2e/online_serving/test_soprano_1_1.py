@@ -72,12 +72,30 @@ def test_complete_wav_and_fixed_default_voice(omni_server, online_client):
 @pytest.mark.advanced_model
 @pytest.mark.parametrize("omni_server", _STREAM, indirect=True)
 def test_raw_pcm_sse_and_complete_concatenate_identically(omni_server, online_client):
+    # This fixed text/seed: official FP32 HNR=0.55369 dB (BF16=0.67694),
+    # native=0.55378, all at 32 kHz. Round the independent reference down
+    # to 0.1 dB; keep the shared 1 dB default for all other scenarios.
+    # ASR and exact raw/SSE/WAV equality remain mandatory.
     raw = online_client.send_audio_speech_request(
-        config(omni_server, stream=True, stream_format="audio", response_format="pcm", transcript_pcm_sample_rate=32000)
+        config(
+            omni_server,
+            stream=True,
+            stream_format="audio",
+            response_format="pcm",
+            transcript_pcm_sample_rate=32000,
+            min_hnr_db=0.5,
+        )
     )[0]
     assert_audio_stream_progress(raw)
     sse = online_client.send_audio_speech_request(
-        config(omni_server, stream=True, stream_format="sse", response_format="pcm", transcript_pcm_sample_rate=32000)
+        config(
+            omni_server,
+            stream=True,
+            stream_format="sse",
+            response_format="pcm",
+            transcript_pcm_sample_rate=32000,
+            min_hnr_db=0.5,
+        )
     )[0]
     complete = online_client.send_audio_speech_request(config(omni_server))[0]
     assert_audio_speech_equal(sse, raw, sample_rate=32000)
