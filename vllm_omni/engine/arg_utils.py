@@ -456,6 +456,7 @@ class OmniEngineArgs(EngineArgs):
     enable_distributed_layerwise_offload: bool | None = None
     enable_submodule_offload: bool | None = None
     dlo_use_allgather: bool | None = None
+    dlo_chunk_size_mb: int | None = None
     dlo_resident_layers: int | None = None
     host_weight_runtime_mode: str | None = None
     host_weight_runtime_root: str | None = None
@@ -469,6 +470,7 @@ class OmniEngineArgs(EngineArgs):
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None
     enable_diffusion_pipeline_profiler: bool | None = None
+    controlnet_model_path: str | None = None
     # Diffusion parallel knobs registered by the serve CLI (``--usp``,
     # ``--ulysses-mode``, ``--ring-degree``, ``--allgather-degree``,
     # ``--use-hsdp``, ``--hsdp-*``, ``--cfg-parallel-size``,
@@ -982,6 +984,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "enable_distributed_layerwise_offload",
         "enable_submodule_offload",
         "dlo_use_allgather",
+        "dlo_chunk_size_mb",
         "dlo_resident_layers",
         "host_weight_runtime_mode",
         "host_weight_runtime_root",
@@ -995,6 +998,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "max_generated_image_size",
         "tts_max_instructions_length",
         "enable_diffusion_pipeline_profiler",
+        "controlnet_model_path",
         # Diffusion parallel knobs: the orchestrator sizes the deployment from
         # them, the engine forwards them to DiffusionParallelConfig.
         "ulysses_degree",
