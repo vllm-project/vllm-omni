@@ -3,16 +3,21 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 
 def _to_device(value: Any, device: torch.device) -> Any:
@@ -99,7 +104,7 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
 
     def _maybe_send_stage_payload(
         self,
-        reqs: list[OmniDiffusionRequest],
+        reqs: Sequence[OmniDiffusionRequest | StepRequestState],
         outputs: list[DiffusionOutput],
     ) -> None:
         """Publish complete leader outputs; keep inline values if the put fails.
