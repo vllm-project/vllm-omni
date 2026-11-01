@@ -1641,3 +1641,36 @@ def test_duplex_window_install_tolerates_missing_cache_or_model_config() -> None
     runner = SimpleNamespace(device=torch.device("cpu"))
     inv_freq = MiniCPMO45DuplexWorkerHelper.get_rope_inv_freq(runner)
     assert inv_freq is not None and inv_freq.shape == (64,)
+
+
+@pytest.mark.parametrize("container", [tuple, list])
+@pytest.mark.parametrize("flattened", [False, True])
+def test_split_kv_reanchor_updates_original_storage(container, flattened):
+    """Ascend split caches must update K in place and preserve V and sink."""
+    block_size, head_dim = 16, 8
+    inv_freq = torch.tensor([1.0, 0.1, 0.01, 0.001])
+    keys = torch.randn(4, block_size, 2, head_dim)
+    values = torch.randn_like(keys)
+    original = keys.clone()
+    original_values = values.clone()
+    cache = (
+        container((keys.view(4, block_size, -1), values.view(4, block_size, -1)))
+        if flattened
+        else container((keys, values))
+    )
+    plan = PositionReanchor(delta=16, moved_from=32, sink_blocks=1)
+    positions = torch.arange(32, 48)
+    expected = rotate_keys(original[1], 16, inv_freq)
+    touched = rotate_cached_keys(
+        cache,
+        block_ids=[0, 1, 2, 3],
+        positions=positions,
+        plan=plan,
+        inv_freq=inv_freq,
+        block_size=block_size,
+    )
+    assert touched == 16
+    torch.testing.assert_close(keys[1], expected)
+    torch.testing.assert_close(keys[0], original[0])
+    torch.testing.assert_close(keys[2:], original[2:])
+    torch.testing.assert_close(values, original_values)
