@@ -1813,6 +1813,12 @@ class MiniMaxH3Pipeline(
                             logger.exception("Failed to release retained allocator cache after offload failure")
                     raise
 
+    def _encoder_component_on_device(self, component: nn.Module):
+        # Media encoding uses encoder + quant_conv; keep decoder weights on CPU.
+        if component is self.video_vae:
+            component = self.video_vae.encoder_component
+        return self._component_on_device(component)
+
     @staticmethod
     def _is_output_owner_rank() -> bool:
         """Whether this rank's output is returned by the diffusion executor."""
@@ -2889,7 +2895,7 @@ class MiniMaxH3Pipeline(
                     video_vae=self.video_vae,
                     audio_vae=self.audio_vae,
                     emit_conditioning=rank == 0,
-                    component_scope=self._component_on_device,
+                    component_scope=self._encoder_component_on_device,
                 )
         except ValueError as exc:
             error = OmniClientError(str(exc))
