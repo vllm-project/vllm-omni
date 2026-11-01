@@ -183,7 +183,9 @@ def write_t3_checkpoint(model_dir: str, stage: ChatterboxT3ForConditionalGenerat
     return checkpoint
 
 
-def write_s3gen_checkpoint(model_dir: str, config: ChatterboxConfig, seed: int) -> dict[str, torch.Tensor]:
+def write_s3gen_checkpoint(
+    model_dir: str, config: ChatterboxConfig, seed: int, encoders_only: bool = False
+) -> dict[str, torch.Tensor]:
     """Write a stage 1 checkpoint in the released file's layout, with seeded initial weights.
 
     The file holds the decoder's ``flow.*`` and ``mel2wav.*`` tensors, from
@@ -196,6 +198,8 @@ def write_s3gen_checkpoint(model_dir: str, config: ChatterboxConfig, seed: int) 
         model_dir: The model directory.
         config: The checkpoint's config.
         seed: Seed of the weights.
+        encoders_only: Leave out the decoder's tensors, for an API process
+            that only loads the reference encoders from the file.
 
     Returns:
         The checkpoint's tensors by name.
@@ -203,7 +207,7 @@ def write_s3gen_checkpoint(model_dir: str, config: ChatterboxConfig, seed: int) 
     from s3tokenizer.model_v2 import S3TokenizerV2
 
     torch.manual_seed(seed)
-    decoder = S3GenDecoder(config, config.max_new_tokens, SEED).state_dict()
+    decoder = {} if encoders_only else S3GenDecoder(config, config.max_new_tokens, SEED).state_dict()
     tokenizer = S3TokenizerV2(config.s3_tokenizer_name).state_dict()
     speaker_encoder = CAMPPlus(feat_dim=80, embedding_size=192, memory_efficient=False).state_dict()
     buffers = dict(zip(TOKENIZER_BUFFERS, (torch.zeros(128, 201), torch.hann_window(400)), strict=True))

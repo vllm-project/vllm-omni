@@ -77,7 +77,7 @@ def model_dir(tmp_path_factory: pytest.TempPathFactory) -> str:
     (Path(directory) / "merges.txt").write_text("#version: 0.2\nH e\nl l\nll o\nHe llo\n")
     write_voice_encoder(directory, seed=0)
     for variant in ("turbo", "original"):
-        write_s3gen_checkpoint(directory, ChatterboxConfig(variant), seed=1)
+        write_s3gen_checkpoint(directory, ChatterboxConfig(variant), seed=1, encoders_only=True)
     return directory
 
 
@@ -144,6 +144,20 @@ def adapter(server: OmniOpenAIServingSpeech) -> ChatterboxAdapter:
 
 
 @pytest.fixture(scope="module")
+def validator(model_dir: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[ChatterboxAdapter]:
+    """One Turbo adapter shared by the tests that only check requests, which change none of its state.
+
+    Building a server loads the reference encoders; the CPU job has no time for one per case.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        # The server reads the uploaded voices' directory once, when it is built.
+        patch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path_factory.mktemp("speakers")))
+        speech = serving(engine_client(model_dir, deploy_on_cpu(DEPLOY["turbo"])))
+    yield speech._adapter
+    speech.shutdown()
+
+
+@pytest.fixture(scope="module")
 def original_model_dir(tmp_path_factory: pytest.TempPathFactory) -> str:
     """Original's own model directory: ``tokenizer.json`` takes the place of Turbo's GPT-2 files.
 
@@ -154,7 +168,7 @@ def original_model_dir(tmp_path_factory: pytest.TempPathFactory) -> str:
     torch.save(BUILTIN, Path(directory) / "conds.pt")
     Tokenizer(WordLevel({"[UNK]": 0, "Hello.": 7}, unk_token="[UNK]")).save(str(Path(directory) / "tokenizer.json"))
     write_voice_encoder(directory, seed=0)
-    write_s3gen_checkpoint(directory, ChatterboxConfig("original"), seed=1)
+    write_s3gen_checkpoint(directory, ChatterboxConfig("original"), seed=1, encoders_only=True)
     return directory
 
 
@@ -260,16 +274,16 @@ def test_entry_stage_selects_chatterbox():
         ({"ref_audio": "clip.wav"}, "ref_audio must be a URL"),
     ],
 )
-def test_unsupported_request_is_rejected(adapter, fields, error):
+def test_unsupported_request_is_rejected(validator, fields, error):
     request = OpenAICreateSpeechRequest(**{"input": "Hello.", **fields})
-    assert error in adapter.validate(request)
+    assert error in validator.validate(request)
 
 
 @pytest.mark.parametrize(
     "fields", [{}, {"voice": "default"}, {"language": "en"}, {"ref_audio": "data:audio/wav;base64,UklGRg=="}]
 )
-def test_builtin_and_reference_requests_are_accepted(adapter, fields):
-    assert adapter.validate(OpenAICreateSpeechRequest(input="Hello.", **fields)) is None
+def test_builtin_and_reference_requests_are_accepted(validator, fields):
+    assert validator.validate(OpenAICreateSpeechRequest(input="Hello.", **fields)) is None
 
 
 def test_builtin_voice_loads_checkpoint_tensors(model_dir: str):
@@ -292,9 +306,9 @@ async def test_builtin_request_uses_shared_prompt_builder_without_reference_enco
     assert prepared.model_type == "chatterbox"
 
 
-def test_request_token_cap_does_not_mutate_deploy_defaults(adapter):
+def test_request_token_cap_does_not_mutate_deploy_defaults(validator):
     defaults = [SamplingParams(max_tokens=1000), SamplingParams(max_tokens=1)]
-    result = adapter.apply_sampling_overrides(defaults, OpenAICreateSpeechRequest(input="Hi.", max_new_tokens=50))
+    result = validator.apply_sampling_overrides(defaults, OpenAICreateSpeechRequest(input="Hi.", max_new_tokens=50))
     assert [params.max_tokens for params in result] == [50, 1]
     assert defaults[0].max_tokens == 1000
 
