@@ -248,10 +248,13 @@ def test_mrv2_batch_preprocess_hook_is_duplex_mrv2_only(mocker, v2, session):
 
 
 def test_mrv2_thinker_returns_drafter_layers_with_hidden_states(mocker):
-    from vllm.model_executor.models.interfaces import SupportsEagle3, supports_eagle3
+    from vllm.model_executor.models.interfaces import EagleModelMixin, supports_eagle3
+
+    class _Decoder(torch.nn.Module, EagleModelMixin):
+        start_layer = 0
 
     model = _model(mocker)
-    language_model = torch.nn.Module()
+    language_model = _Decoder()
     model.thinker.get_language_model = lambda: language_model
     assert supports_eagle3(model)
     # Drafters share the Thinker decoder's embedding and lm_head.
@@ -263,9 +266,9 @@ def test_mrv2_thinker_returns_drafter_layers_with_hidden_states(mocker):
     model.thinker.forward = mocker.Mock(return_value=hidden)
     assert model(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2])) is hidden
 
-    set_layers = mocker.patch.object(SupportsEagle3, "set_aux_hidden_state_layers")
-    model.set_aux_hidden_state_layers((1, 9, 17))
-    set_layers.assert_called_once_with((1, 9, 17))
+    # The guard counts the layers the decoder stores, so a repeated id is one layer.
+    model.set_aux_hidden_state_layers((17, 9, 1, 9))
+    assert language_model.aux_hidden_state_layers == (1, 9, 17)
     model.thinker.forward = mocker.Mock(return_value=(hidden, aux))
     out_hidden, out_aux = model(torch.tensor([1, 2, 3]), torch.tensor([0, 1, 2]))
     assert out_hidden is hidden
