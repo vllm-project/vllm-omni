@@ -698,10 +698,19 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path, request: pyte
         # libgomp is not fork-safe: once the parent has used OpenMP, a parallel
         # op in this forked child segfaults. Keep the child's torch ops inline.
         torch.set_num_threads(1)
-        try:
-            cmd.cmd(args)
-        except Exception:
-            traceback.print_exc()
+        from concurrent.futures import ThreadPoolExecutor
+
+        from vllm import envs
+        from vllm.multimodal.media import connector
+
+        # Fork inherits executor bookkeeping, but the parent's threads do not
+        # survive in this mock server. Keep actual media decoding in a fresh pool.
+        with ThreadPoolExecutor(max_workers=envs.VLLM_MEDIA_LOADING_THREAD_COUNT) as media_pool:
+            connector.global_thread_pool = media_pool
+            try:
+                cmd.cmd(args)
+            except Exception:
+                traceback.print_exc()
 
     # This local target must inherit the in-process engine mocks. Other tests
     # can configure the global default as spawn while preparing real engines.
