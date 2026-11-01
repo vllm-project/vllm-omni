@@ -55,10 +55,14 @@ def fp32_channel_norm(x: torch.Tensor) -> torch.Tensor:
 
     Reading the low-precision tensor directly (``vector_norm(..., dtype=float32)``) skips materializing an fp32
     copy. That is only exact if the backend runs the same reduction for both, so the first call per (device,
-    dtype, shape, layout) checks it on random data and otherwise keeps the upcast.
+    dtype, shape, layout) checks it on random data and otherwise keeps the upcast. Under ``torch.compile`` it
+    is always the upcast.
     """
     if x.dtype is torch.float32:
         return torch.linalg.vector_norm(x, dim=1, keepdim=True)
+    if torch.compiler.is_compiling():
+        # The probe (generator, memory query, host sync) cannot be traced; the reference expression can.
+        return x.float().norm(2, 1, keepdim=True)
     key = (x.device, x.dtype, tuple(x.shape), x.stride())
     verdict = _FP32_NORM_VERDICTS.get(key)
     if verdict is None:
