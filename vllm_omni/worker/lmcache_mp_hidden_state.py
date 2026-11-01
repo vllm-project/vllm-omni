@@ -11,6 +11,7 @@ once at registration.
 
 from typing import Any
 
+import msgspec
 import torch
 from lmcache.v1.multiprocess.transfer_context.tensor_wire import (
     decode_tensors,
@@ -197,7 +198,7 @@ class MPHiddenStateBackend:
                 expected_dtype=getattr(torch, dtype_name),
                 expected_count=num_tokens // self.chunk_size,
             )
-        except Exception:
+        except (ValueError, msgspec.DecodeError):
             logger.exception("LMCache MP: undecodable hidden-state payload (req_id=%s)", request_id)
             return None
         return torch.cat(chunks, dim=0)
