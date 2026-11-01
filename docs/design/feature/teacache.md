@@ -203,7 +203,7 @@ Package all information into a `CacheContext` object.
 | `temb` | `torch.Tensor` | Timestep embedding tensor |
 | `run_transformer_blocks` | `Callable[[], tuple]` | Executes transformer blocks, returns `(hidden_states, [encoder_hidden_states])` |
 | `postprocess` | `Callable[[torch.Tensor], Any]` | Applies final transformations to produce model output |
-| `extra_states` | `dict | None` | Optional dict for additional model-specific state |
+| `extra_states` | `dict | None` | Optional model-specific state. Recognized keys: `teacache_branch` (`"positive"` / `"negative"`), `teacache_bypass` (if true, run blocks+postprocess without reading or updating TeaCache state; used by GLM-Image i2i KV WRITE), `synchronize_cache_decision` |
 
 ### Step 6: Register the Extractor
 
@@ -476,8 +476,9 @@ Complete examples in the codebase:
 |-------|------|---------|-------|
 | **Qwen-Image** | `vllm_omni/diffusion/cache/teacache/extractors.py` | Dual-stream | `extract_qwen_context` |
 | **Bagel** | `vllm_omni/diffusion/cache/teacache/extractors.py` | Omni model | `extract_bagel_context` |
+| **GLM-Image** | `vllm_omni/diffusion/cache/teacache/extractors.py` | Dual-stream + i2i KV bypass | `extract_glm_image_context` (`prior_token_drop` CFG branch, `teacache_bypass` on KV WRITE) |
 | **TeaCache Core** | `vllm_omni/diffusion/cache/teacache/` | Base implementation | Hook and config |
-| **Coefficient Estimator** | `vllm_omni/diffusion/cache/teacache/coefficient_estimator.py` | Estimation tool | Adapter pattern |
+| **Coefficient Estimator** | `vllm_omni/diffusion/cache/teacache/coefficient_estimator.py` | Estimation tool | Adapter pattern (`GlmImageAdapter`) |
 
 ---
 

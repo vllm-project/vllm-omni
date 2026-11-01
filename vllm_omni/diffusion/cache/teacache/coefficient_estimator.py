@@ -134,12 +134,24 @@ class ZImageAdapter(DefaultAdapter):
     model_class_name = "ZImagePipeline"
 
 
+class GlmImageAdapter(DefaultAdapter):
+    """Adapter for GLM-Image TeaCache coefficient estimation.
+
+    The DiT forward requires AR ``prior_token_ids``. Pass them via
+    ``collect_from_prompt(..., prior_token_ids=..., height=..., width=...)``;
+    they are forwarded through ``OmniDiffusionSamplingParams.extra_args``.
+    """
+
+    model_class_name = "GlmImagePipeline"
+
+
 _MODEL_ADAPTERS: dict[str, type[DefaultAdapter]] = {
     "Bagel": BagelAdapter,
     "StableAudio": StableAudioAdapter,
     "Flux2": Flux2Adapter,
     "LongCat": LongCatAdapter,
     "ZImage": ZImageAdapter,
+    "GlmImage": GlmImageAdapter,
 }
 
 _EPSILON = 1e-6
@@ -203,13 +215,30 @@ class TeaCacheCoefficientEstimator:
 
     def collect_from_prompt(self, prompt: str, **generate_kwargs):
         self.hook.start_collection()
+        extra_args = dict(generate_kwargs.get("extra_args") or {})
+        # GLM-Image (and similar multistage DiTs) need externally supplied
+        # AR prior tokens; accept them as a top-level kwarg for convenience.
+        if "prior_token_ids" in generate_kwargs and "prior_token_ids" not in extra_args:
+            extra_args["prior_token_ids"] = generate_kwargs["prior_token_ids"]
+        if "prior_token_image_ids" in generate_kwargs and "prior_token_image_ids" not in extra_args:
+            extra_args["prior_token_image_ids"] = generate_kwargs["prior_token_image_ids"]
+
+        sampling_kwargs: dict[str, Any] = {
+            "num_inference_steps": generate_kwargs.get("num_inference_steps", 20),
+            "seed": generate_kwargs.get("seed", 42),
+            "extra_args": extra_args,
+        }
+        if "height" in generate_kwargs:
+            sampling_kwargs["height"] = generate_kwargs["height"]
+        if "width" in generate_kwargs:
+            sampling_kwargs["width"] = generate_kwargs["width"]
+        if "guidance_scale" in generate_kwargs:
+            sampling_kwargs["guidance_scale"] = generate_kwargs["guidance_scale"]
+
         req = OmniDiffusionRequest(
             prompt=prompt,
             request_id="teacache-coefficient-estimator",
-            sampling_params=OmniDiffusionSamplingParams(
-                num_inference_steps=generate_kwargs.get("num_inference_steps", 20),
-                seed=generate_kwargs.get("seed", 42),
-            ),
+            sampling_params=OmniDiffusionSamplingParams(**sampling_kwargs),
         )
         from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 

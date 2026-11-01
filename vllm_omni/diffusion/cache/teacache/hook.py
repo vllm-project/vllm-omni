@@ -138,6 +138,16 @@ class TeaCacheHook(ModelHook):
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
 
+        # Opt-in bypass: run blocks + postprocess without reading/updating
+        # TeaCache state. Used by GLM-Image i2i KV WRITE (condition pass).
+        extra_states = getattr(ctx, "extra_states", None) or {}
+        if extra_states.get("teacache_bypass"):
+            outputs = ctx.run_transformer_blocks()
+            ctx.hidden_states = outputs[0]
+            if len(outputs) > 1 and ctx.encoder_hidden_states is not None:
+                ctx.encoder_hidden_states = outputs[1]
+            return ctx.postprocess(ctx.hidden_states)
+
         # ============================================================================
         # GENERIC CACHING LOGIC (works for all models)
         # ============================================================================

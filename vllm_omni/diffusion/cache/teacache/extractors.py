@@ -1721,6 +1721,127 @@ def extract_minimax_h3_context(
     )
 
 
+def extract_glm_image_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    prior_token_id: torch.Tensor,
+    prior_token_drop: torch.Tensor,
+    timestep: torch.Tensor | float | int,
+    target_size: torch.Tensor,
+    crop_coords: torch.Tensor,
+    attention_kwargs: dict[str, Any] | None = None,
+    return_dict: bool = True,
+    attention_mask: torch.Tensor | None = None,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+    kv_cache: Any | None = None,
+    **kwargs: Any,
+) -> CacheContext:
+    """Extract cache context for GlmImageTransformer2DModel.
+
+    Mirrors ``GlmImageTransformer2DModel.forward`` preprocessing, then exposes
+    the dual-stream AdaLN image stream as the TeaCache decision feature.
+
+    CFG branch identity comes from ``prior_token_drop`` (all-True = negative /
+    unconditional). Image-edit KV WRITE passes set ``teacache_bypass`` so the
+    hook does not poison residual state with the condition-image forward.
+    """
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    from vllm_omni.diffusion.models.glm_image.glm_image_transformer import KVCacheMode
+
+    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
+        raise ValueError("Module must have transformer_blocks")
+
+    batch_size, _num_channels, height, width = hidden_states.shape
+    kv_cache_mode = kv_cache.mode if kv_cache is not None else None
+
+    # Set SP context if enabled (same as the model forward).
+    sp_size = module.parallel_config.sequence_parallel_size
+    if sp_size is not None and sp_size > 1:
+        get_forward_context().split_text_embed_in_sp = False
+
+    # Text embedding projection
+    encoder_hidden_states = module.glyph_projector(encoder_hidden_states)
+
+    # Prior embedding with dropout (CFG drops prior on the negative branch)
+    prior_embedding = module.prior_token_embedding(prior_token_id)
+    prior_embedding = prior_embedding.clone()
+    prior_embedding[prior_token_drop] *= 0.0
+    prior_hidden_states = module.prior_projector(prior_embedding)
+
+    # Prepare hidden_states and RoPE via GlmImagePrepare (SP plan boundary)
+    hidden_states, rope_cos, rope_sin = module.prepare(hidden_states, prior_hidden_states)
+    image_rotary_emb = (rope_cos, rope_sin)
+    post_patch_height = height // module.patch_size
+    post_patch_width = width // module.patch_size
+
+    temb = module.time_condition_embed(timestep, target_size, crop_coords, hidden_states.dtype)
+
+    # Create padding mask for SP if needed (after _sp_plan hooks have run)
+    hidden_states_mask = None
+    if sp_size is not None and sp_size > 1 and is_forward_context_available():
+        ctx = get_forward_context()
+        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+            img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+            hidden_states_mask = torch.ones(
+                batch_size,
+                img_padded_seq_len,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+
+    # Modulated input: image stream after the first block's AdaLN
+    modulated_input = module.transformer_blocks[0].norm1(hidden_states, encoder_hidden_states, temb)[0]
+
+    def run_transformer_blocks() -> tuple[torch.Tensor, torch.Tensor]:
+        h = hidden_states
+        e = encoder_hidden_states
+        for layer_idx, block in enumerate(module.transformer_blocks):
+            layer_kv_cache = kv_cache[layer_idx] if kv_cache is not None else None
+            h, e = block(
+                h,
+                e,
+                temb,
+                image_rotary_emb,
+                attention_mask,
+                attention_kwargs,
+                kv_cache=layer_kv_cache,
+                kv_cache_mode=kv_cache_mode,
+                hidden_states_mask=hidden_states_mask,
+            )
+        return (h, e)
+
+    def postprocess(h: torch.Tensor) -> Any:
+        h = module.norm_out(h, temb)
+        h = module.proj_out(h)
+        p = module.patch_size
+        h = h.reshape(batch_size, post_patch_height, post_patch_width, -1, p, p)
+        output = h.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    teacache_branch = "negative" if bool(prior_token_drop.all()) else "positive"
+    teacache_bypass = kv_cache_mode == KVCacheMode.WRITE or (
+        isinstance(kv_cache_mode, str) and kv_cache_mode.lower() == "write"
+    )
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states={
+            "teacache_branch": teacache_branch,
+            "teacache_bypass": teacache_bypass,
+        },
+    )
+
+
 def extract_cosmos3_context(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -1822,6 +1943,7 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "FluxTransformer2DModel": extract_flux_context,
     "SenseNovaU1ForCausalLM": extract_sensenova_u1_context,
     "MiniMaxH3DiTModel": extract_minimax_h3_context,
+    "GlmImageTransformer2DModel": extract_glm_image_context,
     # Future models:
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,
 }
