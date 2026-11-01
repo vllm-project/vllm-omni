@@ -519,6 +519,8 @@ def _apply_codec_window_penalty_gpu(
     positions = end.unsqueeze(1) - window_size + offsets.unsqueeze(0)
     valid = positions >= start.unsqueeze(1)
     rows = all_token_ids.index_select(0, slots)
+    # ``total_len`` never exceeds the row width (max_model_len), so the clamp
+    # only bounds draft positions, which are taken from ``draft_ids`` below.
     history = rows.gather(1, positions.clamp(0, rows.shape[1] - 1)).long()
     if draft_ids is not None and local_pos is not None:
         # Draft k of the step (k >= 1) is the input id of logits row k of the request.
@@ -691,6 +693,9 @@ class _ForcedEosSampling:
         self.forced = forced
 
     def __getattr__(self, name: str) -> Any:
+        # Reads only: RejectionSampler never writes to its sampler.
+        if name == "_sampler":
+            raise AttributeError(name)
         return getattr(self._sampler, name)
 
     def apply_sampling_params(
@@ -716,7 +721,8 @@ class _ForcedEosSampling:
             *args,
             **kwargs,
         )
-        forced = self.forced[expanded_idx_mapping.long(), expanded_local_pos.long()]
+        num_logits = processed.shape[0]
+        forced = self.forced[expanded_idx_mapping[:num_logits].long(), expanded_local_pos[:num_logits].long()]
         eos_only = torch.full_like(processed[:1], float("-inf"))
         eos_only[:, self._eos_id] = 0.0
         return torch.where(forced.unsqueeze(1), eos_only, processed)
@@ -1513,18 +1519,27 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any]:
         talker_sampler = _install_mrv2_talker_sampler(sampler, self)
         spec_config = getattr(self.vllm_config, "speculative_config", None)
-        if spec_config is None or self._k_step_frames > 0:
+        if spec_config is None:
             return talker_sampler, None
+        session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
+        if self._k_step_frames > 0 or session_mode == "duplex":
+            # Any draft method, not only drafters that read Talker layers.
+            raise NotImplementedError(
+                "MiniCPM-o 4.5 Talker on model_runner: v2 verifies draft codes in turn sessions only; "
+                "remove the stage-1 speculative_config for duplex or K-step"
+            )
         # Verification reuses the stock sampler, whose penalty stage is the codec window.
         return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
 
     def get_language_model(self) -> Any:
-        """The Talker's codec table and head, where drafter loading looks for a target's.
+        """The Talker's codec table, where drafter loading looks for a target's embedding.
 
-        The stage config reports a text vocabulary, so vLLM does not share these
-        with a codec drafter; such a draft checkpoint ships its own copies.
+        No head is exposed, so a drafter never shares ``head_code`` (a plain
+        Linear, not a ParallelLMHead). The stage config reports a text
+        vocabulary, so vLLM does not share the table with a codec drafter
+        either; such a draft checkpoint ships its own embedding and head.
         """
-        return SimpleNamespace(model=SimpleNamespace(embed_tokens=self.emb_code[0]), lm_head=self.head_code[0])
+        return SimpleNamespace(model=SimpleNamespace(embed_tokens=self.emb_code[0]))
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         # Draft codes are verified per row for turn sessions only; the native

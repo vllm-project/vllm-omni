@@ -664,10 +664,11 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
     mocker.patch.object(module, "_install_mrv2_talker_sampler", return_value="talker-sampler")
     sampler = SimpleNamespace(req_states=SimpleNamespace(device="cpu", max_num_reqs=4))
     assert talker.mrv2_custom_sampler(sampler) == ("talker-sampler", None)
+    spec_config = SimpleNamespace(
+        num_speculative_tokens=7, enable_adaptive_verification=False, rejection_sample_method="standard"
+    )
     talker.vllm_config = SimpleNamespace(
-        speculative_config=SimpleNamespace(
-            num_speculative_tokens=7, enable_adaptive_verification=False, rejection_sample_method="standard"
-        )
+        speculative_config=spec_config, model_config=SimpleNamespace(session_mode="turn")
     )
     talker_sampler, rejection = talker.mrv2_custom_sampler(sampler)
     assert talker_sampler == "talker-sampler"
@@ -675,16 +676,25 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
     # The stock sampler carries the codec window penalty installed above.
     assert rejection.sampler._sampler is sampler
     assert rejection.talker is talker
+    # Any draft method is refused at load where draft codes can't be verified.
+    for session, k_step in (("duplex", 0), ("turn", 2)):
+        talker.vllm_config = SimpleNamespace(
+            speculative_config=spec_config, model_config=SimpleNamespace(session_mode=session)
+        )
+        talker._k_step_frames = k_step
+        with pytest.raises(NotImplementedError, match="turn sessions only"):
+            talker.mrv2_custom_sampler(sampler)
 
 
-def test_drafter_loading_finds_the_codec_table_and_head():
+def test_drafter_loading_finds_the_codec_table_and_no_head():
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
     torch.nn.Module.__init__(talker)
     talker.emb_code = torch.nn.ModuleList([torch.nn.Embedding(10, 4)])
     talker.head_code = torch.nn.ModuleList([torch.nn.Linear(4, 10, bias=False)])
     view = talker.get_language_model()
     assert view.model.embed_tokens is talker.emb_code[0]
-    assert view.lm_head is talker.head_code[0]
+    # No head to share: head_code is a plain Linear, not a ParallelLMHead.
+    assert not hasattr(view, "lm_head")
 
 
 @pytest.mark.parametrize("v2,session,ok", [(True, "turn", True), (True, "duplex", False), (False, "turn", False)])
