@@ -2107,8 +2107,3 @@ def test_level2_sleep_with_a_diffusion_stage_blocks_wake_even_with_opt_in(monkey
             await omni.wake_up()
 
     asyncio.run(run())
-
-
-@pytest.mark.cpu
-def test_async_omni_advertises_ar_level2_wake():
-    assert AsyncOmni.SUPPORTS_AR_LEVEL2_WAKE is True

@@ -17,7 +17,7 @@ import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 import msgspec
@@ -103,9 +103,6 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         ... ):
         ...     print(output)
     """
-
-    # AR stages wake after sleep(level=2) when ar_level2_wake_enabled().
-    SUPPORTS_AR_LEVEL2_WAKE: ClassVar[bool] = True
 
     engine: AsyncOmniEngine
 
