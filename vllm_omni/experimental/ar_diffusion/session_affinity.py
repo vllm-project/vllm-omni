@@ -47,9 +47,7 @@ class SessionRouter:
         """Bind a session to a replica; re-binding to the same one is a no-op."""
         owner = self._owners.get(session_id)
         if owner is not None and owner != replica_id:
-            raise SessionAffinityError(
-                f"session {session_id!r} is bound to replica {owner}, not {replica_id}"
-            )
+            raise SessionAffinityError(f"session {session_id!r} is bound to replica {owner}, not {replica_id}")
         self._owners[session_id] = replica_id
         # `_stale` is not cleared here: it records that this session lost its
         # history at some point, and only release() forgets that.
