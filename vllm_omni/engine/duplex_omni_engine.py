@@ -21,7 +21,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig, apply_session_stats_capability
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -129,7 +129,10 @@ class DuplexOmniEngine(AsyncOmniEngine):
     def duplex_capabilities(self) -> DuplexCapabilities:
         if self.plugin is None:
             raise RuntimeError("duplex plugin is not loaded")
-        return self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions)
+        return apply_session_stats_capability(
+            self.plugin.capabilities(max_sessions=self.duplex_session_config.max_sessions),
+            bool(getattr(self.duplex_session_config, "collect_stats", False)),
+        )
 
     # ---- session message surface ----
 

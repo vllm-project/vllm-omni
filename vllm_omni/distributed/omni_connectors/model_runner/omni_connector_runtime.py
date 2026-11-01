@@ -144,6 +144,7 @@ class _OmniConnectorRuntimeMixin:
     _async_chunk_updated_req_ids: set[str]
     _local_stage_payload_cache: dict[str, dict[str, Any]]
     _local_request_metadata: dict[str, SchedulingMetadataUpdate]
+    _run_stage_payloads: dict[str, bytes]
     _chunk_stream_completed: set[str]
     _pending_full_payload_send: dict[str, tuple[Any, ...]]
     _kv_sent_req_ids: list[str]
@@ -297,6 +298,8 @@ class _OmniConnectorRuntimeMixin:
         self._local_stage_payload_cache: dict[str, dict[str, Any]] = {}
         # Lightweight scheduling metadata pending delivery to the Scheduler.
         self._local_request_metadata: dict[str, SchedulingMetadataUpdate] = {}
+        # Run requests' serialized stage payloads, returned to the Scheduler instead of sent.
+        self._run_stage_payloads: dict[str, bytes] = {}
         # Optional same-process control-plane fast path. Payload tensors remain
         # runner-owned; only OmniConnectorOutput readiness is published.
         self._omni_connector_output_sink: Callable[[OmniConnectorOutput], None] | None = None
