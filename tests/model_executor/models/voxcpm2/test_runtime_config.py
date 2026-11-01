@@ -240,3 +240,11 @@ def test_cfg_value_invalid_yaml_value_blames_the_yaml_source(monkeypatch):
     monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
     with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value=0"):
         talker_mod._resolve_cfg_value(0)
+
+
+def test_cfg_value_non_float_yaml_value_names_the_yaml_source(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value='fast' is not a valid float"):
+        talker_mod._resolve_cfg_value("fast")

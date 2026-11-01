@@ -1037,7 +1037,10 @@ def _resolve_cfg_value(config_value: float) -> float:
             raise ValueError(f"VLLM_OMNI_SPEECH_CFG_VALUE={cfg_from_env!r} is not a valid float") from exc
         source = f"VLLM_OMNI_SPEECH_CFG_VALUE={cfg_from_env!r}"
     else:
-        value = config_value
+        try:
+            value = float(config_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"voxcpm2_runtime_config.cfg_value={config_value!r} is not a valid float") from exc
         source = f"voxcpm2_runtime_config.cfg_value={value!r}"
     if not math.isfinite(value) or value <= 0:
         raise ValueError(
