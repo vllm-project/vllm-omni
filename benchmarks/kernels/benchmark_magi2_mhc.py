@@ -29,6 +29,7 @@ from typing import Any
 from benchmarks.kernels._magi2_gpu_bench import (
     add_arguments,
     check_pair,
+    count_kernels,
     emit,
     load_musa,
     measure_pair,
@@ -83,6 +84,11 @@ def benchmark_shape(torch: Any, mhc: Any, args: argparse.Namespace, tokens: int)
         )
         parity = check_pair(torch, reference, fused, mhc, kernels, rtol=rtol, atol=atol)
         timing = measure_pair(torch, reference, fused, args)
+        # Launch-count evidence (CUDA only; MUSA has no CUPTI profiler).
+        native_kernels = count_kernels(torch, reference)
+        fused_kernels = count_kernels(torch, fused)
+        timing["native_kernels"] = native_kernels
+        timing["fused_kernels"] = fused_kernels
         # Logical minimum traffic: input reads plus output writes. Native
         # intermediates and repeat parameter loads can add actual DRAM traffic.
         element_bytes = streams.element_size()
