@@ -251,6 +251,11 @@ _DIFFUSION_MODELS = {
         "pipeline_internvla_a1",
         "InternVLAA1Pipeline",
     ),
+    "Alpamayo2SuperPipeline": (
+        "alpamayo2_super",
+        "pipeline_alpamayo2_super",
+        "Alpamayo2SuperPipeline",
+    ),
     "Gr00tN1d7Pipeline": (
         "gr00t",
         "pipeline_gr00t",
@@ -473,6 +478,9 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "Pi05Pipeline",
+    # Alpamayo 2 Super's action expert likewise runs its own Euler loop over a
+    # transferred KV prefix, with no DiT block list.
+    "Alpamayo2SuperPipeline",
     # SAM3 is a single forward pass with no denoising steps to cache.
     "Sam3Model",
     "Sam3VideoModel",
