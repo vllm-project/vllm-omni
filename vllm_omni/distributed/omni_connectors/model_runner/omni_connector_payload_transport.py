@@ -10,19 +10,22 @@ import math
 import os
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
 
-from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.data_entry_keys import OmniPayload, returns_stage_payload
 from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import (
     _OmniConnectorRuntimeMixin,
     logger,
     should_accumulate_full_payload_output,
 )
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
 
 
 def _is_full_payload_row_tensor(key: str, value: Any) -> bool:
@@ -54,6 +57,7 @@ if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
+    from vllm_omni.engine import AdditionalInformationPayload
 
 
 class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
@@ -77,47 +81,29 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """Remove and return a stage payload (consume after use)."""
         return cast(OmniPayload | None, self._local_stage_payload_cache.pop(req_id, None))
 
-    def put_local_request_metadata(self, req_id: str, metadata: dict[str, Any]) -> None:
-        """Store lightweight scheduling metadata for a request."""
-        self._local_request_metadata[req_id] = metadata
-
-    def get_local_request_metadata(self, req_id: str) -> dict[str, Any] | None:
-        """Retrieve scheduling metadata for a request."""
+    def get_local_request_metadata(self, req_id: str) -> SchedulingMetadataUpdate | None:
+        """Retrieve the pending scheduler-visible update for a request."""
         return self._local_request_metadata.get(req_id)
+
+    def _extract_scheduling_metadata_update(
+        self, payload: dict[str, Any] | OmniPayload
+    ) -> SchedulingMetadataUpdate | None:
+        # Native async receive keeps the built-in interpretation. Configured
+        # adapters remain scoped to the full-payload receive transaction.
+        adapter = DefaultSchedulingMetadataAdapter() if self._async_chunk else self._scheduling_metadata_adapter
+        update = adapter.extract(cast(OmniPayload, payload), model_mode=self._model_mode)
+        if update is not None and not isinstance(update, SchedulingMetadataUpdate):
+            raise TypeError(
+                "scheduling_metadata_adapter.extract must return None or "
+                f"SchedulingMetadataUpdate, got {type(update).__name__}"
+            )
+        if self._payload_finished(payload):
+            update = replace(update or SchedulingMetadataUpdate(), input_terminal=True)
+        return update
 
     # ------------------------------------------------------------------ #
     #  Scheduling metadata extraction
     # ------------------------------------------------------------------ #
-
-    @classmethod
-    def _extract_scheduling_metadata(cls, payload: dict[str, Any] | OmniPayload) -> dict[str, Any]:
-        """Extract only the fields the scheduler needs from a full payload."""
-        extracted: dict[str, Any] = {}
-        meta = payload.get("meta") if isinstance(payload, dict) else None
-        meta = meta if isinstance(meta, dict) else {}
-        if "next_stage_prompt_len" in meta:
-            extracted["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
-        else:
-            legacy_prompt_len = cast(dict[str, Any], payload).get("next_stage_prompt_len")
-            if legacy_prompt_len is not None:
-                logger.warning_once(
-                    "legacy flat 'next_stage_prompt_len' key in payload; expected 'meta.next_stage_prompt_len'"
-                )
-                extracted["next_stage_prompt_len"] = legacy_prompt_len
-
-        audio_codes = cls._payload_audio_codes(payload)
-        if audio_codes is not None:
-            extracted["code_predictor_codes"] = audio_codes
-
-        if "left_context_size" in meta:
-            extracted["left_context_size"] = meta["left_context_size"]
-        elif "left_context_size" in payload:
-            logger.warning_once("legacy flat 'left_context_size' key in payload; expected 'meta.left_context_size'")
-
-        if cls._payload_finished(payload):
-            extracted["input_terminal"] = True
-
-        return extracted
 
     _NON_CONSUMABLE_PAYLOAD_KEYS: set[tuple[str, str]] = {
         ("meta", "finished"),
@@ -349,11 +335,35 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             logger.warning("Stage payload %s was not delivered; caller must validate inline fallback", get_key)
         return payload
 
+    def _return_stage_payload(
+        self,
+        req_id: str,
+        tags: Mapping[str, object] | AdditionalInformationPayload | None,
+        payload: OmniPayload,
+    ) -> bool:
+        """Keep the payload for the connector output instead of sending it if the tags ask for it."""
+        if not returns_stage_payload(tags):
+            return False
+        with self._lock:
+            self._run_stage_payloads[req_id] = OmniSerializer.serialize(payload)
+        return True
+
+    def _stage_full_payload_locked(self, req_id: str, payload: OmniPayload) -> None:
+        """Cache a received full payload for recv_full_payload_inputs() to publish."""
+        self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
+        # Publish full-payload readiness only after the aligned TP broadcast
+        # path in recv_full_payload_inputs() has materialized the payload on all
+        # local ranks. Publishing metadata / stage_recv from the background recv
+        # thread can let the scheduler observe a request before the payload is
+        # actually visible to the model thread.
+        self._full_payload_pending_broadcast_req_ids.add(req_id)
+        self._pending_load_reqs.pop(req_id, None)
+
     def _apply_staged_payloads_locked(self, staged_payloads: dict[str, Any]) -> None:
         for req_id, payload in staged_payloads.items():
             self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
 
-    def _collect_full_payload_results_locked(self) -> dict[str, Any] | None:
+    def _snapshot_full_payload_results_locked(self) -> dict[str, Any] | None:
         if not self._full_payload_pending_broadcast_req_ids:
             return None
         results: dict[str, Any] = {}
@@ -364,10 +374,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 missing_req_ids.append(req_id)
                 continue
             results[req_id] = self._snapshot_payload(payload)
-            self._full_payload_pending_broadcast_req_ids.discard(req_id)
+            # The caller clears this marker only after metadata extraction
+            # validates, so an adapter failure leaves the receive retryable.
         if missing_req_ids:
             logger.warning(
-                "[Stage-%s] _collect_full_payload_results_locked: "
+                "[Stage-%s] _snapshot_full_payload_results_locked: "
                 "pending full-payload reqs missing from local cache: %s",
                 self._stage_id,
                 missing_req_ids,
@@ -447,6 +458,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             or output.kv_sent_req_ids
             or output.stage_recv_req_ids
             or output.has_pending_kv_work
+            or output.stage_payloads
         )
 
     def attach_omni_connector_output(self, result: Any | None) -> Any:
@@ -512,18 +524,28 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             tp_group is None or getattr(tp_group, "world_size", 1) <= 1
         ) and not self._full_payload_pending_broadcast_req_ids:
             return None
+        is_data_transfer_rank = self.is_data_transfer_rank()
         with self._lock:
-            results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
+            results = self._snapshot_full_payload_results_locked() if is_data_transfer_rank else None
         results = self._broadcast_tp_payload_packet(results)
         if not results:
             return None
+
+        # Validate every update before committing any one-shot readiness state.
+        request_metadata: dict[str, SchedulingMetadataUpdate] = {}
+        for req_id, payload in results.items():
+            update = self._extract_scheduling_metadata_update(payload)
+            if update is not None:
+                request_metadata[req_id] = update
+
         with self._lock:
-            self._stage_recv_req_ids.update(results.keys())
+            self._apply_staged_payloads_locked(results)
+            self._local_request_metadata.update(request_metadata)
+            self._stage_recv_req_ids.update(results)
+            if is_data_transfer_rank:
+                self._full_payload_pending_broadcast_req_ids.difference_update(results)
             for req_id in results:
                 self._pending_load_reqs.pop(req_id, None)
-            self._apply_staged_payloads_locked(results)
-            for req_id, payload in results.items():
-                self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
         logger.debug(
             "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
             self._stage_id,
@@ -789,6 +811,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             if payload is None:
                 logger.debug("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
                 continue
+            # V1 request state only has decoded tags when the request carried some.
+            if self._return_stage_payload(req_id, getattr(request, "additional_information_cpu", None), payload):
+                continue
             if isinstance(payload, dict):
                 audio_codes = self._payload_audio_codes(payload)
                 if isinstance(audio_codes, torch.Tensor):
@@ -860,6 +885,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 return
             # Don't re-register if the finish sentinel was already received
             if request_id in self._chunk_stream_completed:
+                return
+            if isinstance(request.payload_sender_info, bytes):
+                # The payload came on the request: stage it as if fetched, on the rank that fetches.
+                if self.is_data_transfer_rank():
+                    self._stage_full_payload_locked(request_id, OmniSerializer.deserialize(request.payload_sender_info))
                 return
             self._pending_load_reqs[request_id] = request
         self._work_available.set()
@@ -1218,9 +1248,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     existing.update(payload_data)
                 else:
                     self._local_stage_payload_cache[req_id] = payload_data
-                staged_payload = self._local_stage_payload_cache[req_id]
                 self._async_chunk_updated_req_ids.add(req_id)
-                self.put_local_request_metadata(req_id, self._extract_scheduling_metadata(staged_payload))
+                update = self._extract_scheduling_metadata_update(self._local_stage_payload_cache[req_id])
+                if update is not None:
+                    self._local_request_metadata[req_id] = update
                 # A finish-only sentinel still needs one terminal wake-up so
                 # the downstream stage can sync the merged local payload and
                 # flush/finish even when the last recv carries no new
@@ -1249,14 +1280,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             else:
                 engine_inputs = payload_data
             with self._lock:
-                self._local_stage_payload_cache[req_id] = self._snapshot_payload(engine_inputs)
-                # Publish full-payload readiness only after the aligned TP broadcast
-                # path in recv_full_payload_inputs() has materialized the payload on all
-                # local ranks. Publishing metadata / stage_recv from the background recv
-                # thread can let the scheduler observe a request before the payload is
-                # actually visible to the model thread.
-                self._full_payload_pending_broadcast_req_ids.add(req_id)
-                self._pending_load_reqs.pop(req_id, None)
+                self._stage_full_payload_locked(req_id, engine_inputs)
             logger.debug(
                 "[Stage-%s] full_payload recv complete: req=%s key=%s payload_type=%s",
                 self._stage_id,
@@ -1436,6 +1460,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._put_req_chunk.pop(cleanup_req_id, None)
                 self._send_side_request_payload.pop(cleanup_req_id, None)
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
+                getattr(self, "_ming3_chunk_state", {}).pop(cleanup_req_id, None)
                 getattr(self, "_qwen3_tts_emitted_frames", {}).pop(cleanup_req_id, None)
                 self._cached_ic.pop(cleanup_req_id, None)
                 self._ramp_chunk_count.pop(cleanup_req_id, None)
@@ -1530,6 +1555,8 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     if ext_req_id != req_id:
                         self._send_side_request_payload.pop(req_id, None)
         self._chunk_ready_req_ids.update(newly_finished)
+        with self._lock:
+            stage_payloads, self._run_stage_payloads = self._run_stage_payloads, {}
 
         output = OmniConnectorOutput(
             chunk_ready_req_ids=set(self._chunk_ready_req_ids),
@@ -1538,6 +1565,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             kv_sent_req_ids=list(self._kv_sent_req_ids),
             stage_recv_req_ids=set(self._stage_recv_req_ids),
             has_pending_kv_work=self.has_pending_kv_work(),
+            stage_payloads=stage_payloads,
         )
         if output.stage_recv_req_ids or chunk_finished or newly_finished:
             logger.debug(
@@ -1632,6 +1660,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             (request, payload if payload is not None else self._finish_marker_payload())
             for request, payload in entries
             if payload is not None or self._request_is_finished(request)
+        ]
+        # MRv2 request snapshots carry the serialized tags.
+        entries = [
+            (request, payload)
+            for request, payload in entries
+            if not self._return_stage_payload(request.req_id, request.additional_information, payload)
         ]
         if not entries:
             return 0

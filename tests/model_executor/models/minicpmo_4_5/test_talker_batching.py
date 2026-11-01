@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.overrides import TorchFunctionMode
 
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
@@ -21,15 +22,23 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _CODEC_PENALTY_WINDOW,
+    _DRAIN_BOUNDARY_MASK,
+    _DRAIN_NONE,
+    _DRAIN_UNTIL_SILENT,
     _DUPLEX_CODEC_TOKENS_PER_CHUNK,
     _DUPLEX_TURN_END_CODEC_TOKENS,
     _OFFLINE_CODEC_MAX_NEW_TOKENS,
+    _QUIET_CODEC_IDS,
     _REPETITION_PENALTY_CHUNK_SIZE,
+    _SILENT_CODEC_IDS,
+    _TURN_END_QUIET_STOP_FRAMES,
     MiniCPMO45OmniTTSForConditionalGeneration,
     _apply_batched_repetition_penalty,
     _native_duplex_chunk_budget,
     _restore_weight_norm_weight,
+    _trailing_code_runs,
     _turn_end_boundary_eos_masked,
+    _turn_end_drain_kind,
     blank_scheduler_prompt_for_penalties,
 )
 from vllm_omni.utils.mm_outputs import to_payload_element
@@ -890,7 +899,8 @@ def test_cpu_codec_transport_preserves_embedding_and_owns_delta(device, dtype, c
 
 
 @pytest.mark.parametrize("use_snapshot", [False, True])
-def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_snapshot) -> None:
+@pytest.mark.parametrize("include_hidden", [False, True])
+def test_cpu_codec_transport_routes_owned_payloads(monkeypatch, use_snapshot, include_hidden) -> None:
     from types import SimpleNamespace
 
     from tests.worker.test_gpu_ar_model_runner import _make_async_output_runner
@@ -918,9 +928,10 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     assert [value.device.type for value in mm["codes"]["audio"]] == ["cpu"] * 3
     assert [value.shape for value in mm["codes"]["audio"]] == [(1, 1), (0, 1), (1, 1)]
     if use_snapshot:
-        snapshot = _snapshot_tensor_payload_to_cpu_async(
-            {"hidden_states": hidden, "multimodal_outputs": mm}, copy_stream=None, pin_memory=False
-        )
+        payload = {"multimodal_outputs": mm}
+        if include_hidden:
+            payload["hidden_states"] = hidden
+        snapshot = _snapshot_tensor_payload_to_cpu_async(payload, copy_stream=None, pin_memory=False)
         assert snapshot._ready_event is None
         snapshot.wait()
         mm = snapshot.payload["multimodal_outputs"]
@@ -928,7 +939,7 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
         assert mm["codes"]["audio"][0].tolist() == [[0]]
 
     runner = _make_async_output_runner(engine_output_type="latent")
-    assert runner._pooler_payload_include_hidden_flag is True
+    runner._pooler_payload_include_hidden_flag = include_hidden
     runner.requests = {rid: object() for rid in req_ids}
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, ids: ("latent", ids))
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -936,7 +947,7 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     output = runner._build_omni_model_runner_output_from_snapshot(
         scheduler_output=SimpleNamespace(total_num_scheduled_tokens=3, num_scheduled_tokens=dict.fromkeys(req_ids, 1)),
-        hidden_states=hidden,
+        hidden_states=hidden if include_hidden else hidden[:0],
         staged_hidden_states_cpu=None,
         multimodal_outputs=mm,
         req_ids_output_copy=req_ids,
@@ -966,7 +977,10 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     assert [payload["meta.finished"].item() for payload in output.inter_stage_outputs] == [False, True, False]
     assert all(payload["codes.audio"].device.type == "cpu" for payload in output.inter_stage_outputs)
     for index, payload in enumerate(output.inter_stage_outputs):
-        torch.testing.assert_close(payload["hidden"], hidden[index : index + 1])
+        if include_hidden:
+            torch.testing.assert_close(payload["hidden"], hidden[index : index + 1])
+        else:
+            assert "hidden" not in payload
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -1041,7 +1055,8 @@ def test_empty_speech_segment_finishes_without_sampling_codes() -> None:
     assert decode_updates["codes"]["audio"].shape == (0,)
 
 
-def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> None:
+@pytest.mark.parametrize("packed", [False, True])
+def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker, packed) -> None:
     talker = _make_talker()
     talker.emb_text = nn.Embedding(1, 2)
     condition = torch.arange(18, dtype=torch.float32).reshape(9, 2)
@@ -1055,7 +1070,7 @@ def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> Non
         _omni_prompt_len=68,
         request_id="req-chunked-prefill",
         tts_token_ids=torch.tensor([1]),
-        tts_hidden_states=torch.ones(1, 2),
+        tts_hidden_states=pack_handoff_tensor(torch.ones(1, 2)) if packed else torch.ones(1, 2),
     )
 
     assert torch.equal(embeds, condition)
@@ -1407,7 +1422,7 @@ def test_turn_end_drain_masks_only_the_cadence_eos() -> None:
         "step": 25,
         "max_tokens": _DUPLEX_TURN_END_CODEC_TOKENS,
         "min_tokens": 0,
-        "turn_end_drain": True,
+        "turn_end_drain": _DRAIN_BOUNDARY_MASK,
     }
     output = talker.make_omni_output(
         torch.ones(1, 2),
@@ -1426,6 +1441,62 @@ def test_turn_end_drain_masks_only_the_cadence_eos() -> None:
     )
     logits = talker.compute_logits(output.text_hidden_states)
     assert torch.isfinite(logits[0, 7])
+
+
+def test_turn_end_drain_kind_follows_sentence_end() -> None:
+    assert _turn_end_drain_kind(True, {}) == _DRAIN_NONE
+    assert _turn_end_drain_kind(False, {"turn_end": True, "turn_text_ends_sentence": True}) == _DRAIN_NONE
+    assert _turn_end_drain_kind(True, {"turn_end": True}) == _DRAIN_BOUNDARY_MASK
+    assert _turn_end_drain_kind(True, {"turn_end": True, "turn_text_ends_sentence": False}) == _DRAIN_BOUNDARY_MASK
+    assert _turn_end_drain_kind(True, {"turn_end": True, "turn_text_ends_sentence": True}) == _DRAIN_UNTIL_SILENT
+
+
+def test_trailing_code_runs_count_only_the_current_condition() -> None:
+    silent, quiet = _SILENT_CODEC_IDS[0], next(c for c in _QUIET_CODEC_IDS if c not in _SILENT_CODEC_IDS)
+    assert _trailing_code_runs(0, [silent, silent]) == (0, 0)
+    # Codes retained from the previous condition do not count.
+    assert _trailing_code_runs(1, [silent, silent]) == (1, 1)
+    assert _trailing_code_runs(3, [1, silent, silent]) == (2, 2)
+    assert _trailing_code_runs(3, [silent, quiet, silent]) == (1, 3)
+    assert _trailing_code_runs(2, [quiet, 1]) == (0, 0)
+    assert _trailing_code_runs(2, [quiet, 1], silent_ids=(1,), quiet_ids=(1,)) == (1, 1)
+
+
+def _drain_until_silent_output(talker, *, step: int, recent_codes: list[int]):
+    talker._request_audio_states["req-drain"] = {
+        "finished": False,
+        "step": step,
+        "max_tokens": _DUPLEX_TURN_END_CODEC_TOKENS,
+        "min_tokens": 0,
+        "turn_end_drain": _DRAIN_UNTIL_SILENT,
+        "recent_codes": recent_codes,
+    }
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[{"request_id": "req-drain", "codes": {"audio": torch.empty(0)}}],
+        request_token_spans=[(0, 1)],
+    )
+    return output, talker.compute_logits(output.text_hidden_states)
+
+
+def test_turn_end_drain_until_silent_stops_only_after_silence() -> None:
+    silent, quiet = _SILENT_CODEC_IDS[0], next(c for c in _QUIET_CODEC_IDS if c not in _SILENT_CODEC_IDS)
+    talker = _make_talker()
+    # Speech, or a single silent code: the cadence EOS is masked at any step.
+    for step, recent in [(24, [1, 2]), (25, [1, 2]), (30, [1, silent]), (60, [silent, 1])]:
+        output, logits = _drain_until_silent_output(talker, step=step, recent_codes=recent)
+        assert logits[0, 7].item() == float("-inf")
+        assert output.multimodal_outputs["meta"]["finished"][0].item() is False
+    # Two silent codes in a row of this condition: EOS is the model's choice.
+    output, logits = _drain_until_silent_output(talker, step=30, recent_codes=[1, silent, silent])
+    assert torch.isfinite(logits[0, 7])
+    assert output.multimodal_outputs["meta"]["finished"][0].item() is False
+    # A long quiet stretch forces EOS.
+    stop = _TURN_END_QUIET_STOP_FRAMES
+    output, _ = _drain_until_silent_output(talker, step=40, recent_codes=[1] + [quiet] * stop)
+    assert output.multimodal_outputs["meta"]["finished"][0].item() is True
+    output, _ = _drain_until_silent_output(talker, step=40, recent_codes=[1] + [quiet] * (stop - 1))
+    assert output.multimodal_outputs["meta"]["finished"][0].item() is False
 
 
 @pytest.mark.parametrize("aux_penalty", [None, "frequency", "presence"])

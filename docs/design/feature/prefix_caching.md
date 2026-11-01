@@ -41,7 +41,7 @@ The main focus of vLLM-Omni's approach to prefix caching stage outputs is to bui
 
 With this in mind, consider the set of blocks in a 2D layout, where the row represents the index of blocks being considered, and the columns represent the slots corresponding to tokens within each block. Since we know the `num_blocks` and `block_size` from our kv cache config, if we want to cache a tensor with feature size `D`, we can preallocate a CPU tensor of size `(num_blocks, block_size, D)`, and use the same block index and slot mapping to retrieve the corresponding feature vector.
 
-Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of **pinned** CPU memory (pinned so device→host can overlap compute), allocated on the first `save_outputs` that sees the key — the first real request pays the `cudaHostAlloc`. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
+Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of pageable CPU memory, allocated without zero-filling on the first `save_outputs` that sees the key. Device→host copies use separate pinned staging buffers. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
 
 ### Example
 
@@ -256,6 +256,7 @@ Which stages may set `enable_prefix_caching: true`:
 | AR stage with one full-attention kv group whose hidden states / per-token mm feed the next stage (Qwen3-Omni thinker and talker) | supported | The case the cache is built for: full-prompt hidden states are merged from the pool on a hit. |
 | AR stage that sets `requires_full_prefix_cached_hidden_states = False`, optionally with `deferred_prefix_cache_mm_keys` (Qwen3-TTS talker, Higgs v3 talker) | supported | Hidden is not cached; deferred codec rows are written once on finish. |
 | AR stage that appends its mm outputs in `sample()` and sets `mm_outputs_written_in_sample = True` together with `requires_full_prefix_cached_hidden_states = False` (YuE2) | supported | The step snapshot is taken before `sample()` and cannot hold those outputs, so the runner discards the step context and builds the payload from the live outputs. KV blocks are still reused on a hit. Setting the flag without the hidden-state opt-out is refused when the policy is built. |
+| Token-only AR stage with `uses_native_kv_cache_only = True` and `requires_full_prefix_cached_hidden_states = False` (Ming3 Thinker) | native cache only | Bypasses the Omni stage-output tensor cache; native vLLM KV and aligned recurrent-state caching retain their own validation. No prefix hidden states or deferred multimodal outputs may be requested by this policy. |
 | Pooling stage | ignored | Never saves; the gate returns no config. |
 | `kv_role: kv_consumer` / `kv_both` | refused at kv-cache init (`OmniPrefixCacheUnmatchError`) | Producer KV shows up as `num_computed_tokens` and is indistinguishable from a local hit. |
 | Speculative decoding on the stage | refused at kv-cache init | Under async scheduling vLLM keeps `num_computed_tokens_cpu` optimistic (all drafts accepted) during the forward and corrects it afterwards; `step_slots_cpu` would mirror rows at the wrong slots. Not verified; refused as a whole. |
@@ -290,7 +291,8 @@ Hit spans come from adapter-classified `STARTED` events for new requests:
   `EXTENDED`, so the manager does not mark a hit: those rows were delivered in
   earlier steps and re-emitting them would duplicate output. A
   `delivered_upto` span for this case is Phase 2.
-- Preemption + reschedule: vLLM resets `num_computed_tokens` to 0 on
+- Preemption + reschedule: for stages with `recompute_preemption="allow"`
+  (the default), vLLM resets `num_computed_tokens` to 0 on
   preemption and re-runs prefix matching on resume, so the resumed request
   can come back with a fresh hit. With the V1 model runner it arrives
   through `scheduled_cached_reqs` (id in `resumed_req_ids`, `new_block_ids`
@@ -302,6 +304,22 @@ Hit spans come from adapter-classified `STARTED` events for new requests:
   rows, from this request or the one it hit. Stages that need full prompt
   hidden states should be sized so preemption does not occur while prefix
   caching is on. Same as before this refactor; tracked for Phase 2.
+
+Stages whose decode state cannot be reconstructed from token IDs declare
+`recompute_preemption="fail"` in their AR pipeline topology. Capacity
+preemption then finishes the request with one terminal ERROR and releases its
+request/KV state instead of requeueing it, including when a KV-delivery
+connector asks to discard stale output. Explicit `reset_prefix_cache` retains
+its existing resume behavior, subject to `supports_running_prefix_cache_reset`;
+its reset scope, rather than the shared `drop_stale_output` flag, identifies
+that exception. Fail-mode preemption also notifies the auxiliary-output
+connector before removing the request, so the worker receives its finished
+notification and subsequent metadata assembly cannot reference a freed request.
+
+Fish Omni retains the default `allow` policy: its MRv2 model state saves the
+generated codebooks before a slot is reused and restores full frame rows on
+resume. Missing codebooks in the token stream alone do not imply that a stage
+cannot replay; model-state replay support must also be considered.
 
 The adapter is the sole owner of started-request observations. Its single
 `translate_step` entry point captures an immutable `PrefixCacheStep`.
@@ -328,7 +346,8 @@ resume delivery watermarks are follow-up contracts, not inferred here.
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
 - Immediate (`JOIN_NEXT_STEP`): save launches a whole-step device→host into
-  a staging slot; the committer waits that event and writes the CPU pool.
+  a staging slot; one WriteTask covers every request of the step, and the
+  committer waits that event and writes the CPU pool.
   The next save waits `done` (the pool write): a reused slot must never
   leave a pending pool write behind, or a delayed hit read of the old rows
   would find nothing recoverable.

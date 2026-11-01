@@ -14,8 +14,11 @@ from vllm.v1.request import Request
 
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.core.sched import omni_scheduler_mixin
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.data_entry_keys import RETURN_STAGE_PAYLOAD_KEY
+from vllm_omni.outputs import OmniConnectorOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -114,10 +117,14 @@ def test_native_data_plane_uses_the_selected_input_protocol(async_chunk, stage_i
     assert scheduler._native_data_plane
     if async_chunk or (stage_id > 0 and required):
         assert scheduler.input_coordinator._async_chunk is async_chunk
+        assert scheduler.input_coordinator.receives_chunks is (async_chunk and stage_id > 0)
     else:
         assert scheduler.input_coordinator is None
     assert scheduler._async_chunk_transport_enabled() is async_chunk
     assert scheduler.chunk_transfer_adapter is None
+    # Stage zero can own an async coordinator for bookkeeping without
+    # receiving connector chunks. Full-payload inputs are not atomic chunks.
+    assert OmniGenerationScheduler._requires_atomic_chunk(scheduler) is (async_chunk and stage_id > 0)
 
 
 def test_schedule_lifecycle_helpers_process_and_restore_both_input_paths():
@@ -182,6 +189,7 @@ def test_finished_request_attachment_keeps_ar_abort_policy_explicit(
 ):
     scheduler = _Scheduler()
     scheduler.finished_req_ids_dict = defaultdict(set, {2: {"req-finished"}})
+    scheduler._outputs_awaiting_stage_payload = {}
     outputs: dict = {}
 
     scheduler._attach_finished_request_sets(
@@ -236,4 +244,45 @@ def test_native_downstream_sender_stage_does_not_wait_for_chunks(role, coordinat
 
     assert scheduler._native_data_plane
     assert (scheduler.input_coordinator is not None) is coordinated
+    if coordinated:
+        assert scheduler.input_coordinator.receives_chunks
     assert scheduler._async_chunk_transport_enabled() is coordinated
+    assert scheduler.chunk_transfer_adapter is None
+    assert OmniGenerationScheduler._requires_atomic_chunk(scheduler) is coordinated
+
+
+def test_only_run_requests_wait_for_their_stage_payload():
+    """Ensure a run request's finished output is held, not reported as aborted, then sent once with its payload."""
+    scheduler = _Scheduler()
+    # NOTE: run requests don't currently support async chunk
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0, async_chunk=False))
+    scheduler._init_omni_io_scheduling_state()
+    scheduler.finished_req_ids_dict = defaultdict(set, {0: {"run"}})
+    outputs: dict = defaultdict(list)
+
+    for request_id, tags in (("normal", None), ("run", {RETURN_STAGE_PAYLOAD_KEY: True})):
+        request = SimpleNamespace(
+            request_id=request_id,
+            client_index=0,
+            trace_headers=None,
+            take_events=lambda: [],
+            additional_information=tags,
+        )
+        scheduler._append_request_output(outputs, request, new_token_ids=[], finish_reason=FinishReason.STOP)
+
+    # Ensure that attaching the finished request sets emits nothing for the held run request
+    # while the normal request's output is already in this step's outputs.
+    held_step: dict = {}
+    scheduler._attach_finished_request_sets(held_step, synthesize_abort_outputs=True)
+    assert [output.request_id for output in outputs[0]] == ["normal"]
+    assert held_step[0].outputs == []
+
+    # Ensure that once the worker's stage payload arrives, the held
+    # run request's finished is emitted once with the payload,
+    scheduler.enqueue_omni_connector_output(OmniConnectorOutput(stage_payloads={"run": b"payload"}))
+    scheduler._consume_pending_connector_output("ar")
+    released_step: dict = {}
+    scheduler._attach_finished_request_sets(released_step, synthesize_abort_outputs=True)
+
+    [output] = released_step[0].outputs
+    assert (output.request_id, output.finish_reason, output.stage_payload) == ("run", FinishReason.STOP, b"payload")

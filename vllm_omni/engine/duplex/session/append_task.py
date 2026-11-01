@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState, DuplexTurnEventType
-from vllm_omni.engine.duplex.plugin import PcmAppendReservation, settle_response_runtime
+from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError, PcmAppendReservation, settle_response_runtime
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
@@ -71,6 +71,9 @@ class AppendAttempt:
     #: Commits timing state once the runtime accepts the append (before any
     #: returned output event can clear the continuation chain).
     on_append_accepted: Callable[[float], None] | None = None
+    #: After prompt validation and fencing, before stage admission. Interactive
+    #: requests can release a private model slot without preempting for rejected input.
+    on_append_prepared: Callable[[], None] | None = None
     #: Last chance to call the append off, checked once the predecessor is done.
     before_append: Callable[[], bool] | None = None
 
@@ -182,7 +185,8 @@ class AppendAttempt:
             # answer, and that is the client's doing, not a runtime failure.
             # The reservation rollback itself is already a no-op.
             self.abandon(reason="input_cleared")
-            return False
+            # Called off, not failed: audio appended after the clear still runs.
+            return True
         return await self._submit()
 
     async def _submit(self) -> bool:
@@ -209,10 +213,11 @@ class AppendAttempt:
                 input_audio_part=self.input_audio_part,
                 input_audio_parts=self.input_audio_parts,
                 on_append_accepted=self.on_append_accepted,
+                on_append_prepared=self.on_append_prepared,
             )
             if append_ok:
                 model_state.context_locked = True
-                if self.pcm_reservation is not None:
+                if self.pcm_reservation is not None and self.pcm_reservation.active:
                     self.pcm_reservation.commit()
                     session.release_input_bytes(self.pcm_reservation.byte_count)
                 self.discard_retained_audio()
@@ -236,6 +241,14 @@ class AppendAttempt:
             return append_ok
         except asyncio.CancelledError:
             raise
+        except DuplexInputCapacityError as exc:
+            self.abandon(reason=exc.code)
+            self.out.emit_error(exc.code, str(exc), retryable=True)
+            # Already queued successors keep their failed predecessor. A new
+            # client commit may retry admission without a poisoned append tail.
+            if self.ctx.tasks.append_tail is asyncio.current_task():
+                self.ctx.tasks.append_tail = None
+            return False
         except Exception as exc:
             # Compensate while the session is still open, so the client gets
             # the failed ``response.done`` before the error and the close.

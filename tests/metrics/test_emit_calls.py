@@ -429,6 +429,7 @@ def _make_scheduler_shell() -> OmniARScheduler:
     obj.kv_holding_waiting = []
     obj.deferred_waiting = set()
     obj._kv_wait_start_ts = {}
+    obj._outputs_awaiting_stage_payload = {}
     obj._omni_kv_config = None
     return obj
 
