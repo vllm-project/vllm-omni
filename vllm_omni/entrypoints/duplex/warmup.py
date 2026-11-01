@@ -7,7 +7,7 @@ Moved out of ``api_server.py`` under P0.2 of #5227. The
 the hold-clients preamble is ``wait_for_duplex_warmup`` here.
 
 Video-required models default to one short audio-plus-frame turn so the four
-pipeline stages compile real shapes before a client is accepted. That is
+pipeline stages compile real shapes before a client session is admitted. That is
 separate from the per-stage JIT kernel registry, which can finish in ~0.01 s
 without compiling anything.
 """
