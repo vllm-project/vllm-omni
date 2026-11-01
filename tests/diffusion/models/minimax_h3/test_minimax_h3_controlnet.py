@@ -41,6 +41,12 @@ class CPUAttention(nn.Module):
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask
         ).transpose(1, 2)
 
+    def add_schedule_candidate_check(self, check):
+        del check
+
+    def effective_attention(self):
+        return self, self.attn_backend, None
+
 
 @pytest.fixture
 def cpu_layers(monkeypatch):
