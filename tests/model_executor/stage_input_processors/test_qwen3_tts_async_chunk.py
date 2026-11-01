@@ -1724,3 +1724,26 @@ class TestAdaptiveAccumulationPath:
             f"Missing: {sorted(set(expected) - set(emitted_indices))}, "
             f"Extra: {sorted(set(emitted_indices) - set(expected))}"
         )
+
+
+@pytest.mark.parametrize("last_valid", [False, True])
+def test_full_payload_accumulated_validity_preserves_qwen3_audio(last_valid):
+    """Shared mask accumulation must not change Qwen3-TTS sync codec output."""
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+
+    transport = _OmniConnectorPayloadTransportMixin()
+    transport._pending_full_payload_send = {}
+    transport._full_payload_replace_keys_cached = frozenset()
+    request = SimpleNamespace(request_id="r", output_token_ids=[1, 2, 3])
+    for codes, valid in [([0, 0], False), ([1, 2], True), ([3, 4], True), ([0, 0], last_valid)]:
+        transport.accumulate_full_payload_output(
+            "r",
+            {"codes.audio": torch.tensor([codes]), "meta.codec_frame_valid": torch.tensor([valid])},
+            request,
+        )
+    full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["r"])
+    assert full["meta.codec_frame_valid"].tolist() == [False, True, True, last_valid]
+    payload = talker2code2wav_full_payload(None, full, request)
+    assert payload["codes"]["audio"].tolist() == [1, 3, 2, 4]

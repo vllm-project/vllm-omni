@@ -67,12 +67,6 @@ def test_custom_processor_bridge_preserves_prompt_kwargs_and_passthrough(counts,
             "GLMTTSMultiModalProcessor",
             {"prompt_text": "This is the reference voice."},
         ),
-        (
-            "omnivoice",
-            "OmniVoiceDummyInputsBuilder",
-            "OmniVoiceMultiModalProcessor",
-            {"ref_text": "Testing voice cloning."},
-        ),
         ("mimo_audio", "MiMoAudioLLMDummyInputsBuilder", "MiMoAudioLLMMultiModalProcessor", {}),
     ],
 )

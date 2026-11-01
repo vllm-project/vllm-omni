@@ -34,7 +34,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    check_interleaved_audio_video,
     create_qwen2_5_omni_thinker_field_factory,
     merge_interleaved_embeddings,
 )
@@ -88,6 +87,7 @@ from vllm.multimodal.processing.processor import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 
+from vllm_omni.model_executor.models.common.audio_in_video import check_interleaved_audio_video
 from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config,
 )
@@ -1348,8 +1348,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         video_token_id = self.config.video_token_index
         audio_token_id = self.config.audio_token_index
 
-        # The interleaving check reads scalar positions in a Python loop.
-        # Keep its masks on CPU to avoid repeated CUDA synchronization.
+        # Keep the masks on CPU: the counts below and the per-modality counts
+        # in merge_interleaved_embeddings then read back without CUDA syncs.
         input_ids_cpu = input_ids.cpu()
         is_video = is_multimodal & (input_ids_cpu == video_token_id)
         is_audio = is_multimodal & (input_ids_cpu == audio_token_id)

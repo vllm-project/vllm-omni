@@ -207,11 +207,6 @@ class OpenAICreateSpeechRequest(BaseModel):
         ),
     )
 
-    @field_validator("stream_format")
-    @classmethod
-    def validate_stream_format(cls, v: str) -> str:
-        return v
-
     @field_validator("ref_audio", mode="before")
     @classmethod
     def normalize_ref_audio(cls, v):

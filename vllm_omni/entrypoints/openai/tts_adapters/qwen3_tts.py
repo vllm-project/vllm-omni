@@ -109,11 +109,6 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                 return variants[re.sub(r"[-_.]", "", match.group(1))]
         return None
 
-    def normalize(self, request: "OpenAICreateSpeechRequest") -> None:
-        """Qwen3-TTS normalization (Base-task inference, voice lowercasing) is
-        performed inside ``validate`` today; kept fused for a strict behaviour
-        match."""
-
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate Qwen TTS request parameters. Returns error message or None."""
         # Infer Base task when ref_audio or ref_text is provided without explicit task_type.
@@ -252,13 +247,7 @@ class Qwen3TTSAdapter(ARTTSAdapter):
             return f"Instructions too long (max {server._max_instructions_length} characters)"
 
         # Validate max_new_tokens range
-        if request.max_new_tokens is not None:
-            if request.max_new_tokens < self.max_new_tokens_min:
-                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
-            if request.max_new_tokens > self.max_new_tokens_max:
-                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
-
-        return None
+        return self._validate_max_new_tokens(request)
 
     def _build_tts_params(self, request: "OpenAICreateSpeechRequest") -> dict[str, Any]:
         """Build TTS parameters from request.

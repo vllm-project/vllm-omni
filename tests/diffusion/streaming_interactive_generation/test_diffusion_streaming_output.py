@@ -450,6 +450,7 @@ class TestPipelineStreamingOutputToEntrypoint:
         omni = object.__new__(AsyncOmni)
         omni.engine = engine
         omni.log_stats = False
+        omni.collect_stage_metrics = True
         omni._pause_cond = asyncio.Condition()
         omni._paused = False
         omni.request_states = {}

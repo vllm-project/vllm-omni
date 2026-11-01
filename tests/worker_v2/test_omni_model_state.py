@@ -235,6 +235,64 @@ def test_static_decode_embeddings_refresh_from_input_ids():
     assert OmniModelState._preprocess_result_needs_writeback(original, original.view_as(original)) is True
 
 
+@pytest.mark.parametrize(
+    "declared,mm_inputs,encoder_dim,reuses",
+    [(True, True, 4, True), (False, True, 4, False), (True, False, 4, False), (True, True, 6, False)],
+)
+def test_preprocess_model_reuses_encoder_buffer_only_when_declared(
+    monkeypatch, declared, mm_inputs, encoder_dim, reuses
+):
+    def default_init(self, vllm_config, model, encoder_cache, device):
+        self.vllm_config = vllm_config
+        self.model_config = vllm_config.model_config
+        self.scheduler_config = vllm_config.scheduler_config
+        self.model = model
+        self.device = device
+        self.max_num_reqs = 2
+        self.max_num_tokens = 8
+        self.dtype = torch.float32
+        self.supports_mm_inputs = encoder_cache is not None
+        if self.supports_mm_inputs:
+            self.encoder_runner = SimpleNamespace(inputs_embeds=torch.zeros(8, encoder_dim))
+
+    class Model(torch.nn.Module):
+        has_preprocess = True
+        preprocess_keeps_mm_inputs = declared
+
+        def embed_input_ids(self, input_ids):
+            return torch.zeros(input_ids.shape[0], 4)
+
+    monkeypatch.setattr(DefaultModelState, "__init__", default_init)
+    config = SimpleNamespace(model_config=SimpleNamespace(), scheduler_config=SimpleNamespace(max_num_seqs=2))
+    state = OmniModelState(config, Model(), object() if mm_inputs else None, torch.device("cpu"))
+    assert state.preprocess_keeps_mm_inputs is reuses
+    assert state._static_inputs_embeds.shape == (8, 4)
+    encoder_runner = getattr(state, "encoder_runner", None)
+    assert (encoder_runner is not None and state._static_inputs_embeds is encoder_runner.inputs_embeds) is reuses
+
+
+def test_preprocess_on_encoder_embeddings_keeps_media_rows():
+    """With native multimodal inputs kept, the encoder buffer already holds this step's rows."""
+    state = _make_state(has_preprocess=True)
+    encoder_embeds = torch.tensor([[7.0, 7.0], [1.0, 1.0]])  # row 0: image features, row 1: text
+    state._static_inputs_embeds = encoder_embeds
+    state.preprocess_keeps_mm_inputs = True
+    state.model.embed_input_ids = lambda input_ids: torch.zeros(input_ids.shape[0], 2)
+    duplex_embeds = torch.tensor([[3.0, 3.0]])
+
+    def preprocess(input_ids, input_embeds, **info):
+        # A duplex append replaces its own row; a chat row passes through.
+        return input_ids, duplex_embeds if info["req_id"] == "duplex" else input_embeds, {}
+
+    state.model.preprocess = preprocess
+    _fill_buffers(state, "chat", "duplex")
+    state.run_preprocess(
+        _DummyInputBatch([0, 1]),
+        {"input_ids": torch.tensor([151667, 42], dtype=torch.long), "inputs_embeds": encoder_embeds[:2]},
+    )
+    assert torch.equal(encoder_embeds, torch.tensor([[7.0, 7.0], [3.0, 3.0]]))
+
+
 def test_moss_local_decode_runs_depth_predictor_and_routes_eos(mocker):
     """Exercise MRV2 dispatch through the real Local hook, output and logits."""
     from vllm.sampling_params import SamplingParams

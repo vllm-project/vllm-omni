@@ -31,7 +31,7 @@ from vllm.platforms import current_platform
 from vllm.utils import numa_utils
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.engine.utils import CoreEngineProcManager
-from vllm.v1.executor import Executor
+from vllm.v1.executor import Executor, UniProcExecutor
 from vllm.v1.utils import shutdown
 
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
@@ -155,11 +155,13 @@ class StageEngineCoreProcManager(CoreEngineProcManager):
 
                 with (
                     device_control_context,
+                    # UniProcExecutor runs its worker in this process, so its
+                    # worker CPU list must apply at the EngineCore spawn.
                     numa_utils.configure_subprocess(
                         vllm_config,
                         local_rank=0,
                         dp_local_rank=local_dp_rank,
-                        process_kind="EngineCore",
+                        process_kind="worker" if issubclass(executor_class, UniProcExecutor) else "EngineCore",
                     ),
                 ):
                     proc.start()

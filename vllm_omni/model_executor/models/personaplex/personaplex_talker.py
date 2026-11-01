@@ -200,7 +200,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         self,
         text_token: torch.Tensor,
         last_agent: torch.Tensor | None,
-        prev_agent: torch.Tensor | None,
         device: torch.device,
         user_d0: torch.Tensor | None = None,
         user_d1: torch.Tensor | None = None,
@@ -393,9 +392,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # Agent acoustic delay: cb0 (delay 0) = gen[t-1] = the last stored codes;
         # cb1..7 (delay 1) = gen[t-2] = the codes carried from the previous frame.
         last_agent = self._last_agent_codes(info_dict)
-        prev_agent = info_dict.get("pplex_prev_agent")
-        if prev_agent is not None and not isinstance(prev_agent, torch.Tensor):
-            prev_agent = torch.as_tensor(prev_agent, dtype=torch.long)
         # Real user stream (Phase-1 turn-based): user cb0 delay-0, cb1..7 delay-1.
         # Index into the user stream relative to the first decode frame (after the
         # persona prefill), so the user audio aligns with the agent's response.
@@ -407,7 +403,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         decode_frame = max(0, int(meta.get("pplex_frame", 0)) - prefill_len)
         user_d0 = self._user_frame(info_dict, decode_frame - 1)
         user_d1 = self._user_frame(info_dict, decode_frame - 2)
-        base = self._build_frame_embed(text_token, last_agent, prev_agent, device, user_d0, user_d1)
+        base = self._build_frame_embed(text_token, last_agent, device, user_d0, user_d1)
         text_step = self.input_embeddings.text_emb(text_token.reshape(1, 1)).reshape(1, -1)
         # The previous frame's temporal hidden (written by postprocess into
         # hidden_states["last"]) conditions this frame's depformer. Falls back to
@@ -422,9 +418,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             "meta": {"pplex_frame": int(meta.get("pplex_frame", 0)) + 1},
             "mtp_inputs": (last_hidden, text_step),
         }
-        # Carry this frame's gen[t-1] forward; next frame reads it as gen[t-2] (cb1..7).
-        if last_agent is not None:
-            info_update["pplex_prev_agent"] = last_agent.detach().to(torch.long).cpu()
         return input_ids, base, info_update
 
     def _duplex_stage0_runtime(self):
@@ -632,7 +625,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         """Route the Moshi checkpoint into the three components.
 
         * ``transformer.*`` / ``out_norm.alpha`` -> the Helium temporal backbone
-          (same q/k-split + gate/up-split + alpha-squeeze map as HeliumForCausalLM).
+          (q/k-split + gate/up-split + alpha-squeeze map).
         * ``text_linear.weight`` -> ``lm_head``.
         * ``emb.*`` / ``text_emb.weight`` -> input embeddings.
         * ``depformer*`` / ``linears.*`` -> depformer.

@@ -160,6 +160,16 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        # Only the head owns stage-metric collection; API statistics default on.
+        if (
+            not bool(getattr(args, "headless", False))
+            and not bool(getattr(args, "disable_log_stats", False))
+            and not bool(getattr(args, "collect_stage_metrics", True))
+        ):
+            raise ValueError(
+                "--no-collect-stage-metrics requires --disable-log-stats when statistics logging is enabled"
+            )
+
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
 
@@ -452,6 +462,16 @@ class OmniServeCommand(CLISubcommand):
             "--log-stats",
             action="store_true",
             help="Enable logging the stats.",
+        )
+        omni_config_group.add_argument(
+            "--collect-stage-metrics",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Collect per-request stage diagnostics. Enabled by default; "
+                "use --no-collect-stage-metrics with --disable-log-stats to skip diagnostics "
+                "while preserving completion and usage metadata."
+            ),
         )
         omni_config_group.add_argument(
             "--log-file",
@@ -855,6 +875,18 @@ class OmniServeCommand(CLISubcommand):
                 "'channels_last' additionally switches decoder convolutions to channels-last memory "
                 "format and fuses RMSNorm+SiLU (faster, not bit-exact); 'off' keeps the reference "
                 "diffusers implementation."
+            ),
+        )
+
+        omni_config_group.add_argument(
+            "--vae-encode-fast-path",
+            choices=("off", "lossless", "channels_last"),
+            default="lossless",
+            help=(
+                "Cosmos3/Wan2.2 residual VAE encoder fast path, independent of --vae-fast-path. "
+                "'lossless' (default) preserves reference values; 'channels_last' also switches "
+                "encoder convolution layouts and fuses reductions (not bit-exact); 'off' uses "
+                "the reference encoder."
             ),
         )
 

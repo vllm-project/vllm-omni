@@ -283,6 +283,15 @@ class TTSModelAdapter(ABC):
         """
         return None
 
+    def _validate_max_new_tokens(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        """Range-check ``request.max_new_tokens`` against the adapter bounds."""
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < self.max_new_tokens_min:
+                return f"max_new_tokens must be at least {self.max_new_tokens_min}"
+            if request.max_new_tokens > self.max_new_tokens_max:
+                return f"max_new_tokens cannot exceed {self.max_new_tokens_max}"
+        return None
+
     @abstractmethod
     async def build(
         self,

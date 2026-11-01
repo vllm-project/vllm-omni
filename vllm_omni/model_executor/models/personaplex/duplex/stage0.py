@@ -311,7 +311,6 @@ class PersonaPlexStage0DuplexRuntime:
         live_embed = self.stage_model._build_frame_embed(
             text_token,
             last_agent,
-            last_agent,
             device,
             user_d0=user_d0,
             user_d1=user_d1,

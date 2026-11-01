@@ -66,16 +66,8 @@ from .voice_clone import (
 
 logger = init_logger(__name__)
 
-_GLM_TTS_DEFAULT_REPO_ID = "zai-org/GLM-TTS"
 _GLM_TTS_TOKENIZER_SUBDIR = "vq32k-phoneme-tokenizer"
 _GLM_TTS_MAX_PROMPT_SPEECH_TOKENS = 1024
-
-
-def _req_float(param: torch.Tensor | None, req_idx: int, default: float) -> float:
-    if param is None or param.numel() == 0:
-        return default
-    index = min(req_idx, int(param.numel()) - 1)
-    return float(param.reshape(-1)[index].item())
 
 
 def _tensor_param_values(

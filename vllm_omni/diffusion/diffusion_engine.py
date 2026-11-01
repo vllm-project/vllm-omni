@@ -618,12 +618,11 @@ class DiffusionEngine:
         while not self.stop_event.is_set():
             self._process_aborts_queue()
             self._process_rpc_queue()
-            if self._scheduling_paused:
-                # No wave runs while paused, so requests finished by an abort
-                # would otherwise wait for the resume to surface.
-                with self._cv:
-                    pending_finished = self.scheduler.pending_finished_request_ids()
-                self._emit_finished_outputs(pending_finished, None)
+            # Aborting the last request can leave no runnable wave, even when
+            # scheduling is not paused. Deliver its terminal output before idle.
+            with self._cv:
+                pending_finished = self.scheduler.pending_finished_request_ids()
+            self._emit_finished_outputs(pending_finished, None)
 
             with self._cv:
                 while (
@@ -656,7 +655,12 @@ class DiffusionEngine:
             self._emit_request_started_outputs(sched_output)
 
             if sched_output.is_empty:
-                self._emit_finished_outputs(sched_output.finished_req_ids, None)
+                finished_ids = {
+                    rid
+                    for rid in sched_output.finished_req_ids
+                    if (state := self.scheduler.get_request_state(rid)) is not None and state.is_finished()
+                }
+                self._emit_finished_outputs(finished_ids, None)
                 continue
 
             try:
@@ -975,8 +979,21 @@ class DiffusionEngine:
                 _output = runner_output.get_request_output(rid)
             else:
                 _output = None
-            out = self._finalize_finished_request(rid, _output, missing_result_error)
-            self._put_output(rid, out)
+            self._emit_finished_request(rid, _output, missing_result_error)
+
+    def _emit_finished_request(
+        self,
+        request_id: str,
+        runner_output: RunnerOutput | None,
+        missing_result_error: str,
+    ) -> None:
+        # Capture the old stream before finalization permits ID reuse. Only
+        # the busy loop removes request state, so it cannot change in between.
+        with self._cv:
+            stream = self._out_streams.get(request_id)
+        out = self._finalize_finished_request(request_id, runner_output, missing_result_error)
+        if stream is not None:
+            self._put_queue_output(stream, out)
 
     def _emit_outputs(
         self,
@@ -1007,12 +1024,11 @@ class DiffusionEngine:
             req_output = runner_output.get_request_output(request_id)
             if request_id in finished_ids:
                 # This entire request is finished (this is the last chunk)
-                out = self._finalize_finished_request(
+                self._emit_finished_request(
                     request_id,
                     req_output,
                     missing_result_error="Diffusion step execution finished without a final output.",
                 )
-                self._put_output(request_id, out)
                 delivered_finished_req_ids.add(request_id)
             elif req_output is not None and req_output.result is not None:
                 # This is a non-terminal chunk. It is not in scheduler's
@@ -1021,11 +1037,11 @@ class DiffusionEngine:
 
         # Then handle other requests that are finished in this round.
         for request_id in finished_ids - delivered_finished_req_ids:
-            out = self._finalize_finished_request(
+            self._emit_finished_request(
                 request_id,
+                None,
                 missing_result_error="Diffusion step request finished without execution output.",
             )
-            self._put_output(request_id, out)
 
     def _has_output_stream(self, request_id: str) -> bool:
         with self._cv:
@@ -1215,7 +1231,8 @@ class DiffusionEngine:
                     self._fail_engine(exc)
                     raise
                 if sched_output.is_empty:
-                    if target_request_id in sched_output.finished_req_ids:
+                    state = self.scheduler.get_request_state(target_request_id)
+                    if target_request_id in sched_output.finished_req_ids and state is not None and state.is_finished():
                         self._remove_diffusion_kv_requests([target_request_id])
                         return self._finalize_finished_request(target_request_id)
                     if not self.scheduler.has_requests():
@@ -1647,6 +1664,10 @@ class DiffusionEngine:
         for request_id in request_ids:
             if self.scheduler.get_request_state(request_id) is not None:
                 self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+        if getattr(self, "execution_mode", None) == DiffusionExecutionMode.STEP_BATCH and request_ids:
+            # Abort processing is serialized with execution. There may never be
+            # another scheduler wave to deliver finished_req_ids to the runner.
+            self.executor.collective_rpc("release_step_requests", args=(request_ids,))
         self._remove_diffusion_kv_requests(request_ids)
 
     def _finalize_finished_request(
@@ -1655,11 +1676,12 @@ class DiffusionEngine:
         runner_output: RunnerOutput | None = None,
         missing_result_error: str = "Diffusion scheduler finished target request without execution output.",
     ) -> DiffusionOutput:
-        state = self.scheduler.get_request_state(request_id)
-        popped_state = self.scheduler.pop_request_state(request_id)
-        state = state or popped_state
-        if self._request_cancellations is not None:
-            self._request_cancellations.finish(request_id)
+        with self._cv:
+            state = self.scheduler.get_request_state(request_id)
+            popped_state = self.scheduler.pop_request_state(request_id)
+            state = state or popped_state
+            if self._request_cancellations is not None:
+                self._request_cancellations.finish(request_id)
 
         if state is None:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")

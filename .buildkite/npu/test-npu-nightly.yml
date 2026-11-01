@@ -327,7 +327,8 @@ steps:
             exit $$EXIT
       - label: ":full_moon: Diffusion X2V · Wan 2.2 Function Test"
         source_file_dependencies: diffusion_wan22_function
-        mirror_hardwares: a2b3_npu_4
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"

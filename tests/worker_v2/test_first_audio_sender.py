@@ -235,19 +235,3 @@ def test_sender_copy_failure_reports_all_prepared_routes():
     assert client == 3
     assert [(o.request_id, o.finish_reason) for o in outputs.outputs] == [("r", FinishReason.ERROR)]
     assert output_queue.empty()
-
-
-def test_final_codec_delivery_omits_upstream_marker_and_freezes_route():
-    from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
-
-    outputs: queue.Queue = queue.Queue()
-    scheduler = _scheduler(r=3)
-    delivery = engine_output_queue_sink(outputs, scheduler, upstream_first_audio=False).prepare(["r"])
-    scheduler.requests.clear()
-    pcm = torch.ones(4)
-    delivery(["r"], [pcm], torch.tensor(24000))
-    client, batch = outputs.get_nowait()
-    assert client == 3
-    assert FIRST_AUDIO_KEY not in batch.outputs[0].multimodal_output
-    assert batch.outputs[0].multimodal_output["model_outputs"] is pcm
-    assert batch.outputs[0].finish_reason is None

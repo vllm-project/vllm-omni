@@ -192,6 +192,94 @@ def test_condition_noise_accepts_a_reference_video_longer_than_the_target():
     assert result.shape == rows.shape
 
 
+@pytest.mark.parametrize(
+    ("condition_shapes", "noncontiguous"),
+    [([(1, 4, 6)], False), ([(1, 4, 6), (3, 8, 4), (7, 4, 4)], True)],
+)
+@pytest.mark.parametrize("noise_aug", [0.0, 0.999])
+def test_condition_noise_preserves_fp32_recipe_and_owns_output(condition_shapes, noncontiguous, noise_aug):
+    from vllm_omni.diffusion.models.minimax_h3.condition_noise import (
+        minimax_h3_imgvid_cond_noise_aug_rows,
+        minimax_h3_imgvid_cond_noise_rows,
+    )
+    from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
+        minimax_h3_patchify_video_latent,
+    )
+
+    row_count = sum(t * (h // 2) * (w // 2) for t, h, w in condition_shapes)
+    clean_generator = torch.Generator(device="cpu").manual_seed(31)
+    shape = (96, row_count) if noncontiguous else (row_count, 96)
+    clean_rows = torch.randn(shape, generator=clean_generator, dtype=torch.float32)
+    if noncontiguous:
+        clean_rows = clean_rows.t()
+        assert not clean_rows.is_contiguous()
+    clean_before = clean_rows.clone()
+    rng_before = torch.get_rng_state().clone()
+    target_latent_t = 2
+    seed = 2101
+    timestep = torch.tensor(noise_aug, dtype=torch.float32)
+    expected_parts = []
+    expected_noise_parts = []
+    offset = 0
+    # Match the original per-reference FP32 recipe exactly.
+    for t, h, w in condition_shapes:
+        full_t = max(target_latent_t + len(condition_shapes), t)
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        noise = torch.randn(1, 24, full_t, h, w, generator=generator, dtype=torch.float32)[:, :, :t]
+        noise_rows = minimax_h3_patchify_video_latent(noise, patch_size=(1, 2, 2))
+        expected_noise_parts.append(noise_rows)
+        count = noise_rows.shape[0]
+        expected_parts.append(timestep * clean_rows[offset : offset + count] + (1.0 - timestep) * noise_rows)
+        offset += count
+    expected = torch.cat(expected_parts)
+    expected_noise = torch.cat(expected_noise_parts)
+    precomputed_noise = minimax_h3_imgvid_cond_noise_rows(
+        condition_shapes=condition_shapes,
+        target_latent_t=target_latent_t,
+        imgvid_cond_num_frames=len(condition_shapes),
+        seed=seed,
+    )
+
+    result = minimax_h3_imgvid_cond_noise_aug_rows(
+        clean_rows,
+        condition_shapes=condition_shapes,
+        target_latent_t=target_latent_t,
+        imgvid_cond_num_frames=len(condition_shapes),
+        seed=seed,
+        noise_aug=noise_aug,
+    )
+    precomputed_result = minimax_h3_imgvid_cond_noise_aug_rows(
+        clean_rows,
+        condition_shapes=condition_shapes,
+        target_latent_t=target_latent_t,
+        imgvid_cond_num_frames=len(condition_shapes),
+        seed=seed,
+        noise_aug=noise_aug,
+        precomputed_noise_rows=precomputed_noise,
+    )
+    different_seed_noise = minimax_h3_imgvid_cond_noise_rows(
+        condition_shapes=condition_shapes,
+        target_latent_t=target_latent_t,
+        imgvid_cond_num_frames=len(condition_shapes),
+        seed=seed + 1,
+    )
+
+    assert torch.equal(result.view(torch.int32), expected.view(torch.int32))
+    assert torch.equal(precomputed_noise.view(torch.int32), expected_noise.view(torch.int32))
+    assert torch.equal(precomputed_result.view(torch.int32), result.view(torch.int32))
+    assert not torch.equal(different_seed_noise, precomputed_noise)
+    assert precomputed_noise.device.type == "cpu"
+    assert precomputed_noise.dtype == torch.float32
+    assert torch.equal(clean_rows, clean_before)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert result.dtype == torch.float32
+    assert result.device.type == "cpu"
+    assert result.is_contiguous()
+    assert result.untyped_storage().data_ptr() != clean_rows.untyped_storage().data_ptr()
+    result.zero_()
+    assert torch.equal(clean_rows, clean_before)
+
+
 def test_explicit_seq_len_pins_one_shape_across_prompt_lengths():
     """Prompts of different token counts must land on the same packed length.
 

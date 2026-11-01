@@ -253,6 +253,17 @@ def talker2codec_raw_async_chunk(
     if not hasattr(transfer_manager, "ramp_chunk_count"):
         transfer_manager.ramp_chunk_count = defaultdict(int)
 
+    saved = transfer_manager.request_payload.get(req_id)
+    direct_first = isinstance(saved, dict) and bool(saved.get("first_audio", False))
+    if not direct_first:
+        source_meta = multimodal_output.get("meta", {}) if isinstance(multimodal_output, Mapping) else {}
+        direct_first = source_meta.get("first_audio", False)
+        if isinstance(direct_first, torch.Tensor):
+            direct_first = bool(direct_first.numel() and direct_first.reshape(-1)[-1].item())
+        direct_first = bool(direct_first)
+        if direct_first:
+            transfer_manager.request_payload[req_id] = {"first_audio": True}
+
     pending_frames = transfer_manager.code_prompt_token_ids[req_id]
 
     if isinstance(multimodal_output, Mapping):
@@ -306,6 +317,10 @@ def talker2codec_raw_async_chunk(
         # restarts at each segment boundary; put_req_chunk is request-global.
         ramp_index = int(transfer_manager.ramp_chunk_count.get(req_id, 0))
         threshold = ramp_chunk_size(ramp_index, ramp, chunk_frames)
+    # Once Stage0 delivered PCM, prime with the regular chunk unless an
+    # explicit chunk ramp specifies the frame counts.
+    if direct_first and not emitted_any and ramp is None:
+        threshold = chunk_frames
     if pending <= 0:
         if is_finished:
             transfer_manager.code_prompt_token_ids.pop(req_id, None)
@@ -320,6 +335,7 @@ def talker2codec_raw_async_chunk(
                     left_context_size=0,
                     codec_chunk_frames=0,
                     codec_left_context_frames=0,
+                    first_audio=torch.tensor(True, dtype=torch.bool) if direct_first else None,
                     stream_finished=torch.tensor(True, dtype=torch.bool),
                     finished=torch.tensor(True, dtype=torch.bool),
                 ),
@@ -348,6 +364,7 @@ def talker2codec_raw_async_chunk(
             left_context_size=0,
             codec_chunk_frames=int(chunk_np.shape[0]),
             codec_left_context_frames=0,
+            first_audio=torch.tensor(True, dtype=torch.bool) if direct_first else None,
             code_flat_numel=int(codec_flat.numel()),
             stream_finished=torch.tensor(finished, dtype=torch.bool),
             finished=torch.tensor(finished, dtype=torch.bool),

@@ -7,11 +7,44 @@ from unittest.mock import patch
 
 import pytest
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc, _bind_first_audio_sink
+from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+class WrappedUniProcExecutor(UniProcExecutor):
+    pass
+
+
+@pytest.mark.parametrize(
+    "backend,executor_class,tp,pp,expected",
+    [
+        ("uni", UniProcExecutor, 1, 1, True),
+        ("mp", MultiprocExecutor, 1, 1, False),
+        (UniProcExecutor, UniProcExecutor, 1, 1, True),
+        (MultiprocExecutor, MultiprocExecutor, 1, 1, False),
+        ("uni", WrappedUniProcExecutor, 1, 1, True),
+        ("uni", UniProcExecutor, 2, 1, False),
+        ("uni", UniProcExecutor, 1, 2, False),
+    ],
+)
+def test_decoder_capability_matches_sink_binding(mocker, backend, executor_class, tp, pp, expected):
+    executor = executor_class.__new__(executor_class)
+    executor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            distributed_executor_backend=backend, tensor_parallel_size=tp, pipeline_parallel_size=pp
+        )
+    )
+    executor.driver_worker = mocker.Mock()
+    runner = executor.driver_worker.worker.model_runner
+    runner.model.first_frame_decoder = object()
+    assert supports_in_process_first_audio(executor.vllm_config) is expected
+    assert _bind_first_audio_sink(executor, mocker.Mock(), mocker.Mock()) is expected
+    assert runner.model_state.set_first_audio_sink.call_count == int(expected)
 
 
 @pytest.mark.parametrize(
@@ -61,41 +94,7 @@ def test_preprocess_add_request_preserves_omni_fields():
     assert result.additional_information == {"conditioning": "payload"}
 
 
-def test_codec_uses_generic_first_audio_binding(monkeypatch):
-    import queue
-
-    import torch
-
-    from vllm_omni.data_entry_keys import FIRST_AUDIO_KEY
-    from vllm_omni.engine import stage_engine_core_proc as module
-
-    calls: dict[str, Any] = {}
-
-    def hook(*args):
-        return False
-
-    def bind(sink):
-        calls["sink"] = sink
-        return hook
-
-    plane = SimpleNamespace(set_first_chunk_hook=lambda value: calls.update(hook=value))
-    model = SimpleNamespace(bind_first_chunk_fast_path=bind)
-    runner = SimpleNamespace(model=model, get_model=lambda: model, _omni_data_plane=plane)
-    executor = SimpleNamespace(
-        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1)),
-        driver_worker=SimpleNamespace(worker=SimpleNamespace(model_runner=runner)),
-    )
-    monkeypatch.setattr(module, "UniProcExecutor", SimpleNamespace)
-    outputs: queue.Queue = queue.Queue()
-    scheduler = SimpleNamespace(requests={"r": SimpleNamespace(client_index=2)})
-    assert module._bind_first_audio_sink(executor, outputs, scheduler)
-    assert calls["hook"] is hook
-    calls["sink"].prepare(["r"])(["r"], [torch.ones(2)], torch.tensor(24000))
-    client, batch = outputs.get_nowait()
-    assert client == 2 and FIRST_AUDIO_KEY not in batch.outputs[0].multimodal_output
-
-
-def test_first_audio_binding_preserves_talker_marker(monkeypatch):
+def test_first_audio_binding_preserves_talker_marker():
     import queue
 
     import torch
@@ -108,11 +107,11 @@ def test_first_audio_binding_preserves_talker_marker(monkeypatch):
         model=SimpleNamespace(first_frame_decoder=object()),
         model_state=SimpleNamespace(set_first_audio_sink=lambda sink: calls.update(sink=sink)),
     )
-    executor = SimpleNamespace(
-        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1)),
-        driver_worker=SimpleNamespace(worker=SimpleNamespace(model_runner=runner)),
+    executor = UniProcExecutor.__new__(UniProcExecutor)
+    executor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1)
     )
-    monkeypatch.setattr(module, "UniProcExecutor", SimpleNamespace)
+    executor.driver_worker = SimpleNamespace(worker=SimpleNamespace(model_runner=runner))
     outputs: queue.Queue = queue.Queue()
     scheduler = SimpleNamespace(requests={"r": SimpleNamespace(client_index=0)})
     assert module._bind_first_audio_sink(executor, outputs, scheduler)

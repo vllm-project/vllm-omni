@@ -86,8 +86,10 @@ def _align_bf16_routes(
     route_count = flat_ids.numel()
     order = torch.argsort(flat_ids)
     sorted_experts = flat_ids[order]
-    counts = torch.zeros(num_experts, device=flat_ids.device, dtype=torch.int64)
-    counts.scatter_add_(0, flat_ids.long(), torch.ones_like(flat_ids, dtype=torch.int64))
+    # Count in int32 and widen once: MUSA's int64 scatter_add_ is far slower than its int32 one.
+    counts = torch.zeros(num_experts, device=flat_ids.device, dtype=torch.int32)
+    counts.scatter_add_(0, flat_ids.long(), torch.ones_like(flat_ids))
+    counts = counts.long()
     padded_counts = ((counts + block_size - 1) // block_size) * block_size
     starts = torch.cumsum(padded_counts, 0) - padded_counts
     ends = torch.cumsum(counts, 0)
@@ -127,6 +129,17 @@ def _pack_bf16_w13(w_gate: torch.Tensor, w_up: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _can_own_fused_w13(weight: torch.Tensor) -> bool:
+    """Whether this residency can hold the owned fused weight layout.
+
+    Only BF16 accelerator weights pay for it.  Host and meta parameters never
+    reach the fused grouped GEMM, and owning a bank there would spend host
+    memory on a layout nothing reads.
+    """
+
+    return weight.dtype == torch.bfloat16 and weight.device.type not in ("cpu", "meta")
+
+
 def _bf16_fused_moe_forward(
     x_heads: torch.Tensor,
     probabilities: torch.Tensor,
@@ -157,14 +170,15 @@ def _bf16_fused_moe_forward(
     intermediate = torch.empty(
         (num_heads * num_tokens * top_k, intermediate_size), device=x_heads.device, dtype=x_heads.dtype
     )
-    # Keep the qualified MUSA point unchanged.  CUDA/H20 benefits from the
-    # pre-Blackwell tile found by the MAGI-2 BF16 sweep (smaller K/warp count
-    # and deeper pipelining reduce register pressure).  The launch contract
-    # remains the same; only legal, device-specific values are selected.
+    # CUDA/H20 benefits from the pre-Blackwell tile found by the MAGI-2 BF16
+    # sweep (smaller K/warp count and deeper pipelining reduce register
+    # pressure).  On MUSA both GEMMs are faster with a 64-wide K tile.  The
+    # launch contract remains the same; only legal, device-specific values
+    # are selected.
     config = {
         "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 32,
+        "BLOCK_SIZE_K": 32 if not current_omni_platform.is_musa() else 64,
         "GROUP_SIZE_M": 16,
         "num_warps": 4 if not current_omni_platform.is_musa() else 16,
         "num_stages": 3 if not current_omni_platform.is_musa() else 1,
@@ -272,21 +286,46 @@ class Magi2MultiHeadMoE(nn.Module):
             parameter = getattr(target, parts[-1])
             parameter.mmap_weight_transform = self.ep_slice
 
-        # Derived, non-persistent weight storage.  The model loader populates
-        # it after checkpoint loading; the lazy guard also supports direct
-        # layer construction and later weight reloads in tests/tools.
+        # Copy-packed W13 fallback, used only when the owned bank below is
+        # absent (direct layer construction, host-loaded weights, foreign
+        # ``.data`` rebinding).  Non-persistent; built lazily on first use.
         self.register_buffer("_bf16_packed_w13", None, persistent=False)
         self._bf16_packed_w13_key: tuple | None = None
         self._bf16_route_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        # Owned fused W13 bank.  It stays a plain attribute rather than a
+        # buffer: gate/up are views into it, and a buffer would be migrated on
+        # its own by ``.to()`` and pin a second full-size bank.
+        # ``_owns_fused_layout`` is the sticky request; it outlives the drop
+        # ``_apply`` performs, so a device move can rebuild the bank.
+        self._owned_w13: torch.Tensor | None = None
+        self._owns_fused_layout = False
 
     def _apply(self, fn, recurse: bool = True):
         # Do not migrate an extra full-size derived weight bank on .to().
         self._bf16_packed_w13 = None
         self._bf16_packed_w13_key = None
         self._bf16_route_buffers = None
-        return super()._apply(fn, recurse=recurse)
+        # Detach the bank while the parameters move, then re-attach it and let
+        # ``_get_owned_w13`` decide: it survives a move that leaves the aliases
+        # alone, and is rebuilt below for modules that own the layout.
+        owned_w13 = self._owned_w13
+        self._owned_w13 = None
+        applied = super()._apply(fn, recurse=recurse)
+        self._owned_w13 = owned_w13
+        if self._owns_fused_layout and self._get_owned_w13() is None:
+            # Giving the layout up here would put a second full-size W13 copy
+            # back beside gate/up for every later forward.  The resident
+            # pipeline stages the transformer to the host and back around
+            # prompt encoding, so this is the routine path, not an edge case.
+            self.prepare_owned_layout()
+        return applied
 
     def _get_bf16_packed_w13(self) -> torch.Tensor:
+        # When gate/up already live inside one packed bank, that bank *is* the
+        # fused layout: return it and never allocate a derived copy beside it.
+        owned = self._get_owned_w13()
+        if owned is not None:
+            return owned
         # In-place loading increments _version; mmap/.data replacement may
         # not. Include object/storage identity and handle inference tensors,
         # which intentionally do not expose a version counter.
@@ -308,14 +347,83 @@ class Magi2MultiHeadMoE(nn.Module):
             self._bf16_packed_w13_key = key
         return packed
 
+    def _rebind_w13_to_owned_bank(self) -> None:
+        """Rebind gate/up into one interleaved packed bank.
+
+        ``_pack_bf16_w13`` produces the fused layout by copying, so a module
+        that only uses the packed form still carries the original two banks as
+        well.  Allocating one ``[E, 2I, D]`` bank and pointing gate/up at strided
+        views inside it makes the fused layout the *only* copy, which is what
+        the grouped GEMM wants.  Values, dtypes and state_dict keys are
+        unchanged; only the storages differ.
+        """
+
+        if self.W_gate.dtype != torch.bfloat16 or self.W_up.dtype != torch.bfloat16:
+            raise ValueError("Owned W13 requires BF16 gate and up weights")
+        if self._get_owned_w13() is not None:
+            return
+        packed = torch.empty(
+            (self.local_flatten_num_experts, 2 * self.d_expert, self.d_head),
+            dtype=self.W_gate.dtype,
+            device=self.W_gate.device,
+        )
+        views = packed.view(self.local_flatten_num_experts, self.d_expert, 2, self.d_head)
+        gate = views[:, :, 0, :].transpose(1, 2)
+        up = views[:, :, 1, :].transpose(1, 2)
+        # Storage surgery on parameters that require grad: copy under no_grad so
+        # autograd does not try to track a write into a fresh plain tensor.
+        with torch.no_grad():
+            gate.copy_(self.W_gate)
+            up.copy_(self.W_up)
+        self.W_gate.data = gate
+        self.W_up.data = up
+        self._owned_w13 = packed
+
+    def _get_owned_w13(self) -> torch.Tensor | None:
+        """Return the owned W13 bank, or ``None`` once it stops matching."""
+
+        packed = self._owned_w13
+        if packed is None:
+            return None
+        # ``.data = ...`` replacement and dtype or device moves rebind the
+        # parameters without touching ``_owned_w13``, so verify device, dtype,
+        # pointers and strides.
+        expected_stride = (2 * self.d_expert * self.d_head, 1, 2 * self.d_head)
+        if (
+            packed.device != self.W_gate.device
+            or packed.dtype != self.W_gate.dtype
+            or self.W_up.device != packed.device
+            or self.W_up.dtype != packed.dtype
+            or self.W_gate.data_ptr() != packed.data_ptr()
+            or self.W_up.data_ptr() != packed.data_ptr() + self.d_head * packed.element_size()
+            or self.W_gate.stride() != expected_stride
+            or self.W_up.stride() != expected_stride
+        ):
+            self._owned_w13 = None
+            return None
+        return packed
+
+    def prepare_owned_layout(self) -> None:
+        """Own the fused W13 bank and keep owning it across device moves.
+
+        A no-op on host and meta weights, where the fused path never runs.
+        """
+
+        if not _can_own_fused_w13(self.W_gate):
+            return
+        self._rebind_w13_to_owned_bank()
+        self._owns_fused_layout = True
+
     def prepare_bf16_weights(self) -> None:
         """Materialize derived BF16 weights outside the inference hot path."""
 
         # Reload may mutate inference tensors without a version counter.
         self._bf16_packed_w13 = None
         self._bf16_packed_w13_key = None
-        if self.W_gate.dtype == torch.bfloat16 and self.W_gate.device.type not in ("cpu", "meta"):
-            self._get_bf16_packed_w13()
+        # Owning the bank *is* the materialization: it already holds the fused
+        # layout the grouped GEMM reads, so it replaces the copying pack as well
+        # as the separate gate and up banks.
+        self.prepare_owned_layout()
 
     def _get_bf16_route_buffers(self, route_count: int, device: torch.device):
         buffers = self._bf16_route_buffers
