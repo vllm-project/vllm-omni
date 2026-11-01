@@ -561,6 +561,8 @@ steps:
         source_file_dependencies: diffusion_minimax_h3_function
         timeout_in_minutes: 60
         commands:
+          # The exact VAE operators require SM90/SM100/SM103 and skip on L4.
+          - pytest -sv tests/diffusion/models/minimax_h3/test_minimax_h3_vae_ops.py -m 'core_model and cuda and H100 and B200 and cards_1' --run-level "core_model"
           - pytest -sv tests/diffusion/models/minimax_h3/test_minimax_h3_quantization_quality.py -m 'full_model and cuda and H100 and B200 and cards_2' --run-level "full_model"
 
       - label: ":full_moon: Diffusion · Quantization Test with L4"
