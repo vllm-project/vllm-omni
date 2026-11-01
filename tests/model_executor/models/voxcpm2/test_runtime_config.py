@@ -232,10 +232,10 @@ def test_cfg_value_non_positive_names_the_source(monkeypatch, bad):
     import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
 
     monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", bad)
-    # match the full source attribution, not just the variable name: the
-    # message always carries the "(env ... overrides ...)" tail, so a bare
-    # name match would pass even if the error blamed the yaml
-    # the error carries the RAW env string (not the float-repr), so match that
+    # Match the full source attribution — the raw env-string repr, not just
+    # the variable name: the message always carries the "(env ... overrides
+    # ...)" tail, so a bare name match would pass even if the error blamed
+    # the yaml instead of this env var.
     with pytest.raises(ValueError, match=re.escape(f"VLLM_OMNI_SPEECH_CFG_VALUE={bad!r}")):
         talker_mod._resolve_cfg_value(2.0)
 
