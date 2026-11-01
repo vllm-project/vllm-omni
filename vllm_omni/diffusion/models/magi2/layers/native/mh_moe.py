@@ -224,6 +224,12 @@ class Magi2MultiHeadMoE(nn.Module):
     def prepare_bf16_weights(self) -> None:
         """No derived weight layout is required by the native or NPU backend."""
 
+    def release_device_references(self) -> None:
+        """No device tensor is held beside the parameters on this backend."""
+
+    def restore_owned_layout(self) -> None:
+        """No owned W13 bank to re-own after a restage on this backend."""
+
     def ep_slice(self, checkpoint_tensor: torch.Tensor) -> torch.Tensor:
         """Slice flattened ``(head,expert)`` checkpoint rows for this rank."""
 

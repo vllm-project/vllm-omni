@@ -331,7 +331,13 @@ def _external_fa3_varlen() -> tuple[FlashAttnFn, frozenset[str] | None] | None:
 
 
 @cache
-def flash_attn_3_varlen_unsupported(softcap: bool = False, return_softmax_lse: bool = False) -> str | None:
+def flash_attn_3_varlen_unsupported(
+    softcap: bool = False,
+    return_softmax_lse: bool = False,
+    block_table: bool = False,
+    seqused_k: bool = False,
+    out: bool = False,
+) -> str | None:
     """Return why ``flash_attn_3_varlen`` cannot run with these options, or ``None`` when it can."""
     provider = _external_fa3_varlen()
     if provider is None:
@@ -343,7 +349,48 @@ def flash_attn_3_varlen_unsupported(softcap: bool = False, return_softmax_lse: b
         return "This FlashAttention-3 provider does not support softcap"
     if return_softmax_lse and not parameters & {"return_attn_probs", "return_softmax_lse"}:
         return "This FlashAttention-3 provider does not expose an LSE return option"
+    if block_table and "block_table" not in parameters:
+        return "This FlashAttention-3 provider does not support paged KV (block_table)"
+    if seqused_k and "seqused_k" not in parameters:
+        return "This FlashAttention-3 provider does not support seqused_k"
+    if out and "out" not in parameters:
+        return "This FlashAttention-3 provider does not support an out tensor"
     return None
+
+
+def _varlen_result(
+    result: Any,
+    q: torch.Tensor,
+    out: torch.Tensor | None,
+    return_softmax_lse: bool,
+    name: str,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Validate a varlen provider's result; LSE must be packed as ``[heads, tokens]``.
+
+    When ``out`` is given it holds the returned output.
+    """
+    if not return_softmax_lse:
+        output = result[0] if isinstance(result, tuple) and result else result
+        if not isinstance(output, torch.Tensor):
+            raise RuntimeError(f"{name} must return an output tensor")
+        return _into_out(output, out)
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise RuntimeError(f"{name} must return (output, softmax_lse) when LSE is requested")
+    output, lse = result[:2]
+    if not isinstance(output, torch.Tensor) or not isinstance(lse, torch.Tensor):
+        raise RuntimeError(f"{name} output and softmax_lse must be tensors")
+    expected_shape = (q.shape[1], q.shape[0])
+    if lse.shape != expected_shape:
+        raise RuntimeError(f"Expected packed softmax_lse shape {expected_shape}, got {tuple(lse.shape)}")
+    return _into_out(output, out), lse
+
+
+def _into_out(output: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
+    if out is None:
+        return output
+    if output.data_ptr() != out.data_ptr():
+        out.copy_(output)
+    return out
 
 
 def flash_attn_3_varlen(
@@ -352,20 +399,37 @@ def flash_attn_3_varlen(
     v: torch.Tensor,
     *,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_k: torch.Tensor | None = None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float | None = None,
     softcap: float = 0.0,
     causal: bool = False,
     return_softmax_lse: bool = False,
+    seqused_k: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Call standalone FA3 and return the output, or ``(output, LSE)`` with LSE packed as ``[heads, tokens]``.
 
     Providers name the LSE request either ``return_attn_probs`` or ``return_softmax_lse``.
+    With ``block_table`` the keys are paged: ``k``/``v`` are ``[num_pages, page_size, kv_heads,
+    head_dim]`` and query sequence ``i`` reads the first ``seqused_k[i]`` tokens of the pages
+    ``block_table[i]``; ``cu_seqlens_k`` is then ``None``.  ``out`` receives the output when given.
+    Options the provider's signature lacks fail with ``NotImplementedError``.
     """
+    if block_table is not None and (seqused_k is None or cu_seqlens_k is not None):
+        raise ValueError("Paged FlashAttention-3 needs seqused_k and no cu_seqlens_k")
+    if block_table is None and cu_seqlens_k is None:
+        raise ValueError("FlashAttention-3 varlen needs cu_seqlens_k unless the keys are paged")
     softcap = max(float(softcap), 0.0)
-    unsupported = flash_attn_3_varlen_unsupported(softcap > 0, return_softmax_lse)
+    unsupported = flash_attn_3_varlen_unsupported(
+        softcap > 0,
+        return_softmax_lse,
+        block_table=block_table is not None,
+        seqused_k=seqused_k is not None,
+        out=out is not None,
+    )
     if unsupported is not None:
         raise (ImportError if unsupported == _FA3_MISSING else NotImplementedError)(unsupported)
     provider = _external_fa3_varlen()
@@ -387,21 +451,43 @@ def flash_attn_3_varlen(
         kwargs["softcap"] = softcap
     if return_softmax_lse:
         kwargs["return_attn_probs" if "return_attn_probs" in parameters else "return_softmax_lse"] = True
-    result = func(**kwargs)
-    if not return_softmax_lse:
-        out = result[0] if isinstance(result, tuple) and result else result
-        if not isinstance(out, torch.Tensor):
-            raise RuntimeError("FlashAttention-3 must return an output tensor")
-        return out
-    if not isinstance(result, tuple) or len(result) < 2:
-        raise RuntimeError("FlashAttention-3 must return (output, softmax_lse) when LSE is requested")
-    out, lse = result[:2]
-    if not isinstance(out, torch.Tensor) or not isinstance(lse, torch.Tensor):
-        raise RuntimeError("FlashAttention-3 output and softmax_lse must be tensors")
-    expected_shape = (q.shape[1], q.shape[0])
-    if lse.shape != expected_shape:
-        raise RuntimeError(f"Expected packed softmax_lse shape {expected_shape}, got {tuple(lse.shape)}")
-    return out, lse
+    # Paged options are only passed when requested, so providers without them keep working.
+    for name, value in (("seqused_k", seqused_k), ("block_table", block_table), ("out", out)):
+        if value is not None:
+            kwargs[name] = value
+    return _varlen_result(func(**kwargs), q, out, return_softmax_lse, "FlashAttention-3")
+
+
+def _vllm_flash_attn_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softcap: float,
+    fa_version: int | None,
+    **kwargs: Any,
+) -> Any:
+    """Call vLLM's bundled varlen FlashAttention without dropout or a local window; ``kwargs`` pass through."""
+
+    from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_flash_attn_varlen_func
+
+    version = resolve_vllm_flash_attn_version(fa_version)
+    return vllm_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        int(max_seqlen_q),
+        cu_seqlens_q,
+        int(max_seqlen_k),
+        dropout_p=0.0,
+        window_size=None,
+        softcap=max(float(softcap), 0.0),
+        fa_version=version,
+        **kwargs,
+    )
 
 
 def vllm_flash_attn_varlen_with_lse(
@@ -421,25 +507,20 @@ def vllm_flash_attn_varlen_with_lse(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run packed vLLM FlashAttention and retain LSE for post-processing."""
 
-    from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_flash_attn_varlen_func
-
-    version = resolve_vllm_flash_attn_version(fa_version)
-    out, lse = vllm_flash_attn_varlen_func(
+    out, lse = _vllm_flash_attn_varlen(
         q,
         k,
         v,
-        int(max_seqlen_q),
-        cu_seqlens_q,
-        int(max_seqlen_k),
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softcap=softcap,
+        fa_version=fa_version,
         cu_seqlens_k=cu_seqlens_k,
-        dropout_p=0.0,
         softmax_scale=softmax_scale,
         causal=causal,
-        window_size=None,
-        softcap=max(float(softcap), 0.0),
         deterministic=deterministic,
         return_softmax_lse=True,
-        fa_version=version,
     )
     return out, lse
 
@@ -493,6 +574,50 @@ def vllm_flash_attn_dense_with_lse(
     out = out.unflatten(0, (batch_size, seqlen_q))
     lse = lse.unflatten(1, (batch_size, seqlen_q)).permute(1, 0, 2)
     return out, lse
+
+
+def vllm_flash_attn_paged_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor,
+    max_seqlen_k: int,
+    block_table: torch.Tensor,
+    softmax_scale: float | None = None,
+    softcap: float = 0.0,
+    causal: bool = False,
+    return_softmax_lse: bool = False,
+    out: torch.Tensor | None = None,
+    fa_version: int | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run packed vLLM FlashAttention over paged keys.
+
+    ``k``/``v`` are ``[num_pages, page_size, kv_heads, head_dim]``; query sequence ``i`` reads the
+    first ``seqused_k[i]`` tokens of the pages ``block_table[i]``.  Returns the output, or
+    ``(output, LSE)`` with LSE packed as ``[heads, tokens]``; ``out`` receives the output when given.
+    """
+
+    result = _vllm_flash_attn_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softcap=softcap,
+        fa_version=fa_version,
+        cu_seqlens_k=None,
+        seqused_k=seqused_k,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_softmax_lse=return_softmax_lse,
+        out=out,
+    )
+    return _varlen_result(result, q, out, return_softmax_lse, "vLLM FlashAttention")
 
 
 @lru_cache(maxsize=1)

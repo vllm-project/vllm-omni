@@ -224,6 +224,37 @@ def test_move_rebuilds_the_owned_bank(monkeypatch):
 
 
 @pytest.mark.cpu
+def test_restaged_bank_is_owned_again_without_a_copy(monkeypatch):
+    """A restage that keeps the storage layout re-owns the bank in place.
+
+    ``PinnedModuleStager`` rebinds gate/up to a new storage without ``_apply``;
+    the bank must become a view of that storage, not a second copy beside it.
+    """
+
+    monkeypatch.setattr(mh_moe, "_can_own_fused_w13", lambda weight: weight.dtype == torch.bfloat16)
+    module = make_module()
+    gate, up = module.W_gate.clone(), module.W_up.clone()
+    module.prepare_bf16_weights()
+    bank = module._get_owned_w13()
+    assert bank is not None
+
+    module.release_device_references()
+    assert module._owned_w13 is None
+    restaged = bank.clone()
+    views = restaged.view(module.local_flatten_num_experts, module.d_expert, 2, module.d_head)
+    module.W_gate.data = views[:, :, 0, :].transpose(1, 2)
+    module.W_up.data = views[:, :, 1, :].transpose(1, 2)
+    module.restore_owned_layout()
+
+    owned = module._get_owned_w13()
+    assert owned is not None
+    assert owned.data_ptr() == restaged.data_ptr()
+    assert module._get_bf16_packed_w13() is owned
+    assert torch.equal(module.W_gate, gate)
+    assert torch.equal(module.W_up, up)
+
+
+@pytest.mark.cpu
 def test_replacing_only_up_drops_the_owned_bank():
     module = make_module()
     module._rebind_w13_to_owned_bank()
