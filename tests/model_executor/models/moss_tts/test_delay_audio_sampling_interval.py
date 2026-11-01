@@ -44,7 +44,7 @@ def test_delay_audio_sampling_avoids_mask_discovery(
         raise AssertionError("Delay sampling must not inspect a tensor mask on the host")
 
     with monkeypatch.context() as patch:
-        for method in ("__bool__", "nonzero", "item", "__int__", "tolist"):
+        for method in ("__bool__", "nonzero", "item", "__int__", "tolist", "__index__", "__float__"):
             patch.setattr(torch.Tensor, method, forbidden)
         result = model._sample_audio_codes(
             torch.randn(1, 8), dict(audio_lengths=audio_lengths, delayed_lengths=delayed_lengths)
