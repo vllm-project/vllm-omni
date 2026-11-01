@@ -122,14 +122,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _requires_atomic_chunk(self) -> bool:
         adapter = self.chunk_transfer_adapter
-        return adapter is not None and adapter.receives_chunks
+        if adapter is not None:
+            return adapter.receives_chunks
+
+        coordinator = self.input_coordinator
+        # Native receivers have no legacy adapter. A stage-0 coordinator is
+        # bookkeeping only, and full-payload coordinators do not receive chunks.
+        return self._native_data_plane and coordinator is not None and coordinator.receives_chunks
 
     def _reject_oversized_ready_chunks(self) -> None:
         if not self._requires_atomic_chunk():
             return
 
         adapter = self.chunk_transfer_adapter
-        assert adapter is not None  # Narrow Optional for type checking.
+        owner = adapter if adapter is not None else self.input_coordinator
+        assert owner is not None  # An async-chunk receiver owns readiness.
+        ready_request_ids = owner.requests_with_ready_chunks
         full_budget = self.max_num_scheduled_tokens
 
         # finish_requests() mutates the queues; iterate a de-duplicated
@@ -139,14 +147,18 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         for req_id, request in candidates.items():
             if req_id not in self.requests or request.is_finished():
                 continue
-            if req_id not in adapter.requests_with_ready_chunks:
+            if req_id not in ready_request_ids:
                 # Only inspect chunks already handed to the scheduler thread;
                 # requests whose chunk has not arrived (or stale placeholders)
                 # are not new chunks and must not be rejected.
                 continue
+            if self._native_data_plane and request.num_in_flight_tokens > 0:
+                # Let the previous execution emit its valid output before
+                # terminal cleanup. Readiness survives until the fence clears.
+                continue
 
-            # For 1-D codec inputs, _commit_received_chunk() replaces
-            # prompt_token_ids and resets num_computed_tokens to zero,
+            # For 1-D codec inputs, both receive paths replace
+            # prompt_token_ids and reset num_computed_tokens to zero,
             # so len(...) is the full chunk's scheduling length.
             full_chunk_tokens = len(request.prompt_token_ids)
             if full_chunk_tokens <= full_budget:

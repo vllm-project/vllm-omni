@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config import WatermarkConfig
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.omni_config import StageConfigType
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
@@ -125,6 +126,7 @@ class OmniEngineBase:
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
     _output_sink: OutputQueueSink | None = None
+    _watermark_config: WatermarkConfig | None = None
 
     def __init__(
         self,
@@ -136,6 +138,7 @@ class OmniEngineBase:
         prom_metrics: Any = None,
         log_stats: bool = False,
         collect_stage_metrics: bool = True,
+        watermark_config: WatermarkConfig | None = None,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
         client_config: OmniClientConfig | None = None,
@@ -158,6 +161,7 @@ class OmniEngineBase:
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
         self._collect_stage_metrics = collect_stage_metrics
+        self._watermark_config = watermark_config
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
         self._client_config = client_config
 
@@ -305,6 +309,11 @@ class OmniEngineBase:
         # it (the orchestrator loop), so cross-thread use stays correct.
         self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
+        # The orchestrator thread's event loop, captured once startup finishes.
+        # janus's async_q binds to the first loop that awaits it (the
+        # orchestrator loop here), so frontend submissions must route puts
+        # through this loop instead of awaiting async_q from their own loop.
+        self.orchestrator_loop: asyncio.AbstractEventLoop | None = None
         self._output_sink = OutputQueueSink(self.output_queue.sync_q)
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
@@ -403,6 +412,7 @@ class OmniEngineBase:
             request_queue=self.request_queue,
             log_stats=self._log_stats,
             client_config=self._client_config,
+            watermark_config=self._watermark_config,
         )
         self._runtime.initialize()
 
@@ -547,9 +557,7 @@ class OmniEngineBase:
                 self._try_shutdown("[OmniEngine] Failed to cleanup after orchestrator startup timeout")
                 raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s")
             try:
-                startup_future.result(
-                    timeout=min(remaining, _STARTUP_POLL_INTERVAL_S),
-                )
+                self.orchestrator_loop = startup_future.result(timeout=min(remaining, _STARTUP_POLL_INTERVAL_S))
                 break
             except concurrent.futures.TimeoutError:
                 if not self.orchestrator_thread.is_alive():

@@ -27,13 +27,21 @@ from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 
 from tests.helpers.mock import patch_hf_snapshot_download
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    load_omni_transfer_config,
+    resolve_omni_kv_config_for_stage,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+from vllm_omni.engine.stage_init_utils import build_engine_args_dict, get_stage_connector_spec
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+# Explicit so engine configs with connectors build on any platform.
+AR_WORKER_CLS = "vllm_omni.worker.gpu_ar_worker.GPUARWorker"
 
 
 @pytest.mark.parametrize("use_v2", [False, True])
@@ -249,6 +257,42 @@ def test_default_all_values_are_initialized():
     # all attributes, so should raise if we have attributes that are
     # not initialized correctly, e.g., due to default factories
     str(cfg)
+
+
+@pytest.mark.parametrize("stage_id", [0, 1])
+def test_compute_hash_is_stable_across_launches(stage_id):
+    """Ensure relaunching the same deploy config gives a stage the same compile cache hash."""
+
+    def get_model_config_hash() -> str:
+        # Transfer config & kv connector config currently contain UUIDs, which should not affect the compile key
+        transfer_config = load_omni_transfer_config(get_deploy_config_path("qwen3_tts.yaml"))
+        kv_connector_config = resolve_omni_kv_config_for_stage(transfer_config, stage_id)[0]
+        vllm_config = OmniEngineArgs(
+            worker_cls=AR_WORKER_CLS,
+            stage_connector_spec=get_stage_connector_spec(transfer_config, stage_id, async_chunk=True),
+            omni_kv_config={"connector_config": kv_connector_config},
+        ).create_engine_config()
+        # vLLM keys its torch.compile and AOT caches on this hash.
+        return vllm_config.compute_hash()
+
+    first_hash = get_model_config_hash()
+    second_hash = get_model_config_hash()
+    assert first_hash == second_hash
+
+
+def test_compute_hash_keeps_stage_connector_settings():
+    """Ensure connector settings that models read (e.g. codec chunk size) still change the hash."""
+
+    def get_model_config_hash(num_frames: int) -> str:
+        vllm_config = OmniEngineArgs(
+            worker_cls=AR_WORKER_CLS,
+            stage_connector_spec={"name": "SharedMemoryConnector", "extra": {"codec_chunk_frames": num_frames}},
+        ).create_engine_config()
+        return vllm_config.compute_hash()
+
+    first_hash = get_model_config_hash(num_frames=25)
+    second_hash = get_model_config_hash(num_frames=50)
+    assert first_hash != second_hash
 
 
 def test_qwen3_tts_codec_frame_rate_patching():
@@ -619,6 +663,107 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
     assert parallel_config["text_encoder_tp_size"] == 2
 
 
+# For https://github.com/vllm-project/vllm-omni/issues/8503
+# The non-parallel diffusion engine args the serve CLI registers on
+# OrchestratorArgs and the stage engine consumes. Values differ from the
+# OmniDiffusionConfig defaults so a silently reset field fails the check.
+DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
+    ("num_gpus", 4),
+    ("model_class_name", "WanPipeline"),
+    ("hsdp_weight_load_strategy", "shard"),
+    ("diffusion_load_format", "dummy"),
+    ("lora_path", ["./lora.safetensors"]),
+    ("lora_backend", "distill"),
+    ("lora_scale", 0.5),
+    ("diffusers_load_kwargs", '{"local_files_only": true}'),
+    ("diffusers_call_kwargs", '{"num_inference_steps": 20}'),
+    ("diffusion_quantization_config", "fp8"),
+    ("diffusion_attention_backend", "SDPA"),
+    ("fastvideo_vsa_topk", 96),
+    ("diffusion_attention_config", '{"default": {"backend": "SDPA"}}'),
+    ("diffusion_compile_granularity", "whole"),
+    ("diffusion_compile_dynamic", False),
+    ("enable_cuda_graph_decode", False),
+    ("cache_backend", "tea_cache"),
+    ("cache_config", '{"steps": [1, 2]}'),
+    ("video_output_transport", {"backend": "zmq"}),
+    ("enable_cache_dit_summary", True),
+    ("step_execution", True),
+    ("vae_use_slicing", True),
+    ("vae_use_tiling", True),
+    ("vae_fast_path", "channels_last"),
+    ("vae_encode_fast_path", "off"),
+    ("enable_multithread_weight_load", False),
+    ("enable_broadcast_weight_load", True),
+    ("num_weight_load_threads", 8),
+    ("diffusion_offload_config", {"transformer": "cpu"}),
+    ("enable_cpu_offload", True),
+    ("enable_layerwise_offload", True),
+    ("enable_distributed_layerwise_offload", True),
+    ("dlo_use_allgather", False),
+    ("dlo_resident_layers", 2),
+    ("host_weight_runtime_mode", "preferred"),
+    ("host_weight_runtime_root", "/tmp/hwr"),
+    ("dlo_host_registration_limit_gib", 4.0),
+    ("boundary_ratio", 0.875),
+    ("flow_shift", 12.0),
+    ("diffusion_kv_cache_dtype", "fp8_e4m3"),
+    ("diffusion_kv_cache_skip_steps", "0-9"),
+    ("diffusion_kv_cache_skip_layers", "25-30"),
+    ("default_sampling_params", '{"0": {"guidance_scale": 5.0}}'),
+    ("max_generated_image_size", 1048576),
+    ("tts_max_instructions_length", 1000),
+    ("enable_diffusion_pipeline_profiler", True),
+]
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8503
+def test_from_cli_args_preserves_non_parallel_diffusion_engine_args():
+    """Every non-parallel diffusion engine arg must survive from_cli_args.
+
+    ``OmniEngineArgs.from_cli_args`` keeps only dataclass fields, so an arg
+    the dataclass does not declare is silently dropped on the library path
+    (#7652 covered ``text_encoder_tp_size``; the parallel knobs of #8037 are
+    covered separately).
+    """
+    for knob, value in DIFFUSION_NON_PARALLEL_ENGINE_ARGS:
+        engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+        assert getattr(engine_args, knob) == value, f"{knob} was dropped"
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8503
+def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
+    """The preserved values must land where the diffusion stage reads them.
+
+    Forward the explicit overrides to the generic diffusion fallback:
+    ``cache_backend``/``step_execution``/``flow_shift`` are direct
+    ``OmniDiffusionConfig`` fields and ``num_gpus`` resolves the
+    data-parallel degree.
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    overrides = {
+        "cache_backend": "tea_cache",
+        "step_execution": True,
+        "flow_shift": 12.0,
+        "num_gpus": 2,
+        "enable_cuda_graph_decode": False,
+        "vae_encode_fast_path": "off",
+    }
+    engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
+    stage_cfg = StageConfigFactory.create_default_diffusion(
+        {name: getattr(engine_args, name) for name in overrides},
+    )[0]
+
+    resolved = stage_cfg["engine_args"]
+    assert resolved["cache_backend"] == "tea_cache"
+    assert resolved["step_execution"] is True
+    assert resolved["flow_shift"] == 12.0
+    assert resolved["parallel_config"]["data_parallel_size"] == 2
+    assert resolved["enable_cuda_graph_decode"] is False
+    assert resolved["vae_encode_fast_path"] == "off"
+
+
 def test_native_mrv2_worker_provides_connector_without_legacy_mixin():
     from vllm_omni.worker.omni_connector_validation import validate_worker_omni_connector
     from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
@@ -627,3 +772,50 @@ def test_native_mrv2_worker_provides_connector_without_legacy_mixin():
         model_runner_cls = OmniARModelRunner
 
     validate_worker_omni_connector(Worker, required=True)
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+# The diffusion parallel knobs the serve CLI registers and the engine must keep
+# when engine args come from parsed CLI args. Values are not the
+# DiffusionParallelConfig defaults, so a silently reset knob fails the check.
+DIFFUSION_PARALLEL_KNBS = [
+    ("ulysses_degree", 4),
+    ("ulysses_mode", "advanced_uaa"),
+    ("ulysses_a2a_permute", True),
+    ("ring_degree", 2),
+    ("allgather_degree", 8),
+    ("use_hsdp", True),
+    ("hsdp_shard_size", 2048),
+    ("hsdp_replicate_size", 2),
+    ("cfg_parallel_size", 2),
+    ("vae_patch_parallel_size", 2),
+    ("vae_parallel_mode", "spatial_shard_height"),
+]
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+def test_from_cli_args_applies_diffusion_parallel_knobs():
+    """Every CLI-registered diffusion parallel knob must survive and be applied.
+
+    ``OmniEngineArgs.from_cli_args`` keeps only dataclass fields, so a knob
+    that ``OmniEngineArgs`` does not declare was silently reset to its
+    ``DiffusionParallelConfig`` default (#7652 covered
+    ``text_encoder_tp_size`` alone). Every value in the table differs from that
+    default, so an ignored knob fails the second assertion too.
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    for knob, value in DIFFUSION_PARALLEL_KNBS:
+        engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+        assert getattr(engine_args, knob) == value, f"{knob} was dropped"
+
+        # Forward the preserved value rather than the table literal, so the
+        # second assertion fails if ``from_cli_args`` dropped the knob.
+        factory_kwargs = {knob: getattr(engine_args, knob)}
+        if knob == "use_hsdp":
+            # Standalone HSDP (all other parallelism at 1) cannot
+            # auto-calculate its shard size; pass one explicitly.
+            factory_kwargs["hsdp_shard_size"] = 2048
+        stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
+        parallel_config = stage_cfg["engine_args"]["parallel_config"]
+        assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"

@@ -846,6 +846,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
     diffusers_pipeline_cls: Any = None
+    controlnet_model_path: str | None = None
+    """Local original H3 Fun ControlNet Union safetensors checkpoint."""
     lora_path: str | list[str] | None = None
     lora_scale: float = 1.0
     lora_backend: str = "peft"
@@ -859,6 +861,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
+    dlo_chunk_size_mb: int = Field(default=64, gt=0, strict=True)
     dlo_resident_layers: int = Field(default=0, ge=0)
     host_weight_runtime_mode: Literal["disabled", "preferred", "required"] = "disabled"
     host_weight_runtime_root: str | None = None

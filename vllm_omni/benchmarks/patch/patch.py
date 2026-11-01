@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import argparse
 import asyncio
 import contextlib
 import io
@@ -3488,11 +3489,22 @@ from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
     has_metric_samples,
+    validate_goodput_config,
 )
 
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def check_goodput_args(args: argparse.Namespace) -> dict[str, float]:
+    """Parse goodput SLOs with vLLM-Omni request-level metrics."""
+    if not args.goodput:
+        return {}
+
+    goodput_config_dict = serve.parse_goodput(args.goodput)
+    validate_goodput_config(goodput_config_dict)
+    return goodput_config_dict
 
 
 def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
@@ -4131,3 +4143,4 @@ async def benchmark(
 
 
 serve.benchmark = benchmark
+serve.check_goodput_args = check_goodput_args

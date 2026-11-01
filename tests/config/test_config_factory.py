@@ -1154,6 +1154,47 @@ class TestPipelineRegistration:
         assert isinstance(omni_config, VllmOmniConfig)
         assert omni_config.stage_by_id(0).diffusion_config.model == "fake/model"
 
+    @pytest.mark.parametrize(
+        ("checkpoint", "expected_output_type"),
+        [
+            ("Lance", "image"),
+            ("Lance_3B", "image"),
+            ("Lance_3B_Video", "video"),
+        ],
+    )
+    @pytest.mark.parametrize("explicit_deploy", [False, True])
+    def test_lance_checkpoint_output_type(self, checkpoint, expected_output_type, explicit_deploy):
+        from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline
+
+        model = f"/models/{checkpoint}"
+        deploy_path = get_deploy_config_path("lance.yaml") if explicit_deploy else None
+        # Lance's config.json has no model_type. Exercise the real basename
+        # fallback and the explicit deployment override without a remote lookup.
+        with (
+            patch.object(StageConfigFactory, "get_hf_config", return_value=None),
+            patch("vllm_omni.config.config_factory.get_hf_file_to_dict", return_value=None),
+        ):
+            omni_config = StageConfigFactory.create_from_model(
+                model,
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=deploy_path,
+            )
+            legacy_configs, _ = StageConfigFactory.create_legacy_stage_configs_from_model(
+                model,
+                trust_remote_code=False,
+                cli_overrides={},
+                deploy_config_path=deploy_path,
+            )
+
+        assert omni_config is not None
+        assert legacy_configs is not None
+        assert omni_config.pipeline_config.model_type == "lance"
+        assert omni_config.stage_by_id(0).final_output_type == expected_output_type
+        assert legacy_configs[0].final_output_type == expected_output_type
+        assert is_video_generation_pipeline(omni_config.stage_configs) is (expected_output_type == "video")
+        assert OMNI_PIPELINES["lance"].stages[0].final_output_type == "image"
+
     def test_cosyvoice3_deploy_resolves_hash_snapshot_without_hf_metadata(self, tmp_path):
         snapshot = tmp_path / "models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512" / "snapshots" / ("a" * 40)
         snapshot.mkdir(parents=True)
@@ -3282,7 +3323,6 @@ class TestPlatformOverrides:
         if is_cuda:
             args = stages[0].yaml_engine_args
             assert args["enable_prefix_caching"] is True
-            assert args["hf_overrides"]["mrv2_gpu_slot_state"] is True
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
             assert "local_compile_audio_sampler" not in args["hf_overrides"]
@@ -3305,7 +3345,6 @@ class TestPlatformOverrides:
         assert args["max_num_seqs"] == 128
         assert args["max_num_batched_tokens"] == 512
         assert args["hf_overrides"] == {
-            "mrv2_gpu_slot_state": True,
             "mrv2_batch_prefill": True,
             "mrv2_direct_tokens": True,
             "mrv2_eager_mtp": True,

@@ -1293,6 +1293,35 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
         await close_harness(h)
 
 
+@pytest.mark.parametrize("fail_cleanup", [False, True])
+async def test_barge_in_releases_only_successfully_cleaned_request_ids(
+    fail_cleanup: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = await open_harness()
+    original_cleanup = h.port.cleanup
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        async def cleanup_with_new_resource(request_ids: list[str], *, abort: bool = False) -> None:
+            assert h.session.resource_request_ids(submitted=True) == [request_id]
+            await original_cleanup(request_ids, abort=abort)
+            h.session.bind_stage_request(0, "next-epoch-request", fence=h.session.fence)
+            if fail_cleanup:
+                raise RuntimeError("synthetic abort failure")
+
+        monkeypatch.setattr(h.port, "cleanup", cleanup_with_new_resource)
+        events = await h.run(commands.BargeIn())
+        assert h.session.epoch == 1
+        assert h.port.cleanups == [([request_id], True)]
+        assert "next-epoch-request" in h.session.resource_request_ids(submitted=True)
+        assert (request_id in h.session.resource_request_ids(submitted=True)) is fail_cleanup
+        assert any(getattr(event, "code", None) == "runtime_signal_failed" for event in events) is fail_cleanup
+    finally:
+        monkeypatch.setattr(h.port, "cleanup", original_cleanup)
+        await close_harness(h)
+
+
 async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> None:
     h = await open_harness()
     release_abort = asyncio.Event()
@@ -1408,6 +1437,63 @@ async def test_cancel_cleanup_failure_retains_requests_for_close_retry() -> None
         assert result.ok and result.operation == "close"
         assert h.port.cleanups == [([request_id], True), ([request_id], True)]
         assert h.session.resource_request_ids() == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended", [False, True])
+@pytest.mark.parametrize("native_signal", [False, True])
+async def test_audio_truncation_preserves_retrieved_and_terminal_transcript(ended, native_signal) -> None:
+    h = await open_harness()
+    try:
+        session = h.session
+        response = session.begin_response()
+        item_id = f"item_{response}"
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("abcdefghij")
+        session.mark_audio_sent(10_000, text_chars=10, audio_complete=True)
+        h.runner.emit(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": response,
+                "audio": "AAA=",
+                "text": "abcdefghij",
+                "audio_duration_ms": 10_000,
+                "audio_text_marks": [{"text_chars": 10, "audio_end_ms": 10_000}],
+            }
+        )
+        if ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+        await h.settle()
+
+        if native_signal:
+            command = commands.SignalTurn(
+                event="conversation.item.truncate", signal_payload={"item_id": item_id, "audio_end_ms": 4_000}
+            )
+        else:
+            command = commands.TruncateItem(item_id=item_id, audio_end_ms=4_000)
+        events = await h.run(command)
+        assert "error" not in types(events)
+        assert find(events, "conversation.item.truncated").audio_end_ms == 4_000
+        for _ in range(2):
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+
+        if not ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+            events = await h.settle()
+            done = find(events, "response.done")
+            assert done.response["output"][0]["content"][0]["transcript"] == "abcd"
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+        assert session.history_item_ids[item_id]["content"] == "abcd"
     finally:
         await close_harness(h)
 
@@ -3259,6 +3345,67 @@ async def test_cancelling_output_keeps_the_pending_semantic_turn(command) -> Non
         events += await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
         assert "input_audio_buffer.speech_started" not in types(events)
         assert types(events).count("input_audio_buffer.committed") == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_keeps_a_commit_deferred_behind_the_active_response() -> None:
+    """Cancelling the answer in flight must not discard the next turn's audio.
+
+    A commit that arrives while a response is still generating is retained
+    with the response it should start. ``response.cancel`` then tears down only
+    the in-flight answer; the client's already-committed turn has to survive so
+    the ``response.create`` that follows can answer it.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, text="hello", finished=False))
+        assert h.runner.model_state.committed_audio_payload is None
+
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=True))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is True
+
+        await h.run(commands.CancelResponse())
+        assert model_state.committed_audio_payload is not None, "the committed turn was discarded"
+        assert model_state.deferred_response_create is True
+        assert h.session.pending_input_bytes > 0
+
+        events = await h.run(commands.CreateResponse())
+        assert "error" not in types(events), types(events)
+        assert find(events, "response.created")
+        assert model_state.committed_audio_payload is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_releases_audio_retained_for_the_cancelled_answer() -> None:
+    """A retain that belongs to the cancelled answer is still released."""
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", finished=False))
+        # Speech arriving mid-answer, committed without asking for a response:
+        # the retain belongs to the answer being generated, so
+        # ``deferred_response_create`` stays False and no new turn owns it.
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=False))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is False
+
+        await h.run(commands.CancelResponse())
+
+        assert model_state.committed_audio_payload is None
+        assert h.session.pending_input_bytes == 0
     finally:
         await close_harness(h)
 

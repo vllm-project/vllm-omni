@@ -8,6 +8,7 @@ owners:
   - "@fake0fan"
   - "@Sy0307"
   - "@Gaohan123"
+  - "@ZhengWG"
 primary_code_paths:
   - vllm_omni/core/**
   - vllm_omni/worker/**
@@ -86,6 +87,24 @@ scheduler metadata before the next execution can reuse them. Background
 construction snapshots those inputs. Both paths reuse the request IDs already
 copied by upstream bookkeeping; connector collection stays on the main thread
 because it can run a tensor-parallel collective.
+
+## Request-local model errors
+
+MRV2 model states can return an owned, step-local failure mask from
+`get_request_errors()`. `OmniAsyncOutput` copies it alongside the other output
+tensors and resolves request IDs after the copy completes. Before handing
+outputs to the native data plane, it removes failed rows' tokens and audio
+payloads. The scheduler then marks only those requests `FINISHED_ERROR`, frees
+their state through the normal completion path, and propagates `FinishReason.ERROR`
+to the API. Healthy rows continue. Numerical failure must not be represented as
+an ordinary EOS or a successful, truncated audio response.
+
+Ming3's `create_omni_model_state` hook selects its model-owned state before
+generic hybrid dispatch, preserving its flow and AudioVAE lifecycle.
+Ming3 defaults to one MRV2 stage containing the backbone, flow head and
+AudioVAE, without an inter-stage connector. The VAE cursor stays on device and advances under
+the same emission-or-flush mask as the decoder's KV length. Invalid rows
+leave both unchanged; CUDA graph padding rows expose no cached tokens.
 
 ## Safe-change guide
 

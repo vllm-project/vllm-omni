@@ -315,6 +315,7 @@ def pure_diffusion_app(pure_diffusion_engine, mocker):
         disable_log_stats=True,
         max_log_len=0,
         enable_server_load_tracking=False,
+        enable_force_include_usage=False,
     )
 
     app = FastAPI()

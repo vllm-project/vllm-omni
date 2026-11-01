@@ -250,6 +250,7 @@ datasets/
 !vllm_omni/model_executor/models/ming_flash_omni/talker_tn/talker_re.json
 # Omni-DuplexEval CI config JSON (e.g. accuracy/omni_duplex_eval)
 !tests/e2e/accuracy/omni_duplex_eval/*.json
+!tests/e2e/accuracy/sensenova_u1_reference.json
 !tests/e2e/accuracy/qwen_image_21/thresholds.json
 *.jsonl
 # Shared Hunyuan IT2I input for accuracy tests and vllm bench.
@@ -294,7 +295,3 @@ lance_compare/
 
 # Linting binaries downloaded by local pre-commit hooks
 shellcheck*/
-
-# Local Transformers/PyTorch inference experiment for Ming3.
-/examples/offline_inference/ming3_audio/transformers_thinker_talker.py
-/vllm_omni/model_executor/models/ming3_audio/hf_talker.py
