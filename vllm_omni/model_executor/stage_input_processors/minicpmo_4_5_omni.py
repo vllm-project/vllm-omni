@@ -890,6 +890,13 @@ def _turn_hidden_rows(
         logger.warning_once(
             "MiniCPM-o turn handoff: the Thinker row ledger does not match the latent rows; taking rows by index"
         )
+        logger.debug(
+            "MiniCPM-o turn handoff: req=%s ledger has %d ids and %d positions for %d latent rows",
+            request_id,
+            row_ids.numel(),
+            row_positions.numel(),
+            num_rows,
+        )
         return thinker_hidden_states[start:end].to(torch.float32).contiguous()
     ids = row_ids.reshape(-1).tolist()
     latest_row = {

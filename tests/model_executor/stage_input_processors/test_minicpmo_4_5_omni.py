@@ -138,6 +138,7 @@ def test_plain_chat_handoff_logs_a_ledger_of_the_wrong_length_once(mocker) -> No
     from vllm_omni.model_executor.stage_input_processors import minicpmo_4_5_omni as module
 
     warning_once = mocker.patch.object(module.logger, "warning_once")
+    debug = mocker.patch.object(module.logger, "debug")
     prompt_ids, output_ids = [101, 102], [11, 12]
     forwarded = [(101, 0), (102, 1), (11, 2)]
     source = _ledger_output(prompt_ids, output_ids, forwarded)
@@ -149,6 +150,9 @@ def test_plain_chat_handoff_logs_a_ledger_of_the_wrong_length_once(mocker) -> No
     assert info["ids"]["tts"] == [11]
     warning_once.assert_called_once()
     assert "row ledger" in warning_once.call_args.args[0]
+    # The counts go to the debug log, one line per mismatching output.
+    debug.assert_called_once()
+    assert debug.call_args.args[1:] == ("req-1", 3, 2, 3)
 
 
 def test_llm2tts_carries_request_ref_audio() -> None:
