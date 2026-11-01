@@ -404,26 +404,39 @@ class QwenImageLoraLoaderMixin(LoraLoaderMixin):
         else:
             state_dict = _load_lora_state_dict(pretrained_model_name_or_path_or_dict)
 
+        # Normalize PEFT's default adapter suffix before folding alpha into B.
+        state_dict = _remap_state_dict_keys(
+            state_dict,
+            [(".lora_A.default.weight", ".lora_A.weight"), (".lora_B.default.weight", ".lora_B.weight")],
+        )
         has_alpha = any(k.endswith(".alpha") for k in state_dict)
         is_non_diffusers_format = any(k.startswith("diffusion_model.") for k in state_dict)
         is_diffusers_lora_format = any(k.endswith(".lora_A.weight") for k in state_dict)
+        has_unprefixed_weights = any(
+            k.endswith((".lora_A.weight", ".lora_B.weight")) and not k.startswith("transformer.") for k in state_dict
+        )
         if has_alpha and is_diffusers_lora_format:
             state_dict = _apply_diffusers_lora_alpha_scaling(state_dict)
 
-        if has_alpha or is_non_diffusers_format:
+        if has_alpha or is_non_diffusers_format or has_unprefixed_weights:
             converter = get_converter_by_pipeline(self)
             if converter is None:
                 raise ValueError(f"Converter for Lora weights not found for {self.__class__.__name__}")
 
-            state_dict = converter(state_dict)
+            # The converter adds the transformer prefix itself.
+            state_dict = converter({k.removeprefix("transformer."): v for k, v in state_dict.items()})
 
         state_dict = _remap_state_dict_keys(state_dict, [(".to_out.0.", ".to_out.")])
 
-        self.load_lora_into_module(
+        loaded_keys = self.load_lora_into_module(
             state_dict,
             self.transformer,
             prefix=self.transformer_name,
         )
+        if not loaded_keys:
+            raise ValueError(
+                f"No LoRA weights matched {self.__class__.__name__}. Check the adapter's keys and target model."
+            )
 
         self.lora_loaded[adapter_name] = state_dict
 
