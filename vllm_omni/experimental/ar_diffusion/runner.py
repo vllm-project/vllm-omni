@@ -31,6 +31,8 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVCon
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.session import NoisyKVSessionRegistry
+from vllm_omni.experimental.ar_diffusion.reservation import CapacityDemand, SessionCapacityLedger
+from vllm_omni.experimental.ar_diffusion.session_affinity import SessionRouter
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
@@ -133,6 +135,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # request at a time, and the registry refuses a session whose request
         # failed until it is reset.
         self._noisy_sessions = NoisyKVSessionRegistry(capacity=1)
+        # Framework seams from the roadmap: which replica owns a session (2.1)
+        # and what capacity the scheduler reserved for it (2.3). Both are
+        # opt-in, so a single-replica deployment without a ledger behaves
+        # exactly as before.
+        self._session_router: SessionRouter | None = None
+        self._replica_id = 0
+        self._capacity_ledger: SessionCapacityLedger | None = None
+        self._session_reservation_versions = 0
+        self._session_reservation_bytes = 0
         self._perf_e2e_times: list[float] = []
         # Wall-clock start of each request's in-flight stepwise chunk, so
         # ``_perf_e2e_times`` keeps one entry per AR block in both execution
@@ -249,6 +260,49 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             step_replicas,
             blocks_per_rank,
         )
+
+    def bind_session_router(self, router: SessionRouter | None, replica_id: int = 0) -> None:
+        """Install the replica-affinity decision the engine made for this worker."""
+        self._session_router = router
+        self._replica_id = int(replica_id)
+
+    def bind_capacity_ledger(
+        self,
+        ledger: SessionCapacityLedger | None,
+        *,
+        versions: int = 0,
+        reserved_bytes: int = 0,
+    ) -> None:
+        """Install the scheduler's session capacity ledger for this worker."""
+        self._capacity_ledger = ledger
+        self._session_reservation_versions = int(versions)
+        self._session_reservation_bytes = int(reserved_bytes)
+
+    def _route_session(self, session_id: str, *, allow_cold: bool) -> None:
+        """Refuse a request whose session belongs to a replica this one is not."""
+        router = getattr(self, "_session_router", None)
+        if router is None:
+            return
+        router.route(session_id, [int(getattr(self, "_replica_id", 0))], allow_cold=allow_cold)
+
+    def _reserve_session_capacity(self, session_id: str) -> None:
+        """Reserve this session's incremental capacity, or send the request back."""
+        ledger = getattr(self, "_capacity_ledger", None)
+        if ledger is None:
+            return
+        demand = CapacityDemand(
+            versions=int(getattr(self, "_session_reservation_versions", 0)),
+            bytes=int(getattr(self, "_session_reservation_bytes", 0)),
+        )
+        ledger.reserve(session_id, demand)
+
+    def _release_session_reservation(self, session_id: str) -> None:
+        ledger = getattr(self, "_capacity_ledger", None)
+        if ledger is not None:
+            ledger.release(session_id)
+        router = getattr(self, "_session_router", None)
+        if router is not None:
+            router.release(session_id)
 
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
@@ -534,6 +588,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             if explicit_session:
                 if reset:
                     self._noisy_sessions.reset(session_id)
+                    self._release_session_reservation(session_id)
+                self._route_session(session_id, allow_cold=reset)
+                self._reserve_session_capacity(session_id)
                 session, _generation = self._noisy_sessions.admit(session_id)
             started = time.perf_counter()
             ctx = self._make_chunk_context(session=session)
@@ -554,6 +611,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 raise
             if close_session and explicit_session:
                 self._noisy_sessions.close(session_id)
+                self._release_session_reservation(session_id)
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output
         if self.kv_cache is None:

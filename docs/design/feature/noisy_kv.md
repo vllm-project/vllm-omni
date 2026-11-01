@@ -290,11 +290,24 @@ reader rank already holds the history, so a continuation only transfers the
 chunks that are new to it. Every rank advances it from the same admission, which
 keeps the transfer list symmetric.
 
+**Placement and reservation seams.** Two framework components carry the
+roadmap's 2.1/2.3 split. `SessionRouter` owns which replica must serve a
+session: the first request binds it, a follow-up must find its owner among the
+live replicas, and a lost owner is either refused or explicitly restarted cold
+(the loss is recorded, so it is never silent). `SessionCapacityLedger` owns what
+a session may hold: the scheduler reserves the increment over what the session
+already has, and a demand that does not fit is refused so the request returns to
+admission instead of taking another session's capacity. The runner binds both
+(`bind_session_router`, `bind_capacity_ledger`), applies them before admitting a
+session request, and returns the reservation when the session is reset or
+closed. Both are opt-in: a single-replica deployment without a ledger behaves
+exactly as before.
+
 **Not implemented yet (target contract).** Latent state is recomputed per
-request. The retention window is a worker-side quota sized at startup, not a
-per-request reservation from the scheduler, and over-quota demand fails instead
-of returning to the admission queue. Batch unification, StagePool replica
-affinity and cross-layout history conversion remain open.
+request. The retention window is still a worker-side quota sized at startup; the
+ledger above is the admission-side counterpart and does not yet feed the pool
+size. Batch unification, wiring the router into the engine's stage-pool replica
+selection, and cross-layout history conversion remain open.
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
