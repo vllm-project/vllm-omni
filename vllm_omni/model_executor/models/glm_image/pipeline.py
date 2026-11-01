@@ -31,6 +31,7 @@ GLM_IMAGE_PIPELINE = PipelineConfig(
             engine_output_type="token_ids",
             model_subdir="vision_language_encoder",
             tokenizer_subdir="processor",
+            prompt_transform_func="vllm_omni.model_executor.models.glm_image.prompt.propagate_target_size",
         ),
         StagePipelineConfig(
             stage_id=1,

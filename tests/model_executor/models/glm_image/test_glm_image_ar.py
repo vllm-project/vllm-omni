@@ -276,6 +276,42 @@ class TestGetMropeInputPositions:
             assert positions[dim].tolist() == [0, 1, 2, 3]
         assert delta == 0  # max(3) + 1 - seq_len(4) = 0
 
+    @pytest.mark.parametrize(
+        "height,width,preview_h,preview_w",
+        [(768, 768, 16, 16), (1024, 1024, 16, 16), (1536, 1536, 16, 16), (512, 768, 13, 19)],
+    )
+    def test_t2i_matches_transformers_grid_positions(self, model, height, width, preview_h, preview_w):
+        GlmImageModel = pytest.importorskip("transformers.models.glm_image.modeling_glm_image").GlmImageModel
+        reference = object.__new__(GlmImageModel)
+        torch.nn.Module.__init__(reference)
+        reference.config = model.config
+        tokens = [
+            16576,
+            19030,
+            39717,
+            16901,
+            16776,
+            20670,
+            18477,
+            167845,
+            117687,
+            16732,
+            117687,
+            167846,
+            167845,
+            115829,
+            16732,
+            115829,
+            167846,
+            16384,
+        ]
+        grids = torch.tensor([[1, height // 32, width // 32], [1, preview_h, preview_w]])
+        prefill, ref_delta = reference.get_rope_index(torch.tensor([tokens]), grids)
+        expected = torch.cat((prefill[:, 0], reference._cached_decode_position_ids[0]), dim=1)
+        actual, delta = model.get_mrope_input_positions(tokens, target_h=height, target_w=width)
+        assert torch.equal(actual, expected)
+        assert delta == ref_delta.item()
+
     def test_t2i_with_target_size(self, model):
         """t2i with explicit target_h/target_w: grids built from them."""
         input_tokens = [100, 101, 102, 16384]  # text + <bos>
@@ -283,14 +319,42 @@ class TestGetMropeInputPositions:
 
         positions, delta = model.get_mrope_input_positions(input_tokens, **kwargs)
         # 256/32=8 -> grids = [[1,8,8], [1,16,16]] (small uses factor//2=16 base)
-        # Decode order (reversed): grid[-1]=[1,16,16]=256, grid[-2]=[1,8,8]=64, EOS=1
+        # Decode length: preview 16*16 + target 8*8 + EOS = 321
         total_decode = 256 + 64 + 1  # 321
         assert positions.shape == (3, 4 + total_decode)
-        # delta = max_position + 1 - seq_len
-        # Positions advance by max(h,w) per grid: max(16,16)=16, max(8,8)=8
-        # max_pos = seq_len(4) + 16 + 8 = 28, then EOS at 28
-        # delta = 28 + 1 - 4 = 25
-        assert delta == 25
+        assert delta == 0
+
+    def test_t2i_decode_positions_are_spatial(self, model):
+        """Decode visits the preview grid followed by the target grid."""
+        input_tokens = [100, 101, 102, 16384]  # text + <bos>
+        kwargs = {"target_h": 768, "target_w": 768}
+
+        positions, _ = model.get_mrope_input_positions(input_tokens, **kwargs)
+        seq_len = len(input_tokens)
+        # 768/32=24 -> grids = [[1,24,24], [1,16,16]]
+        total_decode = 16 * 16 + 24 * 24 + 1
+        assert positions.shape == (3, seq_len + total_decode)
+        decode = positions[:, seq_len:]
+        assert decode[:, :4].tolist() == [[4, 4, 4, 4], [4, 4, 4, 4], [4, 5, 6, 7]]
+        assert decode[:, 256].tolist() == [20, 20, 20]
+        assert decode[:, 257].tolist() == [20, 20, 21]
+        assert decode[:, -1].tolist() == [44, 44, 44]
+
+    def test_i2i_decode_positions_are_spatial(self, model):
+        """i2i target positions follow the target grid."""
+        source_grid = [1, 2, 2]  # 2x2 = 4 image tokens
+        target_grid = [1, 8, 8]  # 8x8 = 64 tokens
+        mrope_grid = torch.tensor([source_grid, target_grid], dtype=torch.long)
+        input_tokens = [100, 101, 16384] + [167855] * 4 + [16385, 16384]
+
+        positions, _ = model.get_mrope_input_positions(input_tokens, mrope_image_grid_thw=mrope_grid)
+        seq_len = len(input_tokens)
+        total_decode = 8 * 8 + 1  # target grid + EOS
+        assert positions.shape == (3, seq_len + total_decode)
+        decode = positions[:, seq_len:]
+        start = decode[0, 0].item()
+        assert decode[:, :3].tolist() == [[start] * 3, [start] * 3, [start, start + 1, start + 2]]
+        assert decode[:, -1].tolist() == [start + 8] * 3
 
     def test_t2i_1024_default_grids(self, model):
         """t2i with default 1024x1024 grids when no explicit target size."""
