@@ -686,7 +686,9 @@ def test_talker_verifies_drafts_with_its_codec_sampler(mocker):
             talker.mrv2_custom_sampler(sampler)
 
 
-def test_drafter_loading_finds_the_codec_table_and_no_head():
+def test_drafter_loading_finds_the_codec_table_and_no_head(mocker):
+    from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+
     talker = object.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
     torch.nn.Module.__init__(talker)
     talker.emb_code = torch.nn.ModuleList([torch.nn.Embedding(10, 4)])
@@ -695,6 +697,35 @@ def test_drafter_loading_finds_the_codec_table_and_no_head():
     assert view.model.embed_tokens is talker.emb_code[0]
     # No head to share: head_code is a plain Linear, not a ParallelLMHead.
     assert not hasattr(view, "lm_head")
+    # The MRv2 EAGLE / DFlash / DSpark loaders look both up with these helpers.
+    assert eagle_utils.get_target_lm_head(talker, view) is None
+    mocker.patch.object(eagle_utils, "get_pp_group", return_value=SimpleNamespace(world_size=1))
+    draft = torch.nn.Module()
+    draft.model = torch.nn.Module()
+    draft.model.embed_tokens = torch.nn.Embedding(10, 4)
+    draft.has_own_embed_tokens = False
+    eagle_utils.maybe_share_target_embed(draft, draft.model, view.model)
+    assert draft.model.embed_tokens is talker.emb_code[0]
+
+
+@pytest.mark.parametrize(
+    "use_v2,spec,ok",
+    [
+        (False, None, True),
+        (False, SimpleNamespace(method="ngram"), True),
+        (False, {"method": "ngram"}, True),
+        (False, SimpleNamespace(method="suffix"), False),
+        (False, SimpleNamespace(method="dspark"), False),
+        (True, SimpleNamespace(method="suffix"), True),
+    ],
+)
+def test_v1_talker_takes_only_the_multi_frame_speculative_config(use_v2, spec, ok):
+    vllm_config = SimpleNamespace(speculative_config=spec)
+    if ok:
+        MiniCPMO45OmniTTSForConditionalGeneration._check_v1_draft_method(vllm_config, use_v2)
+    else:
+        with pytest.raises(NotImplementedError, match="model_runner: v1"):
+            MiniCPMO45OmniTTSForConditionalGeneration._check_v1_draft_method(vllm_config, use_v2)
 
 
 @pytest.mark.parametrize("v2,session,ok", [(True, "turn", True), (True, "duplex", False), (False, "turn", False)])
