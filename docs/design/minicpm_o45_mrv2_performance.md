@@ -61,6 +61,20 @@ On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
 Slot pooling and its `cfm_row_offset_merge` option remain opt-in. Fusion changes
 floating-point rounding and does not promise identical waveforms.
 
+## Vision softmax compilation
+
+The CUDA BF16 vision softmax keeps its row count and sequence length as runtime
+arguments. Only the 32-column reduction bucket and scale specialize the
+kernel. Different video resolutions and scheduler batch sizes within one bucket
+reuse compiled code, including partial four-row tiles. The ordered FP32
+accumulation and BF16 score rounding remain unchanged; this applies to both
+model runners.
+
+When comparing runners, record the compilation-cache state as well as warmup
+requests. V1 and V2 can select different AOT cache directories, so warming one
+runner does not necessarily warm the other's encoder kernels. Report first-use
+compilation separately from steady-state execution.
+
 ## Optional CFM precision and speaker replay
 
 `cfm_float16: true` in connector `extra` opts CUDA Code2Wav into FP16 for the

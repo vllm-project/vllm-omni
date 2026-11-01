@@ -17,17 +17,24 @@ from vllm.triton_utils import tl, triton
 libdevice = tl.extra.cuda.libdevice
 
 
-@triton.jit
-def _scaled_softmax_kernel(X, Y, N: tl.constexpr, ROWS: tl.constexpr, SCALE: tl.constexpr, BLOCK: tl.constexpr):
+# Video resolutions and scheduler batches vary independently. Specializing on
+# either dimension compiles a new, heavily unrolled kernel during inference.
+# Only the reduction bucket needs to be static; keep strides and bounds dynamic.
+@triton.jit(do_not_specialize=["N", "ROWS"])
+def _scaled_softmax_kernel(X, Y, N, ROWS, SCALE: tl.constexpr, BLOCK: tl.constexpr):
     rows = tl.program_id(0) * 4 + tl.arange(0, 4)
     lane = tl.arange(0, 32)
     xs = ()
     local_max = tl.full((4, 32), -float("inf"), tl.float32)
     for it in tl.static_range(BLOCK // 32):
         col = it * 32 + lane
-        x = tl.load(X + rows[:, None] * N + col[None, :], (rows[:, None] < ROWS) & (col[None, :] < N), other=0)
+        mask = rows[:, None] < ROWS
+        if it == BLOCK // 32 - 1:
+            mask = mask & (col[None, :] < N)
+        x = tl.load(X + rows[:, None] * N + col[None, :], mask, other=0)
         x = (x.to(tl.float32) * SCALE).to(x.dtype).to(tl.float32)
-        x = tl.where(col[None, :] < N, x, -float("inf"))
+        if it == BLOCK // 32 - 1:
+            x = tl.where(col[None, :] < N, x, -float("inf"))
         xs += (x,)
         local_max = tl.maximum(local_max, x)
     row_max = tl.max(local_max, 1)
@@ -41,7 +48,10 @@ def _scaled_softmax_kernel(X, Y, N: tl.constexpr, ROWS: tl.constexpr, SCALE: tl.
     for it in tl.static_range(BLOCK // 32):
         col = it * 32 + lane
         p = libdevice.div_rn(es[it], row_sum[:, None])
-        tl.store(Y + rows[:, None] * N + col[None, :], p, (rows[:, None] < ROWS) & (col[None, :] < N))
+        mask = rows[:, None] < ROWS
+        if it == BLOCK // 32 - 1:
+            mask = mask & (col[None, :] < N)
+        tl.store(Y + rows[:, None] * N + col[None, :], p, mask)
 
 
 def scaled_softmax(x: torch.Tensor, scale: float) -> torch.Tensor:
@@ -54,6 +64,6 @@ def scaled_softmax(x: torch.Tensor, scale: float) -> torch.Tensor:
     n = x.shape[-1]
     rows = x.numel() // n
     _scaled_softmax_kernel[(triton.cdiv(rows, 4),)](
-        x, out, n, rows, scale, max(32, triton.next_power_of_2(n)), enable_fp_fusion=False
+        x, out, n, rows, scale, triton.cdiv(n, 32) * 32, enable_fp_fusion=False
     )
     return out
