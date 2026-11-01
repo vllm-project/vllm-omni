@@ -1049,13 +1049,12 @@ class Qwen2_5OmniForConditionalGeneration(
                     finished=True,
                 )
                 prev_generated = audio_chunk
-                wav_chunks.append(audio_chunk.detach().cpu().numpy())
+                wav_chunks.append(audio_chunk)
 
         if len(wav_chunks) == 0:
             return torch.zeros(0, device=token2wav_dev)
 
-        waveform = np.concatenate(wav_chunks)
-        return torch.as_tensor(waveform, device=token2wav_dev)
+        return torch.cat(wav_chunks)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""

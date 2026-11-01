@@ -904,11 +904,11 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
         if waveform_tensor.dim() == 2 and waveform_tensor.shape[0] == 1:
             waveform_tensor = waveform_tensor.squeeze(0)
 
-        waveform_tensor_cpu = waveform_tensor.detach().cpu().contiguous()
+        waveform_out = waveform_tensor.detach().contiguous()
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": [waveform_tensor_cpu]},
+            multimodal_outputs={"model_outputs": [waveform_out]},
         )
 
     # ------------------------------------------------------------------
@@ -996,7 +996,7 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
 
         return OmniOutput(
             text_hidden_states=None,
-            multimodal_outputs={"model_outputs": [waveform.detach().cpu().contiguous()]},
+            multimodal_outputs={"model_outputs": [waveform.detach().contiguous()]},
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
