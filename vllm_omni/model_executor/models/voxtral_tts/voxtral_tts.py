@@ -293,6 +293,9 @@ class VoxtralTTSForConditionalGeneration(
         # scheduled again, so this one-token continuation is known to be an
         # audio token. Use host metadata to recognize it before touching
         # input_ids, avoiding CUDA bool()/tolist() synchronization per step.
+        # Async scheduling can leave the latest audio payload out of alignment
+        # with this token; only take the shortcut when history confirms the
+        # position, otherwise let the absolute-position replay path handle it.
         if (
             isinstance(audio_tokens, torch.Tensor)
             and audio_history is not None
@@ -442,6 +445,7 @@ class VoxtralTTSForConditionalGeneration(
         in request-local state avoids a model-global cursor, which can associate
         frames with the wrong request under batching. MRV2 may keep active
         history on device and offload it when preempted; V1 keeps CPU history.
+        MRV2 device memory grows with generated frames across active requests.
         request_sample_eligible excludes intermediate prompt chunks; the final
         prompt chunk remains eligible for the first generated token.
         """

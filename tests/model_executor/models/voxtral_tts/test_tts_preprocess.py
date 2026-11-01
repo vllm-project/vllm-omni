@@ -129,18 +129,45 @@ def test_tts_preprocess_steady_state_decode_avoids_cuda_sync_queries(monkeypatch
     def unexpected_sync_query(*args, **kwargs):
         raise AssertionError("steady-state decode must not inspect CUDA mask values on the CPU")
 
-    monkeypatch.setattr(torch.Tensor, "any", unexpected_sync_query)
-    monkeypatch.setattr(torch.Tensor, "tolist", unexpected_sync_query)
+    with monkeypatch.context() as guard:
+        guard.setattr(torch.Tensor, "any", unexpected_sync_query)
+        guard.setattr(torch.Tensor, "tolist", unexpected_sync_query)
+        guard.setattr(torch.Tensor, "__bool__", unexpected_sync_query)
+        guard.setattr(torch.Tensor, "item", unexpected_sync_query)
 
+        _, output_embeds, _ = model.tts_preprocess(
+            input_ids=input_ids,
+            input_embeds=input_embeds,
+            codes={"audio": audio_tokens, "audio_history": [torch.tensor([5, 6, 7, 8])]},
+            _omni_prompt_len=4,
+            _omni_num_computed_tokens=4,
+        )
+
+    torch.testing.assert_close(output_embeds, torch.full((1, 4), 5.0))
+
+
+def test_tts_preprocess_fast_path_falls_back_when_latest_frame_is_not_aligned():
+    model = _make_voxtral_tts_model()
+    input_ids = torch.tensor([model._audio_token_id])
+    input_embeds = torch.zeros((1, 4))
+    history = [torch.tensor([10, 11, 12, 13]), torch.tensor([20, 21, 22, 23])]
+    latest_audio = history[-1].reshape(1, 1, -1)
+
+    # Async output updates may be ahead of this token. The shortcut must defer
+    # to position-based replay and select the frame at this token's position.
     _, output_embeds, _ = model.tts_preprocess(
         input_ids=input_ids,
         input_embeds=input_embeds,
-        codes={"audio": audio_tokens, "audio_history": [torch.tensor([5, 6, 7, 8])]},
+        codes={"audio": latest_audio, "audio_history": history},
         _omni_prompt_len=4,
         _omni_num_computed_tokens=4,
     )
 
-    torch.testing.assert_close(output_embeds, torch.full((1, 4), 5.0))
+    torch.testing.assert_close(
+        model.model.embed_multimodal_calls[0]["audio_tokens"],
+        history[0].reshape(1, 1, -1),
+    )
+    torch.testing.assert_close(output_embeds, torch.full((1, 4), 10.0))
 
 
 def test_tts_preprocess_uses_latest_feedback_without_mrv2_positions():
@@ -174,6 +201,50 @@ def test_tts_preprocess_keeps_legacy_top_level_audio_feedback():
     assert len(model.model.embed_multimodal_calls) == 1
     torch.testing.assert_close(model.model.embed_multimodal_calls[0]["audio_tokens"], audio_tokens)
     torch.testing.assert_close(output_embeds, torch.full((1, 4), 7.0))
+
+
+def test_v1_preprocess_delta_preserves_existing_codes_audio():
+    from types import SimpleNamespace
+
+    from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+    model = _make_voxtral_tts_model()
+    audio_tokens = torch.tensor([[[5, 6, 7, 8]]])
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = model
+    runner.model_intermediate_buffer = {"request-a": {"codes": {"audio": audio_tokens}}}
+    runner.requests = {"request-a": SimpleNamespace()}
+
+    _, _, update = model.tts_preprocess(
+        torch.tensor([model._audio_token_id]),
+        torch.zeros((1, 4)),
+        codes={"audio": audio_tokens},
+    )
+    runner._update_intermediate_buffer("request-a", update)
+
+    codes = runner.model_intermediate_buffer["request-a"]["codes"]
+    torch.testing.assert_close(codes["audio"], audio_tokens)
+    assert codes["audio_history"] == []
+
+
+def test_mrv2_preprocess_delta_preserves_existing_codes_audio():
+    from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
+
+    model = _make_voxtral_tts_model()
+    audio_tokens = torch.tensor([[[5, 6, 7, 8]]])
+    buffer = OmniIntermediateBuffer(1)
+    buffer.buffers[0] = {"req_id": "request-a", "codes": {"audio": audio_tokens}}
+
+    _, _, update = model.tts_preprocess(
+        torch.tensor([model._audio_token_id]),
+        torch.zeros((1, 4)),
+        codes={"audio": audio_tokens},
+    )
+    buffer.update(0, update)
+
+    codes = buffer.buffers[0]["codes"]
+    torch.testing.assert_close(codes["audio"], audio_tokens)
+    assert codes["audio_history"] == []
 
 
 def test_v1_output_hook_persists_feedback_from_preprocess_state_delta():
