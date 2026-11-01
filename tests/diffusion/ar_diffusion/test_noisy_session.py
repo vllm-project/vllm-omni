@@ -8,11 +8,26 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.experimental.ar_diffusion.cell_executor import (
+    ARDiffusionCellContext,
+    CellAdapter,
+    CellRunSpec,
+    CellTopology,
+    run_cell_pipeline,
+)
+from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
+    ARDiffusionNoisyKVSpec,
+    NoisyKVCache,
+    NoisyKVState,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.session import (
+    NoisyKVSession,
     NoisyKVSessionRegistry,
     NoisySessionError,
     NoisySessionState,
@@ -158,3 +173,96 @@ def test_runner_closes_the_session_when_the_request_asks(mocker):
     runner.execute_model(_request(close_session=True))
 
     assert runner._noisy_sessions.get("s1") is None
+
+
+class _SeqRecorder(CellAdapter):
+    """Records the sequence length each cell's KV view exposes."""
+
+    def __init__(self) -> None:
+        self.seq_lens: dict[tuple, int] = {}
+
+    def forward(self, tasks, kv_contexts, *, hidden):
+        del hidden
+        for (_req, cell), ctx_list in zip(tasks, kv_contexts):
+            view = ctx_list[0] if isinstance(ctx_list, list) else ctx_list
+            self.seq_lens[cell] = int(view.seq_len)
+        return torch.zeros(1, 4, 8)
+
+    def pack_activation(self, output):
+        return {"hidden_states": output}
+
+    def unpack_activation(self, payload):
+        return payload["hidden_states"]
+
+
+def _cache() -> NoisyKVCache:
+    return NoisyKVCache(
+        ARDiffusionNoisyKVSpec(
+            num_layers=1,
+            num_kv_heads=1,
+            head_size=1,
+            block_size=4,
+            max_chunk_tokens=4,
+            max_history_chunks=1,
+        ),
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        layer_groups=1,
+        max_batch_size=1,
+    )
+
+
+def _run_request(state: NoisyKVState, session: NoisyKVSession, req: str, chunk_start: int) -> _SeqRecorder:
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=2,
+            num_denoise_steps=1,
+            step_replicas=1,
+            layer_groups=1,
+            ordering=Ordering.SELF_FORCING,
+            kv_history_chunks=1,
+        )
+    )
+    ctx = ARDiffusionCellContext(
+        spec=CellRunSpec(topology=CellTopology(step_replicas=1, layer_groups=1), rank=0),
+        kv=state,
+        chunk_start=chunk_start,
+        session=session,
+    )
+    assert ctx.admit(req, plan, chunk_tokens=4, slot=0)
+    adapter = _SeqRecorder()
+    run_cell_pipeline(ctx=ctx, adapter=adapter)
+    return adapter
+
+
+def test_second_request_continues_from_session_history():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    session = NoisyKVSession(session_id="s1")
+
+    first = _run_request(state, session, "A", chunk_start=0)
+
+    assert first.seq_lens[(0, 0, 0)] == 4
+    assert session.committed_chunks == 2
+    assert {chunk for chunk, _block in session.retained} == {1}
+
+    second = _run_request(state, session, "B", chunk_start=session.committed_chunks)
+
+    # The first cell of the second request reads one retained chunk plus its own
+    # write slot, so its KV view is twice as long as a cold cell's.
+    assert second.seq_lens[(0, 0, 0)] == 8
+    assert session.committed_chunks == 4
+    # Retention is bounded by H=1, so only the newest committed chunk survives.
+    assert {chunk for chunk, _block in session.retained} == {3}
+
+
+def test_retained_history_is_released_when_the_cache_is_reset():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    session = NoisyKVSession(session_id="s1")
+    _run_request(state, session, "A", chunk_start=0)
+
+    assert state.resident_versions == 1
+    state.reset_all()
+
+    assert state.resident_versions == 0

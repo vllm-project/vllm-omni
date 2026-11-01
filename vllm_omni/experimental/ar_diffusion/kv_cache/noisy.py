@@ -127,6 +127,14 @@ class VersionPool:
         if slot is not None:
             self.free[self.local_layer(key)].append(slot)
 
+    def rekey(self, old: VersionKey, new: VersionKey) -> bool:
+        """Hand a slot to another version key without copying or freeing it."""
+        slot = self.keys.pop(old, None)
+        if slot is None:
+            return False
+        self.keys[new] = slot
+        return True
+
     def slot_of(self, key: VersionKey) -> int:
         return self.keys[key]
 
@@ -518,6 +526,8 @@ class NoisyKVState:
         self.cache = cache
         self._plans: dict[str, CellPlan] = {}
         self._chunk_tokens: dict[str, int] = {}
+        # Session identity per in-flight request: (session, chunk_start).
+        self._request_sessions: dict[str, tuple[Any | None, int]] = {}
         self._last_use_global: dict[str, dict[Cell, int]] = {}
         self.bytes_sent = 0
         self.bytes_received = 0
@@ -548,13 +558,25 @@ class NoisyKVState:
     def wait_sends(self) -> None:
         self.cache.transport.wait_sends()
 
-    def begin_request(self, req: str, plan: CellPlan, *, chunk_tokens: int, t0: int = 0) -> None:
+    def begin_request(
+        self,
+        req: str,
+        plan: CellPlan,
+        *,
+        chunk_tokens: int,
+        t0: int = 0,
+        session: Any | None = None,
+        chunk_start: int = 0,
+    ) -> None:
         if chunk_tokens <= 0 or chunk_tokens % self.cache.spec.block_size != 0:
             raise ValueError("chunk_tokens must be a positive multiple of block_size")
         if chunk_tokens > self.cache.spec.max_chunk_tokens:
             raise ValueError("chunk_tokens exceeds max_chunk_tokens")
+        if chunk_start < 0:
+            raise ValueError(f"chunk_start must be non-negative, got {chunk_start}")
         self._plans[req] = plan
         self._chunk_tokens[req] = chunk_tokens
+        self._request_sessions[req] = (session, chunk_start)
         mapped = {version: t0 + slot for version, slot in plan.last_use(self._rank).items()}
         self._last_use_global[req] = mapped
 
@@ -563,6 +585,7 @@ class NoisyKVState:
 
     def end_request(self, req: str) -> None:
         self.cache.transport.wait_sends()
+        self._retain_for_session(req)
         drop = [key for key in self.cache.pool.keys if key[0] == req]
         for key in drop:
             self.cache.transport.discard(key)
@@ -571,6 +594,66 @@ class NoisyKVState:
         self._plans.pop(req, None)
         self._chunk_tokens.pop(req, None)
         self._last_use_global.pop(req, None)
+        self._request_sessions.pop(req, None)
+
+    def _session_history_blocks(self, req: str, task: Cell, num_chunk_blocks: int) -> list[int]:
+        """Session-retained blocks this task reads, oldest first."""
+        session, chunk_start = self._request_sessions.get(req, (None, 0))
+        plan = self._plans.get(req)
+        if session is None or chunk_start <= 0 or plan is None:
+            return []
+        history_chunks = plan.schedule.kv_history_chunks
+        if history_chunks <= 0:
+            return []
+        local_chunk, _step, block = task
+        pool = self.cache.pool
+        blocks: list[int] = []
+        for chunk in range(max(0, chunk_start + local_chunk - history_chunks), chunk_start):
+            key = session.retained.get((chunk, block))
+            if key is None or not pool.has(key):
+                continue
+            blocks.extend(pool.block_ids(pool.slot_of(key))[:num_chunk_blocks])
+        return blocks
+
+    def _retain_for_session(self, req: str) -> None:
+        """Move the history a later request needs into session ownership.
+
+        Versions are re-keyed rather than copied, so the stored bytes are the
+        same; only who may release them changes.
+        """
+        session, chunk_start = self._request_sessions.get(req, (None, 0))
+        plan = self._plans.get(req)
+        if session is None or plan is None:
+            return
+        schedule = plan.schedule
+        history_chunks = schedule.kv_history_chunks
+        if history_chunks <= 0:
+            return
+        pool = self.cache.pool
+        # Clean when the ordering has it, otherwise the last denoise step.
+        # Same-Step keeps a step version; the other orderings keep the clean one.
+        if schedule.ordering is Ordering.SAME_STEP:
+            step = max(0, schedule.num_denoise_steps - 1)
+        else:
+            step = schedule.num_denoise_steps
+        session_key = f"__noisy_session__::{session.session_id}"
+        retained = {key: value for key, value in session.retained.items() if pool.has(value)}
+        for local_chunk in range(schedule.chunks):
+            for block in range(schedule.num_blocks):
+                old_key = (req, local_chunk, step, block)
+                if not pool.has(old_key):
+                    continue
+                new_key = (session_key, chunk_start + local_chunk, step, block)
+                if pool.rekey(old_key, new_key):
+                    retained[(chunk_start + local_chunk, block)] = new_key
+        keep = sorted({chunk for chunk, _block in retained})[-history_chunks:]
+        for key, value in retained.items():
+            if key[0] not in keep:
+                # Outside the retention window: hand the slot back to the pool.
+                pool.release(value)
+        session.retained = {k: v for k, v in retained.items() if k[0] in keep}
+        if session.state.value == "active":
+            session.committed_chunks = chunk_start + schedule.chunks
 
     def reset_all(self) -> None:
         for req in list(self._plans):
@@ -672,7 +755,9 @@ class NoisyKVState:
             write_key = _version_key(req, task)
             write_slot = pool.alloc(write_key)
             write_blocks = pool.block_ids(write_slot)[:num_chunk_blocks]
-            blocks: list[int] = []
+            # Session history is older than anything this request produced.
+            history = self._session_history_blocks(req, task, num_chunk_blocks)
+            blocks: list[int] = list(history)
             for src in srcs:
                 src_key = _version_key(req, src.version)
                 if not pool.has(src_key):
@@ -686,7 +771,8 @@ class NoisyKVState:
             self._block_table_cpu[0, : len(blocks)] = torch.as_tensor(blocks, dtype=torch.int32)
             if len(blocks) < width:
                 self._block_table_cpu[0, len(blocks) :].zero_()
-            seq_len = (len(srcs) + 1) * chunk_tokens
+            history_chunks = len(history) // num_chunk_blocks if num_chunk_blocks else 0
+            seq_len = (history_chunks + len(srcs) + 1) * chunk_tokens
             self._block_table_dev.copy_(self._block_table_cpu, non_blocking=device.type == "cuda")
             self._record_block_table_h2d(device)
             self._seq_lens_dev.fill_(seq_len)

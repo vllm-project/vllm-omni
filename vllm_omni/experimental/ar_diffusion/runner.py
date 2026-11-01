@@ -473,7 +473,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """
         self.release_step_requests(getattr(scheduler_output, "finished_req_ids", None) or ())
 
-    def _make_chunk_context(self):
+    def _make_chunk_context(self, session: Any | None = None):
         from vllm_omni.experimental.ar_diffusion.cell_executor import (
             ARDiffusionCellContext,
             CellRunSpec,
@@ -496,6 +496,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 pp_group=pp_group,
             ),
             kv=NoisyKVState(self.noisy_kv_cache),
+            chunk_start=session.committed_chunks if session is not None else 0,
+            session=session,
         )
 
     @staticmethod
@@ -520,9 +522,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
             if reset:
                 self._noisy_sessions.reset(session_id)
-            self._noisy_sessions.admit(session_id)
+            session, _generation = self._noisy_sessions.admit(session_id)
             started = time.perf_counter()
-            ctx = self._make_chunk_context()
+            ctx = self._make_chunk_context(session=session)
             try:
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     output = super().execute_model(

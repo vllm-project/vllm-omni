@@ -217,6 +217,9 @@ class ARDiffusionCellContext:
     kv: NoisyKVState
     inflight: list[Inflight] = field(default_factory=list)
     pending: list[PendingAdmit] = field(default_factory=list)
+    # Session binding for this execution context; 0/None keeps request mode.
+    chunk_start: int = 0
+    session: Any | None = None
 
     def enqueue(self, req: str, plan: CellPlan, *, chunk_tokens: int) -> None:
         self.pending.append(PendingAdmit(req=req, plan=plan, chunk_tokens=chunk_tokens))
@@ -235,7 +238,9 @@ class ARDiffusionCellContext:
         inflight_tokens = {self.kv._chunk_tokens[item.req] for item in self.inflight}
         if inflight_tokens and chunk_tokens not in inflight_tokens:
             return False
-        self.kv.begin_request(req, plan, chunk_tokens=chunk_tokens, t0=slot)
+        self.kv.begin_request(
+            req, plan, chunk_tokens=chunk_tokens, t0=slot, session=self.session, chunk_start=self.chunk_start
+        )
         self.inflight.append(Inflight(req=req, t0=slot, plan=plan))
         self.kv.set_inflight(tuple(self.inflight))
         return True
