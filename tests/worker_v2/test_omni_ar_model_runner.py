@@ -535,6 +535,40 @@ def test_async_output_drops_rejected_draft_rows(monkeypatch, mocker, async_chunk
         torch.testing.assert_close(payloads[1]["hidden"], hidden[4:5])
 
 
+def test_rejected_rows_trim_latent_and_ledger_together_and_spare_prefill(monkeypatch, mocker):
+    """A prefill request next to a verifying one keeps all its rows; the ledger stays row-aligned."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    # Request 0: 3 prefill rows. Request 1: last sampled token + 3 drafts, 2 rejected.
+    hidden = torch.arange(7 * 4, dtype=torch.float32).reshape(7, 4)
+    ids = torch.arange(100, 107).reshape(7, 1)
+    positions = torch.tensor([0, 1, 2, 20, 21, 22, 23]).reshape(7, 1)
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np = np.array([0, 3, 7])
+    batch.num_scheduled_tokens = np.array([3, 4])
+    batch.num_reqs = 2
+    batch.num_tokens_after_padding = 8
+    output = _async_output(
+        req_ids=["prefill", "verify"],
+        sampler_output=SamplerOutput(
+            torch.ones(2, 4, dtype=torch.long), None, None, torch.tensor([1, 2]), torch.tensor([0, 2])
+        ),
+        num_sampled_tokens=torch.tensor([1, 2]),
+        num_rejected_tokens=torch.tensor([0, 2]),
+        text_hidden=hidden,
+        multimodal_outputs={"latent": hidden, "latent_input_ids": ids, "latent_positions": positions},
+        input_batch=batch,
+        async_chunk=False,
+    ).get_output()
+
+    prefill, verify = output.inter_stage_outputs
+    for payload, rows in ((prefill, slice(0, 3)), (verify, slice(3, 5))):
+        torch.testing.assert_close(payload["latent"], hidden[rows])
+        torch.testing.assert_close(payload["latent_input_ids"], ids[rows])
+        torch.testing.assert_close(payload["latent_positions"], positions[rows])
+
+
 def test_finalized_full_payload_latent_ledger_is_accumulated_once(monkeypatch):
     from tests.engine.test_output_processor_mrv2_text import (
         _Detokenizer,
