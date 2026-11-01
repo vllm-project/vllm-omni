@@ -35,17 +35,22 @@ from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_context,
     extract_flux2_klein_context,
     extract_flux_context,
+    extract_glm_image_context,
     extract_mammoth_moda2_context,
     extract_ming_image_context,
     extract_minimax_h3_context,
     extract_zimage_context,
 )
-from vllm_omni.diffusion.cache.teacache.hook import apply_teacache_hook
+from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook, apply_teacache_hook
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
+from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig, DiffusionParallelConfig
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
+)
+from vllm_omni.diffusion.models.glm_image.glm_image_transformer import (
+    GlmImageTransformer2DModel,
+    KVCacheMode,
 )
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
     Transformer2DModel as MammothModa2Transformer2DModel,
@@ -1295,3 +1300,140 @@ class TestMiniMaxH3Extractor(BaseExtractorTest):
 
         with pytest.raises(ValueError, match="Module must have blocks"):
             extract_minimax_h3_context(invalid_module, **_minimax_h3_sample_kwargs())
+
+
+def _init_linear_base_weights(module: nn.Module) -> None:
+    for submodule in module.modules():
+        if isinstance(submodule, LinearBase):
+            if getattr(submodule, "weight", None) is not None:
+                nn.init.normal_(submodule.weight, std=0.02)
+            bias = getattr(submodule, "bias", None)
+            if bias is not None:
+                nn.init.zeros_(bias)
+
+
+@pytest.mark.cpu
+class TestGlmImageExtractor:
+    """CPU tests for extract_glm_image_context and TeaCacheHook integration."""
+
+    @pytest.fixture
+    def glm_module(self):
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+            parallel_config=DiffusionParallelConfig(
+                tensor_parallel_size=1,
+                sequence_parallel_size=1,
+            ),
+        )
+        tf = SimpleNamespace(
+            patch_size=2,
+            in_channels=4,
+            out_channels=4,
+            num_attention_heads=2,
+            attention_head_dim=4,
+            time_embed_dim=16,
+            condition_dim=8,
+            prior_vq_quantizer_codebook_size=32,
+            text_embed_dim=8,
+            num_layers=2,
+        )
+        od_config.tf_model_config = tf
+        with set_current_diffusion_config(od_config):
+            model = GlmImageTransformer2DModel(od_config=od_config, quant_config=None)
+            _init_linear_base_weights(model)
+            yield model
+
+    @pytest.fixture
+    def sample_inputs(self):
+        batch, channels, height, width = 1, 4, 4, 4
+        seq_len = (height // 2) * (width // 2)
+        return {
+            "hidden_states": torch.randn(batch, channels, height, width),
+            "encoder_hidden_states": torch.randn(batch, 3, 8),
+            "prior_token_id": torch.randint(0, 32, (batch, seq_len)),
+            "prior_token_drop": torch.zeros(batch, seq_len, dtype=torch.bool),
+            "timestep": torch.tensor([500], dtype=torch.long),
+            "target_size": torch.tensor([[height * 8, width * 8]], dtype=torch.float32),
+            "crop_coords": torch.zeros((1, 2), dtype=torch.float32),
+            "return_dict": False,
+        }
+
+    def test_branch_tag_from_prior_token_drop(self, glm_module, sample_inputs):
+        positive = extract_glm_image_context(glm_module, **sample_inputs)
+        assert positive.extra_states["teacache_branch"] == "positive"
+        assert positive.extra_states["teacache_bypass"] is False
+
+        negative_inputs = dict(sample_inputs)
+        negative_inputs["prior_token_drop"] = torch.ones_like(sample_inputs["prior_token_drop"])
+        negative = extract_glm_image_context(glm_module, **negative_inputs)
+        assert negative.extra_states["teacache_branch"] == "negative"
+
+    def test_write_mode_sets_teacache_bypass(self, glm_module, sample_inputs):
+        kv_cache = glm_module.create_kv_cache()
+        kv_cache.set_mode(KVCacheMode.WRITE)
+        context = extract_glm_image_context(glm_module, **sample_inputs, kv_cache=kv_cache)
+        assert context.extra_states["teacache_bypass"] is True
+
+    @torch.no_grad()
+    def test_forced_full_compute_matches_original_forward(self, glm_module, sample_inputs, monkeypatch):
+        expected = glm_module(**sample_inputs)[0]
+
+        config = TeaCacheConfig(
+            transformer_type="GlmImageTransformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=0.1,
+        )
+        apply_teacache_hook(glm_module, config)
+        hook = glm_module._hook_registry.get_hook("teacache")
+        monkeypatch.setattr(hook, "_should_compute_full_transformer", Mock(return_value=True))
+
+        actual = glm_module(**sample_inputs)[0]
+        torch.testing.assert_close(actual, expected)
+
+    @torch.no_grad()
+    def test_kv_write_bypass_leaves_teacache_state_unchanged(self, glm_module, sample_inputs):
+        config = TeaCacheConfig(
+            transformer_type="GlmImageTransformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=0.1,
+        )
+        apply_teacache_hook(glm_module, config)
+        hook: TeaCacheHook = glm_module._hook_registry.get_hook("teacache")
+
+        # Seed positive-branch TeaCache state with a normal (non-bypass) step.
+        _ = glm_module(**sample_inputs)
+        hook.state_manager.set_context("teacache_positive")
+        state = hook.state_manager.get_state()
+        assert state.cnt == 1
+        assert state.previous_modulated_input is not None
+        before = {
+            "cnt": state.cnt,
+            "acc": state.accumulated_rel_l1_distance,
+            "mod": state.previous_modulated_input.detach().clone(),
+            "res": None if state.previous_residual is None else state.previous_residual.detach().clone(),
+            "enc": (
+                None
+                if state.previous_residual_encoder is None
+                else state.previous_residual_encoder.detach().clone()
+            ),
+            "forward_cnt": hook._forward_cnt,
+        }
+
+        kv_cache = glm_module.create_kv_cache()
+        kv_cache.set_mode(KVCacheMode.WRITE)
+        _ = glm_module(**sample_inputs, kv_cache=kv_cache)
+
+        hook.state_manager.set_context("teacache_positive")
+        state = hook.state_manager.get_state()
+        assert state.cnt == before["cnt"]
+        assert state.accumulated_rel_l1_distance == before["acc"]
+        assert hook._forward_cnt == before["forward_cnt"]
+        torch.testing.assert_close(state.previous_modulated_input, before["mod"])
+        if before["res"] is None:
+            assert state.previous_residual is None
+        else:
+            torch.testing.assert_close(state.previous_residual, before["res"])
+        if before["enc"] is None:
+            assert state.previous_residual_encoder is None
+        else:
+            torch.testing.assert_close(state.previous_residual_encoder, before["enc"])
