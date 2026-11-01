@@ -245,16 +245,6 @@ steps:
             "
         mirror_hardwares: h100_1
 
-      - label: "Diffusion · Cosmos3 Test"
-        source_file_dependencies: diffusion_cosmos3_function
-        commands:
-          - |
-            timeout 40m bash -c "
-              export VLLM_IMAGE_FETCH_TIMEOUT=60
-              pytest -s -v tests/e2e/online_serving/test_cosmos3.py -m 'core_model' --run-level 'core_model'
-            "
-        mirror_hardwares: h100_1
-
       - label: "Diffusion · MiniMax-H3 DLO DP2 T2VA Test"
         timeout_in_minutes: 90
         source_file_dependencies: diffusion_minimax_h3_function

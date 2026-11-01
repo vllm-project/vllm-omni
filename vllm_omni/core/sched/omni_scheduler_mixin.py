@@ -43,7 +43,12 @@ from vllm_omni.core.sched.output import (
     OmniRequestPrewarm,
     OmniSchedulerOutput,
 )
-from vllm_omni.data_entry_keys import ASYNC_CHUNK_PREWARM_NS, deserialize_payload, unflatten_payload
+from vllm_omni.data_entry_keys import (
+    ASYNC_CHUNK_PREWARM_NS,
+    deserialize_payload,
+    returns_stage_payload,
+    unflatten_payload,
+)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
@@ -176,6 +181,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     deferred_waiting: set[Request]
     running: list[Request]
     _pending_input_timeout_outputs: dict[str, tuple[int, OmniEngineCoreOutput]]
+    _outputs_awaiting_stage_payload: dict[str, tuple[int, OmniEngineCoreOutput]]
 
     def _init_omni_connector_output_inbox(self) -> None:
         self._omni_connector_output_inbox: queue.SimpleQueue[OmniConnectorOutput] = queue.SimpleQueue()
@@ -235,6 +241,9 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         # Async-chunk prewarm payloads popped in add_request, keyed by request
         # id; handed to the runner once by _wrap_omni_scheduler_output.
         self._pending_request_prewarms: dict[str, dict[str, Any]] = {}
+        # Finished outputs of requests that return their stage payload; the
+        # worker builds the payload a step after the finish.
+        self._outputs_awaiting_stage_payload = {}
         # Optional per-stage pooling-output decoder hook (dotted path in
         # model_config); applied worker-side before IPC.
         self._pooling_output_decoder = None
@@ -414,6 +423,14 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain input notifications into the coordinator on the scheduler thread."""
         connector_outputs = self._drain_omni_connector_outputs()
+
+        # Attach returned payloads to held run outputs.
+        awaiting = self._outputs_awaiting_stage_payload
+        for output in connector_outputs:
+            for req_id, stage_payload in output.stage_payloads.items():
+                if req_id in awaiting:
+                    awaiting[req_id][1].stage_payload = stage_payload
+
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
@@ -884,13 +901,21 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         request: Request,
         **output_fields: Any,
     ) -> None:
-        outputs[request.client_index].append(
-            OmniSchedulerMixin._make_omni_engine_output(
-                self,
-                request,
-                **output_fields,
-            )
+        output = OmniSchedulerMixin._make_omni_engine_output(
+            self,
+            request,
+            **output_fields,
         )
+        if output.finish_reason in (FinishReason.STOP, FinishReason.LENGTH) and returns_stage_payload(
+            request.additional_information
+        ):
+            self._outputs_awaiting_stage_payload[request.request_id] = (request.client_index, output)
+            return
+        outputs[request.client_index].append(output)
+
+    def has_requests(self) -> bool:
+        """Keep stepping while a finished run request's output waits for its stage payload."""
+        return bool(self._outputs_awaiting_stage_payload) or super().has_requests()
 
     def _handle_failed_kv_load_outputs(
         self,
@@ -926,6 +951,14 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 if not any(item.request_id == error_output.request_id for item in output.outputs):
                     output.outputs.append(error_output)
             pending.clear()
+
+        # Emit held run outputs once their payload arrives.
+        awaiting = self._outputs_awaiting_stage_payload
+        for req_id, (client_index, held_output) in list(awaiting.items()):
+            if held_output.stage_payload is not None:
+                engine_core_outputs.setdefault(client_index, EngineCoreOutputs()).outputs.append(held_output)
+                del awaiting[req_id]
+
         finished_req_ids = self.finished_req_ids_dict
         if not finished_req_ids:
             return
@@ -939,7 +972,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 output.outputs.extend(
                     EngineCoreOutput(req_id, [], finish_reason=FinishReason.ABORT)
                     for req_id in finished_set
-                    if req_id not in emitted
+                    if req_id not in emitted and req_id not in awaiting
                 )
             output.finished_requests = finished_set
         finished_req_ids.clear()
@@ -1265,6 +1298,14 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
         if chunk_transfer_adapter := getattr(self, "chunk_transfer_adapter", None):
             chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
+
+        # A run request whose output is held already finished; dropping the output aborts it.
+        if request_ids is None:
+            self._outputs_awaiting_stage_payload.clear()
+        else:
+            for request_id in target_request_ids:
+                if request_id in self._outputs_awaiting_stage_payload:
+                    del self._outputs_awaiting_stage_payload[request_id]
 
         self._realign_request_status_to_queues(
             request_ids,

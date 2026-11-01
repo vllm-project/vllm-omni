@@ -29,7 +29,7 @@ def test_no_ambiguous_overlap_with_real_engine():
     """
     # Fields on both classes by design: orchestrator captures them to prevent
     # uniform per-stage propagation; redistributed via DeployConfig.
-    orchestrator_captured = {"async_chunk", "tokenizer"}
+    orchestrator_captured = {"async_chunk", "tokenizer", "otlp_traces_endpoint"}
     # Orchestrator holds Omni's per-modality watermarking config, which may contain a
     # subconfig that is passed to vLLM to configure sampling time watermarking for text.
     derived_per_modality = {"watermark_config"}

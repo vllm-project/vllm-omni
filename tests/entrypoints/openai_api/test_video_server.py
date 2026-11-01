@@ -511,6 +511,10 @@ async def test_server_worker_keeps_engine_alive_until_http_shutdown(monkeypatch,
     sock = FakeServerSocket()
 
     class FakeEngine:
+        from vllm_omni.engine.omni_engine_base import OmniEngineBase
+
+        engine = object.__new__(OmniEngineBase)
+        engine.tracer_provider = None
         stage_configs = []
 
         def get_diffusion_od_config(self):
