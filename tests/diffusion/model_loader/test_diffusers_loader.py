@@ -2179,6 +2179,8 @@ def _mp_worker_online_quant(rank: int, world_size: int, rendezvous: str, temp_di
         if model.load_called:
             with open(os.path.join(temp_dir, f"rank_{rank}_success.flag"), "w") as f:
                 f.write("ok")
+        # Keep successful ranks alive until every peer has finished initialization/loading.
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
