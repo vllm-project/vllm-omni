@@ -105,3 +105,8 @@ omni = Omni(
 
 Only add a new model to the supported table after comparing the Int8 output
 against a BF16 baseline and documenting any required `ignored_layers`.
+
+## MiniMax H3 operator acceleration
+
+The optional [Video VAE Omni operators](../diffusion/minimax_h3_vae_ops.md)
+can be enabled independently of VAE INT8 quantization.
