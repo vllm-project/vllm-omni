@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Per-shape CUDA graph for one AuK DiT denoise step."""
+"""Bucketed CUDA graphs for AuK DiT steps and complete Euler loops."""
 
 from __future__ import annotations
 
@@ -28,8 +28,19 @@ class _GraphEntry:
     static_out: torch.Tensor
 
 
+@dataclass
+class _LoopGraphEntry:
+    graph: torch.cuda.CUDAGraph
+    static_x_in: torch.Tensor
+    static_ctx: AuKStepContext
+    static_cfg: torch.Tensor | None
+    static_x_out: torch.Tensor
+    static_dts: torch.Tensor
+    static_timesteps: torch.Tensor
+
+
 class AuKCUDAGraphWrapper:
-    """Replay one DiT denoise step and leave Euler scheduling to the caller.
+    """Replay one DiT denoise step or the entire diffusion loop with CUDA graphs.
 
     The graph is keyed by the target, text and reference sequence lengths,
     whether the CFG branch is enabled and, when the caller passes the time
@@ -38,7 +49,8 @@ class AuKCUDAGraphWrapper:
     reuse one graph. With the time grid, the adaLN modulations of every step
     are part of the per-request context and the graph selects its row.
 
-    Only :meth:`AuKTransformer.step` is captured. The per-request context
+    The single-step path captures :meth:`AuKTransformer.step`; the loop path
+    also captures the Euler updates. The per-request context
     (text projection, reference embedding, padding biases, rotary tables) is
     built by :meth:`AuKTransformer.prepare` on the first step of a request and
     copied into the graph's static context, so the replayed steps skip it.
@@ -47,12 +59,23 @@ class AuKCUDAGraphWrapper:
     _TARGET_ALIGNMENT = 32
     _TEXT_ALIGNMENT = 32
     _REF_ALIGNMENT = 50
+    _BATCH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128)
+
+    @classmethod
+    def _batch_bucket(cls, batch_size: int) -> int:
+        """Find the smallest batch ladder step >= batch_size."""
+        for b in cls._BATCH_LADDER:
+            if batch_size <= b:
+                return b
+        return batch_size
 
     def __init__(self, dit: AuKTransformer, *, enabled: bool = True, max_graphs: int = 32) -> None:
         self.dit = dit
         self.enabled = bool(enabled)
         self.max_graphs = max(1, int(max_graphs))
         self._cache: OrderedDict[tuple, _GraphEntry] = OrderedDict()
+        self._loop_cache: OrderedDict[tuple, _LoopGraphEntry] = OrderedDict()
+        self._uncapturable_loop_keys: set[tuple] = set()
         self._pool_handle: int | None = None
         # Key whose static context holds the current request, and the context
         # the eager fallback reuses across the steps of one request.
@@ -68,11 +91,13 @@ class AuKCUDAGraphWrapper:
         c_mask: torch.Tensor,
         ref: torch.Tensor,
         ref_mask: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target_bucket = round_up(x.shape[1], cls._TARGET_ALIGNMENT)
         text_bucket = round_up(text.shape[1], cls._TEXT_ALIGNMENT)
         ref_bucket = round_up(ref.shape[1], cls._REF_ALIGNMENT)
-        x_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+        if x_mask is None:
+            x_mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
         return (
             F.pad(x, (0, 0, 0, target_bucket - x.shape[1])),
             F.pad(x_mask, (0, target_bucket - x_mask.shape[1]), value=False),
@@ -89,13 +114,14 @@ class AuKCUDAGraphWrapper:
         ref: torch.Tensor,
         uses_cfg: bool,
         steps: int = 0,
-    ) -> tuple[int, int, int, bool, int]:
-        return (x.shape[1], text.shape[1], ref.shape[1], uses_cfg, steps)
+    ) -> tuple[int, int, int, int, bool, int]:
+        return (x.shape[0], x.shape[1], text.shape[1], ref.shape[1], uses_cfg, steps)
 
     def _retire_graph_generation_if_full(self) -> None:
         """Retire all graphs together so none outlive shared workspaces."""
-        if len(self._cache) >= self.max_graphs:
+        if len(self._cache) + len(self._loop_cache) >= self.max_graphs:
             self._cache.clear()
+            self._loop_cache.clear()
             self._active_key = None
 
     def _prepare(
@@ -140,6 +166,7 @@ class AuKCUDAGraphWrapper:
         self,
         *,
         x: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
         text: torch.Tensor,
         c_mask: torch.Tensor,
         ref: torch.Tensor,
@@ -166,11 +193,11 @@ class AuKCUDAGraphWrapper:
             timesteps, step_index = None, None
         if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
             if new_request or self._eager_ctx is None:
-                self._eager_ctx = self._prepare(x, None, text, c_mask, ref, ref_mask, uses_cfg, timesteps)
+                self._eager_ctx = self._prepare(x, x_mask, text, c_mask, ref, ref_mask, uses_cfg, timesteps)
             return self._step(x, timestep, self._eager_ctx, cfg_strength, step_index)
 
         target_frames = x.shape[1]
-        x, x_mask, text, c_mask, ref, ref_mask = self._bucket_inputs(x, text, c_mask, ref, ref_mask)
+        x, x_mask, text, c_mask, ref, ref_mask = self._bucket_inputs(x, text, c_mask, ref, ref_mask, x_mask)
         steps = 0 if timesteps is None else int(timesteps.numel())
         key = self._key(x, text, ref, uses_cfg, steps)
         entry = self._cache.get(key)
@@ -185,6 +212,7 @@ class AuKCUDAGraphWrapper:
                 entry = self._capture(x, ctx, timestep, cfg_strength=cfg_strength, step_index=step_index)
             except Exception:
                 self._cache.clear()
+                self._loop_cache.clear()
                 self._active_key = None
                 self.enabled = False
                 logger.exception(
@@ -240,7 +268,9 @@ class AuKCUDAGraphWrapper:
             static_out = self._step(static_x, static_timestep, static_ctx, scale, static_step)
 
         logger.info(
-            "Captured AuK DiT single-step CUDA graph: target_frames=%d text_tokens=%d ref_frames=%d cfg=%s",
+            "Captured AuK DiT single-step CUDA graph: batch_size=%d "
+            "target_frames=%d text_tokens=%d ref_frames=%d cfg=%s",
+            x.shape[0],
             x.shape[1],
             ctx.c.shape[1],
             0 if ctx.prompt is None else ctx.prompt.shape[1],
@@ -254,6 +284,252 @@ class AuKCUDAGraphWrapper:
             static_cfg=static_cfg,
             static_step=static_step,
             static_out=static_out,
+        )
+
+    def _run_eager_loop(
+        self,
+        *,
+        x: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
+        text: torch.Tensor,
+        c_mask: torch.Tensor,
+        ref: torch.Tensor,
+        ref_mask: torch.Tensor,
+        timesteps: torch.Tensor,
+        cfg_strength: float,
+    ) -> torch.Tensor:
+        """Run the multi-step Euler denoising loop eagerly without capturing CUDA graphs."""
+        n_steps = int(timesteps.numel()) - 1
+        if n_steps <= 0:
+            return x
+        uses_cfg = cfg_strength >= 1e-5
+        ctx = self._prepare(x, x_mask, text, c_mask, ref, ref_mask, uses_cfg, timesteps[:-1])
+        for i in range(n_steps):
+            vel = self._step(x, timesteps[i], ctx, cfg_strength, i)
+            dt = (timesteps[i + 1] - timesteps[i]).to(x.device, x.dtype)
+            x = x + dt * vel
+        return x
+
+    @torch.no_grad()
+    def sample_loop(
+        self,
+        *,
+        x: torch.Tensor,
+        x_mask: torch.Tensor | None = None,
+        text: torch.Tensor,
+        c_mask: torch.Tensor,
+        ref: torch.Tensor,
+        ref_mask: torch.Tensor,
+        timesteps: torch.Tensor,
+        cfg_strength: float,
+    ) -> torch.Tensor:
+        """Sample latents over the full Euler time grid inside a single CUDA graph."""
+        n_steps = int(timesteps.numel()) - 1
+        uses_cfg = cfg_strength >= 1e-5
+        if not self.enabled or x.device.type != "cuda" or torch.cuda.is_current_stream_capturing() or n_steps <= 0:
+            return self._run_eager_loop(
+                x=x,
+                x_mask=x_mask,
+                text=text,
+                c_mask=c_mask,
+                ref=ref,
+                ref_mask=ref_mask,
+                timesteps=timesteps,
+                cfg_strength=cfg_strength,
+            )
+
+        target_frames = x.shape[1]
+        orig_batch = x.shape[0]
+        x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._bucket_inputs(
+            x, text, c_mask, ref, ref_mask, x_mask
+        )
+        batch_bucket = self._batch_bucket(x_buck.shape[0])
+        key = (batch_bucket, x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps)
+        if key in self._uncapturable_loop_keys:
+            return self._run_eager_loop(
+                x=x,
+                x_mask=x_mask,
+                text=text,
+                c_mask=c_mask,
+                ref=ref,
+                ref_mask=ref_mask,
+                timesteps=timesteps,
+                cfg_strength=cfg_strength,
+            )
+        entry = self._loop_cache.get(key)
+        hit_key = key if entry is not None else None
+        if entry is None:
+            hit_key, entry = self._larger_loop_entry(
+                batch_bucket, x_buck.shape[1], text_buck.shape[1], ref_buck.shape[1], uses_cfg, n_steps
+            )
+        if entry is None:
+            self._retire_graph_generation_if_full()
+            if batch_bucket > x_buck.shape[0]:
+                x_buck = self._pad_batch_time(x_buck, batch_bucket, x_buck.shape[1])
+                x_mask = self._pad_batch_time(x_mask, batch_bucket, x_mask.shape[1], mask=True)
+                text_buck = self._pad_batch_time(text_buck, batch_bucket, text_buck.shape[1])
+                c_mask_buck = self._pad_batch_time(c_mask_buck, batch_bucket, c_mask_buck.shape[1], mask=True)
+                ref_buck = self._pad_batch_time(ref_buck, batch_bucket, ref_buck.shape[1])
+                ref_mask_buck = self._pad_batch_time(ref_mask_buck, batch_bucket, ref_mask_buck.shape[1], mask=True)
+            ctx = self._prepare(
+                x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck, uses_cfg, timesteps[:-1]
+            )
+            try:
+                entry = self._capture_loop(
+                    x_buck,
+                    ctx,
+                    timesteps=timesteps,
+                    cfg_strength=cfg_strength,
+                )
+                self._loop_cache[key] = entry
+            except Exception:
+                logger.warning(
+                    "AuK DiT multi-step CUDA graph capture failed for key=%s; falling back to eager loop.",
+                    key,
+                    exc_info=True,
+                )
+                self._uncapturable_loop_keys.add(key)
+                return self._run_eager_loop(
+                    x=x,
+                    text=text,
+                    c_mask=c_mask,
+                    ref=ref,
+                    ref_mask=ref_mask,
+                    timesteps=timesteps,
+                    cfg_strength=cfg_strength,
+                )
+        else:
+            assert hit_key is not None
+            self._loop_cache.move_to_end(hit_key)
+            x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._fit_loop_inputs(
+                entry, x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck
+            )
+            ctx = self._prepare(
+                x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck, uses_cfg, timesteps[:-1]
+            )
+            entry.static_ctx.copy_(ctx)
+
+        entry.static_x_in.copy_(x_buck)
+        if entry.static_cfg is not None:
+            entry.static_cfg.fill_(cfg_strength)
+        entry.static_timesteps.copy_(timesteps.float())
+        entry.static_dts.copy_(torch.diff(timesteps.float()))
+        entry.graph.replay()
+        # The graph owns this buffer and overwrites it on the next replay.
+        return entry.static_x_out[:orig_batch, :target_frames].clone()
+
+    def _larger_loop_entry(
+        self,
+        batch: int,
+        frames: int,
+        text: int,
+        ref: int,
+        uses_cfg: bool,
+        n_steps: int,
+    ) -> tuple[tuple | None, _LoopGraphEntry | None]:
+        """Reuse a nearby batch graph with the same sequence buckets.
+
+        A 127-request wave pads into the B=128 serving graph instead of capturing
+        on the first packet. Batch padding is limited to twice the requested size.
+        """
+        best: tuple[int, tuple, _LoopGraphEntry] | None = None
+        for cache_key, entry in self._loop_cache.items():
+            cached_b, cached_f, cached_t, cached_r, cfg, steps = cache_key
+            if (cached_f, cached_t, cached_r, cfg, steps) != (frames, text, ref, uses_cfg, n_steps):
+                continue
+            if not batch <= cached_b <= batch * 2:
+                continue
+            if best is None or cached_b < best[0]:
+                best = (cached_b, cache_key, entry)
+        return (None, None) if best is None else (best[1], best[2])
+
+    @staticmethod
+    def _pad_batch_time(tensor: torch.Tensor, batch: int, seq: int, *, mask: bool = False) -> torch.Tensor:
+        """Right-pad a ``[B, T, ...]`` (or ``[B, T]`` mask) to ``(batch, seq)``."""
+        pad_b = batch - tensor.shape[0]
+        pad_t = seq - tensor.shape[1]
+        if pad_b == 0 and pad_t == 0:
+            return tensor
+        if tensor.ndim == 3:
+            return F.pad(tensor, (0, 0, 0, pad_t, 0, pad_b))
+        return F.pad(tensor, (0, pad_t, 0, pad_b), value=False if mask else 0)
+
+    def _fit_loop_inputs(
+        self,
+        entry: _LoopGraphEntry,
+        x: torch.Tensor,
+        x_mask: torch.Tensor,
+        text: torch.Tensor,
+        c_mask: torch.Tensor,
+        ref: torch.Tensor,
+        ref_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pad bucketed inputs to the static buffers of a larger warmed loop graph."""
+        graph_b, graph_frames = int(entry.static_x_in.shape[0]), int(entry.static_x_in.shape[1])
+        graph_text = int(entry.static_ctx.c.shape[1])
+        graph_ref = 0 if entry.static_ctx.prompt is None else int(entry.static_ctx.prompt.shape[1])
+        return (
+            self._pad_batch_time(x, graph_b, graph_frames),
+            self._pad_batch_time(x_mask, graph_b, graph_frames, mask=True),
+            self._pad_batch_time(text, graph_b, graph_text),
+            self._pad_batch_time(c_mask, graph_b, graph_text, mask=True),
+            self._pad_batch_time(ref, graph_b, graph_ref),
+            self._pad_batch_time(ref_mask, graph_b, graph_ref, mask=True),
+        )
+
+    def _capture_loop(
+        self,
+        x: torch.Tensor,
+        ctx: AuKStepContext,
+        *,
+        timesteps: torch.Tensor,
+        cfg_strength: float,
+    ) -> _LoopGraphEntry:
+        static_x_in = x.clone()
+        static_ctx = ctx.clone()
+        static_cfg = None
+        if ctx.branches == 2:
+            static_cfg = torch.empty((), device=x.device, dtype=torch.float32)
+            static_cfg.fill_(cfg_strength)
+        scale = static_cfg if static_cfg is not None else cfg_strength
+
+        n_steps = int(timesteps.numel()) - 1
+        static_timesteps = timesteps.clone().float()
+        static_dts = torch.diff(static_timesteps).float()
+
+        def run_loop(cur_x: torch.Tensor) -> torch.Tensor:
+            for i in range(n_steps):
+                vel = self._step(cur_x, static_timesteps[i], static_ctx, scale, step_index=i)
+                cur_x = cur_x + static_dts[i] * vel
+            return cur_x
+
+        for _ in range(3):
+            run_loop(static_x_in)
+
+        if self._pool_handle is None:
+            self._pool_handle = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._pool_handle):
+            static_x_out = run_loop(static_x_in)
+
+        logger.info(
+            "Captured AuK DiT multi-step (%d steps) CUDA graph: "
+            "batch_size=%d target_frames=%d text_tokens=%d ref_frames=%d cfg=%s",
+            n_steps,
+            x.shape[0],
+            x.shape[1],
+            ctx.c.shape[1],
+            0 if ctx.prompt is None else ctx.prompt.shape[1],
+            cfg_strength,
+        )
+        return _LoopGraphEntry(
+            graph=graph,
+            static_x_in=static_x_in,
+            static_ctx=static_ctx,
+            static_cfg=static_cfg,
+            static_x_out=static_x_out,
+            static_dts=static_dts,
+            static_timesteps=static_timesteps,
         )
 
 
