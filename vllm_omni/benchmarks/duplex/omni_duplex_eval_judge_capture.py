@@ -17,8 +17,11 @@ from threading import Lock
 from typing import Any
 from uuid import uuid4
 
+import pybase64 as base64
+
 logger = logging.getLogger(__name__)
 _MAX_REQUEST_BYTES = 8 * 1024 * 1024
+_MAX_RESPONSE_BYTES = 64 * 1024
 _MAX_CAPTURE_BYTES = 16 * 1024 * 1024  # Per split's owned judge_requests directory.
 _MAX_FRAME_BYTES = 1024 * 1024
 _MAX_FRAMES = 64
@@ -29,6 +32,9 @@ _CAPTURE_LOCK = Lock()
 class JudgeRequestCapture:
     payload: dict[str, Any] | None = None
     calls: int = 0
+    response_status: int | None = None
+    response_body: bytes | None = None
+    response_calls: int = 0
 
 
 _CURRENT_CAPTURE: ContextVar[JudgeRequestCapture | None] = ContextVar("duplex_judge_request_capture", default=None)
@@ -51,6 +57,33 @@ def record_judge_request(payload: dict[str, Any]) -> None:
         # Keep a reference until parsing finishes; successes never serialize it.
         if captured.calls == 1:
             captured.payload = payload
+
+
+def record_judge_response(status: int, body: bytes) -> None:
+    if (captured := _CURRENT_CAPTURE.get()) is not None:
+        captured.response_calls += 1
+        if captured.calls == 1 and captured.response_calls == 1:
+            # Keep the already-buffered bytes, without another HTTP read or
+            # JSON parse. Successful calls never serialize this reference.
+            captured.response_status = status
+            captured.response_body = body
+
+
+def _failed_response(captured: JudgeRequestCapture) -> dict[str, Any]:
+    result: dict[str, Any] = {"capture_status": "unavailable"}
+    if captured.calls != 1 or captured.response_calls != 1 or captured.response_body is None:
+        return result
+    body = captured.response_body
+    result.update(
+        status_code=captured.response_status,
+        body_bytes=len(body),
+        body_sha256=hashlib.sha256(body).hexdigest(),
+    )
+    if len(body) > _MAX_RESPONSE_BYTES:
+        result["capture_status"] = "response_byte_limit"
+    else:
+        result.update(capture_status="captured", body_base64=base64.b64encode(body).decode("ascii"))
+    return result
 
 
 def _json_bytes(value: object) -> bytes:
@@ -79,6 +112,7 @@ def save_failed_judge_request(captured: JudgeRequestCapture, trace_path: Path, c
             "call_index": call_index,
             "capture_status": "unavailable",
             "replayable": False,
+            "http_response": _failed_response(captured),
         }
         files: dict[str, bytes] = {}
         if captured.calls == 1 and captured.payload is not None:

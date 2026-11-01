@@ -11,7 +11,7 @@ from typing import Any
 import pybase64 as base64
 import requests
 
-from .omni_duplex_eval_judge_capture import record_judge_request
+from .omni_duplex_eval_judge_capture import record_judge_request, record_judge_response
 
 
 class JudgeResponseError(ValueError):
@@ -53,6 +53,9 @@ class DuplexJudge:
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             timeout=self.timeout,
         )
+        # requests.post buffers the body by default; retain that owned body
+        # only if this call later fails HTTP, completion, or score parsing.
+        record_judge_response(response.status_code, response.content)
         if not response.ok:
             raise requests.HTTPError(
                 f"{response.status_code} response from judge: {response.text[:500]}", response=response
