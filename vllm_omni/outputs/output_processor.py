@@ -88,7 +88,7 @@ def _accumulate_segment_tpot(record: dict[str, object], *, elapsed_ms: float, ne
     record["vllm_tpot_ms"] = total_elapsed_ms / float(total_intervals)
 
 
-def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
+def _native_phase_metrics(stats: RequestStateStats, input_ready_ts: float = 0.0) -> dict[str, float | int]:
     """Return the observed queue/prefill/decode split of a finished request.
 
     The intervals match vLLM's ``FinishedRequestStats`` (queued_time,
@@ -96,12 +96,20 @@ def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
     engine-core event never arrived; subtracting it would invent a duration,
     so such intervals, and any that would be negative, are omitted instead
     of reported as 0.
+
+    ``input_ready_ts`` (engine-core clock, 0.0 when not observed) splits the
+    queued interval into input wait and ready-queued time. It is used only
+    when it falls inside that interval: a time from an earlier streaming
+    segment, or one stamped after the first scheduling, splits nothing.
     """
     metrics: dict[str, float | int] = {}
     queued_ts, scheduled_ts = stats.queued_ts, stats.scheduled_ts
     first_ts, last_ts = stats.first_token_ts, stats.last_token_ts
     if queued_ts > 0 and scheduled_ts >= queued_ts:
         metrics[defs.VLLM_QUEUED_MS] = (scheduled_ts - queued_ts) * 1000.0
+    if queued_ts > 0 and queued_ts <= input_ready_ts <= scheduled_ts:
+        metrics[defs.VLLM_INPUT_WAIT_MS] = (input_ready_ts - queued_ts) * 1000.0
+        metrics[defs.VLLM_READY_QUEUED_MS] = (scheduled_ts - input_ready_ts) * 1000.0
     if scheduled_ts > 0 and first_ts >= scheduled_ts:
         metrics[defs.VLLM_PREFILL_MS] = (first_ts - scheduled_ts) * 1000.0
     if first_ts > 0 and last_ts >= first_ts:
@@ -137,6 +145,9 @@ class OmniRequestState(RequestState):
         super().__init__(*args, **kwargs)
         self.is_pooling_request = False
         self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
+        # Engine-core time at which the stage's input gate first saw this
+        # request's input ready; 0.0 until an output reports it.
+        self.native_input_ready_ts = 0.0
         # Omni-specific: multimodal output accumulation
         # TODO: mm_type is per-request, not per-key. If a model ever produces
         # both audio and latent outputs, the modality type would flip on each
@@ -148,6 +159,7 @@ class OmniRequestState(RequestState):
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
         self.native_text_stats = RequestStateStats(arrival_time=float(update.arrival_time or 0.0))
+        self.native_input_ready_ts = 0.0
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         """Accumulate a multimodal tensor payload into the request state.
@@ -878,6 +890,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         if iteration_stats is None or engine_core_timestamp is None or native_stats is None:
             return
 
+        input_ready_ts = getattr(engine_core_output, "input_ready_ts", None)
+        if input_ready_ts is not None:
+            req_state.native_input_ready_ts = float(input_ready_ts)
         is_coalesced = getattr(engine_core_output, "is_coalesced", False) is True
         num_itls_before = len(iteration_stats.inter_token_latencies_iter) if is_coalesced else 0
         iteration_stats.update_from_output(
@@ -942,7 +957,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_stats=native_stats,
             num_cached_tokens=req_state.num_cached_tokens,
         )
-        self._native_text_metric_record(req_state.external_req_id).update(_native_phase_metrics(native_stats))
+        self._native_text_metric_record(req_state.external_req_id).update(
+            _native_phase_metrics(native_stats, req_state.native_input_ready_ts)
+        )
         if not iteration_stats.finished_requests:
             return
 
