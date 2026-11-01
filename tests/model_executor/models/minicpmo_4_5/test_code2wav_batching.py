@@ -194,6 +194,23 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
 
 
 @pytest.mark.parametrize(
+    ("extra", "frames", "batches"),
+    [
+        ({}, [3, 33], [1, 2]),
+        ({"hift_graph_continuation_frames": [], "hift_graph_exact_batch_sizes": [1]}, [], [1]),
+        ({"hift_graph_continuation_frames": [4, 28], "hift_graph_exact_batch_sizes": [2]}, [4, 28], [2]),
+        ({"hift_graph_exact_batch_sizes": []}, [3, 33], []),
+    ],
+)
+def test_hift_exact_graph_defaults_and_overrides(extra, frames, batches):
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    assert model._connector_config["hift_graph_continuation_frames"] == frames
+    assert model._connector_config["hift_graph_exact_batch_sizes"] == batches
+
+
+@pytest.mark.parametrize(
     ("cuda", "extra", "env", "expected"),
     [
         (True, {}, None, True),
@@ -1294,9 +1311,21 @@ def test_fade_in_out_limits_overlap_to_available_previous_audio():
 
     actual = BatchedToken2Wav._fade_in_out(speech, previous, window)
 
-    expected = speech.clone()
-    expected[..., :3] = speech[..., :3] * window[:3] + previous * window[-3:]
+    expected = torch.arange(6, dtype=torch.float32).reshape(1, -1)
+    expected[..., :3] = expected[..., :3] * window[:3] + previous * window[-3:]
     torch.testing.assert_close(actual, expected)
+    assert actual.data_ptr() == speech.data_ptr()
+
+
+def test_fade_in_out_without_previous_audio_preserves_input_storage():
+    speech = torch.arange(6, dtype=torch.float32).reshape(1, -1)
+    previous = torch.empty((1, 0), dtype=torch.float32)
+    window = torch.hamming_window(8, periodic=False)
+
+    actual = BatchedToken2Wav._fade_in_out(speech, previous, window)
+
+    torch.testing.assert_close(actual, speech)
+    assert actual.data_ptr() == speech.data_ptr()
 
 
 def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
