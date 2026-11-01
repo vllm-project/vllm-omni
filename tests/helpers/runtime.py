@@ -557,6 +557,15 @@ class OmniServerStageCli(OmniServer):
                 raise RuntimeError(f"Stage {stage_id} exited with code {ret} before API server became ready.{tail}")
 
     def _start_server(self) -> None:
+        self._reserve_port()
+        # bind(0)/close can return the same port twice. The registration
+        # listener would then satisfy the TCP readiness probe and receive HTTP.
+        for _ in range(128):
+            if self.master_port != self.port:
+                break
+            self.master_port = get_open_port(self.host)
+        if self.master_port == self.port:
+            raise RuntimeError("Could not allocate distinct HTTP and stage registration ports after 128 attempts")
         startup_t0 = time.perf_counter()
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
 
@@ -635,6 +644,15 @@ class OmniServerStageCli(OmniServer):
             print(f"=== end stage {stage_id} log ===\n", flush=True)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self._stop_stages()
+        finally:
+            if self._port_lock is not None:
+                self._port_lock.release()
+                self._port_lock = None
+            cleanup_test_environment()
+
+    def _stop_stages(self) -> None:
         self._dump_stage_logs_for_debug()
         for stage_id in sorted(self.stage_procs, reverse=True):
             proc = self.stage_procs[stage_id]
@@ -662,8 +680,6 @@ class OmniServerStageCli(OmniServer):
         self._stage_log_files = {}
         if not keep_logs:
             self._stage_log_paths = {}
-
-        cleanup_test_environment()
 
 
 _PR_SET_CHILD_SUBREAPER = 36
