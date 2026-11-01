@@ -17,10 +17,13 @@
 - [Cell schedule](#cell-schedule)
 - [Cell executor](#cell-executor)
 - [NoisyKV](#noisykv)
+    - [Lifecycle contract](#lifecycle-contract)
+    - [Session integration (P1 target contract)](#session-integration-p1-target-contract)
 - [Configuration](#configuration)
 - [Compatibility](#compatibility)
 - [Testing](#testing)
 - [Open issues](#open-issues)
+- [Acceptance cases (P1: CausVid, CPU-first)](#acceptance-cases-p1-causvid-cpu-first)
 - [Related](#related)
 
 ## Overview
@@ -213,6 +216,50 @@ implementation, expressed on the operations rather than on the data layout:
 Per-tick KV traffic ≈ history depth × one block × tokens × heads × dim per
 remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`.
 
+### Session integration (P1 target contract)
+
+> Status: target contract for the P1 integration. Not implemented yet; the
+> current cell path is request-scoped and releases everything it produced.
+
+**Ownership.** A session owns the history that later requests must continue from.
+A request owns the versions it produces for its own plan plus any temporary
+scratch. Both live in the same `VersionPool`; ownership decides what survives
+request termination, not where the bytes sit.
+
+**Chunk numbering.** A request admitted into a session with committed history
+starts at `chunk_offset = committed_chunks`. Cell coordinates stay
+request-local, while the session records absolute chunk positions, so
+`chunk_history_chunks` never reaches back into chunks the session already owns.
+
+**Retention set.** The versions a session keeps after a request are exactly
+those a later request can be planned to read:
+
+| Kept | Dropped at request end |
+| --- | --- |
+| The last committed clean (or Same-Step step) version per block, per retained chunk | Versions whose `last_use` fell inside this request |
+| Up to `H` most recent retained chunks plus any sink chunk | In-flight receive buffers and staging |
+| Model-declared state the pipeline commits (conditioning, latent, decoder) | Per-request scratch slots |
+
+Retention is bounded by the same `H` / sink policy the plan already uses, so a
+session can never keep more history than a single request could consume.
+
+**State machine.** `ACTIVE` admits requests. A successful request commits its
+retention set and returns to `ACTIVE`. `reset` discards the retention set and
+returns to `ACTIVE` with `chunk_offset = 0`. `close` moves to `CLOSING`, waits
+for compute and transfers belonging to the session to finish, releases slots and
+model-owned state, then `CLOSED`. Cleanup failure leaves `CLEANUP_FAILED` and
+rejects reset, matching the realtime session tombstone.
+
+**Failure policy.** A failed request, an asynchronous device error, or a broken
+transport leaves the retention set in an unknown state, so the session becomes
+`INVALID`: further requests are rejected until an explicit reset. Late results
+from the failed request are fenced by the request identity and must not update
+session state.
+
+**Completion boundary.** A version may enter the retention set only after its
+producer's completion is established under the transport contract above; a
+returned `forward` is not sufficient evidence.
+
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
@@ -283,10 +330,34 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 ## Open issues
 
 - Paged session vs NoisyKV still separate prealloc; no TP × Noisy KV yet.
-- Noisy KV not wired to session.
+- Noisy KV not wired to session; the P1 contract above is the target.
 - Micro-batch packing (`R`): varlen vs pad.
 - Cell schedule with `K>1` multiplies ticks; activation inbox is keyed by
   `(chunk, step)` (R=1 friendly).
+
+## Acceptance cases (P1: CausVid, CPU-first)
+
+Every case records model, checkpoint, `S`/`G`/`D`/`H`, latent shape, dtype, seed,
+revision and command. Structure and lifecycle cases run on CPU; output quality is
+compared frame-wise against the recorded baseline, and a case fails on a
+regression beyond 2% in chunk cadence, interaction latency or peak memory.
+
+| Case | Level | Passes when |
+| --- | --- | --- |
+| `test_cell_executor`, `test_noisy_kv*`, `test_cell_schedule` | CPU | unchanged green |
+| Request-scoped failure release | CPU | a failed request frees only its own versions |
+| Session: two consecutive requests | CPU | the second starts at `chunk_offset = committed_chunks` |
+| Session: two interleaved sessions | CPU | versions and chunk numbering stay isolated |
+| Session: reset mid-sequence | CPU | no read of pre-reset history; offset returns to 0 |
+| Session: close then request | CPU | rejected, no silent recreation |
+| Session: failed request | CPU | session `INVALID`; further requests rejected until reset |
+| Cancel between pieces | CPU | owned versions released; unrelated resident requests intact |
+| Self-Forcing `S=1` smoke | 2 GPU | finite latents, chunk count and order correct |
+| Latest-KV `S=D+1` smoke | 4 GPU | same, plus a cross-rank history read |
+| Baseline parity | GPU | frame-wise match; no metric beyond the 2% budget |
+
+GPU rows stay recorded as unvalidated until a slot is available. A CPU pass must
+not be reported as distributed-execution or output-quality evidence.
 
 ## Related
 
