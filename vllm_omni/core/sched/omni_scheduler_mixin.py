@@ -1041,8 +1041,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 )
 
     def _queue_holds_request(self, queue: Any, request: Request) -> bool:
-        """Identity membership that does not follow a MagicMock iterator."""
-        if queue is None or type(queue).__module__.startswith("unittest.mock"):
+        """Check whether a waiting collection holds this request object."""
+        if queue is None:
             return False
         try:
             return any(existing is request for existing in queue)
