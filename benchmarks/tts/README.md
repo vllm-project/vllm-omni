@@ -104,6 +104,40 @@ Without it, a 44.1 kHz model reports `audio_duration` 1.84x too long, so
 A quick sanity check: compare `Mean AUDIO_DURATION (s)` against the actual
 length of a saved WAV for the same prompt.
 
+#### Soprano fixed English voice (32 kHz)
+
+Soprano supports only `default_voice`. Start it with the explicit
+`vllm_omni/deploy/soprano_streaming.yaml` deployment; it uses eager FP32
+execution. No Qwen3-TTS `task_type` or reference-audio fields are needed.
+
+```bash
+export VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=32000
+python benchmarks/tts/bench_tts.py \
+    --model ekwek/Soprano-1.1-80M --served-model-name soprano \
+    --task default_voice --locale en \
+    --dataset-path benchmarks/build_dataset/seed_tts_smoke \
+    --concurrency 1 --num-prompts 20 --num-warmups 3 \
+    --request-seed 44 --output-len 512 --metric-percentiles 50,95 \
+    --output-dir ./results/soprano \
+    -- --tokenizer /path/to/Soprano-1.1-80M --seed 0 --save-detailed
+```
+
+The benchmark prefers the server's `X-Audio-Sample-Rate` and
+`X-Audio-Channels` headers; the environment setting is the raw-PCM fallback,
+not a resampling request. At 32 kHz mono, 64000 PCM16 bytes are one second.
+Verify this against saved audio before comparing duration-derived metrics.
+Soprano's Speech API accepts one synthesis unit per request. Split a longer
+source using its documented preprocessing and retain the source/unit mapping
+instead of truncating text to fit.
+
+Run at least three warmed, interleaved baseline/candidate rounds with fixed
+inputs, sampling and power conditions. Save audio during collection and run
+ASR/quality models after stopping the serving processes so scoring does not
+compete for GPU memory. Report WER and human listening separately; speaker
+SIM is not a primary acceptance metric for this fixed-voice task. With a small
+corpus, prefer p50/p95 and retain failures and duration differences alongside
+latency results.
+
 #### Streaming continuity (`audio_underrun`)
 
 `audio_underrun` (seconds) is the per-request worst-case buffer deficit

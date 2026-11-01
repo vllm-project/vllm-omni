@@ -7,6 +7,18 @@
 # is tracked here.
 
 models:
+  # Fixed English voice, 32 kHz mono. For raw PCM without format headers:
+  # export VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE=32000
+  # Soprano requires an explicit soprano_streaming.yaml deploy on the server.
+  ekwek/Soprano-1.1-80M:
+    supported_tasks: [default_voice]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    trust_remote_code: false
+    task_extra_body:
+      default_voice:
+        voice: default
+
   tencent/AuK: &auk
     supported_tasks: [default_voice, voice_clone]
     backend: openai-audio-speech

@@ -54,6 +54,43 @@ def test_load_model_configs(model_configs_path: Path) -> None:
     assert configs["test/ModelA"]["supported_tasks"] == ["voice_clone", "default_voice"]
 
 
+def test_soprano_default_voice_has_no_clone_or_qwen_task_fields() -> None:
+    config = bench_tts.load_model_configs(bench_tts._DEFAULT_MODEL_CONFIGS)["ekwek/Soprano-1.1-80M"]
+    assert config["supported_tasks"] == ["default_voice"]
+    assert config["trust_remote_code"] is False
+    cmd = bench_tts.build_bench_args(
+        host="localhost",
+        port=8000,
+        model="ekwek/Soprano-1.1-80M",
+        served_model_name="soprano",
+        task="default_voice",
+        model_cfg=config,
+        locale="en",
+        num_prompts=20,
+        concurrency=1,
+        dataset_path="/data/english",
+        wer_eval=False,
+        output_dir=None,
+        result_filename=None,
+        extra_cli_args=[],
+        output_len=512,
+        request_seed=44,
+        metric_percentiles="50,95",
+    )
+    assert cmd[cmd.index("--dataset-name") + 1] == "seed-tts-text"
+    assert cmd[cmd.index("--endpoint") + 1] == "/v1/audio/speech"
+    assert json.loads(cmd[cmd.index("--extra-body") + 1]) == {"voice": "default", "seed": 44}
+    assert "--seed-tts-wer-eval" not in cmd
+
+
+def test_soprano_benchmark_rejects_voice_cloning(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["bench_tts.py", "--model", "ekwek/Soprano-1.1-80M", "--task", "voice_clone"])
+    with pytest.raises(SystemExit) as exc:
+        bench_tts.main()
+    assert exc.value.code == 1
+    assert "not supported" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("model", ["tencent/AuK", "tencent/AuK-Flash"])
 @pytest.mark.parametrize("task", ["default_voice", "voice_clone"])
 def test_auk_benchmark_duration_and_local_bundle(model, task):
