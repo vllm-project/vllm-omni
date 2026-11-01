@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import janus
 import torch
+from opentelemetry.trace import Tracer
 from vllm.config import ModelConfig
 from vllm.exceptions import VLLMClientError
 from vllm.logger import init_logger
@@ -87,6 +88,7 @@ from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
 from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
+from vllm_omni.tracing import RequestTrace
 
 if TYPE_CHECKING:
     from vllm_omni.engine import OmniEngineCoreOutput
@@ -326,6 +328,7 @@ class OrchestratorRequestState:
     upstream_first_audio: bool = False
     pending_upstream_first_audio: tuple[int, OmniEngineCoreOutput] | None = None
     pending_first_audio_outputs: list[tuple[int, int, Any]] = field(default_factory=list)
+    trace: RequestTrace | None = None
 
 
 @dataclass
@@ -393,6 +396,7 @@ class OrchestratorBase:
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
     collect_stage_metrics: bool = True
+    tracer: Tracer | None = None
 
     def __init__(
         self,
@@ -411,7 +415,9 @@ class OrchestratorBase:
         log_stats: bool = False,
         collect_stage_metrics: bool = True,
         enable_orch_monitor: bool = False,
+        tracer: Tracer | None = None,
     ) -> None:
+        self.tracer = tracer
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
         self.rpc_async_queue = rpc_async_queue
@@ -551,7 +557,7 @@ class OrchestratorBase:
         if self._membership is not None:
 
             async def cleanup_member_requests(ids: list[str]) -> None:
-                await self._cleanup_request_ids(ids, abort=True)
+                await self._cleanup_request_ids(ids, abort=True, trace_error="replica_removed")
 
             self._membership.install_membership_handlers(
                 output_queue=self.output_async_queue,
@@ -597,6 +603,11 @@ class OrchestratorBase:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
+            for state in self.request_states.values():
+                if state.trace is not None:
+                    state.trace.fail("engine_shutdown")
+                    state.trace.end("error")
+                    state.trace = None
             await self._shutdown_extensions()
 
             if self._membership is not None:
@@ -1632,6 +1643,7 @@ class OrchestratorBase:
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
             release_owners=True,
+            trace_error=getattr(output, "error_type", None) or "stage_error",
         )
 
     def _update_stage_replica_waiting(self, stage_id: int, replica_id: int, n_waiting: int) -> None:
@@ -1733,6 +1745,7 @@ class OrchestratorBase:
                 # frontend request_states entry to land in. No-op for
                 # turn-based requests, which have no owner.
                 release_owners=True,
+                trace_error="engine_dead",
             )
 
     async def _fail_request_dead_stage(self, req_id: str, stage_id: int) -> None:
@@ -1761,6 +1774,7 @@ class OrchestratorBase:
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
             release_owners=True,
+            trace_error="engine_dead",
         )
 
     async def _fail_request_client_error(
@@ -1792,6 +1806,7 @@ class OrchestratorBase:
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
             release_owners=release_owners,
+            trace_error=error_type or DEFAULT_CLIENT_ERROR_TYPE,
         )
 
     async def _dispatch_or_fail_request(
@@ -1936,6 +1951,7 @@ class OrchestratorBase:
         *,
         abort: bool = False,
         release_owners: bool = False,
+        trace_error: str | None = None,
     ) -> list[OutputMessage]:
         """Release pool bindings and logical request state for the given ids.
 
@@ -1953,7 +1969,6 @@ class OrchestratorBase:
             Final-stage AR abort ``OutputMessage`` list when ``abort=True``;
             otherwise an empty list.
         """
-        del release_owners
         if not request_ids:
             return []
 
@@ -1965,6 +1980,9 @@ class OrchestratorBase:
             if pid is not None and pid not in batch and not self._cfg_tracker.is_companion_done(rid):
                 orphaned_parents.setdefault(pid, rid)
         for pid, cid in orphaned_parents.items():
+            parent_state = self.request_states.get(pid)
+            if parent_state is not None and parent_state.trace is not None:
+                parent_state.trace.fail("cfg_companion_lost")
             deferred = self._cfg_tracker.pop_pending_parent(pid)
             await self.output_async_queue.put(
                 ErrorMessage(
@@ -1989,6 +2007,12 @@ class OrchestratorBase:
             self._pd_kv_params.pop(request_id, None)
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
+                if req_state.trace is not None:
+                    for name, duration in req_state.pipeline_timings.items():
+                        req_state.trace.span.set_attribute(f"omni.pipeline.{name}", duration)
+                    if trace_error is not None:
+                        req_state.trace.fail(trace_error)
+                    req_state.trace.end("cancelled" if abort else "success")
                 cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", set()))
             if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                 self._running_counter.decrement()
@@ -2101,6 +2125,8 @@ class OrchestratorBase:
             req_state = self.request_states.get(request_id)
             if req_state is None or req_state.session_owned:
                 continue
+            if req_state.trace is not None:
+                req_state.trace.finish_stage(stage_id)
 
             # A processed terminal output may have arrived before every submitted
             # stage reported completion. Keep that real output instead of replacing
@@ -2203,6 +2229,13 @@ class OrchestratorBase:
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
+        if req_state.trace is not None:
+            if stage_id not in req_state.trace.first_outputs and self.stage_pools[stage_id].has_non_empty_output(
+                output
+            ):
+                req_state.trace.output(stage_id)
+            if finished and not segment_finished:
+                req_state.trace.finish_stage(stage_id)
         # CFG companion: stash output so parent can bundle [parent, *companions]
         # into source_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
@@ -2891,6 +2924,7 @@ class OrchestratorBase:
                 await self._cleanup_request_ids(
                     [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
                     abort=True,
+                    trace_error="cfg_companion_missing",
                 )
                 return
             diffusion_source_outputs = [output, *companion_outputs]
@@ -2944,6 +2978,7 @@ class OrchestratorBase:
                     )
                     await self._cleanup_request_ids(
                         [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                        trace_error="empty_stage_input",
                     )
                     return
                 if isinstance(diffusion_prompt, list):
@@ -2970,6 +3005,7 @@ class OrchestratorBase:
                         )
                         await self._cleanup_request_ids(
                             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                            trace_error="empty_stage_input",
                         )
                         return
                     if len(diffusion_prompt) == 1:
@@ -3839,6 +3875,7 @@ class Orchestrator(OrchestratorBase):
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),
+            trace=RequestTrace(self.tracer, request_id, msg.trace_headers) if self.tracer is not None else None,
         )
         self.request_states[request_id] = req_state
         self._maybe_attach_native_kv_transfer_params(req_state, prompt)
@@ -3968,6 +4005,11 @@ class Orchestrator(OrchestratorBase):
             final_stage_id=0,
             final_output_stage_ids={0},
             request_timestamp=parent_state.request_timestamp,
+            trace=(
+                RequestTrace(self.tracer, companion_id, parent_state.trace.headers())
+                if self.tracer is not None and parent_state.trace is not None
+                else None
+            ),
         )
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()

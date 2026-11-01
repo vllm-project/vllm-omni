@@ -27,6 +27,7 @@ from openai.types.chat import (
 from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
 from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad, ServerVad
+from opentelemetry import context, trace
 from pydantic import TypeAdapter
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -59,6 +60,7 @@ from vllm_omni.entrypoints.openai.realtime.session import (
     _gen_id,
     merge_session_config,
 )
+from vllm_omni.tracing import SessionTrace, capture_trace_headers
 from vllm_omni.utils.audio import audio_chunk_sample_rate
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
 
@@ -131,12 +133,22 @@ class OpenAIFullDuplexConnection:
         self._response_task: asyncio.Task | None = None
         self._response_cancel_event = asyncio.Event()
         self._send_lock = asyncio.Lock()
+        self._session_trace: SessionTrace | None = None
 
     # ------------------------------------------------------------------ #
     #  Lifecycle                                                          #
     # ------------------------------------------------------------------ #
 
     async def handle_connection(self):
+        provider = getattr(getattr(self.engine, "engine", None), "tracer_provider", None)
+        token = None
+        outcome = "disconnect"
+        error_type = None
+        if provider is not None:
+            self._session_trace = SessionTrace(
+                provider.get_tracer("vllm_omni"), self.session.session_id, capture_trace_headers(self.ws.headers)
+            )
+            token = context.attach(self._session_trace.context)
         try:
             await self.ws.accept()
             logger.info("[realtime] connection opened, session_id=%s", self.session.session_id)
@@ -156,11 +168,21 @@ class OpenAIFullDuplexConnection:
                     )
                     continue
                 await self._dispatch_event(event)
-        except Exception:
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except Exception as exc:
+            outcome, error_type = "error", type(exc).__name__
             logger.exception("Unhandled error in realtime connection")
             await self._send_error("Internal server error", "server_error", error_type="server_error")
         finally:
-            await self._cleanup()
+            try:
+                await self._cleanup()
+            finally:
+                if self._session_trace is not None:
+                    self._session_trace.end(outcome, error_type)
+                if token is not None:
+                    context.detach(token)
 
     async def _cleanup(self):
         self._connected = False
@@ -825,10 +847,19 @@ class OpenAIFullDuplexConnection:
             return
 
         completed = False
+        token = None
+        outcome = "failed"
+        if self._session_trace is not None:
+            self._session_trace.start_turn(response_id)
+            token = context.attach(
+                trace.set_span_in_context(self._session_trace.turns[response_id], self._session_trace.context)
+            )
         try:
             await self._run_response_inner(response_id, response, s, active, engine_input)
             completed = True
+            outcome = "completed"
         except asyncio.CancelledError:
+            outcome = "cancelled"
             if self._response_cancel_event.is_set():
                 await self._finish_cancelled_response(s, response_id, response, active)
                 completed = True
@@ -837,9 +868,15 @@ class OpenAIFullDuplexConnection:
         except Exception:
             logger.exception("_run_response failed for %s", response_id)
         finally:
-            if not completed:
-                await self._fail_response(s, response_id, response, active.item_id)
-            s.active_response = None
+            try:
+                if not completed:
+                    await self._fail_response(s, response_id, response, active.item_id)
+                s.active_response = None
+            finally:
+                if self._session_trace is not None:
+                    self._session_trace.finish_turn(response_id, outcome)
+                if token is not None:
+                    context.detach(token)
 
     def _mark_terminal_response(self, response_id: str) -> bool:
         active = self.session.active_response
@@ -1990,6 +2027,8 @@ class OpenAIFullDuplexConnection:
             )
 
     async def _send_event(self, event) -> None:
+        if self._session_trace is not None and isinstance(event, types.ResponseDoneEvent):
+            self._session_trace.finish_turn(event.response.id, event.response.status)
         try:
             data = self._dump_model(event) if hasattr(event, "model_dump") else event
         except Exception:
