@@ -37,6 +37,9 @@ from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
+from .cuda_graph_wrapper import PrefillGraphWrapper
+from .kv_slot_pool import KVSlotPool, PrefillKVLease
+
 # -------------------- token/protocol constants --------------------
 
 
@@ -377,6 +380,19 @@ def chunk_ranges(frames: int, prefix_tokens: int, context: int = CONTEXT):
 
 
 @dataclass
+class ARKVSnapshot:
+    """Independent first-chunk storage; AR positions exclude the terminal END."""
+
+    keys: torch.Tensor
+    values: torch.Tensor
+    ready: torch.Event
+    lease: PrefillKVLease | None = None
+
+
+RunnerKVCopy = Callable[[str, Sequence[str], int, torch.Tensor, torch.Tensor], bool]
+
+
+@dataclass
 class Chunk:
     ar_tokens: list[int]
     noise: torch.Tensor
@@ -553,7 +569,7 @@ def fuse_nar_projections(layers: nn.ModuleList) -> list[tuple[torch.Tensor, ...]
 class CachedNAR:
     """One acoustic chunk: AR prefix K/V prefilled once, ODE walks the NAR path."""
 
-    def __init__(self, model, chunk: Chunk, pool: tuple[int, int] | None = None):
+    def __init__(self, model, chunk: Chunk, pool: tuple[int, int] | None = None, ar_kv: ARKVSnapshot | None = None):
         self.model = model
         self.chunk = chunk
         self.pool = pool
@@ -576,29 +592,65 @@ class CachedNAR:
         self.bounds_k = _sequence_bounds(self.ar_length + self.nar_length, self.device)
         self.graph: torch.cuda.CUDAGraph | None = None
         self.last_use: torch.cuda.Event | None = None
-        self._prefill()
+        self._prefill(ar_kv)
 
-    def _prefill(self):
+    def _prefill(self, ar_kv: ARKVSnapshot | None = None):
         model = self.model
         backbone = model.model
         config = model.config
         total = self.ar_length + self.nar_length
         shape = (len(backbone.layers), total, int(config.num_key_value_heads), int(config.head_dim))
-        self.keys = torch.empty(shape, dtype=self.dtype, device=self.device)
-        self.values = torch.empty(shape, dtype=self.dtype, device=self.device)
-        ids = torch.tensor(self.chunk.ar_tokens, dtype=torch.long).to(self.device, non_blocking=True)
-        cos, sin = model.rotary(torch.arange(self.ar_length, device=self.device)[None])
+        self._kv_lease: PrefillKVLease | None = None if ar_kv is None else ar_kv.lease
+        if self.device.type == "cuda" and (ar_kv is None or ar_kv.lease is not None):
+            wrapper = model.prefill_graph_wrapper()
+            if wrapper is not None:
+                pool = model.prefill_kv_pool()
+                lease = (None if pool is None else pool.acquire(total)) if ar_kv is None else ar_kv.lease
+                if lease is not None:
+                    self._kv_lease = lease
+                    if ar_kv is not None:
+                        torch.cuda.current_stream(self.device).wait_event(ar_kv.ready)
+                    start = 0 if ar_kv is None else self.ar_length - 1
+                    try:
+                        wrapper.prefill(lease, self.chunk.ar_tokens[start:], start)
+                    except (RuntimeError, ValueError):
+                        event = torch.Event()
+                        event.record()
+                        lease.release(event)
+                        raise
+                    self.keys, self.values = lease.views(total)
+                    return
+        start = 0
+        if ar_kv is None:
+            self.keys = torch.empty(shape, dtype=self.dtype, device=self.device)
+            self.values = torch.empty(shape, dtype=self.dtype, device=self.device)
+        else:
+            if tuple(ar_kv.keys.shape) != shape or tuple(ar_kv.values.shape) != shape:
+                raise ValueError("AR KV snapshot does not match the acoustic chunk")
+            torch.cuda.current_stream(self.device).wait_event(ar_kv.ready)
+            self.keys, self.values = ar_kv.keys, ar_kv.values
+            start = self.ar_length - 1  # Only MUSIC_END remains to be evaluated.
+        ids = torch.tensor(self.chunk.ar_tokens[start:], dtype=torch.long).to(self.device, non_blocking=True)
+        cos, sin = model.rotary(torch.arange(start, self.ar_length, device=self.device)[None])
         x = backbone.embed_tokens(ids)  # [T, H]
         last = len(backbone.layers) - 1
         for index, layer in enumerate(backbone.layers):
             # The layernorm is load-bearing: without it the cached AR K/V
             # conditioning is garbage and the ODE latents blow up (clipped audio).
             q, k, v = model.ar_project(layer, layer.input_layernorm(x), cos, sin)
-            self.keys[index, : self.ar_length] = k
-            self.values[index, : self.ar_length] = v
+            self.keys[index, start : self.ar_length] = k
+            self.values[index, start : self.ar_length] = v
             if index == last:
                 break  # the last layer's output feeds nothing
-            h = _flash_attention(self.fa3, q, k, v, causal=True)
+            # A single END query sees the complete copied prefix plus itself.
+            # SDPA's causal mask for unequal Q/K lengths is not suffix-aligned.
+            h = _flash_attention(
+                self.fa3,
+                q,
+                self.keys[index, : self.ar_length],
+                self.values[index, : self.ar_length],
+                causal=start == 0,
+            )
             x = x + _linear(layer.self_attn.o_proj, h.flatten(1))
             x = x + _linear(layer.mlp, layer.post_attention_layernorm(x))
 
@@ -696,6 +748,10 @@ class CachedNAR:
         return result
 
     def close(self):
+        lease = getattr(self, "_kv_lease", None)
+        if lease is not None:
+            lease.release()
+            self._kv_lease = None
         self.keys = self.values = self.graph = None
         self.cos = self.sin = self.pos_emb = None
         self.state_in = self.time_in = self.velocity_out = None
@@ -726,7 +782,13 @@ class _NARGraphPool:
 
 
 def synthesize_iter(
-    model, prefix: Sequence[int], codec: Sequence[int], seed: int, keep: list, graph_pool: _NARGraphPool | None = None
+    model,
+    prefix: Sequence[int],
+    codec: Sequence[int],
+    seed: int,
+    keep: list,
+    graph_pool: _NARGraphPool | None = None,
+    ar_kv: ARKVSnapshot | None = None,
 ) -> Iterator[None]:
     """``synthesize`` as a work generator (one unit per prefill or ODE
     evaluation); returns the in-flight device latents, unchecked. The solver
@@ -736,7 +798,8 @@ def synthesize_iter(
         # Graphs share allocator storage only on this serialized stream.
         # Their state and K/V are retired after each chunk, with no engine cache.
         pool = None if graph_pool is None else graph_pool.handle(next(model.vae2llm.parameters()).device)
-        engine = CachedNAR(model, chunk, pool)
+        engine = CachedNAR(model, chunk, pool, ar_kv=ar_kv)
+        ar_kv = None  # Later chunks have different codec history and positions.
         keep.append(engine)
         yield
         output.append((yield from engine.solve_iter(ODE_STEPS)))
@@ -1711,7 +1774,7 @@ class _SynthesisJob:
         self._released = False
         # Solver engines (captured graphs, K/V buffers), latents and audio:
         # they must outlive the queued kernels that use them.
-        self.keep: list[CachedNAR | torch.Tensor] = []
+        self.keep: list[CachedNAR | ARKVSnapshot | torch.Tensor] = []
         self.t_start: float | None = None
         self.t_done: float | None = None
 
@@ -1806,6 +1869,8 @@ class _SynthesisJob:
         for item in self.keep:
             if isinstance(item, CachedNAR):
                 item.close()
+            elif isinstance(item, ARKVSnapshot) and item.lease is not None:
+                item.lease.release(item.ready)
         self.keep.clear()
         self.stream = None
         self._released = True
@@ -2006,6 +2071,37 @@ class Yue2ForCausalLM(nn.Module):
 
     # ------------------------------------------------------------ sampling
 
+    def bind_runner_kv_copy(self, copy_kv: RunnerKVCopy) -> None:
+        """The runner owns block tables; the model owns snapshot storage."""
+        self._runner_kv_copy = copy_kv
+
+    def prefill_kv_pool(self) -> KVSlotPool | None:
+        """Snapshot storage is independent of graph creation and capture."""
+        if getattr(self, "_warming_up_synthesis", False) or not getattr(self.config, "yue2_prefill_graph", False):
+            return None
+        if not hasattr(self, "_prefill_kv_pool"):
+            weight = next(self.vae2llm.parameters())
+            self._prefill_kv_pool = KVSlotPool(
+                layers=len(self.model.layers),
+                kv_heads=int(self.config.num_key_value_heads),
+                head_dim=int(self.config.head_dim),
+                maximum=self.max_position_embeddings,
+                max_slots=max(1, self._sampler_capacity),
+                device=weight.device,
+                dtype=weight.dtype,
+            )
+        return self._prefill_kv_pool
+
+    def prefill_graph_wrapper(self) -> PrefillGraphWrapper | None:
+        """Keep prefill graphs across chunk engines; storage belongs to the KV pool."""
+        if getattr(self, "_warming_up_synthesis", False):
+            return None
+        if not getattr(self, "_prefill_graphs_initialized", False):
+            enabled = bool(getattr(self.config, "yue2_prefill_graph", False))
+            self._prefill_graphs = PrefillGraphWrapper.create(self) if enabled else None
+            self._prefill_graphs_initialized = True
+        return self._prefill_graphs
+
     def ar_project(self, layer, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         """AR-path Q/K/V from the vLLM backbone's fused projection."""
         attn = layer.self_attn
@@ -2076,10 +2172,12 @@ class Yue2ForCausalLM(nn.Module):
         # warm up in the serving-time state or the first song recompiles.
         self.eval()
         torch.set_default_dtype(torch.float32)
+        self._warming_up_synthesis = True
         try:
             latents = synthesize(self, [EOD, ABC_START, ABC_END, MUSIC_START], list(range(16)), DEFAULT_SEED, steps=1)
             self._decode_latents(latents)
         finally:
+            self._warming_up_synthesis = False
             torch.set_default_dtype(default_dtype)
             self.train(training)
         logger.info("YuE2 synthesis warm-up took %.1f s", time.perf_counter() - t0)
@@ -2539,20 +2637,81 @@ class Yue2ForCausalLM(nn.Module):
         return state.prompt_len + len(state.history) + state.hold_steps + 3 <= self._max_model_len
 
     def _song_iter(
-        self, prefix_ids: list[int], codec: list[int], seed: int, keep: list
+        self, prefix_ids: list[int], codec: list[int], seed: int, keep: list, ar_kv: ARKVSnapshot | None = None
     ) -> Generator[None, None, torch.Tensor]:
         """NAR + VAE for one song as work units; returns the device audio."""
-        latents = yield from synthesize_iter(self, prefix_ids, codec, seed, keep, self._synthesis.graph_pool)
+        work = synthesize_iter(self, prefix_ids, codec, seed, keep, self._synthesis.graph_pool, ar_kv)
+        ar_kv = None  # Only the chunk engine should retain the snapshot buffers.
+        latents = yield from work
         keep.append(latents)
         return (yield from self._decode_latents_iter(latents))
+
+    def _snapshot_ar_kv(self, state: _RequestState) -> ARKVSnapshot | None:
+        """Copy on the AR stream now, even when synthesis must wait in queue."""
+        copy_kv = getattr(self, "_runner_kv_copy", None)
+        if copy_kv is None or not state.history:
+            return None
+        frames = chunk_ranges(len(state.history), len(state.prefix_ids))[0][1]
+        length = len(state.prefix_ids) + frames
+        # A sampled codec is reusable only after it has passed through forward.
+        computed = next((comp + span for rid, comp, span in self._step_rows if rid == state.request_id), 0)
+        if computed < length:
+            return None
+        weight = next(self.vae2llm.parameters())
+        if weight.device.type != "cuda":
+            return None
+        # Reserve [prefix + codec | MUSIC_END | NAR frames + 2 boundaries].
+        # Only the first `length` positions are copied here; prefill writes END,
+        # and each ODE evaluation writes the NAR region.
+        shape = (
+            len(self.model.layers),
+            length + 1 + frames + 2,
+            int(self.config.num_key_value_heads),
+            int(self.config.head_dim),
+        )
+        pool = self.prefill_kv_pool()
+        lease = None if pool is None else pool.acquire(shape[1])
+        if lease is None:
+            keys = torch.empty(shape, dtype=weight.dtype, device=weight.device)
+            values = torch.empty_like(keys)
+        else:
+            keys, values = lease.views(shape[1])
+        names = [layer.self_attn.attn.layer_name for layer in self.model.layers]
+        try:
+            copied = copy_kv(state.request_id, names, length, keys, values)
+        except (RuntimeError, ValueError):
+            if lease is not None:
+                event = torch.Event()
+                event.record()
+                lease.release(event)
+            raise
+        if not copied:
+            if lease is not None:
+                event = torch.Event()
+                event.record()
+                lease.release(event)
+            return None
+        ready = torch.Event()
+        ready.record()
+        return ARKVSnapshot(keys, values, ready, lease)
 
     def _queue_synthesis(self, state: _RequestState) -> None:
         codec = [t - CODEC_OFFSET for t in state.history]
         prefix_ids, seed = state.prefix_ids, state.constants.seed
-        job = _SynthesisJob(state.request_id, lambda keep: self._song_iter(prefix_ids, codec, seed, keep))
+        # Pass the snapshot to the generator once, without retaining another
+        # reference in the callable. Pooled KV storage remains pool-owned;
+        # its lease is returned when the chunk's GPU work completes.
+        snapshots = [self._snapshot_ar_kv(state)]
+        job = _SynthesisJob(
+            state.request_id, lambda keep: self._song_iter(prefix_ids, codec, seed, keep, snapshots.pop())
+        )
         if not codec or min(codec) < 0 or max(codec) >= CODEC_SIZE:
             job.error = RuntimeError("semantic history is empty or contains non-codec tokens")
         state.job = job
+        # A job may be cancelled before its generator starts. Retain the
+        # snapshot lease and copy event so that cancellation returns it safely.
+        if snapshots[0] is not None and snapshots[0].lease is not None:
+            job.keep.append(snapshots[0])
         state.hold_steps = 1
         self._synthesis.submit(job)
 
