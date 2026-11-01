@@ -4,8 +4,10 @@
 """Protect retained exporters and native connectors during bootstrap migration."""
 
 import json
+import os
 import runpy
 import sys
+import sysconfig
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,27 @@ OLD_FAMILY = (
     "opentelemetry-exporter-otlp-proto-grpc",
     "opentelemetry-exporter-otlp-proto-http",
 )
+
+
+@pytest.fixture(autouse=True)
+def _dpkg_query(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    directory = tmp_path / "bin"
+    directory.mkdir()
+    tool = directory / "dpkg-query"
+    tool.write_text(
+        "#!/bin/sh\n"
+        'if [ "${DPKG_QUERY_ERROR:-0}" = 1 ]; then exit 2; fi\n'
+        'case "$3" in "${DPKG_APT_ROOT:-/no-fixture}"/*)\n'
+        '  if [ "${DPKG_METADATA_OWNED:-1}" = 1 ]; then printf "os-package: %s\\n" "$3"; exit 0; fi\n'
+        "  exit 1;;\n"
+        "esac\n"
+        'if [ "${DPKG_PAYLOAD_OWNED:-0}" = 1 ]; then\n'
+        '  printf "os-package: %s\\n" "$3"; exit "${DPKG_OWNER_CODE:-0}"\n'
+        "fi\n"
+        "exit 1\n"
+    )
+    tool.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory) + os.pathsep + os.environ["PATH"])
 
 
 def _distribution(root: Path, name: str, version: str, *requirements: str) -> Path:
@@ -44,11 +67,12 @@ def _old_family(root: Path) -> None:
     _distribution(root, "lmcache", "0.5.6", "opentelemetry-api>=1.20,<=1.40")
 
 
-def _prepare(root: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[set[str], str]:
+def _prepare(root: Path, monkeypatch: pytest.MonkeyPatch, outside: Path | None = None) -> tuple[set[str], str]:
     prepare = runpy.run_path(str(SCRIPT))["prepare"]
     roots, orphans = root / "roots.txt", root / "orphans.txt"
     with monkeypatch.context() as scoped:
-        scoped.setattr(sys, "path", [str(root)])
+        scoped.setattr(sys, "path", [str(root)] + ([str(outside)] if outside else []))
+        scoped.setattr(sysconfig, "get_path", lambda _name: str(root))
         prepare(roots, orphans)
     return set(roots.read_text().splitlines()), orphans.read_text()
 
@@ -64,7 +88,16 @@ def test_only_verified_old_family_orphan_is_removed(tmp_path: Path, monkeypatch:
 
 
 @pytest.mark.parametrize(
-    "guard", ["optional-consumer", "new-family", "common-record", "retained-record", "empty-record", "shared-file"]
+    "guard",
+    [
+        "optional-consumer",
+        "new-family",
+        "common-record",
+        "retained-record",
+        "empty-record",
+        "shared-file",
+        "absent-shared",
+    ],
 )
 def test_uncertain_or_needed_common_is_retained(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, guard: str) -> None:
     _old_family(tmp_path)
@@ -82,13 +115,17 @@ def test_uncertain_or_needed_common_is_retained(tmp_path: Path, monkeypatch: pyt
     elif guard == "shared-file":
         record = next(tmp_path.glob("lmcache-*.dist-info/RECORD"))
         record.write_text(record.read_text() + f"fixture_payload/{COMMON}.py,,\n")
+    elif guard == "absent-shared":
+        for pattern in ("lmcache-*.dist-info/RECORD", "opentelemetry_exporter_otlp_common-*.dist-info/RECORD"):
+            record = next(tmp_path.glob(pattern))
+            record.write_text(record.read_text() + "absent_but_declared.py,,\n")
     roots, orphans = _prepare(tmp_path, monkeypatch)
     assert COMMON in roots
     assert "lmcache==0.5.6" in roots
     assert orphans == ""
 
 
-@pytest.mark.parametrize("invalid", ["duplicate", "missing-name", "malformed-requirement"])
+@pytest.mark.parametrize("invalid", ["duplicate", "missing-name", "malformed-requirement", "malformed-record"])
 def test_ambiguous_metadata_fails_before_prune(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str) -> None:
     _old_family(tmp_path)
     if invalid == "duplicate":
@@ -99,6 +136,68 @@ def test_ambiguous_metadata_fails_before_prune(tmp_path: Path, monkeypatch: pyte
         metadata.write_text(metadata.read_text().replace("Name: retained-feature\n", ""))
     elif invalid == "malformed-requirement":
         _distribution(tmp_path, "retained-feature", "1.0", "broken dependency !")
+    elif invalid == "malformed-record":
+        next(tmp_path.glob("opentelemetry_exporter_otlp_common-*.dist-info/RECORD")).write_text("two,columns\n")
     with pytest.raises(ValueError if invalid == "malformed-requirement" else RuntimeError):
         _prepare(tmp_path, monkeypatch)
     assert not (tmp_path / "orphans.txt").exists()
+
+
+@pytest.mark.parametrize("outside_kind", ["consumer", "common-owner"])
+def test_outside_metadata_cannot_be_silently_discarded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outside_kind: str
+) -> None:
+    _old_family(tmp_path)
+    outside = tmp_path / "os-site"
+    outside.mkdir()
+    if outside_kind == "consumer":
+        # Same canonical name as a managed root must not erase this reverse edge.
+        _distribution(outside, "LMCache", "0.5.6", COMMON + "; extra == 'optional'")
+    else:
+        _distribution(outside, COMMON, "0.66b1")
+    roots, orphans = _prepare(tmp_path, monkeypatch, outside)
+    assert COMMON in roots
+    assert "lmcache==0.5.6" in roots
+    assert orphans == ""
+
+
+@pytest.mark.parametrize("decision", ["unowned", "metadata-unowned", "payload-owned", "partial-owner", "query-error"])
+def test_os_manifests_must_prove_metadata_and_payload_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, decision: str
+) -> None:
+    _old_family(tmp_path)
+    outside = tmp_path / "os-site"
+    outside.mkdir()
+    legacy = _distribution(outside, "cryptography", "41.0.7")
+    (legacy / "RECORD").unlink()
+    _distribution(tmp_path, "cryptography", "44.0.0")
+    monkeypatch.setenv("DPKG_APT_ROOT", str(outside))
+    if decision == "metadata-unowned":
+        monkeypatch.setenv("DPKG_METADATA_OWNED", "0")
+    elif decision in {"payload-owned", "partial-owner"}:
+        monkeypatch.setenv("DPKG_PAYLOAD_OWNED", "1")
+        if decision == "partial-owner":
+            monkeypatch.setenv("DPKG_OWNER_CODE", "1")
+    elif decision == "query-error":
+        monkeypatch.setenv("DPKG_QUERY_ERROR", "1")
+    roots, orphans = _prepare(tmp_path, monkeypatch, outside)
+    receipt = json.loads(capsys.readouterr().out)
+    if decision == "unowned":
+        assert COMMON not in roots
+        assert orphans == COMMON + "\n"
+        assert receipt["outside_unknown_metadata_os_owned"] is True
+        assert receipt["common_payload_os_unowned"] is True
+    else:
+        assert COMMON in roots
+        assert orphans == ""
+    assert receipt["os_ownership_queries"]
+
+
+def test_unavailable_os_manager_cannot_authorize_removal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _old_family(tmp_path)
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    roots, orphans = _prepare(tmp_path, monkeypatch)
+    assert COMMON in roots
+    assert orphans == ""

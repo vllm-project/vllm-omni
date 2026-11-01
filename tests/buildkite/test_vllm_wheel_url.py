@@ -8,6 +8,7 @@ import runpy
 import shlex
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -88,6 +89,7 @@ def test_bootstrap_telemetry_solve_keeps_unselected_exporters(tmp_path: Path, mo
     # packages and editable finders cannot enter this probe.
     with monkeypatch.context() as scoped:
         scoped.setattr(sys, "path", [str(tmp_path)])
+        scoped.setattr(sysconfig, "get_path", lambda _name: str(tmp_path))
         prepare(roots, orphans)
     assert set(roots.read_text().splitlines()) == telemetry
     assert len(roots.read_text().splitlines()) == len(telemetry)
