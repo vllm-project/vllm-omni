@@ -193,3 +193,50 @@ def test_mrv1_rejects_outer_full_cudagraph(mode_name):
 )
 def test_supported_graph_modes_pass(mode_name, uses_v2):
     reject_outer_full_cudagraph(_graph_config(CUDAGraphMode[mode_name], uses_v2=uses_v2))
+
+
+def test_cfg_value_env_overrides_yaml(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", "3.0")
+    assert talker_mod._resolve_cfg_value(2.0) == 3.0
+
+
+def test_cfg_value_unset_falls_back_to_config(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    assert talker_mod._resolve_cfg_value(2.0) == 2.0
+    assert talker_mod._resolve_cfg_value(3.5) == 3.5
+
+
+def test_cfg_value_empty_is_unset(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", "  ")
+    assert talker_mod._resolve_cfg_value(2.5) == 2.5
+
+
+def test_cfg_value_non_numeric_names_the_variable(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", "abc")
+    with pytest.raises(ValueError, match="VLLM_OMNI_SPEECH_CFG_VALUE='abc' is not a valid float"):
+        talker_mod._resolve_cfg_value(2.0)
+
+
+@pytest.mark.parametrize("bad", ["-1", "0"])
+def test_cfg_value_non_positive_names_the_source(monkeypatch, bad):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", bad)
+    with pytest.raises(ValueError, match="VLLM_OMNI_SPEECH_CFG_VALUE"):
+        talker_mod._resolve_cfg_value(2.0)
+
+
+def test_cfg_value_invalid_yaml_value_blames_the_yaml_source(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value=0"):
+        talker_mod._resolve_cfg_value(0)
