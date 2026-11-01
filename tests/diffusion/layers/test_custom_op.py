@@ -23,8 +23,8 @@ class _NativeOnlyOp(CustomOp):
 @pytest.fixture
 def mock_platform(monkeypatch):
     def select(backend):
-        platform = Mock(spec=["is_rocm", "is_cuda", "is_npu", "is_xpu", "is_musa"])
-        for name in ("rocm", "cuda", "npu", "xpu", "musa"):
+        platform = Mock(spec=["is_rocm", "is_cuda", "is_npu", "is_xpu", "is_musa", "is_out_of_tree"])
+        for name in ("rocm", "cuda", "npu", "xpu", "musa", "out_of_tree"):
             getattr(platform, f"is_{name}").return_value = name == backend
         monkeypatch.setattr(custom_op, "current_omni_platform", platform)
         return platform
@@ -35,7 +35,7 @@ def mock_platform(monkeypatch):
 @pytest.mark.skipif(
     any(
         getattr(custom_op.current_omni_platform, f"is_{backend}")()
-        for backend in ("rocm", "cuda", "npu", "xpu", "musa")
+        for backend in ("rocm", "cuda", "npu", "xpu", "musa", "out_of_tree")
     ),
     reason="Requires the native platform dispatch path",
 )
@@ -66,7 +66,7 @@ def test_constructor_dispatch_and_argument_forwarding(mock_platform, monkeypatch
         methods[f"forward_{name}"] = spy
 
     op = _NativeOnlyOp()
-    for name in ("rocm", "cuda", "npu", "xpu", "musa"):
+    for name in ("rocm", "cuda", "npu", "xpu", "musa", "out_of_tree"):
         getattr(platform, f"is_{name}").side_effect = AssertionError("Dispatch must happen at construction")
 
     x, residual = torch.randn(4, 8), torch.randn(4, 8)
@@ -165,5 +165,9 @@ def test_mot_rmsnorm_dispatches_on_xpu_without_an_override(mock_platform):
     assert torch.equal(norm(x), norm.forward_native(x))
     assert torch.equal(
         norm(x, text_indices=text_indices, vae_indices=vae_indices),
+        norm.forward_native(x, text_indices, vae_indices),
+    )
+    assert torch.equal(
+        norm(x, text_indices, vae_indices),
         norm.forward_native(x, text_indices, vae_indices),
     )
