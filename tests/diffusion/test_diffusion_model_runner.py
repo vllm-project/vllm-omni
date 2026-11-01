@@ -940,8 +940,9 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
     assert observed_batch_rows == [(2, 2)]
     assert runner.state_cache == {}
     assert runner.input_batch is None
-    assert len(forward_context_calls) == 1
-    assert forward_context_calls[0][1]["in_diffusion_kv_memory_profile"] is True
+    # Both preparation and denoising must retain the startup profiling scope.
+    assert len(forward_context_calls) == 2
+    assert all(kwargs["in_diffusion_kv_memory_profile"] is True for _, kwargs in forward_context_calls)
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()
