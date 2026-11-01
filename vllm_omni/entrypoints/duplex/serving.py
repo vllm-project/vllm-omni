@@ -36,6 +36,7 @@ from vllm_omni.engine.duplex.events import (
     SessionReplaced,
     SessionResumed,
     SessionResyncRequired,
+    SessionStats,
     SessionUpdated,
     new_event_id,
 )
@@ -69,7 +70,8 @@ _DEFAULT_IDLE_TIMEOUT_S = 300.0
 #: connection open; the pump itself closes the socket on its way out.
 _PUMP_DRAIN_TIMEOUT_S = 5.0
 #: session.created is journaled by the registry when it hands out the resume credential.
-_UNJOURNALED_EVENTS = (SessionCreated,)
+#: session.stats is a point-in-time answer and must not be replayed on resume.
+_UNJOURNALED_EVENTS = (SessionCreated, SessionStats)
 
 
 def _log_rollback_failure(done: asyncio.Task[None]) -> None:

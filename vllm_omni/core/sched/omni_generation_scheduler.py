@@ -23,6 +23,7 @@ from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.duplex_stage_work import perf_chunk_from_buffer, set_request_perf_chunk
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -1191,6 +1192,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
 
         self._capture_omni_connector_output(model_runner_output)
+        OmniSchedulerMixin._attach_duplex_stage_work(self, scheduler_output, engine_core_outputs)
 
         return engine_core_outputs
 
@@ -1200,4 +1202,5 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         Do not expend prompt id using update.
         """
+        set_request_perf_chunk(session, perf_chunk_from_buffer(getattr(update, "model_intermediate_buffer", None)))
         self._replace_streaming_session(session, update)

@@ -62,6 +62,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+from vllm_omni.model_executor.models.qwen3_omni.talker_rows import talker_placeholder_token_ids
 from vllm_omni.model_executor.models.qwen3_omni.tool_speech import spoken_span_end
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
@@ -1124,10 +1125,18 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_sequence_embeds = to_device_nonblocking(embed["prefill"], talker_device).to(
             torch.bfloat16
         )  # Tensor [P,H]
-        thinker_hidden_states = to_device_nonblocking(hs["output"], talker_device).to(torch.bfloat16)  # Tensor [K,H]
         # Token ids stay on CPU too: prefill parsing reads them on the host.
         thinker_sequences_cpu = None if ids.get("all") is None else _cpu_long(ids["all"])
         thinker_chatml_ids_cpu = None if ids.get("prompt") is None else _cpu_long(ids["prompt"])
+        if meta.get("prefill_holds_accept_hidden") and thinker_chatml_ids_cpu is not None:
+            # Async chunk 0 sent one merged prefill tensor whose placeholder
+            # rows already hold the accept-layer hidden state.
+            thinker_hidden_states = thinker_sequence_embeds[: thinker_chatml_ids_cpu.shape[-1]]
+        else:
+            hidden_output = hs.get("output")
+            thinker_hidden_states = None
+            if hidden_output is not None:
+                thinker_hidden_states = to_device_nonblocking(hidden_output, talker_device).to(torch.bfloat16)  # [K,H]
         thinker_sequences = (
             None if thinker_sequences_cpu is None else to_device_nonblocking(thinker_sequences_cpu, talker_device)
         )
@@ -1273,10 +1282,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         result_ids = thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids
         im_start_indexes = torch.nonzero(parse_ids[0] == self.config.im_start_token_id).flatten().tolist()
         im_start_indexes.append(target_len)
+        # Same placeholder set as the merged chunk-0 prefill (talker_rows.py).
+        audio_token_id, image_token_id, video_token_id = talker_placeholder_token_ids(self.thinker_config)
         multimodal_mask = (
-            (result_ids == self.thinker_config.audio_token_id) |
-            (result_ids == self.thinker_config.image_token_id) |
-            (result_ids == self.thinker_config.video_token_id)
+            (result_ids == audio_token_id) |
+            (result_ids == image_token_id) |
+            (result_ids == video_token_id)
         )  # [t] # fmt: skip
         role_tokens = parse_ids[0].tolist()
 
