@@ -1,0 +1,331 @@
+{
+  "id": "d406b3a2-9faa-5bf1-b86d-8b39c59d0988",
+  "revision": 0,
+  "last_node_id": 14,
+  "last_link_id": 11,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [40, 100],
+      "size": [320, 300],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "image", "name": "image", "type": "COMBO", "widget": {"name": "image"}, "link": null},
+        {"localized_name": "choose file to upload", "name": "upload", "type": "IMAGEUPLOAD", "widget": {"name": "upload"}, "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "IMAGE", "name": "IMAGE", "type": "IMAGE", "links": [1]},
+        {"localized_name": "MASK", "name": "MASK", "type": "MASK", "links": null}
+      ],
+      "title": "Frame 1 \u2014 identity reference and opening of shot 1",
+      "properties": {"Node name for S&R": "LoadImage"},
+      "widgets_values": ["h3_frame_ref_1.png", "image"]
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [40, 470],
+      "size": [320, 300],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "image", "name": "image", "type": "COMBO", "widget": {"name": "image"}, "link": null},
+        {"localized_name": "choose file to upload", "name": "upload", "type": "IMAGEUPLOAD", "widget": {"name": "upload"}, "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "IMAGE", "name": "IMAGE", "type": "IMAGE", "links": [3]},
+        {"localized_name": "MASK", "name": "MASK", "type": "MASK", "links": null}
+      ],
+      "title": "Frame 2 \u2014 keyframe at 1.5 s (frame 36)",
+      "properties": {"Node name for S&R": "LoadImage"},
+      "widgets_values": ["h3_frame_ref_2.png", "image"]
+    },
+    {
+      "id": 3,
+      "type": "LoadImage",
+      "pos": [40, 840],
+      "size": [320, 300],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "image", "name": "image", "type": "COMBO", "widget": {"name": "image"}, "link": null},
+        {"localized_name": "choose file to upload", "name": "upload", "type": "IMAGEUPLOAD", "widget": {"name": "upload"}, "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "IMAGE", "name": "IMAGE", "type": "IMAGE", "links": [5]},
+        {"localized_name": "MASK", "name": "MASK", "type": "MASK", "links": null}
+      ],
+      "title": "Frame 3 \u2014 keyframe at 3.0 s (frame 72)",
+      "properties": {"Node name for S&R": "LoadImage"},
+      "widgets_values": ["h3_frame_ref_3.png", "image"]
+    },
+    {
+      "id": 4,
+      "type": "LoadImage",
+      "pos": [40, 1210],
+      "size": [320, 300],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "image", "name": "image", "type": "COMBO", "widget": {"name": "image"}, "link": null},
+        {"localized_name": "choose file to upload", "name": "upload", "type": "IMAGEUPLOAD", "widget": {"name": "upload"}, "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "IMAGE", "name": "IMAGE", "type": "IMAGE", "links": [7]},
+        {"localized_name": "MASK", "name": "MASK", "type": "MASK", "links": null}
+      ],
+      "title": "Frame 4 \u2014 keyframe at 5.0 s (frame 120)",
+      "properties": {"Node name for S&R": "LoadImage"},
+      "widgets_values": ["h3_frame_ref_4.png", "image"]
+    },
+    {
+      "id": 5,
+      "type": "VLLMOmniVideoReferences",
+      "pos": [420, 100],
+      "size": [300, 365],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "image_1", "name": "image_1", "shape": 7, "type": "IMAGE", "link": 1},
+        {"localized_name": "image_2", "name": "image_2", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "audio_1", "name": "audio_1", "shape": 7, "type": "AUDIO", "link": null},
+        {"localized_name": "audio_2", "name": "audio_2", "shape": 7, "type": "AUDIO", "link": null},
+        {"localized_name": "video_1", "name": "video_1", "shape": 7, "type": "VIDEO", "link": null},
+        {"localized_name": "video_2", "name": "video_2", "shape": 7, "type": "VIDEO", "link": null},
+        {"localized_name": "image_3", "name": "image_3", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "image_4", "name": "image_4", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "image_5", "name": "image_5", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "image_6", "name": "image_6", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "image_7", "name": "image_7", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "image_8", "name": "image_8", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "image_9", "name": "image_9", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "audio_3", "name": "audio_3", "shape": 7, "type": "AUDIO", "link": null},
+        {"localized_name": "video_3", "name": "video_3", "shape": 7, "type": "VIDEO", "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "references", "name": "references", "type": "VIDEO_REFERENCES", "links": [2]}
+      ],
+      "title": "Semantic reference \u2014 <Picture 1>",
+      "properties": {"Node name for S&R": "VLLMOmniVideoReferences"},
+      "widgets_values": []
+    },
+    {
+      "id": 6,
+      "type": "VLLMOmniMiniMaxH3Guide",
+      "pos": [420, 530],
+      "size": [300, 160],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "frame_index", "name": "frame_index", "type": "INT", "widget": {"name": "frame_index"}, "link": null},
+        {"localized_name": "image", "name": "image", "shape": 7, "type": "IMAGE", "link": 3},
+        {"localized_name": "video", "name": "video", "shape": 7, "type": "VIDEO", "link": null},
+        {"localized_name": "audio", "name": "audio", "shape": 7, "type": "AUDIO", "link": null},
+        {"localized_name": "timeline_guides", "name": "timeline_guides", "shape": 7, "type": "H3_TIMELINE_GUIDES", "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "timeline_guides", "name": "timeline_guides", "type": "H3_TIMELINE_GUIDES", "links": [4]}
+      ],
+      "title": "Guide 1 \u2014 frame 36 (1.5 s)",
+      "properties": {"Node name for S&R": "VLLMOmniMiniMaxH3Guide"},
+      "widgets_values": [36]
+    },
+    {
+      "id": 7,
+      "type": "VLLMOmniMiniMaxH3Guide",
+      "pos": [420, 730],
+      "size": [300, 160],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "frame_index", "name": "frame_index", "type": "INT", "widget": {"name": "frame_index"}, "link": null},
+        {"localized_name": "image", "name": "image", "shape": 7, "type": "IMAGE", "link": 5},
+        {"localized_name": "video", "name": "video", "shape": 7, "type": "VIDEO", "link": null},
+        {"localized_name": "audio", "name": "audio", "shape": 7, "type": "AUDIO", "link": null},
+        {"localized_name": "timeline_guides", "name": "timeline_guides", "shape": 7, "type": "H3_TIMELINE_GUIDES", "link": 4}
+      ],
+      "outputs": [
+        {"localized_name": "timeline_guides", "name": "timeline_guides", "type": "H3_TIMELINE_GUIDES", "links": [6]}
+      ],
+      "title": "Guide 2 \u2014 frame 72 (3.0 s)",
+      "properties": {"Node name for S&R": "VLLMOmniMiniMaxH3Guide"},
+      "widgets_values": [72]
+    },
+    {
+      "id": 8,
+      "type": "VLLMOmniMiniMaxH3Guide",
+      "pos": [420, 930],
+      "size": [300, 160],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "frame_index", "name": "frame_index", "type": "INT", "widget": {"name": "frame_index"}, "link": null},
+        {"localized_name": "image", "name": "image", "shape": 7, "type": "IMAGE", "link": 7},
+        {"localized_name": "video", "name": "video", "shape": 7, "type": "VIDEO", "link": null},
+        {"localized_name": "audio", "name": "audio", "shape": 7, "type": "AUDIO", "link": null},
+        {"localized_name": "timeline_guides", "name": "timeline_guides", "shape": 7, "type": "H3_TIMELINE_GUIDES", "link": 6}
+      ],
+      "outputs": [
+        {"localized_name": "timeline_guides", "name": "timeline_guides", "type": "H3_TIMELINE_GUIDES", "links": [8]}
+      ],
+      "title": "Guide 3 \u2014 frame 120 (5.0 s)",
+      "properties": {"Node name for S&R": "VLLMOmniMiniMaxH3Guide"},
+      "widgets_values": [120]
+    },
+    {
+      "id": 9,
+      "type": "VLLMOmniDiffusionSampling",
+      "pos": [420, 1130],
+      "size": [310, 275],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "n", "name": "n", "type": "INT", "widget": {"name": "n"}, "link": null},
+        {"localized_name": "num_inference_steps", "name": "num_inference_steps", "type": "INT", "widget": {"name": "num_inference_steps"}, "link": null},
+        {"localized_name": "guidance_scale", "name": "guidance_scale", "type": "FLOAT", "widget": {"name": "guidance_scale"}, "link": null},
+        {"localized_name": "true_cfg_scale", "name": "true_cfg_scale", "type": "FLOAT", "widget": {"name": "true_cfg_scale"}, "link": null},
+        {"localized_name": "vae_use_slicing", "name": "vae_use_slicing", "type": "BOOLEAN", "widget": {"name": "vae_use_slicing"}, "link": null},
+        {"localized_name": "vae_use_tiling", "name": "vae_use_tiling", "type": "BOOLEAN", "widget": {"name": "vae_use_tiling"}, "link": null},
+        {"localized_name": "seed", "name": "seed", "type": "INT", "widget": {"name": "seed"}, "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "diffusion sampling params", "name": "diffusion sampling params", "type": "SAMPLING_PARAMS", "links": [9]}
+      ],
+      "title": "Sampling \u2014 50 points, seed 42",
+      "properties": {"Node name for S&R": "VLLMOmniDiffusionSampling"},
+      "widgets_values": [1, 50, 1.0, 1.0, false, false, 42, "fixed"]
+    },
+    {
+      "id": 10,
+      "type": "VLLMOmniMiniMaxH3Params",
+      "pos": [420, 1350],
+      "size": [310, 105],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "audio_flow_shift", "name": "audio_flow_shift", "type": "FLOAT", "widget": {"name": "audio_flow_shift"}, "link": null},
+        {"localized_name": "flow_shift", "name": "flow_shift", "type": "FLOAT", "widget": {"name": "flow_shift"}, "link": null},
+        {"localized_name": "audio_mode", "name": "audio_mode", "type": "COMBO", "widget": {"name": "audio_mode"}, "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "MiniMax-H3 video params", "name": "MiniMax-H3 video params", "type": "VIDEO_PARAMS", "links": [10]}
+      ],
+      "title": "H3 flow shifts \u2014 12 / 3",
+      "properties": {"Node name for S&R": "VLLMOmniMiniMaxH3Params"},
+      "widgets_values": [3.0, 12.0, "native"]
+    },
+    {
+      "id": 11,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [800, 100],
+      "size": [470, 610],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "frame", "name": "frame", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "first_frame", "name": "first_frame", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "last_frame", "name": "last_frame", "shape": 7, "type": "IMAGE", "link": null},
+        {"localized_name": "references", "name": "references", "shape": 7, "type": "VIDEO_REFERENCES", "link": 2},
+        {"localized_name": "sampling_params", "name": "sampling_params", "shape": 7, "type": "SAMPLING_PARAMS", "link": 9},
+        {"localized_name": "lora", "name": "lora", "shape": 7, "type": "REMOTE_LORA", "link": null},
+        {"localized_name": "model_params", "name": "model_params", "shape": 7, "type": "VIDEO_PARAMS", "link": 10},
+        {"localized_name": "fast_h3", "name": "fast_h3", "shape": 7, "type": "FASTH3_DEPLOYMENT", "link": null},
+        {"localized_name": "latent_edit", "name": "latent_edit", "shape": 7, "type": "LATENT_MASK_EDITING", "link": null},
+        {"localized_name": "timeline_guides", "name": "timeline_guides", "shape": 7, "type": "H3_TIMELINE_GUIDES", "link": 8},
+        {"localized_name": "url", "name": "url", "type": "STRING", "widget": {"name": "url"}, "link": null},
+        {"localized_name": "model", "name": "model", "type": "STRING", "widget": {"name": "model"}, "link": null},
+        {"localized_name": "prompt", "name": "prompt", "type": "STRING", "widget": {"name": "prompt"}, "link": null},
+        {"localized_name": "negative_prompt", "name": "negative_prompt", "type": "STRING", "widget": {"name": "negative_prompt"}, "link": null},
+        {"localized_name": "width", "name": "width", "type": "INT", "widget": {"name": "width"}, "link": null},
+        {"localized_name": "height", "name": "height", "type": "INT", "widget": {"name": "height"}, "link": null},
+        {"localized_name": "fps", "name": "fps", "type": "INT", "widget": {"name": "fps"}, "link": null},
+        {"localized_name": "duration", "name": "duration", "type": "FLOAT", "widget": {"name": "duration"}, "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "video", "name": "video", "type": "VIDEO", "links": [11]}
+      ],
+      "title": "Generate Video \u2014 Ref2VA with three guides",
+      "properties": {"Node name for S&R": "VLLMOmniGenerateVideo"},
+      "widgets_values": ["http://localhost:8000/v1", "MiniMaxAI/MiniMax-H3", "A three-shot cinematic sequence built from four anchors.\nShot 1 (frames 0-35): <Picture 1> defines the subject's identity, wardrobe, and color palette; the video opens on that composition and holds it with a slow push-in.\nShot 2 (frames 36-71): at 1.5 s the video cuts to the first keyframe, the same subject turned three-quarters toward the light, keeping identity, wardrobe, and grade.\nShot 3 (frames 72-119): at 3.0 s it cuts to the second keyframe, a tighter angle of the same subject mid-motion, with the camera easing to a stop.\nEnding (frames 120-123): at 5.0 s it settles into the third keyframe and holds there to the last frame.\nCoherent motion between anchors, consistent lighting and characters across the cuts, no flicker or morphing. Audio: continuous ambient room tone with a quiet sustained score that follows the cuts.", "", 1344, 768, 24, 5.167]
+    },
+    {
+      "id": 12,
+      "type": "SaveVideo",
+      "pos": [1360, 100],
+      "size": [410, 420],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {"localized_name": "video", "name": "video", "shape": 7, "type": "VIDEO", "link": 11},
+        {"localized_name": "filename_prefix", "name": "filename_prefix", "type": "STRING", "widget": {"name": "filename_prefix"}, "link": null},
+        {"localized_name": "format", "name": "format", "type": "COMBO", "widget": {"name": "format"}, "link": null},
+        {"localized_name": "codec", "name": "codec", "type": "COMFY_DYNAMICCOMBO_V3", "widget": {"name": "codec"}, "link": null}
+      ],
+      "outputs": [
+        {"localized_name": "video", "name": "video", "type": "VIDEO", "links": null}
+      ],
+      "title": "Save generated video with audio",
+      "properties": {},
+      "widgets_values": ["video/MiniMax-H3-Multiframe-Reference", "mp4", "h264"]
+    },
+    {
+      "id": 13,
+      "type": "MarkdownNote",
+      "pos": [800, 760],
+      "size": [470, 380],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "How the four anchors map",
+      "properties": {},
+      "widgets_values": ["## Four anchors, three shots\nThis template recreates the official ComfyUI MiniMax H3 Multiframe Reference layout on a remote vLLM-Omni server.\n\n- **Frame 1** is the semantic reference, prompt tag `<Picture 1>`, and the opening composition of shot 1.\n- **Frames 2-4** are timeline guides at 1.5 s, 3.0 s, and 5.0 s: the video must pass through those compositions at frames 36, 72, and 120.\n\nSelect your own four images; the loader filenames are placeholders. Guide images pin a composition but are not `<Picture N>` references, so the prompt only tags `<Picture 1>`. Rewrite the prompt for your own assets and keep the timing words (1.5 s / 3.0 s / 5.0 s) aligned with the guide indices.\n\n**Output:** 24 FPS, 1344x768, 124 frames (17k+5, about 5.17 s), base H3 at 50 sampling points with video/audio flow shifts 12/3. The server aligns guide indices to 17k+5 clips and rejects an index that does not fit."]
+    },
+    {
+      "id": 14,
+      "type": "MarkdownNote",
+      "pos": [1360, 560],
+      "size": [410, 380],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Server requirements",
+      "properties": {},
+      "widgets_values": ["## Server requirements\nGuided requests need base MiniMax-H3 weights: keep **FastH3 Deployment**, **Remote LoRA** (including Turbo), and **Latent Mask Editing** disconnected. Generate Video sends `fps=24` and `quality=lossless` for guided requests, and the server rejects cache acceleration, distilled schedules, and `audio_mode=lock_source`.\n\nUse a vLLM-Omni server that includes timeline-guide support and set the served model name to the MiniMax-H3 spec (for example `MiniMaxAI/MiniMax-H3`). The graph sends a Ref2VA request: references first, then the three guides, so the prompt still sees `<Picture 1>` as the identity reference.\n\nValidate the graph locally with:\n`python -m pytest tests/e2e/features/comfyui/test_h3_multiframe_reference_workflow.py -q`\n\nReal-model generation, saved audio, and guide placement still need a server run."]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 5, 0, "IMAGE"],
+    [2, 5, 0, 11, 3, "VIDEO_REFERENCES"],
+    [3, 2, 0, 6, 1, "IMAGE"],
+    [4, 6, 0, 7, 4, "H3_TIMELINE_GUIDES"],
+    [5, 3, 0, 7, 1, "IMAGE"],
+    [6, 7, 0, 8, 4, "H3_TIMELINE_GUIDES"],
+    [7, 4, 0, 8, 1, "IMAGE"],
+    [8, 8, 0, 11, 9, "H3_TIMELINE_GUIDES"],
+    [9, 9, 0, 11, 4, "SAMPLING_PARAMS"],
+    [10, 10, 0, 11, 6, "VIDEO_PARAMS"],
+    [11, 11, 0, 12, 0, "VIDEO"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {"workflowRendererVersion": "LG", "ds": {"scale": 0.75, "offset": [100, 100]}},
+  "version": 0.4
+}
