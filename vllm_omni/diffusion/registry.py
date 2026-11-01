@@ -578,15 +578,20 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
 
     Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
-    ``lossless`` / ``channels_last``). Only CUDA and XPU are supported; other
-    platforms keep the reference implementation. Failures never abort model loading.
+    ``lossless`` / ``channels_last``). CUDA and XPU support both complete fast paths.
+    Ascend supports only the decoder's lossless causal-Conv3D spatial-padding
+    optimization. Other platforms keep the reference implementation. Failures
+    never abort model loading.
     """
     level = getattr(od_config, "vae_fast_path", "lossless")
     encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
-    if level == "off" and encode_level == "off":
+    is_cuda = current_omni_platform.is_cuda()
+    is_xpu = current_omni_platform.is_xpu()
+    is_npu = current_omni_platform.is_npu()
+    if not (is_cuda or is_xpu or is_npu):
+        logger.debug("Wan VAE fast path is only supported on CUDA, XPU, and Ascend; skipping")
         return
-    if not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()):
-        logger.debug("Wan VAE fast path is only supported on CUDA and XPU; skipping")
+    if ((is_cuda or is_xpu) and level == "off" and encode_level == "off") or (is_npu and level == "off"):
         return
 
     from diffusers.models.autoencoders import AutoencoderKLWan
@@ -609,14 +614,21 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     for name, vae in candidates:
         if not isinstance(vae, AutoencoderKLWan):
             continue
-        for component, component_level, install in (
-            ("decoder", level, install_wan_vae_fastpath),
-            ("encoder", encode_level, install_wan_vae_encoder_fastpath),
-        ):
+        components = [("decoder", level)]
+        if is_cuda or is_xpu:
+            components.append(("encoder", encode_level))
+        for component, component_level in components:
             if component_level == "off":
                 continue
             try:
-                report = install(vae, level=component_level)
+                if component == "decoder":
+                    report = install_wan_vae_fastpath(
+                        vae,
+                        level=component_level,
+                        npu_spatial_padding_only=is_npu,
+                    )
+                else:
+                    report = install_wan_vae_encoder_fastpath(vae, level=component_level)
             except Exception:
                 logger.warning(
                     "Failed to install the Wan VAE %s fast path on %s; using the reference %s",

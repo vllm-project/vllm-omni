@@ -120,7 +120,12 @@ def _restore_module_layouts(
             restore(grad, strides)
 
 
-def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanVaeFastPathReport:
+def install_wan_vae_fastpath(
+    vae: nn.Module,
+    *,
+    level: str = "lossless",
+    npu_spatial_padding_only: bool | None = None,
+) -> WanVaeFastPathReport:
     """Install the Wan decoder fast path on one loaded ``AutoencoderKLWan``. Idempotent.
 
     ``level``:
@@ -157,6 +162,16 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
     if isinstance(parallel_mode, str) and parallel_mode.startswith("spatial_shard"):
         return _skip(level, f"vae_parallel_mode={parallel_mode!r} is not supported")
 
+    device = next((p.device for p in decoder.parameters()), torch.device("cpu"))
+    # The registry supplies the platform because installation can happen before
+    # a VAE is moved off CPU. Direct callers retain device-based detection.
+    use_npu_spatial_padding_only = device.type == "npu" or npu_spatial_padding_only is True
+    if use_npu_spatial_padding_only and level == "channels_last":
+        return _skip(level, "channels_last is only supported on CUDA")
+    replacements: Mapping[type[nn.Module], Callable[..., Any]] = (
+        {WanCausalConv3d: forwards.causal_conv_forward} if use_npu_spatial_padding_only else _REPLACEMENT_FORWARDS
+    )
+
     modules = [(f"decoder.{name}" if name else "decoder", module) for name, module in decoder.named_modules()]
     post_quant_conv = getattr(vae, "post_quant_conv", None)
     if type(post_quant_conv) is WanCausalConv3d:
@@ -165,20 +180,21 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
     convs: list[nn.Module] = []
     bypassed: set[nn.Module] = set()
     for _, module in modules:
-        replacement = _REPLACEMENT_FORWARDS.get(type(module))
-        if forwards.is_diffusers_rms_norm(module):
+        replacement = replacements.get(type(module))
+        if not use_npu_spatial_padding_only and forwards.is_diffusers_rms_norm(module):
             replacement = forwards.rms_norm_forward
             bypassed.add(module)
         if replacement is not None:
             bindings.append((module, replacement))
         if isinstance(module, (nn.Conv2d, nn.Conv3d)):
             convs.append(module)
-        if type(module) in (WanResample, DupUp3D, nn.SiLU) or (
-            type(module) is WanCausalConv3d and module is not post_quant_conv
-        ):
-            bypassed.add(module)
-        if type(module) is WanResample and forwards._is_upsample_conv_pair(module.resample):
-            bypassed.update((module.resample, module.resample[1]))
+        if not use_npu_spatial_padding_only:
+            if type(module) in (WanResample, DupUp3D, nn.SiLU) or (
+                type(module) is WanCausalConv3d and module is not post_quant_conv
+            ):
+                bypassed.add(module)
+            if type(module) is WanResample and forwards._is_upsample_conv_pair(module.resample):
+                bypassed.update((module.resample, module.resample[1]))
 
     replaced = {module for module, _ in bindings}
     for name, module in modules:
