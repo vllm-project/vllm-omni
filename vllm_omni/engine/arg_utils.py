@@ -164,19 +164,41 @@ def register_omni_models_to_vllm():
     import vllm_omni.reasoning  # noqa: F401
 
 
+_LMCACHE_MODES = {"in_process": "LMCacheConnectorV1", "mp": "LMCacheMPConnector"}
+
+
 def _build_lmcache_connector_config(lmcache_config: dict) -> dict:
-    """Build a single LMCacheConnectorV1 config from omni_kv_config."""
+    """Build a single LMCache connector config from omni_kv_config.
+
+    ``mode`` selects the connector and is consumed here rather than forwarded:
+    it addresses vLLM's connector choice, not anything LMCache parses.
+    """
     lmcache_extra: dict = {}
+    mode = "in_process"
     if isinstance(lmcache_config, dict):
         for key, value in lmcache_config.items():
+            if key == "mode":
+                mode = str(value)
+                continue
             prefixed = key if key.startswith("lmcache.") else f"lmcache.{key}"
             lmcache_extra[prefixed] = value
+    if mode not in _LMCACHE_MODES:
+        raise ValueError(f"lmcache_config.mode must be one of {sorted(_LMCACHE_MODES)}, got {mode!r}")
+    if mode == "mp":
+        # The cache lives in a separate server process, so the in-process
+        # hidden-state pool and its sizing warning do not apply: hidden states
+        # are stored over RPC against the server's own memory.
+        return {
+            "kv_connector": _LMCACHE_MODES[mode],
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": lmcache_extra,
+        }
     # Omni stages need hidden states alongside KV; enable by default so the
     # HiddenStateStore is created. User can override via lmcache_config.
     lmcache_extra.setdefault("lmcache.enable_hidden_state_cache", True)
     _warn_if_hidden_state_pool_undersized(lmcache_extra)
     return {
-        "kv_connector": "LMCacheConnectorV1",
+        "kv_connector": _LMCACHE_MODES[mode],
         "kv_role": "kv_both",
         "kv_connector_extra_config": lmcache_extra,
     }
@@ -228,8 +250,8 @@ def _map_offload_config(args: "OmniEngineArgs") -> None:
     lmcache_config = kv_store.get("lmcache_config")
 
     if lmcache_config:
-        # LMCacheConnectorV1 only (OffloadingConnector removed due to
-        # per-step CPU overhead; LMCache handles CPU KV offloading).
+        # LMCache only (OffloadingConnector removed due to per-step CPU
+        # overhead; LMCache handles CPU KV offloading).
         entry = _build_lmcache_connector_config(lmcache_config)
 
         from vllm.config.kv_transfer import KVTransferConfig
