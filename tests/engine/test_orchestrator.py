@@ -1285,7 +1285,7 @@ async def test_request_watermarking(stage_type: str, watermarking: bool | None) 
     else:
         await pool.process_llm_raw_outputs(
             0,
-            SimpleNamespace(outputs=[output], timestamp=1.0, scheduler_stats=None, weight_version=None),
+            OmniEngineCoreOutputs(outputs=[output], timestamp=1.0, scheduler_stats=None, weight_version=None),
         )
 
     # Then ensure the watermarking behavior is as expected
@@ -1348,7 +1348,7 @@ async def test_strict_watermark_failure_replaces_llm_output_with_error() -> None
     ]
 
     outputs = await pool.process_llm_raw_outputs(
-        0, SimpleNamespace(outputs=raw_outputs, timestamp=1.0, scheduler_stats=None, weight_version=None)
+        0, OmniEngineCoreOutputs(outputs=raw_outputs, timestamp=1.0, scheduler_stats=None, weight_version=None)
     )
 
     good_output, bad_output = outputs

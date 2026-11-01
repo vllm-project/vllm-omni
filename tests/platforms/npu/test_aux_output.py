@@ -14,6 +14,7 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxOutputSchedulerConnector,
     PackedBlockHashes,
 )
+from vllm.forward_context import ForwardContext
 from vllm.model_executor.layers.fused_moe import routed_experts_capturer
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
@@ -51,7 +52,7 @@ def runner(monkeypatch):
     monkeypatch.setattr(
         routed_experts_capturer,
         "get_forward_context",
-        lambda: SimpleNamespace(dp_metadata=None, batch_descriptor=None),
+        lambda: ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={}),
     )
     monkeypatch.setattr(worker, "get_tp_group", lambda: SimpleNamespace(is_first_rank=True))
     runner = _Runner()
@@ -121,7 +122,7 @@ def test_routing_reaches_scheduler_and_owns_legacy_batch_snapshot(runner):
                 single_type_managers={0: SimpleNamespace(block_size=4)},
             ),
             block_pool=SimpleNamespace(hash_block_size=4),
-            kv_cache_config=SimpleNamespace(num_blocks=8),
+            kv_cache_config=KVCacheConfig(num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[]),
         )
     ).take_output(request, output)
     np.testing.assert_array_equal(rows, expected)

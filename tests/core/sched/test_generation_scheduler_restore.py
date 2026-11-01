@@ -15,6 +15,7 @@ from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerCo
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, _has_async_chunk_payload_to_run
@@ -139,7 +140,7 @@ def test_generation_scheduler_preserves_auxiliary_output_metadata() -> None:
                 single_type_managers={0: manager},
             ),
             block_pool=SimpleNamespace(hash_block_size=16),
-            kv_cache_config=SimpleNamespace(num_blocks=8),
+            kv_cache_config=KVCacheConfig(num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[]),
         )
     )
 
