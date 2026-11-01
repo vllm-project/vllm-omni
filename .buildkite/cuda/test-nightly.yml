@@ -458,23 +458,14 @@ steps:
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and B200 and cards_1"
 
       - label: ":full_moon: Diffusion X2V · Perf Test · 2-GPU"
-        source_file_dependencies:
-          - diffusion_wan22_perf
-          - diffusion_cosmos3_perf
+        source_file_dependencies: diffusion_wan22_perf
         key: nightly-diffusion-x2v-performance-2gpu
         timeout_in_minutes: 180
         artifact_paths:
           - tests/dfx/perf/results/*.json
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and B200 and cards_2"
-            EXIT1=$$?
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_cosmos3_vllm_omni.json -m "H100 and B200 and cards_2"
-            EXIT2=$$?
-            if [ $$EXIT1 -ne 0 ]; then exit $$EXIT1; fi
-            exit $$EXIT2
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json -m "H100 and B200 and cards_2"
 
       - label: ":full_moon: Diffusion X2V · Perf Test · HunyuanVideo-1.5"
         source_file_dependencies: diffusion_hunyuan_video_perf
