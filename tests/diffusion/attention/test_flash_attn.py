@@ -32,6 +32,39 @@ HAS_FLASH_ATTN = fa.HAS_FLASH_ATTN
 flash_attn_func = fa.flash_attn_func  # noqa: N813
 
 
+@pytest.mark.cpu
+def test_fa4_dense_dispatch_is_opaque_to_compile(monkeypatch):
+    calls = []
+
+    def kernel(query, key, value, **kwargs):
+        calls.append(kwargs)
+        return query + value.mean()
+
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", True)
+    monkeypatch.setattr(fa, "flash_attn_func", kernel)
+    impl = FlashAttentionImpl(2, 16, softmax_scale=0.25, causal=True)
+    impl.fa_deterministic = True
+    query = torch.randn(1, 5, 2, 16)
+    key, value = torch.randn(1, 7, 2, 16), torch.randn(1, 7, 2, 16)
+    expected = impl.forward_cuda(query, key, value)
+    compiled = torch.compile(impl.forward_cuda, backend="eager", fullgraph=True, dynamic=True)
+    torch.testing.assert_close(compiled(query, key, value), expected, rtol=0, atol=0)
+    assert calls == [dict(softmax_scale=0.25, causal=True, deterministic=True)] * 2
+
+
+@pytest.mark.cpu
+def test_fa4_dense_fake_preserves_value_head_dimension():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        query = torch.empty(1, 5, 4, 16)
+        key = torch.empty(1, 7, 2, 16)
+        value = torch.empty(1, 7, 2, 32)
+        output = torch.ops.vllm_omni.fa4_dense_attention(query, key, value, 0.25, False, False)
+        assert output.shape == (1, 5, 4, 32)
+        assert output.dtype == query.dtype and output.device == query.device
+
+
 @pytest.mark.parametrize(
     ("device_major", "requested", "supported", "expected"),
     [
@@ -248,7 +281,7 @@ def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch)
     assert captured["softmax_scale"] == 0.25
 
 
-@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@hardware_test(res={"cuda": ["L4", "H100", "B200"]}, num_cards=1)
 @pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
 def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
     """Exercise the real versioned vLLM dispatcher and its LSE contract."""
@@ -263,8 +296,7 @@ def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
     value = torch.randn_like(key)
 
     capability = torch.cuda.get_device_capability(device)
-    expected_version = 3 if capability[0] == 9 else 2
-    assert capability[0] in (8, 9), f"test expects an Ampere/Ada or Hopper GPU, got SM{capability[0]}{capability[1]}"
+    expected_version = 4 if capability[0] >= 10 else 3 if capability[0] == 9 else 2
     assert fa.resolve_vllm_flash_attn_version() == expected_version
 
     output, lse = fa.vllm_flash_attn_dense_with_lse(
