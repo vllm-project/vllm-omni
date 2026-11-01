@@ -21,6 +21,9 @@ connectors:
       initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
       codec_left_context_frames: 25
+      # CUDA: fuse final residual-codebook sampling and batch streaming decode.
+      code_predictor_fused_sampling: true
+      codec_graph_batch_sizes: [2, 4]
 
 stages:
   - stage_id: 0
