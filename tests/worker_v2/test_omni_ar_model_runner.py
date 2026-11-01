@@ -147,6 +147,7 @@ def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, 
         assert output.multimodal_outputs == [{}, {}]
 
 
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.parametrize("needs_history", [False, True])
 @pytest.mark.parametrize("include_hidden", [None, False, True])
 @pytest.mark.parametrize("engine_output_type", ["text", "latent"])
