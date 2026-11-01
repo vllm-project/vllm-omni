@@ -100,7 +100,8 @@ class MingTTSAdapter(ARTTSAdapter):
                 model_name, trust_remote_code=trust_remote_code
             )
 
-        ref_text = request.ref_text
+        # Speaker-only mode also overrides transcripts restored from uploaded voices.
+        ref_text = None if request.x_vector_only_mode else request.ref_text
         reference_waveforms, reference_sample_rates = self._build_ming_reference_waveforms(ref_audio_data)
         reference_waveform = torch.cat(reference_waveforms, dim=-1) if reference_waveforms else None
         prompt_waveforms = (
