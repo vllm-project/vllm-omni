@@ -596,7 +596,7 @@ steps:
           PROBE_OUTPUT="$$(mktemp -d /workspace/build/native-cpu-phase-probe.XXXXXX)"
           if [ -n "$${PROBE_OUTPUT}" ]; then
             export NATIVE_PHASE_PROBE_OUTPUT_DIR="$${PROBE_OUTPUT}"
-            export NATIVE_PHASE_PROBE_PARENT_PID=$$$$
+            export NATIVE_PHASE_PROBE_PARENT_PID=$${BASHPID}
             export NATIVE_PHASE_PROBE_SLOW_SECONDS=1.0
             export NATIVE_PHASE_PROBE_MAX_EVENTS=2000
             export NATIVE_PHASE_PROBE_MAX_BYTES=2097152

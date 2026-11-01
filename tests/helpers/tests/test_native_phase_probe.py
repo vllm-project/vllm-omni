@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -244,3 +245,27 @@ def test_sigkill_retains_last_complete_checkpoint_within_budget(project):
         if process.poll() is None:
             process.kill()
             process.communicate(timeout=10)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="The native CPU agent runs Bash")
+def test_native_pipeline_parent_token_survives_upload_and_kubernetes(tmp_path: Path):
+    source = (_ROOT / ".buildkite/cuda/test-nightly.yml").read_text()
+    (export_line,) = [line.strip() for line in source.splitlines() if "export NATIVE_PHASE_PROBE_PARENT_PID=" in line]
+    # The uploader unescapes $$ once. Kubernetes expands the command EnvVar a
+    # second time: this exact export has no $(VAR) references, so only $$ changes.
+    uploaded = export_line.replace("$$", "$")
+    assert "$(" not in uploaded
+    container_export = uploaded.replace("$$", "$")
+    child = (
+        "import json, os; "
+        "token = os.environ['NATIVE_PHASE_PROBE_PARENT_PID']; "
+        "parent = os.getppid(); "
+        "print(json.dumps({'token': token, 'parent': parent}), flush=True); "
+        "assert token == str(parent)"
+    )
+    # Keep a command after Python so Bash cannot replace itself with the child.
+    command = container_export + "\n" + shlex.join([sys.executable, "-c", child]) + '\nstatus=$?\nexit "$status"'
+    result = subprocess.run(["bash", "-e", "-c", command], cwd=tmp_path, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    fence = json.loads(result.stdout)
+    assert fence["token"] == str(fence["parent"])
