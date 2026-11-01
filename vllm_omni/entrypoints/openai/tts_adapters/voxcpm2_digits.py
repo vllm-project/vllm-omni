@@ -55,14 +55,15 @@ def shape_voxcpm2_edge_digits(text: str) -> str:
     # Trailing digit-run -> FULL STOP, never a comma (see module docstring).
     # Three entry shapes: digit + ， -> replace with 。; bare digit ->
     # append 。; digit already followed by 。 -> untouched.
-    if text.endswith("，"):
+    if re.fullmatch(r"\d{1,2}", text):
+        # ZhIMQ's simplification (the whole text IS a 1-2 digit run)
+        text = f"{text}。"
+    elif text.endswith("，"):
         core = text[:-1]
         if _VOXCPM2_TRAILING_DIGIT_RUN_RE.search(core) or re.search(r"\d{1,2}$", core):
             text = core + "。"
     elif not re.search(r"[。！？]$", text):
         text = _VOXCPM2_TRAILING_DIGIT_RUN_RE.sub(r"\1\2。", text)
-        if re.search(r"\d{1,2}$", text):
-            text = f"{text}。"
     # Hold a LONE edge '0' out of TN conversion. The lookbehind matters: in
     # "10。" the 0 is the second digit of the run - sentinel-splitting it
     # would emit "1<sentinel>。" i.e. "一零".

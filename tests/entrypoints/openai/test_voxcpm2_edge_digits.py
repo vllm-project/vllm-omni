@@ -144,3 +144,9 @@ def test_normalize_sentinel_survives_normalizer_roundtrip(monkeypatch):
     shaped = shape_voxcpm2_edge_digits("0今天天气真好")
     out = normalize_voxcpm2_text(shaped, _Stub())
     assert out.startswith("0，"), f"sentinel must protect the leading 0 through TN, got {out!r}"
+
+
+def test_bare_digit_text_gets_full_stop():
+    # ZhIMQ's case: the whole text IS a 1-2 digit run
+    assert shape_voxcpm2_edge_digits("10") == "10。"
+    assert shape_voxcpm2_edge_digits("7") == "7。"
