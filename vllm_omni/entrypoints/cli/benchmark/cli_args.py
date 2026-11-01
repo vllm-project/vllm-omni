@@ -263,6 +263,14 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+_DIFFUSION_TASK_TO_ENDPOINT = {
+    "t2i": "/v1/images/generations",
+    "i2i": "/v1/images/edits",
+    "t2v": "/v1/videos",
+    "i2v": "/v1/videos",
+}
+
+
 def add_diffusion_cli_args(parser: argparse.ArgumentParser) -> None:
     """Add CLI arguments for diffusion model benchmarks."""
     group = parser.add_argument_group("Diffusion Models Options")
@@ -276,6 +284,63 @@ def add_diffusion_cli_args(parser: argparse.ArgumentParser) -> None:
             "(--backend openai-image-edits-omni or --endpoint /v1/images/edits). "
             'Use --extra-body \'{"bot_task":"..."}\' to override per run.'
         ),
+    )
+    group.add_argument(
+        "--diffusion-dataset",
+        type=str,
+        choices=["random", "vbench", "custom"],
+        default="random",
+        help="Prompt source for diffusion benchmarks. "
+        "'random' generates synthetic prompts (default), "
+        "'vbench' downloads VBench prompts, "
+        "'custom' reads from --dataset-path JSONL.",
+    )
+    group.add_argument(
+        "--diffusion-task",
+        type=str,
+        choices=["t2i", "i2i", "t2v", "i2v"],
+        default=None,
+        help="Diffusion task type. Auto-maps to the appropriate endpoint: "
+        "t2i -> /v1/images/generations, i2i -> /v1/images/edits, "
+        "t2v/i2v -> /v1/videos. Overridden by explicit --endpoint.",
+    )
+    group.add_argument(
+        "--width",
+        type=int,
+        default=1024,
+        help="Output image/video width for diffusion generation (default: 1024).",
+    )
+    group.add_argument(
+        "--height",
+        type=int,
+        default=1024,
+        help="Output image/video height for diffusion generation (default: 1024).",
+    )
+    group.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=20,
+        help="Number of denoising steps for diffusion generation (default: 20).",
+    )
+    group.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        help="Number of video frames for video generation. None for image generation (default: None).",
+    )
+    group.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Video frames per second (default: None).",
+    )
+    group.add_argument(
+        "--random-request-config",
+        type=str,
+        default=None,
+        help="JSON array of weighted resolution profiles for random diffusion "
+        "prompts. Each entry: "
+        '{"width":W, "height":H, "num_inference_steps":S, "weight":P}.',
     )
 
 
@@ -591,8 +656,21 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
     add_diffusion_cli_args(parser)
 
 
+def _preprocess_diffusion_args(args: argparse.Namespace) -> None:
+    """Auto-map diffusion task to endpoint when not explicitly set."""
+    task = getattr(args, "diffusion_task", None)
+    if task is None:
+        return
+
+    explicit = getattr(args, "explicit_keys", ())
+    if task and "endpoint" not in explicit:
+        args.endpoint = _DIFFUSION_TASK_TO_ENDPOINT[task]
+
+
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    _preprocess_diffusion_args(args)
+
     if getattr(args, "dataset_name", None) == "omni-duplex-eval":
         if args.backend != "openai-realtime-duplex" or args.endpoint != "/v1/realtime":
             raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")

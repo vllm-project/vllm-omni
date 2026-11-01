@@ -619,6 +619,168 @@ def test_fail_fast_on_timeout_rejects_finite_rate_before_dispatch(mocker) -> Non
     enable_fail_fast.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("task", "expected_endpoint"),
+    [
+        ("t2i", "/v1/images/generations"),
+        ("i2i", "/v1/images/edits"),
+        ("t2v", "/v1/videos"),
+        ("i2v", "/v1/videos"),
+    ],
+)
+def test_diffusion_task_auto_maps_endpoint(task: str, expected_endpoint: str) -> None:
+    parser = TrackingArgumentParser()
+    parser.add_argument("--endpoint", default="/v1/completions")
+    parser.add_argument("--backend", default="openai")
+    add_omni_args(parser)
+    args = parser.parse_args(["--diffusion-task", task])
+    preprocess_serve_args(args)
+    assert args.endpoint == expected_endpoint
+
+
+def test_diffusion_task_does_not_override_explicit_endpoint() -> None:
+    parser = TrackingArgumentParser()
+    parser.add_argument("--endpoint", default="/v1/completions")
+    parser.add_argument("--backend", default="openai")
+    add_omni_args(parser)
+    args = parser.parse_args(["--diffusion-task", "t2i", "--endpoint", "/v1/videos"])
+    preprocess_serve_args(args)
+    assert args.endpoint == "/v1/videos"
+
+
+def _parse_real_serve_args(argv: list[str]) -> argparse.Namespace:
+    """Parse argv through the full serve parser (upstream + omni) and preprocess."""
+    parser = TrackingArgumentParser()
+    vllm_benchmark_serve.add_cli_args(parser)
+    add_omni_args(parser)
+    extend_omni_choices(parser)
+    args = parser.parse_args(argv)
+    preprocess_serve_args(args)
+    return args
+
+
+def test_diffusion_cli_flags_reach_request_overrides() -> None:
+    """Diffusion generation flags must flow into per-request overrides."""
+    from vllm_omni.benchmarks.patch.patch import get_samples
+
+    args = _parse_real_serve_args(
+        [
+            "--model",
+            "test-model",
+            "--diffusion-task",
+            "t2i",
+            "--width",
+            "512",
+            "--height",
+            "768",
+            "--num-inference-steps",
+            "7",
+            "--num-frames",
+            "9",
+            "--fps",
+            "12",
+            "--seed",
+            "42",
+            "--num-prompts",
+            "2",
+        ]
+    )
+    assert args.endpoint == "/v1/images/generations"
+    samples = get_samples(args, tokenizer=None)
+    assert len(samples) == 2
+    for sample in samples:
+        assert sample.request_overrides == {
+            "width": 512,
+            "height": 768,
+            "num_inference_steps": 7,
+            "num_frames": 9,
+            "fps": 12,
+            "seed": 42,
+        }
+
+
+def test_diffusion_dataset_selection_from_cli(tmp_path: Path) -> None:
+    """--diffusion-dataset selects the diffusion loader, not upstream random."""
+    from vllm_omni.benchmarks.patch.patch import get_samples
+
+    jsonl = tmp_path / "prompts.jsonl"
+    jsonl.write_text('{"prompt": "a red car"}\n{"prompt": "a blue sky"}\n', encoding="utf-8")
+
+    args = _parse_real_serve_args(
+        [
+            "--model",
+            "test-model",
+            "--diffusion-task",
+            "t2i",
+            "--diffusion-dataset",
+            "custom",
+            "--dataset-path",
+            str(jsonl),
+            "--num-prompts",
+            "0",
+        ]
+    )
+    samples = get_samples(args, tokenizer=None)
+    assert [s.prompt for s in samples] == ["a red car", "a blue sky"]
+    assert all(s.prompt_len == 0 for s in samples)
+
+
+def test_explicit_extra_body_precedence_over_cli_flags() -> None:
+    """Request overrides win over --extra-body base; extra-body-only keys survive."""
+    from vllm_omni.benchmarks.patch.patch import _merge_overrides, get_samples
+
+    args = _parse_real_serve_args(
+        [
+            "--model",
+            "test-model",
+            "--diffusion-task",
+            "t2i",
+            "--width",
+            "512",
+            "--extra-body",
+            '{"width": 256, "guidance_scale": 3.0}',
+            "--num-prompts",
+            "1",
+        ]
+    )
+    samples = get_samples(args, tokenizer=None)
+    merged = _merge_overrides(args.extra_body, samples[0].request_overrides)
+    assert merged["width"] == 512
+    assert merged["guidance_scale"] == 3.0
+
+
+def test_diffusion_random_request_config_profiles() -> None:
+    """--random-request-config samples weighted profiles into per-request overrides."""
+    from vllm_omni.benchmarks.patch.patch import get_samples
+
+    config = json.dumps(
+        [
+            {"prompt": "landscape", "width": 512, "height": 512, "num_inference_steps": 4},
+            {"prompt": "portrait", "width": 1024, "height": 768, "num_inference_steps": 8, "weight": 0.0},
+        ]
+    )
+    args = _parse_real_serve_args(
+        [
+            "--model",
+            "test-model",
+            "--diffusion-task",
+            "t2i",
+            "--random-request-config",
+            config,
+            "--num-prompts",
+            "2",
+        ]
+    )
+    samples = get_samples(args, tokenizer=None)
+    # weight 0 on the second profile pins sampling to the first one.
+    assert [s.prompt for s in samples] == ["landscape", "landscape"]
+    for sample in samples:
+        assert sample.request_overrides["width"] == 512
+        assert sample.request_overrides["height"] == 512
+        assert sample.request_overrides["num_inference_steps"] == 4
+        assert "weight" not in sample.request_overrides
+
+
 def test_realtime_chat_choice_is_available_without_importing_runtime() -> None:
     parser = TrackingArgumentParser()
     parser.add_argument("--backend", choices=["openai-chat-omni"])
