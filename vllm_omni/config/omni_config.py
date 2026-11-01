@@ -860,6 +860,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    dlo_vae_resident: bool = Field(default=False, strict=True)
+    dlo_text_encoder_resident: bool = Field(default=False, strict=True)
     dlo_use_allgather: bool = True
     dlo_chunk_size_mb: int = Field(default=64, gt=0, strict=True)
     dlo_resident_layers: int = Field(default=0, ge=0)

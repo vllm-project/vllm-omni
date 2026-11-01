@@ -953,6 +953,18 @@ class MiniMaxH3Pipeline(
         del prefix
         super().__init__()
         self.od_config = od_config
+        if getattr(od_config, "dlo_vae_resident", False) and (
+            resolve_offload_strategy(od_config) is not OffloadStrategy.DISTRIBUTED_LAYER_WISE
+        ):
+            raise ValueError("MiniMax H3 dlo_vae_resident requires distributed layerwise offload")
+        if getattr(od_config, "dlo_text_encoder_resident", False):
+            offload = resolve_offload(od_config)
+            if offload.strategy is not OffloadStrategy.DISTRIBUTED_LAYER_WISE:
+                raise ValueError("MiniMax H3 dlo_text_encoder_resident requires distributed layerwise offload")
+            if offload.public is not None and offload.offloads(TEXT_ENCODER_COMPONENT):
+                raise ValueError(
+                    "dlo_text_encoder_resident conflicts with diffusion_offload_config selecting text_encoder"
+                )
         self.parallel_config = od_config.parallel_config
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
@@ -971,12 +983,15 @@ class MiniMaxH3Pipeline(
             )
         self._encoder_modules = ["text_encoder"] if self.load_text_encoder else []
         self._PROFILER_TARGETS = list(type(self)._PROFILER_TARGETS)
+        # Residency must disable both block hooks and whole-component staging.
         encoder_block_attrs = dict(self._offload_plan.encoder_block_attrs)
-        if not self.load_text_encoder:
+        if not self.load_text_encoder or od_config.dlo_text_encoder_resident:
             encoder_block_attrs.pop("text_encoder", None)
         on_demand_component_paths = set(self._offload_plan.on_demand_component_paths)
-        if not self.load_text_encoder:
+        if not self.load_text_encoder or od_config.dlo_text_encoder_resident:
             on_demand_component_paths.discard("text_encoder")
+        if od_config.dlo_vae_resident:
+            on_demand_component_paths.difference_update(("video_vae", "audio_vae"))
         if not self.load_vae_decoder:
             on_demand_component_paths.difference_update(("video_vae", "audio_vae"))
             self._vae_modules = []
@@ -1285,7 +1300,8 @@ class MiniMaxH3Pipeline(
         # Preserve the legacy MiniMax-H3 low-residency path. The compact API
         # deliberately limits explicit component selection to dit/text_encoder,
         # so VAEs stay resident for new configurations.
-        component_load_device = torch.device("cpu") if legacy_manual_components else self.device
+        stage_vaes = legacy_manual_components and not od_config.dlo_vae_resident
+        component_load_device = torch.device("cpu") if stage_vaes else self.device
         self.video_vae = None
         self.audio_vae = None
         if self.load_vae_decoder:
@@ -1314,6 +1330,8 @@ class MiniMaxH3Pipeline(
             )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+        if od_config.dlo_vae_resident:
+            logger.info("MiniMax H3 DLO keeps loaded video and audio VAEs resident on %s", self.device)
 
         # Optional learned latent super-resolution, run between the denoise
         # loop and the VAE. Absent unless --additional-config names a
@@ -1697,6 +1715,16 @@ class MiniMaxH3Pipeline(
         od_config = getattr(self, "od_config", None)
         if od_config is None:
             return False
+        if getattr(od_config, "dlo_text_encoder_resident", False) and component is getattr(self, "text_encoder", None):
+            return False
+        if getattr(od_config, "dlo_vae_resident", False):
+            video_vae = getattr(self, "video_vae", None)
+            if (
+                component is video_vae
+                or component is getattr(self, "audio_vae", None)
+                or (isinstance(component, _VideoVAEPartProxy) and component.sequential_offload_target is video_vae)
+            ):
+                return False
         if getattr(od_config, "diffusion_offload_config", None) is None:
             # The compatibility topology stages every component it can.
             return offload_streams_blocks(od_config)
