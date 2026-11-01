@@ -33,15 +33,11 @@ adherence. It requires ~6.5 GiB for model weights and runs inference at
 
 #### Environment
 
-- OS: Linux
-- Python: 3.10+
 - Driver / runtime: Intel XPU environment with Intel Arc BMG GPU
-- vLLM version: Match the repository requirements for your checkout
-- vLLM-Omni version or commit: Use the commit you are deploying from
 
 #### Command
 
-**Offline inference:**
+**Without CFG:**
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
@@ -92,6 +88,24 @@ print('saved output.png')
 - `negative_prompt` requires `guidance_scale > 1` to take effect. Recommended range: 5.0-9.0.
 - Default resolution is 1024x1024. Other supported sizes: 512x512, 768x768.
 - The model uses dual CLIP text encoders (ViT-L/14 + OpenCLIP ViT-bigG/14) for rich text understanding.
+
+### 2x Intel Arc BMG GPU (XPU)
+
+#### Command
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python examples/offline_inference/text_to_image/text_to_image.py \
+  --model stabilityai/stable-diffusion-xl-base-1.0 \
+  --negative-prompt "blurry, low quality" \
+  --num-inference-steps 30 \
+  --guidance-scale 7.5 \
+  --cfg-parallel-size 2 \
+  --enable-cpu-offload \
+  --enforce-eager \
+  --seed 42 \
+  --output sdxl_cfg2_q30.png
+```
 
 ### 1x NVIDIA GPU (24+ GB VRAM)
 
