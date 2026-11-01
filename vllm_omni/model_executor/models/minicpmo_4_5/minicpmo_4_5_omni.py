@@ -166,12 +166,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.model_stage = vllm_config.model_config.model_stage
         self.model_sampler_wants_sampling_params = self.model_stage == "tts"
         self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
-        if (
-            self.model_stage == "llm"
-            and self._use_v2_model_runner
-            and getattr(vllm_config.model_config, "async_chunk", False)
-        ):
-            raise ValueError("MiniCPM-o MRv2 Thinker requires async_chunk: false for its full llm2tts payload")
         # The Thinker's row ledger needs real token identities even when
         # embeddings are supplied, including during CUDA graph capture/replay.
         self.requires_raw_input_tokens = self.model_stage == "llm"

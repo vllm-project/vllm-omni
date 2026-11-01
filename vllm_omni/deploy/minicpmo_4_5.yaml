@@ -171,9 +171,6 @@ platforms:
     cuda_mps: true
     stages:
       - stage_id: 0
-        # Send the completed Thinker payload to Talker through the
-        # orchestrator; only Talker -> Code2Wav streams connector chunks.
-        async_chunk: false
         # Match the CUDA Thinker backend used for Transformers accuracy validation.
         # Keep this scoped to stage 0; Talker retains its own backend selection.
         attention_backend: TRITON_ATTN

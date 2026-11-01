@@ -1,9 +1,8 @@
 # MiniCPM-o 4.5 MRv2 profiles
 
 The default `minicpmo_4_5.yaml` selects MRv2 for all three stages on CUDA
-and retains MRv1 on other platforms. CUDA stage 0 uses a full-payload
-handoff; downstream stages retain streaming chunks. The ordinary turn profile
-keeps Thinker prefix caching disabled with either runner.
+and retains MRv1 on other platforms. All three stages keep `async_chunk: true`.
+The ordinary turn profile keeps Thinker prefix caching disabled with either runner.
 
 Turn mode uses the stage-level MRv2 contracts from #8184. Thinker emits live
 latent metadata outside graph replay; Talker keeps codec history and EOS

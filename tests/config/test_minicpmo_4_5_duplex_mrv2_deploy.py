@@ -25,15 +25,21 @@ def _resolve_cuda_stages(monkeypatch, filename):
     return config, merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
 
 
-@pytest.mark.parametrize("filename,use_v2", [("minicpmo_4_5.yaml", True), (_DEPLOY, True)])
-def test_duplex_cuda_runner_selection(monkeypatch, filename, use_v2) -> None:
+@pytest.mark.parametrize(
+    "filename,use_v2,async_chunks",
+    [
+        ("minicpmo_4_5.yaml", True, [True, True, True]),
+        (_DEPLOY, True, [False, True, True]),
+    ],
+)
+def test_duplex_cuda_runner_selection(monkeypatch, filename, use_v2, async_chunks) -> None:
     config, stages = _resolve_cuda_stages(monkeypatch, filename)
     assert config.session_mode == "duplex"
     # All three stages follow the default or explicit runner.
     assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == [use_v2] * 3
-    # Stage 0 duplex preprocessing stays on the synchronous path while the
-    # downstream stages keep streaming chunk transfer.
-    assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]
+    # The default profile keeps pipeline async_chunk on every stage. The
+    # explicit duplex overlay still opts stage 0 out; Talker and Code2Wav stream.
+    assert [s.yaml_engine_args["async_chunk"] for s in stages] == async_chunks
     # Preserve asynchronous AR scheduling, including the Talker.
     assert all(s.yaml_engine_args["async_scheduling"] for s in stages[:2])
     assert stages[2].yaml_engine_args.get("async_scheduling") is not False
