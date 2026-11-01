@@ -6,9 +6,9 @@ Naming aligns with vLLM's v1/core KV-cache design.
 """
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, NamedTuple, TypeAlias
+from typing import Any, TypeAlias
 
 import torch
 
@@ -111,13 +111,15 @@ class PrefixCacheConfig:
         )
 
 
-class StageCacheOutputs(NamedTuple):
-    """Plain value object: per-request merged stage outputs."""
+@dataclass
+class StageCacheOutputs:
+    """Materialized rows and their save-time request positions."""
 
-    # req -> full-prompt hidden states (None when policy skips them)
     hidden_states: dict[ReqId, torch.Tensor] | None
-    # tensor name -> req -> payload element
     mm_outputs: dict[TensorName, dict[ReqId, Any]]
+    token_ranges: dict[ReqId, tuple[int, int]] = field(default_factory=dict)
+    cached_mm_keys: frozenset[TensorName] = frozenset()
+    token_mm_keys: frozenset[TensorName] = frozenset()
 
 
 class OmniPrefixCacheUnmatchError(RuntimeError):

@@ -267,6 +267,9 @@ class _StepContext:
 
     # Packed layout in batch order: req -> [start, end) of this step's rows.
     spans: dict[ReqId, tuple[int, int]]
+    token_ranges: dict[ReqId, tuple[int, int]]
+    hit_starts: dict[ReqId, int]
+    token_mm_keys: frozenset[TensorName]
     num_tokens_unpadded: int = 0
 
     # Hits snapshotted at new_step_starts. Prefetch fills [hit | empty tail]
@@ -369,7 +372,7 @@ class _SlotStatusTable:
 
 
 class _RequestTaskTable:
-    """Per request: still live, which writes it opened, deferred task.
+    """Per request: which writes it opened, deferred task.
 
     Also allocates ``tid`` and increments per-request ``write_n``.
     Device→host copy and pool write stay on the controller.
@@ -437,6 +440,7 @@ class OmniPrefixCacheManager:
         # This step's hits (copied into _StepContext at save).
         self._cur_num_scheduled: dict[ReqId, int] = {}
         self._hit_spans: dict[ReqId, tuple[int, list[int]]] = {}  # (upto, blocks)
+        self._hit_starts: dict[ReqId, int] = {}
         self._hit_prefetch: dict[ReqId, dict[TensorName, Future]] = {}
 
         # Planned-but-unread slot refs. A write reusing their slots copies the
@@ -490,7 +494,11 @@ class OmniPrefixCacheManager:
             #    would leave future hits ABSENT. The next save waits
             #    join_host_ready. (Not leftover_mm — those are this-step reads.)
             for event in events:
-                if event.kind not in (PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.ABORTED):
+                if event.kind not in (
+                    PrefixCacheEventKind.FINISHED,
+                    PrefixCacheEventKind.ABORTED,
+                    PrefixCacheEventKind.REPLACED,
+                ):
                     continue
                 req_id = event.req_id
                 tids, dtask = self._request_tasks.finish(req_id)
@@ -507,13 +515,16 @@ class OmniPrefixCacheManager:
             #    materialize (async builder) must not reread that live table.
             self._clear_hit_infos()
             for event in events:
-                if event.kind not in (PrefixCacheEventKind.STARTED,):
-                    continue
                 req_id = event.req_id
-                # The adapter alone classifies starts versus continuation or
-                # resume. Do not re-infer that lifecycle from write-task state.
+                if event.kind not in (
+                    PrefixCacheEventKind.STARTED,
+                    PrefixCacheEventKind.REPLACED,
+                    PrefixCacheEventKind.RESUMED,
+                ):
+                    continue
                 num_computed = int(event.hit_end)
-                if num_computed > 0:
+                hit_start = event.delivered_upto
+                if num_computed > hit_start:
                     # block_ids is per-kv-group; group 0 only.
                     block_groups = event.block_ids
                     if not block_groups or not block_groups[0]:
@@ -536,6 +547,7 @@ class OmniPrefixCacheManager:
                         )
                     hit_blocks = list(block_groups[0][:needed])
                     self._hit_spans[req_id] = (num_computed, hit_blocks)
+                    self._hit_starts[req_id] = hit_start
 
             # 4. Gather those spans on the prefetch thread; overlaps this forward.
             while self._prefetch_queue and self._prefetch_queue[0][0].done():
@@ -644,6 +656,12 @@ class OmniPrefixCacheManager:
                     slots_cpu=slots_cpu,
                     mm_keys=set(mm_outputs.keys()),
                     write_ctx=write_ctx,
+                    token_ranges={w.req_id: (w.token_start, w.token_end) for w in write_layout.writes},
+                    token_mm_keys=frozenset(
+                        key
+                        for key, value in mm_outputs.items()
+                        if _is_step_token_tensor(value, num_tokens_unpadded, num_tokens_padded)
+                    ),
                 )
                 # Eager execution and queue dispatch must remain outside the lock.
                 write_ctx.start_writes()
@@ -696,7 +714,7 @@ class OmniPrefixCacheManager:
                         continue
                     hit_upto, hit_blocks = hit
                     prefetched = ctx.hit_prefetch.get(req_id, {})
-                    slots = self._get_hit_slots(hit_upto, hit_blocks)
+                    slots = self._get_hit_slots(hit_upto, hit_blocks, ctx.hit_starts[req_id])
                     keys = self._policy.get_hit_keys(cached_keys)
                     for key in keys:
                         fut = prefetched.get(key)
@@ -741,7 +759,15 @@ class OmniPrefixCacheManager:
                 }
 
             self._merge_uncached_mm(ctx, req_ids, cached_keys, mm_out)
-            return StageCacheOutputs(hidden_states=hidden_out, mm_outputs=mm_out)
+            return StageCacheOutputs(
+                hidden_states=hidden_out,
+                mm_outputs=mm_out,
+                token_ranges={
+                    r: (ctx.hit_starts.get(r, ctx.token_ranges[r][0]), ctx.token_ranges[r][1]) for r in req_ids
+                },
+                cached_mm_keys=frozenset(ctx.cached_keys),
+                token_mm_keys=ctx.token_mm_keys,
+            )
         finally:
             if ctx is not None and not step_released:
                 self._release_step_staging(ctx)
@@ -776,6 +802,7 @@ class OmniPrefixCacheManager:
     def _clear_hit_infos(self) -> None:
         """Drop the live hit / prefetch tables. Caller holds ``_state_lock``."""
         self._hit_spans.clear()
+        self._hit_starts.clear()
         self._hit_prefetch.clear()
 
     def _invalidate_overwritten_prefetches(self) -> None:
@@ -808,7 +835,7 @@ class OmniPrefixCacheManager:
             if all(key in futs for key in keys):
                 continue
             n_new = int(self._cur_num_scheduled.get(req_id, 0))
-            slots = self._get_hit_slots(hit_upto, hit_blocks)
+            slots = self._get_hit_slots(hit_upto, hit_blocks, self._hit_starts[req_id])
             for key in keys:
                 if key in futs:
                     continue
@@ -893,6 +920,8 @@ class OmniPrefixCacheManager:
         slots_cpu: torch.Tensor | None,
         mm_keys: set[str],
         write_ctx: StepWriteContext,
+        token_ranges: dict[ReqId, tuple[int, int]],
+        token_mm_keys: frozenset[TensorName],
     ) -> None:
         """Takes ``_state_lock``. Register this step's writes and store the
         consume-once snapshot. Copies live hits into the snapshot, then
@@ -913,6 +942,9 @@ class OmniPrefixCacheManager:
             self._prefetch_hit_spans()
         self._next_step_id = step_id + 1
         self._step_ctxs[step_id] = _StepContext(
+            token_ranges=dict(token_ranges),
+            hit_starts=dict(self._hit_starts),
+            token_mm_keys=token_mm_keys,
             spans={r: (query_start[r], query_start[r] + num_sched[r]) for r in req_order},
             num_tokens_unpadded=num_tokens_unpadded,
             hits=dict(self._hit_spans),
@@ -1154,13 +1186,13 @@ class OmniPrefixCacheManager:
 
     # -------------------------------------------------- slot ref / fetch
 
-    def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int]) -> torch.Tensor:
+    def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int], hit_start: int = 0) -> torch.Tensor:
         """Prefix-hit block ids → KV slot ids. Alignment is checked at
         ``new_step_starts``. Does not require ``_state_lock``.
         """
         bs = self._config.block_size
         block_ids = torch.tensor(hit_blocks, dtype=torch.int64)
-        return (block_ids.unsqueeze(1) * bs + torch.arange(bs)).reshape(-1)[:hit_upto]
+        return (block_ids.unsqueeze(1) * bs + torch.arange(bs)).reshape(-1)[hit_start:hit_upto]
 
     def _slot_ref(self, slots: torch.Tensor, key: str, req_id: str) -> _SlotRef:
         """Caller holds ``_state_lock``. Pin a ``_SlotRef`` for `slots` (no data movement).

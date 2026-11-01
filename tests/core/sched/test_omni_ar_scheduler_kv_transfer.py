@@ -141,6 +141,7 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
 
     scheduler_output = mocker.MagicMock()
     scheduler_output.num_scheduled_tokens = {request.request_id: 1}
+    scheduler_output.scheduled_token_ranges = {request.request_id: (0, 1)}
     scheduler_output.total_num_scheduled_tokens = 1
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0

@@ -241,6 +241,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         # Async-chunk prewarm payloads popped in add_request, keyed by request
         # id; handed to the runner once by _wrap_omni_scheduler_output.
         self._pending_request_prewarms: dict[str, dict[str, Any]] = {}
+        self._discarded_req_ids: set[str] = set()
         # Finished outputs of requests that return their stage payload; the
         # worker builds the payload a step after the finish.
         self._outputs_awaiting_stage_payload = {}
@@ -268,6 +269,15 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             self.vllm_config.model_config.hf_config,
         )
 
+    def _record_full_payload_discard(self, request: Request) -> None:
+        if request.status in (
+            RequestStatus.FINISHED_ABORTED,
+            RequestStatus.FINISHED_ERROR,
+            RequestStatus.FINISHED_IGNORED,
+        ):
+            self._discarded_req_ids = getattr(self, "_discarded_req_ids", set())
+            self._discarded_req_ids.add(request.request_id)
+
     def _free_input_coordinator_request(self, request_id: str) -> None:
         """Prune full-payload coordinator state for a completed request."""
         input_coordinator = getattr(self, "input_coordinator", None)
@@ -276,6 +286,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     def _reset_streaming_session_replacement_state(self, session: Request) -> None:
         """Fence transport and async state that belongs to an old prompt."""
+        session.delivered_upto = 0
+        session._omni_delivery_replaced = True
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
@@ -392,6 +404,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 continue
             # The streaming update may already have fenced this same in-flight
             # frame. Seed idempotently so the replacement does not count it twice.
+            request.delivered_upto = 0
+            request._omni_delivery_replaced = True
             request.num_stale_output_tokens = int(getattr(request, "num_in_flight_tokens", 0) or 0)
             request.drop_stale_output = True
             request.num_output_placeholders = 0
@@ -779,8 +793,27 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             if request_id in self.requests
         ]
         pending_prewarms.clear()
+        discarded_req_ids: set[str] = getattr(self, "_discarded_req_ids", set())
+        finished_discarded_req_ids = discarded_req_ids & base.finished_req_ids
+        discarded_req_ids.difference_update(finished_discarded_req_ids)
+        starts = {data.req_id: data.num_computed_tokens for data in base.scheduled_new_reqs}
+        starts.update(zip(base.scheduled_cached_reqs.req_ids, base.scheduled_cached_reqs.num_computed_tokens))
+        replaced_req_ids = set()
+        for req_id in base.num_scheduled_tokens:
+            request = self.requests[req_id]
+            if getattr(request, "_omni_delivery_replaced", False):
+                replaced_req_ids.add(req_id)
+                request._omni_delivery_replaced = False
         scheduler_output = OmniSchedulerOutput(
             **base_data,
+            scheduled_token_ranges={
+                rid: (start, start + base.num_scheduled_tokens[rid])
+                for rid, start in starts.items()
+                if rid in base.num_scheduled_tokens
+            },
+            delivered_upto={rid: getattr(self.requests[rid], "delivered_upto", 0) for rid in base.num_scheduled_tokens},
+            replaced_req_ids=replaced_req_ids,
+            discarded_req_ids=finished_discarded_req_ids,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_input_registrations=pending_input_registrations,
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,

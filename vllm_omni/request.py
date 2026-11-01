@@ -50,6 +50,7 @@ class OmniRequest(Request):
         if prompt_embeds is not None:
             kwargs["prompt_embeds"] = self._maybe_decode_prompt_embeds(prompt_embeds)
         super().__init__(*args, **kwargs)
+        self.delivered_upto = 0
         # vLLM 0.27 owns this counter; accelerator images still based on 0.26
         # do not. Keep the Omni scheduler's stale-output drain compatible with
         # both request layouts until those images move to 0.27.

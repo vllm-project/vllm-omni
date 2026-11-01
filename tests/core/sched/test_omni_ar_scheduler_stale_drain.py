@@ -113,7 +113,7 @@ def _make_drain_sched(session: Request) -> MagicMock:
     return sched
 
 
-def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: int, spec=None) -> bool:
+def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: int, spec=None, start=0) -> bool:
     """Feed one model-runner frame through update_from_output.
 
     Returns True when the frame's tokens were delivered (the append ran),
@@ -123,6 +123,7 @@ def _run_step(sched: MagicMock, session: Request, *, num_scheduled: int, token: 
     scheduler_output.num_scheduled_tokens = {session.request_id: num_scheduled}
     scheduler_output.scheduled_spec_decode_tokens = {session.request_id: spec} if spec else {}
     scheduler_output.num_invalid_spec_tokens = 0
+    scheduler_output.scheduled_token_ranges = {session.request_id: (start, start + num_scheduled)}
 
     model_runner_output = MagicMock(spec=ModelRunnerOutput)
     model_runner_output.sampled_token_ids = [[token]]
@@ -330,3 +331,59 @@ def test_reset_running_streaming_codec_is_rejected_before_preemption(
         assert not request.drop_stale_output
     else:
         reset.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "stale,drop,fast,want",
+    [(False, False, False, 9), (False, False, True, 9), (True, False, False, 9), (True, True, False, 8)],
+)
+def test_delivery_boundary_tracks_accepted_frame(monkeypatch, stale, drop, fast, want):
+    from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+
+    monkeypatch.setattr(OmniSchedulerMixin, "_append_request_output", lambda *args, **kwargs: None)
+    session = _make_session()
+    session.delivered_upto = 8
+    session.num_computed_tokens = 100
+    session.num_in_flight_tokens = 1
+    session.num_stale_output_tokens = int(stale)
+    session.drop_stale_output = drop
+    sched = _make_drain_sched(session)
+    if fast:
+        sched.chunk_transfer_adapter = None
+    _run_step(sched, session, num_scheduled=1, token=42, start=8)
+    assert session.delivered_upto == want
+
+
+def test_delivery_boundary_excludes_rejected_drafts(monkeypatch):
+    from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+
+    monkeypatch.setattr(OmniSchedulerMixin, "_append_request_output", lambda *args, **kwargs: None)
+    session = _make_session()
+    session.delivered_upto = 8
+    session.num_computed_tokens = 100
+    session.num_in_flight_tokens = 3
+    sched = _make_drain_sched(session)
+    _run_step(sched, session, num_scheduled=3, token=42, spec=[50, 51], start=8)
+    assert session.delivered_upto == 9
+
+
+def test_stopped_frame_does_not_advance_replacement_prompt(monkeypatch):
+    from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+
+    monkeypatch.setattr(OmniSchedulerMixin, "_append_request_output", lambda *args, **kwargs: None)
+    session = _make_session()
+    session.delivered_upto = 8
+    session.resumable = True
+    session.num_computed_tokens = 9
+    session.num_in_flight_tokens = 1
+    sched = _make_drain_sched(session)
+    sched._update_request_with_output.return_value = ([42], True)
+
+    def replace_prompt(request):
+        OmniSchedulerMixin._reset_streaming_session_replacement_state(sched, request)
+        request.status = RequestStatus.WAITING
+        return False
+
+    sched._handle_stopped_request.side_effect = replace_prompt
+    _run_step(sched, session, num_scheduled=1, token=42, start=8)
+    assert session.delivered_upto == 0

@@ -64,6 +64,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     """Own payload caching, full/chunk transport, and connector I/O."""
 
     _full_payload_replace_keys_cached: frozenset[str]
+    _full_payload_token_keys_cached: frozenset[str]
 
     # ------------------------------------------------------------------ #
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
@@ -627,57 +628,64 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
         return output, request
 
-    def _resolve_full_payload_replace_keys(self) -> frozenset[str]:
-        """Per-model REPLACE-key set for the full-payload accumulator.
-
-        Looked up from the stage-input-processor module that ships the model's sync builder
-        (`model_config.custom_process_input_func.__module__`).  The module
-        declares ``_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str]``; if absent,
-        returns the empty set.
-
-        Cached per instance.  Keys in this set use REPLACE semantics in the
-        accumulator (subsequent emissions discard prior chunks) instead of
-        the default CONCAT semantics.  Use for tensors that carry the full
-        result so far rather than per-step deltas (e.g. ``model_outputs``).
-        """
-        cached = getattr(self, "_full_payload_replace_keys_cached", None)
+    def _resolve_full_payload_keys(self, declaration: str, cache_attr: str) -> frozenset[str]:
+        cached = getattr(self, cache_attr, None)
         if cached is not None:
             return cached
         proc = getattr(self, "_custom_process_func", None)
-        if proc is None:
-            self._full_payload_replace_keys_cached = frozenset()
-            return self._full_payload_replace_keys_cached
         module_name = getattr(proc, "__module__", None)
-        if module_name is None:
-            self._full_payload_replace_keys_cached = frozenset()
-            return self._full_payload_replace_keys_cached
-        try:
-            import sys as _sys
+        keys: Any = frozenset()
+        if module_name is not None:
+            try:
+                import sys as _sys
 
-            mod = _sys.modules.get(module_name) or importlib.import_module(module_name)
-            keys: Any = getattr(mod, "_FULL_PAYLOAD_REPLACE_KEYS", frozenset())
-        except ImportError:
-            logger.debug(
-                "Could not import stage input processor module %s while resolving "
-                "_FULL_PAYLOAD_REPLACE_KEYS; using CONCAT semantics for all keys.",
-                module_name,
-                exc_info=True,
-            )
-            keys = frozenset()
+                mod = _sys.modules.get(module_name) or importlib.import_module(module_name)
+                keys = getattr(mod, declaration, frozenset())
+            except ImportError:
+                logger.debug(
+                    "Could not import stage input processor module %s while resolving %s.",
+                    module_name,
+                    declaration,
+                    exc_info=True,
+                )
         if not isinstance(keys, (frozenset, set)):
-            logger.debug(
-                "Ignoring non-set _FULL_PAYLOAD_REPLACE_KEYS from %s: %s",
-                module_name,
-                type(keys).__name__,
-            )
+            logger.debug("Ignoring non-set %s from %s: %s", declaration, module_name, type(keys).__name__)
             keys = frozenset()
-        self._full_payload_replace_keys_cached = frozenset(keys)
-        logger.debug(
-            "Resolved _FULL_PAYLOAD_REPLACE_KEYS for %s: %s",
-            module_name,
-            sorted(self._full_payload_replace_keys_cached),
-        )
-        return self._full_payload_replace_keys_cached
+        resolved = frozenset(keys)
+        setattr(self, cache_attr, resolved)
+        return resolved
+
+    def _resolve_full_payload_replace_keys(self) -> frozenset[str]:
+        """Resolve processor fields whose latest value replaces earlier emissions."""
+        return self._resolve_full_payload_keys("_FULL_PAYLOAD_REPLACE_KEYS", "_full_payload_replace_keys_cached")
+
+    def _is_full_payload_token_key(self, key: str) -> bool:
+        """Match token-aligned fields or flattened namespaces declared by the processor."""
+        if key in self._resolve_full_payload_replace_keys():
+            return False
+        if key == "hidden":
+            return True
+        token_keys = self._resolve_full_payload_keys("_FULL_PAYLOAD_TOKEN_KEYS", "_full_payload_token_keys_cached")
+        return any(key == name or key.startswith(name + ".") for name in token_keys)
+
+    def resume_full_payload_output(self, req_id: str, delivered_upto: int) -> None:
+        """Drop unaccepted token rows before a request resumes."""
+        entry = self._pending_full_payload_send.get(req_id)
+        if entry is None:
+            return
+        chunks, _latest, rows, _request = entry
+        for key, tensors in chunks.items():
+            if not self._is_full_payload_token_key(key) or rows[key] <= delivered_upto:
+                continue
+            kept = []
+            remaining = delivered_upto
+            for tensor in tensors:
+                if remaining <= 0:
+                    break
+                kept.append(tensor if tensor.shape[0] <= remaining else tensor[:remaining].clone())
+                remaining -= tensor.shape[0]
+            chunks[key] = kept
+            rows[key] = delivered_upto
 
     def accumulate_full_payload_output(
         self,
@@ -687,9 +695,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
-        Per-token tensors (2-D+, matching trailing dims) and the 1-D codec
+        Row tensors (2-D+, matching trailing dims) and the 1-D codec
         validity mask are concatenated along dim-0. Scalar / global tensors
         are replaced with the latest value.
+
+        Callers clip replayed token rows before accumulation. Other payload
+        fields retain their per-model CONCAT or REPLACE policy.
 
         Note: codec rows are NOT filtered for zero placeholders here. The
         downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
@@ -703,7 +714,6 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """
         replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
-
         if existing is None:
             chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
             self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
@@ -745,8 +755,12 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
         self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
-    def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
-        """Send accumulated full_payload outputs for requests that just finished."""
+    def flush_full_payload_outputs(
+        self, finished_req_ids: set[str], *, discarded_req_ids: set[str] | None = None
+    ) -> None:
+        """Discard failed accumulators and send normally finished payloads."""
+        for req_id in discarded_req_ids or ():
+            self._pending_full_payload_send.pop(req_id, None)
         pending_req_ids = set(self._pending_full_payload_send.keys())
         if not (finished_req_ids & pending_req_ids):
             return
