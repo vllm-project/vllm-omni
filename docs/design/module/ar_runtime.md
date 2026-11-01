@@ -32,6 +32,14 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+For Bagel image editing, the vLLM 0.33 prefix-range helper receives shallow
+`image` views of the custom `img2img` features so both VAE and ViT embedding
+spans retain bidirectional attention. The original features keep their modality,
+encoder data, cache identifiers and placeholder masks. Upstream still computes
+the ranges and applies sliding-window and padding rules. This adapter is installed
+from `vllm_omni.patch` for both upstream runner implementations; it is unnecessary
+with vLLM versions that build the ranges inline.
+
 MOSS Local's fused and separate depth-attention paths share an explicitly
 rounded initial weighted value and the same FMA accumulation order. This
 preserves bitwise parity when the compiler inlines attention into sampling,
