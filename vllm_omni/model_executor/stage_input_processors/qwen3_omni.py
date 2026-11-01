@@ -4,7 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -237,6 +237,17 @@ def _ensure_list(x):
     elif not isinstance(x, list):
         return x
     return list(x)
+
+
+def _token_id_list(value: Any) -> list[int]:
+    """Normalize token IDs carried by either a Python payload or wire tensors."""
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().reshape(-1).tolist()
+    elif not isinstance(value, (list, tuple)):
+        value = [value]
+    return [int(token_id) for token_id in value if int(token_id) >= 0]
 
 
 def _as_tensor_or_none(value: Any) -> torch.Tensor | None:
@@ -498,6 +509,7 @@ def thinker2talker_async_chunk(
     multimodal_output: OmniPayload | dict[str, Any],
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
+    new_token_ids: Iterable[int] | None = None,
 ) -> OmniPayloadStruct | None:
     """
     Process thinker outputs to create talker inputs.
@@ -516,6 +528,19 @@ def thinker2talker_async_chunk(
     thinker_layers = cast(Mapping[int | str, Any], thinker_hs.get("layers", {}) if isinstance(thinker_hs, dict) else {})
     thinker_embed_raw = multimodal_output.get("embed", {})
     thinker_embed = thinker_embed_raw if isinstance(thinker_embed_raw, dict) else {}
+    payload_meta = multimodal_output.get("meta", {})
+    decode_span = bool(payload_meta.get("decode_span", False)) if isinstance(payload_meta, Mapping) else False
+    payload_ids = multimodal_output.get("ids", {})
+    payload_committed_ids = payload_ids.get("output") if isinstance(payload_ids, Mapping) else None
+    raw_committed_ids = payload_committed_ids if decode_span and payload_committed_ids is not None else new_token_ids
+    committed_ids = _token_id_list(raw_committed_ids)
+    if decode_span and isinstance(payload_meta, Mapping) and payload_meta.get("committed_token_count") is not None:
+        committed_count = int(payload_meta["committed_token_count"])
+        if committed_count != len(committed_ids):
+            raise RuntimeError(
+                f"Committed token count mismatch for request {request_id}: "
+                f"meta={committed_count} ids={len(committed_ids)}"
+            )
 
     embedding_idx = _get_embedding_layer_index()
     accept_hidden_idx = _get_accept_hidden_layer_index(transfer_manager)
@@ -534,7 +559,8 @@ def thinker2talker_async_chunk(
     }
     thinker_emb = _layer_tensor(semantic_layers, "embedding")
     thinker_hid = _layer_tensor(semantic_layers, "accept_hidden")
-    if thinker_emb is None or thinker_hid is None:
+    is_committed_decode_span = bool(committed_ids) and decode_span
+    if thinker_emb is None or (thinker_hid is None and not is_committed_decode_span):
         logger.debug(
             "thinker2talker_async_chunk: missing thinker layers for req=%s "
             "(embedding_layer=%d:%s accept_hidden_layer=%d:%s)",
@@ -548,8 +574,70 @@ def thinker2talker_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
 
-    def _maybe_cpu(t: Any) -> torch.Tensor | None:
-        return t.detach().cpu() if isinstance(t, torch.Tensor) else None
+    if is_committed_decode_span:
+        if thinker_emb.shape[0] != len(committed_ids):
+            raise RuntimeError(
+                f"Committed token/embedding mismatch for request {request_id}: "
+                f"ids={len(committed_ids)} rows={thinker_emb.shape[0]}"
+            )
+        # The scheduler may cut a verifier result at EOS or the length limit.
+        if new_token_ids is not None:
+            scheduled_count = len(_token_id_list(new_token_ids)) + (chunk_id == 0)
+            committed_ids = committed_ids[:scheduled_count]
+            thinker_emb = thinker_emb[:scheduled_count]
+        output_ids = _ensure_list(getattr(request, "output_token_ids", None) or [])
+        token_start = max(0, len(output_ids) - len(committed_ids)) if output_ids else 0
+        if is_finished and not getattr(request, "resumable", False):
+            committed_ids = committed_ids[:-1]
+            thinker_emb = thinker_emb[:-1]
+        if not committed_ids:
+            return None
+        token_end = token_start + len(committed_ids)
+
+        # A prefill-only chunk 0 may have been held until a generated token
+        # became available. Flush it together with the first committed span.
+        if chunk_id == 0:
+            saved = transfer_manager.request_payload.pop(request_id, None)
+            if isinstance(saved, dict) and saved.get("embed", {}).get("prefill") is not None:
+                saved_prefill = saved["embed"]["prefill"]
+                saved_hidden = saved.get("hidden_states", {}).get("output")
+                return OmniPayloadStruct(
+                    meta=MetaStruct(
+                        finished=torch.tensor(is_finished, dtype=torch.bool),
+                        decode_span=True,
+                        committed_token_count=len(committed_ids),
+                    ),
+                    embed=EmbeddingsStruct(
+                        prefill=torch.cat((saved_prefill, thinker_emb[:1].detach().cpu()), dim=0),
+                        decode=thinker_emb[1:].detach().cpu(),
+                        tts_bos=saved["embed"].get("tts_bos"),
+                        tts_eos=saved["embed"].get("tts_eos"),
+                        tts_pad=saved["embed"].get("tts_pad"),
+                    ),
+                    hidden_states=HiddenStatesStruct(output=saved_hidden),
+                    ids=IdsStruct(
+                        all=_ensure_list(request.prompt_token_ids) + committed_ids[:1],
+                        prompt=_ensure_list(request.prompt_token_ids),
+                    ),
+                    speaker=speaker,
+                    language=language,
+                )
+
+        return OmniPayloadStruct(
+            meta=MetaStruct(
+                finished=torch.tensor(is_finished, dtype=torch.bool),
+                decode_span=True,
+                committed_token_count=len(committed_ids),
+            ),
+            embed=EmbeddingsStruct(
+                decode=thinker_emb.detach().cpu(),
+                decode_token_start=token_start,
+                decode_token_end=token_end,
+            ),
+            ids=IdsStruct(output=committed_ids),
+            speaker=speaker,
+            language=language,
+        )
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
@@ -557,9 +645,9 @@ def thinker2talker_async_chunk(
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
                 prefill=thinker_emb.detach().cpu(),
-                tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
-                tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
-                tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
+                tts_bos=_as_tensor_or_none(thinker_embed.get("tts_bos")),
+                tts_eos=_as_tensor_or_none(thinker_embed.get("tts_eos")),
+                tts_pad=_as_tensor_or_none(thinker_embed.get("tts_pad")),
             ),
             hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),

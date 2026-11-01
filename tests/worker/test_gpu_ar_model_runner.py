@@ -512,6 +512,7 @@ def test_omni_async_gpu_model_runner_output_reraises_background_exception():
 def _make_async_output_runner(engine_output_type: str = "audio"):
     runner = object.__new__(GPUARModelRunner)
     runner._omni_output_executor = None
+    runner.speculative_config = None
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     model_config = SimpleNamespace(

@@ -134,6 +134,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     audio_seed: int
     token_role_ids: torch.Tensor
     minimax_h3_prepared_reference_videos: str
+    decode_span: bool
+    committed_token_count: int
 
 
 class OmniPayload(TypedDict, total=False):
@@ -266,6 +268,8 @@ class MetaStruct(_StructBase):
     # Duplex session stats (RFC #8325): [epoch, seq] of the chunk the sending
     # request worked on, stamped by the chunk transfer adapter.
     duplex_perf_chunk: list[int] | None = None
+    decode_span: bool | None = None
+    committed_token_count: int | None = None
 
 
 class OmniPayloadStruct(_StructBase):

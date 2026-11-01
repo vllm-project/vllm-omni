@@ -1445,7 +1445,10 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         cached_thinker_decode_embeds = embed.get("cached_decode", None)
         thinker_decode_embed = embed.get("decode", None)
-        if getattr(self.vllm_config.model_config, "use_v2_model_runner", False) and not meta.get("resumable", False):
+        queued_decode = meta.get("decode_span", False) or getattr(
+            self.vllm_config.model_config, "use_v2_model_runner", False
+        )
+        if queued_decode and not meta.get("resumable", False):
             return self._next_thinker_decode_text_step(
                 cached_thinker_decode_embeds, thinker_decode_embed, meta, device, update_dict
             )

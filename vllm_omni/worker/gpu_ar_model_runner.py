@@ -1057,10 +1057,8 @@ class GPUARModelRunner(
         scheduler_output: SchedulerOutput,
         valid_sampled_token_ids: list[list[int]],
     ) -> list[int] | None:
-        """Return committed token IDs for the supported synchronous spec step."""
+        """Return verifier-committed token IDs for this speculative step."""
         if self.speculative_config is None or not self.speculative_config.use_dflash():
-            return None
-        if getattr(getattr(self, "model_config", None), "async_chunk", False):
             return None
 
         if not scheduler_output.scheduled_spec_decode_tokens.get(rid):
@@ -1073,11 +1071,16 @@ class GPUARModelRunner(
         req_state = getattr(self, "requests", {}).get(rid)
         prompt_len = len(req_state.prompt_token_ids or []) if req_state else 0
         output_ids = list(req_state.output_token_ids or []) if req_state else []
+        is_async_chunk = bool(getattr(getattr(self, "model_config", None), "async_chunk", False))
+        # Async chunk mode holds the first prefill sample until the first
+        # verifier span arrives. Seed it only on that first generated-token
+        # step; later spans already have prior output tokens.
+        seed_first_sample = len(output_ids) - len(committed) == 1 if is_async_chunk else prior_rows <= prompt_len
         if (
-            prior_rows <= prompt_len
+            seed_first_sample
             and output_ids
             and committed
-            and int(output_ids[0]) != int(committed[0])
+            and (is_async_chunk or int(output_ids[0]) != int(committed[0]))
         ):
             committed.insert(0, int(output_ids[0]))
         return committed
@@ -1152,6 +1155,11 @@ class GPUARModelRunner(
             for key in tuple(mm_payload):
                 if key.startswith("hidden_states.layer_") and key != "hidden_states.layer_0":
                     mm_payload.pop(key, None)
+            payload["meta"] = {
+                "decode_span": True,
+                "committed_token_count": len(committed_token_ids or []),
+            }
+            payload["ids"] = {"output": list(committed_token_ids or [])}
 
         # Prepend per-layer HS restored from LMCache on a KV-cache hit so the
         # talker sees the full prefix. Audio-sparse outputs skip the hidden tap

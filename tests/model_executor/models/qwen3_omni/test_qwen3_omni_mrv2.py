@@ -58,10 +58,12 @@ def test_mtp_frame_valid_rejects_codec_eos_and_special_ids():
     assert _talker().mtp_frame_valid(layer0).tolist() == [True, True, False, False, False]
 
 
-def test_decode_rows_are_consumed_one_per_step_in_arrival_order():
+@pytest.mark.parametrize("v2", [True, False])
+def test_decode_rows_are_consumed_one_per_step_in_arrival_order(v2):
     model = _talker()
+    model.vllm_config.model_config.use_v2_model_runner = v2
     # Two rows were already pending (cached at prefill); two more arrive at once.
-    payload = {"embed": {"cached_decode": _rows(1, 2), "decode": _rows(3, 4)}, "meta": {}}
+    payload = {"embed": {"cached_decode": _rows(1, 2), "decode": _rows(3, 4)}, "meta": {"decode_span": not v2}}
     steps = [_step(model, payload)[0].item()]
     for arrival in (None, _rows(5), None, None, None, None):
         payload["embed"]["decode"] = arrival
