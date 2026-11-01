@@ -1055,7 +1055,10 @@ class MiniMaxH3DiTModel(nn.Module):
                 # parameter, including TP slicing and online quantization.
                 weight_loader(param, loaded_weight, layout)
                 qkv_parts.setdefault(name, set()).add(layout)
-            elif name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")) and self._grouped_qkv_weights:
+            elif name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")) and getattr(
+                self, "_grouped_qkv_weights", True
+            ):
+                # Default True: some callers build the model without this constructor path.
                 # The native checkpoint groups Q/K/V per head for both the
                 # weight and its scale. Transform both before entering vLLM's
                 # loader so each scale stays aligned with its weight rows.
