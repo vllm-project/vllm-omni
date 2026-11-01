@@ -1037,6 +1037,13 @@ def _resolve_cfg_value(config_value: float) -> float:
             raise ValueError(f"VLLM_OMNI_SPEECH_CFG_VALUE={cfg_from_env!r} is not a valid float") from exc
         source = f"VLLM_OMNI_SPEECH_CFG_VALUE={cfg_from_env!r}"
     else:
+        # a yaml boolean parses as a Python bool, which float() silently
+        # accepts (true -> 1.0 = CFG effectively off); reject it loudly.
+        if isinstance(config_value, bool):
+            raise ValueError(
+                f"voxcpm2_runtime_config.cfg_value={config_value!r} is a boolean; "
+                "cfg_value must be a positive finite float"
+            )
         try:
             value = float(config_value)
         except (TypeError, ValueError) as exc:
