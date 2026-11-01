@@ -1268,7 +1268,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
 
         response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", response_format="pcm"))
 
@@ -1289,7 +1293,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
         await server.create_speech(OpenAICreateSpeechRequest(input="Hello", watermarking=False))
         assert mock_engine.generate.call_args.kwargs["watermarking"] is False
 
@@ -1523,7 +1531,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
         mocker.patch.object(
             server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
         )

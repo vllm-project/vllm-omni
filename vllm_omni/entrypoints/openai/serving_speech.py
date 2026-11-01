@@ -4,7 +4,6 @@
 import asyncio
 import base64
 import contextlib
-import copy
 import hashlib
 import io
 import json

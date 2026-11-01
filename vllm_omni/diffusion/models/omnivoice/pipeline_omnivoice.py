@@ -460,9 +460,10 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         instruct = "None"
         voice_name = None
         extra = sampling_params.extra_args or {}
-        seed = sampling_params.seed
+        # Legacy model-owned seeds must survive the request's random default.
+        seed = extra.get("seed")
         if seed is None:
-            seed = extra.get("seed")
+            seed = sampling_params.seed
         try:
             chunk_duration = _parse_chunking_seconds(
                 "audio_chunk_duration",
