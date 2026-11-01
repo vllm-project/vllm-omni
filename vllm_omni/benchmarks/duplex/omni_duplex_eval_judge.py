@@ -11,6 +11,8 @@ from typing import Any
 import pybase64 as base64
 import requests
 
+from .omni_duplex_eval_judge_capture import record_judge_request
+
 
 class JudgeResponseError(ValueError):
     """Retain an incomplete judge reply without treating its prefix as a score."""
@@ -37,14 +39,17 @@ class DuplexJudge:
 
     def chat(self, content: Any, *, system: str | None = None, max_tokens: int = 1200) -> str:
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+        }
+        # Observe only the owned JSON body; never headers, credentials or client state.
+        record_judge_request(payload)
         response = requests.post(
             _build_openai_url(self.base_url, "/chat/completions"),
-            json={
-                "model": self.model,
-                "messages": messages,
-                "temperature": 0.1,
-                "max_tokens": max_tokens,
-            },
+            json=payload,
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             timeout=self.timeout,
         )
