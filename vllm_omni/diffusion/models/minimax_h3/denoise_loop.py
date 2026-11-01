@@ -22,9 +22,11 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.diffusion.kv_offload_config import REFERENCE_ISOLATION_STATE
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit, minimax_h3_prepare_edit_rows
+from .reference_isolation import MiniMaxH3ReferenceIsolation, reference_isolation_enabled
 from .sampling import create_h3_sample_solver
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
@@ -369,17 +371,29 @@ def minimax_h3_denoise_loop(
     video_solver = create_h3_sample_solver(sampler, sigmas_video)
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
-    reference_kv_state = None
-    create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
-    if callable(create_reference_kv_state):
-        reference_kv_state = create_reference_kv_state(
-            global_reference_rows=int((~positive.update_mask).sum()),
+    reference_isolation = None
+    if reference_isolation_enabled(getattr(model, "od_config", None)):
+        if video_edit is not None or audio_edit is not None:
+            raise ValueError("--kv-isolate does not support latent editing")
+        reference_isolation = MiniMaxH3ReferenceIsolation(
+            positive.img_pos[~positive.update_mask],
+            sequence_rows=positive.seq_len,
+            used_rows=positive.used_len,
+            condition_timestep=float(imgvid_cond_noise_aug_for_inference),
             device=device,
         )
-    if reference_kv_state is not None:
-        positive.static_kwargs["reference_kv_state"] = reference_kv_state
-
+    reference_kv_state = None
     try:
+        create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
+        if callable(create_reference_kv_state):
+            reference_kv_state = create_reference_kv_state(
+                global_reference_rows=int((~positive.update_mask).sum()),
+                device=device,
+            )
+        if reference_kv_state is not None:
+            positive.static_kwargs["reference_kv_state"] = reference_kv_state
+        if reference_isolation is not None:
+            positive.static_kwargs[REFERENCE_ISOLATION_STATE] = reference_isolation
         for step in range(num_steps):
             check_request_cancellation()
             step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
@@ -395,6 +409,8 @@ def minimax_h3_denoise_loop(
                 minimax_h3_publish_denoise_progress(step, s_v, num_steps)
                 t_v, t_a = 1.0 - s_v, 1.0 - s_a
                 imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
+                if reference_isolation is not None:
+                    imgvid_cond_t = reference_isolation.condition_timestep
                 audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
 
                 model_video_rows, video_target_timesteps = minimax_h3_prepare_edit_rows(
@@ -476,9 +492,14 @@ def minimax_h3_denoise_loop(
 
     finally:
         minimax_h3_publish_denoise_progress(None, None, None)
-        if reference_kv_state is not None:
-            positive.static_kwargs.pop("reference_kv_state", None)
-            reference_kv_state.close()
+        positive.static_kwargs.pop("reference_kv_state", None)
+        positive.static_kwargs.pop(REFERENCE_ISOLATION_STATE, None)
+        try:
+            if reference_kv_state is not None:
+                reference_kv_state.close()
+        finally:
+            if reference_isolation is not None:
+                reference_isolation.close()
     return video_rows, audio_rows
 
 

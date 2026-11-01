@@ -981,6 +981,14 @@ class OmniServeCommand(CLISubcommand):
             "resident_layers (DiT only).",
         )
         omni_config_group.add_argument(
+            "--kv-isolate",
+            action="store_true",
+            default=None,
+            help="Experimental MiniMax-H3 visual-reference isolation with one-time KV capture, "
+            "Host INT8 and asynchronous layer prefetch. Changes model semantics and takes "
+            "precedence over --kv-offload-config.",
+        )
+        omni_config_group.add_argument(
             "--kv-offload-config",
             type=json.loads,
             default=None,
