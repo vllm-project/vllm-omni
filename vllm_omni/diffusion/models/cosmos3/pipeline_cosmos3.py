@@ -1282,6 +1282,10 @@ class Cosmos3OmniDiffusersPipeline(
 
         Returns the remapped name under ``transformer.``, or None to skip.
         """
+        # ModelOpt calibration state is not consumed by runtime linears;
+        # their exported input_scale/weight_scale tensors are loaded instead.
+        if ".input_quantizer." in key or ".weight_quantizer." in key:
+            return None
         k = key
         # Strip the weights_sources prefix
         if k.startswith("transformer."):

@@ -643,7 +643,8 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help=(
                 "HSDP checkpoint loading strategy: 'full' loads then shards; "
-                "'pre_sharded' shards meta parameters first and reads rank-local HF safetensors slices."
+                "'pre_sharded' reads checkpoint shards into proxies, then gathers, processes, "
+                "and shards each real block one by one."
             ),
         )
         omni_config_group.add_argument(
