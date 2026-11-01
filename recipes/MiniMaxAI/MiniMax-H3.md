@@ -613,9 +613,9 @@ vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors 
   --enable-distributed-layerwise-offload --dlo-no-use-allgather --dlo-resident-layers 20
 ```
 
-- `--task-type fl2va` serves T2VA and FL2VA from the file; `--task-type ref2va`
-  serves Ref2VA from the same or another file. The combined `auto` mode is not
-  supported for single files, because one file holds one DiT.
+- `--task-type` is required: `fl2va` serves T2VA and FL2VA from the file,
+  `ref2va` serves Ref2VA from the same or another file. One file holds one
+  DiT, so the default combined partition is rejected at startup.
 - `base_model` / `base_revision` default to the pinned MiniMax-H3 release shown
   above; `base_model` may also be a local component tree (the directory that
   contains `FL2VA/`). Only the shared components are downloaded from it.
@@ -631,10 +631,18 @@ vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors 
   rejected at load time. The exact AdaLN sidecar cache (below) is disabled for
   single files; the runtime AdaLN cache still applies.
 - All parallelism and offload profiles of this recipe apply unchanged
-  (validated: TP1 + Ulysses 4 with HSDP, TP2 + distributed layerwise offload,
-  TP4). Quality numbers for 10Eros-Max beta5 against official H3, and an open
-  finding on near-silent FL2VA audio for some first/last-frame inputs, are in
-  `docs/source/features/diffusion/minimax_h3_beta5_validation.md`.
+  (validated with 10Eros-Max beta5: TP1 + Ulysses 4 with HSDP, TP2 +
+  distributed layerwise offload, TP4 for Turbo, single-GPU layerwise offload).
+- Fixed-seed comparison of beta5 against official H3 (TP2 + DLO, seed 42;
+  LPIPS lower is closer, CLAP is the cosine similarity of the two audio
+  tracks): Turbo T2VA / FL2VA / Ref2VA LPIPS 0.70 / 0.03 / 0.34, CLAP 0.68 /
+  -0.15 / 0.81; non-Turbo 0.57 / 0.03 / 0.46, CLAP 0.80 / -0.12 / 0.70.
+  Seconds per request are within ±25% of official H3 in every case. Under
+  some first/last-frame inputs with a quiet prompt, beta5 FL2VA audio is
+  near-silent while official H3 is not; the DiT predicts the audio VAE's
+  silence latent from the first step, so this is checkpoint behaviour, not a
+  loader defect. Run manifests, per-seed metrics and the reproduction scripts:
+  <https://github.com/abinzzz/vllm-omni/tree/feat/h3-single-file-bf16/tools/minimax_h3/reproduce_a1>.
 
 ## AMD ROCm (gfx942 / gfx950)
 

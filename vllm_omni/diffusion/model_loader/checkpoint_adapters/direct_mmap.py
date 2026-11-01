@@ -29,7 +29,9 @@ class DirectMmapAdapter(Protocol):
     ) -> DirectMmapTensorPolicy | None: ...
 
 
-def _restore_h3_fp32(weight: torch.Tensor, *, transform: Callable | None = None) -> torch.Tensor:
+def _restore_h3_fp32(
+    weight: torch.Tensor, *, transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+) -> torch.Tensor:
     if transform is not None:
         weight = transform(weight)
     return weight.float()

@@ -24,7 +24,10 @@ class MiniMaxH3SingleFileSpec:
             for name in source.keys():
                 tensor = source.get_slice(name)
                 if tensor.get_dtype() not in {"BF16", "F32"}:
-                    raise ValueError(f"H3 A1 does not support quantized or non-BF16/FP32 tensors: {name}")
+                    raise ValueError(
+                        "MiniMax-H3 single-file loading supports only BF16/FP32 tensors; "
+                        f"got {tensor.get_dtype()} for {name}"
+                    )
                 shapes[name] = tuple(tensor.get_shape())
 
         def shape(name: str, ndim: int) -> tuple[int, ...]:

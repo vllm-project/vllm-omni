@@ -76,7 +76,7 @@ def test_inspect_compressed_checkpoint_derives_native_architecture(tmp_path, che
     [
         ("missing_projection", "missing"),
         ("bad_projection_shape", "shape"),
-        ("quantized", "quantized"),
+        ("quantized", "only BF16/FP32"),
         ("unknown_tensor", "unsupported"),
         ("missing_block", "contiguous"),
         ("invalid_grid", "curve"),
@@ -243,16 +243,21 @@ def test_pipeline_loads_selected_file_for_each_task(
         }[base_source],
     )
     config.enrich_config()
+    if task is None:
+        # One file holds one DiT: the default combined partition is rejected before any download.
+        with pytest.raises(ValueError, match="holds one DiT"):
+            pipeline_module.MiniMaxH3Pipeline(od_config=config)
+        assert base_download_calls == []
+        return
     pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=config)
     loader = DiffusersPipelineLoader(LoadConfig(), config)
     sources = pipeline.weights_sources
-    assert len(sources) == (2 if task is None else 1)
+    assert len(sources) == 1
     weights = (item for source in sources for item in loader._get_weights_iterator(source, model=pipeline))
     loaded = pipeline.load_weights(weights)
     expected = torch.tensor([[1.0, 6.0]])
-    for requested in {"t2va", "fl2va", "ref2va"} if task is None else {task}:
-        transformer = pipeline._transformer_for_task(requested)
-        torch.testing.assert_close(transformer.time_embedder(torch.tensor([0.25])), expected, rtol=0, atol=0)
+    transformer = pipeline._transformer_for_task(task)
+    torch.testing.assert_close(transformer.time_embedder(torch.tensor([0.25])), expected, rtol=0, atol=0)
     assert "transformer.time_embedder.table" in loaded
     assert all(source.model_or_path == str(path.parent) for source in sources)
     assert set(component_paths) == {str(base / "FL2VA" / component) for component in ("video_vae", "audio_vae")}

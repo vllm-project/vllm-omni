@@ -16,7 +16,7 @@ from torch import nn
 
 from tests.helpers.mark import hardware_marks
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.parallel]
+pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion, pytest.mark.parallel]
 
 
 def _load_worker(rank, checkpoint_dir, rendezvous):

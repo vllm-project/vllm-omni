@@ -1031,6 +1031,10 @@ class MiniMaxH3Pipeline(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
+        if single_file and self.partition == "combined":
+            raise ValueError(
+                "a single-file MiniMax-H3 checkpoint holds one DiT; pass --task-type t2va, fl2va or ref2va"
+            )
         control_path = getattr(od_config, "controlnet_model_path", None)
         if control_path:
             if not Path(control_path).is_file() or Path(control_path).suffix != ".safetensors":
@@ -1062,7 +1066,7 @@ class MiniMaxH3Pipeline(
             component_revision,
             self.partition,
             load_text_encoder=self.load_text_encoder,
-            **({"load_transformer": False} if single_file else {}),
+            load_transformer=not single_file,
         )
         if modular:
             model_path = model_root
