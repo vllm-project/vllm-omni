@@ -81,3 +81,66 @@ def test_edge_pad_disabled_returns_text_untouched(monkeypatch):
 
 def test_empty_text_passthrough():
     assert shape_voxcpm2_edge_digits("") == ""
+
+
+def test_normalize_with_unavailable_normalizer_keeps_sentinel(monkeypatch):
+    from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import normalize_voxcpm2_text
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1")
+    # the cached-None normalizer (import/construct failure) must degrade to
+    # the documented TN-off path: no crash, sentinel still applied+restored
+    shaped = shape_voxcpm2_edge_digits("10今天天气真好，一起去吃饭。10")
+    out = normalize_voxcpm2_text(shaped, None)
+    assert "10" in out and "" not in out  # sentinel round-trips away
+
+
+def test_normalize_none_guard_with_tn_trigger(monkeypatch):
+    from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import normalize_voxcpm2_text
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1")
+    # the regression: a numeric string + None normalizer used to AttributeError
+    out = normalize_voxcpm2_text("10，今天天气真好", None)
+    assert out == "10，今天天气真好"
+
+
+def test_normalize_off_switch_skips_normalizer(monkeypatch):
+    from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import normalize_voxcpm2_text
+
+    class _Boom:
+        def normalize(self, t):
+            raise AssertionError("normalizer must not be called when TN is off")
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "0")
+    assert normalize_voxcpm2_text("10，今天", _Boom()) == "10，今天"
+
+
+def test_normalize_calls_normalizer_when_on(monkeypatch):
+    from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import normalize_voxcpm2_text
+
+    class _Stub:
+        def __init__(self):
+            self.calls = []
+
+        def normalize(self, t):
+            self.calls.append(t)
+            return t.replace("10", "十")
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1")
+    stub = _Stub()
+    out = normalize_voxcpm2_text("10，今天天气真好", stub)
+    assert stub.calls == ["10，今天天气真好"]
+    assert out == "十，今天天气真好"
+
+
+def test_normalize_sentinel_survives_normalizer_roundtrip(monkeypatch):
+    from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import normalize_voxcpm2_text
+
+    # a lone leading zero is sentinel-held into TN and restored after
+    class _Stub:
+        def normalize(self, t):
+            return t.replace("0", "零")  # would eat a bare leading 0
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1")
+    shaped = shape_voxcpm2_edge_digits("0今天天气真好")
+    out = normalize_voxcpm2_text(shaped, _Stub())
+    assert out.startswith("0，"), f"sentinel must protect the leading 0 through TN, got {out!r}"

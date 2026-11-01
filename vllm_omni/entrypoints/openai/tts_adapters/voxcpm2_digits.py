@@ -47,7 +47,7 @@ def shape_voxcpm2_edge_digits(text: str) -> str:
     lone-zero sentinel) before TextNormalizer sees the text."""
     if not text:
         return text
-    if os.environ.get("VLLM_OMNI_SPEECH_EDGE_PAD", "1") == "0":
+    if os.environ.get("VLLM_OMNI_SPEECH_EDGE_PAD", "1").strip().lower() in {"0", "false", "no", "off"}:
         return text
     # Leading "10" gets the same comma lead-in as single digits.
     text = _VOXCPM2_LEAD_TEN_RE.sub("10，", text)
@@ -85,7 +85,7 @@ def normalize_voxcpm2_text(text: str, text_normalizer: Any) -> str:
     if (
         text
         and text_normalizer is not None
-        and os.environ.get("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1") != "0"
+        and os.environ.get("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1").strip().lower() not in {"0", "false", "no", "off"}
         and _VOXCPM2_TN_TRIGGER_RE.search(text)
     ):
         normalized = text_normalizer.normalize(text)
