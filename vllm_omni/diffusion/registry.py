@@ -22,6 +22,7 @@ logger = init_logger(__name__)
 
 _NATIVE_SINGLE_FILE_MODELS = {
     "AnimaPipeline": ("AnimaModularPipeline",),
+    "MiniMaxH3Pipeline": ("MiniMaxH3ModularPipeline",),
 }
 
 

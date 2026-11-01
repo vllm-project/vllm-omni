@@ -595,6 +595,47 @@ them across ranks. DiT `rank-local` instead retains complete loader-produced
 tensors and avoids the synchronized request-wave contract. H3's TP-sharded
 text encoder uses `rank-local`.
 
+## Community single-file checkpoints (ComfyUI layout)
+
+Community H3 derivatives such as [TenStrip/10Eros-Max](https://huggingface.co/TenStrip/10Eros-Max)
+are published as one ComfyUI-layout `.safetensors` file per DiT variant instead
+of the `FL2VA/` and `Ref2VA/` component trees. Point the server at that file;
+the tokenizer, processor, Qwen3-VL text encoder, video/audio VAEs and release
+metadata are taken from the base MiniMax-H3 repository.
+
+```bash
+vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors \
+  --omni --model-class-name MiniMaxH3Pipeline --trust-remote-code \
+  --task-type fl2va \
+  --custom-pipeline-args '{"base_model": "MiniMaxAI/MiniMax-H3", "base_revision": "42ed227ee7df40d41602854ae760620d6eb651fe"}' \
+  --num-gpus 2 --tensor-parallel-size 2 --text-encoder-tp-size 2 \
+  --vae-patch-parallel-size 2 --vae-parallel-mode tile \
+  --enable-distributed-layerwise-offload --dlo-no-use-allgather --dlo-resident-layers 20
+```
+
+- `--task-type fl2va` serves T2VA and FL2VA from the file; `--task-type ref2va`
+  serves Ref2VA from the same or another file. The combined `auto` mode is not
+  supported for single files, because one file holds one DiT.
+- `base_model` / `base_revision` default to the pinned MiniMax-H3 release shown
+  above; `base_model` may also be a local component tree (the directory that
+  contains `FL2VA/`). Only the shared components are downloaded from it.
+- The file is executed as stored. Its QKV rows already use vLLM's packed
+  order, and its **compressed AdaLN** (`adaln_t_table` plus per-block
+  projections) is interpolated and projected in FP32 exactly as ComfyUI does,
+  without reconstructing dense time embeddings. The optional `adaln_basis` /
+  `adaln_mean` adapter tensors are ignored at inference.
+- Turbo files already contain the merged distillation deltas: do not add a
+  LightX2V adapter. Use 8 steps for Turbo files and 50 for the others, with
+  the same video/audio flow shifts as the official release.
+- Supported tensor dtypes are BF16 and FP32. INT8 and W4A8 single files are
+  rejected at load time. The exact AdaLN sidecar cache (below) is disabled for
+  single files; the runtime AdaLN cache still applies.
+- All parallelism and offload profiles of this recipe apply unchanged
+  (validated: TP1 + Ulysses 4 with HSDP, TP2 + distributed layerwise offload,
+  TP4). Quality numbers for 10Eros-Max beta5 against official H3, and an open
+  finding on near-silent FL2VA audio for some first/last-frame inputs, are in
+  `docs/source/features/diffusion/minimax_h3_beta5_validation.md`.
+
 ## AMD ROCm (gfx942 / gfx950)
 
 The sections above describe the NVIDIA CUDA path. This section covers the AMD

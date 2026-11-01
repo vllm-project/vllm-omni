@@ -92,10 +92,11 @@ def _resolve_source_root(source: object) -> str:
             download_weights_from_hf,
         )
 
+        allow_patterns = getattr(source, "allow_patterns_overrides", None)
         source_root = download_weights_from_hf(
             model_name_or_path=source_root,
             cache_dir=None,
-            allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+            allow_patterns=["*.safetensors", "*.safetensors.index.json"] if allow_patterns is None else allow_patterns,
             revision=getattr(source, "revision", None),
             subfolder=subfolder,
         )
@@ -122,9 +123,13 @@ def _add_safetensors_source(
     prefix: str,
     remap_fn: Callable[[str], str | None] | None,
     model_to_ckpt: dict[str, tuple[str, str]],
+    allow_patterns: list[str] | None = None,
 ) -> int:
     indexed_keys = 0
-    index_files = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors.index.json")))
+    # Match the ordinary loader: explicit weight patterns bypass shard indices.
+    index_files = (
+        sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors.index.json"))) if allow_patterns is None else []
+    )
     if index_files:
         for index_file in index_files:
             with open(index_file, encoding="utf-8") as handle:
@@ -142,7 +147,13 @@ def _add_safetensors_source(
                 indexed_keys += 1
         return indexed_keys
 
-    for filename in sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors"))):
+    weight_files = {
+        filename
+        for pattern in (["*.safetensors"] if allow_patterns is None else allow_patterns)
+        for filename in glob.glob(os.path.join(checkpoint_dir, pattern))
+        if filename.endswith(".safetensors")
+    }
+    for filename in sorted(weight_files):
         with safe_open(filename, framework="pt", device="cpu") as handle:
             for checkpoint_key in handle.keys():
                 source_name = prefix + checkpoint_key
@@ -168,6 +179,7 @@ def _build_source_map(
             getattr(source, "prefix", ""),
             remap_fn,
             model_to_ckpt,
+            allow_patterns=getattr(source, "allow_patterns_overrides", None),
         )
 
     if not sources:
