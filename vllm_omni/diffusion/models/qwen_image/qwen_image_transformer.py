@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from math import prod
 from typing import TYPE_CHECKING, Any
 
@@ -16,12 +17,15 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
+from diffusers.models.normalization import RMSNorm as DiffusersRMSNorm
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -60,6 +64,7 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     select01_modulation_native,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -655,6 +660,45 @@ class FeedForward(nn.Module):
         return hidden_states
 
 
+class _ReferenceAdaLayerNorm(AdaLayerNorm):
+    """Keep PyTorch reduction and activation rounding in the eager reference."""
+
+    def forward_cuda(self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x, scale, shift)
+
+
+class _ReferenceTextQKVMethod(UnquantizedLinearMethod):
+    """Separate text GEMMs while retaining packed weights and LoRA dispatch."""
+
+    def __init__(self, original: UnquantizedLinearMethod):
+        # Preserve the configured GEMM provider instead of selecting a new one.
+        self._gemm_impl = original._gemm_impl
+
+    def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        if envs.VLLM_BATCH_INVARIANT or x.device.type != "cuda" or x.dtype != torch.bfloat16:
+            return super().apply(layer, x, bias)
+        sizes = layer.output_partition_sizes
+        weights = layer.weight.split(sizes, dim=0)
+        biases = bias.split(sizes, dim=0) if bias is not None else [None] * len(sizes)
+        return torch.cat([self._gemm_impl(layer, x, w, b) for w, b in zip(weights, biases)], dim=-1)
+
+
+def _reference_qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    norm_q: nn.Module,
+    norm_k: nn.Module,
+    freqs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from diffusers.models.transformers.transformer_qwenimage import apply_rotary_emb_qwen
+
+    # FP32 complex rotation belongs outside compiled/FA paths (#7494).
+    return (
+        apply_rotary_emb_qwen(norm_q(q), freqs, use_real=False),
+        apply_rotary_emb_qwen(norm_k(k), freqs, use_real=False),
+    )
+
+
 class QwenImageCrossAttention(nn.Module):
     def __init__(
         self,
@@ -671,6 +715,7 @@ class QwenImageCrossAttention(nn.Module):
         out_dim: int | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reference_eager: bool = False,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0
@@ -691,9 +736,6 @@ class QwenImageCrossAttention(nn.Module):
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
-
-        self.norm_q = nn.RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
-        self.norm_k = nn.RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         self.inner_dim = out_dim if out_dim is not None else head_dim * self.total_num_heads
 
@@ -730,9 +772,6 @@ class QwenImageCrossAttention(nn.Module):
             prefix=f"{prefix}.to_out.0",
         )
 
-        self.norm_added_q = nn.RMSNorm(head_dim, eps=eps)
-        self.norm_added_k = nn.RMSNorm(head_dim, eps=eps)
-
         self.attn = Attention(
             num_heads=self.query_num_heads,
             head_size=self.head_dim,
@@ -741,6 +780,24 @@ class QwenImageCrossAttention(nn.Module):
             num_kv_heads=self.kv_num_heads,
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
+        # TORCH_SDPA is the existing conservative correctness reference. Do not
+        # change the selected attention backend or compiled/FA arithmetic.
+        self.reference_precision = bool(
+            reference_eager
+            and current_omni_platform.is_cuda()
+            and self.attn.attn_backend is not None
+            and self.attn.attn_backend.get_name() == "SDPA"
+        )
+        norm_cls = DiffusersRMSNorm if self.reference_precision else nn.RMSNorm
+        self.norm_q = norm_cls(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = norm_cls(head_dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_added_q = norm_cls(head_dim, eps=eps)
+        self.norm_added_k = norm_cls(head_dim, eps=eps)
+        # Keep QKVParallelLinear and its loaders, TP shards, quantization and
+        # outer LoRA wrappers. Only the concrete dense method changes its GEMM
+        # partitioning; explicit batch-invariant execution still delegates.
+        if self.reference_precision and type(self.add_kv_proj.quant_method) is UnquantizedLinearMethod:
+            self.add_kv_proj.quant_method = _ReferenceTextQKVMethod(self.add_kv_proj.quant_method)
 
         try:
             config = get_forward_context().omni_diffusion_config
@@ -785,7 +842,8 @@ class QwenImageCrossAttention(nn.Module):
         # sharded by `_sp_plan` while `txt_freqs` stays replicated, so a joint
         # table built from the two would not line up with the local tokens.
         use_fused_joint = (
-            self.qk_norm
+            not self.reference_precision
+            and self.qk_norm
             and qk_norm_rope_table is not None
             and not sp_active
             and _fused_cuda_supported(img_query, img_key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
@@ -805,6 +863,14 @@ class QwenImageCrossAttention(nn.Module):
                 qk_norm_rope_table,
                 self.eps,
             )
+        elif self.reference_precision:
+            img_query, img_key = _reference_qk_norm_rope(img_query, img_key, self.norm_q, self.norm_k, vid_freqs)
+            txt_query, txt_key = _reference_qk_norm_rope(
+                txt_query, txt_key, self.norm_added_q, self.norm_added_k, txt_freqs
+            )
+            joint_query = torch.cat([txt_query, img_query], dim=1)
+            joint_key = torch.cat([txt_key, img_key], dim=1)
+            joint_value = torch.cat([txt_value, img_value], dim=1)
         else:
             img_query, img_key = _qwen_image_qk_norm_rope(
                 img_query,
@@ -882,6 +948,8 @@ class QwenImageCrossAttention(nn.Module):
 
 
 class QwenImageTransformerBlock(nn.Module):
+    reference_precision = False
+
     def __init__(
         self,
         dim: int,
@@ -892,6 +960,7 @@ class QwenImageTransformerBlock(nn.Module):
         zero_cond_t: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reference_eager: bool = False,
     ):
         super().__init__()
 
@@ -913,7 +982,6 @@ class QwenImageTransformerBlock(nn.Module):
                 prefix=f"{prefix}.img_mod.1",
             ),
         )
-        self.img_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = QwenImageCrossAttention(
             dim=dim,
             num_heads=num_attention_heads,
@@ -922,8 +990,12 @@ class QwenImageTransformerBlock(nn.Module):
             head_dim=attention_head_dim,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            reference_eager=reference_eager,
         )
-        self.img_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.reference_precision = self.attn.reference_precision
+        norm_cls = _ReferenceAdaLayerNorm if self.reference_precision else AdaLayerNorm
+        self.img_norm1 = norm_cls(dim, elementwise_affine=False, eps=eps)
+        self.img_norm2 = norm_cls(dim, elementwise_affine=False, eps=eps)
         self.img_mlp = FeedForward(
             dim=dim,
             dim_out=dim,
@@ -944,9 +1016,9 @@ class QwenImageTransformerBlock(nn.Module):
                 prefix=f"{prefix}.txt_mod.1",
             ),
         )
-        self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.txt_norm1 = norm_cls(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
-        self.txt_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.txt_norm2 = norm_cls(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = FeedForward(
             dim=dim,
             dim_out=dim,
@@ -986,7 +1058,9 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-        use_fused_select01 = modulate_index is not None and can_use_qwen_select01_triton(hidden_states)
+        use_fused_select01 = (
+            not self.reference_precision and modulate_index is not None and can_use_qwen_select01_triton(hidden_states)
+        )
         if use_fused_select01:
             img_modulated, img_gate1 = fused_layernorm_select01(
                 hidden_states,
@@ -1165,18 +1239,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
         self.guidance_embeds = guidance_embeds
         self.quant_config = quant_config
 
-        if not use_layer3d_rope:
-            self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
-        else:
-            self.pos_embed = QwenEmbedLayer3DRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
-
         self.time_text_embed = QwenTimestepProjEmbeddings(
             embedding_dim=self.inner_dim,
             use_additional_t_cond=use_additional_t_cond,
             quant_config=quant_config,
         )
-
-        self.txt_norm = nn.RMSNorm(joint_attention_dim, eps=1e-6)
 
         # Entry projections (image/text) are kept full precision —
         # small sensitive layers at the network boundary (see #2728).
@@ -1206,10 +1273,22 @@ class QwenImageTransformer2DModel(CachedTransformer):
                     zero_cond_t=zero_cond_t,
                     quant_config=quant_config,
                     prefix=f"transformer_blocks.{i}",
+                    reference_eager=od_config.enforce_eager and od_config.dtype == torch.bfloat16,
                 )
                 for i in range(num_layers)
             ]
         )
+
+        self.reference_precision = any(block.reference_precision for block in self.transformer_blocks)
+        norm_cls = DiffusersRMSNorm if self.reference_precision else nn.RMSNorm
+        self.txt_norm = norm_cls(joint_attention_dim, eps=1e-6)
+        # Diffusers constructs these complex tables on CPU before moving them;
+        # do the same computation rather than copying any reference operand.
+        with torch.device("cpu") if self.reference_precision else nullcontext():
+            if not use_layer3d_rope:
+                self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
+            else:
+                self.pos_embed = QwenEmbedLayer3DRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
 
         # Final modulation and output projection are kept full precision —
         # they produce the output latent and are precision-sensitive
@@ -1365,9 +1444,11 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         # One packed table per forward for the joint QK RMSNorm + RoPE + cat of
         # every block. Never mutate the caller-owned dict: rebind to a copy.
-        qk_norm_rope_table = _packed_qk_norm_rope_table(
-            image_rotary_emb[0], image_rotary_emb[1], hidden_states.shape[0], hidden_states.dtype
-        )
+        qk_norm_rope_table = None
+        if not self.reference_precision:
+            qk_norm_rope_table = _packed_qk_norm_rope_table(
+                image_rotary_emb[0], image_rotary_emb[1], hidden_states.shape[0], hidden_states.dtype
+            )
         if qk_norm_rope_table is not None:
             attention_kwargs = {**(attention_kwargs or {}), QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
         elif attention_kwargs is not None:
