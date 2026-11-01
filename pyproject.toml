@@ -109,6 +109,12 @@ indextts2 = [
     "WeTextProcessing; sys_platform == 'linux'",
 ]
 
+# Kokoro-82M grapheme-to-phoneme frontend (English + espeak-ng languages).
+# Japanese / Mandarin voices additionally need misaki[ja] / misaki[zh].
+kokoro = [
+    "misaki[en]>=0.9.4",
+]
+
 # Local-test-only extras
 local = [
     "FlagEmbedding",

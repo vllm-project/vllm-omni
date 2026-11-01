@@ -32,6 +32,7 @@ def _talker(device: torch.device) -> VoxCPM2TalkerForConditionalGeneration:
     model._patch_size = 4
     model._feat_dim = 2
     model._side_dtype = torch.float32
+    model._vae_dtype = torch.float32
     model.config = SimpleNamespace(hidden_size=6)
     model._n_decode_pad_frames = 12
     model._vae_decode_every = 1
