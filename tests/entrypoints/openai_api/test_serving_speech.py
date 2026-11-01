@@ -252,6 +252,7 @@ class TestAudioMixin:
 def create_mock_audio_output_for_test(
     request_id: str = "speech-mock-123",
     metrics: dict | None = None,
+    audio_sample_rate: int | None = None,
 ) -> OmniRequestOutput:
     class MockCompletionOutput:
         def __init__(self, index: int = 0):
@@ -267,6 +268,8 @@ def create_mock_audio_output_for_test(
             self.request_id = request_id
             self.outputs = [MockCompletionOutput(index=0)]
             self.multimodal_output = {"audio": audio_tensor}
+            if audio_sample_rate is not None:
+                self.multimodal_output["audio_sample_rate"] = audio_sample_rate
             self.finished = True
             self.prompt_token_ids = None
             self.encoder_prompt_token_ids = None
@@ -288,6 +291,20 @@ def create_mock_audio_output_for_test(
     )
     output.metrics = metrics
     return output
+
+
+def omnivoice_diffusion_stage_configs():
+    return [
+        SimpleNamespace(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=0,
+                model_stage="dit",
+                model_arch="OmniVoicePipeline",
+            ),
+            model_config=SimpleNamespace(model_arch="OmniVoicePipeline"),
+            worker_type="diffusion",
+        )
+    ]
 
 
 def _write_custom_voice_manifest(root: Path, *, model_type: str, voices: dict) -> None:
@@ -1231,7 +1248,8 @@ class TestSpeechAPI:
         engine_client = mocker.MagicMock()
         server = OmniOpenAIServingSpeech.for_diffusion(
             diffusion_engine=engine_client,
-            model_name="test-model",
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
         )
         assert isinstance(server._adapter, OmniVoiceAdapter)
 
@@ -1250,7 +1268,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
 
         response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", response_format="pcm"))
 
@@ -1271,7 +1293,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
         await server.create_speech(OpenAICreateSpeechRequest(input="Hello", watermarking=False))
         assert mock_engine.generate.call_args.kwargs["watermarking"] is False
 
@@ -1309,11 +1335,15 @@ class TestSpeechAPI:
 
         # Mock generate to yield a valid OmniRequestOutput
         async def mock_generate(*args, **kwargs):
-            yield create_mock_audio_output_for_test()
+            yield create_mock_audio_output_for_test(audio_sample_rate=16000)
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
 
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
 
         # Mock create_audio to avoid actual audio processing/saving
         mocker.patch.object(
@@ -1340,6 +1370,9 @@ class TestSpeechAPI:
         assert response.media_type == "audio/wav"
         assert response.body == b"dummy"
 
+        audio_obj = server.create_audio.call_args.args[0]
+        assert audio_obj.sample_rate == 16000
+
         # Verify generate was called
         mock_engine.generate.assert_called_once()
 
@@ -1353,8 +1386,6 @@ class TestSpeechAPI:
         expected_extra = {
             "existing_arg": "new_value",
             "new_arg": 123,
-            "num_inference_steps": 12,
-            "guidance_scale": 7.0,
         }
         if default_legacy_seed is not None:
             expected_extra["seed"] = (
@@ -1393,7 +1424,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
         mocker.patch.object(
             server,
             "create_audio",
@@ -1459,7 +1494,11 @@ class TestSpeechAPI:
     ) -> None:
         mock_engine = mocker.MagicMock()
         mock_engine.default_sampling_params_list = [OmniDiffusionSamplingParams()]
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
 
         response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", extra_params=extra_params))
 
@@ -1492,7 +1531,11 @@ class TestSpeechAPI:
             yield create_mock_audio_output_for_test()
 
         mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
-        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mock_engine,
+            model_name="test-model",
+            stage_configs=omnivoice_diffusion_stage_configs(),
+        )
         mocker.patch.object(
             server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
         )
@@ -1537,18 +1580,38 @@ class TestTTSMethods:
         yield server
         server.shutdown()
 
-    def test_diffusion_audio_encode_speed_skips_ar_adapter(self, mocker: MockerFixture):
-        """Pure-diffusion speech keeps generic speed handling outside AR adapters."""
+    def test_diffusion_audio_encode_speed_uses_diffusion_adapter(self, mocker: MockerFixture):
+        """Pure-diffusion speech uses its adapter's speed capability."""
         server = OmniOpenAIServingSpeech.for_diffusion(
             diffusion_engine=mocker.MagicMock(),
-            model_name="test-model",
+            model_name="k2-fsa/OmniVoice",
+            stage_configs=omnivoice_diffusion_stage_configs(),
         )
-        resolve_adapter = mocker.patch.object(serving_speech_module, "resolve_adapter")
 
         speed = server._audio_encode_speed(OpenAICreateSpeechRequest(input="Hello", speed=1.25))
 
         assert speed == 1.25
-        resolve_adapter.assert_not_called()
+
+    def test_diffusion_adapter_detection_scans_pipeline_stages(self, mocker: MockerFixture):
+        server = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=mocker.MagicMock(),
+            model_name="custom-served-name",
+            stage_configs=[
+                SimpleNamespace(
+                    stage_pipeline_config=StagePipelineConfig(
+                        stage_id=0,
+                        model_stage="llm",
+                        model_arch="OtherModel",
+                    ),
+                    model_config=SimpleNamespace(model_arch="OtherModel"),
+                    worker_type="ar",
+                ),
+                omnivoice_diffusion_stage_configs()[0],
+            ],
+        )
+
+        assert server._tts_model_type == "omnivoice"
+        assert isinstance(server._adapter, OmniVoiceAdapter)
 
     @pytest.mark.asyncio
     async def test_create_speech_cuda_oom_returns_internal_server_error(
