@@ -232,6 +232,29 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     assert runner._resolve_global_request_id("unknown") == "unknown"  # fallback to the local id
 
 
+@pytest.mark.parametrize(
+    "steps,last_rank,has_verifier",
+    [(0, True, False), (7, False, False), (7, True, True), (7, True, False)],
+)
+def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier):
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    calls = []
+
+    def load(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        self.num_speculative_steps = steps
+        self.is_last_pp_rank = last_rank
+        self.rejection_sampler = object() if has_verifier else None
+
+    monkeypatch.setattr(omni_ar_model_runner.OmniGPUModelRunner, "load_model", load)
+    if steps and last_rank and not has_verifier:
+        with pytest.raises(ValueError, match="requires a rejection sampler"):
+            runner.load_model(load_dummy_weights=True)
+    else:
+        runner.load_model(load_dummy_weights=True)
+    assert calls == [((), {"load_dummy_weights": True})]
+
+
 @pytest.mark.parametrize("scheduled", [0, 3, 7])
 def test_speculative_proposal_preserves_aux_and_publishes_scheduled_drafts(monkeypatch, scheduled):
     runner = OmniARModelRunner.__new__(OmniARModelRunner)

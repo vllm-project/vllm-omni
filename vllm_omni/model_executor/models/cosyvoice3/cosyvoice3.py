@@ -888,8 +888,11 @@ class CosyVoice3Model(
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
     def get_language_model(self) -> "nn.Module":
-        """Return the language model for upstream MoE detection."""
+        """Expose the decoder for upstream MoE detection and draft-layer setup."""
         if getattr(self, "_dspark_config", None) is not None:
+            # This Qwen decoder's text embedding is not a speech embedding.
+            # Converted drafts must retain their own embed_tokens and lm_head
+            # weights; upstream DSpark honors their loaded own-weight flags.
             return self.talker.llm
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()

@@ -185,18 +185,18 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 \
 
 This option defaults to `false`, preserves the selected attention backend, and compiles only the padded DiT estimator after loading its weights. CUDA with CUDNN_ATTN, FLASH_ATTN, or TORCH_SDPA is required; CPU and the separately compiled packed Flow profiles reject this option. HiFT and the Talker are unchanged. It is independent of speculative decoding and introduces no environment variable.
 
-Compilation occurs on first use, so warm up representative shapes before measuring serving latency. This experimental option is not waveform-equivalent to the eager path: finite-precision changes can affect generated audio, and a small automatic quality screen does not establish equivalence for all inputs. End-to-end throughput and average first-audio latency improved in the measured short-text workload, but tail latency was variable. Validate audio quality and latency for your deployment before enabling it.
+Compilation occurs on first use, so warm up representative request batches and mel lengths before measuring serving latency. The default `torch.compile` automatic-dynamic policy can recompile when shapes change; warmup for one shape does not cover every future length. Use `TORCH_LOGS=recompiles` to check recompilation and fallback on the deployment workload, and measure cold-start latency separately. This experimental option is not waveform-equivalent to the eager path: finite-precision changes can affect generated audio, and a small automatic quality screen does not establish equivalence for all inputs. End-to-end throughput and average first-audio latency improved in the measured short-text workload, but tail latency was variable. Validate audio quality and latency for your deployment before enabling it.
 
 ### Optional DSpark speculative decoding
 
 CosyVoice3 can use vLLM's DSpark drafter on the Talker stage with Model Runner V2 and tensor parallel size 1. This is opt-in and requires a compatible CosyVoice3 DSpark checkpoint; do not configure the drafter on Code2Wav. Convert the checkpoint's unified vocabulary to the speech vocabulary before serving:
 
 ```bash
-python -m vllm_omni.model_executor.models.cosyvoice3.dspark \
+python tools/convert_cosyvoice3_dspark.py \
   /path/to/dspark-checkpoint /path/to/draft-speech
 ```
 
-The conversion writes a new directory and records source and converted file hashes; it refuses to overwrite an existing directory. Add the following fields to stage 0 in a copy of the deploy configuration, retaining the other stage and connector settings:
+Run the converter from a repository checkout with vLLM-Omni installed. The conversion writes a new directory and records source and converted file hashes; it refuses to overwrite an existing directory. Keep its input embedding and output-head weights: the target Qwen decoder has a text embedding, not the drafter's speech-vocabulary embedding. Add the following fields to stage 0 in a copy of the deploy configuration, retaining the other stage and connector settings:
 
 ```yaml
 model_runner: v2
@@ -208,6 +208,8 @@ speculative_config:
 ```
 
 RAS verification includes each draft prefix in the generated-token history while excluding reference-prompt tokens. Standard sampling uses the native rejection sampler. Acceptance and end-to-end gains depend on the workload and Code2Wav cost; enabling speculative decoding does not guarantee lower latency or higher audio throughput.
+
+RAS probability compilation is also lazy: warmup must exercise an actual draft-verification step, not just prefill or ordinary one-token decode. Check both the Talker verification and Code2Wav compiled paths before collecting steady-state metrics. A comparison against a V1 server measures the complete deployment change; to attribute gains to DSpark or DiT compilation, use a separate V2 baseline with both features disabled and change one feature at a time.
 
 ### CLI client
 
