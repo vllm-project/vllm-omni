@@ -114,6 +114,42 @@ def _forget_active_hwr_registration(
 # ones stay resident for lower latency.
 
 
+def _layerwise_prefix_layout(module: nn.Module) -> tuple[int, dict, set, list]:
+    """Discover optional quant-method prefix tensors without registering buffers."""
+    steps, auxiliary, replaced, owners = 0, {}, set(), []
+    for path, child in module.named_modules():
+        provider = getattr(getattr(child, "quant_method", None), "get_layerwise_prefix_weights", None)
+        layout = provider(child) if callable(provider) else None
+        if layout is None:
+            continue
+        count, tensors, names = layout
+        if steps and steps != count:
+            raise ValueError("DLO prefix providers within a block must use the same K")
+        if type(count) is not int or count <= 0:
+            raise ValueError("DLO prefix provider K must be a positive integer")
+        steps = count
+
+        def qualify(name, path=path):
+            return f"{path}.{name}" if path else name
+
+        auxiliary.update({qualify(name): tensor for name, tensor in tensors.items()})
+        replaced.update(qualify(name) for name in names)
+        owners.append(child)
+    return steps, auxiliary, replaced, owners
+
+
+def _in_prefix(steps: int) -> bool:
+    from vllm_omni.diffusion.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    if not steps or not is_forward_context_available():
+        return False
+    step = get_forward_context().denoise_step_idx
+    return step is not None and 0 <= int(step) < steps
+
+
 class DistributedLayerwiseOffloadHook(ModelHook):
     """Hook for distributed layerwise offloading with fixed double-buffer.
 
@@ -243,6 +279,15 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self.gpu_shard_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
 
         self._cached_repoint: tuple[tuple[Any, ...], ...] = ()
+        self._prefix_payload: dict[str, Any] | None = None
+        self._prefix_steps = 0
+        self._block_prefix_steps = 0
+        self._block_auxiliary: dict[str, torch.Tensor] = {}
+        self._next_auxiliary: dict[str, torch.Tensor] = {}
+        self._prefix_owners: list[nn.Module] = []
+        self._prefetched_prefix: bool | None = None
+        self._prefix_staging_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
+        self._prefix_staging_events: list[Any | None] = [None, None]
 
     # ------------------------------------------------------------------ #
     #  DTensor helpers (shared with LayerwiseOffloadHook)                 #
@@ -258,6 +303,23 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         self.next_block_parameters = dict(self.next_block.named_parameters())
         self.next_block_buffers = dict(self.next_block.named_buffers())
+
+        self._block_prefix_steps, self._block_auxiliary, _, _ = _layerwise_prefix_layout(module)
+        self._prefix_steps, self._next_auxiliary, replaced, owners = _layerwise_prefix_layout(self.next_block)
+        if self._prefix_steps:
+            if self.rank_local_mmap:
+                raise ValueError("DLO prefix weights require ordinary CPU backing, not mmap/HWR")
+            if not replaced.issubset(self.next_block_parameters.keys() | self.next_block_buffers.keys()):
+                raise ValueError("DLO prefix provider replaces unknown weights")
+            if any(t.device.type != "cpu" or not t.numel() for t in self._next_auxiliary.values()):
+                raise ValueError("DLO prefix masters must be materialized CPU tensors")
+            prefix_params = {k: v for k, v in self.next_block_parameters.items() if k not in replaced}
+            prefix_bufs = {k: v for k, v in self.next_block_buffers.items() if k not in replaced}
+            if self._next_auxiliary.keys() & (prefix_params.keys() | prefix_bufs.keys()):
+                raise ValueError("DLO auxiliary prefix tensor name collision")
+            prefix_bufs.update(self._next_auxiliary)
+            self._prefix_payload = self._build_prefix_payload(prefix_params, prefix_bufs)
+            self._prefix_owners = owners
 
         if self.rank_local_mmap:
             self.cpu_sources, self.metadata = self._collect_mmap_sources(
@@ -317,9 +379,65 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         # Commit the storage mutation only after every allocation and metadata
         # calculation above has succeeded. Until here, hook setup is retryable.
-        clear_tensor_storage(chain(self.next_block_parameters.values(), self.next_block_buffers.values()))
+        clear_tensor_storage(
+            chain(
+                self.next_block_parameters.values(),
+                self.next_block_buffers.values(),
+                self._next_auxiliary.values(),
+            )
+        )
+        for owner in self._prefix_owners:
+            owner._layerwise_prefix_managed = True
 
         return module
+
+    def _build_prefix_payload(
+        self,
+        params: dict[str, nn.Parameter],
+        bufs: dict[str, torch.Tensor],
+    ) -> dict[str, Any]:
+        """Pack the BF16 representation with the same transport layout machinery."""
+        if self.dp_size > 1:
+            cpu_shards, metadata, manifest = self._pack_chunk_shards(
+                params, bufs, part_id="bf16_prefix", pin_memory=False
+            )
+        else:
+            cpu_shards, metadata = self._shard_and_pin(
+                params,
+                bufs,
+                self.dp_size,
+                self.rank,
+                False,
+                self.tensor_transforms,
+            )
+            manifest = None
+        targets = {**params, **bufs}
+        repoint = tuple(
+            (
+                targets[m["name"]],
+                dtype,
+                m["offset"],
+                m["numel"],
+                m["shape"],
+                m["stride"],
+            )
+            for dtype, metas in metadata.items()
+            for m in metas
+        )
+        ag_sizes = {}
+        for dtype, metas in metadata.items():
+            if manifest is not None:
+                dtype_manifest = next(dm for dm in manifest.dtypes if dm.dtype == dtype)
+                ag_sizes[dtype] = dtype_manifest.padded_numel
+            else:
+                ag_sizes[dtype] = cpu_shards[dtype].numel() * self.dp_size
+        return {
+            "cpu_shards": cpu_shards,
+            "metadata": metadata,
+            "manifest": manifest,
+            "repoint": repoint,
+            "ag_sizes": ag_sizes,
+        }
 
     @staticmethod
     def _collect_mmap_sources(
@@ -384,8 +502,11 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         self,
         params: dict[str, nn.Parameter],
         bufs: dict[str, torch.Tensor],
+        part_id: str = "block",
+        pin_memory: bool | None = None,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]], PartManifest]:
         """Pack next-block weights in chunk-major layout for sliced AllGather."""
+        pin_memory = self.pin_memory if pin_memory is None else pin_memory
         specs: list[tuple[str, torch.Tensor, bool]] = []
         for name, target in chain(params.items(), bufs.items()):
             local = target.to_local() if hasattr(target, "to_local") else target
@@ -404,7 +525,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         manifest = build_part_manifest(
             specs,
             block_id=id(self.next_block),
-            part_id="block",
+            part_id=part_id,
             weight_shard_size=self.dp_size,
             weight_shard_rank=self.rank,
             chunk_size_bytes=self.chunk_size_bytes,
@@ -413,7 +534,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         def _alloc(numel: int, dtype: torch.dtype) -> torch.Tensor:
             tensor = torch.empty(numel, dtype=dtype, device="cpu")
-            return tensor.pin_memory() if self.pin_memory else tensor
+            return tensor.pin_memory() if pin_memory else tensor
 
         cpu_shards = pack_local_shard(specs, manifest, allocator=_alloc)
         metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
@@ -490,27 +611,104 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         return cpu_shards, dtype_metadata
 
+    def device_buffer_sizes(self) -> dict[torch.dtype, int]:
+        """Return per-dtype output capacity required by either representation."""
+        layouts = [(self.metadata, self.manifest, self.cpu_shards)]
+        if self._prefix_payload is not None:
+            layouts.append(
+                (
+                    self._prefix_payload["metadata"],
+                    self._prefix_payload["manifest"],
+                    self._prefix_payload["cpu_shards"],
+                )
+            )
+        sizes: dict[torch.dtype, int] = {}
+        for metadata, manifest, cpu_shards in layouts:
+            for dtype, metas in metadata.items():
+                padded = sum(m["numel"] for m in metas)
+                if self.dp_size > 1:
+                    if manifest is not None:
+                        dtype_manifest = next(dm for dm in manifest.dtypes if dm.dtype == dtype)
+                        padded = dtype_manifest.padded_numel
+                    else:
+                        padded = cpu_shards[dtype].numel() * self.dp_size
+                sizes[dtype] = max(sizes.get(dtype, 0), padded)
+        return sizes
+
+    def shard_buffer_sizes(self) -> dict[torch.dtype, int]:
+        """Return bounded AllGather-input capacity for standard and prefix payloads."""
+        layouts = [(self.manifest, self.cpu_shards)]
+        if self._prefix_payload is not None:
+            layouts.append((self._prefix_payload["manifest"], self._prefix_payload["cpu_shards"]))
+        sizes: dict[torch.dtype, int] = {}
+        for manifest, cpu_shards in layouts:
+            if manifest is not None:
+                for dtype_manifest in manifest.dtypes:
+                    numel = 2 * max(dtype_manifest.local_chunk_numel, 1)
+                    sizes[dtype_manifest.dtype] = max(sizes.get(dtype_manifest.dtype, 0), numel)
+            else:
+                for dtype, shard in cpu_shards.items():
+                    sizes[dtype] = max(sizes.get(dtype, 0), shard.numel())
+        return sizes
+
+    @staticmethod
+    def configure_prefix_staging(hooks: list[DistributedLayerwiseOffloadHook]) -> None:
+        """Bound pinned BF16-prefix backing to two largest per-rank shards."""
+        selected = [h for h in hooks if h._prefix_payload is not None and h.pin_memory]
+        if not selected:
+            return
+        sizes: dict[torch.dtype, int] = {}
+        for hook in selected:
+            for dtype, shard in hook._prefix_payload["cpu_shards"].items():
+                sizes[dtype] = max(sizes.get(dtype, 0), shard.numel())
+        buffers = [
+            {dtype: torch.empty(size, dtype=dtype, device="cpu", pin_memory=True) for dtype, size in sizes.items()}
+            for _ in range(2)
+        ]
+        events: list[Any | None] = [None, None]
+        for hook in selected:
+            hook._prefix_staging_buffers = buffers
+            hook._prefix_staging_events = events
+        logger.info(
+            "BF16 prefix backing is pageable; shared pinned staging bytes=%d across %d hooks",
+            2 * sum(size * _dtype_size(dtype) for dtype, size in sizes.items()),
+            len(selected),
+        )
+
+    def _stage_prefix_shards(self, slot: int) -> dict[torch.dtype, torch.Tensor]:
+        """Wait for prior DMA before replacing a shared host staging slot."""
+        assert self._prefix_payload is not None
+        previous_copy = self._prefix_staging_events[slot]
+        if previous_copy is not None:
+            synchronize = getattr(previous_copy, "synchronize", None)
+            if callable(synchronize):
+                synchronize()
+            else:
+                current_omni_platform.synchronize()
+            self._prefix_staging_events[slot] = None
+        buffers = self._prefix_staging_buffers[slot]
+        if buffers is None:
+            raise RuntimeError("Shared BF16 prefix host staging was not allocated")
+        staged = {}
+        for dtype, source in self._prefix_payload["cpu_shards"].items():
+            target = buffers[dtype][: source.numel()]
+            target.copy_(source)
+            staged[dtype] = target
+        return staged
+
     def _allocate_device_buffers(self) -> None:
         """Pre-allocate exactly two device buffers (one per slot)."""
         for slot in range(2):
             gpu_weights: dict[torch.dtype, torch.Tensor] = {}
-            for dtype, metas in self.metadata.items():
-                total_numel = sum(m["numel"] for m in metas)
-                # AllGather output = dp_size * shard_size (padded)
-                padded = total_numel
-                if self.dp_size > 1:
-                    if self.manifest is not None:
-                        dtype_manifest = next(dm for dm in self.manifest.dtypes if dm.dtype == dtype)
-                        padded = dtype_manifest.padded_numel
-                    else:
-                        shard_sz = (total_numel + self.dp_size - 1) // self.dp_size
-                        padded = shard_sz * self.dp_size
+            for dtype, padded in self.device_buffer_sizes().items():
                 gpu_weights[dtype] = torch.empty(padded, dtype=dtype, device=self.device)
             self.gpu_buffers[slot] = gpu_weights
 
     @property
     def is_materialized(self) -> bool:
         """Check whether this block's parameters hold real data on device."""
+        if self._block_auxiliary and _in_prefix(self._block_prefix_steps):
+            return all(is_materialized_tensor(t) for t in self._block_auxiliary.values())
         return self._materialization_probe is None or is_materialized_tensor(self._materialization_probe)
 
     # ------------------------------------------------------------------ #
@@ -608,7 +806,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     ).copy_(source, non_blocking=async_copy)
 
     @torch.compiler.disable
-    def prefetch_layer(self, slot: int, non_blocking: bool = True) -> None:
+    def prefetch_layer(self, slot: int, non_blocking: bool = True, *, prefix: bool | None = None) -> None:
         """Prepare next block's weights into the shared device buffer for *slot*.
 
         Uses the pre-allocated ``self.gpu_buffers[slot]`` instead of
@@ -620,6 +818,24 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         evt = current_omni_platform.Event()
         gpu_weights = self.gpu_buffers[slot]
         assert gpu_weights is not None, f"gpu_buffers[{slot}] not allocated"
+        use_prefix = self._prefix_payload is not None and (_in_prefix(self._prefix_steps) if prefix is None else prefix)
+        if (
+            self._prefix_payload is not None
+            and self._prefetched_prefix is not None
+            and self._prefetched_prefix != use_prefix
+        ):
+            # A speculative prefetch from the previous phase may still own the
+            # shared slot. Serialize only the representation transition.
+            self.copy_stream.wait_stream(self.comm_stream)
+        payload = self._prefix_payload if use_prefix else None
+        manifest = payload["manifest"] if payload is not None else self.manifest
+        ag_sizes = payload["ag_sizes"] if payload is not None else self._ag_output_sizes
+        repoint = payload["repoint"] if payload is not None else self._cached_repoint
+        staged_prefix = payload is not None and self.pin_memory
+        if staged_prefix:
+            cpu_shards = self._stage_prefix_shards(slot)
+        else:
+            cpu_shards = payload["cpu_shards"] if payload is not None else self.cpu_shards
 
         if self.dp_size <= 1 or self.dp_group is None:
             if self.rank_local_mmap and self.registered_mmap:
@@ -632,7 +848,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                     )
                     evt.record(self.copy_stream)
             else:
-                cpu_weights = self._stage_mmap_sources(slot) if self.rank_local_mmap else self.cpu_shards
+                cpu_weights = self._stage_mmap_sources(slot) if self.rank_local_mmap else cpu_shards
                 with current_omni_platform.stream(self.copy_stream):
                     for dtype, cpu_shard in cpu_weights.items():
                         gw = gpu_weights[dtype]
@@ -646,17 +862,17 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         else:
             shard_bufs = self.gpu_shard_buffers[slot]
             assert shard_bufs is not None, f"gpu_shard_buffers[{slot}] not allocated"
-            if self.manifest is None:
+            if manifest is None:
                 gpu_shards: dict[torch.dtype, torch.Tensor] = {}
                 with current_omni_platform.stream(self.copy_stream):
-                    for dtype, cpu_shard in self.cpu_shards.items():
+                    for dtype, cpu_shard in cpu_shards.items():
                         gpu_shard = shard_bufs[dtype][: cpu_shard.numel()]
                         gpu_shard.copy_(cpu_shard, non_blocking=non_blocking)
                         gpu_shards[dtype] = gpu_shard
                 self.comm_stream.wait_stream(self.copy_stream)
                 with current_omni_platform.stream(self.comm_stream):
                     for dtype, local_shard in gpu_shards.items():
-                        gw = gpu_weights[dtype][: self._ag_output_sizes[dtype]]
+                        gw = gpu_weights[dtype][: ag_sizes[dtype]]
                         torch.distributed.all_gather_into_tensor(
                             gw,
                             local_shard,
@@ -664,8 +880,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                         )
                     evt.record(self.comm_stream)
             else:
-                for dtype_manifest in self.manifest.dtypes:
-                    cpu_shard = self.cpu_shards[dtype_manifest.dtype]
+                for dtype_manifest in manifest.dtypes:
+                    cpu_shard = cpu_shards[dtype_manifest.dtype]
                     buf = shard_bufs[dtype_manifest.dtype]
                     for chunk in dtype_manifest.chunks:
                         if buf.numel() >= 2 * chunk.local_numel:
@@ -697,9 +913,13 @@ class DistributedLayerwiseOffloadHook(ModelHook):
                 with current_omni_platform.stream(self.comm_stream):
                     evt.record(self.comm_stream)
 
+        if staged_prefix:
+            # Protect the shared host slot until H2D and any AllGather finish.
+            self._prefix_staging_events[slot] = evt
         self.ready_events[slot] = evt
         self._prefetch_done = evt
         self._prefetched_slot = slot
+        self._prefetched_prefix = use_prefix
 
         # Stamp the slot with this hook's group ID so that group-first
         # hooks can detect whether another group has overwritten the slot.
@@ -709,7 +929,17 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             self._shared_slot_owner[slot] = id(self)
 
         # Re-point using cached metadata (avoids per-layer dict lookups).
-        for target, dtype, offset, numel, shape, stride in self._cached_repoint:
+        if self._prefix_payload is not None:
+            # Detach views from the previous representation before exposing
+            # the selected payload; shared allocations themselves stay alive.
+            clear_tensor_storage(
+                chain(
+                    self.next_block_parameters.values(),
+                    self.next_block_buffers.values(),
+                    self._next_auxiliary.values(),
+                )
+            )
+        for target, dtype, offset, numel, shape, stride in repoint:
             set_tensor_storage(
                 target,
                 torch.as_strided(
@@ -743,6 +973,8 @@ class DistributedLayerwiseOffloadHook(ModelHook):
     def offload_layer(self) -> None:
         """Free GPU memory for current block by replacing tensors with placeholders."""
         clear_block_storage(self.block_parameters, self.block_buffers, self._prefetch_done)
+        if self._block_auxiliary:
+            clear_tensor_storage(self._block_auxiliary.values())
         self._prefetch_done = None
 
     @torch.compiler.disable
@@ -754,6 +986,33 @@ class DistributedLayerwiseOffloadHook(ModelHook):
         or placeholders would make a later enable shard invalid tensors.
         """
 
+        restored_auxiliary = []
+        if self._prefix_payload is not None:
+            if self.dp_size > 1:
+                self.prefetch_layer(0, non_blocking=False, prefix=True)
+                current_omni_platform.synchronize()
+                for target in self._next_auxiliary.values():
+                    restored_auxiliary.append((target, target.detach().to("cpu").clone()))
+            else:
+                for target, dtype, offset, numel, shape, stride in self._prefix_payload["repoint"]:
+                    if not any(target is tensor for tensor in self._next_auxiliary.values()):
+                        continue
+                    value = torch.as_strided(
+                        self._prefix_payload["cpu_shards"][dtype][offset : offset + numel],
+                        size=shape,
+                        stride=stride,
+                    )
+                    restored_auxiliary.append((target, value))
+
+        # Standard restoration may repoint the shared buffers. Restore the
+        # auxiliary masters afterwards, independently of the live request step.
+        self._restore_standard_next_block_to_cpu()
+        for target, value in restored_auxiliary:
+            restore_tensor_storage(target, value, device="cpu")
+        for owner in self._prefix_owners:
+            owner._layerwise_prefix_managed = False
+
+    def _restore_standard_next_block_to_cpu(self) -> None:
         if self.rank_local_mmap:
             for dtype, metas in self.metadata.items():
                 for source_info, meta in zip(self.cpu_sources[dtype], metas, strict=True):
@@ -785,7 +1044,7 @@ class DistributedLayerwiseOffloadHook(ModelHook):
 
         if self.dp_group is None:
             raise RuntimeError("Cannot restore distributed offload weights without the DLO process group")
-        self.prefetch_layer(0, non_blocking=False)
+        self.prefetch_layer(0, non_blocking=False, prefix=False)
         current_omni_platform.synchronize()
         for target in chain(self.next_block_parameters.values(), self.next_block_buffers.values()):
             local = target.to_local() if hasattr(target, "to_local") else target
@@ -809,6 +1068,13 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             and self._shared_slot_owner[self.current_slot] != id(self._prev_hook)
         )
 
+        # Tail-to-head prefetch belongs to the previous forward's phase.
+        phase_mismatch = (
+            self._prev_hook is not None
+            and self._prev_hook._prefix_payload is not None
+            and self._prev_hook._prefetched_prefix != _in_prefix(self._prev_hook._prefix_steps)
+        )
+
         # Group-first hook: check whether the shared buffer slot was
         # overwritten by another group since our last forward.  If the
         # slot still contains our own data (from the tail hook's async
@@ -817,14 +1083,14 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             slot_contaminated = True
             if self._shared_slot_group is not None:
                 slot_contaminated = weights_overwritten or self._shared_slot_group[self.current_slot] != self._group_id
-            if slot_contaminated:
-                # Another group (or no group) wrote to our slot — re-fetch
+            if slot_contaminated or phase_mismatch:
+                # Another group, a different phase, or no group owns the slot.
                 self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
             # Always wait for data to be ready (handles both sync and async paths)
             self._prev_hook._wait_for_weights(self.current_slot)
-        elif (not self.is_materialized or weights_overwritten) and self._prev_hook is not None:
-            # A predecessor was skipped, or this block's retained view points
-            # at a slot overwritten since its previous prefetch.
+        elif (phase_mismatch or not self.is_materialized or weights_overwritten) and self._prev_hook is not None:
+            # A predecessor was skipped, the prefix phase changed, or this
+            # block's retained view points at a reused slot.
             self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
             self._prev_hook._wait_for_weights(self.current_slot)
 
@@ -1863,6 +2129,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         all_hooks = [hook for group in self._all_hook_groups for hook in group]
         self._configure_hwr_transfer(all_hooks)
+        DistributedLayerwiseOffloadHook.configure_prefix_staging(all_hooks)
 
         if not self._all_hook_groups:
             self.enabled = bool(self._resident_blocks or self._encoder_modules or self._staged_components)
@@ -2129,21 +2396,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """
         max_sizes: dict[torch.dtype, int] = {}
         for hook in hooks:
-            dp = hook.dp_size
-            for dtype, metas in hook.metadata.items():
-                total = sum(m["numel"] for m in metas)
-                # AllGather output = dp * ceil(total/dp) (padded for equal shards)
-                if dp > 1:
-                    if hook.manifest is not None:
-                        dtype_manifest = next(
-                            (dm for dm in hook.manifest.dtypes if dm.dtype == dtype),
-                            None,
-                        )
-                        total = (
-                            dtype_manifest.padded_numel if dtype_manifest is not None else ((total + dp - 1) // dp) * dp
-                        )
-                    else:
-                        total = ((total + dp - 1) // dp) * dp
+            for dtype, total in hook.device_buffer_sizes().items():
                 if dtype not in max_sizes or total > max_sizes[dtype]:
                     max_sizes[dtype] = total
 
@@ -2213,17 +2466,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         """
         max_shard_sizes: dict[torch.dtype, int] = {}
         for hook in hooks:
-            if hook.manifest is not None:
-                for dtype_manifest in hook.manifest.dtypes:
-                    # Two in-flight chunks per output slot (H2D overlaps AllGather).
-                    numel = 2 * max(dtype_manifest.local_chunk_numel, 1)
-                    if dtype_manifest.dtype not in max_shard_sizes or numel > max_shard_sizes[dtype_manifest.dtype]:
-                        max_shard_sizes[dtype_manifest.dtype] = numel
-            else:
-                for dtype, shard in hook.cpu_shards.items():
-                    numel = shard.numel()
-                    if dtype not in max_shard_sizes or numel > max_shard_sizes[dtype]:
-                        max_shard_sizes[dtype] = numel
+            for dtype, numel in hook.shard_buffer_sizes().items():
+                if dtype not in max_shard_sizes or numel > max_shard_sizes[dtype]:
+                    max_shard_sizes[dtype] = numel
 
         device = hooks[0].device
         shared_shard_buffers: list[dict[torch.dtype, torch.Tensor] | None] = [None, None]
