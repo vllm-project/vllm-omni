@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import wave
@@ -14,6 +15,7 @@ from typing import Any
 import numpy as np
 import pytest
 from openai.types import realtime as types
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
@@ -88,9 +90,10 @@ def _make_connection(
     websocket: Any = None,
     engine: Any = None,
     chat_handler: Any = None,
+    hf_config: Any = None,
 ) -> tuple[OpenAIFullDuplexConnection, _FakeRenderer]:
     renderer = _FakeRenderer()
-    model_config = SimpleNamespace(max_model_len=max_model_len, multimodal_config=None)
+    model_config = SimpleNamespace(max_model_len=max_model_len, multimodal_config=None, hf_config=hf_config)
 
     async def preprocess_chat(request: Any, messages: list[dict[str, Any]], **kwargs: Any):
         tok_params = request.build_tok_params(model_config)
@@ -670,7 +673,6 @@ async def test_realtime_truncation_survives_history_mutations() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_audio_prompt_uses_standard_chat_audio_content() -> None:
     audio = b"\x00\x00\x00\x40"
     connection, renderer = _make_connection(websocket=_FakeWebSocket())
@@ -741,6 +743,155 @@ async def test_generated_audio_is_resampled_to_realtime_rate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_generated_audio_honors_session_speed() -> None:
+    samples = SAMPLE_RATE_HZ // 5
+    waveform = np.sin(2 * np.pi * 440 * np.arange(samples) / SAMPLE_RATE_HZ).astype(np.float32)
+    multimodal_output = {"audio": waveform, "sample_rate": SAMPLE_RATE_HZ}
+    output = SimpleNamespace(
+        final_output_type="audio",
+        multimodal_output=multimodal_output,
+        outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
+    )
+
+    async def generate(**_kwargs):
+        yield output
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=[],
+        generate=generate,
+    )
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+    assert connection.session.output_speed == 0.5
+
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["audio"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+
+    events = [json.loads(message) for message in websocket.messages]
+    audio_deltas = [event for event in events if event["type"] == "response.output_audio.delta"]
+    pcm = b"".join(base64.b64decode(event["delta"]) for event in audio_deltas)
+    assert active.item_id is not None
+    assert len(pcm) == int(samples / 0.5) * 2
+    assert connection.session.item_duration_ms[active.item_id] == pytest.approx(400)
+
+
+@pytest.mark.asyncio
+async def test_generated_audio_stretches_each_delta() -> None:
+    samples = SAMPLE_RATE_HZ // 5
+    waveform = np.sin(2 * np.pi * 440 * np.arange(samples) / SAMPLE_RATE_HZ).astype(np.float32)
+    outputs = []
+    for chunk in np.split(waveform, 2):
+        multimodal_output = {"audio": chunk, "sample_rate": SAMPLE_RATE_HZ}
+        outputs.append(
+            SimpleNamespace(
+                final_output_type="audio",
+                multimodal_output=multimodal_output,
+                outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
+            )
+        )
+
+    async def generate(**_kwargs):
+        for output in outputs:
+            yield output
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=[],
+        generate=generate,
+    )
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["audio"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+
+    events = [json.loads(message) for message in websocket.messages]
+    audio_deltas = [event for event in events if event["type"] == "response.output_audio.delta"]
+    assert len(audio_deltas) == 2
+    pcm = b"".join(base64.b64decode(event["delta"]) for event in audio_deltas)
+    assert active.item_id is not None
+    assert len(pcm) == int(samples / 0.5) * 2
+    assert connection.session.item_duration_ms[active.item_id] == pytest.approx(400)
+
+
+def test_stretch_audio_delta_is_noop_at_default_speed() -> None:
+    chunk = np.zeros(128, dtype=np.float32)
+
+    assert OpenAIFullDuplexConnection._stretch_audio_delta(chunk, SAMPLE_RATE_HZ, 1.0) is chunk
+
+
+@pytest.mark.asyncio
+async def test_generated_audio_applies_speed_before_resampling() -> None:
+    source_rate = 32_000
+    samples = source_rate // 10
+    waveform = np.sin(2 * np.pi * 440 * np.arange(samples) / source_rate).astype(np.float32)
+    multimodal_output = {"audio": waveform, "sample_rate": source_rate}
+
+    async def generate(**_kwargs):
+        yield SimpleNamespace(
+            final_output_type="audio",
+            multimodal_output=multimodal_output,
+            outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
+        )
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=[],
+        generate=generate,
+    )
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["audio"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+
+    events = [json.loads(message) for message in websocket.messages]
+    pcm = b"".join(
+        base64.b64decode(event["delta"]) for event in events if event["type"] == "response.output_audio.delta"
+    )
+    assert active.item_id is not None
+    assert len(pcm) == int(samples / 0.5 / source_rate * SAMPLE_RATE_HZ) * 2
+    assert connection.session.item_duration_ms[active.item_id] == pytest.approx(200)
+
+
+@pytest.mark.asyncio
 async def test_minicpmo45_realtime_keeps_thinker_final_only() -> None:
     model_arch = "MiniCPMO45OmniForConditionalGeneration"
     stages = [
@@ -785,6 +936,845 @@ async def test_minicpmo45_realtime_keeps_thinker_final_only() -> None:
         RequestOutputKind.FINAL_ONLY,
         RequestOutputKind.DELTA,
     ]
+
+
+def _session_update(voice: str | dict[str, str], *, speed: float | None = None) -> types.SessionUpdateEvent:
+    output: dict[str, Any] = {
+        "format": {"type": "audio/pcm", "rate": 24000},
+        "voice": voice,
+    }
+    if speed is not None:
+        output["speed"] = speed
+    return types.SessionUpdateEvent(
+        event_id="evt_test",
+        type="session.update",
+        session=types.RealtimeSessionCreateRequest.model_validate(
+            {
+                "type": "realtime",
+                "audio": {"output": output},
+            }
+        ),
+    )
+
+
+_SPEAKER_HF_CONFIG = SimpleNamespace(
+    talker_config={"speaker_id": {"vivian": 0, "ethan": 1}},
+)
+
+
+@pytest.mark.asyncio
+async def test_session_update_normalizes_and_forwards_voice() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_session_update(_session_update("Vivian"))
+
+    updated_session = next(
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    )
+    assert updated_session["audio"]["output"]["voice"] == "vivian"
+
+    engine_input = await connection._build_full_prompt()
+    assert engine_input["additional_information"]["speaker"] == ["vivian"]
+
+
+@pytest.mark.asyncio
+async def test_session_update_rejects_unsupported_voice() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_session_update(_session_update("uncle_fu"))
+
+    error = next(event for event in _websocket_events(websocket) if event["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "invalid_value"
+    assert error["error"]["param"] == "session.audio.output.voice"
+    assert error["error"]["event_id"] == "evt_test"
+    assert "Invalid speaker 'uncle_fu'" in error["error"]["message"]
+    assert connection.session.output_voice is None
+
+
+@pytest.mark.asyncio
+async def test_session_update_rejects_custom_voice_reference() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_session_update(_session_update({"id": "voice_1234"}))
+
+    error = next(event for event in _websocket_events(websocket) if event["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"].get("code") is None
+    assert error["error"]["param"] == "voice_id"
+    assert error["error"].get("event_id") is None
+    assert "No voice found with id 'voice_1234'" in error["error"]["message"]
+    assert connection.session.output_voice is None
+
+
+@pytest.mark.asyncio
+async def test_session_update_accepts_voice_without_speaker_list() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=SimpleNamespace())
+
+    await connection._handle_session_update(_session_update("Alloy"))
+
+    assert not [event for event in _websocket_events(websocket) if event["type"] == "error"]
+    updated_session = next(
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    )
+    assert updated_session["audio"]["output"]["voice"] == "alloy"
+    engine_input = await connection._build_full_prompt()
+    assert engine_input["additional_information"]["speaker"] == ["alloy"]
+
+
+@pytest.mark.asyncio
+async def test_session_update_keeps_voice_when_update_omits_it() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+    await connection._handle_session_update(_session_update("Vivian"))
+
+    await connection._handle_session_update(
+        types.SessionUpdateEvent(
+            event_id="evt_test2",
+            type="session.update",
+            session=types.RealtimeSessionCreateRequest.model_validate({"type": "realtime", "instructions": "be brief"}),
+        )
+    )
+
+    updated_session = [
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    ][-1]
+    assert updated_session["audio"]["output"]["voice"] == "vivian"
+    assert updated_session["instructions"] == "be brief"
+    engine_input = await connection._build_full_prompt()
+    assert engine_input["additional_information"]["speaker"] == ["vivian"]
+
+
+def test_resolve_response_honors_response_level_voice() -> None:
+    connection, _ = _make_connection(hf_config=_SPEAKER_HF_CONFIG)
+    connection.session.config.audio.output.voice = "vivian"
+    response_cfg = types.RealtimeResponseCreateParams.model_validate({"audio": {"output": {"voice": "Ethan"}}})
+
+    assert connection._resolve_response(response_cfg).voice == "ethan"
+
+
+@pytest.mark.parametrize("response_voice", [None, ""])
+def test_resolve_response_leaves_voice_override_unset(response_voice: str | None) -> None:
+    connection, _ = _make_connection(hf_config=_SPEAKER_HF_CONFIG)
+    connection.session.config.audio.output.voice = "vivian"
+    response_cfg = (
+        None
+        if response_voice is None
+        else types.RealtimeResponseCreateParams.model_validate({"audio": {"output": {"voice": response_voice}}})
+    )
+
+    assert connection._resolve_response(response_cfg).voice is None
+
+
+@pytest.mark.asyncio
+async def test_response_create_rejects_unsupported_voice() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_response_create(
+        types.ResponseCreateEvent(
+            event_id="evt_resp",
+            type="response.create",
+            response=types.RealtimeResponseCreateParams.model_validate({"audio": {"output": {"voice": "uncle_fu"}}}),
+        )
+    )
+
+    error = next(event for event in _websocket_events(websocket) if event["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "invalid_value"
+    assert error["error"]["param"] == "response.audio.output.voice"
+    assert error["error"]["event_id"] == "evt_resp"
+
+
+@pytest.mark.asyncio
+async def test_response_create_rejects_custom_voice_reference() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_response_create(
+        types.ResponseCreateEvent(
+            event_id="evt_resp",
+            type="response.create",
+            response=types.RealtimeResponseCreateParams.model_validate(
+                {"audio": {"output": {"voice": {"id": "voice_1234"}}}}
+            ),
+        )
+    )
+
+    events = _websocket_events(websocket)
+    assert [event["type"] for event in events] == ["error"]
+    error = events[0]["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error.get("code") is None
+    assert error["param"] == "voice_id"
+    assert error.get("event_id") is None
+    assert error["message"] == "No voice found with id 'voice_1234'."
+    assert connection.session.active_response is None
+
+
+@pytest.mark.asyncio
+async def test_build_full_prompt_applies_response_voice_override() -> None:
+    connection, _ = _make_connection(hf_config=_SPEAKER_HF_CONFIG)
+    connection.session.config.audio.output.voice = "vivian"
+
+    engine_input = await connection._build_full_prompt(voice="ethan")
+
+    assert engine_input["additional_information"]["speaker"] == ["ethan"]
+
+
+@pytest.mark.asyncio
+async def test_response_create_uses_response_voice_for_the_prompt() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+    await connection._handle_session_update(_session_update("vivian"))
+    captured: list[dict[str, Any]] = []
+
+    async def truncate(response: Any) -> list[Any]:
+        return []
+
+    async def build_prompt(**kwargs: Any) -> dict[str, Any]:
+        captured.append(kwargs)
+        return {"prompt_token_ids": []}
+
+    connection._truncate_prompt_items = truncate
+    connection._build_full_prompt = build_prompt
+
+    await connection._handle_response_create(
+        types.ResponseCreateEvent(
+            event_id="evt_resp",
+            type="response.create",
+            response=types.RealtimeResponseCreateParams.model_validate({"audio": {"output": {"voice": "Ethan"}}}),
+        )
+    )
+    if connection._response_task is not None:
+        connection._response_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await connection._response_task
+
+    assert captured[0]["voice"] == "ethan"
+    assert connection.session.output_voice == "vivian"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", ["", "   "])
+async def test_session_update_blank_voice_is_unset(voice: str) -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_session_update(_session_update(voice))
+
+    assert not [event for event in _websocket_events(websocket) if event["type"] == "error"]
+    assert connection.session.output_voice is None
+    engine_input = await connection._build_full_prompt()
+    assert "speaker" not in engine_input.get("additional_information", {})
+
+
+def test_output_speed_defaults_to_one() -> None:
+    connection, _ = _make_connection()
+
+    assert connection.session.output_speed == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("speed", [0.25, 0.5, 1.5])
+async def test_session_update_accepts_speed_in_range(speed: float) -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+
+    await connection._handle_session_update(_session_update("alloy", speed=speed))
+
+    assert not [event for event in _websocket_events(websocket) if event["type"] == "error"]
+    updated_session = next(
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    )
+    assert updated_session["audio"]["output"]["speed"] == speed
+    assert connection.session.output_speed == speed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("speed", "code"),
+    [
+        (0.2, "decimal_below_min_value"),
+        (0.0, "decimal_below_min_value"),
+        (-1.0, "decimal_below_min_value"),
+        (2.0, "decimal_above_max_value"),
+    ],
+)
+async def test_session_update_rejects_speed_out_of_range(speed: float, code: str) -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+
+    await connection._handle_session_update(_session_update("alloy", speed=speed))
+
+    error = next(event for event in _websocket_events(websocket) if event["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == code
+    assert error["error"]["param"] == "session.audio.output.speed"
+    assert error["error"]["event_id"] == "evt_test"
+    assert connection.session.output_speed == 1.0
+
+
+@pytest.mark.asyncio
+async def test_session_update_keeps_speed_when_update_omits_it() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+
+    await connection._handle_session_update(
+        types.SessionUpdateEvent(
+            event_id="evt_test2",
+            type="session.update",
+            session=types.RealtimeSessionCreateRequest.model_validate({"type": "realtime", "instructions": "be brief"}),
+        )
+    )
+
+    updated_session = [
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    ][-1]
+    assert updated_session["audio"]["output"]["speed"] == 0.5
+    assert connection.session.output_speed == 0.5
+
+
+@pytest.mark.asyncio
+async def test_session_update_rejected_speed_keeps_previous_value() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+
+    await connection._handle_session_update(_session_update("alloy", speed=2.0))
+
+    assert connection.session.output_speed == 0.5
+    assert len([event for event in _websocket_events(websocket) if event["type"] == "session.updated"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [None, "test-model", "other-model"])
+async def test_session_update_ignores_model(model: str | None) -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+
+    await connection._handle_session_update(
+        types.SessionUpdateEvent(
+            event_id="evt_model",
+            type="session.update",
+            session=types.RealtimeSessionCreateRequest.model_validate({"type": "realtime", "model": model}),
+        )
+    )
+
+    assert not [event for event in _websocket_events(websocket) if event["type"] == "error"]
+    assert connection.session.config.model == "test-model"
+
+
+@pytest.mark.parametrize(
+    ("modalities", "expected"),
+    [(["text"], "high"), (["audio"], None), (["text", "audio"], None)],
+)
+def test_resolve_response_gates_reasoning_on_output_modalities(modalities: list[str], expected: str | None) -> None:
+    connection, _ = _make_connection()
+    connection.session.config.output_modalities = modalities
+    connection.session.config.reasoning = types.RealtimeReasoning(effort="high")
+
+    response = connection._resolve_response(None)
+
+    assert response.reasoning_effort == expected
+
+
+def test_resolve_response_honors_response_level_reasoning() -> None:
+    connection, _ = _make_connection()
+    connection.session.config.output_modalities = ["text"]
+    connection.session.config.reasoning = types.RealtimeReasoning(effort="high")
+    response_cfg = types.RealtimeResponseCreateParams.model_validate({"reasoning": {"effort": "low"}})
+
+    assert connection._resolve_response(response_cfg).reasoning_effort == "low"
+
+
+def test_resolve_response_drops_response_level_reasoning_for_audio() -> None:
+    connection, _ = _make_connection()
+    response_cfg = types.RealtimeResponseCreateParams.model_validate({"reasoning": {"effort": "low"}})
+
+    assert connection._resolve_response(response_cfg).reasoning_effort is None
+
+
+def test_resolve_response_drops_session_reasoning_for_audio() -> None:
+    connection, _ = _make_connection()
+    connection.session.config.output_modalities = ["audio"]
+    connection.session.config.reasoning = types.RealtimeReasoning(effort="high")
+
+    assert connection._resolve_response(None).reasoning_effort is None
+
+
+def test_resolve_response_applies_session_reasoning_to_text_only_override() -> None:
+    connection, _ = _make_connection()
+    connection.session.config.output_modalities = ["audio"]
+    connection.session.config.reasoning = types.RealtimeReasoning(effort="high")
+    response_cfg = types.RealtimeResponseCreateParams.model_validate({"output_modalities": ["text"]})
+
+    assert connection._resolve_response(response_cfg).reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_build_full_prompt_forwards_reasoning_effort() -> None:
+    connection, _ = _make_connection()
+    captured: list[Any] = []
+    original = connection.chat_handler._preprocess_chat
+
+    async def capture(request, messages, **kwargs):
+        captured.append(request)
+        return await original(request, messages, **kwargs)
+
+    connection.chat_handler._preprocess_chat = capture
+
+    await connection._build_full_prompt(reasoning_effort="high")
+
+    assert captured[0].reasoning_effort == "high"
+
+
+class _StubResponseParser:
+    """Combined-parser stand-in: text after END_MARKER is content."""
+
+    END_MARKER = "__END__"
+    END_TOKEN_ID = 999
+
+    class _SubParser:
+        engine_based_streaming = True
+
+    reasoning_parser = _SubParser()
+    tool_parser = None
+
+    def __init__(self, *, preserve_special_tokens: bool = False) -> None:
+        self._reasoning_ended = False
+        self.preserve_special_tokens = preserve_special_tokens
+        self.adjusted = False
+        self.prompt_token_ids_seen: list[int] | None = None
+
+    def adjust_request(self, request):
+        self.adjusted = True
+        if self.preserve_special_tokens:
+            request.skip_special_tokens = False
+        return request
+
+    def set_prompt_token_ids(self, prompt_token_ids):
+        self.prompt_token_ids_seen = list(prompt_token_ids)
+
+    def parse_delta(self, delta_text, delta_token_ids, request, prompt_token_ids=None, *, finished):
+        if prompt_token_ids and self.END_TOKEN_ID in prompt_token_ids:
+            self._reasoning_ended = True
+        if not self._reasoning_ended:
+            if self.END_TOKEN_ID not in delta_token_ids:
+                return None
+            self._reasoning_ended = True
+            delta_text = delta_text.split(self.END_MARKER, 1)[-1]
+        return SimpleNamespace(content=delta_text or None, tool_calls=[])
+
+
+def _stub_parser(parser: _StubResponseParser):
+    def build(request):
+        return parser
+
+    return build
+
+
+def _text_output(text: str, token_ids: list[int], finish_reason: str | None = None) -> Any:
+    return SimpleNamespace(
+        final_output_type="text",
+        prompt_token_ids=[],
+        outputs=[SimpleNamespace(text=text, token_ids=token_ids, finish_reason=finish_reason)],
+    )
+
+
+def _audio_output(chunk: np.ndarray, sample_rate: int) -> Any:
+    multimodal_output = {"audio": chunk, "sample_rate": sample_rate}
+    return SimpleNamespace(
+        final_output_type="audio",
+        multimodal_output=multimodal_output,
+        outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
+    )
+
+
+def _make_run_connection(
+    websocket: _FakeWebSocket,
+    *,
+    sampling_params: list[Any] | None = None,
+) -> OpenAIFullDuplexConnection:
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=sampling_params or [],
+        generate=None,
+    )
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    return connection
+
+
+async def _run_text_response(
+    connection: OpenAIFullDuplexConnection,
+    outputs: list[Any],
+    prompt_token_ids: list[int],
+    submitted_params: list[list[SamplingParams]] | None = None,
+    tool_choice: str | None = "none",
+    modalities: list[str] | None = None,
+    reasoning_effort: str | None = None,
+):
+    async def generate(**kwargs):
+        if submitted_params is not None:
+            submitted_params.append(kwargs["sampling_params_list"])
+        for output in outputs:
+            yield output
+
+    connection.engine.generate = generate
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=modalities or ["text"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice=tool_choice,
+        metadata=None,
+        reasoning_effort=reasoning_effort,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": prompt_token_ids})
+    return active
+
+
+@pytest.mark.asyncio
+async def test_run_response_strips_reasoning_from_text_output(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    end = _StubResponseParser.END_MARKER
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_StubResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [
+            _text_output("weighing the options", [10, 11]),
+            _text_output("more " + end + "Hello", [12, _StubResponseParser.END_TOKEN_ID, 13]),
+            _text_output(" world", [14]),
+        ],
+        prompt_token_ids=[7],
+    )
+
+    events = _websocket_events(websocket)
+    deltas = [event["delta"] for event in events if event["type"] == "response.output_text.delta"]
+    assert deltas == ["Hello", " world"]
+    done = next(event for event in events if event["type"] == "response.output_text.done")
+    assert done["text"] == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_run_response_accepts_tool_choice_without_tools(monkeypatch) -> None:
+    """Clearing a session's tools must not leave a tool_choice that rejects the request."""
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_StubResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [_text_output("Hello", [7])],
+        prompt_token_ids=[_StubResponseParser.END_TOKEN_ID],
+        tool_choice="auto",
+    )
+
+    events = _websocket_events(websocket)
+    deltas = [event["delta"] for event in events if event["type"] == "response.output_text.delta"]
+    assert deltas == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_run_response_emits_content_when_prompt_already_ended_reasoning(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_StubResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [_text_output("Hello", [7])],
+        prompt_token_ids=[_StubResponseParser.END_TOKEN_ID],
+    )
+
+    events = _websocket_events(websocket)
+    deltas = [event["delta"] for event in events if event["type"] == "response.output_text.delta"]
+    assert deltas == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_run_response_accepts_unset_tool_choice(monkeypatch) -> None:
+    """A session that never sets tool_choice must not fail request construction."""
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_StubResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [_text_output("Hello", [7])],
+        prompt_token_ids=[_StubResponseParser.END_TOKEN_ID],
+        tool_choice=None,
+    )
+
+    events = _websocket_events(websocket)
+    deltas = [event["delta"] for event in events if event["type"] == "response.output_text.delta"]
+    assert deltas == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_run_response_strips_reasoning_from_audio_transcripts(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    end = _StubResponseParser.END_MARKER
+    parser_requests: list[ChatCompletionRequest] = []
+
+    def build(request: ChatCompletionRequest):
+        parser_requests.append(request)
+        return _StubResponseParser()
+
+    monkeypatch.setattr(connection, "_build_response_parser", build)
+
+    await _run_text_response(
+        connection,
+        [
+            _text_output("weighing the options", [10, 11]),
+            _text_output("more " + end + "Hello", [12, _StubResponseParser.END_TOKEN_ID, 13]),
+        ],
+        prompt_token_ids=[7],
+        modalities=["audio"],
+        reasoning_effort=None,
+    )
+
+    assert parser_requests[0].reasoning_effort is None
+    events = _websocket_events(websocket)
+    transcripts = [event["delta"] for event in events if event["type"] == "response.output_audio_transcript.delta"]
+    assert transcripts == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_run_response_applies_parser_request_adjustments(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket, sampling_params=[SamplingParams()])
+    parser = _StubResponseParser(preserve_special_tokens=True)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(parser))
+    submitted: list[list[SamplingParams]] = []
+
+    await _run_text_response(
+        connection,
+        [_text_output("Hi", [7])],
+        prompt_token_ids=[7, 8],
+        submitted_params=submitted,
+    )
+
+    assert parser.adjusted
+    assert parser.prompt_token_ids_seen == [7, 8]
+    assert [params.skip_special_tokens for params in submitted[0]] == [False]
+
+
+class _ToolCallResponseParser(_StubResponseParser):
+    """Combined-parser stand-in that reports one complete tool call."""
+
+    def parse_delta(self, delta_text, delta_token_ids, request, prompt_token_ids=None, *, finished):
+        return SimpleNamespace(
+            content=None,
+            tool_calls=[
+                SimpleNamespace(
+                    index=0,
+                    id="call_1",
+                    function=SimpleNamespace(name="get_time", arguments='{"tz":"UTC"}'),
+                )
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_response_streams_tool_calls_from_parser(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_ToolCallResponseParser()))
+
+    await _run_text_response(connection, [_text_output("", [1], finish_reason="stop")], prompt_token_ids=[7])
+
+    events = _websocket_events(websocket)
+    added = [
+        event
+        for event in events
+        if event["type"] == "response.output_item.added" and event["item"]["type"] == "function_call"
+    ]
+    assert [event["item"]["call_id"] for event in added] == ["call_1"]
+    assert [event["item"]["name"] for event in added] == ["get_time"]
+    deltas = [event["delta"] for event in events if event["type"] == "response.function_call_arguments.delta"]
+    assert deltas == ['{"tz":"UTC"}']
+
+
+@pytest.mark.asyncio
+async def test_run_response_streams_tool_calls_from_audio(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_ToolCallResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [_text_output("", [1], finish_reason="stop"), _audio_output(np.zeros(240, dtype=np.float32), 24000)],
+        prompt_token_ids=[7],
+        modalities=["audio"],
+        reasoning_effort=None,
+    )
+
+    events = _websocket_events(websocket)
+    added = [
+        event
+        for event in events
+        if event["type"] == "response.output_item.added" and event["item"]["type"] == "function_call"
+    ]
+    assert [event["item"]["call_id"] for event in added] == ["call_1"]
+    assert [event["item"]["name"] for event in added] == ["get_time"]
+    deltas = [event["delta"] for event in events if event["type"] == "response.function_call_arguments.delta"]
+    assert deltas == ['{"tz":"UTC"}']
+    assert not [event for event in events if event["type"] == "response.output_audio_transcript.delta"]
+    assert not [event for event in events if event["type"] == "response.output_audio.delta"]
+
+
+def test_build_response_parser_matches_chat_path() -> None:
+    calls: dict[str, Any] = {}
+
+    class _ParserCls:
+        reasoning_parser_cls = object()
+
+        def __init__(self, tokenizer: Any, tools: Any, **kwargs: Any) -> None:
+            calls.update(tokenizer=tokenizer, tools=tools, **kwargs)
+
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    connection.chat_handler.parser_cls = _ParserCls
+    connection.chat_handler._effective_chat_template_kwargs = lambda _request: {"enable_thinking": False}
+    request = ChatCompletionRequest(messages=[])
+
+    parser = connection._build_response_parser(request)
+
+    assert isinstance(parser, _ParserCls)
+    assert calls["tokenizer"] is connection._tokenizer
+    assert calls["tools"] is None
+    assert calls["chat_template_kwargs"] == {"enable_thinking": False}
+    assert calls["model_config"] is connection.engine.model_config
+
+
+def test_build_response_parser_returns_none_without_parser_cls() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    connection.chat_handler.parser_cls = None
+
+    request = ChatCompletionRequest(messages=[])
+
+    assert connection._build_response_parser(request) is None
+
+
+def _function_tool_response() -> types.RealtimeResponseCreateParams:
+    return types.RealtimeResponseCreateParams(
+        tools=[
+            types.RealtimeFunctionTool(
+                type="function",
+                name="get_time",
+                description="Return the current time",
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+        tool_choice="auto",
+    )
+
+
+def test_resolve_response_rejects_tools_without_a_tool_parser() -> None:
+    connection, _ = _make_connection(websocket=_FakeWebSocket())
+
+    with pytest.raises(ValueError, match="--tool-call-parser"):
+        connection._resolve_response(_function_tool_response())
+
+
+def test_resolve_response_keeps_tools_when_a_tool_parser_is_configured() -> None:
+    connection, _ = _make_connection(websocket=_FakeWebSocket())
+    connection.chat_handler.parser_cls = SimpleNamespace(tool_parser_cls=object)
+
+    resolved = connection._resolve_response(_function_tool_response())
+
+    assert resolved.tools is not None
+    assert resolved.tool_choice == "auto"
+
+
+@pytest.mark.asyncio
+async def test_session_update_rejects_mcp_tools() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    update = types.SessionUpdateEvent(
+        event_id="evt_mcp",
+        type="session.update",
+        session=types.RealtimeSessionCreateRequest.model_validate(
+            {
+                "type": "realtime",
+                "tools": [
+                    {"type": "mcp", "server_label": "docs", "server_url": "https://mcp.example.com"},
+                ],
+            }
+        ),
+    )
+
+    await connection._handle_session_update(update)
+
+    error = next(msg for msg in _websocket_events(websocket) if msg["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "unsupported_feature"
+    assert error["error"]["param"] == "session.tools"
+    assert error["error"]["message"] == "Remote MCP tools are not supported"
+    assert connection.session.config.tools is None
+
+
+@pytest.mark.asyncio
+async def test_session_update_rejects_mcp_tool_choice() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    update = types.SessionUpdateEvent(
+        event_id="evt_mcp_choice",
+        type="session.update",
+        session=types.RealtimeSessionCreateRequest.model_validate(
+            {
+                "type": "realtime",
+                "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+                "tool_choice": {"type": "mcp", "server_label": "docs", "name": "search"},
+            }
+        ),
+    )
+
+    await connection._handle_session_update(update)
+
+    error = next(msg for msg in _websocket_events(websocket) if msg["type"] == "error")
+    assert error["error"]["code"] == "unsupported_feature"
+    assert error["error"]["param"] == "session.tool_choice"
+    assert connection.session.config.tool_choice is None
+
+
+@pytest.mark.asyncio
+async def test_response_create_rejects_mcp_tools() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    event = types.ResponseCreateEvent.model_validate(
+        {
+            "type": "response.create",
+            "event_id": "evt_mcp_response",
+            "response": {
+                "tools": [
+                    {"type": "mcp", "server_label": "docs", "server_url": "https://mcp.example.com"},
+                ],
+            },
+        }
+    )
+
+    await connection._handle_response_create(event)
+
+    error = next(msg for msg in _websocket_events(websocket) if msg["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "unsupported_feature"
+    assert error["error"]["param"] == "response.tools"
+    assert error["error"]["message"] == "Remote MCP tools are not supported"
 
 
 @pytest.mark.parametrize(

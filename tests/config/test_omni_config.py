@@ -472,6 +472,16 @@ def test_from_pipeline_config_rejects_explicit_unowned_engine_cli_fields(cli_ove
         _from_pipeline_key("qwen3_tts", cli_overrides=cli_overrides)
 
 
+def test_from_pipeline_config_accepts_frontend_consumed_reasoning_parser():
+    """The API worker consumes --reasoning-parser, so stages must not claim it."""
+    omni_config = _from_pipeline_key(
+        "qwen3_omni_moe_thinker_only",
+        cli_overrides={"reasoning_parser": "qwen3"},
+    )
+
+    assert omni_config.stage_by_id(0) is not None
+
+
 @pytest.mark.parametrize(
     ("engine_extras", "unowned_field"),
     [
