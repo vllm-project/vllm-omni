@@ -81,7 +81,7 @@ class _FakeBlockTables:
         self.block_tables = [object()]
 
     def __getitem__(self, idx):
-        return SimpleNamespace()
+        return SimpleNamespace(block_size=BLOCK_SIZE, kv_cache_block_size=BLOCK_SIZE, dcp_world_size=1)
 
 
 class _Runner(PrefixCacheRunnerMixin):
