@@ -2445,6 +2445,7 @@ async def generate_images(
 @with_cancellation
 async def edit_images(
     raw_request: Request,
+    response: Response,
     image: list[UploadFile] | None = File(None),
     image_array: list[UploadFile] | None = File(None, alias="image[]"),
     url: list[str] | None = Form(None),
@@ -2767,6 +2768,8 @@ async def edit_images(
             peak_memory_mb = getattr(result, "peak_memory_mb", None)
             response_metrics = getattr(result, "metrics", None) if return_stage_metrics else None
 
+        if peak_memory_mb is not None and peak_memory_mb > 0:
+            response.headers["X-Peak-Memory-MB"] = f"{peak_memory_mb:.3f}"
         if images is None:
             images = []
         logger.debug(f"Successfully generated {len(images)} image(s)")

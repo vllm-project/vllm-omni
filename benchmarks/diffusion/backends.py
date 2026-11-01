@@ -147,6 +147,10 @@ async def async_request_image_edits(
                 resp_json = await response.json()
                 output.response_body = resp_json
                 output.success = True
+                try:
+                    output.peak_memory_mb = float(response.headers.get("X-Peak-Memory-MB", 0))
+                except (TypeError, ValueError):
+                    pass
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False
