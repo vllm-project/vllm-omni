@@ -252,6 +252,30 @@ def test_rope_only_needs_a_width_covering_every_row():
         torch.testing.assert_close(bucketed_part, exact_part, rtol=0, atol=0)
 
 
+def test_packed_solve_scopes_precise_bf16_gemms(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import solve_flow_euler_packed
+
+    matmul = torch.backends.cuda.matmul
+    monkeypatch.setattr(matmul, "allow_bf16_reduced_precision_reduction", True)
+    seen = []
+
+    def run(*args, **kwargs):
+        seen.append(matmul.allow_bf16_reduced_precision_reduction)
+        raise RuntimeError("solve failed")
+
+    estimator = SimpleNamespace(graph_runner=SimpleNamespace(run=run))
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="solve failed"):
+            solve_flow_euler_packed(
+                estimator, None, None, None, None, None, None, cfg_rate=0.7, streaming=False, modulation_key=()
+            )
+
+    assert seen == [False, False]
+    assert matmul.allow_bf16_reduced_precision_reduction
+
+
 @pytest.fixture
 def fake_gpu(monkeypatch):
     import vllm_omni.model_executor.models.cosyvoice3.runtime as runtime

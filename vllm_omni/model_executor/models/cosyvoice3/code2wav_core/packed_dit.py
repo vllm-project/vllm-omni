@@ -13,7 +13,8 @@ FA2 full-context segments are whole rows and attend unpaged.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -760,6 +761,24 @@ def rotate_in_place(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> No
     rotary.copy_(rotary * cos + half * sin)
 
 
+@contextmanager
+def precise_bf16_gemms() -> Iterator[None]:
+    """Keep BF16 GEMM reductions in full precision, then restore the worker's setting.
+
+    cuBLAS picks kernels by shape, so batch composition and graph padding can
+    otherwise select a reduced-precision GEMM, and the Euler solve amplifies the
+    layout-dependent rounding.
+    """
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_bf16_reduced_precision_reduction
+    matmul.allow_bf16_reduced_precision_reduction = False
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = previous
+
+
+@precise_bf16_gemms()
 def solve_flow_euler_packed(
     estimator: PackedDiT,
     noise: torch.Tensor,
