@@ -125,7 +125,7 @@ def _cold_reference_burst(processor, monkeypatch, *, failure=None):
         owner_started.set()
         assert release_owner.wait(timeout=5)
         if failure is not None:
-            raise RuntimeError(failure)
+            raise failure
         return original_speech(audio, device)
 
     with monkeypatch.context() as patch:
@@ -151,8 +151,14 @@ def _cold_reference_burst(processor, monkeypatch, *, failure=None):
 
 
 def test_reference_cache_merges_cold_calls_and_returns_independent_tensors(processor, monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3 as module
+
     obj, _, calls = processor
+    lookups = {"hits": 0, "misses": 0, "coalesced": 0}
+    monkeypatch.setattr(module, "_REFERENCE_CACHE_DEBUG", lookups)
+    monkeypatch.setenv("COSYVOICE3_REFERENCE_CACHE_DEBUG", "1")
     results, encoder_calls = _cold_reference_burst(processor, monkeypatch)
+    assert lookups == {"hits": 0, "misses": 1, "coalesced": 7}
     assert encoder_calls == 1
     assert len(calls) == 1
     assert len(results) == 8
@@ -167,15 +173,62 @@ def test_reference_cache_merges_cold_calls_and_returns_independent_tensors(proce
     assert len(calls) == 1
 
 
-def test_reference_cache_fans_out_failure_and_retries(processor, monkeypatch):
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])
+def test_reference_cache_fans_out_failure_and_retries(processor, monkeypatch, error_type):
     obj, _, calls = processor
-    results, encoder_calls = _cold_reference_burst(processor, monkeypatch, failure="reference encoding failed")
+    failure = error_type("reference encoding failed")
+    results, encoder_calls = _cold_reference_burst(processor, monkeypatch, failure=failure)
     assert encoder_calls == 1
     assert len(results) == 8
-    assert all(isinstance(error, RuntimeError) and str(error) == "reference encoding failed" for error in results)
+    assert all(error is failure for error in results)
     assert obj._speaker_cache.stats()["entries"] == 0
     result = _condition_reference(obj, np.arange(8, dtype=np.float32))
     assert result["speech_token"].tolist() == [[1, 2]]
+    assert len(calls) == 1
+
+
+class _Interrupt(BaseException):
+    pass
+
+
+def test_reference_cache_keeps_interrupts_in_the_owner_thread(processor, monkeypatch):
+    interrupt = _Interrupt()
+    results, encoder_calls = _cold_reference_burst(processor, monkeypatch, failure=interrupt)
+    assert encoder_calls == 1
+    assert results[0] is interrupt
+    assert len(results) == 8
+    assert all(type(error) is RuntimeError and error.__cause__ is interrupt for error in results[1:])
+
+
+def test_reference_cache_waiter_fails_after_bounded_wait_on_stuck_worker(processor, monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3 as module
+
+    obj, _, calls = processor
+    original_speech = obj._extract_speech_token_via_s3
+    owner_started = threading.Event()
+    release_worker = threading.Event()
+    warnings = []
+
+    def speech(audio, device):
+        # Every extraction shares one stuck worker, like the S3 batcher thread.
+        owner_started.set()
+        assert release_worker.wait(timeout=5)
+        return original_speech(audio, device)
+
+    monkeypatch.setattr(obj, "_extract_speech_token_via_s3", speech)
+    monkeypatch.setattr(module, "_REFERENCE_CONDITIONING_WAIT_S", 0.01)
+    monkeypatch.setattr(module.logger, "warning", lambda *args: warnings.append(args))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        owner = executor.submit(_condition_reference, obj, np.arange(8, dtype=np.float32))
+        try:
+            assert owner_started.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                _condition_reference(obj, np.arange(8, dtype=np.float32))
+        finally:
+            release_worker.set()
+        assert owner.result(timeout=5)["speech_token"].tolist() == [[1, 2]]
+    assert len(warnings) == 1
+    assert _condition_reference(obj, np.arange(8, dtype=np.float32))["speech_token"].tolist() == [[1, 2]]
     assert len(calls) == 1
 
 
