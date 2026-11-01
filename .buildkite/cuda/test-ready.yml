@@ -232,7 +232,7 @@ steps:
         timeout_in_minutes: 15
         commands:
           - "uv pip install 'inflect>=7.6.0,<8' 'Unidecode>=1.4.0,<2'"
-          - "pytest -sv tests/e2e/online_serving/test_soprano_1_1.py tests/e2e/online_serving/test_soprano_1_1_streaming.py -m 'core_model and cuda' --run-level core_model"
+          - "pytest -sv tests/e2e/online_serving/test_soprano_1_1.py -m 'core_model and tts and cuda and L4 and cards_1' --run-level core_model"
         mirror_hardwares: l4_1
 
       - label: "TTS · Qwen3-TTS CustomVoice Test"

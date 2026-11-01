@@ -83,6 +83,7 @@ def run_isolated(decoder, hidden):
     return [state.push(decoder, row[None], finished=i == len(hidden) - 1) for i, row in enumerate(hidden)]
 
 
+@pytest.mark.usefixtures("single_threaded_cpu")
 def test_nonzero_real_decoder_interleaving_and_batch_row_swaps():
     # Compare identical operations, so no invented floating-point tolerance.
     with torch.random.fork_rng(devices=[]):

@@ -30,6 +30,7 @@ from vllm.logger import init_logger
 from tests.helpers.assertions import (
     SuccessRateGate,
     assert_audio_speech_response,
+    assert_cancelled_audio_speech_response,
     assert_diffusion_response,
     assert_http_error,
     assert_images_generations_response,
@@ -105,6 +106,7 @@ class OmniResponse:
     audio_bytes: bytes | None = None
     audio_chunk_arrivals_s: list[float] | None = None
     audio_chunk_sizes: list[int] | None = None
+    cancelled: bool = False
     word_timestamps: list[dict[str, str | int]] | None = None
     #: End-to-end wall time in **seconds** (``perf_counter`` delta), from just before the
     #: OpenAI client call through response parsing and local post-process (e.g. audio decode).
@@ -1550,6 +1552,60 @@ class OnlineOmniClient:
 
         return result
 
+    def send_audio_speech_cancel_request(self, request_config: dict[str, Any]) -> OmniResponse:
+        """Close a raw PCM speech response after bounded, complete int16 frames.
+
+        ``json`` contains the endpoint payload; local controls are ``timeout``
+        and ``cancel_after_audio_bytes``. This is cancellation evidence, never
+        a successful complete inference result. Transport reads are not model
+        audio chunks. The response context closes even on errors.
+        """
+        payload = request_config["json"]
+        if not (
+            payload.get("stream")
+            and payload.get("stream_format") == "audio"
+            and payload.get("response_format") == "pcm"
+        ):
+            raise ValueError("Cancellation probe requires stream=true, stream_format=audio, response_format=pcm")
+        limit = request_config.get("cancel_after_audio_bytes", 4096)
+        if type(limit) is not int or not 2 <= limit <= 1024 * 1024:
+            raise ValueError("cancel_after_audio_bytes must be an integer between 2 and 1048576")
+        data = bytearray()
+        sizes, arrivals = [], []
+        start = time.perf_counter()
+        with requests.post(
+            f"{self.base_url}/v1/audio/speech",
+            json=payload,
+            stream=True,
+            timeout=request_config.get("timeout", 120),
+        ) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not content_type.startswith("audio/pcm"):
+                raise ValueError(f"Expected audio/pcm, got {content_type!r}")
+            cancelled = False
+            for chunk in response.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                data.extend(chunk)
+                sizes.append(len(chunk))
+                arrivals.append(time.perf_counter() - start)
+                if len(data) >= limit:
+                    cancelled = True
+                    break
+        # A network read can end mid-sample. Keep complete frames for prefix
+        # comparison; intentional cancellation makes no complete-EOF claim.
+        result = OmniResponse(
+            audio_bytes=bytes(data[: len(data) // 2 * 2]),
+            audio_format=content_type,
+            audio_chunk_sizes=sizes,
+            audio_chunk_arrivals_s=arrivals,
+            e2e_latency=time.perf_counter() - start,
+            cancelled=cancelled,
+        )
+        assert_cancelled_audio_speech_response(result)
+        return result
+
     def send_audio_speech_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
         """
         Call the /v1/audio/speech endpoint using the same configuration-dict
@@ -2107,6 +2163,27 @@ class OfflineOmniClient:
         # [TODO] Add audio processing when tests are introduced
         result.success = True
         return result
+
+    def send_worker_probe_request(self, request_config: dict[str, Any]) -> dict[str, Any]:
+        """Run real inference between existing worker-extension RPC probes.
+
+        The test owns the extension and fixed-token schedule. The harness owns
+        invocation and restoration, including inference failures. No model
+        identity, hidden-state convention or numeric tolerance lives here.
+        """
+        rpc = self.runner.omni.engine.collective_rpc
+        method = request_config["probe_method"]
+        try:
+            rpc(method, args=(True, request_config["probe_config"]), timeout=request_config.get("probe_timeout", 60))
+            outputs = list(
+                self.runner.generate(
+                    request_config["prompt"], sampling_params_list=request_config["sampling_params_list"]
+                )
+            )
+        finally:
+            observations = rpc(method, args=(False, {}), timeout=request_config.get("probe_timeout", 60))
+        assert outputs, "Real inference returned no pipeline output"
+        return {"outputs": outputs, "worker_observations": observations}
 
     def send_omni_request(self, request_config: dict[str, Any] | None = None) -> OmniResponse:
         if request_config is None:

@@ -1,144 +1,132 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Real Soprano WAV API smoke, including negative requests and worker recovery.
+"""Real native speech through the standard module-scoped runtime fixtures.
 
-SOPRANO_TEST_BASE_URL attaches to an existing local server. Otherwise the
-standard OmniServer harness launches the explicit Soprano deploy. Optional
-SOPRANO_ONLINE_ARTIFACTS saves actual HTTP headers/bodies and WAVs.
+L2 has one complete-response and one streaming protocol smoke. L3 additionally
+checks length flush and cancellation/slot reuse. Hardware variants are collected
+separately; selecting RTX4090Laptop never executes the L4-labelled variant.
 """
 
-import json
 import os
-from io import BytesIO
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 import pytest
-import requests
-import soundfile as sf
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.assertions import (
+    assert_audio_speech_equal,
+    assert_audio_speech_samples,
+    assert_audio_stream_progress,
+)
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.tts]
-_TIMEOUT = 180
+MODEL = os.environ.get("SOPRANO_MODEL_PATH", "ekwek/Soprano-1.1-80M")
 
 
-@pytest.fixture(scope="module")
-def soprano_endpoint():
-    attached = os.environ.get("SOPRANO_TEST_BASE_URL")
-    if attached:
-        yield attached.rstrip("/")
-        return
-    from tests.helpers.runtime import OmniServer
-
-    model = os.environ.get("SOPRANO_MODEL_PATH", "ekwek/Soprano-1.1-80M")
-    args = [
-        "--deploy-config",
-        get_deploy_config_path("soprano.yaml"),
-        "--served-model-name",
-        "soprano",
-        "--disable-log-stats",
+def server_params(deploy):
+    return [
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                stage_config_path=get_deploy_config_path(deploy),
+                server_args=["--disable-log-stats"],
+                env_dict={"TRITON_F32_DEFAULT": "ieee", "VLLM_USE_V2_MODEL_RUNNER": "0"},
+            ),
+            id=sku,
+            marks=hardware_marks(res={"cuda": sku}, num_cards=1),
+        )
+        for sku in ["L4", "RTX4090Laptop"]
     ]
-    with OmniServer(model, args, env_dict={"TRITON_F32_DEFAULT": "ieee"}) as server:
-        yield f"http://{server.host}:{server.port}"
 
 
-def _save(label: str, response, payload=None):
-    directory = os.environ.get("SOPRANO_ONLINE_ARTIFACTS")
-    if directory is None:
-        return
-    root = Path(directory)
-    root.mkdir(parents=True, exist_ok=True)
-    record = {
-        "url": response.url,
-        "status": response.status_code,
-        "headers": dict(response.headers),
-        "request": payload,
-    }
-    (root / f"{label}.json").write_text(json.dumps(record, indent=2))
-    suffix = ".wav" if response.content.startswith(b"RIFF") else ".body"
-    (root / f"{label}{suffix}").write_bytes(response.content)
+_COMPLETE = server_params("soprano.yaml")
+_STREAM = server_params("soprano_streaming.yaml")
 
 
-def _post(base, label, **extra):
-    payload = {
-        "model": "soprano",
-        "input": "Hello, this is a reproducible speech synthesis test.",
+def config(server, **changes):
+    return {
+        "model": server.model,
+        "input": "Hello, this is a simple speech synthesis test.",
         "response_format": "wav",
         "seed": 44,
+        "sample_rate": 32000,
+        "expected_sample_rate": 32000,
+        "min_audio_bytes": 4096,
         "extra_params": {"temperature": 0.3, "top_p": 0.95, "top_k": 50, "repetition_penalty": 1.2},
-        **extra,
+        **changes,
     }
-    response = requests.post(f"{base}/v1/audio/speech", json=payload, timeout=_TIMEOUT)
-    _save(label, response, payload)
-    return response
-
-
-def _wav(response):
-    assert response.status_code == 200, response.text[:1000]
-    assert response.headers["content-type"].startswith("audio/wav")
-    assert response.content[:4] == b"RIFF" and response.content[8:12] == b"WAVE"
-    wave, rate = sf.read(BytesIO(response.content), dtype="float32")
-    assert rate == 32000 and wave.ndim == 1 and wave.size > 0
-    assert np.isfinite(wave).all() and np.abs(wave).max() > 0
-    return wave
 
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_complete_wav_and_fixed_default_voice(soprano_endpoint):
-    base = soprano_endpoint
-    health = requests.get(f"{base}/health", timeout=30)
-    _save("health", health)
-    assert health.status_code == 200
-    models = requests.get(f"{base}/v1/models", timeout=30)
-    _save("models", models)
-    assert models.status_code == 200
-    assert "soprano" in {m["id"] for m in models.json()["data"]}
-    omitted = _wav(_post(base, "voice-omitted"))
-    explicit = _wav(_post(base, "voice-default", voice="default", language="English", sample_rate=32000))
-    assert np.array_equal(omitted, explicit)
+@pytest.mark.parametrize("omni_server", _COMPLETE, indirect=True)
+def test_complete_wav_and_fixed_default_voice(omni_server, online_client):
+    omitted = online_client.send_audio_speech_request(config(omni_server))[0]
+    explicit = online_client.send_audio_speech_request(config(omni_server, voice="default", language="English"))[0]
+    assert_audio_speech_equal(omitted, explicit, sample_rate=32000)
 
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_unsupported_options_are_request_errors(soprano_endpoint):
-    cases = [
-        ("voice", {"voice": "alloy"}),
-        ("instructions", {"instructions": "Speak happily"}),
-        ("reference", {"ref_audio": "file:///this-must-not-be-opened.wav"}),
-        ("language", {"language": "Chinese"}),
-        ("stream", {"stream": True}),
-        ("speed", {"speed": 1.2}),
-        ("format", {"response_format": "mp3"}),
-        ("rate", {"sample_rate": 24000}),
-        ("budget", {"max_new_tokens": 513}),
-        ("extra", {"extra_params": {"ignore_eos": True}}),
-        ("invalid-sampling", {"extra_params": {"top_p": 1.1}}),
-        (
-            "multiple-units",
-            {
-                "input": "This sentence is long enough to stand alone. The next sentence is also long enough to stand alone."
-            },
-        ),
-    ]
-    for label, kwargs in cases:
-        response = _post(soprano_endpoint, f"reject-{label}", **kwargs)
-        assert response.status_code == 400, (label, response.status_code, response.text[:500])
-        assert "error" in response.json()
-        assert not response.content.startswith(b"RIFF")
+@pytest.mark.parametrize("omni_server", _STREAM, indirect=True)
+def test_raw_pcm_sse_and_complete_concatenate_identically(omni_server, online_client):
+    raw = online_client.send_audio_speech_request(
+        config(omni_server, stream=True, stream_format="audio", response_format="pcm", transcript_pcm_sample_rate=32000)
+    )[0]
+    assert_audio_stream_progress(raw)
+    sse = online_client.send_audio_speech_request(
+        config(omni_server, stream=True, stream_format="sse", response_format="pcm", transcript_pcm_sample_rate=32000)
+    )[0]
+    complete = online_client.send_audio_speech_request(config(omni_server))[0]
+    assert_audio_speech_equal(sse, raw, sample_rate=32000)
+    assert_audio_speech_equal(complete, raw, sample_rate=32000)
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_short_output_error_does_not_kill_server(soprano_endpoint):
-    response = _post(soprano_endpoint, "short-output-error", max_new_tokens=1)
-    assert response.status_code == 500 and "error" in response.json()
-    health = requests.get(f"{soprano_endpoint}/health", timeout=30)
-    _save("health-after-error", health)
-    assert health.status_code == 200
-    _wav(_post(soprano_endpoint, "recovered"))
+@pytest.mark.parametrize("omni_server", _STREAM, indirect=True)
+def test_length_stop_flushes_partial_block(omni_server, online_client):
+    # Forced short output is a shape/tail contract, not a full-text ASR test.
+    result = online_client.send_audio_speech_request(
+        config(
+            omni_server,
+            stream=True,
+            stream_format="audio",
+            response_format="wav",
+            max_new_tokens=9,
+            transcript_expected_text=None,
+        )
+    )[0]
+    assert_audio_speech_samples(result, samples=2048 * 8, sample_rate=32000)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.parametrize("omni_server", _STREAM, indirect=True)
+def test_cancel_peer_completion_and_slot_reuse(omni_server, online_client):
+    first = config(
+        omni_server,
+        stream=True,
+        stream_format="audio",
+        response_format="pcm",
+        input="The patient traveler walks beside the river and describes the bright colors of the trees to the children.",
+    )
+    second = config(
+        omni_server,
+        stream=True,
+        stream_format="audio",
+        response_format="pcm",
+        input="A silver bell rings in the quiet room.",
+    )
+    first_baseline = online_client.send_audio_speech_request(first)[0]
+    second_baseline = online_client.send_audio_speech_request(second)[0]
+    payload = {k: v for k, v in first.items() if k not in {"min_audio_bytes", "expected_sample_rate"}}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cancelled = executor.submit(online_client.send_audio_speech_cancel_request, {"json": payload})
+        peer = executor.submit(online_client.send_audio_speech_request, second)
+        prefix, completed = cancelled.result(), peer.result()[0]
+    assert_audio_speech_equal(prefix, first_baseline, sample_rate=32000, prefix=True)
+    assert_audio_speech_equal(completed, second_baseline, sample_rate=32000)
+    # The same server's only sequence slot serves a new request after cancellation.
+    recovered = online_client.send_audio_speech_request(first)[0]
+    assert_audio_speech_equal(recovered, first_baseline, sample_rate=32000)
