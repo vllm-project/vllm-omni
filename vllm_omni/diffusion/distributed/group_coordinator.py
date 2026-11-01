@@ -221,6 +221,13 @@ class GroupCoordinator:
         output_tensor = torch.empty(input_size, dtype=input_.dtype, device=input_.device)
         # All-gather.
         torch.distributed.all_gather_into_tensor(output_tensor, input_.contiguous(), group=group)
+
+        if separate_tensors:
+            tensor_list = [
+                output_tensor.narrow(0, input_.shape[0] * i, input_.shape[0]).contiguous() for i in range(world_size)
+            ]
+            return tensor_list
+
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
@@ -231,18 +238,11 @@ class GroupCoordinator:
             )
             output_tensor = output_tensor.movedim(0, dim)
 
-        if separate_tensors:
-            tensor_list = [
-                output_tensor.view(-1).narrow(0, input_.numel() * i, input_.numel()).view_as(input_)
-                for i in range(world_size)
-            ]
-            return tensor_list
-        else:
-            input_size = list(input_.size())
-            input_size[dim] = input_size[dim] * world_size
-            # Reshape
-            output_tensor = output_tensor.reshape(input_size)
-            return output_tensor
+        input_size = list(input_.size())
+        input_size[dim] = input_size[dim] * world_size
+        # Reshape
+        output_tensor = output_tensor.reshape(input_size)
+        return output_tensor
 
     def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor:
         """
