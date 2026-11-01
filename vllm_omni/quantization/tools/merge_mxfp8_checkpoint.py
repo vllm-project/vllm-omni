@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Merge W8A8 MXFP8 quantized Wan2.2 weights into HF Diffusers format for vllm-omni.
 
 Based on the SGLang convert_wan_to_diffusers approach, extended to:
@@ -114,18 +115,54 @@ def _get_quant_subdir(model_type: str, quant_path: pathlib.Path, transformer_dir
 
 def _remap_keys(state_dict: dict, quant_meta: dict) -> tuple[dict, dict]:
     """Apply TRANSFORMER_KEYS_RENAME_DICT to both state_dict and quant_meta."""
-    new_state: dict = {}
-    new_meta: dict = {}
-
-    for key, tensor in state_dict.items():
+    renamed_state_keys: dict[str, str] = {}
+    for key in state_dict:
         new_key = key
         for src, dst in TRANSFORMER_KEYS_RENAME_DICT.items():
             new_key = new_key.replace(src, dst)
+        renamed_state_keys[key] = new_key
+
+    # msModelSlim wraps a smoothed linear module as ``<prefix>.linear`` and
+    # writes the multiplier beside it as ``<prefix>.div.mul_scale``. Only
+    # unwrap prefixes that have this marker, so ordinary ``.linear.`` names
+    # remain unchanged.
+    smooth_prefixes = {
+        new_key[: -len(".div.mul_scale")]
+        for new_key in renamed_state_keys.values()
+        if new_key.endswith(".div.mul_scale")
+    }
+
+    def normalize_key(new_key: str) -> str:
+        # msModelSlim represents SmoothQuant metadata as a sibling ``div``
+        # module. Runtime linear layers consume it as ``mul_scale``.
+        if new_key.endswith(".div.mul_scale"):
+            new_key = new_key[: -len(".div.mul_scale")] + ".mul_scale"
+
+        for prefix in smooth_prefixes:
+            wrapper = f"{prefix}.linear."
+            if new_key.startswith(wrapper):
+                return prefix + "." + new_key[len(wrapper) :]
+        return new_key
+
+    new_state: dict = {}
+    new_meta: dict = {}
+    for key, tensor in state_dict.items():
+        new_key = normalize_key(renamed_state_keys[key])
         new_state[new_key] = tensor
         if key in quant_meta:
             new_meta[new_key] = quant_meta[key]
 
     return new_state, new_meta
+
+
+def _has_complete_mxfp8_smooth_scales(state_dict: dict[str, object], quant_meta: dict[str, object]) -> bool:
+    """Return whether every serialized MXFP8 weight has a paired smooth scale."""
+    mxfp8_layers = {
+        key[: -len(".weight")]
+        for key, qtype in quant_meta.items()
+        if key.endswith(".weight") and isinstance(qtype, str) and qtype.startswith("W8A8_MXFP8")
+    }
+    return bool(mxfp8_layers) and all(f"{name}.mul_scale" in state_dict for name in mxfp8_layers)
 
 
 def _load_safetensors(directory: pathlib.Path, glob: str = "*.safetensors") -> dict:
@@ -207,7 +244,10 @@ def _convert_transformer(
     if src_config.is_file():
         with open(src_config) as f:
             config = json.load(f)
-        config["quantization_config"] = MXFP8_QUANT_CONFIG
+        quant_config = dict(MXFP8_QUANT_CONFIG)
+        if _has_complete_mxfp8_smooth_scales(quant_state_dict, quant_meta):
+            quant_config["require_smooth_scale"] = True
+        config["quantization_config"] = quant_config
         with open(output_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2)
         print(f"  Injected quantization_config into config.json → {output_dir / 'config.json'}")
