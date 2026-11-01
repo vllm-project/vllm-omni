@@ -2058,3 +2058,57 @@ def test_tracked_streaming_submit_waits_for_full_wake():
         assert omni._admitting == 0
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_ar_level2_sleep_wakes_with_discard_opt_in(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", "1")
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        await omni.sleep(level=2)
+        assert omni._level2_sleeping is False
+
+        await omni.wake_up()
+
+        methods = [c.kwargs.get("method") for c in omni.collective_rpc.await_args_list]
+        assert methods[-1] == "wake_up"
+        assert not omni._sleeping_tags
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("value", [None, "0", "true"])
+def test_ar_level2_sleep_still_blocks_wake_without_opt_in(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", value)
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        await omni.sleep(level=2)
+        with pytest.raises(NotImplementedError, match=r"sleep\(level=2\)"):
+            await omni.wake_up()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_level2_sleep_with_a_diffusion_stage_blocks_wake_even_with_opt_in(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", "1")
+
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm", "diffusion"])
+        omni.collective_rpc = AsyncMock(return_value=[OmniACK(task_id="t", status="SUCCESS", stage_id=1, rank=0)])
+        await omni.sleep(level=2)
+        with pytest.raises(NotImplementedError):
+            await omni.wake_up()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_async_omni_advertises_ar_level2_wake():
+    assert AsyncOmni.SUPPORTS_AR_LEVEL2_WAKE is True
