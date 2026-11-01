@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import bisect
 import gc
 import math
 import os
@@ -27,6 +28,63 @@ from vllm_omni.diffusion.data import (
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _save_non_parameter_tensors(models: list[torch.nn.Module], allocator) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """CPU copies of the device tensors a level-2 sleep discards and a weight sync does not rewrite.
+
+    Level 2 unmaps the "weights" pool without a host copy. Besides parameters,
+    that pool holds module buffers and plain tensor attributes of modules and
+    of their ``quant_method`` (rotary caches, for example). Tensors that share
+    storage with a parameter, or live outside the pool (the KV cache), are
+    skipped. An allocator without ``pointer_to_data`` gets vLLM's behavior:
+    every module buffer.
+    """
+    pointer_to_data = getattr(allocator, "pointer_to_data", None)
+    pool = (
+        sorted((ptr, data.handle[1]) for ptr, data in pointer_to_data.items() if data.tag == "weights")
+        if pointer_to_data is not None
+        else None
+    )
+    starts = [ptr for ptr, _ in pool or ()]
+
+    def in_weights_pool(ptr: int) -> bool:
+        if pool is None:
+            return True
+        i = bisect.bisect_right(starts, ptr) - 1
+        return i >= 0 and ptr < pool[i][0] + pool[i][1]
+
+    param_storages = {p.untyped_storage().data_ptr() for m in models for p in m.parameters()}
+    seen: set[int] = set()
+    saved = []
+
+    def visit(tensor) -> None:
+        if not isinstance(tensor, torch.Tensor) or isinstance(tensor, torch.nn.Parameter):
+            return
+        if id(tensor) in seen:
+            return
+        seen.add(id(tensor))
+        storage_ptr = tensor.untyped_storage().data_ptr()
+        if storage_ptr in param_storages or not in_weights_pool(storage_ptr):
+            return
+        saved.append((tensor, tensor.detach().to("cpu", copy=True)))
+
+    for model in models:
+        for module in model.modules():
+            for buffer in module._buffers.values():
+                visit(buffer)
+            if pool is None:
+                continue
+            for owner in (module, getattr(module, "quant_method", None)):
+                if owner is not None:
+                    for value in vars(owner).values():
+                        visit(value)
+    return saved
+
+
+def _restore_non_parameter_tensors(saved: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+    for tensor, cpu_copy in saved:
+        tensor.data.copy_(cpu_copy)
 
 
 class OmniGPUWorkerBase(GPUWorker):
@@ -359,7 +417,8 @@ class OmniGPUWorkerBase(GPUWorker):
         """
         Put the worker to sleep.
         Args:
-            level: 1 (Offload weights to CPU), level: 2 (Total Discard).
+            level: 1 (Offload weights to CPU), level: 2 (Total Discard; buffers
+                and other non-parameter tensors come back on ``wake_up``).
         """
         from vllm.device_allocator import get_mem_allocator_instance
 
@@ -372,6 +431,12 @@ class OmniGPUWorkerBase(GPUWorker):
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
         offload_tags = ("weights",) if level == 1 else tuple()
         allocator = get_mem_allocator_instance()
+        if level == 2:
+            self._sleep_saved_tensors = _save_non_parameter_tensors(self._sleep_models(), allocator)
+            logger.info(
+                f"[LLM Worker {self.rank}] Level 2 Sleep: saved {len(self._sleep_saved_tensors)} non-parameter "
+                f"tensors ({sum(c.nbytes for _, c in self._sleep_saved_tensors) / 1024**2:.1f} MiB)."
+            )
         allocator.sleep(offload_tags=offload_tags)
         # allocator.sleep already gc.collects and empty_cache()s. A second
         # empty_cache on the pluggable allocator is a known CUDA invalid
@@ -393,9 +458,21 @@ class OmniGPUWorkerBase(GPUWorker):
 
         allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
+        saved = getattr(self, "_sleep_saved_tensors", None)
+        if saved and (tags is None or "weights" in tags):
+            _restore_non_parameter_tensors(saved)
+            self._sleep_saved_tensors = []
         current_omni_platform.synchronize()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
+
+    def _sleep_models(self) -> list[torch.nn.Module]:
+        runner = getattr(self, "model_runner", None)
+        models = [getattr(runner, "model", None)]
+        get_draft_model = getattr(runner, "get_draft_model", None)
+        if callable(get_draft_model):
+            models.append(get_draft_model())
+        return [m for m in models if isinstance(m, torch.nn.Module)]
 
     def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK | None:
         "Handle deterministic Sleep command from the main process"
