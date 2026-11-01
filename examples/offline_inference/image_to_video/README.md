@@ -31,6 +31,7 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 480 x 832 | 81 | 50 | 6.0 | Native `SanaImageToVideoPipeline`; Wan VAE |
 | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 704 x 1280 | 81 | 50 | 6.0 | Native `SanaImageToVideoPipeline`; LTX-2 Video VAE |
 | `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers` | 480 x 864 | 125 | 50 | 5.0 | ~75 GiB reserved (H100, CPU offload); public Hub repo |
+| `GD-ML/DreamX-World-5B-Cam` | 704 x 1280 | 121 | 50 | 3.0 | Around 50 GiB BF16 for basic single-card usage |
 
 MAGI-2 native Preview setup, four-GPU topology and DLO choices, I2VA commands,
 and eight-GPU validation status are documented in the
@@ -312,6 +313,23 @@ python image_to_video.py \
   --output cosmos3_i2v.mp4
 ```
 
+### DreamX-World-5B-Cam
+
+Camera action tokens (composable, e.g. `"wj"` = push in + pan left):
+`w` push in · `s` pull out · `a` move left · `d` move right ·
+`i` tilt up · `k` tilt down · `j` pan left · `l` pan right.
+
+```bash
+python image_to_video.py \
+  --model GD-ML/DreamX-World-5B-Cam \
+  --image /path/to/DreamX-World/demo/007.jpg \
+  --prompt "Style: Minecraft. A serene Minecraft landscape at sunset, featuring a blocky cliffside overlooking a calm ocean. In the foreground, grassy terrain with yellow flowers and red soil leads up to a rugged cliff composed of layered red and gray blocks. Sparse trees grow on rocky outcrops, adding life to the structured environment. The midground reveals the cliff's dramatic descent into the water, while the background showcases a vast ocean reflecting the warm hues of the setting sun. The sky is painted in gradients of orange, pink, and pale blue, with pixelated clouds drifting above. The lighting casts soft shadows and enhances the textured, cubic surfaces, creating a peaceful and immersive atmosphere that blends natural beauty with digital artistry." \
+  --height 704 --width 1280 --num-frames 121 --fps 24 \
+  --num-inference-steps 50 --guidance-scale 3.0 --flow-shift 3.0 --seed 42 \
+  --extra-body '{"action_seq": ["w", "wj"], "action_speed_list": [4, 6]}' \
+  --output dreamx_i2v.mp4
+```
+
 Key arguments:
 
 - `--model`: Model ID (I2V-A14B for MoE, TI2V-5B for unified T2V+I2V, LTX-2,
@@ -344,8 +362,6 @@ Key arguments:
 - `--use-hsdp`: Enable Hybrid Sharded Data Parallel to shard model weights across GPUs.
 - `--hsdp-shard-size`: Number of GPUs to shard model weights across within each replica group. -1 (default) auto-calculates as world_size / replicate_size.
 - `--hsdp-replicate-size`: Number of replica groups for HSDP. Each replica holds a full sharded copy. Default 1 means pure sharding (no replication).
-
-
 
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 

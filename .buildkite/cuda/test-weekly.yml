@@ -374,6 +374,16 @@ steps:
             --run-level "full_model"
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · DreamX-World-Cam · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - >-
+            pytest -sv
+            tests/e2e/offline_inference/test_dreamx_world_cam.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · LongCat · H100 · Single-GPU"
         timeout_in_minutes: 90
         commands:
