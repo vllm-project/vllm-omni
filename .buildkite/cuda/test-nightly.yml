@@ -29,6 +29,10 @@ steps:
           - omni_qwen3_omni_function
           - omni_minicpmo_4_5_function
         timeout_in_minutes: 90
+        env:
+          VLLM_OMNI_TEST_FAILURE_DIR: tests/e2e/online_serving/results/omni_audio_failures
+        artifact_paths:
+          - tests/e2e/online_serving/results/omni_audio_failures/**/*
         commands:
           - pytest -sv tests/e2e --run-level "full_model" -m "full_model and H100 and B200 and omni and cards_2" --ignore=tests/e2e/accuracy --ignore=tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
 
