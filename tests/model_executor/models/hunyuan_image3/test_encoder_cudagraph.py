@@ -42,8 +42,12 @@ def test_replay_padding_keeps_tail_sequence_capacity():
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("shape_lengths", [(2, 2), (1, 3), (3, 2), (2**32 + 2, 2)])
-def test_replay_buffers_validate_each_images_patch_count(mocker, shape_lengths):
+@pytest.mark.parametrize(
+    "shape_lengths,shape_dtype",
+    [(lengths, dtype) for lengths in ((2, 2), (1, 3), (3, 2)) for dtype in (torch.int32, torch.int64)]
+    + [((2**32 + 2, 2), torch.int64)],
+)
+def test_replay_buffers_validate_each_images_patch_count(mocker, shape_lengths, shape_dtype):
     from vllm_omni.model_executor.models.hunyuan_image3.encoder_cudagraph import _VisionEncoder
 
     embeddings = Siglip2VisionEmbeddings(Config(dict(hidden_size=8, patch_size=2, num_channels=3, num_patches=4)))
@@ -55,7 +59,7 @@ def test_replay_buffers_validate_each_images_patch_count(mocker, shape_lengths):
     inputs = {
         "pixels": torch.arange(96, dtype=torch.float32).reshape(2, 4, 12),
         "mask": torch.tensor([[1, 1, 0, 0], [1, 1, 0, 0]]),
-        "shapes": torch.tensor([[1, length] for length in shape_lengths]),
+        "shapes": torch.tensor([[1, length] for length in shape_lengths], dtype=shape_dtype),
     }
     if shape_lengths != (2, 2):
         # (1, 3) has the right total but would mix the two images' segments.
