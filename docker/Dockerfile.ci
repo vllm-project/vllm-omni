@@ -47,12 +47,20 @@ ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 # Do NOT use a non-editable install here — that copies an empty stub into
 # site-packages and breaks ``import vllm_omni.entrypoints``.
 RUN python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+# Include the bootstrap image's whole telemetry family in this solve. Otherwise
+# uv can retain an unselected exporter that requires a different SDK, even when
+# the selected project dependencies resolve. Keep every installed feature and
+# let the normal resolver enforce the family's reverse dependency constraints.
+RUN python3 -c 'import importlib.metadata as m; \
+    names = {d.metadata.get("Name", "") for d in m.distributions()}; \
+    print("\n".join(sorted(n for n in names if n.lower().startswith("opentelemetry-"))))' \
+    > /tmp/vllm-otel-roots.txt
 RUN VLLM_WHEEL_VERSION=$(printf '%s' "${VLLM_VERSION}" | sed 's/+/%2B/g') && \
-    uv pip install --system \
+    uv pip install --system -r /tmp/vllm-otel-roots.txt \
     /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl \
     "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_WHEEL_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
     -e ".[dev]"
-RUN uv pip check --system && rm -rf /tmp/gradio-pillow13
+RUN uv pip check --system && rm -rf /tmp/gradio-pillow13 /tmp/vllm-otel-roots.txt
 # Fail the image build if dependency resolution replaced the selected vLLM.
 # The CPU builder has no NVIDIA driver; CUDA imports are checked at the start
 # of each GPU test job by .buildkite/cuda/scripts/check_vllm_runtime.py.

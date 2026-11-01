@@ -4,7 +4,9 @@
 """Exercise the Docker install commands without downloading packages or building images."""
 
 import os
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 from urllib.parse import quote, unquote
 
@@ -44,3 +46,45 @@ def test_cuda_wheel_url_encodes_local_version(tmp_path: Path, dockerfile: str, v
     expected_filename = f"vllm-{quote(version, safe='')}-cp38-abi3-manylinux_2_28_{arch}.whl"
     assert wheel_url == f"https://wheels.vllm.ai/{commit}/{expected_filename}"
     assert unquote(wheel_url).split("/")[-1] == f"vllm-{version}-cp38-abi3-manylinux_2_28_{arch}.whl"
+    if dockerfile == "Dockerfile.ci":
+        args = args_file.read_text().splitlines()
+        assert args[args.index("-r") + 1] == "/tmp/vllm-otel-roots.txt"
+
+
+def test_bootstrap_telemetry_solve_keeps_unselected_exporters(tmp_path: Path) -> None:
+    # The newer common exporter can force an SDK upgrade while an older,
+    # unselected Prometheus exporter still requires the old SDK. Both reverse
+    # constraints must participate in the normal combined dependency solve.
+    telemetry = {
+        "opentelemetry-api",
+        "opentelemetry-sdk",
+        "OpenTelemetry-Exporter-OTLP-Common",
+        "opentelemetry-exporter-prometheus",
+        "opentelemetry-instrumentation-fastapi",
+        "opentelemetry-instrumentation-requests",
+    }
+    for index, name in enumerate(sorted(telemetry | {"torch", "gradio"})):
+        metadata = tmp_path / f"fixture_{index}-1.0.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n")
+    text = (REPO_ROOT / "docker/Dockerfile.ci").read_text().replace("\\\n", "")
+    collection = next(
+        shlex.split(line.removeprefix("RUN "))
+        for line in text.splitlines()
+        if line.startswith("RUN python3 -c 'import importlib.metadata")
+    )
+    assert collection[:2] == ["python3", "-c"]
+    assert collection[3:] == [">", "/tmp/vllm-otel-roots.txt"]
+    # -S confines discovery to these real dist-info fixtures and the stdlib;
+    # no installed developer packages or editable finders enter this probe.
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", collection[2]],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(tmp_path)),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert set(result.stdout.splitlines()) == telemetry
+    assert len(result.stdout.splitlines()) == len(telemetry)
+    assert "RUN uv pip check --system" in text
