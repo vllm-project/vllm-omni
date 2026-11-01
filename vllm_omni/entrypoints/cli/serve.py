@@ -863,6 +863,17 @@ class OmniServeCommand(CLISubcommand):
             '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
         )
 
+        omni_config_group.add_argument(
+            "--diffusion-attention-schedule",
+            type=_json_object,
+            default=None,
+            help="Startup attention profiles and default step ranges as JSON or dotted flags. "
+            "Each profile is an independent attention config; ranges use zero-based [start, end) steps, "
+            "with null end meaning the actual sequence end. "
+            'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'.',
+        )
+
         # Cache optimization parameters
         omni_config_group.add_argument(
             "--cache-backend",

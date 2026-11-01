@@ -18,7 +18,9 @@ from pytest_mock import MockerFixture
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.attention import schedule as schedule_module
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.data import DiffusionOutput, parse_attention_schedule_config
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
@@ -31,6 +33,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.types import (
     ChunkMediaSpec,
@@ -937,6 +940,62 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 2
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
+
+    def test_unscheduled_step_leaves_attention_schedule_unbound(self):
+        """Without a service schedule, the real forward context carries no schedule during denoise."""
+        runner = _make_runner()
+        runner.vllm_config = None
+        seen: list[object] = []
+
+        class _ContextRecordingStepPipeline(_StepPipeline):
+            def denoise_step(self, input_batch, **kwargs):
+                ctx = get_forward_context()
+                seen.append(ctx.attention_schedule)
+                return super().denoise_step(input_batch, **kwargs)
+
+        runner.pipeline = _ContextRecordingStepPipeline()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=0))
+        DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        assert seen == [None, None]
+        assert "req-1" not in runner.state_cache
+        assert is_forward_context_available() is False
+
+    def test_cached_step_reuses_the_schedule_resolved_at_admission(self, monkeypatch):
+        """A request's schedule is resolved once when it reaches the runner, not again on each later step."""
+        runner = _make_runner()
+        runner.vllm_config = None
+        runner.od_config.diffusion_attention_schedule = parse_attention_schedule_config(
+            {
+                "profiles": {"dense": {"default": "TORCH_SDPA"}},
+                "default": [{"start": 1, "end": None, "profile": "dense"}],
+            }
+        )
+        resolved: list[object] = []
+        real_resolve = schedule_module.resolve_attention_schedule
+
+        def _recording_resolve(*args, **kwargs):
+            schedule = real_resolve(*args, **kwargs)
+            resolved.append(schedule)
+            return schedule
+
+        monkeypatch.setattr(schedule_module, "resolve_attention_schedule", _recording_resolve)
+        seen: list[object] = []
+
+        class _ContextRecordingStepPipeline(_StepPipeline):
+            def denoise_step(self, input_batch, **kwargs):
+                seen.append(get_forward_context().attention_schedule)
+                return super().denoise_step(input_batch, **kwargs)
+
+        runner.pipeline = _ContextRecordingStepPipeline()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=0))
+        DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        expected = (AttentionScheduleRange(start=1, end=None, profile="dense"),)
+        assert seen == [expected, expected]
+        assert resolved == [expected]
 
     @staticmethod
     def _make_grouping_runner(pipeline, *, grouping: bool):

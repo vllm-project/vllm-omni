@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.schedule import AttentionSchedule
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.interaction.types import (
         InteractionBoundaryContext,
@@ -87,6 +88,9 @@ class StepRequestState:
     # request state is removed before this Worker state is built.
     prepared_layout: Any | None = None
     external_req_id: str | None = None
+    # Attention schedule resolved against the service default when the
+    # request reaches the runner; later steps reuse it.
+    attention_schedule: AttentionSchedule = ()
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None
