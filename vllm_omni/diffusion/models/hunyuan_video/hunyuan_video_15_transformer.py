@@ -647,6 +647,11 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
 
     _hsdp_shard_conditions = [is_transformer_block_module]
 
+    # Read by apply_sequence_parallel (hooks/sequence_parallel.py). This model masks SP padding only
+    # when parallel_config.mask_sp_padding is set (see forward), so the SP hook needs a mask-capable
+    # attention backend only in that case.
+    _sp_padding_mask_optional = True
+
     _sp_plan = {
         "rope": {
             0: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
