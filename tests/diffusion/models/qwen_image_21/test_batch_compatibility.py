@@ -8,7 +8,9 @@ import pytest
 from PIL import Image
 
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
+    QWEN_IMAGE_21_T2I_PROMPT_TEMPLATE,
     get_qwen_image_21_pre_process_func,
+    qwen_image_21_prompt_text,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler, StepScheduler
@@ -21,6 +23,30 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 def preprocess(tmp_path):
     vae_dir = tmp_path / "vae"
     vae_dir.mkdir()
+    (vae_dir / "config.json").write_text(json.dumps({"temperal_downsample": [False] * 4}))
+    return get_qwen_image_21_pre_process_func(SimpleNamespace(model=str(tmp_path)))
+
+
+def _stub_tokenizer(text):
+    """Stand-in for the Qwen3-VL processor tokenizer: one id per character."""
+    return {"input_ids": list(range(len(text)))}
+
+
+@pytest.fixture
+def sized_preprocess(tmp_path, monkeypatch):
+    """Pre-process func whose prompt tokenizer is a deterministic stub.
+
+    The stub makes the prompt token count depend only on the templated string,
+    so compatibility keys can be compared without a checkpoint on disk.
+    """
+    from vllm_omni.diffusion.models.qwen_image_21 import decode_graph as decode_graph_mod
+    from vllm_omni.diffusion.models.qwen_image_21 import pipeline_qwen_image_21 as pipeline_mod
+
+    monkeypatch.setitem(pipeline_mod._PROMPT_TOKENIZER_CACHE, str(tmp_path), _stub_tokenizer)
+    # Treat this fixture as a CUDA graph-capable serve even in CPU-only CI.
+    monkeypatch.setattr(decode_graph_mod.current_omni_platform, "is_cuda", lambda: True)
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir(exist_ok=True)
     (vae_dir / "config.json").write_text(json.dumps({"temperal_downsample": [False] * 4}))
     return get_qwen_image_21_pre_process_func(SimpleNamespace(model=str(tmp_path)))
 
@@ -189,4 +215,220 @@ def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess)
     assert isinstance(prompt_image, Image.Image)
     (width, height) = info["input_image_sizes"][0]
     assert prompt_image.size == (width, height)
-    assert processed.batch_compatibility_key == ("qwen_image_21", ((width, height),))
+    key = processed.batch_compatibility_key
+    assert key[:2] == ("qwen_image_21", ((width, height),))
+    # ``tmp_path`` has no ``processor/`` subfolder, so the prompt size is unknown
+    # and the key stays length-agnostic.
+    assert key[2] is None
+
+
+def test_prompt_scaffold_tracks_the_image_count():
+    assert qwen_image_21_prompt_text("hi", 0) == QWEN_IMAGE_21_T2I_PROMPT_TEMPLATE.format("hi")
+    one = qwen_image_21_prompt_text("hi", 1)
+    two = qwen_image_21_prompt_text("hi", 2)
+    assert one.count("<|image_pad|>") == 1
+    assert two.count("<|image_pad|>") == 2
+    assert "<image2>" not in one
+    assert "<image2>" in two
+
+
+def test_prompt_length_is_part_of_the_compatibility_key(sized_preprocess):
+    short = sized_preprocess(make_request("short", [(64, 64)]))
+    short_again = sized_preprocess(make_request("short-again", [(64, 64)], color="blue"))
+    long_request = make_request("long", [(64, 64)], color="blue")
+    long_request.prompt["prompt"] = "A ceramic teapot on a windowsill " * 8
+    long = sized_preprocess(long_request)
+
+    # Same reference layout, different prompt text: the layout part still
+    # matches, only the text-length slot separates the two requests.
+    assert short.batch_compatibility_key[1] == long.batch_compatibility_key[1]
+    assert short.batch_compatibility_key[2] == short_again.batch_compatibility_key[2]
+    assert long.batch_compatibility_key[2] > short.batch_compatibility_key[2]
+
+
+def test_text_only_requests_are_keyed_by_prompt_length(sized_preprocess):
+    short = sized_preprocess(make_request("short", []))
+    long_request = make_request("long", [])
+    long_request.prompt = {"prompt": "A ceramic teapot on a windowsill " * 8}
+    long = sized_preprocess(long_request)
+
+    assert short.batch_compatibility_key is not None
+    assert short.batch_compatibility_key[2] != long.batch_compatibility_key[2]
+
+
+def test_unsizable_prompt_keeps_the_length_agnostic_key(preprocess):
+    key = preprocess(make_request("unsized", [(64, 64)])).batch_compatibility_key
+    assert key[0] == "qwen_image_21"
+    assert len(key) == 4
+    assert key[2] is None
+    assert key[3] is None
+
+
+@pytest.mark.parametrize("od_config", [{"enforce_eager": True}, {"enable_cuda_graph_decode": False}])
+def test_eager_serve_keeps_the_padding_friendly_key(tmp_path, monkeypatch, od_config):
+    from vllm_omni.diffusion.models.qwen_image_21 import pipeline_qwen_image_21 as pipeline_mod
+
+    monkeypatch.setitem(pipeline_mod._PROMPT_TOKENIZER_CACHE, str(tmp_path), _stub_tokenizer)
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir(exist_ok=True)
+    (vae_dir / "config.json").write_text(json.dumps({"temperal_downsample": [False] * 4}))
+
+    preprocess = get_qwen_image_21_pre_process_func(SimpleNamespace(model=str(tmp_path), **od_config))
+
+    # Padding is free when no decode graph can be captured, so the key must not
+    # split requests by prompt length.
+    assert preprocess(make_request("eager", [(64, 64)])).batch_compatibility_key[2] is None
+
+
+@pytest.mark.parametrize(
+    "config_overrides",
+    [
+        pytest.param({"parallel_config": SimpleNamespace(tensor_parallel_size=2)}, id="tensor-parallel"),
+        pytest.param({"parallel_config": SimpleNamespace(sequence_parallel_size=2)}, id="sequence-parallel"),
+        pytest.param({"parallel_config": SimpleNamespace(use_hsdp=True)}, id="hsdp"),
+        pytest.param({"extras": {"prefix_kv_cache_dtype": "fp8"}}, id="quantized-prefix-kv"),
+        pytest.param({"enable_layerwise_offload": True}, id="layer-wise-offload"),
+    ],
+)
+def test_ineligible_graph_config_keeps_the_padding_friendly_key(tmp_path, monkeypatch, config_overrides):
+    from vllm_omni.diffusion.models.qwen_image_21 import decode_graph as decode_graph_mod
+    from vllm_omni.diffusion.models.qwen_image_21 import pipeline_qwen_image_21 as pipeline_mod
+
+    monkeypatch.setitem(pipeline_mod._PROMPT_TOKENIZER_CACHE, str(tmp_path), _stub_tokenizer)
+    monkeypatch.setattr(decode_graph_mod.current_omni_platform, "is_cuda", lambda: True)
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir(exist_ok=True)
+    (vae_dir / "config.json").write_text(json.dumps({"temperal_downsample": [False] * 4}))
+    preprocess = get_qwen_image_21_pre_process_func(
+        SimpleNamespace(model=str(tmp_path), enable_cuda_graph_decode=True, **config_overrides)
+    )
+
+    assert preprocess(make_request("ineligible", [(64, 64)])).batch_compatibility_key[2] is None
+
+
+def test_non_cuda_graph_request_keeps_the_padding_friendly_key(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.qwen_image_21 import decode_graph as decode_graph_mod
+    from vllm_omni.diffusion.models.qwen_image_21 import pipeline_qwen_image_21 as pipeline_mod
+
+    monkeypatch.setitem(pipeline_mod._PROMPT_TOKENIZER_CACHE, str(tmp_path), _stub_tokenizer)
+    monkeypatch.setattr(decode_graph_mod.current_omni_platform, "is_cuda", lambda: False)
+    vae_dir = tmp_path / "vae"
+    vae_dir.mkdir(exist_ok=True)
+    (vae_dir / "config.json").write_text(json.dumps({"temperal_downsample": [False] * 4}))
+    preprocess = get_qwen_image_21_pre_process_func(
+        SimpleNamespace(model=str(tmp_path), enable_cuda_graph_decode=True, enforce_eager=False)
+    )
+
+    assert preprocess(make_request("npu", [(64, 64)])).batch_compatibility_key[2] is None
+
+
+@pytest.mark.parametrize("scheduler_class", [RequestScheduler, StepScheduler])
+def test_ragged_prompt_lengths_do_not_share_a_wave(sized_preprocess, scheduler_class):
+    short = sized_preprocess(make_request("short", [(64, 64)]))
+    long_request = make_request("long", [(64, 64)], color="blue")
+    long_request.prompt["prompt"] = "A ceramic teapot on a windowsill " * 8
+    long = sized_preprocess(long_request)
+
+    scheduler = scheduler_class()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+    scheduler.add_request(short)
+    scheduler.add_request(long)
+
+    # Pairing these two would right-pad the short prompt and cost the wave its
+    # captured decode graph, so they must not be scheduled together.
+    assert scheduler.schedule().scheduled_request_ids == ["short"]
+    scheduler.finish_requests("short", DiffusionRequestStatus.FINISHED_COMPLETED)
+    assert scheduler.schedule().scheduled_request_ids == ["long"]
+
+
+@pytest.mark.parametrize("scheduler_class", [RequestScheduler, StepScheduler])
+def test_equal_length_prompts_still_share_a_wave(sized_preprocess, scheduler_class):
+    scheduler = scheduler_class()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+    for request_id, color in (("first", "red"), ("second", "blue")):
+        scheduler.add_request(sized_preprocess(make_request(request_id, [(64, 64)], color=color)))
+
+    assert scheduler.schedule().scheduled_request_ids == ["first", "second"]
+
+
+def test_negative_prompt_length_is_part_of_the_compatibility_key(sized_preprocess):
+    def with_negative(request_id, negative):
+        request = make_request(request_id, [(64, 64)])
+        request.sampling_params.true_cfg_scale = 4.0
+        request.prompt["negative_prompt"] = negative
+        return sized_preprocess(request)
+
+    short_neg = with_negative("neg-short", "blurry")
+    long_neg = with_negative("neg-long", "blurry, low quality, watermark, text")
+    same_neg = with_negative("neg-same", "blurry")
+
+    assert short_neg.batch_compatibility_key[:3] == long_neg.batch_compatibility_key[:3]
+    assert short_neg.batch_compatibility_key[3] != long_neg.batch_compatibility_key[3]
+    assert short_neg.batch_compatibility_key == same_neg.batch_compatibility_key
+
+
+@pytest.mark.parametrize("scheduler_class", [RequestScheduler, StepScheduler])
+def test_omitted_and_empty_negative_prompts_do_not_share_a_wave(sized_preprocess, scheduler_class):
+    omitted = make_request("omitted-negative", [(64, 64)])
+    omitted.sampling_params.true_cfg_scale = 4.0
+    empty = make_request("empty-negative", [(64, 64)], color="blue")
+    empty.sampling_params.true_cfg_scale = 4.0
+    empty.prompt["negative_prompt"] = ""
+
+    omitted = sized_preprocess(omitted)
+    empty = sized_preprocess(empty)
+
+    assert omitted.batch_compatibility_key[:3] == empty.batch_compatibility_key[:3]
+    assert omitted.batch_compatibility_key[3] != empty.batch_compatibility_key[3]
+    assert empty.batch_compatibility_key[3] == (
+        True,
+        len(qwen_image_21_prompt_text(" ", num_images=0)),
+    )
+
+    scheduler = scheduler_class()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+    scheduler.add_request(omitted)
+    scheduler.add_request(empty)
+    assert scheduler.schedule().scheduled_request_ids == ["omitted-negative"]
+
+
+@pytest.mark.parametrize("preprocess_kind", ["unsized", "eager"])
+@pytest.mark.parametrize("scheduler_class", [RequestScheduler, StepScheduler])
+def test_fallback_keys_keep_negative_prompt_presence(
+    tmp_path, monkeypatch, preprocess, preprocess_kind, scheduler_class
+):
+    if preprocess_kind == "unsized":
+        preprocess_func = preprocess
+    else:
+        from vllm_omni.diffusion.models.qwen_image_21 import pipeline_qwen_image_21 as pipeline_mod
+
+        monkeypatch.setitem(pipeline_mod._PROMPT_TOKENIZER_CACHE, str(tmp_path), _stub_tokenizer)
+        vae_dir = tmp_path / "vae"
+        vae_dir.mkdir(exist_ok=True)
+        (vae_dir / "config.json").write_text(json.dumps({"temperal_downsample": [False] * 4}))
+        preprocess_func = get_qwen_image_21_pre_process_func(SimpleNamespace(model=str(tmp_path), enforce_eager=True))
+
+    omitted = make_request("fallback-omitted", [(64, 64)])
+    omitted.sampling_params.true_cfg_scale = 4.0
+    empty = make_request("fallback-empty", [(64, 64)], color="blue")
+    empty.sampling_params.true_cfg_scale = 4.0
+    empty.prompt["negative_prompt"] = ""
+    omitted = preprocess_func(omitted)
+    empty = preprocess_func(empty)
+
+    assert omitted.batch_compatibility_key[2] is None
+    assert empty.batch_compatibility_key[2] is None
+    assert omitted.batch_compatibility_key[3] != empty.batch_compatibility_key[3]
+
+    scheduler = scheduler_class()
+    scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+    scheduler.add_request(omitted)
+    scheduler.add_request(empty)
+    assert scheduler.schedule().scheduled_request_ids == ["fallback-omitted"]
+
+
+def test_negative_prompt_ignored_when_cfg_is_off(sized_preprocess):
+    request = make_request("neg-off", [(64, 64)])
+    request.prompt["negative_prompt"] = "blurry"
+    key = sized_preprocess(request).batch_compatibility_key
+    assert key[3] is None

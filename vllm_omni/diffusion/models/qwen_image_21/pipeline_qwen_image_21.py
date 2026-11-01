@@ -43,6 +43,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_edit import (
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import QwenImage21CFGParallelMixin
+from vllm_omni.diffusion.models.qwen_image_21.decode_graph import decode_graph_config_eligible
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
     QwenImage21KVCache,
     QwenImage21Transformer2DModel,
@@ -82,6 +83,71 @@ OUTPUT_RESOLUTION = 1024
 # Re-export the shared metadata value locally so this pipeline keeps a nearby,
 # descriptive constant for validation without becoming the source of truth.
 MAX_QWEN_IMAGE_21_INPUT_IMAGES = QWEN_IMAGE_21_MAX_INPUT_IMAGES
+
+# Prompt scaffold the checkpoint was trained with. The strings live at module
+# scope because the admission path sizes a prompt during pre-processing, before
+# any pipeline object exists, and must agree with the prompt encoder.
+QWEN_IMAGE_21_IMAGE_PLACEHOLDER = "<image1><|vision_start|><|image_pad|><|vision_end|>"
+QWEN_IMAGE_21_SYSTEM_PROMPT = "Comprehend and analyze the provided prompt."
+QWEN_IMAGE_21_T2I_PROMPT_TEMPLATE = (
+    f"<|im_start|>system\n{QWEN_IMAGE_21_SYSTEM_PROMPT}<|im_end|>\n"
+    f"<|im_start|>user\n{{}}<|im_end|>\n"
+    f"<|im_start|>assistant\n"
+)
+QWEN_IMAGE_21_TI2I_PROMPT_TEMPLATE = (
+    f"<|im_start|>system\n{QWEN_IMAGE_21_SYSTEM_PROMPT}<|im_end|>\n"
+    f"<|im_start|>user\n{QWEN_IMAGE_21_IMAGE_PLACEHOLDER}{{}}<|im_end|>\n"
+    f"<|im_start|>assistant\n"
+)
+
+
+def qwen_image_21_prompt_text(prompt: str, num_images: int) -> str:
+    """VLM prompt string for *prompt* carrying *num_images* condition images.
+
+    Shared by pre-processing (which only sizes the prompt) and by the prompt
+    encoder (which tokenizes it), so both agree on what its length depends on.
+    """
+    if num_images <= 0:
+        return QWEN_IMAGE_21_T2I_PROMPT_TEMPLATE.format(prompt)
+    placeholders = QWEN_IMAGE_21_IMAGE_PLACEHOLDER
+    for index in range(2, num_images + 1):
+        placeholders += f" <image{index}><|vision_start|><|image_pad|><|vision_end|>"
+    template = QWEN_IMAGE_21_TI2I_PROMPT_TEMPLATE.replace(QWEN_IMAGE_21_IMAGE_PLACEHOLDER, placeholders)
+    return template.format(prompt)
+
+
+# Keyed by model path; ``None`` marks a checkpoint whose ``processor`` subfolder
+# cannot be read (unit tests that stub the directory, text-encoder-only setups).
+_PROMPT_TOKENIZER_CACHE: dict[str, Any | None] = {}
+_PROMPT_TOKENIZER_WARNED: set[str] = set()
+
+
+def resolve_qwen_image_21_tokenizer(model: str | None):
+    """Tokenizer used to size prompts, resolved once per model path.
+
+    Returns ``None`` when it cannot be loaded, in which case callers fall back
+    to a length-agnostic batch key instead of failing the request.
+    """
+    if model is None:
+        return None
+    if model in _PROMPT_TOKENIZER_CACHE:
+        return _PROMPT_TOKENIZER_CACHE[model]
+    tokenizer = None
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model, subfolder="processor", local_files_only=os.path.isdir(model))
+    except Exception as exc:  # any load failure degrades to the length-agnostic key
+        if model not in _PROMPT_TOKENIZER_WARNED:
+            _PROMPT_TOKENIZER_WARNED.add(model)
+            logger.warning(
+                "Qwen-Image-2.1 prompt tokenizer unavailable for %s (%s); request batches keep the "
+                "length-agnostic compatibility key.",
+                model,
+                exc,
+            )
+    _PROMPT_TOKENIZER_CACHE[model] = tokenizer
+    return tokenizer
 
 
 def _read_vae_scale_factor(od_config: OmniDiffusionConfig) -> int:
@@ -167,6 +233,46 @@ def get_qwen_image_21_pre_process_func(
     vae_image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
     sample_sigmas = (getattr(od_config, "extras", None) or {}).get("sample_sigmas")
 
+    tokenizer = resolve_qwen_image_21_tokenizer(getattr(od_config, "model", None))
+    # A request batch right-pads every prompt to the longest one. The padded
+    # positions make the decode attention mask ragged, which costs the decode
+    # steps their captured CUDA graph (see decode_graph.register_prefill), so
+    # on a graph-enabled serve the batch key carries the VLM text length and
+    # wave-mates stay padding-free. Eager serves keep the padding-friendly key.
+    padding_is_cheap = not decode_graph_config_eligible(od_config)
+
+    def _prompt_token_count(prompt_text: str, num_images: int) -> int | None:
+        """VLM text-token count of the templated prompt, or None when unsized."""
+        if padding_is_cheap or tokenizer is None:
+            return None
+        return len(tokenizer(qwen_image_21_prompt_text(prompt_text or " ", num_images))["input_ids"])
+
+    def _negative_token_count(num_images: int, prompt_obj, true_cfg_scale) -> tuple[bool, int | None] | None:
+        """Negative-prompt presence and token count when true CFG is actually used.
+
+        ``None`` means CFG is off. The presence bit distinguishes an omitted
+        prompt (which disables CFG at execution) from an explicitly empty one.
+        """
+        if true_cfg_scale is None or float(true_cfg_scale) <= 1.0:
+            return None
+        negative_text = prompt_obj.get("negative_prompt") if hasattr(prompt_obj, "get") else None
+        if negative_text is None:
+            # An omitted negative prompt disables true CFG, while an explicitly
+            # empty one still enables the negative-prompt path at execution.
+            return (False, 0)
+        # encode_prompt normalizes an empty prompt to a single space before
+        # tokenization; size that same text so admission matches execution.
+        return (True, _prompt_token_count(negative_text or " ", num_images))
+
+    def _length_key_tail(num_images: int, prompt_obj, true_cfg_scale) -> tuple:
+        positive = _prompt_token_count(prompt_obj["prompt"], num_images)
+        negative = _negative_token_count(num_images, prompt_obj, true_cfg_scale)
+        if positive is None:
+            # Keep positive-length grouping disabled when padding is cheap or
+            # the tokenizer is unavailable, but preserve CFG compatibility.
+            return (None, negative)
+        return (positive, negative)
+
     def _to_pil(image: Any) -> PIL.Image.Image:
         if isinstance(image, PIL.Image.Image):
             return image
@@ -206,6 +312,7 @@ def get_qwen_image_21_pre_process_func(
         # for paths that bypass this hook; request-level sigmas always win.
         if request.sampling_params.sigmas is None and sample_sigmas:
             request.sampling_params.sigmas = list(sample_sigmas)
+        true_cfg_scale = request.sampling_params.true_cfg_scale
         prompt = request.prompt
         multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
@@ -217,7 +324,11 @@ def get_qwen_image_21_pre_process_func(
         if isinstance(raw_image, tuple):
             raw_image = list(raw_image)
         if raw_image is None or (isinstance(raw_image, list) and len(raw_image) == 0):
-            request.batch_compatibility_key = ("qwen_image_21", ())
+            request.batch_compatibility_key = (
+                "qwen_image_21",
+                (),
+                *_length_key_tail(0, prompt, true_cfg_scale),
+            )
             request.prompt = prompt
             return request
 
@@ -261,7 +372,11 @@ def get_qwen_image_21_pre_process_func(
         prompt["additional_information"]["input_image_sizes"] = input_image_sizes
         prompt["additional_information"]["calculated_height"] = calculated_height
         prompt["additional_information"]["calculated_width"] = calculated_width
-        request.batch_compatibility_key = ("qwen_image_21", tuple(input_image_sizes))
+        request.batch_compatibility_key = (
+            "qwen_image_21",
+            tuple(input_image_sizes),
+            *_length_key_tail(len(images), prompt, true_cfg_scale),
+        )
         request.prompt = prompt
         return request
 
@@ -431,22 +546,14 @@ class QwenImage21Pipeline(
         self.vae_scale_factor = 16
         self.latent_channels = self.vae.config.z_dim if getattr(self, "vae", None) else 64
 
-        self.sys_prompt = "Comprehend and analyze the provided prompt."
+        self.sys_prompt = QWEN_IMAGE_21_SYSTEM_PROMPT
         # The prompt is built as a raw template string and passed straight to
         # `self.processor(text=..., images=...)`, rather than going through
         # `apply_chat_template`: the two tokenize differently and the checkpoint
         # expects this one. The "<image1>..." vision prefix only appears in
         # the image-conditioned template.
-        self.prompt_template_t2i = (
-            f"<|im_start|>system\n{self.sys_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{{}}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
-        self.prompt_template_ti2i = (
-            f"<|im_start|>system\n{self.sys_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n<image1><|vision_start|><|image_pad|><|vision_end|>{{}}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
+        self.prompt_template_t2i = QWEN_IMAGE_21_T2I_PROMPT_TEMPLATE
+        self.prompt_template_ti2i = QWEN_IMAGE_21_TI2I_PROMPT_TEMPLATE
         # Number of leading system-role tokens to drop from the hidden states.
         # Derived from the tokenized system message rather than hardcoded, so it
         # tracks the processor's template.
@@ -589,7 +696,7 @@ class QwenImage21Pipeline(
 
         has_images = images_per_prompt is not None and any(images_per_prompt)
         if not has_images:
-            txt = [self.prompt_template_t2i.format(e) for e in prompt]
+            txt = [qwen_image_21_prompt_text(e, 0) for e in prompt]
         else:
             if images_per_prompt is None or len(images_per_prompt) != len(prompt):
                 raise ValueError("`images_per_prompt` must align with `prompt`.")
@@ -600,17 +707,7 @@ class QwenImage21Pipeline(
                     img if isinstance(img, PIL.Image.Image) else PIL.Image.fromarray(img) for img in (images or [])
                 ]
                 condition_pil_per_prompt.append(images)
-                if not images:
-                    txt.append(self.prompt_template_t2i.format(t))
-                    continue
-                n_imgs = len(images)
-                replace = "<image1><|vision_start|><|image_pad|><|vision_end|>"
-                for i in range(2, n_imgs + 1):
-                    replace += f" <image{i}><|vision_start|><|image_pad|><|vision_end|>"
-                template = self.prompt_template_ti2i.replace(
-                    "<image1><|vision_start|><|image_pad|><|vision_end|>", replace
-                )
-                txt.append(template.format(t))
+                txt.append(qwen_image_21_prompt_text(t, len(images)))
             condition_pil_list = []
             for images in condition_pil_per_prompt:
                 for img in images:
