@@ -151,7 +151,8 @@ def ras_verification_logits(
         expanded_local_pos,
         win_size,
     )
-    # Keep the check outside compiled math: Inductor can elide _assert_async.
+    # Fail-stop invariant: on CUDA this poisons the context and terminates the
+    # worker, not just this request. Keep outside compile: Inductor can elide it.
     torch._assert_async(
         ((history == -1) | ((history >= 0) & (history < logits.shape[-1]))).all(),
         "CosyVoice3 RAS history must contain stage speech-token IDs or -1, not unified-vocabulary IDs",
