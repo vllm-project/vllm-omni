@@ -134,6 +134,27 @@ def _step_pipeline(model, *, packed_batch_supported: bool = True):
     return pipeline
 
 
+@pytest.mark.parametrize("steps", [(0,), (0, 7)])
+def test_pdd_step_execution_keeps_request_steps_without_backend_warning(steps, mocker):
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.models.minimax_h3.fasth3_checkpoint import FastH3OmniCheckpointSpec
+    from vllm_omni.diffusion.models.minimax_h3.pdd import pdd_sigmas
+
+    model = mocker.Mock(wraps=_SegmentMeanModel())
+    pipeline = _step_pipeline(model)
+    pipeline._fasth3_checkpoint = FastH3OmniCheckpointSpec()
+    warning = mocker.patch.object(mod.logger, "warning_once")
+    states = []
+    for index, step in enumerate(steps):
+        branch, video, audio = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=index)
+        state = _make_state(str(index), model, branch, video, audio, pdd_sigmas(12), pdd_sigmas(3))
+        state.step_index = step
+        states.append(state)
+    pipeline.denoise_step(None, states=states)
+    assert [call.kwargs["pdd_step"] for call in model.call_args_list] == list(steps)
+    warning.assert_not_called()
+
+
 @pytest.mark.parametrize("num_steps", [1, 8, 50])
 def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     """Stepping through the contract must reproduce the request-mode loop."""
@@ -592,7 +613,7 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames):
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,
         "_prepare_encoder_conditioning_inputs",
-        lambda self, value, sampling: context if value is conditioning else pytest.fail("wrong encoder handoff"),
+        lambda self, value, sampling, **_: context if value is conditioning else pytest.fail("wrong encoder handoff"),
     )
     monkeypatch.setattr(
         mod.MiniMaxH3Pipeline,

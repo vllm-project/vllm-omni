@@ -33,6 +33,7 @@ from __future__ import annotations
 import itertools
 import re
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -80,6 +81,22 @@ def _tp_range(group: Any) -> tuple[int, int]:
     return group.rank_in_group, group.world_size
 
 
+_QKV_PROJECTION_RE = re.compile(
+    r"^(layers\.\d+\.self_attn\.)(?P<part>[qkv])_proj\.(?P<kind>weight(?:_packed|_scale)?)$"
+)
+_GATE_UP_PROJECTION_RE = re.compile(
+    r"^(layers\.\d+\.mlp\.)(?P<part>gate|up)_proj\.(?P<kind>weight(?:_packed|_scale)?)$"
+)
+_MINIMAX_H3_TEXT_LAYER_PREFIX = "text_encoder.text_model.layers"
+
+
+def _is_serialized_mxfp_auto_round(config: Any) -> bool:
+    if not isinstance(config, dict):
+        return False
+    method = str(config.get("quant_method", "")).lower().replace("_", "-")
+    return method in {"auto-round", "inc"} and "mx_fp" in str(config.get("data_type", "")).lower()
+
+
 # ---------------------------------------------------------------------------
 # Tensor-parallel primitives bound to the encoder process group.
 #
@@ -118,10 +135,9 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
         start_idx = self._tp_rank * self.num_embeddings_per_partition
         end_idx = start_idx + self.num_embeddings_per_partition
         input_mask = (input_ < start_idx) | (input_ >= end_idx)
-        masked_input = input_.clone() - start_idx
-        masked_input[input_mask] = 0
+        masked_input = torch.where(input_mask, torch.zeros_like(input_), input_ - start_idx)
         output = F.embedding(masked_input, self.weight)
-        output[input_mask, :] = 0.0
+        output = output.masked_fill(input_mask.unsqueeze(-1), 0.0)
         self.group.all_reduce(output)
         return output
 
@@ -358,7 +374,15 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
     ) -> None:
         del loaded_shard_id
-        shard_size = self.input_size_per_partition
+        # The stored width is input_size_per_partition for BF16 weights and
+        # input_size_per_partition/{2,32} for MXFP4 packed weights/scales.
+        shard_size = param.data.shape[1]
+        expected_size = shard_size * self._tp_size
+        if loaded_weight.shape[1] != expected_size:
+            raise ValueError(
+                f"row-parallel weight width {loaded_weight.shape[1]} does not match "
+                f"TP{self._tp_size} shard width {shard_size}"
+            )
         start_idx = self._tp_rank * shard_size
         param.data.copy_(loaded_weight.narrow(1, start_idx, shard_size))
 
@@ -448,9 +472,14 @@ class MiniMaxH3Qwen3VLTextRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
         return inv_freq.to(device)
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor, *, inv_freq: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # position_ids: (3, 1, seq)
-        inv_freq = self._get_inv_freq(position_ids.device)
+        if inv_freq is None:
+            inv_freq = self._get_inv_freq(position_ids.device)
+        elif inv_freq.dtype != torch.float32 or inv_freq.device != position_ids.device:
+            raise ValueError("prepared rotary inverse frequencies must be float32 on the positions device")
         inv_freq_expanded = inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
         position_ids_expanded = position_ids[:, :, None, :].float()
         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
@@ -975,9 +1004,10 @@ class MiniMaxH3Qwen3VLTextModel(nn.Module):
         *,
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
+        rotary_inv_freq: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, positions)
+        position_embeddings = self.rotary_emb(hidden_states, positions, inv_freq=rotary_inv_freq)
         for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(hidden_states, position_embeddings=position_embeddings)
             if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
@@ -1093,6 +1123,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
     stub that never runs the forward.
     """
 
+    quant_config: QuantizationConfig | None = None
+
     def __init__(
         self,
         model_path: str,
@@ -1106,7 +1138,6 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         self.device_target = device
         self.encoder_group = encoder_group
         self.quant_config = quant_config
-        _validate_encoder_quant_config(quant_config)
         self.image_token_id = 151655
         self.video_token_id = 151656
         self._tp_size = 1
@@ -1119,6 +1150,38 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         self.image_token_id = int(config.image_token_id)
         self.video_token_id = int(config.video_token_id)
         self._tp_size = int(encoder_group.world_size) if encoder_group is not None else 1
+        from .checkpoint_quantization import FastH3NVFP4Config
+
+        hf_quant_config = getattr(config, "quantization_config", None)
+        if not isinstance(hf_quant_config, dict):
+            hf_quant_config = {}
+        if hf_quant_config.get("quant_method") == "nvfp4":
+            from .vae_nvfp4 import require_nvfp4_linear
+
+            require_nvfp4_linear(device)
+            quant_config = FastH3NVFP4Config.from_encoder(
+                Path(model_path), rank=encoder_group.rank_in_group if encoder_group is not None else 0
+            )
+            self.quant_config = quant_config
+        elif _is_serialized_mxfp_auto_round(hf_quant_config):
+            from vllm_omni.quantization.inc_config import OmniINCConfig
+
+            quant_config = OmniINCConfig.from_config(hf_quant_config)
+            # The checkpoint names modules under the HF ``model.language_model``
+            # and ``model.visual`` namespaces while this encoder builds them
+            # under ``text_encoder.text_model`` and ``text_encoder.vision``.
+            # Remap the full config so per-layer ``extra_config`` exceptions
+            # (for example a BF16 ``down_proj``) still resolve at runtime.
+            quant_config.apply_prefix_map(
+                {
+                    "model.language_model.": "text_encoder.text_model.",
+                    "model.visual.": "text_encoder.vision.",
+                }
+            )
+            if not quant_config.block_name_to_quantize:
+                quant_config.block_name_to_quantize = [_MINIMAX_H3_TEXT_LAYER_PREFIX]
+            self.quant_config = quant_config
+        _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
         self.vision.to(dtype=dtype)
@@ -1129,7 +1192,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             dtype,
             quant_config=quant_config,
         )
-        self.text_model.to(dtype=dtype)
+        if not isinstance(quant_config, FastH3NVFP4Config):
+            self.text_model.to(dtype=dtype)
         logger.info(
             "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
@@ -1156,46 +1220,46 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             match = re.match(r"layers\.(\d+)\.", rest)
             if match is not None and int(match.group(1)) >= MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER:
                 return None
-            if ".self_attn.q_proj.weight" in rest:
+            match = _QKV_PROJECTION_RE.match(rest)
+            if match is not None:
                 return (
-                    "text_model." + rest.replace(".self_attn.q_proj.weight", ".self_attn.qkv_proj.weight"),
-                    "q",
+                    "text_model." + match.group(1) + "qkv_proj." + match.group("kind"),
+                    match.group("part"),
                 )
-            if ".self_attn.k_proj.weight" in rest:
+            match = _GATE_UP_PROJECTION_RE.match(rest)
+            if match is not None:
                 return (
-                    "text_model." + rest.replace(".self_attn.k_proj.weight", ".self_attn.qkv_proj.weight"),
-                    "k",
-                )
-            if ".self_attn.v_proj.weight" in rest:
-                return (
-                    "text_model." + rest.replace(".self_attn.v_proj.weight", ".self_attn.qkv_proj.weight"),
-                    "v",
-                )
-            if ".mlp.gate_proj.weight" in rest:
-                return (
-                    "text_model." + rest.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight"),
-                    0,
-                )
-            if ".mlp.up_proj.weight" in rest:
-                return (
-                    "text_model." + rest.replace(".mlp.up_proj.weight", ".mlp.gate_up_proj.weight"),
-                    1,
+                    "text_model." + match.group(1) + "gate_up_proj." + match.group("kind"),
+                    0 if match.group("part") == "gate" else 1,
                 )
             return ("text_model." + rest, None)
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from .checkpoint_quantization import FastH3NVFP4Config
+
+        serialized_map = self.quant_config.weight_map if isinstance(self.quant_config, FastH3NVFP4Config) else {}
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         # Seeded from modules that own a multi-shard loader, so a fused weight
         # receiving no source shard is caught as well as a partially filled one.
-        expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {
-            f"{module_name}.weight": sources
-            for module_name, module in self.named_modules()
-            if (sources := _fused_source_shards(module)) is not None
-        }
+        expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {}
+        for module_name, module in self.named_modules():
+            sources = _fused_source_shards(module)
+            if sources is None:
+                continue
+            for suffix in ("weight", "weight_packed", "weight_scale"):
+                param_name = f"{module_name}.{suffix}"
+                if param_name in params:
+                    expected_fused_shards[param_name] = sources
         loaded_fused_shards: dict[str, set[str | int]] = {name: set() for name in expected_fused_shards}
         for name, tensor in weights:
+            if name in serialized_map:
+                param_name = serialized_map[name]
+                parameter = params[param_name]
+                parameter.weight_loader(parameter, tensor)
+                loaded.add(param_name)
+                continue
             mapped = self._map_weight_name(name)
             if mapped is None:
                 continue

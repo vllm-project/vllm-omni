@@ -1567,7 +1567,7 @@ class TestLaunchOmniCoreEngines:
             "vllm_omni.engine.stage_engine_startup.CoreEngineProcManager",
             return_value=local_engine_manager,
         )
-        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
+        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup_with_deadline", autospec=True)
         with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=mocker.Mock(),
@@ -1640,11 +1640,14 @@ class TestLaunchOmniCoreEngines:
             ),
         )
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
+        local_engine_manager = mocker.Mock()
         mocker.patch(
             "vllm_omni.engine.stage_engine_startup.CoreEngineProcManager",
-            return_value=mocker.Mock(),
+            return_value=local_engine_manager,
         )
-        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup", autospec=True)
+        mock_wait = mocker.patch(
+            "vllm_omni.engine.stage_engine_startup.wait_for_engine_startup_with_deadline", autospec=True
+        )
         with _launch_omni_core_engines(
             vllm_config=vllm_config,
             executor_class=mocker.Mock(),
@@ -1653,6 +1656,7 @@ class TestLaunchOmniCoreEngines:
             stage_id=7,
             stage_config={"stage_id": 7},
             replica_id=3,
+            stage_init_timeout=42,
         ) as (_, yielded_coordinator, yielded_addresses):
             assert yielded_coordinator is coordinator
             assert yielded_addresses.coordinator_input == "tcp://coord-in"
@@ -1668,3 +1672,6 @@ class TestLaunchOmniCoreEngines:
             replica_id=3,
         )
         mock_wait.assert_called_once()
+        # stage_init_timeout must bound the distributed local launch as well.
+        assert mock_wait.call_args.kwargs["timeout"] == 42
+        assert mock_wait.call_args.kwargs["kill_processes"] == local_engine_manager.shutdown

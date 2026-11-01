@@ -49,6 +49,7 @@ from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
 from vllm_omni.model_extras.ltx2 import (
     LTX_EXTRA_BODY_PARAMS,
     LTX_EXTRA_OUTPUT_PARAMS,
+    LTX_T2A_EXTRA_BODY_PARAMS,
     ltx_preserves_reference_image_size,
     ltx_transformer_config_subfolder,
 )
@@ -91,6 +92,7 @@ from vllm_omni.model_extras.ming_image import (
 from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
+from vllm_omni.model_extras.minimax_h3 import minimax_h3_transformer_subfolder
 from vllm_omni.model_extras.qwen_image_21 import (
     QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
 )
@@ -272,6 +274,7 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     **{
         model_class_name: {
             "reference_image_size_resolver": _always_preserve_reference_image_size,
+            "transformer_config_subfolder_resolver": minimax_h3_transformer_subfolder,
         }
         for model_class_name in (
             "MiniMaxH3Pipeline",
@@ -309,6 +312,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     },
     "SanaImageToVideoPipeline": {
         "extra_body_params": SANA_VIDEO_EXTRA_BODY_PARAMS,
+    },
+    "LTX2TextToAudioPipeline": {
+        "extra_body_params": LTX_T2A_EXTRA_BODY_PARAMS,
+        "extra_output_params": LTX_EXTRA_OUTPUT_PARAMS,
+        "transformer_config_subfolder_resolver": ltx_transformer_config_subfolder,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,

@@ -16,9 +16,10 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
     --trust-remote-code
 ```
 
-To enable [incremental prefill](#incremental-prefill), set
-`enable_prefix_caching: true` on stage 0 (the thinker) in the deploy config. Otherwise
-the server falls back to rebuilding the prompt per query.
+[Incremental prefill](#incremental-prefill) keys on `enable_prefix_caching` for
+stage 0 (the thinker). The default Qwen3-Omni deploy config turns it on, so the
+server uses incremental prefill out of the box; set it to `false` on stage 0 to
+fall back to rebuilding the prompt per query.
 
 ### Run the Example Client
 
