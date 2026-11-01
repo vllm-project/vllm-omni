@@ -19,6 +19,7 @@ from vllm_omni.diffusion.lora.layers import (
     DiffusionReplicatedLinearWithLoRA,
     DiffusionRowParallelLinearWithLoRA,
 )
+from vllm_omni.diffusion.lora.layers.mot_qkv_parallel_linear import DiffusionMoTQKVParallelLinearWithLoRA
 
 
 def _select_moe_lora_wrapper_cls() -> type:
@@ -204,6 +205,7 @@ def from_layer_diffusion(
         return instance
 
     diffusion_lora_classes = [
+        DiffusionMoTQKVParallelLinearWithLoRA,
         DiffusionMergedQKVParallelLinearWithLoRA,
         DiffusionQKVParallelLinearWithLoRA,
         DiffusionMergedColumnParallelLinearWithLoRA,
