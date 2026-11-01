@@ -165,6 +165,52 @@ def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk
     assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
 
 
+@pytest.mark.parametrize("stop", ["token", "length"])
+@pytest.mark.parametrize("text_tokens", [[21], [21, 22, 23]])
+def test_qwen3_full_payload_preserves_last_text_embedding(plane, stop, text_tokens):
+    """A sampled stop has no input embedding; keep the last spoken input row."""
+    from vllm_omni.model_executor.stage_input_processors import qwen3_omni as q3
+
+    plane._async_chunk = False
+    plane._full_payload_replace_keys_cached = frozenset()
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(
+        stop_token_ids=[2150], max_tokens=len(text_tokens) + 1 if stop == "length" else 10
+    )
+    plane.register_request(request)
+    embeddings = torch.arange((len(request.prompt_token_ids) + len(text_tokens)) * 2).reshape(-1, 2).float()
+    hidden = embeddings + 100
+
+    def emit(start, end, sampled):
+        plane.reserve_outputs(["internal"])
+        _complete(
+            plane,
+            [{"hidden_states.layer_0": embeddings[start:end], "hidden_states.layer_24": hidden[start:end]}],
+            token=sampled,
+        )
+
+    prompt_len = len(request.prompt_token_ids)
+    emit(0, prompt_len, text_tokens[0])
+    for i in range(len(text_tokens)):
+        sampled = text_tokens[i + 1] if i + 1 < len(text_tokens) else (2150 if stop == "token" else 24)
+        emit(prompt_len + i, prompt_len + i + 1, sampled)
+    # A forward already in flight after the sampled stop must remain excluded.
+    emit(0, 1, 99)
+    plane.request_terminal({"internal"})
+    [(snapshot, accumulated)] = plane.record.batches[0]
+    plane._get_model_config = lambda: SimpleNamespace(
+        use_v2_model_runner=True,
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24)),
+    )
+    payload = q3.thinker2talker_full_payload(plane, accumulated, snapshot)
+
+    assert payload is not None
+    torch.testing.assert_close(payload["embed"]["prefill"], embeddings)
+    torch.testing.assert_close(payload["hidden_states"]["output"], hidden)
+    assert payload["ids"]["all"] == request.prompt_token_ids + text_tokens + [sampled]
+
+
 @pytest.mark.parametrize("ignore_eos", [False, True])
 def test_native_output_honors_ignore_eos_and_min_tokens(plane, ignore_eos):
     request = _new_request()

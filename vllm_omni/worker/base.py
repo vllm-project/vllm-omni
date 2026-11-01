@@ -184,10 +184,12 @@ class OmniGPUWorkerBase(GPUWorker):
             1. requested_memory = total_gpu_memory * gpu_memory_utilization
                (computed in init_device from cache_config)
 
-            2. Measure weights + peak_activation + non_torch_increase with
-               ``memory_profiling`` around ``profile_run()``.
-               ``non_torch_increase`` is device-level, so it reflects whatever
-               else is resident on the GPU at profiling time.
+            2. Measure ``non_kv_cache_memory`` with ``memory_profiling``
+               around ``profile_run()``. This includes device consumption
+               since initialization plus transient peak headroom. In
+               particular, runner buffers allocated before profiling are
+               resident consumption, not part of the profiling-window peak
+               increase or the model weights.
 
             3. Profile the CUDA graphs the runner captures through
                ``cudagraph_dispatcher``, the encoder graph manager and the
@@ -256,7 +258,7 @@ class OmniGPUWorkerBase(GPUWorker):
         # graph size again when it suggests --kv-cache-memory in
         # compile_or_warm_up_model. Keep the activation peak alone so that
         # suggestion counts the graph pool once.
-        self.peak_activation_memory = profile_result.torch_peak_increase
+        self.peak_activation_memory = profile_result.transient_peak_headroom
         # Upstream 58b2012aa2 added `total_consumed` to the profiling result
         # and reads it in GPUWorker.compile_or_warm_up_model() (when
         # kv_cache_memory_bytes is None and peak_activation_memory is set, both
@@ -265,13 +267,7 @@ class OmniGPUWorkerBase(GPUWorker):
         # --kv-cache-memory suggestion counts them here.
         self.total_consumed = profile_result.total_consumed + auxiliary_graph_memory
 
-        profiled_usage = (
-            int(self.model_runner.model_memory_usage)
-            + profile_result.torch_peak_increase
-            + profile_result.non_torch_increase
-            + cudagraph_memory_estimate
-            + auxiliary_graph_memory
-        )
+        profiled_usage = profile_result.non_kv_cache_memory + cudagraph_memory_estimate + auxiliary_graph_memory
         self.available_kv_cache_memory_bytes = max(0, self.requested_memory - profiled_usage)
         logger.debug(
             "Profiling KV budget (PID %d, GPU %d): requested=%s, profiled=%s, available=%s",
