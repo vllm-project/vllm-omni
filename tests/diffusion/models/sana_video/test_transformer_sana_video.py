@@ -479,6 +479,54 @@ def test_linear_attention_requires_rotary_embeddings():
         attention(torch.randn(1, 4, 24))
 
 
+def test_paired_rope_falls_back_to_eager_on_cpu(monkeypatch):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.randn(2, 7, 3, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 7, 1, 12, dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    assert not sana_video.can_use_fused_interleaved_rope(query, key, cos, sin)
+    monkeypatch.setattr(
+        sana_video,
+        "fused_interleaved_rope",
+        lambda *_args: pytest.fail("CPU fallback must not launch the fused kernel"),
+    )
+
+    query_out, key_out = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+
+    assert torch.equal(query_out, sana_video.apply_interleaved_rotary_emb(query, cos, sin))
+    assert torch.equal(key_out, sana_video.apply_interleaved_rotary_emb(key, cos, sin))
+
+
+@pytest.mark.parametrize("error_type", [torch.OutOfMemoryError, RuntimeError])
+def test_paired_rope_propagates_kernel_errors_and_allows_retry(monkeypatch, error_type):
+    import vllm_omni.diffusion.models.sana_video.transformer_sana_video as sana_video
+
+    query = torch.randn(1, 3, 2, 12, dtype=torch.bfloat16)
+    key = torch.randn_like(query)
+    cos = torch.randn(1, 3, 1, 12, dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    reference = tuple(sana_video.apply_interleaved_rotary_emb(x, cos, sin) for x in (query, key))
+    monkeypatch.setattr(sana_video, "can_use_fused_interleaved_rope", lambda *_args: True)
+    monkeypatch.setattr(
+        sana_video, "apply_interleaved_rotary_emb", lambda *_args: pytest.fail("Supported inputs must use fused RoPE")
+    )
+    error = error_type("synthetic kernel failure")
+
+    def fail(*_args):
+        raise error
+
+    monkeypatch.setattr(sana_video, "fused_interleaved_rope", fail)
+    with pytest.raises(error_type) as exc_info:
+        sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+    assert exc_info.value is error
+
+    monkeypatch.setattr(sana_video, "fused_interleaved_rope", lambda *_args: reference)
+    result = sana_video.apply_interleaved_rotary_emb_pair(query, key, cos, sin)
+    assert result is reference
+
+
 def test_linear_attention_bfloat16_matches_diffusers_mixed_precision():
     from diffusers.models.attention_processor import Attention as DiffusersAttention
     from diffusers.models.transformers.transformer_sana_video import SanaLinearAttnProcessor3_0
