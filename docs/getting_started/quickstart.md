@@ -33,6 +33,10 @@ ROCm/XPU runtime validation remain pending. Install Omni from this source
 checkout. For published Omni wheels and other installation methods, see the
 [installation guide](installation/README.md).
 
+For source development or Gradio demos, also follow the
+[source dependency instructions](installation/README.md#source-development-and-demo-dependencies)
+to install the temporary Gradio wheel together with the requested extras.
+
 !!! note
     It is important to install the same major & minor version of vLLM and vLLM Omni, otherwise things may not work as expected. If the versions are misaligned, you will see a warning when you import vLLM Omni.
 

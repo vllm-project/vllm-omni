@@ -63,6 +63,12 @@ pip install av websockets
 pip install 'vllm-omni[demo]' websockets
 ```
 
+For this 0.33 source checkout, install `.[demo]` with the temporary Gradio wheel
+using the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+from the repository root, while retaining the `av` and `websockets` client
+dependencies above. The published-package command above applies to released
+versions and does not replace the source setup.
+
 ## Run The Client
 
 ```bash

@@ -72,11 +72,15 @@ WORKDIR ${COMMON_WORKDIR}/vllm-omni
 RUN mkdir -p vllm_omni && touch vllm_omni/__init__.py
 COPY pyproject.toml setup.py ./
 COPY requirements/ requirements/
+COPY tools/build_gradio_pillow13.py tools/build_gradio_pillow13.py
+COPY tools/gradio_pillow13/ tools/gradio_pillow13/
 # Scope the override to Omni; dependency source builds need their own versions.
 ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 
-RUN uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
-        --no-cache-dir --override requirements/vllm033-overrides.txt -e ".[dev]" --no-build-isolation && \
+RUN python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13 && \
+    uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" \
+        --no-cache-dir /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl \
+        -e ".[dev]" --no-build-isolation && \
     python3 -m pip uninstall -y onnxruntime && \
     python3 -m pip install --no-cache-dir --force-reinstall --no-deps \
         "onnxruntime-rocm>=1.22.2" && \

@@ -1,8 +1,12 @@
+<!-- Snippet boundary markers and heading levels are interpreted by the parent GPU page. -->
+<!-- markdownlint-disable MD001 MD025 -->
+
 # --8<-- [start:requirements]
 
 - GPU: Moore Threads GPU with MUSA SDK installed (validated on MTT S5000)
 
 # --8<-- [end:requirements]
+
 # --8<-- [start:set-up-using-python]
 
 vLLM-Omni for MUSA requires building from source. Pre-built wheels are not currently available.
@@ -40,11 +44,19 @@ cd vllm-omni
 VLLM_OMNI_TARGET_DEVICE=musa pip install -e . --no-build-isolation
 ```
 
-For Gradio demos:
+For Gradio demos from this source checkout, retain the MUSA target and
+include the temporary Gradio backport in the normal dependency install:
 
 ```bash
-pip install -e '.[demo]' --no-build-isolation
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+VLLM_OMNI_TARGET_DEVICE=musa pip install -e '.[demo]' --no-build-isolation \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+python -m pip check
 ```
+
+See the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+for provenance and qualification limits. The CPU serialization checks do not
+establish MUSA runtime or browser acceptance.
 
 #### Environment Variables
 

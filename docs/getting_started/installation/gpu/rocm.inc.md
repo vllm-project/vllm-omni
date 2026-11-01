@@ -70,6 +70,19 @@ VLLM_OMNI_TARGET_DEVICE=rocm uv pip install -e .
 uv pip install -e . --no-build-isolation
 ```
 
+For source development or Gradio demos, include the temporary Gradio backport
+in the normal install while retaining the ROCm target:
+
+```bash
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+VLLM_OMNI_TARGET_DEVICE=rocm uv pip install --no-build-isolation -e '.[dev,demo]' \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
+```
+
+See the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+for provenance and qualification limits. ROCm runtime acceptance remains pending.
+
 <details><summary>(Optional) Installation of vLLM from source</summary>
 If you want to check, modify or debug with source code of vLLM, install the library from source with the following instructions:
 
@@ -89,8 +102,9 @@ python3 setup.py develop
 
 The Dockerfile starts from `vllm/vllm-openai-rocm:v0.32.0` and defaults to
 `USE_NIGHTLY_BUILD=1` with source commit `4ba787ec9959e566d3b587a796dff07673324da5`. Its development dependency
-install uses `requirements/vllm033-overrides.txt` for the Gradio/Pillow
-constraint conflict. ROCm runtime validation remains pending.
+install builds the hash-pinned temporary Gradio source backport and installs
+the resulting local wheel with the normal resolver. ROCm runtime validation
+remains pending.
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocm -t vllm-omni-rocm .

@@ -30,7 +30,8 @@ aws ecr-public get-login-password --region "$REGION" \
 # This is because dependencies don't change often, so most PRs will have the same hash.
 #
 # The Dockerfile is also included to avoid churn in the cached image based on the vLLM version.
-DEP_FILES=(pyproject.toml setup.py requirements/*.txt docker/Dockerfile.ci)
+DEP_FILES=(pyproject.toml setup.py requirements/*.txt docker/Dockerfile.ci
+    tools/build_gradio_pillow13.py tools/gradio_pillow13/*)
 CACHE_KEY=$(cat "${DEP_FILES[@]}" | sha256sum | cut -c1-16)
 CACHE_TAG="deps-cache-${CACHE_KEY}"
 echo "Cache key: ${CACHE_TAG}"

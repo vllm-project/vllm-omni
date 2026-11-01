@@ -79,22 +79,27 @@ cd vllm-omni
 uv pip install -e .
 ```
 
-To run Gradio demos, install with optional extras:
+To run Gradio demos from this source checkout, build the temporary Gradio
+backport and pass its wheel in the same normal dependency install:
 
 ```bash
-uv pip install --override requirements/vllm033-overrides.txt -e '.[demo]'
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+uv pip install -e '.[demo]' \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
 ```
 
-Development installs use the same override:
+Development installs use the same built wheel:
 
 ```bash
-uv pip install --override requirements/vllm033-overrides.txt -e '.[dev]'
+uv pip install -e '.[dev]' \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
 ```
 
-The override retains vLLM's Pillow 13 requirement while Gradio, used by
-demos and the VoxCPM test dependency, still declares `pillow<13`.
-See [Gradio #13999](https://github.com/gradio-app/gradio/issues/13999).
-The CI Dockerfile applies this override too.
+See the [source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+for exact source provenance and qualification limits. This local Gradio 6.31
+backport supplies the upstream Pillow 13 compatibility changes; browser,
+native model and full CI acceptance remain pending.
 
 <details><summary>(Optional) Installation of vLLM from source</summary>
 If you want to check, modify or debug with source code of vLLM, install the library from source with the following instructions:

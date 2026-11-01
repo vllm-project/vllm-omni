@@ -16,6 +16,22 @@ vLLM-Omni currently recommends using the Docker image setup steps below.
 
 # --8<-- [start:build-wheel-from-source]
 
+For development or Gradio demos in a source environment with the matching
+upstream XPU runtime already installed, run from the Omni repository root:
+
+```bash
+python tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
+VLLM_OMNI_TARGET_DEVICE=xpu uv pip install --no-build-isolation \
+  --excludes <(printf 'torch\ntriton-xpu\n') -e '.[dev,demo]' \
+  /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl
+uv pip check
+```
+
+Keep the upstream PyTorch and Triton packages paired. See the
+[source dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+for the temporary Gradio backport's provenance and qualification limits.
+XPU runtime acceptance remains pending.
+
 # --8<-- [end:build-wheel-from-source]
 
 # --8<-- [start:build-docker]

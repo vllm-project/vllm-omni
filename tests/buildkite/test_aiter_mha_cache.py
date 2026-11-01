@@ -155,12 +155,25 @@ def test_image_dependency_identity_tracks_the_rocm_image_inputs(tmp_path: Path) 
     requirements = root / "requirements"
     requirements.mkdir()
     (requirements / "rocm.txt").write_text("torch\n", encoding="utf-8")
+    backport = root / "tools/gradio_pillow13"
+    backport.mkdir()
+    for filename in ("manifest.json", "backport.patch", "build-constraints.txt", "NOTICE.md"):
+        (backport / filename).write_text(filename, encoding="utf-8")
 
     original = cache.dependency_identity(root)
     assert len(original) == 64
     assert cache.dependency_identity(root) == original
     (requirements / "rocm.txt").write_text("torch==2\n", encoding="utf-8")
     assert cache.dependency_identity(root) != original
+    (requirements / "rocm.txt").write_text("torch\n", encoding="utf-8")
+    for path in (root / "tools/build_gradio_pillow13.py", *backport.iterdir()):
+        content = path.read_bytes()
+        path.write_bytes(content + b"changed\n")
+        assert cache.dependency_identity(root) != original, path
+        path.write_bytes(content)
+        assert cache.dependency_identity(root) == original
+    shutil.rmtree(backport)
+    assert cache.dependency_identity(root) == ""
 
 
 def test_stage_and_restore_verify_module_identity_and_provenance(tmp_path: Path) -> None:

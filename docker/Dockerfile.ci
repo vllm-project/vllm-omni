@@ -38,16 +38,21 @@ RUN apt-get update && \
 # for CI
 COPY pyproject.toml setup.py ./
 COPY requirements/ requirements/
+COPY tools/build_gradio_pillow13.py tools/build_gradio_pillow13.py
+COPY tools/gradio_pillow13/ tools/gradio_pillow13/
 # Scope the override to Omni; dependency source builds need their own versions.
 ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
 # Editable install: deps + project metadata are cached in this layer, while
 # the package itself is linked to APP_DIR (populated later by COPY --link).
 # Do NOT use a non-editable install here — that copies an empty stub into
 # site-packages and breaks ``import vllm_omni.entrypoints``.
+RUN python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13
 RUN VLLM_WHEEL_VERSION=$(printf '%s' "${VLLM_VERSION}" | sed 's/+/%2B/g') && \
-    uv pip install --system --override requirements/vllm033-overrides.txt \
+    uv pip install --system \
+    /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl \
     "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_WHEEL_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
     -e ".[dev]"
+RUN uv pip check --system && rm -rf /tmp/gradio-pillow13
 # Fail the image build if dependency resolution replaced the selected vLLM.
 # The CPU builder has no NVIDIA driver; CUDA imports are checked at the start
 # of each GPU test job by .buildkite/cuda/scripts/check_vllm_runtime.py.

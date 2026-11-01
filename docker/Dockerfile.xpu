@@ -41,8 +41,10 @@ ENV VLLM_OMNI_TARGET_DEVICE=xpu
 # vLLM XPU wheel requires triton==3.8.0+xpu; installing the old triton-xpu
 # overlay would replace that runtime with an incompatible version.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-build-isolation --override requirements/vllm033-overrides.txt --excludes <(printf "torch\ntriton-xpu\n") \
-    ".[dev]"
+    python3 tools/build_gradio_pillow13.py --output-dir /tmp/gradio-pillow13 && \
+    uv pip install --no-build-isolation --excludes <(printf "torch\ntriton-xpu\n") \
+    /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl ".[dev]" && \
+    uv pip check
 
 FROM vllm-omni AS vllm-omni-openai
 

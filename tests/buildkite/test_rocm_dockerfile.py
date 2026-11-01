@@ -74,6 +74,8 @@ def test_amd_cache_key_tracks_dependency_inputs_and_architecture() -> None:
         "setup.py",
         "requirements",
         "tools/install_torchcodec_rocm.sh",
+        "tools/build_gradio_pillow13.py",
+        "tools/gradio_pillow13/*",
         "ROCM_ARCH",
     ):
         assert cache_input in script

@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "base_version": "6.31.0",
+  "version": "6.31.0+omni.pillow13",
+  "wheel": "gradio-6.31.0+omni.pillow13-py3-none-any.whl",
+  "expected_wheel_sha256": "1c80d33042642f5ad61d4f82b6634893a4830e5c4b047025380b97d61da25778",
+  "base_commit": "07341609c68bb98701e7db9ba9e2ad6c0fb2acb4",
+  "upstream_patch_commit": "d6972ed9d1185634cea083e0263839543d5ceb8d",
+  "upstream_patch_url": "https://github.com/gradio-app/gradio/pull/14005",
+  "license": "Apache-2.0; preserve bundled third-party notices",
+  "inputs": {
+    "gradio-6.31.0-py3-none-any.whl": {
+      "url": "https://files.pythonhosted.org/packages/17/03/c1fdcfe84d1dce2a75921654e7b2075b251f7d48904d2b6006a2556a16b5/gradio-6.31.0-py3-none-any.whl",
+      "sha256": "7b50b9b6a2d23cd02851ad4c8b1c8312c88d8b911d1f29c93f9761c98348a64a"
+    },
+    "gradio-6.31.0.tar.gz": {
+      "url": "https://files.pythonhosted.org/packages/68/98/a76721a95bebc678b8a89c174d72292b3e99b2e4b387b77965d2797a1b52/gradio-6.31.0.tar.gz",
+      "sha256": "40cf094fe8ea1b8ada0fc4c10b685c4c5f09c4061d34c073be25bab342e14e22"
+    },
+    "requirements-mcp.txt": {
+      "url": "https://raw.githubusercontent.com/gradio-app/gradio/07341609c68bb98701e7db9ba9e2ad6c0fb2acb4/requirements-mcp.txt",
+      "sha256": "21951cbe1c5714b99b47a81a968d84c0ed342cfd0a7528ac368318decab49e88"
+    },
+    "upstream-processing_utils.py": {
+      "url": "https://raw.githubusercontent.com/gradio-app/gradio/d6972ed9d1185634cea083e0263839543d5ceb8d/gradio/processing_utils.py",
+      "sha256": "6b177675a861604f68825020e39949927cee5f392279314a9f1ebbacd3b9797f"
+    }
+  },
+  "local_inputs": {
+    "backport.patch": "3d6691ad0ddc9b4ba95e9ddf677661be1525baf18f2628255273813eb28fab40",
+    "build-constraints.txt": "35498847b65225c90c83f4ace3f2676f7155f1d33b5e20652a6a941a1237f77d",
+    "NOTICE.md": "4c450fa5b01628255717a87f8fdcd362d6a0b56cf8a6766e8fb97ad2469d5f1f"
+  },
+  "source_files": {
+    "requirements.txt": {
+      "before_sha256": "5072e48f74f7a094bdbc11aec8a6101ea06841f3dee87a4799eab2f10d43870f",
+      "after_sha256": "b55b36b6538ef94eb3b1d062b484b56f553d9e8431c0658abae563a7990ad3c3"
+    },
+    "gradio/processing_utils.py": {
+      "before_sha256": "a087c5d5273b50169810d3b800a65d76ca532dc0e1fd325e3032fbc7a909a40e",
+      "after_sha256": "cace26b5a13f8979503ef98c27eee9a85b758c79c832b4f08374587372cfb276"
+    },
+    "gradio/package.json": {
+      "before_sha256": "5a4661b2ad3fafb01163b7d2d37839802cee3b47469598a9bf8e0d45826dcf12",
+      "after_sha256": "ae1f3856f35d9024738a899ef3961c02dc170d4f705353743da9eaf8f2e597a1"
+    }
+  },
+  "python_range": [
+    "3.11",
+    "3.12",
+    "3.13"
+  ],
+  "qualification": {
+    "tested_python": "3.12.13",
+    "uv": "0.11.8",
+    "untested_python": [],
+    "model_and_browser_qualification": false,
+    "published": false,
+    "builder_tested_python": [
+      "3.11.15",
+      "3.12.13",
+      "3.13.13"
+    ],
+    "full_environment_untested_python": [
+      "3.11",
+      "3.13"
+    ]
+  }
+}
