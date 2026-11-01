@@ -902,7 +902,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Model Runner V2 keeps the sampled id, codec history and EOS state on
         # the GPU (see make_omni_output_mrv2 and mrv2_custom_sampler).
         self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
-        self._check_v1_draft_method(vllm_config, self._use_v2_model_runner)
+        self._check_v1_draft_method(vllm_config, self._use_v2_model_runner, self._k_step_frames)
         # Per request slot: the Thinker handed over an empty condition.
         self._mrv2_empty_speech: torch.Tensor | None = None
         # Rows the sampler must force to codec EOS, computed with this step's output.
@@ -951,24 +951,27 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return frames
 
     @staticmethod
-    def _check_v1_draft_method(vllm_config: Any, use_v2_model_runner: bool) -> None:
-        """On Model Runner V1 a stage-1 ``speculative_config`` is the multi-frame contract only.
+    def _check_v1_draft_method(vllm_config: Any, use_v2_model_runner: bool, k_step_frames: int) -> None:
+        """On Model Runner V1 a stage-1 ``speculative_config`` has to arm the multi-frame loop.
 
         The V1 codec window penalty and forced EOS are per request
         (``_apply_codec_repetition_penalty`` and ``_force_eos_on_sampled_ids``
-        skip a batch whose row count differs), so draft rows from another
-        method would be sampled without them. MRv2 turn sessions verify draft
-        codes (``mrv2_custom_sampler``).
+        skip a batch whose row count differs), so draft rows the K-step loop
+        does not consume would be sampled without them. MRv2 turn sessions
+        verify draft codes (``mrv2_custom_sampler``).
         """
         spec = getattr(vllm_config, "speculative_config", None)
-        if spec is None or use_v2_model_runner:
+        if spec is None or use_v2_model_runner or k_step_frames > 0:
             return
-        method = spec.get("method") if isinstance(spec, dict) else getattr(spec, "method", None)
-        if method != "ngram":
-            raise NotImplementedError(
-                f"MiniCPM-o 4.5 Talker on model_runner: v1 takes a speculative_config only for multi-frame "
-                f"decode (method ngram), got {method!r}; run the Talker on model_runner: v2 to verify draft codes"
-            )
+        if isinstance(spec, dict):
+            method, num_spec = spec.get("method"), spec.get("num_speculative_tokens")
+        else:
+            method, num_spec = getattr(spec, "method", None), getattr(spec, "num_speculative_tokens", None)
+        raise NotImplementedError(
+            "MiniCPM-o 4.5 Talker on model_runner: v1 takes a stage-1 speculative_config only when it arms "
+            f"multi-frame decode (method ngram, num_speculative_tokens >= 1); got method={method!r}, "
+            f"num_speculative_tokens={num_spec!r}. Run the Talker on model_runner: v2 to verify draft codes"
+        )
 
     def _init_native_talker(self, prefix: str) -> None:
         if self._tts_config is None:

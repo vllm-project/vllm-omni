@@ -712,20 +712,29 @@ def test_drafter_loading_finds_the_codec_table_and_no_head(mocker):
     "use_v2,spec,ok",
     [
         (False, None, True),
-        (False, SimpleNamespace(method="ngram"), True),
-        (False, {"method": "ngram"}, True),
-        (False, SimpleNamespace(method="suffix"), False),
-        (False, SimpleNamespace(method="dspark"), False),
-        (True, SimpleNamespace(method="suffix"), True),
+        (False, SimpleNamespace(method="ngram", num_speculative_tokens=7), True),
+        (False, {"method": "ngram", "num_speculative_tokens": 7}, True),
+        (False, SimpleNamespace(method="ngram", num_speculative_tokens=0), False),
+        (False, SimpleNamespace(method="suffix", num_speculative_tokens=4), False),
+        (False, SimpleNamespace(num_speculative_tokens=4), False),
+        (True, SimpleNamespace(method="suffix", num_speculative_tokens=4), True),
     ],
 )
-def test_v1_talker_takes_only_the_multi_frame_speculative_config(use_v2, spec, ok):
-    vllm_config = SimpleNamespace(speculative_config=spec)
+def test_v1_talker_takes_only_a_speculative_config_that_arms_multi_frame(use_v2, spec, ok):
+    talker_cls = MiniCPMO45OmniTTSForConditionalGeneration
+    vllm_config = SimpleNamespace(
+        speculative_config=spec, model_config=SimpleNamespace(model_stage="tts", use_v2_model_runner=use_v2)
+    )
+    # The same frame count __init__ reads back from the shared K-step contract.
+    frames = talker_cls._parse_k_step_frames(vllm_config)
     if ok:
-        MiniCPMO45OmniTTSForConditionalGeneration._check_v1_draft_method(vllm_config, use_v2)
+        talker_cls._check_v1_draft_method(vllm_config, use_v2, frames)
+        # A V1 config that loads is the K-step loop.
+        assert frames > 0 or spec is None or use_v2
     else:
-        with pytest.raises(NotImplementedError, match="model_runner: v1"):
-            MiniCPMO45OmniTTSForConditionalGeneration._check_v1_draft_method(vllm_config, use_v2)
+        assert frames == 0
+        with pytest.raises(NotImplementedError, match=r"model_runner: v1 .* got method="):
+            talker_cls._check_v1_draft_method(vllm_config, use_v2, frames)
 
 
 @pytest.mark.parametrize("v2,session,ok", [(True, "turn", True), (True, "duplex", False), (False, "turn", False)])
