@@ -213,6 +213,19 @@ class WanStreamingDecoder:
         frame expands to a single raw frame and every later one to the full
         temporal factor.
         """
+        # Reclaim the denoise loop's cached allocator blocks before the decode
+        # allocates its per-frame buffers. AR denoise and streaming VAE decode
+        # interleave on the same device; without the reclaim the denoise
+        # fragments ride along under the decode, and on memory-tight streaming
+        # deployments the peak rides the physical cap. Measured on 910B3
+        # (TP2+USP4, 480x832, 117-frame session): per-card HBM peak
+        # 63.99 GiB -> 59.84 GiB, post-session residency 63.6 -> 53.0 GiB.
+        if latent.device.type != "cpu":
+            # Device-guarded lazy import keeps the device-less contract tests
+            # free of the platform plugin machinery.
+            from vllm_omni.platforms import current_omni_platform
+
+            current_omni_platform.empty_cache()
         if output_format not in ("video", "planar_uint8") or type(produce_output) is not bool:
             raise ValueError("Invalid streaming decoder pixel output contract")
         patch_size = getattr(getattr(self._vae, "config", None), "patch_size", None)
