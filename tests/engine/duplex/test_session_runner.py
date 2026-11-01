@@ -16,7 +16,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import struct
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +31,7 @@ from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.commands import DuplexCommand
 from vllm_omni.engine.duplex.config import DuplexSessionConfig, DuplexSessionState
 from vllm_omni.engine.duplex.contracts import (
+    DuplexFence,
     DuplexOutputContext,
     DuplexRequestIdentity,
     DuplexStagePort,
@@ -37,6 +39,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
     duplex_resource_request_id,
+    duplex_turn_id_from_request_id,
 )
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent
@@ -197,6 +200,8 @@ class Harness:
         segment_token_ids: Sequence[int] = (),
         epoch: int | None = None,
         metrics: Any = None,
+        stage_work: Sequence[tuple[int, int, int, int, int]] = (),
+        output_chunk: tuple[int, int] | None = None,
     ) -> bool:
         session = self.session
         fence = session.fence if epoch is None else session.fence.__class__(SESSION_ID, epoch=epoch)
@@ -206,10 +211,13 @@ class Harness:
             segment_finished=segment_finished,
             segment_token_ids=tuple(segment_token_ids),
             segment_output_metadata=dict(segment_output_metadata or {}),
+            perf_chunks={(row[1], row[2]) for row in stage_work} | ({output_chunk} if output_chunk else set()),
         )
         request_id = getattr(output, "request_id", None)
         if not isinstance(request_id, str):
             raise AssertionError("stage output is missing request_id")
+        # The orchestrator hands spans over with the raw output, before the session output.
+        self.runner.on_stage_work(stage_work)
         return self.runner.on_stage_output(stage_id, output, metrics, request_id=request_id, context=context)
 
     async def deliver_and_settle(self, output: SimpleNamespace, **kwargs: Any) -> list[DuplexEvent]:
@@ -231,6 +239,7 @@ async def open_harness(
     clock: Any = None,
     log_stats: bool = False,
     plugin: DuplexModelPlugin | None = None,
+    model: str = "openbmb/MiniCPM-o-4_5",
 ) -> Harness:
     if plugin is None:
         plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
@@ -254,7 +263,7 @@ async def open_harness(
     )
     body: dict[str, object] = {"auto_response": auto_response, **(extra_body or {})}
     config = DuplexSessionConfig(
-        model="openbmb/MiniCPM-o-4_5",
+        model=model,
         modalities=list(modalities),
         instructions="You are a concise assistant.",
         extra_body=body,
@@ -280,6 +289,199 @@ async def open_harness(
 
 async def close_harness(harness: Harness) -> None:
     await harness.manager.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Session stats (RFC #8325)                                                   #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_session_stats_get_is_refused_when_the_deployment_does_not_collect() -> None:
+    h = await open_harness()
+    try:
+        assert h.session.perf is None
+        assert h.session.capabilities.supports_session_stats is False
+        events = await h.run(commands.GetSessionStats(event_id="evt_stats"))
+        assert types(events) == ["error"]
+        assert events[0].code == "session_stats_disabled"
+        assert events[0].related_event_id == "evt_stats"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_session_stats_report_each_chunks_stage_work_and_audio_by_turn() -> None:
+    from vllm_omni.benchmarks.duplex_session_metrics import session_stats_turn_metrics
+
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        ledger = h.session.perf
+        assert ledger is not None
+        assert h.session.capabilities.supports_session_stats is True
+        await h.run(append_audio())
+        # The append carries its chunk id so every stage can time its steps.
+        assert h.port.submissions[0].prompt["model_intermediate_buffer"]["duplex"]["perf_chunk"] == [0, 1]
+
+        before = await h.run(commands.GetSessionStats(event_id="evt_before"))
+        assert types(before) == ["session.stats"]
+        (turn,) = before[0].stats["turns"]
+        (chunk,) = turn["chunks"]
+        assert (turn["status"], chunk["seq"], chunk["complete"]) == ("open", 1, False)
+        assert chunk["done_ns"] is None
+        assert session_stats_turn_metrics(turn) == {"final": False, "epoch": 0, "turn_id": 0}
+
+        start = ledger.opened_at_ns + chunk["submitted_ns"]
+        ms = 1_000_000
+        request_id = h.stage0_request_id()
+        stage_work = ((0, 0, 1, start + 10 * ms, 50 * ms), (1, 0, 1, start + 40 * ms, 100 * ms))
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"), stage_work=stage_work)
+        events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", turn_end=True))
+        done = find(events, "response.done")
+
+        reply = await h.run(commands.GetSessionStats(event_id="evt_after"))
+        assert types(reply) == ["session.stats"]
+        assert reply[0].request_event_id == "evt_after"
+        stats = reply[0].stats
+        assert [stage["stage_id"] for stage in stats["stages"]] == [0, 1]
+        (turn,) = stats["turns"]
+        assert (turn["epoch"], turn["turn_id"], turn["status"]) == (0, 0, "done")
+        assert turn["response_ids"] == [done.response_id]
+        (chunk,) = turn["chunks"]
+        assert chunk["complete"] is True and chunk["done_ns"] >= chunk["submitted_ns"]
+        assert chunk["stage_work"] == [
+            {"stage_id": 0, "spans": [[chunk["submitted_ns"] + 10 * ms, 50 * ms]]},
+            {"stage_id": 1, "spans": [[chunk["submitted_ns"] + 40 * ms, 100 * ms]]},
+        ]
+        assert sum(piece["duration_ms"] for piece in turn["audio"]) == 1000
+        assert all(piece["response_id"] == done.response_id for piece in turn["audio"])
+
+        metrics = session_stats_turn_metrics(turn)
+        assert metrics["final"] is True
+        # Stage spans overlap from 40 ms to 60 ms: the union is 130 ms, not 150 ms.
+        assert metrics["generation_ms"] == 130.0
+        assert metrics["busy_rtf"] == 0.13
+        assert metrics["stall_ratio"] == pytest.approx(metrics["stall_ms"] / 1000.0)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_an_output_without_spans_still_marks_its_chunk_handled() -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        ledger = h.session.perf
+        assert ledger is not None
+        await h.run(append_audio())
+        start = ledger.opened_at_ns + ledger.snapshot()["turns"][0]["chunks"][0]["submitted_ns"]
+        request_id = h.stage0_request_id()
+        # The step's spans left with an earlier output; the audio output carries none.
+        h.deliver(listen_output(request_id), stage_id=0, stage_work=((0, 0, 1, start, 1),), output_chunk=(0, 1))
+        first = ledger._chunk(0, 1)[1].handled_ns
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hi"), output_chunk=(0, 1))
+        assert ledger._chunk(0, 1)[1].handled_ns > first
+    finally:
+        await close_harness(h)
+
+
+def test_output_context_keeps_an_immutable_snapshot_of_the_segment_metadata() -> None:
+    metadata = {"meta.listen_token_id": 1}
+    context = DuplexOutputContext(
+        identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=DuplexFence(SESSION_ID)),
+        final_stage_id=1,
+        segment_finished=False,
+        segment_output_metadata=metadata,
+        perf_chunks={(0, 1)},
+    )
+    metadata["meta.listen_token_id"] = 2
+    assert context.segment_output_metadata["meta.listen_token_id"] == 1
+    with pytest.raises(TypeError):
+        context.segment_output_metadata["meta.listen_token_id"] = 3  # type: ignore[index]
+    assert context.perf_chunks == frozenset({(0, 1)})
+
+
+@pytest.mark.asyncio
+async def test_spans_reported_while_the_append_submit_awaits_are_kept() -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        ledger = h.session.perf
+        assert ledger is not None
+        submit = h.port.submit
+
+        async def submit_and_report(submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
+            # A live resumable request steps on the update before submit returns.
+            h.runner.on_stage_work([(0, 0, 1, ledger.now_ns(), 1_000_000)])
+            return await submit(submission)
+
+        h.port.submit = submit_and_report  # type: ignore[method-assign]
+        await h.run(append_audio())
+        (turn,) = ledger.snapshot()["turns"]
+        assert [work["stage_id"] for work in turn["chunks"][0]["stage_work"]] == [0]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_append_submit_leaves_no_chunk_behind() -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        assert h.session.perf is not None
+        h.port.fail_submit = RuntimeError("stage down")
+        await h.run(append_audio())
+        assert h.session.perf.snapshot()["turns"] == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_retried_append_does_not_take_the_failed_submits_spans() -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        ledger = h.session.perf
+        assert ledger is not None
+        h.port.fail_submit = RuntimeError("stage down")
+        await h.run(append_audio())
+        h.port.fail_submit = None
+        await h.run(append_audio())
+        retry = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]["perf_chunk"]
+        assert retry != [0, 1]
+        # A late span of the failed submit still carries the old id.
+        h.runner.on_stage_work([(0, 0, 1, ledger.now_ns(), 1_000_000)])
+        (turn,) = ledger.snapshot()["turns"]
+        assert [(chunk["seq"], chunk["stage_work"]) for chunk in turn["chunks"]] == [(1, [])]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_session_stats_get_is_still_answered_while_the_session_closes() -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        await h.run(append_audio())
+        # Queued before the close began (later ones get ``session_closed`` at admission).
+        h.runner.run.closing = True
+        h.runner.submit(commands.GetSessionStats(event_id="evt_closing"))
+        events = await h.settle()
+        assert types(events) == ["session.stats"]
+        assert events[0].request_event_id == "evt_closing"
+    finally:
+        h.runner.run.closing = False
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_session_stats_mark_barge_in_turns_cancelled() -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        await h.run(append_audio())
+        assert h.session.perf is not None
+        h.session.barge_in()
+        (turn,) = h.session.perf.snapshot()["turns"]
+        # No abort-completion signal: a cancelled turn reports raw data but never numbers.
+        assert (turn["epoch"], turn["status"], turn["final"]) == (0, "cancelled", False)
+        assert turn["chunks"][0]["complete"] is False
+    finally:
+        await close_harness(h)
 
 
 # --------------------------------------------------------------------------- #
@@ -1903,6 +2105,346 @@ async def test_direct_response_listen_still_emits_response_done_after_continuati
         await close_harness(h)
 
 
+@asynccontextmanager
+async def _turn_harness(
+    *, auto_response: bool = True, runtime_config: DuplexSessionRuntimeConfig | None = None
+) -> AsyncIterator[Harness]:
+    h = await open_harness(auto_response=auto_response, runtime_config=runtime_config)
+    h.session.capabilities = replace(h.session.capabilities, supports_core_resumable_request=False)
+    try:
+        yield h
+    finally:
+        await close_harness(h)
+
+
+def _terminal_listen_result(request_id: str, turn_id: int | None) -> dict[str, object]:
+    result: dict[str, object] = {
+        "is_listen": True,
+        "end_of_turn": True,
+        "data_plane_request_id": request_id,
+        "abort_data_plane_request": True,
+    }
+    if turn_id is not None:
+        result["model_turn_id"] = turn_id
+    return result
+
+
+async def _send_model_result_and_settle(h: Harness, result: dict[str, object]) -> list[DuplexEvent]:
+    await h.runner.model._send_one_model_output_event(result, expected_epoch=h.session.epoch)
+    return await h.settle()
+
+
+async def _append_turn(h: Harness, *, response: bool = False) -> DuplexStageRequestContext:
+    await h.run(append_audio())
+    context = h.port.submissions[-1].context
+    if response:
+        await h.deliver_and_settle(tts_output(context.request_id, turn_id=context.fence.turn_id))
+        assert h.session.active_response_id is not None
+    return context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state,explicit_turn",
+    [
+        ("unbound", True),
+        ("unbound", False),
+        ("bound", True),
+        ("bound", False),
+        ("response", True),
+        ("response", False),
+        ("resumable", True),
+    ],
+)
+async def test_terminal_listen_advances_and_allows_next_response(state: str, explicit_turn: bool) -> None:
+    async with _turn_harness() as h:
+        session = h.session
+        if state == "resumable":
+            session.capabilities = replace(session.capabilities, supports_core_resumable_request=True)
+        first = await _append_turn(h, response=state == "response")
+        if state == "resumable":
+            assert duplex_turn_id_from_request_id(first.request_id) is None
+        response_id = session.active_response_id
+        if state == "response":
+            assert response_id is not None
+            assert h.runner.model.response_continuations_remaining(response_id)
+        else:
+            assert response_id is None
+            if state == "bound":
+                session.bind_response_turn(first.fence.turn_id)
+        turn = first.fence.turn_id
+        events = await _send_model_result_and_settle(
+            h, _terminal_listen_result(first.request_id, turn if explicit_turn else None)
+        )
+        if response_id is not None:
+            assert "response.listen" in types(events)
+            assert find(events, "response.done").response_id == response_id
+        else:
+            assert types(events) == ["response.listen"]
+        assert (session.turn_id, session.fence.turn_id, session.active_response_id) == (turn + 1, turn + 1, None)
+        second = await _append_turn(h, response=True)
+        assert second.fence.turn_id == turn + 1
+        if state != "resumable":
+            assert second.request_id != first.request_id and f"-turn{turn + 1}" in second.request_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_response", [False, True], ids=["before-next-append", "during-next-response"])
+async def test_late_terminal_listen_of_a_completed_turn_is_ignored(
+    monkeypatch: pytest.MonkeyPatch, next_response: bool
+) -> None:
+    async with _turn_harness() as h:
+        session = h.session
+        committed: list[str] = []
+        monkeypatch.setattr(
+            h.runner.plugin,
+            "commit_model_context",
+            lambda *, session_id, assistant_text: committed.append(assistant_text),
+        )
+        first = await _append_turn(h)
+        turn, epoch = first.fence.turn_id, session.epoch
+        listen = {**_terminal_listen_result(first.request_id, turn), "model_context_text": "<silent>"}
+        await _send_model_result_and_settle(h, listen)
+        assert (session.turn_id, committed) == (turn + 1, ["<silent>"])
+        aborts = len(h.port.aborts)
+        if next_response:
+            second = await _append_turn(h, response=True)
+            assert second.request_id != first.request_id
+            # Unbind the request so request-id filtering cannot hide the late-listen bug.
+            await _send_model_result_and_settle(h, {"is_buffering": True, "data_plane_request_id": second.request_id})
+            assert session.active_request_id is None
+        response_id = session.active_response_id
+        assert session.epoch == epoch
+        assert await _send_model_result_and_settle(h, listen) == []
+        assert committed == ["<silent>"] and len(h.port.aborts) == aborts
+        assert (session.turn_id, session.active_response_id, session.epoch) == (turn + 1, response_id, epoch)
+        if not next_response:
+            assert f"-turn{turn + 1}" in (await _append_turn(h)).request_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close", [False, True], ids=["replace-owner", "begin-close"])
+async def test_terminal_listen_rechecks_state_after_abort(close: bool) -> None:
+    async with _turn_harness() as h:
+        session = h.session
+        first = await _append_turn(h, response=True)
+        turn, old_response = first.fence.turn_id, session.active_response_id
+        model_state = h.runner.model_state
+        model_state.continuation_owner_id, model_state.continuation_units = f"response:{old_response}", 2
+        resources = dict(session.request_resources)
+        h.port.abort_gate = asyncio.Event()
+        pending = asyncio.create_task(
+            h.runner.model._send_one_model_output_event(
+                _terminal_listen_result(first.request_id, turn), expected_epoch=session.epoch
+            )
+        )
+        try:
+            await asyncio.wait_for(h.port.abort_started.wait(), timeout=2.0)
+            assert not pending.done()
+            assert session.turn_id == turn + 1
+            assert (model_state.continuation_owner_id, model_state.continuation_units) == (None, 0)
+            if close:
+                h.runner._begin_close("client_close")
+            else:
+                session.end_response(commit_text=False, preserve_request=True)
+                new_response = session.begin_response(turn_id=turn + 1)
+                new_request = h.manager.stage_request_id(session.fence, stage_id=0, resumable=False)
+                session.bind_request(new_request)
+                session.bind_stage_request(0, new_request, fence=session.fence)
+                model_state.continuation_owner_id, model_state.continuation_units = f"response:{new_response}", 1
+            h.port.abort_gate.set()
+            await asyncio.wait_for(pending, timeout=2.0)
+            events = await h.settle()
+            assert "response.done" not in types(events)
+            if close:
+                assert session.state == DuplexSessionState.CLOSING
+                assert (session.turn_id, session.active_response_id) == (turn + 1, old_response)
+                assert session.request_resources == resources and h.port.cleanups == []
+            else:
+                assert (session.active_response_id, session.active_response_turn_id) == (new_response, turn + 1)
+                assert session.active_request_id == new_request and (0, new_request) in session.request_resources
+                assert model_state.continuation_owner_id == f"response:{new_response}"
+                assert model_state.continuation_units == 1
+                assert (h.port.aborts, h.port.cleanups) == ([[first.request_id]], [([first.request_id], False)])
+        finally:
+            h.port.abort_gate.set()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_terminal_listen_does_not_advance_when_its_emit_overflows() -> None:
+    async with _turn_harness(runtime_config=DuplexSessionRuntimeConfig(max_pending_output_events_per_session=8)) as h:
+        session = h.session
+        first = await _append_turn(h)
+        for _ in range(8):
+            h.manager.emit(session, [AudioDelta(response_id="resp-held", delta="AAAA")])
+        assert not h.runner.run.closing and h.output_buffer.pending_events == 8
+        await h.runner.model._send_one_model_output_event(
+            _terminal_listen_result(first.request_id, first.fence.turn_id), expected_epoch=session.epoch
+        )
+        assert h.runner.run.closing and h.runner.run.close_reason == "output_backpressure"
+        assert session.turn_id == first.fence.turn_id
+        assert (h.port.aborts, h.port.cleanups) == ([], [])
+        events = await h.settle()
+        assert (find(events, "error").code, find(events, "session.closed").reason) == (
+            "output_backpressure",
+            "output_backpressure",
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_listen_preserves_an_older_draining_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _turn_harness() as h:
+        session = h.session
+        session.capabilities = replace(session.capabilities, supports_concurrent_turn_requests=True)
+        committed: list[str] = []
+        monkeypatch.setattr(
+            h.runner.plugin,
+            "commit_model_context",
+            lambda *, session_id, assistant_text: committed.append(assistant_text),
+        )
+        first = await _append_turn(h, response=True)
+        turn, old_response = first.fence.turn_id, session.active_response_id
+        assert old_response is not None
+        drain_id = h.manager.stage_request_id(session.fence, stage_id=1, resumable=False)
+        session.bind_stage_request(1, drain_id, fence=session.fence)
+        session.bind_draining_request(drain_id, old_response)
+        session.snapshot_active_response_for_drain()
+        session.complete_model_turn(turn)
+        new_response = session.begin_response(turn_id=turn + 1)
+        h.runner.emit({"type": "response.created", "response_id": new_response})
+        second = await _append_turn(h)
+        events = await _send_model_result_and_settle(
+            h, {**_terminal_listen_result(drain_id, turn), "model_context_text": "old context"}
+        )
+        assert events == [] and committed == ["old context"]
+        assert (session.active_response_id, session.response_id_for_request(drain_id)) == (new_response, old_response)
+        assert h.port.aborts == []
+        events = await _send_model_result_and_settle(h, _terminal_listen_result(second.request_id, turn + 1))
+        assert (find(events, "response.done").response_id, session.turn_id) == (new_response, turn + 2)
+        assert session.response_id_for_request(drain_id) == old_response and (1, drain_id) in session.request_resources
+        assert session.assistant_transcript(old_response) == "hello" and h.port.aborts == [[second.request_id]]
+        events = await _send_model_result_and_settle(
+            h, {"data_plane_request_id": drain_id, "model_turn_id": turn, "text": " tail", "end_of_turn": True}
+        )
+        assert find(events, "response.output_audio_transcript.delta").response_id == old_response
+        assert find(events, "response.done").response_id == old_response
+        assert session.assistant_transcript(old_response) == "hello tail"
+        assert session.active_response_id is None and not session.is_draining_request(drain_id)
+        assert (1, drain_id) not in session.request_resources
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [commands.BargeIn(), commands.CancelResponse()], ids=["barge-in", "cancel"])
+@pytest.mark.parametrize("next_response", [False, True], ids=["after-silence", "during-next-response"])
+async def test_terminal_listen_then_interrupt_recovers(interrupt: DuplexCommand, next_response: bool) -> None:
+    async with _turn_harness() as h:
+        session = h.session
+        first = await _append_turn(h)
+        turn = first.fence.turn_id
+        await _send_model_result_and_settle(h, _terminal_listen_result(first.request_id, turn))
+        assert session.turn_id == turn + 1
+        reply = await _append_turn(h, response=True) if next_response else None
+        if reply:
+            assert reply.request_id != first.request_id and reply.fence.turn_id == turn + 1
+        response_id, epoch = session.active_response_id, session.epoch
+        events = await h.run(interrupt)
+        if reply:
+            done = [e for e in events if e.type == "response.done"]
+            assert len(done) == 1 and (done[0].response_id, done[0].status) == (response_id, "cancelled")
+            assert any(reply.request_id in ids for ids in h.port.aborts)
+            assert any(reply.request_id in ids and abort for ids, abort in h.port.cleanups)
+        else:
+            assert "response.done" not in types(events) and len(h.port.submissions) == 1
+        idle_cancel = not next_response and isinstance(interrupt, commands.CancelResponse)
+        if idle_cancel:
+            assert types(events) == ["error"] and events[0].code == "response_not_active"
+        else:
+            assert "error" not in types(events)
+        assert session.epoch == epoch + int(not idle_cancel) and session.active_response_id is None
+        if reply:
+            aborts = len(h.port.aborts)
+            await h.runner.model._send_one_model_output_event(
+                _terminal_listen_result(first.request_id, turn), expected_epoch=epoch
+            )
+            h.deliver(tts_output(reply.request_id, text="late", turn_id=reply.fence.turn_id, epoch=epoch), epoch=epoch)
+            assert await h.settle() == [] and len(h.port.aborts) == aborts
+        else:
+            assert session.turn_id == turn + 1
+        recovered = await _append_turn(h)
+        assert recovered.request_id not in {first.request_id, reply.request_id if reply else first.request_id}
+        if reply:
+            assert recovered.fence.epoch == epoch + 1
+        else:
+            assert recovered.fence.turn_id == turn + 1
+        events = await h.deliver_and_settle(
+            tts_output(recovered.request_id, turn_id=recovered.fence.turn_id, epoch=session.epoch, turn_end=True)
+        )
+        assert "response.output_audio.delta" in types(events)
+        if reply:
+            assert "response.output_audio_transcript.delta" in types(events)
+        assert find(events, "response.done").status == "completed" and session.active_response_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("next_response", [False, True], ids=["after-silence", "during-next-response"])
+async def test_close_after_terminal_listen_releases_the_session(next_response: bool) -> None:
+    async with _turn_harness() as h:
+        session = h.session
+        first = await _append_turn(h)
+        turn = first.fence.turn_id
+        await _send_model_result_and_settle(h, _terminal_listen_result(first.request_id, turn))
+        assert sum(first.request_id in ids for ids, _ in h.port.cleanups) == 1
+        reply = await _append_turn(h, response=True) if next_response else None
+        if reply:
+            assert reply.request_id != first.request_id
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="c-close", session_id=SESSION_ID, reason="client_close")
+        )
+        result = await asyncio.wait_for(h.results.get(), timeout=2.0)
+        events = await h.settle()
+        assert result.ok and result.operation == "close"
+        assert types(events).count("session.closed") == 1 and "response.listen" not in types(events)
+        assert session.state == DuplexSessionState.CLOSED and session.active_response_id is None
+        assert not session.request_resources and SESSION_ID not in h.manager.runners and not h.manager._closing
+        assert sum(first.request_id in ids for ids, _ in h.port.cleanups) == 1
+        if reply:
+            assert any(reply.request_id in ids and abort for ids, abort in h.port.cleanups)
+        h.deliver(tts_output(reply.request_id if reply else first.request_id, turn_id=turn + 1))
+        assert await h.settle() == []
+        events = await h.run(commands.Heartbeat(event_id="evt-after-close"))
+        assert types(events) == ["error"] and events[0].code == "unknown_session"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget_spent", [False, True], ids=["continuations-left", "budget-spent"])
+async def test_terminal_listen_preserves_manual_turn_lifecycle(budget_spent: bool) -> None:
+    async with _turn_harness(auto_response=False) as h:
+        session = h.session
+        await h.run(append_audio())
+        assert h.port.submissions == []
+        await h.run(commands.Commit(create_response=True))
+        first = h.port.submissions[-1].context
+        response_id, turn = session.active_response_id, session.turn_id
+        assert response_id is not None
+        if budget_spent:
+            h.runner.model_state.continuation_owner_id = f"response:{response_id}"
+            h.runner.model_state.continuation_units = h.runner.model._RESPONSE_MAX_CONTINUATION_UNITS
+        events = await _send_model_result_and_settle(h, _terminal_listen_result(first.request_id, turn))
+        assert types(events).count("response.listen") == types(events).count("response.done") == 1
+        assert find(events, "response.done").response_id == response_id
+        assert session.active_response_id is None and session.active_request_id is None
+        assert (session.turn_id, len(h.port.submissions)) == (turn, 1)
+        assert h.port.aborts == [[first.request_id]] and sum(first.request_id in ids for ids, _ in h.port.cleanups) == 1
+        await h.run(append_audio())
+        assert len(h.port.submissions) == 1
+        await h.run(commands.Commit(create_response=True))
+        reply = h.port.submissions[-1].context
+        assert len(h.port.submissions) == 2
+        events = await h.deliver_and_settle(tts_output(reply.request_id, turn_id=reply.fence.turn_id, finished=True))
+        assert find(events, "response.done").status == "completed" and "response.output_audio.delta" in types(events)
+
+
 @pytest.mark.asyncio
 async def test_listen_decision_on_a_resumable_request_keeps_the_turn_going() -> None:
     """Same unfinished listen, budget left: it must schedule the next unit.
@@ -3345,6 +3887,67 @@ async def test_cancelling_output_keeps_the_pending_semantic_turn(command) -> Non
         events += await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
         assert "input_audio_buffer.speech_started" not in types(events)
         assert types(events).count("input_audio_buffer.committed") == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_keeps_a_commit_deferred_behind_the_active_response() -> None:
+    """Cancelling the answer in flight must not discard the next turn's audio.
+
+    A commit that arrives while a response is still generating is retained
+    with the response it should start. ``response.cancel`` then tears down only
+    the in-flight answer; the client's already-committed turn has to survive so
+    the ``response.create`` that follows can answer it.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, text="hello", finished=False))
+        assert h.runner.model_state.committed_audio_payload is None
+
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=True))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is True
+
+        await h.run(commands.CancelResponse())
+        assert model_state.committed_audio_payload is not None, "the committed turn was discarded"
+        assert model_state.deferred_response_create is True
+        assert h.session.pending_input_bytes > 0
+
+        events = await h.run(commands.CreateResponse())
+        assert "error" not in types(events), types(events)
+        assert find(events, "response.created")
+        assert model_state.committed_audio_payload is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_releases_audio_retained_for_the_cancelled_answer() -> None:
+    """A retain that belongs to the cancelled answer is still released."""
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", finished=False))
+        # Speech arriving mid-answer, committed without asking for a response:
+        # the retain belongs to the answer being generated, so
+        # ``deferred_response_create`` stays False and no new turn owns it.
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=False))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is False
+
+        await h.run(commands.CancelResponse())
+
+        assert model_state.committed_audio_payload is None
+        assert h.session.pending_input_bytes == 0
     finally:
         await close_harness(h)
 

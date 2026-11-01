@@ -289,3 +289,68 @@ def test_begin_request_rejects_invalid_chunk_length(chunk_tokens):
     with pytest.raises(ValueError, match="chunk_tokens"):
         state.begin_request("A", _vertical_plan(), chunk_tokens=chunk_tokens)
     assert state.resident_versions == 0
+
+
+@pytest.mark.parametrize("history", [0, 1, 3])
+def test_same_step_sink_cache_lifetime_and_attention_window(history):
+    # Simulate all ranks and explicit P2P payload copies. This checks actual
+    # pool allocation, table width, last-use eviction and final cleanup.
+    steps, blocks, chunks = 2, 2, 12
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=chunks,
+            num_denoise_steps=steps,
+            step_replicas=steps,
+            layer_groups=1,
+            ordering=Ordering.SAME_STEP,
+            kv_history_chunks=history,
+            blocks=blocks,
+        )
+    )
+    states = []
+    for rank in range(plan.world):
+        spec = ARDiffusionNoisyKVSpec(
+            num_layers=blocks,
+            num_kv_heads=2,
+            head_size=4,
+            block_size=4,
+            max_chunk_tokens=4,
+            max_history_chunks=max(1, history),
+        )
+        cache = NoisyKVCache(
+            spec, dtype=torch.float32, device=torch.device("cpu"), layer_groups=1, max_batch_size=1, step_replicas=steps
+        )
+        state = NoisyKVState(cache)
+        state.bind_rank(rank, None)
+        state.begin_request("A", plan, chunk_tokens=4)
+        states.append(state)
+    for tick in range(plan.num_slots):
+        for rank, state in enumerate(states):
+            task = plan.task(tick, rank)
+            if task is None:
+                continue
+            context = state.prepare((("A", task),))[0][0]
+            pool = state.cache.pool
+            for src in plan.sources(task, rank):
+                key = ("A", *src.version)
+                k, v = pool.kv_block_views(key, 1)
+                expected = 1000 + 100 * src.version[0] + 10 * src.version[1] + src.version[2]
+                torch.testing.assert_close(k, torch.full_like(k, expected))
+                torch.testing.assert_close(v, torch.full_like(v, -expected))
+            assert context.seq_len == (len(plan.sources(task, rank)) + 1) * 4
+            key = ("A", *task)
+            k, v = pool.kv_block_views(key, 1)
+            value = 1000 + 100 * task[0] + 10 * task[1] + task[2]
+            k.fill_(value)
+            v.fill_(-value)
+        for xfer in plan.transfers(tick):
+            key = ("A", *xfer.version)
+            source = states[xfer.src].cache.pool
+            target = states[xfer.dst].cache.pool
+            target.alloc(key)
+            target.copy_into(key, source.tensor_dict(key, 1))
+        for state in states:
+            state.evict(tick)
+    for state in states:
+        state.end_request("A")
+        assert state.resident_versions == 0

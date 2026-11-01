@@ -141,9 +141,13 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _check_max_generated_image_size,
     _choose_output_format,
     _extract_images_from_result,
+    _extract_segmentation_instances,
     _generated_size_str,
     _get_max_edit_input_images,
     _load_input_images,
+    _load_uploaded_image,
+    _parse_json_list_form,
+    _supports_segmentation,
     _update_if_not_none,
 )
 from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
@@ -157,18 +161,22 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
     ImageGenerationResponse,
+    ImageSegmentationResponse,
     ResponseFormat,
+    SegmentationMaskFormat,
 )
 from vllm_omni.entrypoints.openai.protocol.rollout import (
     CreateSessionRequest,
     RolloutStepRequest,
 )
+from vllm_omni.entrypoints.openai.protocol.run import RunRequest
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoDeleteResponse,
     VideoGenerationRequest,
     VideoGenerationStatus,
     VideoListResponse,
     VideoResponse,
+    VideoSegmentationResponse,
 )
 from vllm_omni.entrypoints.openai.rollout_session import (
     RolloutSessionCapacityError,
@@ -178,6 +186,7 @@ from vllm_omni.entrypoints.openai.rollout_session import (
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_rl_rollout import ServingRLRollout
+from vllm_omni.entrypoints.openai.serving_run import ServingRun, run_endpoint_restrictions
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
@@ -199,10 +208,18 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     _cleanup_video,
     _cleanup_video_references,
     _parse_video_form,
+    _persist_uploaded_reference,
     _run_video_generation_job,
     _status_code_for_video_failure,
     _unpack_video_generation_result,
+    validate_latent_continuation_source,
     video_response_from_request,
+)
+from vllm_omni.entrypoints.openai.video.segmentation.helpers import (
+    VIDEO_SEGMENTATION_MAX_BYTES,
+    extract_video_segmentation,
+    render_video_segmentation_response,
+    supports_video_segmentation,
 )
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.entrypoints.serve import weight_transfer_api
@@ -441,6 +458,9 @@ async def omni_run_server_worker(
             shutdown_unsupported_routes(app, engine_client.endpoint_restrictions)
         else:
             logger.warning("engine client has no endpoint restrictions attribute")
+
+        # Shutdown run requests unless we enabled it directly
+        shutdown_unsupported_routes(app, run_endpoint_restrictions())
 
         # Start background processes
         await STORAGE_MANAGER.start()
@@ -761,6 +781,7 @@ async def _init_duplex_app_state(
         "openai_streaming_video_output",
         "openai_serving_realtime_robot",
         "anthropic_serving_messages",
+        "run_serving",
     ):
         setattr(state, attribute, None)
     state.openai_serving_duplex = OmniDuplexSessionHandler(duplex_omni=engine_client)
@@ -936,6 +957,7 @@ async def omni_init_app_state(
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
+    state.run_serving = ServingRun(engine_client)
 
     # Initialize the API surface for the selected engine, not just the model.
     if isinstance(engine_client, DuplexOmni):
@@ -954,6 +976,7 @@ async def omni_init_app_state(
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
+            enable_force_include_usage=args.enable_force_include_usage,
         )
         state.openai_serving_chat_batch = OmniOpenAIServingChatBatch.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
@@ -1967,6 +1990,28 @@ async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
     return True
 
 
+@router.post("/v1/run", dependencies=[Depends(validate_json_request)])
+@with_cancellation
+@load_aware_call
+async def run_stage(request: RunRequest, raw_request: Request):
+    """Run one pipeline stage and return its encoded result; see `ServingRun`."""
+    serving: ServingRun | None = raw_request.app.state.run_serving
+    if serving is None:
+        return _unsupported_api_response(raw_request, "Run API")
+    request_id = f"run-{random_uuid()}"
+    raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+    try:
+        response = await serving.run(request, request_id=request_id)
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except OmniClientError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except ValueError as exc:
+        # Includes stage_input payloads that fail to decode.
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
+    return response.model_dump(exclude_none=True)
+
+
 # RL Rollout serving (RFC #3747, P0)
 
 
@@ -2751,6 +2796,168 @@ async def edit_images(
 
 
 @router.post(
+    "/v1/images/segmentations",
+    response_model=None,
+    responses={
+        HTTPStatus.OK.value: {"model": ImageSegmentationResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def segment_image(
+    raw_request: Request,
+    image: UploadFile | None = File(None),
+    prompt: str = Form(""),
+    boxes: str | None = Form(None),  # JSON [[x0, y0, x1, y1], ...] in pixels
+    box_labels: str | None = Form(None),  # JSON [1 | 0, ...]: positive or negative exemplar
+    score_threshold: Annotated[float | None, Form(ge=0, le=1)] = None,
+    mask_threshold: Annotated[float | None, Form(ge=0, le=1)] = None,
+    mask_format: SegmentationMaskFormat = Form(SegmentationMaskFormat.PNG),
+    model: str | None = Form(None),
+) -> ImageSegmentationResponse:
+    """Segment every instance of a text and/or exemplar-box concept in one image."""
+    engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model not in (None, "auto", model_name):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
+        )
+    if not _supports_segmentation(raw_request, engine_client):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model '{model_name}' does not support image segmentation.",
+        )
+    if image is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Upload the input 'image'.")
+    box_list = _parse_json_list_form(boxes, "boxes")
+    label_list = _parse_json_list_form(box_labels, "box_labels")
+    if not prompt.strip() and not box_list:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value, detail="Provide a text 'prompt', exemplar 'boxes', or both."
+        )
+    try:
+        request_id = f"img_seg-{random_uuid()}"
+        raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+        pil_image = await _load_uploaded_image(image)
+        omni_prompt = OmniTextPrompt(prompt=prompt.strip(), multi_modal_data={"image": pil_image})
+        extra_args: dict[str, Any] = {}
+        for key, value in (
+            ("boxes", box_list),
+            ("box_labels", label_list),
+            ("score_threshold", score_threshold),
+            ("mask_threshold", mask_threshold),
+        ):
+            if value is not None:
+                extra_args[key] = value
+        result = await _generate_with_async_omni(
+            engine_client=engine_client,
+            gen_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+            stage_configs=stage_configs,
+            prompt=omni_prompt,
+            request_id=request_id,
+        )
+        width, height = pil_image.size
+        return ImageSegmentationResponse(
+            created=int(time.time()),
+            model=model_name,
+            width=width,
+            height=height,
+            mask_format=mask_format,
+            data=_extract_segmentation_instances(result, mask_format),
+        )
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except HTTPException:
+        raise
+    except OmniClientError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception("Image segmentation failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Image segmentation failed: {e}"
+        ) from e
+
+
+@router.post(
+    "/v1/videos/segmentations",
+    response_model=None,
+    responses={
+        HTTPStatus.OK.value: {"model": VideoSegmentationResponse},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.SERVICE_UNAVAILABLE.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+async def segment_video(
+    raw_request: Request,
+    video: UploadFile | None = File(None),
+    prompt: str = Form(""),
+    prompts: str | None = Form(None),  # JSON ["other concept", ...], tracked alongside ``prompt``
+    mask_video: bool = Form(False),
+    model: str | None = Form(None),
+) -> Response:
+    """Track every instance of one or more text concepts through a video."""
+    engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model not in (None, "auto", model_name):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
+        )
+    if not supports_video_segmentation(raw_request, engine_client):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model '{model_name}' does not support video segmentation.",
+        )
+    if video is None:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Upload the input 'video'.")
+    extra_prompts = _parse_json_list_form(prompts, "prompts")
+    if not prompt.strip() and not extra_prompts:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Provide a text 'prompt'.")
+    path = None
+    try:
+        request_id = f"vid_seg-{random_uuid()}"
+        raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
+        suffix = os.path.splitext(video.filename or "")[1].lower() or ".mp4"
+        path = await _persist_uploaded_reference(
+            video, field_name="video", suffix=suffix, max_bytes=VIDEO_SEGMENTATION_MAX_BYTES
+        )
+        omni_prompt = OmniTextPrompt(prompt=prompt.strip(), multi_modal_data={"video": path})
+        extra_args: dict[str, Any] = {"prompts": extra_prompts} if extra_prompts else {}
+        result = await _generate_with_async_omni(
+            engine_client=engine_client,
+            gen_params=OmniDiffusionSamplingParams(extra_args=extra_args),
+            stage_configs=stage_configs,
+            prompt=omni_prompt,
+            request_id=request_id,
+        )
+        payload = extract_video_segmentation(result)
+        # Build and serialize off the event loop: a long video's response can be tens of MB.
+        body = await asyncio.to_thread(render_video_segmentation_response, payload, model_name, mask_video)
+        return Response(content=body, media_type="application/json")
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
+    except HTTPException:
+        raise
+    except OmniClientError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except ValueError as e:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e))
+    except Exception as e:
+        logger.exception("Video segmentation failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Video segmentation failed: {e}"
+        ) from e
+    finally:
+        if path is not None and os.path.exists(path):
+            os.unlink(path)
+
+
+@router.post(
     "/v1/videos",
     dependencies=[Depends(_require_single_api_video_store)],
     responses={
@@ -2769,7 +2976,6 @@ async def create_video(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> VideoResponse:
@@ -2785,18 +2991,19 @@ async def create_video(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     ) = ctx
 
     def _cleanup_request_resources() -> None:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
 
     task: asyncio.Task[None] | None = None
     ref = None
     try:
+        continue_from = await validate_latent_continuation_source(handler, request)
         ref = video_response_from_request(effective_model_name, request)
+        ref.remixed_from_video_id = continue_from
         await VIDEO_STORE.upsert(ref.id, ref)
         task = asyncio.create_task(
             _run_video_generation_job(
@@ -2806,7 +3013,6 @@ async def create_video(
                 reference_image,
                 reference_video,
                 reference_audio,
-                control_path,
                 app_state=raw_request.app.state,
                 latent_edit_input=latent_edit_input,
             )
@@ -2844,7 +3050,6 @@ async def create_video_sync(
         ReferenceImage | None,
         ReferenceVideo | None,
         ReferenceAudio | None,
-        str | None,
         LatentEditInput | None,
     ] = Depends(_parse_video_form),
 ) -> Response:
@@ -2864,13 +3069,13 @@ async def create_video_sync(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     ) = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
+        await validate_latent_continuation_source(handler, request)
         video_bytes, stage_durations, peak_memory_mb, _action, _video_metadata = _unpack_video_generation_result(
             await asyncio.wait_for(
                 handler.generate_video_bytes(
@@ -2903,7 +3108,7 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
     inference_time_s = time.perf_counter() - started_at
 

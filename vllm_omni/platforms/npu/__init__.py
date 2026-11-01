@@ -18,7 +18,7 @@ def is_a5(device: torch.device | None = None) -> bool:
     if device is not None and device.type != "npu":
         return False
     try:
-        from vllm_ascend.utils import is_950
+        from vllm_ascend.device.device_config import is_950
 
         return bool(is_950())
     except (ImportError, AttributeError):

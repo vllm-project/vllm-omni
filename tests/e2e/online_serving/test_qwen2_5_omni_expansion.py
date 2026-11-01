@@ -131,6 +131,7 @@ def test_audio_in_video_boundaries(omni_server, online_client, stream: bool) -> 
 
 @pytest.mark.slow
 @pytest.mark.omni
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, online_client) -> None:
     """
