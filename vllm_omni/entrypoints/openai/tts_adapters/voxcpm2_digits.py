@@ -75,10 +75,19 @@ def normalize_voxcpm2_text(text: str, text_normalizer: Any) -> str:
     """Run TextNormalizer when the text contains TN-trigger characters, then
     restore sentinel-held digits. A lone leading "0，" is held out of TN with
     the sentinel (normalized 零 is swallowed at the leading edge; the raw
-    digit token voices a weak-but-right líng)."""
+    digit token voices a weak-but-right líng).
+
+    ``text_normalizer=None`` (the optional dependency unavailable) keeps the
+    documented TN-off path: the sentinel still applies and is restored, only
+    the numeric normalization is skipped."""
     if text and _LONE_LEADING_ZERO_RE.match(text):
         text = _VOXCPM2_ZERO_SENTINEL + text[1:]
-    if text and os.environ.get("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1") != "0" and _VOXCPM2_TN_TRIGGER_RE.search(text):
+    if (
+        text
+        and text_normalizer is not None
+        and os.environ.get("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1") != "0"
+        and _VOXCPM2_TN_TRIGGER_RE.search(text)
+    ):
         normalized = text_normalizer.normalize(text)
         if isinstance(normalized, str):
             text = normalized
