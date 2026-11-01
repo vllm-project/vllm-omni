@@ -375,3 +375,93 @@ def test_every_ordering_retains_the_version_the_next_request_reads(ordering, num
     # own write, so its KV view is twice a cold cell's. Chunk 1 already sees
     # two chunks either way, which is why this looks at cell 0 only.
     assert second.seq_lens[(0, 0, 0)] == 8
+
+
+def test_requests_without_a_session_id_do_not_share_retained_kv(mocker):
+    """Retention is opt-in: no ``session_id`` means no session is bound.
+
+    ``_request_session`` maps a missing id to ``default`` for the paged path, so
+    binding the cell path unconditionally would let independent requests inherit
+    each other's retained KV.
+    """
+    runner = _runner(mocker, execute=lambda *_a, **_k: DiffusionOutput(output=None))
+    req = OmniDiffusionRequest(
+        prompt="a world",
+        request_id="r1",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1, extra_args={}),
+    )
+
+    runner.execute_model(req)
+    runner.execute_model(req)
+
+    assert len(runner._noisy_sessions) == 0
+
+
+def test_released_session_returns_its_slots_to_the_pool():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    session = NoisyKVSession(session_id="s1")
+    _run_request(state, session, "A", chunk_start=0)
+    assert any(key[0].startswith("__noisy_session__::") for key in cache.pool.keys)
+
+    released = cache.release_session("s1")
+
+    assert released == len(session.retained)
+    assert not any(key[0].startswith("__noisy_session__::") for key in cache.pool.keys)
+    assert state.resident_versions == 0
+
+
+def test_registry_reset_and_close_release_session_slots():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    registry = NoisyKVSessionRegistry(capacity=1, on_release=cache.release_session)
+
+    session, _generation = registry.admit("s1")
+    _run_request(state, session, "A", chunk_start=0)
+    registry.reset("s1")
+    assert not any(key[0].startswith("__noisy_session__::") for key in cache.pool.keys)
+
+    session, _generation = registry.admit("s1")
+    _run_request(state, session, "B", chunk_start=0)
+    registry.close("s1")
+    assert not any(key[0].startswith("__noisy_session__::") for key in cache.pool.keys)
+
+
+def test_registry_lru_eviction_releases_the_evicted_session_slots():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    registry = NoisyKVSessionRegistry(capacity=1, on_release=cache.release_session)
+
+    first, _generation = registry.admit("s1")
+    _run_request(state, first, "A", chunk_start=0)
+    assert any(key[0].startswith("__noisy_session__::s1") for key in cache.pool.keys)
+
+    registry.admit("s2")
+
+    assert not any(key[0].startswith("__noisy_session__::s1") for key in cache.pool.keys)
+
+
+def test_resetting_the_same_session_id_does_not_accumulate_slots():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    registry = NoisyKVSessionRegistry(capacity=1, on_release=cache.release_session)
+
+    for _ in range(3):
+        session, _generation = registry.admit("s1")
+        if session.committed_chunks:
+            registry.reset("s1")
+        _run_request(state, session, "A", chunk_start=session.committed_chunks)
+
+    session_keys = [key for key in cache.pool.keys if key[0].startswith("__noisy_session__::")]
+    assert len(session_keys) == 1
+
+
+def test_rekey_refuses_to_overwrite_a_live_version():
+    pool = _cache().pool
+    pool.alloc(("r", 0, 0, 0))
+    live = pool.alloc(("r", 1, 0, 0))
+
+    with pytest.raises(RuntimeError, match="overwrite"):
+        pool.rekey(("r", 0, 0, 0), ("r", 1, 0, 0))
+
+    assert pool.slot_of(("r", 1, 0, 0)) == live

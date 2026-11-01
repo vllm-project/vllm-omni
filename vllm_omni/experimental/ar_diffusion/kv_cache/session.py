@@ -7,15 +7,16 @@ the history a later request continues from, a request owns the versions it
 produces plus its scratch, and a failed request leaves the session unusable
 until an explicit reset.
 
-This module owns only the lifecycle decision. Retaining the KV bytes themselves
-is the next layer; until it lands, ``commit_chunks`` records the continuation
-offset without keeping the versions, and the runner does not advance it.
+This module owns the lifecycle decision and the identities of the versions a
+session retains. The bytes stay in the KV pool under the session owner
+(``SESSION_OWNER_PREFIX`` in ``noisy.py``), which is why dropping a session has
+to hand those slots back rather than only clearing this dictionary.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -98,11 +99,26 @@ class NoisyKVSession:
 class NoisyKVSessionRegistry:
     """LRU-bounded registry; capacity counts sessions, not bytes."""
 
-    def __init__(self, capacity: int = 1) -> None:
+    def __init__(
+        self,
+        capacity: int = 1,
+        on_release: Callable[[str], None] | None = None,
+    ) -> None:
         if capacity < 1:
             raise ValueError(f"session capacity must be positive, got {capacity}")
         self.capacity = capacity
+        self.on_release = on_release
         self._sessions: OrderedDict[str, NoisyKVSession] = OrderedDict()
+
+    def _release(self, session_id: str) -> None:
+        """Hand a session's slots back before the registry forgets the session.
+
+        Retention re-keys versions to the session owner, so request cleanup
+        never frees them; without this the pool stays short of those slots for
+        every reset, close and eviction.
+        """
+        if self.on_release is not None:
+            self.on_release(session_id)
 
     def __len__(self) -> int:
         return len(self._sessions)
@@ -125,6 +141,7 @@ class NoisyKVSessionRegistry:
                 if evicted.state is NoisySessionState.ACTIVE:
                     evicted.close()
                 logger.info("Noisy KV session %s evicted from a full registry", evicted_id)
+                self._release(evicted_id)
                 del self._sessions[evicted_id]
             session = NoisyKVSession(session_id=session_id)
             self._sessions[session_id] = session
@@ -133,11 +150,13 @@ class NoisyKVSessionRegistry:
     def reset(self, session_id: str) -> None:
         session = self.get(session_id)
         if session is not None:
+            self._release(session_id)
             session.reset()
 
     def close(self, session_id: str) -> None:
         session = self._sessions.pop(session_id, None)
         if session is not None:
+            self._release(session_id)
             session.close()
 
     def inactivate(self, session_id: str, reason: str) -> None:
@@ -147,6 +166,7 @@ class NoisyKVSessionRegistry:
             session.invalidate(reason)
 
     def clear(self) -> None:
-        for session in self._sessions.values():
+        for session_id, session in self._sessions.items():
+            self._release(session_id)
             session.close()
         self._sessions.clear()

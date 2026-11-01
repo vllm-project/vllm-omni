@@ -235,6 +235,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             # runs, so that quota is reserved on top of the live one.
             session_retention_chunks=self._noisy_sessions.capacity * spec.max_history_chunks,
         )
+        # The registry knows session identities; the pool owns their slots, so
+        # dropping a session has to go through the cache to hand them back.
+        self._noisy_sessions.on_release = self.noisy_kv_cache.release_session
         logger.info(
             "AR-Diffusion noisy KV: capacity=%d reserved_bytes=%d layers=%d H=%d G=%d R=%d S=%d K=%d",
             self.noisy_kv_cache.capacity,
@@ -523,9 +526,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             session_id, extra_args, tick = self._request_session(req)
             reset = tick.reset if tick is not None else bool(extra_args.get("reset", False))
             close_session = tick.close_session if tick is not None else bool(extra_args.get("close_session", False))
-            if reset:
-                self._noisy_sessions.reset(session_id)
-            session, _generation = self._noisy_sessions.admit(session_id)
+            # Retention is opt-in. ``_request_session`` answers ``default`` for a
+            # missing id because the paged path has always run that way, so
+            # binding it here would let independent requests inherit KV.
+            explicit_session = tick is not None or bool(extra_args.get("session_id"))
+            session = None
+            if explicit_session:
+                if reset:
+                    self._noisy_sessions.reset(session_id)
+                session, _generation = self._noisy_sessions.admit(session_id)
             started = time.perf_counter()
             ctx = self._make_chunk_context(session=session)
             try:
@@ -535,14 +544,15 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     )
             except Exception:
                 self._release_cell_requests(ctx)
-                self._noisy_sessions.inactivate(session_id, "chunk forward failed")
+                if explicit_session:
+                    self._noisy_sessions.inactivate(session_id, "chunk forward failed")
                 logger.warning(
                     "AR-Diffusion chunk forward failed; the request's NoisyKV versions were released "
                     "and session %s was invalidated",
-                    session_id,
+                    session_id if explicit_session else "<none>",
                 )
                 raise
-            if close_session:
+            if close_session and explicit_session:
                 self._noisy_sessions.close(session_id)
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output

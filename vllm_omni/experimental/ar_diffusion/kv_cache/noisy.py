@@ -29,6 +29,14 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
 VersionKey = tuple[str, int, int, int]  # req, chunk, step, block
 
 
+SESSION_OWNER_PREFIX = "__noisy_session__::"
+
+
+def _session_owner(session_id: str) -> str:
+    """Owner name of the versions a session retains across requests."""
+    return f"{SESSION_OWNER_PREFIX}{session_id}"
+
+
 def _version_key(req: str, version: Cell) -> VersionKey:
     return (req, version[0], version[1], version[2])
 
@@ -132,6 +140,11 @@ class VersionPool:
         slot = self.keys.pop(old, None)
         if slot is None:
             return False
+        if new in self.keys:
+            # Overwriting would strand the destination's slot: it stays allocated
+            # with nothing naming it, so no later release can find it.
+            self.keys[old] = slot
+            raise RuntimeError(f"rekey would overwrite live version {new}")
         self.keys[new] = slot
         return True
 
@@ -524,6 +537,21 @@ class NoisyKVCache:
         self.bytes_per_version = bytes_per_version
         self.reserved_bytes = self.capacity * bytes_all_layers
 
+    def release_session(self, session_id: str) -> int:
+        """Return every slot a session owns.
+
+        The retained versions outlive the request that wrote them, so request
+        cleanup never frees them; forgetting the session without this leaves the
+        pool permanently short of those slots.
+        """
+        owner = _session_owner(session_id)
+        keys = [key for key in self.pool.keys if key[0] == owner]
+        for key in keys:
+            self.transport.discard(key)
+        for key in keys:
+            self.pool.release(key)
+        return len(keys)
+
 
 class NoisyKVState:
     """Per-request bridge used by the chunk executor."""
@@ -647,7 +675,7 @@ class NoisyKVState:
             step = max(0, schedule.num_denoise_steps - 1)
         else:
             step = schedule.num_denoise_steps
-        session_key = f"__noisy_session__::{session.session_id}"
+        session_key = _session_owner(session.session_id)
         retained = {key: value for key, value in session.retained.items() if pool.has(value)}
         for local_chunk in range(schedule.chunks):
             for block in range(schedule.num_blocks):
