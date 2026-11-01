@@ -27,10 +27,10 @@ from __future__ import annotations
 import binascii
 import hashlib
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 import numpy as np
 import pybase64 as base64
@@ -72,6 +72,68 @@ class StreamingVADResult:
     # Actual start of the silence that produced speech_stopped. Hysteresis
     # can delay the stop beyond silence_duration_ms.
     silence_start_ms: int | None = None
+
+
+_T = TypeVar("_T")
+
+
+@dataclass(frozen=True, slots=True)
+class FrameScoreRequest:
+    """One 512-sample Silero frame a detector needs scored; the driver sends back its raw speech probability."""
+
+    frame: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class TurnScoreRequest:
+    """Smart Turn work a ``semantic_vad`` detector needs done.
+
+    With ``is_loading`` the driver calls the detector's ``load_turn_scorer``;
+    otherwise it sends back ``score_turn(window)``.
+    """
+
+    window: np.ndarray | None = None
+    is_loading: bool = False
+
+
+#: Turn detection written as a coroutine over scoring requests: it yields a
+#: :class:`FrameScoreRequest` for each frame that needs a Silero score and, for
+#: ``semantic_vad``, a :class:`TurnScoreRequest` for Smart Turn work, receiving
+#: each one's result, and returns its result.
+#: Whoever drives it decides where scoring happens -- in line
+#: (:func:`run_frame_steps`) or batched across sessions (the duplex VAD batcher).
+#: Smart Turn work is too slow to share a thread with every session's frame
+#: scoring, so a driver runs it where it may block; what it raises is thrown in.
+FrameSteps = Generator[FrameScoreRequest | TurnScoreRequest, object, _T]
+
+
+def run_frame_steps(
+    steps: FrameSteps[_T],
+    score: Callable[[np.ndarray], float],
+    *,
+    load_turn_scorer: Callable[[], None] | None = None,
+    score_turn: Callable[[np.ndarray], float] | None = None,
+) -> _T:
+    """Drive ``steps`` to completion in line, scoring each frame it asks for with ``score``.
+
+    ``load_turn_scorer`` and ``score_turn`` serve a ``semantic_vad`` detector's Smart Turn requests.
+    """
+    try:
+        request = next(steps)
+        while True:
+            if isinstance(request, FrameScoreRequest):
+                request = steps.send(score(request.frame))
+                continue
+            if not isinstance(request, TurnScoreRequest):
+                raise TypeError(f"turn detection yielded an unknown request: {type(request).__name__}")
+            try:
+                result = load_turn_scorer() if request.is_loading else score_turn(request.window)
+            except Exception as exc:
+                request = steps.throw(exc)
+            else:
+                request = steps.send(result)
+    except StopIteration as stop:
+        return stop.value
 
 
 # --------------------------------------------------------------------------- #
@@ -134,40 +196,66 @@ class SileroVADBackend:
         )
 
     def infer(self, frame: np.ndarray, state: object) -> tuple[float, object]:
-        if not isinstance(state, _SileroVADState):
-            raise TypeError("Silero detector state must be created by SileroVADBackend.new_state()")
-        model_state = np.ascontiguousarray(state.model_state, dtype=np.float32)
-        context = np.ascontiguousarray(state.context, dtype=np.float32)
-        if model_state.shape != self.model_state_shape:
-            raise ValueError(f"Silero model state must have shape {self.model_state_shape}, got {model_state.shape}")
-        expected_context_shape = (1, self.context_samples)
-        if context.shape != expected_context_shape:
-            raise ValueError(f"Silero context must have shape {expected_context_shape}, got {context.shape}")
+        probabilities, states = self.infer_batch([frame], [state])
+        return probabilities[0], states[0]
 
-        audio = np.ascontiguousarray(frame, dtype=np.float32).reshape(1, -1)
-        if audio.shape[1] != self.frame_samples:
-            raise ValueError(
-                f"Silero detector frame must contain exactly {self.frame_samples} samples, got {audio.shape[1]}"
-            )
-        model_input = np.concatenate((context, audio), axis=1)
+    def infer_batch(
+        self, frames: Sequence[np.ndarray], states: Sequence[object]
+    ) -> tuple[list[float], list[_SileroVADState]]:
+        """Score one frame from each of ``len(frames)`` independent streams in a single ONNX run.
+
+        Rows never interact: the graph's batch axis carries one stream's frame,
+        context and recurrent state each, so the result per row is the same as
+        scoring that stream alone.
+        """
+        if len(frames) != len(states) or not frames:
+            raise ValueError("Silero batch needs one state per frame and at least one frame")
+        model_states, contexts, audio = [], [], []
+        for frame, state in zip(frames, states):
+            if not isinstance(state, _SileroVADState):
+                raise TypeError("Silero detector state must be created by SileroVADBackend.new_state()")
+            if state.model_state.shape != self.model_state_shape:
+                raise ValueError(
+                    f"Silero model state must have shape {self.model_state_shape}, got {state.model_state.shape}"
+                )
+            expected_context_shape = (1, self.context_samples)
+            if state.context.shape != expected_context_shape:
+                raise ValueError(f"Silero context must have shape {expected_context_shape}, got {state.context.shape}")
+            row = np.asarray(frame, dtype=np.float32).reshape(-1)
+            if row.size != self.frame_samples:
+                raise ValueError(
+                    f"Silero detector frame must contain exactly {self.frame_samples} samples, got {row.size}"
+                )
+            model_states.append(state.model_state)
+            contexts.append(state.context)
+            audio.append(row)
+        model_input = np.concatenate((np.concatenate(contexts, axis=0), np.stack(audio)), axis=1).astype(
+            np.float32, copy=False
+        )
         # ONNX Runtime permits concurrent Run calls on one CPU session. Stream
         # state is explicit, so independent sessions can safely share this one.
         output = self._session.run(
             None,
             {
                 "input": model_input,
-                "state": model_state,
+                "state": np.ascontiguousarray(np.concatenate(model_states, axis=1), dtype=np.float32),
                 "sr": np.asarray(self.sample_rate_hz, dtype=np.int64),
             },
         )
         if len(output) < 2:
             raise ServerVADUnavailableError("Silero ONNX model did not return probability and model state")
-        probability = float(np.asarray(output[0]).reshape(-1)[0])
-        next_state = _SileroVADState(
-            model_state=np.ascontiguousarray(output[1], dtype=np.float32),
-            context=np.ascontiguousarray(model_input[:, -self.context_samples :], dtype=np.float32),
-        )
-        return probability, next_state
+        probabilities = np.asarray(output[0], dtype=np.float32).reshape(-1)
+        next_model_state = np.asarray(output[1], dtype=np.float32)
+        if probabilities.size != len(frames) or next_model_state.shape[1:2] != (len(frames),):
+            raise ServerVADUnavailableError("Silero ONNX model returned a batch of the wrong size")
+        next_states = [
+            _SileroVADState(
+                model_state=np.ascontiguousarray(next_model_state[:, row : row + 1]),
+                context=np.ascontiguousarray(model_input[row : row + 1, -self.context_samples :]),
+            )
+            for row in range(len(frames))
+        ]
+        return [float(p) for p in probabilities], next_states
 
 
 class TorchSileroBackend:
@@ -367,10 +455,19 @@ class SileroStreamingVAD:
         """Decode one appended chunk to 16 kHz float32 samples."""
         if not isinstance(audio, str):
             raise ValueError("Silero server VAD requires base64 audio")
-        try:
-            raw = base64.b64decode(audio, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError("Silero server VAD received invalid base64 audio") from exc
+        return self.decode_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+
+    def decode_audio(self, audio: object, *, fmt: object, sample_rate_hz: object) -> np.ndarray:
+        """:meth:`decode_base64`, also taking a chunk that is already decoded to bytes."""
+        if isinstance(audio, bytes | bytearray):
+            raw = bytes(audio)
+        elif isinstance(audio, str):
+            try:
+                raw = base64.b64decode(audio, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("Silero server VAD received invalid base64 audio") from exc
+        else:
+            raise ValueError("Silero server VAD requires base64 audio or PCM bytes")
         rate = int(sample_rate_hz) if isinstance(sample_rate_hz, int | float) else self._SAMPLE_RATE_HZ
         if rate <= 0:
             raise ValueError("Silero server VAD requires a positive sample rate")
@@ -424,6 +521,10 @@ class SileroStreamingVAD:
     # ------------------------------------------------------------------ #
 
     def process(self, samples: np.ndarray) -> StreamingVADResult:
+        return run_frame_steps(self.frame_steps(samples), self._score_frame)
+
+    def frame_steps(self, samples: np.ndarray) -> FrameSteps[StreamingVADResult]:
+        """:meth:`process` with frame scoring left to the driver (see :data:`FrameSteps`)."""
         samples = np.asarray(samples, dtype=np.float32).reshape(-1)
         if samples.size:
             self._pending = np.concatenate((self._pending, samples))
@@ -446,7 +547,7 @@ class SileroStreamingVAD:
             offset += self._WINDOW_SAMPLES
             frame_start = self._processed_samples
             self._processed_samples += self._WINDOW_SAMPLES
-            probability = min(1.0, max(0.0, self._score_frame(frame)))
+            probability = min(1.0, max(0.0, float((yield FrameScoreRequest(frame)))))
             max_probability = max(max_probability, probability)
 
             if self._speech_active:
@@ -518,3 +619,41 @@ class SileroStreamingVAD:
             self._backend = provider.get()
             self._detector_state = self._backend.new_state()
         return self._backend
+
+
+def score_frames(requests: Sequence[tuple[SileroStreamingVAD, np.ndarray]]) -> list[float | BaseException]:
+    """Score one pending frame for each of several streams, batching what can share a model run.
+
+    Streams on the same batch-capable backend (the shared ONNX one) are scored in
+    one ``infer_batch`` call; a stream with its own scorer or a per-session torch
+    backend is scored alone. Each stream's recurrent state advances exactly as
+    :meth:`SileroStreamingVAD.process` would advance it. An entry is the raw
+    probability, or the exception that stream's scoring raised -- a failure stays
+    with the streams it belongs to.
+    """
+    scores: list[float | BaseException] = [0.0] * len(requests)
+    batches: dict[int, tuple[Callable[..., tuple[list[float], list[object]]], list[int]]] = {}
+    for index, (vad, frame) in enumerate(requests):
+        try:
+            backend = None if vad._frame_scorer is not None else vad._require_backend()
+            infer_batch = getattr(backend, "infer_batch", None)
+            if infer_batch is not None:
+                batches.setdefault(id(backend), (infer_batch, []))[1].append(index)
+            else:
+                scores[index] = vad._score_frame(frame)
+        except Exception as exc:
+            scores[index] = exc
+    for infer_batch, indices in batches.values():
+        streams = [requests[index][0] for index in indices]
+        try:
+            probabilities, states = infer_batch(
+                [requests[index][1] for index in indices], [vad._detector_state for vad in streams]
+            )
+        except Exception as exc:
+            for index in indices:
+                scores[index] = exc
+            continue
+        for index, vad, probability, state in zip(indices, streams, probabilities, states):
+            vad._detector_state = state
+            scores[index] = probability
+    return scores

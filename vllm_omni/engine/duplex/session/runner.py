@@ -30,6 +30,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
 
+import pybase64 as base64
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.commands import (
@@ -121,7 +122,7 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
 )
 from vllm_omni.metrics.stats import StageRequestStats
-from vllm_omni.protocol.duplex import convert_input_audio_with_rate
+from vllm_omni.protocol.duplex import CONVERTIBLE_INPUT_FORMATS, convert_input_audio_with_rate
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -769,7 +770,9 @@ class DuplexSessionRunner:
             admission = len(command.audio) + sum(len(frame) for frame in command.video_frames)
             with ExitStack() as reservation:
                 reservation.callback(session.release_input_bytes, admission, queued=True)
-                await self._on_append_audio(command.payload(), release_queued_input=reservation.close)
+                await self._on_append_audio(
+                    command.payload(encode_audio=False), release_queued_input=reservation.close
+                )
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
             self._emit_error(
@@ -1287,7 +1290,9 @@ class DuplexSessionRunner:
             if isinstance(video_frames_raw, list)
             else []
         )
-        has_audio = isinstance(audio, str) and bool(audio)
+        # A client append arrives as the decoded bytes (``payload(encode_audio=False)``);
+        # internal payloads carry base64.
+        has_audio = isinstance(audio, str | bytes) and bool(audio)
         has_video = bool(video_frames)
         modality_error = session.capabilities.validate_append_modalities(has_audio=has_audio, has_video=has_video)
         if modality_error is not None:
@@ -1319,26 +1324,36 @@ class DuplexSessionRunner:
             event["video_frames"] = video_frames
             detected = [(event, None)]
         else:
-            try:
-                converted: tuple[object, object, int | float | None] = await self.offload(
-                    convert_input_audio_with_rate,
-                    audio,
-                    fmt,
-                    sample_rate_hz=sample_rate_hz,
-                )
-            except ValueError as exc:
-                self._emit_error("bad_event", str(exc))
-                return
-            audio, fmt, converted_rate = converted
-            if converted_rate is not None:
-                sample_rate_hz = converted_rate
-            if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
-                self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
-                return
+            # The front end already decodes appends to pcm_f32le, where conversion is a
+            # no-op; only pcm16 / G.711 still left as such goes to the pool to convert.
+            if fmt.lower() in CONVERTIBLE_INPUT_FORMATS:
+                if isinstance(audio, bytes):
+                    audio = base64.b64encode(audio).decode("ascii")
+                try:
+                    converted: tuple[object, object, int | float | None] = await self.offload(
+                        convert_input_audio_with_rate,
+                        audio,
+                        fmt,
+                        sample_rate_hz=sample_rate_hz,
+                    )
+                except ValueError as exc:
+                    self._emit_error("bad_event", str(exc))
+                    return
+                audio, fmt, converted_rate = converted
+                if converted_rate is not None:
+                    sample_rate_hz = converted_rate
+                if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+                    self._emit_error("bad_audio", "input_audio_buffer.append pcm16 audio could not be decoded")
+                    return
             event["audio"] = audio
             event["format"] = fmt
             event["sample_rate_hz"] = sample_rate_hz
             detected = await self.control.run_turn_detection(event)
+            for segment, _ in detected:
+                # Turn detection hands back base64 segments; audio it did not split
+                # (no detector) is still the decoded bytes, encoded here for the plugin.
+                if isinstance(segment.get("audio"), bytes):
+                    segment["audio"] = base64.b64encode(segment["audio"]).decode("ascii")
         with ExitStack() as unprocessed:
             releases: list[Callable[[], None] | None] = [None] * len(detected)
             charges = [0] * len(detected)

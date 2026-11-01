@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal, TypeVar, cast
 
 import numpy as np
 import pybase64 as base64
@@ -30,14 +30,19 @@ from vllm_omni.engine.duplex.smart_turn import (
 )
 from vllm_omni.engine.duplex.vad import (
     SILERO_VAD_MIN_THRESHOLD,
+    FrameSteps,
     ServerVADUnavailableError,
     SileroStreamingVAD,
     SileroVADBackendProvider,
     SileroVADConfig,
     StreamingVADResult,
+    TurnScoreRequest,
+    run_frame_steps,
 )
 
 logger = init_logger(__name__)
+
+_T = TypeVar("_T")
 
 __all__ = [
     "PendingTurnDetectionUpdate",
@@ -292,35 +297,36 @@ class TurnDetectionSegment:
     result: TurnDetectionResult
 
 
-def _process_frames(detector: TurnDetector, samples: np.ndarray) -> list[tuple[int, TurnDetectionResult]]:
+def _frame_steps(detector: TurnDetector, samples: np.ndarray) -> FrameSteps[list[tuple[int, TurnDetectionResult]]]:
     """Advance detector state one Silero frame boundary at a time."""
     frames: list[tuple[int, TurnDetectionResult]] = []
     offset = 0
     while offset < samples.size:
         end = min(samples.size, offset + detector.vad.samples_until_frame)
-        frames.append((end, detector._process_samples(samples[offset:end])))
+        frames.append((end, (yield from detector._sample_steps(samples[offset:end]))))
         offset = end
     return frames
 
 
-def _process_segments(
+def _segment_steps(
     detector: TurnDetector,
-    base64_audio: str,
+    audio: str | bytes,
     *,
     fmt: str,
     sample_rate_hz: int | None,
-) -> list[TurnDetectionSegment]:
+) -> FrameSteps[list[TurnDetectionSegment]]:
     """Score on Silero's frame grid, retaining every boundary in a wire append.
 
     Only audio through the current frame may reach Smart Turn. Flush a segment
     at each commit so the runner can commit it before buffering the next turn.
     The final partial frame stays in the detector for the next append.
+    ``audio`` is base64 or the already-decoded bytes.
     """
-    samples = detector.vad.decode_base64(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+    samples = detector.vad.decode_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
     segments: list[TurnDetectionSegment] = []
     start = 0
     accumulated: TurnDetectionResult | None = None
-    for offset, result in _process_frames(detector, samples):
+    for offset, result in (yield from _frame_steps(detector, samples)):
         if accumulated is not None:
             result = TurnDetectionResult(
                 is_speech=accumulated.is_speech or result.is_speech,
@@ -417,10 +423,18 @@ class ServerTurnDetector:
     def process_segments(
         self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None
     ) -> list[TurnDetectionSegment]:
-        return _process_segments(self, base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+        return run_frame_steps(
+            self.segment_steps(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz), self._vad._score_frame
+        )
 
-    def _process_samples(self, samples: np.ndarray) -> TurnDetectionResult:
-        result: StreamingVADResult = self._vad.process(samples)
+    def segment_steps(
+        self, audio: str | bytes, *, fmt: str, sample_rate_hz: int | None
+    ) -> FrameSteps[list[TurnDetectionSegment]]:
+        """:meth:`process_segments` with Silero frame scoring left to the driver; ``audio`` may be decoded bytes."""
+        return _segment_steps(self, audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+
+    def _sample_steps(self, samples: np.ndarray) -> FrameSteps[TurnDetectionResult]:
+        result: StreamingVADResult = yield from self._vad.frame_steps(samples)
         detected = TurnDetectionResult(
             is_speech=result.is_speech,
             speech_active=result.speech_active,
@@ -533,7 +547,13 @@ class SemanticTurnDetector:
     def process_segments(
         self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None
     ) -> list[TurnDetectionSegment]:
-        return _process_segments(self, base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+        return self._run_steps(self.segment_steps(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz))
+
+    def segment_steps(
+        self, audio: str | bytes, *, fmt: str, sample_rate_hz: int | None
+    ) -> FrameSteps[list[TurnDetectionSegment]]:
+        """:meth:`process_segments` with Silero frame scoring left to the driver; ``audio`` may be decoded bytes."""
+        return _segment_steps(self, audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
 
     def process(
         self,
@@ -550,9 +570,9 @@ class SemanticTurnDetector:
         completed turn followed by new speech, matching the legacy Realtime API.
         """
         samples = self._vad.decode_base64(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
-        frames = _process_frames(self, samples)
+        frames = self._run_steps(_frame_steps(self, samples))
         if not frames:
-            return self._process_samples(samples)
+            return self._run_steps(self._sample_steps(samples))
 
         results = [result for _, result in frames]
         last = results[-1]
@@ -590,7 +610,7 @@ class SemanticTurnDetector:
             min_speech_duration_ms=max(32, int(config.min_speech_duration_ms)),
         )
 
-    def _process_samples(self, samples: np.ndarray) -> TurnDetectionResult:
+    def _sample_steps(self, samples: np.ndarray) -> FrameSteps[TurnDetectionResult]:
         """Run the shared semantic state machine on decoded audio samples.
 
         Raises ``SemanticVADUnavailableError`` / ``ServerVADUnavailableError`` /
@@ -598,9 +618,12 @@ class SemanticTurnDetector:
         not raise: it is logged and the pause counts as incomplete, so the
         eagerness limit still ends the turn.
         """
-        scorer = self._require_turn_scorer()
+        if self._turn_scorer is None:
+            # With the first chunk, so a missing model fails early and the first
+            # pause does not wait for it; the driver loads it off the scoring thread.
+            yield TurnScoreRequest(is_loading=True)
         self._audio.append(samples)
-        inner = self._vad.process(samples)
+        inner = yield from self._vad.frame_steps(samples)
         was_active = self._turn_active
 
         started = False
@@ -631,7 +654,7 @@ class SemanticTurnDetector:
                 try:
                     window = self._turn_window()
                     evaluations = 1
-                    probability = float(scorer(window))
+                    probability = float(cast("float", (yield TurnScoreRequest(window))))
                 except Exception:
                     # Degrade to the eagerness silence limit rather than drop
                     # or prematurely commit the turn.
@@ -692,12 +715,21 @@ class SemanticTurnDetector:
         turn_samples = (self._vad.processed_ms - self._turn_start_ms) * 16
         return self._audio.last(turn_samples + self._vad.scratch_bytes // 4)
 
-    def _require_turn_scorer(self) -> Callable[[np.ndarray], float]:
-        """Load Smart Turn with the first chunk, off the endpoint path."""
+    def load_turn_scorer(self) -> None:
+        """Load the shared Smart Turn model (slow, may block); serves a loading :class:`TurnScoreRequest`."""
         if self._turn_scorer is None:
             provider = self._smart_turn_provider or SmartTurnBackendProvider()
             self._turn_scorer = provider.get().predict
-        return self._turn_scorer
+
+    def score_turn(self, window: np.ndarray) -> float:
+        """Smart Turn's completion probability for ``window`` (slow); serves :class:`TurnScoreRequest`."""
+        return self._turn_scorer(window)
+
+    def _run_steps(self, steps: FrameSteps[_T]) -> _T:
+        """Drive ``steps`` in line, Smart Turn work included."""
+        return run_frame_steps(
+            steps, self._vad._score_frame, load_turn_scorer=self.load_turn_scorer, score_turn=self.score_turn
+        )
 
 
 TurnDetector = ServerTurnDetector | SemanticTurnDetector

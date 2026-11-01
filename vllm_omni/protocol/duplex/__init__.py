@@ -56,8 +56,11 @@ from vllm_omni.protocol.duplex.errors import (
     realtime_error_type,
 )
 from vllm_omni.protocol.realtime.audio import (
+    CONVERTIBLE_INPUT_FORMATS,
     MAX_INPUT_SAMPLE_RATE_HZ,
     MIN_INPUT_SAMPLE_RATE_HZ,
+    base64_decoded_size,
+    convert_input_audio_to_pcm_f32,
     convert_input_audio_with_rate,
     convert_output_audio,
     decode_g711_alaw,
@@ -111,6 +114,7 @@ from vllm_omni.protocol.realtime.session import (
 )
 
 __all__ = [
+    "CONVERTIBLE_INPUT_FORMATS",
     "MAX_INPUT_SAMPLE_RATE_HZ",
     "MIN_INPUT_SAMPLE_RATE_HZ",
     "REALTIME_ERROR_TYPES_BY_CODE",
@@ -123,6 +127,8 @@ __all__ = [
     "RealtimeProtocolError",
     "RealtimeSessionRejection",
     "apply_realtime_session_defaults",
+    "base64_decoded_size",
+    "convert_input_audio_to_pcm_f32",
     "convert_input_audio_with_rate",
     "convert_output_audio",
     "copy_realtime_input_hints",

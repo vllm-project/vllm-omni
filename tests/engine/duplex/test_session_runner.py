@@ -499,10 +499,16 @@ def append_audio(
     value: float = 0.05,
     is_speech: bool | None = True,
     event_id: str | None = None,
+    audio_format: str = "pcm_f32le",
 ) -> commands.AppendAudio:
+    """A client append. ``audio_format="pcm16"`` is one the runner still converts (off-loop)."""
+    if audio_format == "pcm16":
+        audio = struct.pack(f"<{samples}h", *([round(value * 32767)] * samples))
+    else:
+        audio = pcm_f32(samples, value=value)
     return commands.AppendAudio(
-        audio=pcm_f32(samples, value=value),
-        format="pcm_f32le",
+        audio=audio,
+        format=audio_format,
         sample_rate_hz=16000,
         is_speech=is_speech,
         event_id=event_id,
@@ -1000,6 +1006,11 @@ async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch,
     finished = asyncio.Event()
     owner = h.runner if phase == "decode" else h.runner.control
     method = "offload" if phase == "decode" else "run_turn_detection"
+    # Only a format the runner converts (pcm16) is decoded off-loop; pcm_f32le goes
+    # straight to VAD. Same 32 kB on the wire either way; pcm16 decodes to twice that.
+    audio_format, first, over, decoded = (
+        ("pcm16", 16_000, 20_000, 64_000) if phase == "decode" else ("pcm_f32le", 8000, 10_000, 32_000)
+    )
     original = getattr(owner, method)
     on_command = h.runner._on_command
 
@@ -1019,10 +1030,10 @@ async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch,
     monkeypatch.setattr(owner, method, blocked)
     monkeypatch.setattr(h.runner, "_on_command", track_command)
     try:
-        h.submit(append_audio(samples=8000))
+        h.submit(append_audio(samples=first, audio_format=audio_format))
         await asyncio.wait_for(started.wait(), timeout=2.0)
         assert h.session.pending_input_bytes == 32_000
-        h.submit(append_audio(samples=10_000, event_id="over-limit"))
+        h.submit(append_audio(samples=over, event_id="over-limit", audio_format=audio_format))
         events = await h.settle()
         assert any(
             event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
@@ -1032,12 +1043,12 @@ async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch,
         release.set()
         await asyncio.wait_for(finished.wait(), timeout=2.0)
         events = await h.settle()
-        assert h.session.pending_input_bytes == (0 if fails else 32_000)
+        assert h.session.pending_input_bytes == (0 if fails else decoded)
         assert h.session._input.queued_input_bytes == 0
         if fails:
             assert any(event.type == "error" and "preprocessing failed" in event.message for event in events)
         else:
-            assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+            assert h.runner.model_state.audio_buffer.pending_byte_count == decoded
         await h.run(commands.ClearInput())
         assert h.session.pending_input_bytes == 0
     finally:
@@ -1186,11 +1197,18 @@ async def test_admitted_pcm16_append_that_decodes_past_the_limit_is_rejected_cle
 class _SplitDetector:
     """Splits every append into one 1 s segment and its remainder."""
 
+    vad = None  # never asks the batcher to score a frame
+
+    def segment_steps(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
+        yield from ()
+        return self.process_segments(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+
     def process_segments(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
         from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult, TurnDetectionSegment
 
         del fmt, sample_rate_hz
-        audio = base64.b64decode(base64_audio)
+        # A client append reaches turn detection as decoded bytes; internal payloads as base64.
+        audio = base64_audio if isinstance(base64_audio, bytes) else base64.b64decode(base64_audio)
         result = TurnDetectionResult(is_speech=True, speech_active=True)
         return [
             TurnDetectionSegment(base64.b64encode(part).decode(), result) for part in (audio[:64_000], audio[64_000:])
@@ -3652,6 +3670,8 @@ async def test_stale_epoch_append_does_not_own_request_start() -> None:
 class _ScriptedDetector:
     """A turn detector that answers each appended chunk with a pre-decided result."""
 
+    vad = None  # never asks the batcher to score a frame
+
     def __init__(self, results: list[object]) -> None:
         self._results = list(results)
         self.resets = 0
@@ -3659,6 +3679,10 @@ class _ScriptedDetector:
     def process(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None, audio_end_ms: int | None = None):
         del base64_audio, fmt, sample_rate_hz, audio_end_ms
         return self._results.pop(0)
+
+    def segment_steps(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
+        yield from ()
+        return self.process_segments(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
 
     def process_segments(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
         from vllm_omni.engine.duplex.turn_detection import TurnDetectionSegment

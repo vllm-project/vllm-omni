@@ -120,13 +120,15 @@ class SessionControl:
         if detector is None:
             return [(event, None)]
         audio = event.get("audio")
-        if not isinstance(audio, str) or not audio:
+        if not isinstance(audio, str | bytes) or not audio:
             return [(event, None)]
         fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm_f32le"
         sample_rate_hz = event.get("sample_rate_hz")
         try:
-            segments = await self._ctx.services.offload(
-                detector.process_segments,
+            # The manager's batcher scores this session's Silero frames together
+            # with every other session's, instead of one pool task per append.
+            segments = await self._ctx.manager.turn_detection_batcher.process_segments(
+                detector,
                 audio,
                 fmt=fmt,
                 sample_rate_hz=sample_rate_hz if isinstance(sample_rate_hz, int) else None,
