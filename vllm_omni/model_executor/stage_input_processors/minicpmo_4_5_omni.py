@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 from collections.abc import Mapping, Sequence
+from http import HTTPStatus
 from typing import Any
 
 import torch
@@ -15,6 +16,7 @@ from vllm_omni.engine.duplex.intermediate import (
     set_ref_audio,
     set_tts_handoff,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
@@ -871,12 +873,16 @@ def _turn_hidden_rows(
 
     The accumulated latent is not one row per token in order: the MRv2
     full-payload output reports each step's rows on both output channels, and
-    a step that verified draft tokens also forwarded the rejected ones. The
-    row ledger (``latent_input_ids`` / ``latent_positions``) names the token
-    and position of every row, so take the latest row forwarded at each
-    position. The slice ends at the first token with no row, e.g. the last
-    sampled token, which is never forwarded. Without a ledger the rows are
-    taken by position.
+    a step that verified draft tokens may also have forwarded rejected ones.
+    The row ledger (``latent_input_ids`` / ``latent_positions``) names the
+    token and position of every row. Walking it from the tail, a row is live
+    only if no later row sits at its position or an earlier one, so a rewind
+    also drops the rows computed past it. The slice ends at the first token
+    with no live row, e.g. the last sampled token, which is never forwarded.
+
+    A Thinker forward without a ledger keeps its rows in forward order, so they
+    are taken by index. A malformed ledger fails the request: on a duplicated
+    payload, index slicing would hand the Talker prompt rows for reply tokens.
 
     Ledger positions are token indices: the Thinker's positions are 1-D
     (MiniCPM-o 4.5 has no M-RoPE), placeholder tokens included.
@@ -884,41 +890,51 @@ def _turn_hidden_rows(
     row_ids = mm_output.get("latent_input_ids")
     row_positions = mm_output.get("latent_positions")
     num_rows = int(thinker_hidden_states.shape[0])
-    if not isinstance(row_ids, torch.Tensor) or not isinstance(row_positions, torch.Tensor):
+    if row_ids is None and row_positions is None:
         return thinker_hidden_states[start:end].to(torch.float32).contiguous()
-    if row_ids.numel() != num_rows or row_positions.numel() != num_rows:
-        logger.warning_once(
-            "MiniCPM-o turn handoff: the Thinker row ledger does not match the latent rows; taking rows by index"
+    if (
+        not isinstance(row_ids, torch.Tensor)
+        or not isinstance(row_positions, torch.Tensor)
+        or row_ids.numel() != num_rows
+        or row_positions.numel() != num_rows
+    ):
+        raise OmniClientError(
+            f"MiniCPM-o turn handoff: malformed Thinker row ledger for request_id={request_id}: "
+            f"ids={getattr(row_ids, 'shape', None)} positions={getattr(row_positions, 'shape', None)} rows={num_rows}",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            error_type="MiniCPMOTurnHandoffError",
         )
-        logger.debug(
-            "MiniCPM-o turn handoff: req=%s ledger has %d ids and %d positions for %d latent rows",
-            request_id,
-            row_ids.numel(),
-            row_positions.numel(),
-            num_rows,
-        )
-        return thinker_hidden_states[start:end].to(torch.float32).contiguous()
     ids = row_ids.reshape(-1).tolist()
-    latest_row = {
-        int(position): row
-        for row, position in enumerate(row_positions.reshape(-1).tolist())
-        if start <= int(position) < end
-    }
+    positions = row_positions.reshape(-1).tolist()
+    live_row: dict[int, int] = {}
+    lowest = end
+    for row in range(num_rows - 1, -1, -1):
+        position = int(positions[row])
+        if position < lowest:
+            lowest = position
+            if position < start:
+                break
+            live_row[position] = row
     rows: list[int] = []
+    id_mismatch = None
     for position in range(start, end):
-        row = latest_row.get(position)
-        if row is None or int(ids[row]) != int(full_token_ids[position]):
+        token_row = live_row.get(position)
+        if token_row is None:
             break
-        rows.append(row)
-    if len(rows) < end - start - 1:
-        # Only the last sampled token is expected to have no row.
+        if int(ids[token_row]) != int(full_token_ids[position]):
+            id_mismatch = f"row has token {int(ids[token_row])}, reply has {int(full_token_ids[position])}"
+            break
+        rows.append(token_row)
+    # Only the last sampled token is expected to have no row. A wrong id never is.
+    if id_mismatch is not None or len(rows) < end - start - 1:
         logger.warning(
-            "MiniCPM-o turn handoff: req=%s Thinker rows stop at token %d of %d (position %d); "
+            "MiniCPM-o turn handoff: req=%s Thinker rows stop at token %d of %d (position %d, %s); "
             "the Talker gets the shorter reply",
             request_id,
             len(rows),
             end - start,
             start + len(rows),
+            id_mismatch or "no row",
         )
     return thinker_hidden_states[rows].to(torch.float32).contiguous()
 
