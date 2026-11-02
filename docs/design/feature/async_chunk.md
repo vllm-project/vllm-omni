@@ -312,6 +312,35 @@ overrides `additional_config` per key. The policy remains disabled by default.
 
 ### Code2Wav Batch Configuration
 
+Generation stages receiving async chunks can coalesce ready inputs with the
+following connector `extra` settings:
+
+```yaml
+generation_min_batch_size: 16
+generation_max_wait_ms: 6
+```
+
+Batch waiting is disabled by default. Ready streams execute when the target
+is reached or the wait bound expires. If the total live request count is below
+the target, ready inputs execute immediately. First and final chunks share the
+same bounded window. The target is a dispatch threshold, not a guarantee that
+the token or execution budget can accommodate the entire batch.
+
+Native MRV2 retains its existing stateful TP1/PP1 support and notification-inbox
+waiting. V1 async-chunk receivers support TP1/PP1 for stateful and stateless
+stages with `generation_coalescing_policy: fixed` (the default). V1 polls
+readiness on scheduler ticks; it does not block the scheduler thread or consume
+deferred chunks. Its dispatch time includes scheduler tick granularity.
+`generation_coalescing_policy: idle_wait` remains native MRV2-only. Sender-only
+stages and plain prompt inputs do not acquire V1 batch waiting.
+
+V1 input executions that yield `pending_generation` continue without another
+batch wait for that same input. Cancellation, completion, input errors, and
+timeouts continue to be processed during coalescing. Deferred inputs retain
+their payload and readiness; no KV allocation or execution accounting occurs
+for them until scheduling succeeds. `generation_max_regular_batch` still caps
+execution batch size; first-chunk express behavior retains its native scope.
+
 For optimal performance with async_chunk, the code2wav stage should be configured with batching:
 
 ```yaml

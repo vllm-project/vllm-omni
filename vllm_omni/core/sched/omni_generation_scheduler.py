@@ -60,6 +60,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
         self._supports_pending_generation = bool(getattr(model_config, "supports_pending_generation", False))
         self._pending_finish_reqs: list[Request] = []
+        self._generation_pending_inputs: set[str] = set()
         self._pending_chunk_error_outputs: list[tuple[int, EngineCoreOutput]] = []
         connector_config = getattr(model_config, "stage_connector_config", None)
         extra = (
@@ -81,22 +82,25 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             raise ValueError("generation_max_wait_ms must be finite and nonnegative")
         if self._generation_max_wait_s and self._generation_min_batch_size > 1:
             parallel = self.vllm_config.parallel_config
-            if not self._native_data_plane:
-                # CUDA-oriented profiles can inherit a platform's V1 runner.
-                # Their connector extras survive that override, but batching
-                # must revert to the fallback runner's default scheduling.
+            legacy_receiver = (
+                not self.use_v2_model_runner
+                and self.chunk_transfer_adapter is not None
+                and self.chunk_transfer_adapter.receives_chunks
+            )
+            if not self._native_data_plane and not legacy_receiver:
                 logger.warning(
                     "Generation batch waiting and regular-batch limit ignored: "
-                    "requires native MRV2; using default generation scheduling."
+                    "requires a native MRV2 stage or V1 async-chunk receiver."
                 )
                 self._generation_min_batch_size = 1
                 self._generation_max_wait_s = 0.0
                 self._generation_max_regular_batch = 0
-            elif not (
-                self._retains_state_across_chunks
-                and parallel.tensor_parallel_size == parallel.pipeline_parallel_size == 1
-            ):
-                raise ValueError("Generation batch waiting requires a stateful native MRV2 TP1/PP1 stage")
+            elif parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
+                raise ValueError("Generation batch waiting requires TP1/PP1")
+            elif self._native_data_plane and not self._retains_state_across_chunks:
+                raise ValueError("Native MRV2 generation batch waiting requires a stateful stage")
+            elif legacy_receiver and self._generation_coalescing_policy != "fixed":
+                raise ValueError("V1 generation batch waiting supports only the fixed coalescing policy")
             else:
                 logger.info(
                     "Generation input coalescing: target batch=%d, max wait=%.3f ms",
@@ -204,13 +208,57 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         target = self._generation_min_batch_size
         return len(runnable) >= target or len(self.requests) < target
 
+    def _process_pending_omni_inputs(self, model_mode: str) -> None:
+        """Process inputs for either runner, then apply V1-only batch waiting."""
+        super()._process_pending_omni_inputs(model_mode)
+        if not self.use_v2_model_runner:
+            self._process_v1_pending_omni_inputs()
+
+    def _process_v1_pending_omni_inputs(self) -> None:
+        """Coalesce received V1 inputs without blocking completion processing.
+
+        V1 readiness comes from the legacy adapter after input processing.
+        Revisit its batch deadline on scheduler ticks; native V2 waiting is
+        handled separately by _drain_omni_connector_outputs().
+        """
+        self._generation_defer_batch = False
+        adapter = self.chunk_transfer_adapter
+        max_wait = getattr(self, "_generation_max_wait_s", 0.0)
+        if (
+            not max_wait
+            or self._generation_min_batch_size <= 1
+            or adapter is None
+            or not adapter.receives_chunks
+            or self._pause_state != PauseState.UNPAUSED
+        ):
+            self._generation_batch_deadline = None
+            return
+        runnable = self._generation_runnable_ids(set(adapter.requests_with_ready_chunks))
+        if not runnable or self._generation_batch_ready(runnable) or runnable & self._generation_pending_inputs:
+            # A model yielding part of an input must keep executing that input;
+            # its retained ready marker is not a newly arrived chunk.
+            self._generation_batch_deadline = None
+            return
+        deadline = getattr(self, "_generation_batch_deadline", None)
+        now = time.monotonic()
+        if deadline is None:
+            deadline = now + max_wait
+        self._generation_defer_batch = now < deadline
+        self._generation_batch_deadline = deadline if self._generation_defer_batch else None
+
     def _drain_omni_connector_outputs(self):
         self._generation_defer_batch = False
         outputs = super()._drain_omni_connector_outputs()
         max_wait = getattr(self, "_generation_max_wait_s", 0)
         target = getattr(self, "_generation_min_batch_size", 1)
         coordinator = self.input_coordinator
-        if not max_wait or target <= 1 or coordinator is None or self._pause_state != PauseState.UNPAUSED:
+        if (
+            not self._native_data_plane
+            or not max_wait
+            or target <= 1
+            or coordinator is None
+            or self._pause_state != PauseState.UNPAUSED
+        ):
             return outputs
 
         # Count distinct runnable streams, not notifications, padding rows, or
@@ -846,6 +894,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        pending_inputs = getattr(self, "_generation_pending_inputs", None)
+        if pending_inputs is not None:
+            pending_inputs.discard(request.request_id)
         if getattr(self, "_first_chunk_express", False):
             self._chunk_started.discard(request.request_id)
             getattr(self, "_stream_audio", {}).pop(request.request_id, None)
@@ -1022,6 +1073,12 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # One-shot generation request: finish after its current input unit
             # has been fully processed.
             generation_pending = req_id in getattr(model_runner_output, "pending_generation_req_ids", set())
+            pending_inputs = getattr(self, "_generation_pending_inputs", None)
+            if pending_inputs is not None:
+                if generation_pending:
+                    pending_inputs.add(req_id)
+                else:
+                    pending_inputs.discard(req_id)
             if generation_pending:
                 # The model owns its AR/KV state and yielded an output chunk.
                 # Re-schedule this input unit without inventing output tokens.
