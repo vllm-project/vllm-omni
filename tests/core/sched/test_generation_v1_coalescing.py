@@ -126,3 +126,44 @@ def test_free_request_clears_pending_input_ownership(monkeypatch):
     monkeypatch.setattr(VLLMScheduler, "_free_request", lambda *args: (None, None))
     OmniGenerationScheduler._free_request(s, s.requests["0"])
     assert not s._generation_pending_inputs
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_v1_reduced_target_waits_only_when_enabled(monkeypatch, enabled):
+    s, clock = scheduler(monkeypatch)
+    s.requests.pop("3")
+    s._generation_always_wait_target_batch = enabled
+    output = s.schedule()
+    assert bool(output.num_scheduled_tokens) is not enabled
+    if enabled:
+        clock[0] += 0.012
+        assert s.schedule().num_scheduled_tokens == {"0": 8}
+
+
+def test_v1_reduced_target_releases_when_all_registered_streams_arrive(monkeypatch):
+    s, clock = scheduler(monkeypatch)
+    s.requests.pop("3")
+    s._generation_always_wait_target_batch = True
+    assert not s.schedule().num_scheduled_tokens
+    clock[0] += 0.003
+    for i in (1, 2):
+        _stage_waiting_chunk(s, s.requests[str(i)])
+    assert s.schedule().num_scheduled_tokens == {str(i): 8 for i in range(3)}
+
+
+def test_v1_shrinking_registered_population_releases_lone_stream(monkeypatch):
+    s, _ = scheduler(monkeypatch)
+    s._generation_always_wait_target_batch = True
+    assert not s.schedule().num_scheduled_tokens
+    s.finish_requests({"1", "2", "3"}, RequestStatus.FINISHED_ABORTED)
+    assert s.schedule().num_scheduled_tokens == {"0": 8}
+
+
+def test_v1_inactive_registered_streams_keep_target_until_deadline(monkeypatch):
+    s, clock = scheduler(monkeypatch)
+    s._generation_always_wait_target_batch = True
+    s.chunk_transfer_adapter._active_window = 1
+    s.chunk_transfer_adapter._active_streams = {"0"}
+    assert not s.schedule().num_scheduled_tokens
+    clock[0] += 0.012
+    assert s.schedule().num_scheduled_tokens == {"0": 8}
