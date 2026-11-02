@@ -285,21 +285,21 @@ class TemporalModule(nn.Module):
 
 
 class ResidualConvUnit(nn.Module):
-    def __init__(self, features: int):
+    def __init__(self, width: int):
         super().__init__()
-        self.conv1 = nn.Conv2d(features, features, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(features, features, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(width, width, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(width, width, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv2(F.relu(self.conv1(F.relu(x)))) + x
 
 
 class FeatureFusionBlock(nn.Module):
-    def __init__(self, features: int):
+    def __init__(self, width: int):
         super().__init__()
-        self.out_conv = nn.Conv2d(features, features, kernel_size=1)
-        self.resConfUnit1 = ResidualConvUnit(features)
-        self.resConfUnit2 = ResidualConvUnit(features)
+        self.out_conv = nn.Conv2d(width, width, kernel_size=1)
+        self.resConfUnit1 = ResidualConvUnit(width)
+        self.resConfUnit2 = ResidualConvUnit(width)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None, size: tuple[int, int] | None = None):
         if skip is not None:
@@ -315,7 +315,7 @@ class DPTHeadTemporal(nn.Module):
 
     def __init__(self, config: VideoDepthAnythingConfig, num_frames: int):
         super().__init__()
-        out_channels, features = config.out_channels, config.features
+        out_channels, width = config.out_channels, config.features
         self.projects = nn.ModuleList(nn.Conv2d(config.embed_dim, channels, kernel_size=1) for channels in out_channels)
         self.resize_layers = nn.ModuleList(
             [
@@ -328,20 +328,20 @@ class DPTHeadTemporal(nn.Module):
         self.scratch = nn.Module()
         for index, channels in enumerate(out_channels, 1):
             setattr(
-                self.scratch, f"layer{index}_rn", nn.Conv2d(channels, features, kernel_size=3, padding=1, bias=False)
+                self.scratch, f"layer{index}_rn", nn.Conv2d(channels, width, kernel_size=3, padding=1, bias=False)
             )
         for index in range(1, 5):
-            setattr(self.scratch, f"refinenet{index}", FeatureFusionBlock(features))
-        self.scratch.output_conv1 = nn.Conv2d(features, features // 2, kernel_size=3, padding=1)
+            setattr(self.scratch, f"refinenet{index}", FeatureFusionBlock(width))
+        self.scratch.output_conv1 = nn.Conv2d(width, width // 2, kernel_size=3, padding=1)
         self.scratch.output_conv2 = nn.Sequential(
-            nn.Conv2d(features // 2, 32, kernel_size=3, padding=1),
+            nn.Conv2d(width // 2, 32, kernel_size=3, padding=1),
             nn.ReLU(True),
             nn.Conv2d(32, 1, kernel_size=1),
             nn.ReLU(True),
             nn.Identity(),
         )
         self.motion_modules = nn.ModuleList(
-            TemporalModule(channels, num_frames) for channels in (out_channels[2], out_channels[3], features, features)
+            TemporalModule(channels, num_frames) for channels in (out_channels[2], out_channels[3], width, width)
         )
 
     def forward(
