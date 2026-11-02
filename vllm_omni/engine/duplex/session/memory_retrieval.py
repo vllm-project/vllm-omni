@@ -161,6 +161,29 @@ class DuplexMemorySuppression:
     def suppressed_keys(self) -> frozenset[str]:
         return frozenset(key for barrier in self._barriers.values() if barrier.keys is not None for key in barrier.keys)
 
+    def barriers(self) -> tuple[DuplexMemoryBarrier, ...]:
+        return tuple(self._barriers.values())
+
+    def stage(self) -> "DuplexMemorySuppression":
+        """Detach bounded proof metadata for an owner-only admission transaction."""
+        staged = DuplexMemorySuppression()
+        staged._barriers = self._barriers.copy()
+        staged._coverage = {key: value.copy() for key, value in self._coverage.items()}
+        staged._coverage_generations = {key: value.copy() for key, value in self._coverage_generations.items()}
+        staged._next_id = self._next_id
+        staged._version = self._version
+        staged._overflowed = self._overflowed
+        return staged
+
+    def commit(self, staged: "DuplexMemorySuppression") -> None:
+        """Commit validated metadata synchronously with its card admission."""
+        self._barriers = staged._barriers
+        self._coverage = staged._coverage
+        self._coverage_generations = staged._coverage_generations
+        self._next_id = staged._next_id
+        self._version = staged._version
+        self._overflowed = staged._overflowed
+
     def block(
         self,
         *,

@@ -60,3 +60,96 @@ class DuplexMemoryAdmission:
     status: DuplexMemoryAdmissionStatus
     node_ids: tuple[int, ...] = ()
     reason_code: str | None = None
+
+
+@dataclass(frozen=True)
+class DuplexContextAuxiliaryPolicy:
+    """Cheap opt-in gate, evaluated before capturing any history evidence."""
+
+    max_sources: int = 8
+    max_chars: int = 8192
+    allow_during_response: bool = False
+
+
+@dataclass(frozen=True, order=True)
+class DuplexMemoryCursor:
+    slot_order: int = 0
+    char_offset: int = 0
+
+
+@dataclass(frozen=True)
+class DuplexContextEvidence:
+    handle: int
+    source_id: int
+    revision: int
+    slot_order: int
+    role: Literal["user", "assistant"]
+    text: str = field(repr=False)
+    char_start: int
+    char_end: int
+
+
+@dataclass(frozen=True)
+class DuplexContextAuxiliaryWork:
+    scope_id: str = field(repr=False)
+    epoch: int
+    config_revision: int
+    progress_generation: int
+    start: DuplexMemoryCursor
+    end: DuplexMemoryCursor
+    read_set: tuple[DuplexMemoryEvidenceSpan, ...]
+    catalog_revision: int
+    pass_id: int = 0
+    catalog_page: int = 0
+    suppression_version: int = 0
+
+
+@dataclass(frozen=True)
+class DuplexContextAuxiliaryInput:
+    work: DuplexContextAuxiliaryWork
+    evidence: tuple[DuplexContextEvidence, ...]
+    catalog: tuple[DuplexMemoryCardHead, ...]
+    history_revision: int
+    barriers: tuple["DuplexContextBarrier", ...] = ()
+
+    @property
+    def work_key(self) -> DuplexContextAuxiliaryWork:
+        """Stable across unrelated history appends and retries of this window."""
+        return self.work
+
+
+@dataclass(frozen=True)
+class DuplexMemoryEvidenceSelection:
+    handle: int
+    char_start: int
+    char_end: int
+
+
+@dataclass(frozen=True)
+class DuplexMemoryProposal:
+    fact_key: str = field(repr=False)
+    text: str | None = field(repr=False)
+    evidence: tuple[DuplexMemoryEvidenceSelection, ...]
+
+
+@dataclass(frozen=True)
+class DuplexMemoryProposalBatch:
+    operations: tuple[DuplexMemoryProposal, ...]
+    resolutions: tuple["DuplexMemoryResolution", ...] = ()
+
+
+@dataclass(frozen=True)
+class DuplexContextBarrier:
+    handle: int
+    barrier_id: int
+    generation: int
+    keys: frozenset[str] = field(repr=False)
+    evidence: tuple[DuplexMemoryEvidenceSelection, ...]
+
+
+@dataclass(frozen=True)
+class DuplexMemoryResolution:
+    handle: int
+    keys: frozenset[str] = field(repr=False)
+    evidence: tuple[DuplexMemoryEvidenceSelection, ...]
+    disposition: Literal["replace", "retract", "no_conflict"] = "no_conflict"

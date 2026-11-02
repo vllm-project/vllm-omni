@@ -14,6 +14,7 @@ import asyncio
 import math
 import uuid
 from collections.abc import Callable, Hashable, Mapping
+from dataclasses import replace
 
 from vllm.logger import init_logger
 
@@ -24,7 +25,8 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_is_auxiliary_request,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryRequest, duplex_text_history
+from vllm_omni.engine.duplex.memory_types import DuplexContextAuxiliaryInput, DuplexContextAuxiliaryPolicy
+from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryPolicy, DuplexAuxiliaryRequest, duplex_text_history
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 
@@ -111,12 +113,24 @@ class SessionMemoryRuntime:
             epoch, config_revision = payload["epoch"], payload["config_revision"]
             assert isinstance(request, DuplexAuxiliaryRequest)
             assert isinstance(epoch, int) and isinstance(config_revision, int)
-            if self._context_matches(request, epoch, config_revision):
+            context = payload.get("context")
+            assert context is None or isinstance(context, DuplexContextAuxiliaryInput)
+            if self._context_matches(request, epoch, config_revision, context):
                 output = payload["output"]
                 try:
-                    applied = output is not None and self._ctx.plugin.apply_auxiliary_result(
-                        request=request, output=output, state=self._ctx.model_state
-                    )
+                    if context is not None:
+                        proposal = (
+                            self._ctx.plugin.decode_context_auxiliary_result(request=request, output=output)
+                            if output is not None
+                            else None
+                        )
+                        applied = proposal is not None and self._ctx.session.admit_memory_result(
+                            context=context, proposal=proposal
+                        ).status in {"applied", "no_change"}
+                    else:
+                        applied = output is not None and self._ctx.plugin.apply_auxiliary_result(
+                            request=request, output=output, state=self._ctx.model_state
+                        )
                 except Exception as exc:
                     logger.warning("Duplex auxiliary result failed: %s", type(exc).__name__)
                     applied = False
@@ -169,8 +183,18 @@ class SessionMemoryRuntime:
         self._clear_interaction_pending()
         self._interaction_active = False
 
-    def _context_matches(self, request: DuplexAuxiliaryRequest, epoch: int, config_revision: int) -> bool:
+    def _context_matches(
+        self,
+        request: DuplexAuxiliaryRequest,
+        epoch: int,
+        config_revision: int,
+        context: DuplexContextAuxiliaryInput | None = None,
+    ) -> bool:
         if self._closing or self._ctx.session.epoch != epoch or self._ctx.session.config_revision != config_revision:
+            return False
+        if context is not None:
+            return request.context_work == context.work and self._ctx.session.memory_context_matches(context)
+        if request.context_work is not None:
             return False
         return self._ctx.plugin.auxiliary_source_matches(
             request=request, state=self._ctx.model_state, history=self._current_history()
@@ -203,7 +227,9 @@ class SessionMemoryRuntime:
 
     def _interactive_input(self, payload: Mapping[str, object], *, has_new_user_input: bool) -> bool:
         """Record input intent without cancelling work needed to admit it."""
-        return self._ctx.plugin.supports_auxiliary_requests and self._ctx.plugin.auxiliary_preempted_by_input(
+        return (
+            self._ctx.plugin.supports_auxiliary_requests or self._ctx.plugin.supports_context_auxiliary_requests
+        ) and self._ctx.plugin.auxiliary_preempted_by_input(
             payload=payload, state=self._ctx.model_state, has_new_user_input=has_new_user_input
         )
 
@@ -245,13 +271,18 @@ class SessionMemoryRuntime:
         )
 
     def maybe_start(self) -> None:
-        if not self._ctx.plugin.supports_auxiliary_requests or self._closing:
+        context_mode = self._ctx.plugin.supports_context_auxiliary_requests
+        if not (self._ctx.plugin.supports_auxiliary_requests or context_mode) or self._closing:
             return
-        history = self._current_history()
+        history = () if context_mode else self._current_history()
         # Policy also advances model-owned camera chunks while summaries run;
         # unchanged text history alone cannot establish that it is a no-op.
-        policy = self._ctx.plugin.auxiliary_policy(
-            state=self._ctx.model_state, history_revision=self._ctx.session.history_revision, history=history
+        policy = (
+            None
+            if context_mode
+            else self._ctx.plugin.auxiliary_policy(
+                state=self._ctx.model_state, history_revision=self._ctx.session.history_revision, history=history
+            )
         )
         if self._interaction_epoch != self._ctx.session.epoch:
             self._interaction_epoch = self._ctx.session.epoch
@@ -282,6 +313,25 @@ class SessionMemoryRuntime:
         # an unbounded collection of abandoned background requests behind it.
         if any(duplex_is_auxiliary_request(request_id) for _, request_id in self._ctx.session.request_resources):
             return
+        context = None
+        if context_mode:
+            if self._interaction_pending or self._interaction_active:
+                return
+            context_policy = self._ctx.plugin.context_auxiliary_policy(runtime_config=self._ctx.session.runtime_config)
+            if context_policy is not None:
+                if not isinstance(context_policy, DuplexContextAuxiliaryPolicy):
+                    raise ValueError("invalid_context_auxiliary_policy")
+                if not context_policy.allow_during_response and (
+                    self._ctx.session.active_response_id is not None or self._ctx.tasks.append_tasks
+                ):
+                    return
+                context = self._ctx.session.capture_memory_context(
+                    max_sources=context_policy.max_sources,
+                    max_chars=context_policy.max_chars,
+                    excluded_item_ids=frozenset(self._pending_user_items),
+                )
+                if context is not None:
+                    policy = DuplexAuxiliaryPolicy(context.work_key, context_policy.allow_during_response)
         if policy is None:
             self._source = None
             self.cancel_retry()
@@ -302,11 +352,13 @@ class SessionMemoryRuntime:
         self._source = source
         self._epoch = self._ctx.session.epoch
         self._generation += 1
-        self._task = asyncio.create_task(self._run(duplex_text_history(history)), name="duplex-auxiliary")
+        self._task = asyncio.create_task(self._run(duplex_text_history(history), context), name="duplex-auxiliary")
         self._ctx.services.spawn(self._task, name="duplex-auxiliary")
         self._task.add_done_callback(self._wake)
 
-    async def _run(self, history: tuple[tuple[str, str], ...]) -> None:
+    async def _run(
+        self, history: tuple[tuple[str, str], ...], context: DuplexContextAuxiliaryInput | None = None
+    ) -> None:
         session = self._ctx.session
         epoch, config_revision = session.epoch, session.config_revision
         generation = session.config_generation
@@ -316,15 +368,23 @@ class SessionMemoryRuntime:
         output = None
         submission_started = False
         try:
-            request = await asyncio.wait_for(
-                self._ctx.plugin.prepare_auxiliary_request(
+            preparation = (
+                self._ctx.plugin.prepare_context_auxiliary_request(
+                    context=context, runtime_config=session.runtime_config
+                )
+                if context is not None
+                else self._ctx.plugin.prepare_auxiliary_request(
                     history=history,
                     runtime_config=session.runtime_config,
                     state=self._ctx.model_state,
-                ),
-                timeout=30.0,
+                )
             )
-            if request is None or not self._context_matches(request, epoch, config_revision):
+            request = await asyncio.wait_for(preparation, timeout=30.0)
+            if request is not None and context is not None:
+                if request.context_work is not None and request.context_work != context.work:
+                    return
+                request = replace(request, context_work=context.work)
+            if request is None or not self._context_matches(request, epoch, config_revision, context):
                 return
             if (
                 not 0 <= request.stage_id < self._ctx.stage_port.stage_count
@@ -343,7 +403,7 @@ class SessionMemoryRuntime:
             self._output = output_future
             sampling = list(self._ctx.manager.sampling_params_for(session))
             sampling[request.stage_id] = request.sampling_params
-            context = DuplexStageRequestContext(
+            stage_context = DuplexStageRequestContext(
                 request_id=request_id,
                 session_id=session.session_id,
                 fence=session.fence,
@@ -352,22 +412,22 @@ class SessionMemoryRuntime:
                 config_generation=generation,
                 sampling_params=tuple(sampling),
             )
-            session.reserve_stage_request(request.stage_id, request_id, fence=context.fence)
+            session.reserve_stage_request(request.stage_id, request_id, fence=stage_context.fence)
             # Mark submitted before yielding so concurrent close always aborts
             # an in-flight submit rather than merely dropping its reservation.
             session.request_resources[(request.stage_id, request_id)].submitted = True
-            self._ctx.stage_port.ensure_request(context)
+            self._ctx.stage_port.ensure_request(stage_context)
             self._ctx.manager.register_request(request_id, session.session_id)
 
             async def submit_and_wait() -> object:
                 nonlocal submission_started
                 submission_started = True
                 result = await self._ctx.stage_port.submit(
-                    DuplexStageSubmission(context, request.prompt, already_submitted=False, resumable=False)
+                    DuplexStageSubmission(stage_context, request.prompt, already_submitted=False, resumable=False)
                 )
                 if result.request_id != request_id or result.stage_id != request.stage_id:
                     raise RuntimeError("Auxiliary stage submission returned a mismatched identity")
-                if not self._context_matches(request, epoch, config_revision):
+                if not self._context_matches(request, epoch, config_revision, context):
                     return None
                 return await output_future
 
@@ -418,6 +478,8 @@ class SessionMemoryRuntime:
                     raise asyncio.CancelledError
         # Queue completion after cleanup, so the mailbox may schedule the next
         # bounded chunk without racing the previous task's owned resources.
+        if context is not None and request is not None and (request.stage_id, request_id) in session.request_resources:
+            return
         if request is not None and submission_started and operation == self._generation:
             self._completion_pending = True
             self._post(
@@ -428,5 +490,6 @@ class SessionMemoryRuntime:
                     "epoch": epoch,
                     "config_revision": config_revision,
                     "operation": operation,
+                    "context": context,
                 },
             )

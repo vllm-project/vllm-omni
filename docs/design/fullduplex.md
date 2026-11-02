@@ -415,9 +415,30 @@ Partial reconciliation is discarded for keys whose head generation changes.
 Recognizing a natural-language correction is a model-policy responsibility,
 separate from these deterministic validity rules.
 
-These card APIs are internal foundations. Extraction scheduling, shared auxiliary
-budgets and a stage's final prompt consumption are separate integrations; the
-existing L1 view policy below does not enable them.
+Plugins can opt into owner-bound auxiliary work with
+`supports_context_auxiliary_requests` and `context_auxiliary_policy`. The default
+is disabled. The policy gate runs before capturing history; an idle context
+policy does not fall back to legacy memory hooks. Existing auxiliary plugins
+retain their prepare, source-validation and apply contracts.
+
+The session captures bounded, detached text evidence, stable source identity and
+revisions. Pending user input and unsettled assistant speech are excluded;
+accepted heard prefixes constrain assistant evidence. The plugin prepares a
+request and decodes local evidence handles without receiving live session state.
+The existing private request slot, preemption and mailbox own its execution.
+After successful resource cleanup, the owner binds those handles and validates
+epoch, settings, source, catalogue and suppression fences before admission.
+
+Progress covers text fragments and bounded catalogue pages. A successful empty
+result advances only its coverage unit. Own card admissions retain the current
+page pass; external catalogue changes discard it. New keys require extension
+coverage, and earlier source edits requeue their slots. Unrelated tail appends
+do not invalidate captured evidence or replenish a failed unit's retry budget.
+Explicit barrier resolutions and card mutations are preflighted together;
+rejection commits neither. A partial page or text fragment cannot clear a global
+barrier. Recovery from stale triggers and suppression overflow, shared compute
+budgets and a stage's final prompt consumption remain separate integrations;
+the existing L1 view policy below does not enable memory extraction.
 
 A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
 `context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:

@@ -39,7 +39,12 @@ from vllm_omni.engine.duplex.config import (
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
-from vllm_omni.engine.duplex.memory_types import DuplexMemoryAdmission, DuplexMemoryCardBatch
+from vllm_omni.engine.duplex.memory_types import (
+    DuplexContextAuxiliaryInput,
+    DuplexMemoryAdmission,
+    DuplexMemoryCardBatch,
+    DuplexMemoryProposalBatch,
+)
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
 from vllm_omni.engine.duplex.session.context_view import DuplexHistoryView
 from vllm_omni.engine.duplex.session.context_view import render_history_view as render_context_view
@@ -49,6 +54,7 @@ from vllm_omni.engine.duplex.session.lease import (
     DuplexLeaseConfig,
     DuplexLeaseState,
 )
+from vllm_omni.engine.duplex.session.memory_context import DuplexMemoryContextState
 from vllm_omni.engine.duplex.session.memory_retrieval import DuplexMemorySuppression
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
 from vllm_omni.metrics.stats import (
@@ -251,6 +257,7 @@ class DuplexEngineSession:
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
     _context_ledger: DuplexContextLedger = field(default_factory=DuplexContextLedger, repr=False)
     _memory_suppression: DuplexMemorySuppression = field(default_factory=DuplexMemorySuppression, repr=False)
+    _memory_context: DuplexMemoryContextState | None = field(default=None, repr=False)
     model_state: DuplexModelSessionState | None = field(default=None, repr=False)
     projector: RealtimeProjectionState | None = field(default=None, repr=False)
     created_monotonic: float = field(default_factory=time.monotonic)
@@ -536,6 +543,25 @@ class DuplexEngineSession:
         """Pending-correction eligibility, preserved with this live session."""
         return self._memory_suppression
 
+    def capture_memory_context(
+        self, *, max_sources: int = 8, max_chars: int = 8192, excluded_item_ids: frozenset[str] = frozenset()
+    ) -> DuplexContextAuxiliaryInput | None:
+        if self._memory_context is None:
+            self._memory_context = DuplexMemoryContextState()
+        return self._memory_context.capture(
+            self, max_sources=max_sources, max_chars=max_chars, excluded_item_ids=excluded_item_ids
+        )
+
+    def memory_context_matches(self, context: DuplexContextAuxiliaryInput) -> bool:
+        return self._memory_context is not None and self._memory_context.matches(self, context)
+
+    def admit_memory_result(
+        self, *, context: DuplexContextAuxiliaryInput, proposal: DuplexMemoryProposalBatch
+    ) -> DuplexMemoryAdmission:
+        if self._memory_context is None:
+            return DuplexMemoryAdmission("stale", reason_code="memory_context_changed")
+        return self._memory_context.admit(self, context=context, proposal=proposal)
+
     def render_history_view(
         self, policy: DuplexContextViewPolicy, *, snapshot: DuplexHistorySnapshot | None = None
     ) -> DuplexHistoryView:
@@ -580,6 +606,9 @@ class DuplexEngineSession:
             source.revision += 1
         self._conversation.revision += 1
 
+        if self._memory_context is not None:
+            self._memory_context.note_change(source.slot_order)
+
     def _allocate_history_slot(self) -> int:
         order = self._conversation.next_slot_order
         self._conversation.next_slot_order += 1
@@ -587,9 +616,11 @@ class DuplexEngineSession:
 
     def _forget_history_message(self, message: dict[str, object]) -> None:
         if id(message) in self._conversation.sources:
-            self._history_source(message)
+            source = self._history_source(message)
             del self._conversation.sources[id(message)]
             self._conversation.revision += 1
+            if self._memory_context is not None:
+                self._memory_context.note_change(source.slot_order)
 
     def _history_item_metadata_changed(self, item_id: str) -> None:
         message = self._conversation.item_ids.get(item_id)

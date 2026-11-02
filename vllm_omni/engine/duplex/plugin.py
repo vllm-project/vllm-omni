@@ -29,6 +29,12 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputDecision,
 )
+from vllm_omni.engine.duplex.memory_types import (
+    DuplexContextAuxiliaryInput,
+    DuplexContextAuxiliaryPolicy,
+    DuplexContextAuxiliaryWork,
+    DuplexMemoryProposalBatch,
+)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
@@ -417,6 +423,8 @@ class DuplexAuxiliaryRequest:
     retry_delays_s: tuple[float, ...] = ()
     # Continue at this interval after the short retry budget is exhausted.
     retry_cooldown_s: float | None = None
+    # Issued and bound by the session owner, never supplied by model output.
+    context_work: DuplexContextAuxiliaryWork | None = None
 
 
 class DuplexModelPlugin(ABC):
@@ -438,6 +446,7 @@ class DuplexModelPlugin(ABC):
 
     projects_intermediate_outputs: bool = False
     supports_auxiliary_requests: bool = False
+    supports_context_auxiliary_requests: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
@@ -496,6 +505,22 @@ class DuplexModelPlugin(ABC):
     ) -> dict[str, object]:
         """Add model-owned context before planning an append on the session loop."""
         return config
+
+    def context_auxiliary_policy(self, *, runtime_config: Mapping[str, object]) -> DuplexContextAuxiliaryPolicy | None:
+        """Opt into owner-bound text work; None is idle, without legacy fallback."""
+        return None
+
+    async def prepare_context_auxiliary_request(
+        self, *, context: DuplexContextAuxiliaryInput, runtime_config: Mapping[str, object]
+    ) -> DuplexAuxiliaryRequest | None:
+        """Prepare private work from detached evidence, without live session state."""
+        return None
+
+    def decode_context_auxiliary_result(
+        self, *, request: DuplexAuxiliaryRequest, output: object
+    ) -> DuplexMemoryProposalBatch | None:
+        """Pure decode only; the session validates and admits returned proposals."""
+        return None
 
     async def prepare_auxiliary_request(
         self,

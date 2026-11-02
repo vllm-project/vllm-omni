@@ -3,6 +3,8 @@
 
 """Derived context nodes over authoritative duplex history sources."""
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import IntEnum
@@ -138,6 +140,16 @@ class DuplexContextLedger:
         source_orders: Mapping[int, int],
         batch: DuplexMemoryCardBatch,
     ) -> DuplexMemoryAdmission:
+        prepared = self._prepare_card_batch(snapshot, source_orders=source_orders, batch=batch)
+        return prepared if isinstance(prepared, DuplexMemoryAdmission) else self._commit_card_batch(prepared)
+
+    def _prepare_card_batch(
+        self,
+        snapshot: DuplexHistorySnapshot,
+        *,
+        source_orders: Mapping[int, int],
+        batch: DuplexMemoryCardBatch,
+    ) -> _CardAdmissionPlan | DuplexMemoryAdmission:
         """Preflight the entire batch before changing nodes, heads or IDs.
 
         The owner supplies a current snapshot and source slot orders. Evidence
@@ -214,13 +226,30 @@ class DuplexContextLedger:
                     )
                 )
             heads.append(DuplexMemoryCardHead(operation.fact_key, generation, node_id, order))
-        self._remove_nodes(retired)
-        for node in nodes:
+        projected = dict(self._card_heads)
+        for key, head in projected.items():
+            if head.node_id in retired:
+                projected[key] = DuplexMemoryCardHead(key, head.generation + 1, None, head.evidence_order_floor)
+        projected.update((head.fact_key, head) for head in heads)
+        return _CardAdmissionPlan(
+            self, self._card_catalog_revision, self._next_node_id, retired, tuple(nodes), tuple(projected.values())
+        )
+
+    def _commit_card_batch(self, plan: _CardAdmissionPlan) -> DuplexMemoryAdmission:
+        """Owner-only: commit immediately after preflight, without yielding."""
+        if (
+            plan.owner is not self
+            or plan.catalog_revision != self._card_catalog_revision
+            or plan.next_node_id != self._next_node_id
+        ):
+            return DuplexMemoryAdmission("stale", reason_code="catalog_changed")
+        self._remove_nodes(plan.retired)
+        for node in plan.nodes:
             self._nodes[node.node_id] = node
-        self._card_heads.update((head.fact_key, head) for head in heads)
-        self._next_node_id += len(nodes)
+        self._card_heads = {head.fact_key: head for head in plan.catalog}
+        self._next_node_id += len(plan.nodes)
         self._card_catalog_revision += 1
-        return DuplexMemoryAdmission("applied", node_ids=tuple(node.node_id for node in nodes))
+        return DuplexMemoryAdmission("applied", node_ids=tuple(node.node_id for node in plan.nodes))
 
     def _retired_with_descendants(self, roots: set[int]) -> set[int]:
         retired = set(roots)
@@ -381,3 +410,13 @@ class DuplexContextLedger:
                 and all(self._valid_against(parent, current, memo) for parent in node.parents)
             )
         return memo[node_id]
+
+
+@dataclass(frozen=True)
+class _CardAdmissionPlan:
+    owner: DuplexContextLedger
+    catalog_revision: int
+    next_node_id: int
+    retired: set[int]
+    nodes: tuple[DuplexContextNode, ...]
+    catalog: tuple[DuplexMemoryCardHead, ...]
