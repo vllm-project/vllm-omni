@@ -456,6 +456,16 @@ model's declaration. Shared compute budgets and a stage's final prompt consumer
 remain separate integrations; the L1 view policy below does not enable memory
 extraction.
 
+Qwen's memory codec renders captured text as quoted JSON data with local
+evidence and barrier handles. Its strict output schema accepts upsert/retract
+proposals, explicit resolutions and a scoped reconciliation declaration;
+unknown or duplicate fields, invalid references and oversized output are refused.
+Decoding never changes session state. An empty valid result differs from invalid
+output, and only the owner can authorize mutations. Formatting preserves the
+entire captured scope; the eventual request policy must count the full rendered
+template before submission. This codec alone enables no model requests or stage
+consumption.
+
 A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
 `context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:
 the prompt config is built exactly as before and no L1 view is rendered. With a
