@@ -164,6 +164,7 @@ from .latent_upscaler import (
     resolve_minimax_h3_latent_upscale_target,
     resolve_minimax_h3_latent_upscaler,
 )
+from .lightvae import resolve_h3_lightvae_decoder_path
 from .lora import TurboSpec, load_minimax_h3_turbo_lora
 from .minimax_h3_blocks import (
     MiniMaxH3Attention,
@@ -1288,6 +1289,7 @@ class MiniMaxH3Pipeline(
         self.video_vae = None
         self.audio_vae = None
         if self.load_vae_decoder:
+            lightvae_decoder_path = resolve_h3_lightvae_decoder_path(od_config.additional_config or {})
             self.video_vae = MiniMaxH3VideoVAE(
                 os.path.join(vae_model_path, "video_vae"),
                 device=self.device,
@@ -1297,9 +1299,11 @@ class MiniMaxH3Pipeline(
                 decoder_source=(od_config.additional_config or {}).get(
                     "video_vae_decoder",
                     str(model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors")
-                    if (model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors").is_file()
+                    if lightvae_decoder_path is None
+                    and (model_path / "vae_decoder_nvfp4/decoder-nvfp4.safetensors").is_file()
                     else None,
                 ),
+                lightvae_decoder_path=lightvae_decoder_path,
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),
