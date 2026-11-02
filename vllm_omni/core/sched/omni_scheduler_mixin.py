@@ -175,6 +175,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     # Provided by the concrete vLLM scheduler.
     vllm_config: VllmConfig
+    max_num_running_reqs: int
     requests: dict[str, Request]
     waiting: RequestQueue
     kv_holding_waiting: RequestQueue
@@ -334,6 +335,22 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         session.update_block_hashes()
         session.num_prompt_tokens = len(new_prompt)
         self._finish_streaming_session_update(session, update)
+
+    def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
+        """Initialize shared batch settings from scheduler-resolved config.
+
+        Runner, topology and scheduling-policy checks belong to each scheduler.
+        """
+        self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
+        self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
+        self._generation_always_wait_target_batch = extra.get("generation_always_wait_target_batch", False)
+        self._generation_batch_deadline: float | None = None
+        if not 1 <= self._generation_min_batch_size <= self.max_num_running_reqs:
+            raise ValueError("generation_min_batch_size must be in [1, max_num_seqs]")
+        if not math.isfinite(self._generation_max_wait_s) or self._generation_max_wait_s < 0:
+            raise ValueError("generation_max_wait_ms must be finite and nonnegative")
+        if not isinstance(self._generation_always_wait_target_batch, bool):
+            raise ValueError("generation_always_wait_target_batch must be a boolean")
 
     def _get_coalescing_ready_request_ids(
         self, connector_outputs: Iterable[OmniConnectorOutput] = ()

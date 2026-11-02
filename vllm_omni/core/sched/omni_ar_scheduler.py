@@ -4,10 +4,9 @@
 from __future__ import annotations
 
 import inspect
-import math
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import replace
 from typing import Any, TypedDict
 
@@ -220,7 +219,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._hold_payloadless_outputs = _holds_payloadless_outputs(self.vllm_config.model_config)
         # External finishes release Request before their terminal output is assembled.
         self._held_token_ids: dict[str, list[int]] = {}
-        self._init_prefill_admission_policy()
+        extra = self._get_scheduler_extra_config()
+        self._init_prefill_admission_policy(extra)
+        self._init_generation_coalescing(extra)
 
     def add_request(self, request: Request) -> None:
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
@@ -374,15 +375,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         is_final, _ = self._omni_final_stage_flags(request)
         return is_final
 
-    def _init_prefill_admission_policy(self) -> None:
-        """Optional prefill batching under load (stage connector ``extra`` or ``additional_config``).
-
-        While at least ``ar_prefill_admission_min_running`` requests run, a new
-        request waits until ``ar_prefill_admission_min_batch`` requests wait or
-        the oldest has waited ``ar_prefill_admission_max_wait_ms``: arrivals then
-        share one prefill / mixed step instead of each turning a decode step
-        into one. Off unless ``ar_prefill_admission_min_batch`` > 1.
-        """
+    def _get_scheduler_extra_config(self) -> dict[str, Any]:
+        """Resolve AR settings, with connector values taking precedence."""
         connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
         extra = (
             connector_config.get("extra", connector_config)
@@ -391,7 +385,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         ) or {}
         # A stage without a configured connector edge sets the same keys in additional_config.
         additional = getattr(self.vllm_config, "additional_config", None)
-        extra = {**(additional if isinstance(additional, dict) else {}), **extra}
+        return {**(additional if isinstance(additional, dict) else {}), **extra}
+
+    def _init_prefill_admission_policy(self, extra: Mapping[str, Any]) -> None:
+        """Optional prefill batching under load (stage connector ``extra`` or ``additional_config``).
+
+        While at least ``ar_prefill_admission_min_running`` requests run, a new
+        request waits until ``ar_prefill_admission_min_batch`` requests wait or
+        the oldest has waited ``ar_prefill_admission_max_wait_ms``: arrivals then
+        share one prefill / mixed step instead of each turning a decode step
+        into one. Off unless ``ar_prefill_admission_min_batch`` > 1.
+        """
         self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
         self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
         self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
@@ -407,16 +411,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._prefill_admission_min_running,
             )
 
-        self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
-        self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
-        self._generation_always_wait_target_batch = extra.get("generation_always_wait_target_batch", False)
-        self._generation_batch_deadline: float | None = None
-        if self._generation_min_batch_size < 1:
-            raise ValueError("generation_min_batch_size must be positive")
-        if not math.isfinite(self._generation_max_wait_s) or self._generation_max_wait_s < 0:
-            raise ValueError("generation_max_wait_ms must be finite and nonnegative")
-        if not isinstance(self._generation_always_wait_target_batch, bool):
-            raise ValueError("generation_always_wait_target_batch must be a boolean")
+    def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
+        """Initialize AR execution batching after admission policy setup."""
+        super()._init_generation_coalescing(extra)
         if self._generation_min_batch_size > 1 and self._generation_max_wait_s:
             if any(
                 extra.get(key)
@@ -427,8 +424,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 )
             ):
                 raise ValueError("generation coalescing and ar_prefill_admission_* cannot be enabled together")
-            if self._generation_min_batch_size > self.max_num_running_reqs:
-                raise ValueError("generation_min_batch_size must not exceed max_num_seqs")
             parallel = self.vllm_config.parallel_config
             if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
                 raise ValueError("AR generation batch waiting requires TP1/PP1")

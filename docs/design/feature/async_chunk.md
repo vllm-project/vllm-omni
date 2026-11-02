@@ -328,6 +328,9 @@ with any nonzero `ar_prefill_admission_*` setting raises a configuration error.
 The legacy admission-only policy retains its existing behavior when execution
 coalescing is disabled.
 
+For both AR and generation schedulers, `generation_min_batch_size` must be in
+`[1, max_num_seqs]`, including when batch waiting is disabled.
+
 The AR gate counts distinct input-ready streams, runnable waiting requests,
 and running requests with outstanding token work. In-flight execution alone
 does not disqualify an async AR continuation. Input-blocked and finished requests
