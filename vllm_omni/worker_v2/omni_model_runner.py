@@ -95,7 +95,10 @@ class OmniGPUModelRunner(GPUModelRunner):
     _native_output_materializer: NativeOutputWorker | None
     model_state: OmniModelState
     vocab_size: int
-    use_aux_hidden_state_outputs: bool
+    # Speculative decoding state; the upstream __init__ sets the real values.
+    use_aux_hidden_state_outputs: bool = False
+    speculator: Any = None
+    num_speculative_steps: int = 0
     _last_aux_output: Any
     _last_multimodal_outputs: dict[str, Any] | None
     _model_returns_tuple: bool
@@ -391,6 +394,14 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._last_aux_output = None
         self._last_multimodal_outputs = None
         self._configure_cudagraph_output_contract()
+        if self.use_aux_hidden_state_outputs and (
+            self._model_returns_tuple or hasattr(self.model, "_last_captured_layers")
+        ):
+            # Both would use the forward's tuple output slot.
+            raise NotImplementedError(
+                f"{type(self.model).__name__} returns its own auxiliary output; a drafter that "
+                "reads target hidden layers is not supported with it on MRv2 yet"
+            )
 
         # Preprocess models own embedding buffers; encoder_runner sizing would
         # mismatch unless the model builds its preprocess on the encoder output.
@@ -766,6 +777,9 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
+        # Target layers a drafter reads (EAGLE-3, DFlash, DSpark). They ride in
+        # the forward's tuple output, separate from the Omni auxiliary output.
+        draft_aux_hidden_states = None
         # --- Model forward ---
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # FULL graph replay.  Preprocess already wrote to the static
@@ -773,6 +787,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
             replayed = self.cudagraph_manager.run_fullgraph(batch_desc)
+            if self.use_aux_hidden_state_outputs:
+                replayed, draft_aux_hidden_states = replayed
             self._last_multimodal_outputs = None
             hidden_states, self._last_aux_output = self._split_fullgraph_output(replayed)
             if hasattr(self.model, "_last_captured_layers"):
@@ -817,6 +833,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Extract hidden_states from model output.
             self._last_aux_output = None
             self._last_multimodal_outputs = None
+            if self.use_aux_hidden_state_outputs:
+                model_output, draft_aux_hidden_states = model_output
             if isinstance(model_output, OmniOutput):
                 hidden_states = model_output.text_hidden_states
                 if model_output.multimodal_outputs:
@@ -835,7 +853,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
             hidden_states=hidden_states,
-            aux_hidden_states=None,
+            aux_hidden_states=draft_aux_hidden_states,
             dp_sync_state=dp_sync,
             finished_req_ids=scheduler_output.finished_req_ids,
             ec_connector_output=ec_connector_output,
