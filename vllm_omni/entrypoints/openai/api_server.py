@@ -198,6 +198,10 @@ from vllm_omni.entrypoints.openai.serving_video import (
 )
 from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
+from vllm_omni.entrypoints.openai.stage_params import (
+    build_stage_sampling_params_list,
+    get_default_sampling_params_list,
+)
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
@@ -2307,9 +2311,11 @@ async def generate_images(
         prompt = OmniTextPrompt(prompt=request.prompt, modalities=["image"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
-        gen_params = OmniDiffusionSamplingParams()
-        app_state_args = getattr(raw_request.app.state, "args", None)
-        apply_stage_default_sampling_params(getattr(app_state_args, "default_sampling_params", None), gen_params, "0")
+        (gen_params,) = build_stage_sampling_params_list(
+            stage_configs,
+            get_default_sampling_params_list(engine_client),
+            diffusion_params=OmniDiffusionSamplingParams(),
+        )
         if "n" in request.model_fields_set:
             gen_params.num_outputs_per_prompt = request.n
         extra_args = {**gen_params.extra_args, **(request.extra_params or {})}

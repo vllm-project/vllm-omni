@@ -807,16 +807,15 @@ class StageConfigFactory:
                 stage_overrides[f"stage_0_{name}"] = kwargs[name]
         # Caller defaults belong to deployment, not immutable pipeline constraints:
         # explicit request sampling parameters must still be able to override them.
-        if default_sampling_params:
-            stage_deploy.default_sampling_params = {
-                **(stage_deploy.default_sampling_params or {}),
-                **default_sampling_params,
-            }
         return VllmOmniConfig.from_pipeline_config(
             pipeline,
             user_deploy_config=deploy,
             deploy_config_path=deploy_config_path,
-            cli_overrides={"model": model, **stage_overrides},
+            cli_overrides={
+                "model": model,
+                **stage_overrides,
+                "default_sampling_params": {"0": default_sampling_params},
+            },
         )
 
     @classmethod

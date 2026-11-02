@@ -8,10 +8,12 @@ OpenAI-compatible async text-to-image generation API endpoints in api_server.py.
 """
 
 import base64
+import copy
 import io
 import json
 from argparse import Namespace
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +25,8 @@ from vllm import SamplingParams
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_omni.config.config_factory import StageConfigFactory
+from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.image_api_utils import (
@@ -217,6 +221,9 @@ def test_client(mock_async_diffusion):
 
     # Set up app state with diffusion engine
     app.state.engine_client = mock_async_diffusion
+    mock_async_diffusion.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(num_inference_steps=4, guidance_scale=7.5, generator_device="cpu")
+    ]
     app.state.diffusion_engine = mock_async_diffusion  # Also set for health endpoint
     app.state.stage_configs = [SimpleNamespace(stage_type="diffusion")]
     from vllm.entrypoints.openai.models.protocol import BaseModelPath
@@ -2693,18 +2700,24 @@ def test_is_image_generation_stage_matrix():
 
 @pytest.fixture
 def image_client_with_cli_defaults(test_client: TestClient) -> TestClient:
-    test_client.app.state.args.default_sampling_params = json.dumps(
+    config = StageConfigFactory.create_typed_default_diffusion(
+        "test-model",
         {
-            "0": {
-                "num_inference_steps": 50,
-                "num_outputs_per_prompt": 2,
-                "guidance_scale": 3.0,
-                "seed": 42,
-                "generator_device": "cpu",
-                "extra_args": {"flow_shift": 5.0, "use_system_prompt": True},
+            "default_sampling_params": {
+                "0": {
+                    "num_inference_steps": 50,
+                    "num_outputs_per_prompt": 2,
+                    "guidance_scale": 3.0,
+                    "seed": 42,
+                    "generator_device": "cpu",
+                    "extra_args": {"flow_shift": 5.0, "use_system_prompt": "dynamic"},
+                }
             }
-        }
+        },
     )
+    test_client.app.state.engine_client.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(**config.stage_by_id(0).model_config.default_sampling_params)
+    ]
     return test_client
 
 
@@ -2718,7 +2731,7 @@ def test_image_sampling_omitted_fields_use_cli_defaults(image_client_with_cli_de
     assert params.seed == 42
     assert params.num_outputs_per_prompt == 2
     assert params.generator_device == "cpu"
-    assert params.extra_args == {"flow_shift": 5.0, "use_system_prompt": True}
+    assert params.extra_args == {"flow_shift": 5.0, "use_system_prompt": "dynamic"}
 
 
 def test_image_sampling_explicit_overrides(image_client_with_cli_defaults: TestClient) -> None:
@@ -2734,7 +2747,7 @@ def test_image_sampling_explicit_overrides(image_client_with_cli_defaults: TestC
     assert params.seed == 0
     assert params.num_outputs_per_prompt == 1
     assert params.generator_device == "cpu"
-    assert params.extra_args == {"flow_shift": 2.0, "use_system_prompt": True}
+    assert params.extra_args == {"flow_shift": 2.0, "use_system_prompt": "dynamic"}
 
 
 def test_image_sampling_defaults_are_request_isolated(image_client_with_cli_defaults: TestClient) -> None:
@@ -2745,3 +2758,81 @@ def test_image_sampling_defaults_are_request_isolated(image_client_with_cli_defa
     response = client.post("/v1/images/generations", json={"prompt": "another cat"})
     assert response.status_code == 200
     assert client.app.state.engine_client.captured_sampling_params_list[0].extra_args["flow_shift"] == 5.0
+
+
+@pytest.mark.parametrize(
+    "model,architecture,yaml_name,cfg_field,default_cfg,yaml_extra_args",
+    [
+        (
+            "OpenMOSS-Team/MOSS-Image-Base",
+            "MOSSImagePipeline",
+            "moss_image.yaml",
+            "guidance_scale",
+            3.0,
+            {"flow_shift": 5.0},
+        ),
+        ("Qwen/Qwen-Image-2.1", "QwenImage21Pipeline", "qwen_image_21.yaml", "true_cfg_scale", 1.0, {}),
+    ],
+    ids=["moss-image", "qwen-image21"],
+)
+@pytest.mark.parametrize("override", ["none", "cli-cfg", "request-cfg", "cli-extra-args", "request-extra-args"])
+def test_image_sampling_yaml_defaults_reach_generation(
+    test_client: TestClient,
+    mocker: MockerFixture,
+    model: str,
+    architecture: str,
+    yaml_name: str,
+    cfg_field: str,
+    default_cfg: float,
+    yaml_extra_args: dict[str, float],
+    override: str,
+) -> None:
+    mocker.patch("vllm_omni.config.config_factory.StageConfigFactory.get_hf_config", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.config_factory.get_hf_file_to_dict",
+        side_effect=lambda filename, *args, **kwargs: (
+            {"_class_name": architecture} if filename == "model_index.json" else None
+        ),
+    )
+    cli_defaults: dict[str, float | dict[str, str]] = {}
+    request: dict[str, str | int | float | bool] = {"prompt": "a cat", "seed": 42}
+    expected_cfg = default_cfg
+    expected_extra_args: dict[str, float | str] = dict(yaml_extra_args)
+    if override == "cli-cfg":
+        cli_defaults = {cfg_field: 4.0}
+        expected_cfg = 4.0
+    elif override == "request-cfg":
+        cli_defaults = {cfg_field: 4.0}
+        request[cfg_field] = 0.0
+        expected_cfg = 0.0
+    elif override == "cli-extra-args":
+        cli_defaults = {"extra_args": {"use_system_prompt": "dynamic"}}
+        expected_extra_args["use_system_prompt"] = "dynamic"
+    elif override == "request-extra-args":
+        cli_defaults = {"extra_args": {"use_system_prompt": "dynamic"}}
+        request["use_system_prompt"] = "en_vanilla"
+        expected_extra_args["use_system_prompt"] = "en_vanilla"
+    config = resolve_omni_config(
+        model=model,
+        trust_remote_code=None,
+        deploy_config_path=None,
+        cli_overrides={"default_sampling_params": json.dumps({"0": cli_defaults})},
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    assert Path(config.config_path).name == yaml_name
+    defaults = config.stage_by_id(0).model_config.default_sampling_params
+    defaults_before_requests = copy.deepcopy(defaults)
+    test_client.app.state.engine_client.default_sampling_params_list = [OmniDiffusionSamplingParams(**defaults)]
+    test_client.app.state.args.default_sampling_params = None
+    for _ in range(2):
+        response = test_client.post("/v1/images/generations", json=request)
+        assert response.status_code == 200
+        params = test_client.app.state.engine_client.captured_sampling_params_list[0]
+        assert params.height is None
+        assert params.width is None
+        assert params.num_inference_steps == 50
+        assert getattr(params, cfg_field) == expected_cfg
+        assert params.extra_args == expected_extra_args
+    assert defaults[cfg_field] == cli_defaults.get(cfg_field, default_cfg)
+    assert defaults == defaults_before_requests

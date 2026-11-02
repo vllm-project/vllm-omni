@@ -1,0 +1,8 @@
+# MOSS-Image sampling defaults for text-to-image generation.
+stages:
+  - stage_id: 0
+    default_sampling_params:
+      num_inference_steps: 50
+      guidance_scale: 3.0
+      extra_args:
+        flow_shift: 5.0
