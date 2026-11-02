@@ -1,0 +1,25 @@
+# Explicit MRv2 single-stage topology: Talker sampling -> local Code2Wav.
+# Select with --stage-configs-path vllm_omni/deploy/cosyvoice3_single_stage.yaml.
+# Talker forward permits CUDA graphs; post-sample Code2Wav runs outside them.
+# A model-local codec thread owns decoding on a side stream. Host-ready PCM
+# bypasses the AR output future; terminal output waits for the final PCM chunk.
+pipeline: cosyvoice3_single_stage
+model_runner: v2
+async_chunk: true
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.7
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    default_sampling_params:
+      max_tokens: 2048
+      top_k: 25
+      top_p: 0.8
+      repetition_penalty: 1.0001
+    disable_hybrid_kv_cache_manager: true
+    mm_processor_cache_gb: 0
+    skip_mm_profiling: true

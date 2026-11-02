@@ -287,6 +287,7 @@ def _ras_mrv2_sample(
     pos: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
+    seq_lens_upper_bound_np: np.ndarray,
     return_logprobs: bool = False,
     *,
     default_top_p: float,
@@ -306,9 +307,24 @@ def _ras_mrv2_sample(
     replacement draw uses a disjoint noise stream.
     """
     from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+    from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+    from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
 
     logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
-    sampler.logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
+    ctx = LogitsContext(
+        expanded_idx_mapping=expanded_idx_mapping,
+        idx_mapping=idx_mapping,
+        idx_mapping_np=idx_mapping_np,
+        pos=pos,
+        input_ids=input_ids,
+        expanded_local_pos=expanded_local_pos,
+        seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+    )
+    # Match the previous RAS path: apply bias/stop masks, without ordinary
+    # repetition/frequency/presence penalties or temperature/top-k processing.
+    for processor in sampler.logits_processors:
+        if isinstance(processor, LogitBiasState):
+            logits = processor.apply(logits, ctx)
     states = sampler.sampling_states
     temperature = states.temperature.gpu
     req_states = sampler.req_states
@@ -838,6 +854,13 @@ class CosyVoice3Model(
         # Full-response codec consumes tokens and conditioning, not LLM hidden states.
         self.omni_pooler_payload_include_hidden = not cosyvoice3_packed_inference_enabled()
         self.model_stage = vllm_config.model_config.model_stage
+        # The selected topology determines whether Talker owns audio decoding.
+        self.local_code2wav = (
+            self.model_stage == "cosyvoice3_talker"
+            and vllm_config.model_config.engine_output_type == "audio"
+            and vllm_config.model_config.final_output
+        )
+
         model_dir = vllm_config.model_config.model
         if not os.path.isdir(model_dir):
             model_dir = hf_api().snapshot_download(model_dir)
@@ -869,6 +892,19 @@ class CosyVoice3Model(
             # default loader streams every *.pt in the model dir (flow.pt,
             # hift.pt) into load_weights, whose keys belong to other stages.
             self.allow_patterns_overrides = ["llm.pt"]
+            if self.local_code2wav:
+                from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
+
+                self.code2wav = CosyVoice3Code2Wav(self.config)
+                self.mm_outputs_fresh_per_step = True
+                if (
+                    vllm_config.parallel_config.pipeline_parallel_size != 1
+                    or vllm_config.parallel_config.tensor_parallel_size != 1
+                ):
+                    raise ValueError(
+                        "CosyVoice3 single-stage currently requires pipeline_parallel_size=1 and tensor_parallel_size=1"
+                    )
+
         elif self.model_stage == "cosyvoice3_code2wav":
             # Initialize code2wav stage (flow matching + vocoder)
             from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
@@ -883,6 +919,16 @@ class CosyVoice3Model(
             self._stream_vocoder_cache_by_req: dict[str, dict[str, torch.Tensor]] = {}
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
+
+    def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+        from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+
+        state_cls = OmniModelState
+        if self.local_code2wav:
+            from vllm_omni.model_executor.models.cosyvoice3.model_state import CosyVoice3ModelState
+
+            state_cls = CosyVoice3ModelState
+        return state_cls(vllm_config, self, encoder_cache, device)
 
     def get_language_model(self) -> "nn.Module":
         """Return the language model for upstream MoE detection."""
@@ -1624,6 +1670,9 @@ class CosyVoice3Model(
                 )
             )
 
+        if self.local_code2wav:
+            # Post-sample fills this fresh container, including decode-only steps.
+            multimodal_outputs["audio"] = []
         return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
 
     def forward(
@@ -1855,6 +1904,10 @@ class CosyVoice3Model(
                 self.model.to(device)
             self._talker_weights_loaded = True
             self.model.eval()
+            if self.local_code2wav:
+                if not getattr(self, "_code2wav_weights_loaded", False):
+                    self.code2wav.load_weights(self.model_dir, next(self.parameters()).device)
+                    self._code2wav_weights_loaded = True
         elif self.model_stage == "cosyvoice3_code2wav":
             # Load weights for code2wav stage (flow + hift)
             device = next(self.parameters()).device

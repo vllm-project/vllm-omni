@@ -63,3 +63,35 @@ def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming):
             torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
     runner = model._packed_estimator.graph_runner
     assert len(runner.graphs) == 1
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_packed_metadata_uploads_are_async_and_preserve_rows():
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import pack_rows
+
+    device = torch.device("cuda", 0)
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        # Match allocator shapes before recording the steady-state upload path.
+        pack_rows([5, 2, 4], device)
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        ) as p:
+            with torch.profiler.record_function("codec_metadata_upload"):
+                first = pack_rows([5, 2, 4], device)
+                second = pack_rows([2, 5, 4], device)
+        # A later upload must not overwrite metadata still owned by an earlier solve.
+        assert first.row_ids.cpu().tolist() == [0] * 5 + [1] * 2 + [2] * 4
+        assert first.positions.cpu().tolist() == list(range(5)) + list(range(2)) + list(range(4))
+        assert second.row_ids.cpu().tolist() == [0] * 2 + [1] * 5 + [2] * 4
+    names = []
+    for event in p.events():
+        parent = event.cpu_parent
+        while parent is not None:
+            if parent.name == "codec_metadata_upload":
+                names.append(event.name)
+                break
+            parent = parent.cpu_parent
+    assert "aten::_to_copy" in names
+    assert "cudaStreamSynchronize" not in names
+    assert "cudaDeviceSynchronize" not in names

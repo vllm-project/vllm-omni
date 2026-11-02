@@ -36,6 +36,7 @@ class HiFTDecodeGraphs:
         self.graphs: dict[tuple, _DecodeGraph] = {}
         self.seen: OrderedDict[tuple, int] = OrderedDict()
         self.pool = None
+        self.capture_stream: torch.cuda.Stream | None = None
 
     @torch.inference_mode()
     def run(self, mel: torch.Tensor, source: torch.Tensor, finalize: bool) -> torch.Tensor:
@@ -66,13 +67,17 @@ class HiFTDecodeGraphs:
             if count < 3:
                 return self.decode(mel, source, finalize=finalize)
             static_mel, static_source = mel.clone(), source.clone()
-            stream = torch.cuda.Stream(device=mel.device)
+            if self.capture_stream is None:
+                self.capture_stream = torch.cuda.Stream(device=mel.device)
+            stream = self.capture_stream
             stream.wait_stream(torch.cuda.current_stream(mel.device))
             with torch.cuda.stream(stream):
                 self.decode(static_mel, static_source, finalize=finalize)
             torch.cuda.current_stream(mel.device).wait_stream(stream)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self.pool):
+            from .graph_capture import capture_codec_graph
+
+            with capture_codec_graph(graph, pool=self.pool, stream=self.capture_stream):
                 output = self.decode(static_mel, static_source, finalize=finalize)
             if self.pool is None:
                 self.pool = graph.pool()
