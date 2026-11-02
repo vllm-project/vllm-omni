@@ -292,6 +292,23 @@ steps:
             --run-level "full_model"
         mirror_hardwares: l4_1
 
+      # Own step: the image has no misaki G2P, so these files import-skip out of
+      # the mark-selected TTS steps above. The spaCy model is installed up front
+      # because misaki otherwise pip-installs it at first use.
+      - label: "TTS · Kokoro-82M · L4"
+        timeout_in_minutes: 30
+        commands:
+          - >-
+            uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')"
+            "misaki[en]>=0.9.4"
+            "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl"
+          - >-
+            pytest -s -v tests/e2e/offline_inference/test_kokoro.py
+            tests/e2e/online_serving/test_kokoro.py
+            -m "tts and cuda"
+            --run-level "advanced_model"
+        mirror_hardwares: l4_1
+
       - label: "Diffusion · L4 · Single-GPU"
         timeout_in_minutes: 60
         commands:
@@ -438,6 +455,17 @@ steps:
             pytest -sv
             tests/e2e/offline_inference/test_kandinsky6.py
             tests/e2e/online_serving/test_kandinsky6.py
+            -m "slow and diffusion and H100 and cards_1"
+            --run-level "full_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Cosmos3 · H100 · Single-GPU"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_IMAGE_FETCH_TIMEOUT=60
+          - >-
+            pytest -sv
+            tests/e2e/online_serving/test_cosmos3.py
             -m "slow and diffusion and H100 and cards_1"
             --run-level "full_model"
         mirror_hardwares: h100_1

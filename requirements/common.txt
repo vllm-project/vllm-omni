@@ -1,4 +1,5 @@
 # Common dependencies for all platforms
+opentelemetry-api>=1.28.0
 # Match vLLM v0.32.0's supported Transformers range. The release runtime
 # uses the 5.16+ model and tokenizer APIs; the former <5.15 cap conflicts.
 # MOSS-TTS-Nano's list/set weight-loading compatibility is handled by
