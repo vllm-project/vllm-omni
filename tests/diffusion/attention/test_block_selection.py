@@ -204,6 +204,67 @@ def test_pinned_routing_ties_and_high_sparsity(cuda_selector, sparsity):
     torch.testing.assert_close(actual.counts, expected.counts, atol=0, rtol=0)
 
 
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@pytest.mark.parametrize("columns,kept", [(33, 1), (351, 88), (4097, 1024), (8193, 16)])
+@pytest.mark.parametrize("distribution", ["random", "clustered", "ties", "extreme_finite"])
+@torch.inference_mode()
+def test_exact_topk_matches_stable_sort(cuda_selector, columns, kept, distribution):
+    from vllm_omni.diffusion.attention.block_selection.subblock_topk import _fused_topk
+
+    generator = torch.Generator(device="cuda").manual_seed(53)
+    scores = torch.randn(3, columns, generator=generator, device="cuda", dtype=torch.float32)
+    if distribution == "clustered":
+        # A huge outlier and a tight ascending cluster defeat bounded threshold
+        # search: the best cluster entries occur after the first eligible ones.
+        scores[:] = torch.arange(columns, device=scores.device) * 1e-7
+        scores[:, -1] = 1e30
+        scores[1].neg_()
+    elif distribution == "ties":
+        scores = scores.round()
+        scores[0].zero_()
+    elif distribution == "extreme_finite":
+        limit = torch.finfo(torch.float32).max
+        scores[:, ::2] = -limit
+        scores[:, 1::2] = limit
+
+    expected = torch.argsort(scores, descending=True, stable=True)[:, :kept].sort(dim=-1).values.int()
+    actual = _fused_topk(scores, kept)
+    assert actual.dtype == torch.int32
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=1)
+@torch.inference_mode()
+def test_exact_topk_prefix_and_cutoff_ties(cuda_selector, monkeypatch):
+    from vllm_omni.diffusion.attention.block_selection.subblock_topk import SubBlockTopK
+
+    q, k, _ = make_attention_inputs(q_len=17, kv_len=4226, heads=2, kv_heads=1)
+    prefix = 65
+    prefix_blocks = 2
+    # The high-score group has eight blocks. Fill the remaining eight slots
+    # from the tied group by ascending index, while always retaining the prefix.
+    scores = torch.zeros(2, 2, 1, 67, device=q.device)
+    scores[..., :prefix_blocks] = -1e30
+    scores[..., -8:] = 2
+    scores[..., prefix_blocks:40] = 1
+    monkeypatch.setattr(SubBlockTopK, "_compute_scores", staticmethod(lambda *args: scores))
+    selector = SubBlockTopK({"target_sparsity": 0.8})
+    selector.prepare((64, 64), 128, q.device)
+    actual = selector.select(q, k, 128**-0.5, prefix)
+    candidates = torch.argsort(scores[..., prefix_blocks:], descending=True, stable=True)[..., :16]
+    expected = (
+        torch.cat(
+            (torch.arange(prefix_blocks, device=q.device).expand(2, 2, 1, prefix_blocks), candidates + prefix_blocks),
+            dim=-1,
+        )
+        .sort(dim=-1)
+        .values.int()
+    )
+    torch.testing.assert_close(actual.indices, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual.counts, torch.full_like(actual.counts, 18), atol=0, rtol=0)
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("kind", ["nan", "mixed", "positive_inf", "negative_inf", "extreme_finite"])
 @torch.inference_mode()

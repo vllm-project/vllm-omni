@@ -5,7 +5,7 @@
 # python/sglang/multimodal_gen/runtime/layers/attention/backends/subblock_sparse/kernels.py.
 # Recipe reference: 704808ed27cef61e210100e7581c115db3ee8401.
 # Modified to integrate GQA and protected-prefix routing in vLLM-Omni.
-"""SubBlock pooled scoring and approximate top-k selection."""
+"""SubBlock pooled scoring and exact top-k selection."""
 
 import math
 
@@ -119,7 +119,7 @@ class SubBlockTopK(BlockSelector):
 
     @staticmethod
     def _select_blocks(scores, kept, prefix_blocks):
-        # Reserve protected blocks structurally, outside approximate top-k.
+        # Reserve protected blocks structurally, outside top-k.
         rows, key_blocks = scores.shape[:-1], scores.shape[-1]
         remaining = kept - prefix_blocks
         candidates = scores[..., prefix_blocks:].contiguous().view(-1, key_blocks - prefix_blocks)
@@ -351,46 +351,29 @@ def _fused_scores(qp, kp, out, *, n_k, n_valid, n_q, m_valid, heads_per_kv=1):
 
 
 @triton.jit
-def _topk_kernel(scores_ptr, output_ptr, columns, topk, block_size: tl.constexpr, iterations: tl.constexpr):
-    """Select blocks using bounded threshold search and compact their indices."""
+def _topk_kernel(scores_ptr, output_ptr, columns, topk, block_size: tl.constexpr):
+    """Select the exact score budget, breaking cutoff ties by column index."""
     row = tl.program_id(0)
     offs = tl.arange(0, block_size)
-    m = offs < columns
-    s = tl.load(scores_ptr + row * columns + offs, mask=m, other=-float("inf")).to(tl.float32)
-    lo = tl.min(tl.where(m, s, float("inf")))
-    hi = tl.max(tl.where(m, s, -float("inf"))) + 1.0
-    clo = tl.sum(m.to(tl.int32), axis=0).to(tl.float32)
-    chi = 0.0
-    for _ in tl.static_range(iterations):
-        den = clo - chi
-        t = (clo - topk) / tl.where(den > 0.5, den, 1.0)
-        t = tl.minimum(tl.maximum(t, 0.05), 0.95)  # keep the step inside the bracket
-        mid = lo + (hi - lo) * t
-        cnt = tl.sum(((s >= mid) & m).to(tl.int32), axis=0).to(tl.float32)
-        take = cnt >= topk
-        lo = tl.where(take, mid, lo)
-        clo = tl.where(take, cnt, clo)
-        hi = tl.where(take, hi, mid)
-        chi = tl.where(take, chi, cnt)
-    sel = (s >= lo) & m
-    # Nonfinite scores have no reliable ranking (finite inputs can overflow
-    # during pooling). Use the first k candidates for the entire affected row.
-    # Also cover finite-score threshold arithmetic that cannot fill the budget.
-    nonfinite = tl.sum((m & ((s != s) | (tl.abs(s) == float("inf")))).to(tl.int32), axis=0) > 0
-    insufficient = tl.sum(sel.to(tl.int32), axis=0) < topk
-    sel = tl.where(nonfinite | insufficient, m & (offs < topk), sel)
-    pos = tl.cumsum(sel.to(tl.int32), axis=0) - 1
-    tl.store(output_ptr + row * topk + pos, offs.to(tl.int32), mask=sel & (pos < topk))
-
-
-def _topk_iters(columns, k):
-    """Use more threshold-search iterations for higher sparsity."""
-    L = math.log2(max(columns, 1) / max(k, 1))
-    return 16 if L <= 2.5 else 24 if L <= 3.5 else 32
+    valid = offs < columns
+    scores = tl.load(scores_ptr + row * columns + offs, mask=valid, other=-float("inf")).to(tl.float32)
+    ordered = tl.sort(scores, descending=True)
+    cutoff = tl.sum(tl.where(offs == topk - 1, ordered, 0.0), axis=0)
+    above = valid & (scores > cutoff)
+    tied = valid & (scores == cutoff)
+    remaining = topk - tl.sum(above.to(tl.int32), axis=0)
+    tie_rank = tl.cumsum(tied.to(tl.int32), axis=0)
+    selected = above | (tied & (tie_rank <= remaining))
+    # Preserve the deterministic first-k fallback for nonfinite score rows.
+    # Finite inputs can still overflow during pooling/scoring.
+    nonfinite = tl.sum((valid & ((scores != scores) | (tl.abs(scores) == float("inf")))).to(tl.int32), axis=0) > 0
+    selected = tl.where(nonfinite, valid & (offs < topk), selected)
+    pos = tl.cumsum(selected.to(tl.int32), axis=0) - 1
+    tl.store(output_ptr + row * topk + pos, offs.to(tl.int32), mask=selected)
 
 
 def _fused_topk(scores2d, k):
-    """Return ascending int32 indices; prefix-sum compaction preserves column order."""
+    """Return exact top-k as ascending int32 indices, with lower indices winning ties."""
     rows, columns = scores2d.shape
     out = torch.empty(rows, k, dtype=torch.int32, device=scores2d.device)
     _topk_kernel[(rows,)](
@@ -399,7 +382,6 @@ def _fused_topk(scores2d, k):
         columns,
         k,
         block_size=triton.next_power_of_2(columns),
-        iterations=_topk_iters(columns, k),
-        num_warps=4 if columns >= 1024 else 2,  # short rows do not fill four warps
+        num_warps=4,
     )
     return out

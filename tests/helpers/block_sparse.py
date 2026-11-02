@@ -44,7 +44,7 @@ def pinned_subblock_reference(q, k, scale, sparsity, prefix, block_size):
     """Independent Torch oracle for the pinned SubBlock recipe.
 
     Recipe: SGLang 704808ed27cef61e210100e7581c115db3ee8401;
-    threshold search: kernels.py at 367e3700cfb6a0b03b2fa41a4524febf18ec1f15.
+    Selection uses exact stable top-k of the pooled scores.
     Includes this integration's native GQA and additive protected-prefix policy.
     Does not call production pooling, scoring, budget or top-k helpers.
     """
@@ -74,19 +74,7 @@ def pinned_subblock_reference(q, k, scale, sparsity, prefix, block_size):
         if retained == candidates:
             chosen = torch.arange(candidates, device=q.device)
         else:
-            lo, hi = values.min(), values.max() + 1
-            clo, chi = float(candidates), 0.0
-            ratio = math.log2(candidates / retained)
-            iterations = 16 if ratio <= 2.5 else 24 if ratio <= 3.5 else 32
-            for _ in range(iterations):
-                fraction = min(max((clo - retained) / (clo - chi if clo - chi > 0.5 else 1), 0.05), 0.95)
-                threshold = lo + (hi - lo) * fraction
-                count = float((values >= threshold).sum())
-                if count >= retained:
-                    lo, clo = threshold, count
-                else:
-                    hi, chi = threshold, count
-            chosen = torch.where(values >= lo)[0][:retained]
+            chosen = torch.argsort(values, descending=True, stable=True)[:retained].sort().values
         rows.append(torch.cat((torch.arange(protected, device=q.device), chosen + protected)))
     indices = torch.stack(rows).reshape(*scores.shape[:-1], protected + retained).int()
     return scores, BlockSelection(

@@ -97,6 +97,18 @@ MiniMax currently supplies a zero protected prefix, so conditioning tokens can
 also be sparsified. Protecting them requires the packer to expose their actual
 boundary.
 
+### Block ranking
+
+The selector scores blocks using 16-token pooled Q/K, then keeps the exact
+highest-scoring candidate blocks within the rounded budget. Equal scores at the
+cutoff are resolved by lower KV-block index. Selected IDs are emitted in ascending
+order, and protected blocks remain outside the candidate budget.
+
+Exact top-k applies to the pooled scores, not to full-token attention probabilities:
+block scoring and sparse attention remain approximate. A candidate row containing
+NaN or infinity retains the first candidate blocks deterministically instead of
+attempting to rank nonfinite scores.
+
 ## Execution contract
 
 Q/K/V use BSHD layout. `BlockSelection` contains contiguous device-local int32

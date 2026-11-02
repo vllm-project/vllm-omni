@@ -87,7 +87,7 @@ steps:
           - "python -c \"from flash_attn.cute.interface import flash_attn_func; assert callable(flash_attn_func)\""
           - "python -c \"import torch; assert torch.cuda.get_device_capability() in ((10, 0), (10, 3))\""
           - "python .buildkite/cuda/scripts/check_vllm_runtime.py"
-          - "timeout 30m pytest -sv tests/diffusion/attention/test_block_sparse_adapters.py -m 'core_model and cuda and B200 and cards_1' --run-level=core_model"
+          - "timeout 30m pytest -sv tests/diffusion/attention/test_block_selection.py tests/diffusion/attention/test_block_sparse_adapters.py -m 'core_model and cuda and B200 and cards_1' --run-level=core_model"
         mirror_hardwares: b200_1
 
       - label: "Diffusion · Sparse Models · 1-GPU"
