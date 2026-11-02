@@ -284,8 +284,13 @@ class TeaCacheHook(ModelHook):
         # Reduce across SP before the threshold so every rank takes the same
         # skip/compute path (otherwise a cache hit on one rank deadlocks
         # waiting on collectives the miss path never enters).
-        mean_diff = (modulated_inp - state.previous_modulated_input).abs().mean()
-        mean_prev = state.previous_modulated_input.abs().mean()
+        # Upcast to float32 before the reduction: a bf16 running mean drops
+        # small contributions (spacing near 1.0 is ~2^-7 ≈ 0.0078), which
+        # underestimates the distance and over-skips steps.
+        mod_f32 = modulated_inp.float()
+        prev_f32 = state.previous_modulated_input.float()
+        mean_diff = (mod_f32 - prev_f32).abs().mean()
+        mean_prev = prev_f32.abs().mean()
         mean_diff, mean_prev = _average_l1_stats_across_sp(mean_diff, mean_prev)
         rel_distance = (mean_diff / (mean_prev + 1e-8)).item()
 

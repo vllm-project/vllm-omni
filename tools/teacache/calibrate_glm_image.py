@@ -8,7 +8,8 @@ Workflow (matches the GLM-Image TeaCache plan):
 1. Dump AR prior tokens for ~70 Parti prompts (or load a pre-dumped ``.pt``).
 2. Run the DiT with ``DataCollectionHook`` via ``GlmImageAdapter`` at
    1024x1024 / 50 steps, feeding ``prior_token_ids`` through
-   ``OmniDiffusionSamplingParams.extra_args``.
+   ``OmniDiffusionSamplingParams.extra_args``. CFG positive/negative forwards
+   are stored as separate trajectories (never cross-branch pairs).
 3. Fit a 4th-order polynomial and print coeffs + R^2 for
    ``vllm_omni/diffusion/cache/teacache/config.py``.
 
@@ -32,9 +33,12 @@ import numpy as np
 import torch
 
 from vllm_omni.diffusion.cache.teacache.coefficient_estimator import (
+    BranchTrajectories,
     TeaCacheCoefficientEstimator,
+    Trajectory,
     calculate_relative_l1,
     estimate_teacache_coefficients,
+    iter_same_branch_trajectories,
 )
 
 
@@ -53,17 +57,20 @@ def _load_prior_tokens(path: Path) -> dict[str, Any]:
     raise TypeError(f"Unsupported prior-token dump type: {type(payload)}")
 
 
-def _r_squared(collected: list[list[tuple[np.ndarray, np.ndarray]]], coeffs: list[float]) -> float:
+def _step_pairs(collected: list[Trajectory] | list[BranchTrajectories]) -> tuple[np.ndarray, np.ndarray]:
     xs: list[float] = []
     ys: list[float] = []
-    for sample in collected:
+    for sample in iter_same_branch_trajectories(collected):
         for t in range(len(sample) - 1):
             feat_in_curr, feat_out_curr = sample[t]
             feat_in_next, feat_out_next = sample[t + 1]
             xs.append(calculate_relative_l1(feat_in_curr, feat_in_next))
             ys.append(calculate_relative_l1(feat_out_curr, feat_out_next))
-    x = np.asarray(xs, dtype=np.float64)
-    y = np.asarray(ys, dtype=np.float64)
+    return np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64)
+
+
+def _r_squared(collected: list[Trajectory] | list[BranchTrajectories], coeffs: list[float]) -> float:
+    x, y = _step_pairs(collected)
     pred = np.poly1d(coeffs)(x)
     ss_res = float(np.sum((y - pred) ** 2))
     ss_tot = float(np.sum((y - y.mean()) ** 2)) + 1e-12
@@ -88,6 +95,12 @@ def main() -> None:
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--poly-order", type=int, default=4)
     parser.add_argument("--max-prompts", type=int, default=70)
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=1.5,
+        help="CFG scale; positive/negative forwards are collected as separate trajectories",
+    )
     parser.add_argument("--out-json", type=Path, default=None, help="Optional path to write fit summary")
     args = parser.parse_args()
 
@@ -114,20 +127,22 @@ def main() -> None:
             seed=args.seed,
             height=args.height,
             width=args.width,
+            guidance_scale=args.guidance_scale,
             prior_token_ids=prior,
         )
 
     coeffs = estimate_teacache_coefficients(estimator.collected_data, poly_order=args.poly_order)
     r2 = _r_squared(estimator.collected_data, coeffs)
+    x, _y = _step_pairs(estimator.collected_data)
 
-    xs = []
+    branch_counts = {"positive": 0, "negative": 0}
     for sample in estimator.collected_data:
-        for t in range(len(sample) - 1):
-            xs.append(calculate_relative_l1(sample[t][0], sample[t + 1][0]))
-    x = np.asarray(xs, dtype=np.float64)
+        for branch, steps in sample.items():
+            branch_counts[branch] = branch_counts.get(branch, 0) + max(len(steps) - 1, 0)
 
-    print("\n=== GLM-Image TeaCache fit ===")
+    print("\n=== GLM-Image TeaCache fit (same-branch pairs only) ===")
     print(f"prompts={len(estimator.collected_data)} step_pairs={len(x)} R^2={r2:.4f}")
+    print(f"branch step pairs: {branch_counts}")
     print(f"input rel_l1 range: {x.min():.4f} .. {x.max():.4f} (mean {x.mean():.4f})")
     print("coefficients:")
     print(json.dumps(coeffs, indent=2))
@@ -143,9 +158,12 @@ def main() -> None:
                     "input_rel_l1_mean": float(x.mean()),
                     "num_prompts": len(estimator.collected_data),
                     "num_step_pairs": len(x),
+                    "branch_step_pairs": branch_counts,
                     "height": args.height,
                     "width": args.width,
                     "steps": args.steps,
+                    "guidance_scale": args.guidance_scale,
+                    "provisional": False,
                 },
                 indent=2,
             )
