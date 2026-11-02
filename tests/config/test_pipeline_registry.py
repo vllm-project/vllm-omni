@@ -20,34 +20,28 @@ from vllm_omni.diffusion.models.interface import stage_component_groups
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_minicpmo_kstep_overlay_is_explicit_opt_in():
-    """The default deploy stays single-frame; K-step needs the overlay.
+def test_minicpmo_kstep_is_on_by_default():
+    """K-step multi-frame decode is the shipped CUDA decode path.
 
-    K-step multi-frame decode is only ahead at low concurrency today, so the
-    default ``minicpmo_4_5.yaml`` must not book a K span behind the operator's
-    back. The overlay flips the stage-1 drafts/stop id and the stage-2 CFM
-    merge, and inherits every other field from the base config.
+    Five-tier sweep against the single-frame default in one window: c1 RTF
+    0.12 -> 0.09 and throughput +34%, c4 +5.8%, c8-c32 within noise. The K-step
+    knobs therefore live in ``minicpmo_4_5.yaml`` itself, with no separate
+    overlay. ``async_scheduling: false`` stays: async books the spec span a step
+    early, and the multi-frame loop refuses the resulting non-uniform steps.
     """
-    base = resolve_deploy_yaml("vllm_omni/deploy/minicpmo_4_5.yaml")
-    overlay = resolve_deploy_yaml("vllm_omni/deploy/minicpmo_4_5_kstep.yaml")
-    base_cuda = {s["stage_id"]: s for s in base["platforms"]["cuda"]["stages"]}
-    overlay_cuda = {s["stage_id"]: s for s in overlay["platforms"]["cuda"]["stages"]}
-    base_extra = base["connectors"]["connector_of_shared_memory"]["extra"]
+    from pathlib import Path
 
-    assert "speculative_config" not in base_cuda[1]
-    assert "async_scheduling" not in base_cuda[1]
-    assert "cfm_cross_bucket_merge" not in base_extra
+    config = resolve_deploy_yaml("vllm_omni/deploy/minicpmo_4_5.yaml")
+    cuda = {s["stage_id"]: s for s in config["platforms"]["cuda"]["stages"]}
+    extra = config["connectors"]["connector_of_shared_memory"]["extra"]
 
-    assert overlay_cuda[1]["speculative_config"]["num_speculative_tokens"] == 7
-    assert overlay_cuda[1]["async_scheduling"] is False
-    assert overlay_cuda[1]["default_sampling_params"]["stop_token_ids"] == [1]
-    assert overlay["connectors"]["connector_of_shared_memory"]["extra"]["cfm_cross_bucket_merge"] is True
+    assert cuda[1]["speculative_config"]["num_speculative_tokens"] == 7
+    assert cuda[1]["async_scheduling"] is False
+    assert cuda[1]["default_sampling_params"]["stop_token_ids"] == [1]
+    assert extra["cfm_cross_bucket_merge"] is True
 
-    # The overlay only flips the K-step knobs; the rest is inherited verbatim.
-    assert overlay["stages"] == base["stages"]
-    assert overlay["duplex_session"] == base["duplex_session"]
-    assert overlay_cuda[0] == base_cuda[0]
-    assert overlay_cuda[1]["kv_cache_memory_bytes"] == base_cuda[1]["kv_cache_memory_bytes"]
+    # The knobs are in the default deploy; do not reintroduce an overlay.
+    assert not Path("vllm_omni/deploy/minicpmo_4_5_kstep.yaml").exists()
 
 
 @pytest.mark.parametrize("topology,ports", [("eg", [50081]), ("egd", [50091, 50092])])
