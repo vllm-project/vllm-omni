@@ -18,7 +18,7 @@ from vllm_omni.diffusion.models.cosmos3_nano_sim_bimanual.state_cosmos3_nano_sim
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def config(**overrides):
+def config(artifact_values=None, **overrides):
     original = manifest()
     artifact = {
         key: getattr(original, key)
@@ -30,6 +30,7 @@ def config(**overrides):
         "t_list": list(original.t_list),
         "num_train_timesteps": original.num_train_timesteps,
     }
+    artifact.update(artifact_values or {})
     return SimpleNamespace(tf_model_config={"cosmos3_nano_sim_bimanual": artifact}, model_config=overrides)
 
 
@@ -44,8 +45,48 @@ def test_override_preserves_checkpoint_and_separates_sessions(cache_size, sinks)
     assert options.tf_model_config["cosmos3_nano_sim_bimanual"]["window_frames"] == baseline.window_frames
 
 
-def test_retained_history_matches_reference_frame_indices():
-    effective = Cosmos3NanoSimBimanualManifest.from_od_config(config(kv_cache_inference_size=64, attention_sink_size=8))
+@pytest.mark.parametrize(("cache_size", "sinks"), [(16, 0), (30, 3), (64, 8), (128, 32)])
+def test_checkpoint_window_matches_reference_capacity(cache_size, sinks):
+    checkpoint = Cosmos3NanoSimBimanualManifest.from_od_config(
+        config({"window_frames": cache_size, "sink_frames": sinks})
+    )
+    override = Cosmos3NanoSimBimanualManifest.from_od_config(
+        config(kv_cache_inference_size=cache_size, attention_sink_size=sinks)
+    )
+    assert (checkpoint.window_frames, checkpoint.sink_frames) == (cache_size - sinks - 1, sinks)
+    assert checkpoint.digest == override.digest
+
+
+def test_override_replaces_checkpoint_window():
+    effective = Cosmos3NanoSimBimanualManifest.from_od_config(
+        config({"window_frames": 64, "sink_frames": 8}, kv_cache_inference_size=32, attention_sink_size=4)
+    )
+    assert (effective.window_frames, effective.sink_frames) == (27, 4)
+
+
+def test_checkpoint_full_history_is_unbounded():
+    effective = Cosmos3NanoSimBimanualManifest.from_od_config(config({"window_frames": None, "sink_frames": 0}))
+    assert (effective.window_frames, effective.sink_frames) == (None, 0)
+
+
+@pytest.mark.parametrize(
+    ("window", "sinks"),
+    [(0, 0), (1, 0), (8, 8), (9, 8), (None, 8), (True, 0), (64, -1)],
+)
+def test_invalid_checkpoint_window_rejected(window, sinks):
+    with pytest.raises(ValueError):
+        Cosmos3NanoSimBimanualManifest.from_od_config(config({"window_frames": window, "sink_frames": sinks}))
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"artifact_values": {"window_frames": 64, "sink_frames": 8}},
+        {"kv_cache_inference_size": 64, "attention_sink_size": 8},
+    ],
+)
+def test_retained_history_matches_reference_frame_indices(options):
+    effective = Cosmos3NanoSimBimanualManifest.from_od_config(config(**options))
     history = None
     for frame in range(226):
         expected = list(range(min(frame, 8))) + list(range(max(8, frame - 55), frame))
@@ -69,6 +110,7 @@ def test_retained_history_matches_reference_frame_indices():
         {"kv_cache_inference_size": 1},
         {"kv_cache_inference_size": 64, "attention_sink_size": -1},
         {"kv_cache_inference_size": 64, "attention_sink_size": 63},
+        {"kv_cache_inference_size": 64, "attention_sink_size": True},
     ],
 )
 def test_invalid_override_rejected(overrides):

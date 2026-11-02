@@ -80,9 +80,12 @@ latent frames: 64 with 8 sinks retains 8 initial frames and up to 55 recent past
 frames, reserving 1 position for the current frame. Other valid cache/sink sizes
 are supported. Changing the history window can change generated outputs.
 
-With neither override, the checkpoint history policy applies. A checkpoint with
-`window_frames: null` and `sink_frames: 0` uses full history and sizes the cache
-for the requested rollout.
+With neither override, the checkpoint history policy applies. The manifest's
+`window_frames` and `sink_frames` have the same meaning as
+`kv_cache_inference_size` and `attention_sink_size`: `window_frames: 64` with
+`sink_frames: 8` is the same 64-frame cache as the overrides above. A checkpoint
+with `window_frames: null` and `sink_frames: 0` uses full history and sizes the
+cache for the requested rollout.
 
 For typed tick video, the diffusion-stage option
 `video_output_transport: {enable_device_postprocess: true}` converts
