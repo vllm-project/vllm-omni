@@ -11,9 +11,11 @@ class StreamingTextFrontend(Protocol):
     """One utterance's text processing, including commitment and segmentation.
 
     ``feed`` accepts arbitrary transport chunks and returns ordered, irreversible
-    non-whitespace synthesis segments. ``finish`` flushes the text at EOF. Neither
-    operation may block or perform synthesis. Raise ``ValueError`` on invalid
-    input or a resource limit; no segments from that call are submitted.
+    text units. By default these are non-whitespace synthesis segments; with
+    aggregation disabled they contain newly released text, including whitespace,
+    without waiting for a segment boundary. ``finish`` flushes the text at EOF.
+    Neither operation may block or perform synthesis. Raise ``ValueError`` on
+    invalid input or a resource limit; no units from that call are submitted.
 
     A frontend owns its text state and boundaries, so normalization or a future
     TN/CAPS composition can be substituted without transport changes. Factories
@@ -30,6 +32,7 @@ class StreamingTextFrontend(Protocol):
 class StreamingTextFrontendConfig:
     language: str
     max_pending_chars: int
+    aggregate_segments: bool = True
 
 
 StreamingTextFrontendFactory = Callable[[StreamingTextFrontendConfig], StreamingTextFrontend]
@@ -39,7 +42,9 @@ def _create_zh_en_frontend(config: StreamingTextFrontendConfig) -> StreamingText
     # Load the concrete implementation only when its profile is selected.
     from vllm_omni.model_executor.stage_input_processors.streaming_text_commitment import CommitmentTextFrontend
 
-    return CommitmentTextFrontend(max_pending_chars=config.max_pending_chars)
+    return CommitmentTextFrontend(
+        max_pending_chars=config.max_pending_chars, aggregate_segments=config.aggregate_segments
+    )
 
 
 _FRONTEND_FACTORIES: dict[str, StreamingTextFrontendFactory] = {
