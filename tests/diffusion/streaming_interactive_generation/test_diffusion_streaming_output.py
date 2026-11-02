@@ -296,12 +296,13 @@ class TestPipelineStreamingOutputToEntrypoint:
 
         encoded = [b"pipeline-fmp4-0", b"pipeline-fmp4-1"]
 
+        audio_calls = []
+
         class FakeStreamingVideoEncoder:
             encode_calls: list[int] = []
 
             def encode(self, video, audio=None, *, audio_sample_rate=None):
-                assert audio is None
-                assert audio_sample_rate is None
+                audio_calls.append((audio, audio_sample_rate))
                 del video
                 idx = len(self.encode_calls)
                 self.encode_calls.append(idx)
@@ -353,6 +354,7 @@ class TestPipelineStreamingOutputToEntrypoint:
                     assert done["type"] == "session.done"
                     assert done["chunks"] == 2
 
+            assert audio_calls == [(None, None), (None, None)]
             await _wait_for(lambda: len(pipeline.requests) == 1)
             assert pipeline.requests[0].request_id
         finally:
