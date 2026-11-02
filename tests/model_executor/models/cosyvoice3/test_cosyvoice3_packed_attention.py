@@ -91,7 +91,7 @@ def test_paged_attention_matches_isolated_row_attention(backend, chunk_size):
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize("chunk_size", [None, CHUNK])
-@pytest.mark.parametrize("lengths", [[1], [67, 0, 103, 16, 1, 500, 7, 129, 64]])
+@pytest.mark.parametrize("lengths", [[1], [15, 17, 33], [67, 0, 103, 16, 1], [500, 7, 129, 64, 0]])
 def test_every_segment_reads_exactly_its_rows_frames(backend, chunk_size, lengths):
     rows, attention = _attention(lengths, backend, chunk_size)
     page_size = attention.page_size
@@ -99,6 +99,7 @@ def test_every_segment_reads_exactly_its_rows_frames(backend, chunk_size, length
     if attention.paged:
         # Every page index must fit the gathered K/V buffer.
         slot_frames = attention.slot_frames
+        assert slot_frames.shape[0] == sum(-(-n // page_size) for n in lengths) * page_size
         assert int(attention.page_table.max()) < slot_frames.shape[0] // page_size
     # Paged slots past a row's end alias frame 0, so a segment must never read
     # past its own row: each one reads exactly its row's frames, in order.
@@ -217,13 +218,14 @@ def test_packed_solve_scopes_precise_bf16_gemms(monkeypatch):
         raise RuntimeError("solve failed")
 
     estimator = SimpleNamespace(graph_runner=SimpleNamespace(run=run))
-    with pytest.raises(RuntimeError, match="solve failed"):
-        solve_flow_euler_packed(
-            estimator, None, None, None, None, None, None, cfg_rate=0.7, streaming=False, modulation_key=()
-        )
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="solve failed"):
+            solve_flow_euler_packed(
+                estimator, None, None, None, None, None, None, cfg_rate=0.7, streaming=False, modulation_key=()
+            )
+        assert matmul.allow_bf16_reduced_precision_reduction
 
-    assert seen == [False]
-    assert matmul.allow_bf16_reduced_precision_reduction
+    assert seen == [False, False]
 
 
 @pytest.fixture
@@ -242,11 +244,14 @@ def fake_gpu(monkeypatch):
     [
         ({"fa2", "fa3"}, None, "fa3"),  # Hopper
         ({"fa2"}, None, "fa2"),  # Ampere, Ada, Blackwell
+        (set(), None, None),
         ({"fa2", "fa3"}, "fa2", "fa2"),
         ({"fa2"}, "fa3", None),
-        # FlashInfer is opt-in: installed alone, it is never picked automatically.
+        # FlashInfer is never selected automatically, alone or alongside FA backends.
+        ({"fa2", "fa3", "flashinfer"}, None, "fa3"),
         ({"flashinfer"}, None, None),
         ({"fa2", "flashinfer"}, "flashinfer", "flashinfer"),
+        ({"fa2"}, "flashinfer", None),
     ],
 )
 def test_packed_backend_prefers_fa3_and_honors_the_pin(monkeypatch, fake_gpu, supported, pinned, expected):
@@ -268,7 +273,7 @@ def test_packed_backend_rejects_unknown_pins(monkeypatch, fake_gpu):
         fake_gpu[0].cosyvoice3_packed_attention_backend()
 
 
-@pytest.mark.parametrize("capability, expected", [((7, 5), False), ((8, 0), True)])
+@pytest.mark.parametrize("capability, expected", [((7, 5), False), ((8, 0), True), ((12, 0), True)])
 def test_flashinfer_pin_keeps_the_stock_flow_below_sm80(monkeypatch, capability, expected):
     import vllm_omni.model_executor.models.cosyvoice3.runtime as runtime
 
@@ -323,7 +328,7 @@ def fake_flashinfer(monkeypatch):
     return packed_flashinfer
 
 
-@pytest.mark.parametrize("lengths", [[1], [67, 0, 103, 16, 1, 500, 7, 129, 64]])
+@pytest.mark.parametrize("lengths", [[1], [15, 17, 33], [67, 0, 103, 16, 1], [500, 7, 129, 64, 0]])
 def test_flashinfer_chunk_plan_reads_each_rows_prefix_in_place(fake_flashinfer, lengths):
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import row_segments
 
@@ -339,6 +344,9 @@ def test_flashinfer_chunk_plan_reads_each_rows_prefix_in_place(fake_flashinfer, 
     assert {t.dtype for t in (qo_indptr, kv_indptr, indices, last_page_len)} == {torch.int32}
     # Chunk queries must see the entire prefix, not a token-causal triangle.
     assert kwargs["causal"] is False
+    # Preserve the explicit planning policy, independently of output tolerance.
+    assert kwargs["disable_split_kv"] is True
+    assert kwargs["q_data_type"] == torch.bfloat16
     assert qo_indptr.tolist() == offsets
     assert last_page_len.tolist() == [1] * len(segment_ends)
     # One-frame pages are packed frames: each segment reads its row's prefix.

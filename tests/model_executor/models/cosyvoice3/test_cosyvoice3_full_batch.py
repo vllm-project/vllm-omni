@@ -170,6 +170,18 @@ def test_packed_attention_matches_row_reference(monkeypatch, backend, chunk_size
         torch.testing.assert_close(actual[start : start + length].float(), expected, rtol=0.03, atol=0.01)
         start += length
 
+    if backend == "fa2":
+        # Invalid paged slots alias frame zero. Poison it and invoke the real
+        # kernel again: neither unpaged nor paged attention may leak it to row 2.
+        clean_other_rows = actual[lengths[0] :].clone()
+        k[0].fill_(float("nan"))
+        v[0].fill_(float("nan"))
+        poisoned = ragged_attention_tensor_geometry(
+            q.reshape(1, -1, 128), k.reshape(1, -1, 128), v.reshape(1, -1, 128), attention, attention.max_seqlen_q
+        ).reshape(-1, 2, 64)
+        assert torch.isfinite(poisoned[lengths[0] :]).all()
+        torch.testing.assert_close(poisoned[lengths[0] :], clean_other_rows, rtol=0, atol=0)
+
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("graph", [False, True])

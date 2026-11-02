@@ -18,9 +18,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platfo
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("backend", PACKED_BACKENDS)
-@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("streaming, seed", [(False, 0), (False, 15), (True, 0), (True, 36)])
 @torch.inference_mode()
-def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming, backend):
+def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming, backend, seed):
     require_packed_backend(monkeypatch, backend)
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
     from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
@@ -30,11 +30,13 @@ def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming, backend):
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0" if streaming else "1")
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1" if streaming else "0")
     monkeypatch.setattr(module, "CausalHiFTGenerator", MelOutput)
-    # Fix model weights; run() separately fixes the solve noise. Historical
-    # failing seeds used different noise and are not targeted regressions here.
+    # Keep seed 0 plus one historical failing weight initialization per mode:
+    # 15 for full context, 36 for streaming. The original scan used different
+    # noise, so these retain weight coverage rather than reproduce that scan.
+    # run() fixes the solve noise independently.
     # Start with the PyTorch default: solves must apply and restore the precision policy.
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_bf16_reduced_precision_reduction", True)
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     config = CosyVoice3Config()
     config.flow["pre_lookahead_layer"]["channels"] = 32
     # 256 channels in 16 conv groups keep the packed convolution (and graphs).
@@ -102,3 +104,56 @@ def test_precise_bf16_gemms_keep_a_padded_projection_stable():
         unpadded = torch.nn.functional.linear(inputs[:908], weight, bias)
         padded = torch.nn.functional.linear(inputs, weight, bias)[:908]
     torch.testing.assert_close(unpadded, padded, rtol=1e-2, atol=1e-2)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize("streaming", [False, True])
+@torch.inference_mode()
+def test_flow_graph_metadata_retains_loaded_buffers(monkeypatch, backend, streaming):
+    """Metadata passed by the production solver must observe later buffer loads."""
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import packed_dit
+
+    require_packed_backend(monkeypatch, backend)
+    estimator = SimpleNamespace(
+        backend=backend,
+        dit=SimpleNamespace(
+            transformer_blocks=[SimpleNamespace(attn=SimpleNamespace(heads=2, inner_dim=128))],
+            static_chunk_size=50,
+        ),
+        step_modulations=lambda *_args: None,
+        compiled_full_forward=None,
+    )
+    runner = packed_dit.FlowGraphRunner(estimator)
+    noise = torch.zeros(1, 50, 80, device="cuda", dtype=torch.bfloat16)
+    spks = torch.zeros(2, 80, device="cuda", dtype=torch.bfloat16)
+    time_span = torch.tensor([0.0, 1.0], device="cuda")
+    key, *layout = runner._layout((17, 33), streaming)
+    state = runner._allocate(key, noise, spks, time_span)
+    runner._load(state, *layout, noise, noise, noise, spks, time_span)
+    observed = []
+
+    def observe_metadata(forward, noise, time_span, mu, spks, cond, flow_time, rows, attention, modulations, cfg_rate):
+        observed.append(attention)
+        return noise
+
+    # Stop at the solver's consumer boundary, after real metadata construction.
+    monkeypatch.setattr(packed_dit, "euler_steps", observe_metadata)
+    runner._solve(state, 0.7, key + ((),))
+    attention = observed[0]
+    snapshots = {}
+    for name in ("cache_seqlens", "cu_seqlens_q", "page_table", "slot_frames"):
+        buffer = getattr(state, name)
+        assert getattr(attention, name) is buffer
+        if buffer is not None:
+            snapshots[name] = buffer.clone()
+
+    next_key, *next_layout = runner._layout((19, 31), streaming)
+    assert next_key == key
+    runner._load(state, *next_layout, noise, noise, noise, spks, time_span)
+    for name, before in snapshots.items():
+        # Check the metadata already handed to the consumer, not a new object.
+        assert getattr(attention, name) is getattr(state, name)
+        assert not torch.equal(getattr(attention, name), before)
