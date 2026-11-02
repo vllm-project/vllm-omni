@@ -43,6 +43,16 @@ def test_quality_rejects_unsupported_request_level() -> None:
         OmniDiffusionSamplingParams(quality="medium")
 
 
+@pytest.mark.parametrize(
+    ("value", "default", "expected"),
+    [(None, 4.0, 4.0), (0.0, 4.0, 0.0), (2.5, 4.0, 2.5)],
+)
+def test_resolve_true_cfg_scale_only_defaults_none(value: float | None, default: float, expected: float) -> None:
+    params = OmniDiffusionSamplingParams(true_cfg_scale=value)
+
+    assert params.resolve_true_cfg_scale(default) == expected
+
+
 def test_from_params_converts_sampling_params_seed_and_known_extra_args() -> None:
     params = _sampling_params(
         seed=1234,
