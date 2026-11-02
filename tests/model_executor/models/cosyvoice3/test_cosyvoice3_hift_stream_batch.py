@@ -155,3 +155,39 @@ def test_decode_receptive_field_fits_the_settled_bound():
     moved = (hift._decode_eager(mel, source, finalize=True) - base).abs()[0] > 0
     assert moved.any()
     assert int(moved.nonzero().max()) // 480 < DECODE_RECEPTIVE_FRAMES
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@torch.inference_mode()
+def test_empty_nonfinal_hop_is_hift_noop(monkeypatch, batched):
+    """Inserting an empty hop preserves state and subsequent audio, including EOF."""
+    monkeypatch.setattr(cosyvoice3_code2wav, "cosyvoice3_hift_batch_enabled", lambda: batched)
+    model = _voiced_model(window_len=64)
+    chunks = _stream_chunks(17, 70, 50, 2)
+
+    def run(insert_empty):
+        torch.manual_seed(23)
+        state, outputs = None, []
+        for index, mel in enumerate(chunks):
+            [(speech, state)] = model._stream_hift([mel], [state], finalize=False)
+            outputs.append(speech)
+            if insert_empty and index == 0:
+                state["flow_prefix"] = object()
+                state["conditioning"] = object()
+                before = dict(state)
+                with monkeypatch.context() as patch:
+
+                    def unexpected_inference(*args, **kwargs):
+                        raise AssertionError("empty non-final hop must not run HiFT")
+
+                    patch.setattr(model.hift, "inference", unexpected_inference)
+                    [(empty, unchanged)] = model._stream_hift([mel[..., :0]], [state], finalize=False)
+                assert empty.shape == (1, 1, 0)
+                assert unchanged is state
+                assert all(unchanged[key] is value for key, value in before.items())
+        [(tail, final_state)] = model._stream_hift([chunks[-1][..., :0]], [state], finalize=True)
+        assert tail.shape[-1] > 0
+        assert final_state is None
+        return torch.cat([*outputs, tail], dim=-1)
+
+    torch.testing.assert_close(run(True), run(False), rtol=0, atol=0)

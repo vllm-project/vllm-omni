@@ -297,6 +297,10 @@ class CosyVoice3Code2Wav(nn.Module):
     ) -> tuple[torch.Tensor, StreamingHiFTState | None]:
         hift_weight = self.hift.m_source.l_linear.weight
         chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
+        if not finalize and chunk_mel.shape[-1] == 0:
+            # A non-final empty hop must not advance vocoder state. Final hops
+            # still decode the overlap to release withheld waveform samples.
+            return chunk_mel.new_empty((chunk_mel.shape[0], 1, 0)), cache_state
 
         cached_mel = None if not cache_state else cache_state.get("mel")
         cached_offset = 0 if not cache_state else int(cache_state.get("mel_offset", 0))
@@ -932,7 +936,7 @@ class CosyVoice3Code2Wav(nn.Module):
             start = min(state.committed, emit // cache.chunk * cache.chunk)
             if end <= start:
                 # An empty non-final hop does not abandon the request's prefix.
-                results[index] = (weight.new_empty((1, self.output_size, 0)), state)
+                results[index] = (weight.new_empty((1, self.output_size, 0), dtype=torch.float32), state)
                 continue
             if not cache.reserve(state, end):
                 cache.release(state)

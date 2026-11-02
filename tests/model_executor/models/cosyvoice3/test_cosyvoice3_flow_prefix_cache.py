@@ -108,11 +108,17 @@ def test_empty_nonfinal_hop_preserves_prefix_pages(monkeypatch):
     cache = model._flow_prefix_cache
     pages, committed, used = list(state.pages), state.committed, cache.used_pages
     allocated = cache.allocated_bytes
+    assert cache.num_pages == 64
     assert allocated == 64 * page_bytes
     assert committed == 150
     empty = dict(first, token_offset_tokens=45, cache_state={"flow_prefix": state})
+    original_weights = {key: value.clone() for key, value in model.flow_model.state_dict().items()}
+    model.flow_model.to(dtype=torch.bfloat16)
     [(mel, retained)] = model._stream_prefix_mels([empty], STEPS)
+    model.flow_model.to(dtype=torch.float32)
+    model.flow_model.load_state_dict(original_weights)
     assert mel.shape == (1, 80, 0)
+    assert mel.dtype == torch.float32
     assert retained is state
     assert state.pages == pages
     assert state.committed == committed
