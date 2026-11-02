@@ -70,8 +70,10 @@ hook used by explicit close and failure cleanup.
 Scratch storage is also capability-driven. `frames_per_block` reserves space for
 an uncommitted current video block, while `max_scratch_tokens_per_branch`
 declares the maximum model-specific tokens, such as action/state registers, that
-must coexist with it. `AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH` may increase
-that derived minimum for deployment experiments but cannot reduce it.
+must coexist with it. `ar_diffusion_kv_config.scratch_blocks_per_branch` may
+increase that derived minimum for deployment experiments but cannot reduce it.
+The `AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH` environment variable is still
+read when the field is unset, but it is deprecated.
 
 ## DreamZero adapter
 
