@@ -139,3 +139,5 @@ class OmniSchedulerOutput(SchedulerOutput):
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)
+    # Coalescing-only V1 AR idle steps retain persistent rows for the next run.
+    preserve_v1_batch: bool = False

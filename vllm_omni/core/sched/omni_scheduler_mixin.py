@@ -790,6 +790,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
         data_plane_terminal_req_ids: set[str] | None = None,
         input_terminal_req_ids: set[str] | None = None,
+        preserve_v1_batch: bool = False,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 
@@ -835,6 +836,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             data_plane_terminal_req_ids=data_plane_terminal_req_ids,
             input_terminal_req_ids=input_terminal_req_ids or set(),
             pending_request_prewarms=request_prewarms,
+            preserve_v1_batch=preserve_v1_batch,
         )
         OmniSchedulerMixin._duplex_stage_work_recorder(self).step_begin(scheduler_output, getattr(self, "requests", {}))
         return scheduler_output
