@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -124,6 +125,11 @@ def _default_result_dir() -> Path:
     return Path(__file__).resolve().parent / "qwen3_omni" / "results" / "qwen_omni_acc"
 
 
+def _default_diffusion_accuracy_result_dir() -> Path:
+    """Shared sink for diffusion (and other non-bench) accuracy ``result_acc_*.json`` files."""
+    return Path(__file__).resolve().parent / "results"
+
+
 def _accuracy_hardware_label() -> str:
     """Local device token for the accuracy result, or ``""`` when detection fails.
 
@@ -142,6 +148,73 @@ def _accuracy_hardware_label() -> str:
         return ""
 
 
+def _json_safe_metric_value(value: Any) -> Any:
+    """Make metric values JSON-serializable with ``allow_nan=False``.
+
+    Legitimate infinite PSNR (identical images) becomes the string ``\"inf\"``.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe_metric_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_metric_value(item) for item in value]
+    return value
+
+
+def _is_hardware_nested_accuracy_baseline(baseline: Mapping[str, Any]) -> bool:
+    """True when every value is a non-empty metric dict (perf-style hardware nesting)."""
+    if not baseline:
+        return False
+    return all(isinstance(value, Mapping) and bool(value) for value in baseline.values())
+
+
+def normalize_accuracy_baseline(
+    baseline: Mapping[str, Any] | None,
+    *,
+    hardware: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Normalize accuracy thresholds to the perf hardware-nested shape.
+
+    Perf result JSON stores::
+
+        {"baseline": {"H100": {"ssim": 0.99, "psnr": 40.0}, "A3": {...}}}
+
+    Callers may pass that nested map, a ``SimilarityThresholds`` table (via
+    :func:`baseline_from_similarity_thresholds`), or a flat metric dict. Flat
+    dicts are wrapped under the current ``Hardware`` label (or ``default`` when
+    detection fails), matching how a single-SKU perf case records one bucket.
+    """
+    if not baseline:
+        return {}
+    if _is_hardware_nested_accuracy_baseline(baseline):
+        nested: dict[str, dict[str, Any]] = {}
+        for profile, metrics in baseline.items():
+            if not isinstance(metrics, Mapping):
+                continue
+            cleaned = {str(key): value for key, value in metrics.items() if value is not None}
+            if cleaned:
+                nested[str(profile)] = cleaned
+        return nested
+
+    hw = hardware if hardware is not None else _accuracy_hardware_label()
+    if not hw:
+        hw = "default"
+    flat = {str(key): value for key, value in baseline.items() if value is not None}
+    return {hw: flat} if flat else {}
+
+
+def baseline_from_similarity_thresholds(
+    table: Mapping[str, "SimilarityThresholds"],
+) -> dict[str, dict[str, float]]:
+    """Convert a per-device ``SimilarityThresholds`` table into a nested baseline."""
+    return {str(profile): {"ssim": thr.ssim, "psnr": thr.psnr} for profile, thr in table.items()}
+
+
 def _write_accuracy_result_metadata(
     path: Path,
     data: dict[str, Any],
@@ -154,7 +227,8 @@ def _write_accuracy_result_metadata(
     ``vllm bench serve`` saves measured scores only. The thresholds from the
     accuracy test (``--min-daily-omni-accuracy``, ``--max-seed-tts-mean-wer``, …)
     are applied afterwards, so persist them under ``baseline`` before the check.
-    Unset optional gates (``None``) are omitted.
+    Unset optional gates (``None``) are omitted. ``baseline`` is normalized to the
+    same hardware-nested shape as perf / :func:`write_accuracy_result`.
 
     ``dataset`` is the filename token (``daily_omni``, ``videomme``, ``seed_tts``).
     Model and dataset names both contain underscores, so the dashboard reads
@@ -167,11 +241,62 @@ def _write_accuracy_result_metadata(
     performance result records and Omni-DuplexEval accuracy artifacts. It is
     empty outside CI.
     """
+    hardware = _accuracy_hardware_label()
     data["dataset"] = dataset
-    data["baseline"] = {key: value for key, value in baseline.items() if value is not None}
-    data["Hardware"] = _accuracy_hardware_label()
+    data["baseline"] = normalize_accuracy_baseline(baseline, hardware=hardware or None)
+    data["Hardware"] = hardware
     data["branch"] = os.environ.get("BUILDKITE_BRANCH", "")
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def write_accuracy_result(
+    *,
+    model_id: str,
+    dataset: str,
+    metrics: Mapping[str, Any],
+    baseline: Mapping[str, Any] | None = None,
+    result_dir: str | Path | None = None,
+    when: datetime | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> Path:
+    """Persist measured accuracy scores into a dashboard ``result_acc_*.json`` file.
+
+    Keep this separate from ``assert_*`` helpers: compute metrics, call this to
+    retain SSIM/PSNR/WER (and related fields), then assert. Failed gates still
+    keep numbers when write happens first.
+
+    ``metrics`` is merged at the top level (for example ``ssim``, ``psnr``,
+    ``seed_tts_content_error_mean`` / WER). ``baseline`` is stored like perf:
+    hardware-nested ``{ \"H100\": {\"ssim\": ...}, \"A3\": {...} }``. Pass an
+    already-nested map (or :func:`baseline_from_similarity_thresholds`); a flat
+    metric dict is wrapped under the current ``Hardware`` label.
+
+    ``result_dir`` defaults to ``ACC_BENCH_RESULT_DIR`` when set, otherwise
+    ``tests/e2e/accuracy/results``.
+    """
+    when = datetime.now() if when is None else when
+    if result_dir is None:
+        env_dir = os.environ.get("ACC_BENCH_RESULT_DIR")
+        result_dir = Path(env_dir) if env_dir else _default_diffusion_accuracy_result_dir()
+    else:
+        result_dir = Path(result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    path = result_dir / _acc_result_filename(model_id, dataset, when=when)
+    hardware = _accuracy_hardware_label()
+    data: dict[str, Any] = {
+        "model_id": model_id,
+        "date": when.strftime("%Y%m%d-%H%M%S"),
+        "Hardware": hardware,
+        **{str(key): _json_safe_metric_value(value) for key, value in metrics.items()},
+    }
+    if extra:
+        data.update({str(key): _json_safe_metric_value(value) for key, value in extra.items()})
+    data["dataset"] = dataset
+    data["baseline"] = normalize_accuracy_baseline(baseline, hardware=hardware or None)
+    data["branch"] = os.environ.get("BUILDKITE_BRANCH", "")
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"accuracy_result={path}", flush=True)
+    return path
 
 
 def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
@@ -1229,6 +1354,32 @@ def assert_video_metadata(
     assert metadata["frame_count"] == frame_count
 
 
+def measure_video_similarity_metrics(
+    *,
+    label: str,
+    online_path: Path,
+    offline_path: Path,
+) -> tuple[float, float]:
+    """Run ffmpeg SSIM/PSNR and print diagnostics without gating."""
+    ssim_output = run_ffmpeg_similarity("ssim", online_path, offline_path)
+    psnr_output = run_ffmpeg_similarity("psnr", online_path, offline_path)
+    ssim_score = parse_ssim_score(ssim_output)
+    psnr_score = parse_psnr_score(psnr_output)
+
+    print(f"{label} similarity metrics:")
+    print(f"  SSIM: value={ssim_score:.6f}, range=[0, 1], higher_is_better=True, interpretation=structural_similarity")
+    print(
+        "  PSNR:"
+        f" value={psnr_score:.6f} dB,"
+        " range=[0, +inf),"
+        " higher_is_better=True,"
+        " interpretation=pixel_error_in_decibels"
+    )
+    print(f"online_video={online_path}")
+    print(f"offline_video={offline_path}")
+    return ssim_score, psnr_score
+
+
 def assert_video_similarity_metrics(
     *,
     label: str,
@@ -1236,31 +1387,36 @@ def assert_video_similarity_metrics(
     offline_path: Path,
     ssim_threshold: float,
     psnr_threshold: float,
+    ssim_score: float | None = None,
+    psnr_score: float | None = None,
 ) -> tuple[float, float]:
-    ssim_output = run_ffmpeg_similarity("ssim", online_path, offline_path)
-    psnr_output = run_ffmpeg_similarity("psnr", online_path, offline_path)
-    ssim_score = parse_ssim_score(ssim_output)
-    psnr_score = parse_psnr_score(psnr_output)
-
-    print(f"{label} similarity metrics:")
-    print(
-        "  SSIM:"
-        f" value={ssim_score:.6f},"
-        f" threshold>={ssim_threshold:.6f},"
-        " range=[0, 1],"
-        " higher_is_better=True,"
-        " interpretation=structural_similarity"
-    )
-    print(
-        "  PSNR:"
-        f" value={psnr_score:.6f} dB,"
-        f" threshold>={psnr_threshold:.6f} dB,"
-        " range=[0, +inf),"
-        " higher_is_better=True,"
-        " interpretation=pixel_error_in_decibels"
-    )
-    print(f"online_video={online_path}")
-    print(f"offline_video={offline_path}")
+    """Gate video SSIM/PSNR. Prefer measure → ``write_accuracy_result`` → this assert."""
+    if ssim_score is None or psnr_score is None:
+        ssim_score, psnr_score = measure_video_similarity_metrics(
+            label=label,
+            online_path=online_path,
+            offline_path=offline_path,
+        )
+    else:
+        print(f"{label} similarity metrics:")
+        print(
+            "  SSIM:"
+            f" value={ssim_score:.6f},"
+            f" threshold>={ssim_threshold:.6f},"
+            " range=[0, 1],"
+            " higher_is_better=True,"
+            " interpretation=structural_similarity"
+        )
+        print(
+            "  PSNR:"
+            f" value={psnr_score:.6f} dB,"
+            f" threshold>={psnr_threshold:.6f} dB,"
+            " range=[0, +inf),"
+            " higher_is_better=True,"
+            " interpretation=pixel_error_in_decibels"
+        )
+        print(f"online_video={online_path}")
+        print(f"offline_video={offline_path}")
 
     assert ssim_score >= ssim_threshold, (
         f"SSIM below threshold: got {ssim_score:.6f}, expected >= {ssim_threshold:.6f}. "
@@ -1273,17 +1429,16 @@ def assert_video_similarity_metrics(
     return ssim_score, psnr_score
 
 
-def assert_similarity(
+def measure_image_similarity(
     *,
     model_name: str,
     vllm_image: Image.Image,
     diffusers_image: Image.Image,
-    ssim_threshold: float,
-    psnr_threshold: float,
     width: int | None = None,
     height: int | None = None,
     compare_mode: str = "RGB",
-) -> None:
+) -> tuple[float, float]:
+    """Compute image SSIM/PSNR without gating. Callers write results then assert."""
     requested_size = (width, height) if width is not None and height is not None else None
     if requested_size is not None and diffusers_image.size != requested_size:
         pytest.skip(
@@ -1294,12 +1449,36 @@ def assert_similarity(
     assert vllm_image.size == diffusers_image.size, (
         f"Online and diffusers output sizes mismatch: online={vllm_image.size}, diffusers={diffusers_image.size}"
     )
-
-    ssim_score, psnr_score = compute_image_ssim_psnr(
+    return compute_image_ssim_psnr(
         prediction=vllm_image,
         reference=diffusers_image,
         compare_mode=compare_mode,
     )
+
+
+def assert_similarity(
+    *,
+    model_name: str,
+    vllm_image: Image.Image,
+    diffusers_image: Image.Image,
+    ssim_threshold: float,
+    psnr_threshold: float,
+    width: int | None = None,
+    height: int | None = None,
+    compare_mode: str = "RGB",
+    ssim_score: float | None = None,
+    psnr_score: float | None = None,
+) -> tuple[float, float]:
+    """Gate image SSIM/PSNR. Prefer measure → ``write_accuracy_result`` → this assert."""
+    if ssim_score is None or psnr_score is None:
+        ssim_score, psnr_score = measure_image_similarity(
+            model_name=model_name,
+            vllm_image=vllm_image,
+            diffusers_image=diffusers_image,
+            width=width,
+            height=height,
+            compare_mode=compare_mode,
+        )
     assert_similarity_metrics(
         model_name=model_name,
         ssim_score=ssim_score,
@@ -1307,6 +1486,7 @@ def assert_similarity(
         ssim_threshold=ssim_threshold,
         psnr_threshold=psnr_threshold,
     )
+    return ssim_score, psnr_score
 
 
 def assert_similarity_metrics(
@@ -1317,7 +1497,7 @@ def assert_similarity_metrics(
     ssim_threshold: float,
     psnr_threshold: float,
 ) -> None:
-    """Check computed image metrics, allowing callers to save all evidence first."""
+    """Check computed image metrics. Persist scores with ``write_accuracy_result`` before this."""
     print(f"{model_name} similarity metrics:")
     print(f"  SSIM: value={ssim_score:.6f}, threshold>={ssim_threshold:.6f}, range=[-1, 1], higher_is_better=True")
     print(
@@ -1332,6 +1512,30 @@ def assert_similarity_metrics(
     )
 
 
+def measure_image_sequence_similarity(
+    *,
+    model_name: str,
+    vllm_images: list[Image.Image],
+    diffusers_images: list[Image.Image],
+    compare_mode: str = "RGB",
+) -> list[tuple[float, float]]:
+    """Measure per-layer SSIM/PSNR without gating."""
+    assert len(vllm_images) == len(diffusers_images), (
+        f"Output image count mismatch for {model_name}: online={len(vllm_images)}, diffusers={len(diffusers_images)}"
+    )
+    scores: list[tuple[float, float]] = []
+    for index, (vllm_image, diffusers_image) in enumerate(zip(vllm_images, diffusers_images, strict=True), start=1):
+        scores.append(
+            measure_image_similarity(
+                model_name=f"{model_name}[layer={index}]",
+                vllm_image=vllm_image,
+                diffusers_image=diffusers_image,
+                compare_mode=compare_mode,
+            )
+        )
+    return scores
+
+
 def assert_image_sequence_similarity(
     *,
     model_name: str,
@@ -1340,45 +1544,38 @@ def assert_image_sequence_similarity(
     ssim_threshold: float,
     psnr_threshold: float,
     compare_mode: str = "RGB",
-) -> None:
-    assert len(vllm_images) == len(diffusers_images), (
-        f"Output image count mismatch for {model_name}: online={len(vllm_images)}, diffusers={len(diffusers_images)}"
-    )
-    for index, (vllm_image, diffusers_image) in enumerate(zip(vllm_images, diffusers_images, strict=True), start=1):
-        assert_similarity(
-            model_name=f"{model_name}[layer={index}]",
-            vllm_image=vllm_image,
-            diffusers_image=diffusers_image,
-            ssim_threshold=ssim_threshold,
-            psnr_threshold=psnr_threshold,
+    layer_scores: list[tuple[float, float]] | None = None,
+) -> list[tuple[float, float]]:
+    """Gate each layer. Prefer measure → ``write_accuracy_result`` → this assert."""
+    if layer_scores is None:
+        layer_scores = measure_image_sequence_similarity(
+            model_name=model_name,
+            vllm_images=vllm_images,
+            diffusers_images=diffusers_images,
             compare_mode=compare_mode,
         )
+    assert len(layer_scores) == len(vllm_images), (
+        f"Output image count mismatch for {model_name}: scores={len(layer_scores)}, images={len(vllm_images)}"
+    )
+    for index, (ssim_score, psnr_score) in enumerate(layer_scores, start=1):
+        assert_similarity_metrics(
+            model_name=f"{model_name}[layer={index}]",
+            ssim_score=ssim_score,
+            psnr_score=psnr_score,
+            ssim_threshold=ssim_threshold,
+            psnr_threshold=psnr_threshold,
+        )
+    return list(layer_scores)
 
 
-def assert_images_pixel_close(
+def measure_images_pixel_close(
     *,
     model_name: str,
     vllm_image: Image.Image,
     diffusers_image: Image.Image,
-    mean_threshold: float,
-    p99_threshold: float,
     compare_mode: str = "RGB",
-) -> None:
-    """Assert full-image pixel closeness between online serving and diffusers output.
-
-    Match the threshold style used by diffusion parallelism tests: convert both
-    images to float32 RGB tensors in the [0, 1] range, then compare mean and p99
-    absolute channel differences.
-
-    Accuracy improves as both values move lower:
-    - ``mean_abs_diff`` tracks global average drift across the whole image.
-    - ``p99_abs_diff`` tracks tail drift while ignoring the noisiest 1% of
-      channel samples.
-
-    The printed mismatch ratios are diagnostics only. ``pixel_ratio`` counts
-    pixels where any channel exceeds a tolerance, while ``channel_ratio`` counts
-    individual channel samples above that tolerance.
-    """
+) -> dict[str, Any]:
+    """Compute pixel closeness metrics without gating."""
     assert vllm_image.size == diffusers_image.size, (
         f"Online and diffusers output sizes mismatch: online={vllm_image.size}, diffusers={diffusers_image.size}"
     )
@@ -1393,17 +1590,12 @@ def assert_images_pixel_close(
     }
 
     print(f"{model_name} pixel metrics:")
-    print(
-        f"  mean_abs_diff: value={mean_abs_diff:.6e}, threshold<={mean_threshold:.6e}, "
-        "range=[0, 1], lower_is_better=True"
-    )
-    print(
-        f"  p99_abs_diff: value={p99_abs_diff:.6e}, threshold<={p99_threshold:.6e}, range=[0, 1], lower_is_better=True"
-    )
+    print(f"  mean_abs_diff: value={mean_abs_diff:.6e}, range=[0, 1], lower_is_better=True")
+    print(f"  p99_abs_diff: value={p99_abs_diff:.6e}, range=[0, 1], lower_is_better=True")
     print("  abs_diff_percentiles:")
     for percentile, value in percentiles.items():
         print(f"    p{percentile}: value={value:.6e}, range=[0, 1], lower_is_better=True")
-    print("  mismatch_ratios_by_channel_threshold:")
+    print("  mismatch_rates_by_channel_threshold:")
     for tolerance in (0, 1, 2, 4, 8, 16, 32, 64, 128):
         normalized_tolerance = tolerance / 255.0
         pixel_mismatch = np.any(channel_abs_diff > normalized_tolerance, axis=-1)
@@ -1415,12 +1607,46 @@ def assert_images_pixel_close(
             f"    threshold>{normalized_tolerance:.6e} ({tolerance}/255): pixel_ratio={pixel_mismatch_ratio:.8f}, "
             f"channel_ratio={channel_mismatch_ratio:.8f}"
         )
+    return {
+        "mean_abs_diff": mean_abs_diff,
+        "p99_abs_diff": p99_abs_diff,
+        "abs_diff_percentiles": percentiles,
+    }
 
+
+def assert_images_pixel_close(
+    *,
+    model_name: str,
+    vllm_image: Image.Image,
+    diffusers_image: Image.Image,
+    mean_threshold: float,
+    p99_threshold: float,
+    compare_mode: str = "RGB",
+    metrics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assert full-image pixel closeness between online serving and diffusers output.
+
+    Match the threshold style used by diffusion parallelism tests: convert both
+    images to float32 RGB tensors in the [0, 1] range, then compare mean and p99
+    absolute channel differences.
+
+    Prefer ``measure_images_pixel_close`` → ``write_accuracy_result`` → this assert.
+    """
+    if metrics is None:
+        metrics = measure_images_pixel_close(
+            model_name=model_name,
+            vllm_image=vllm_image,
+            diffusers_image=diffusers_image,
+            compare_mode=compare_mode,
+        )
+    mean_abs_diff = float(metrics["mean_abs_diff"])
+    p99_abs_diff = float(metrics["p99_abs_diff"])
     assert mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold, (
         f"Image diff exceeded threshold for {model_name}: mean_abs_diff={mean_abs_diff:.6e}, "
         f"p99_abs_diff={p99_abs_diff:.6e} (thresholds: mean<={mean_threshold:.6e}, "
         f"p99<={p99_threshold:.6e})"
     )
+    return dict(metrics)
 
 
 def compute_image_ssim_psnr(

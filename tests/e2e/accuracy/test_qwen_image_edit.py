@@ -14,7 +14,14 @@ from diffusers import QwenImageEditPipeline, QwenImageEditPlusPipeline
 from PIL import Image
 
 from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
-from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
+from tests.e2e.accuracy.helpers import (
+    assert_images_pixel_close,
+    assert_similarity,
+    measure_image_similarity,
+    measure_images_pixel_close,
+    model_output_dir,
+    write_accuracy_result,
+)
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -271,6 +278,19 @@ def test_qwen_image_edit_single_matches_diffusers(
         accuracy_artifact_root=accuracy_artifact_root,
         qwen_bear_image=qwen_bear_image,
     )
+    ssim, psnr = measure_image_similarity(
+        model_name=SINGLE_MODEL,
+        vllm_image=vllm_image,
+        diffusers_image=diffusers_image,
+        width=WIDTH,
+        height=HEIGHT,
+    )
+    write_accuracy_result(
+        model_id=SINGLE_MODEL,
+        dataset="image_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": SSIM_THRESHOLD, "psnr": PSNR_THRESHOLD},
+    )
     assert_similarity(
         model_name=SINGLE_MODEL,
         vllm_image=vllm_image,
@@ -279,6 +299,8 @@ def test_qwen_image_edit_single_matches_diffusers(
         height=HEIGHT,
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
 
 
@@ -314,10 +336,25 @@ def test_qwen_image_edit_2511_matches_diffusers_pixelwise(accuracy_artifact_root
     print(f"  vllm_omni: {vllm_output_path}")
     print(f"  diffusers: {diffusers_output_path}")
 
+    pixel_metrics = measure_images_pixel_close(
+        model_name=EDIT_2511_MODEL,
+        vllm_image=vllm_image,
+        diffusers_image=diffusers_image,
+    )
+    write_accuracy_result(
+        model_id=EDIT_2511_MODEL,
+        dataset="image_pixel",
+        metrics=pixel_metrics,
+        baseline={
+            "mean_abs_diff": EDIT_2511_MEAN_ABS_DIFF_THRESHOLD,
+            "p99_abs_diff": EDIT_2511_P99_ABS_DIFF_THRESHOLD,
+        },
+    )
     assert_images_pixel_close(
         model_name=EDIT_2511_MODEL,
         vllm_image=vllm_image,
         diffusers_image=diffusers_image,
         mean_threshold=EDIT_2511_MEAN_ABS_DIFF_THRESHOLD,
         p99_threshold=EDIT_2511_P99_ABS_DIFF_THRESHOLD,
+        metrics=pixel_metrics,
     )

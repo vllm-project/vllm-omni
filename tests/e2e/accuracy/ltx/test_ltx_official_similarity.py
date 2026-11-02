@@ -24,7 +24,7 @@ import pytest
 import torch
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
-from tests.e2e.accuracy.helpers import reset_artifact_dir
+from tests.e2e.accuracy.helpers import reset_artifact_dir, write_accuracy_result
 from tests.helpers.mark import hardware_test
 from vllm_omni.transformers_utils.repo_utils import hf_api
 
@@ -615,6 +615,25 @@ def test_ltx_matches_official(case: LTXAccuracyCase, accuracy_artifact_root: Pat
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    write_accuracy_result(
+        model_id=f"ltx_{case.name}",
+        dataset="video_audio_similarity",
+        metrics={
+            "video_ssim_mean": video_metrics["ssim_mean"],
+            "video_ssim_min": video_metrics["ssim_min"],
+            "video_psnr_mean_db": video_metrics["psnr_mean_db"],
+            "audio_relative_l2": audio_metrics["relative_l2"],
+            "audio_cosine_similarity": audio_metrics["cosine_similarity"],
+        },
+        baseline={
+            "video_ssim_mean": STRICT_THRESHOLDS.video_ssim_mean,
+            "video_ssim_min": STRICT_THRESHOLDS.video_ssim_min,
+            "video_psnr_mean_db": STRICT_THRESHOLDS.video_psnr_mean_db,
+            "audio_relative_l2": STRICT_THRESHOLDS.audio_relative_l2,
+            "audio_cosine_similarity": STRICT_THRESHOLDS.audio_cosine_similarity,
+        },
+        extra={"case": case.name, "metrics_json": str(output_root / "metrics.json")},
+    )
     print(json.dumps(result, indent=2))
 
     assert video_metrics["ssim_mean"] >= STRICT_THRESHOLDS.video_ssim_mean
