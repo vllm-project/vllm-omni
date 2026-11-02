@@ -3,6 +3,7 @@
 
 import threading
 from collections import defaultdict
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -83,6 +84,33 @@ def _decode(backend, values, request_ids, caches, *, terminal=None, eager=None):
         chunk_size=300,
         left_context_size=25,
     )
+
+
+def test_priming_pre_capture_uses_descending_shapes_and_shared_pool(monkeypatch, mocker):
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz import streaming_decoder
+
+    monkeypatch.setattr(module, "StreamingCodecDecoder", _Codec)
+    monkeypatch.setattr(_Codec, "RING", 128)
+    monkeypatch.setattr(_Codec, "max_frames", 57)
+    monkeypatch.setattr(_Codec, "nq", 1, raising=False)
+    monkeypatch.setattr(_Codec, "scratch_slot", 0, raising=False)
+    mocker.patch.object(streaming_decoder.current_omni_platform, "synchronize")
+    mocker.patch.object(torch.cuda, "CUDAGraph")
+    mocker.patch.object(torch.cuda, "graph", side_effect=lambda *_args, **_kwargs: nullcontext())
+
+    backend = module.StreamingCode2Wav(
+        None, num_slots=4, max_batch_size=4, batch_sizes=[1, 4, 2], frame_sizes=[1, 25], capture=True
+    )
+
+    priming_frames = [72, 55]
+    assert list(backend.prefix_graphs) == priming_frames
+    # Each shape runs once for warmup and once inside capture.
+    assert [(codes.shape[1], codes.shape[0]) for codes, _, _ in backend.decoder.calls] == [
+        (frames, batch) for frames in [*priming_frames, 25, 1] for batch in [4, 2, 1] for _ in range(2)
+    ]
+    graphs = [*backend.prefix_graphs.values(), *backend.graphs.values()]
+    assert all(graph.pool is backend.graph_pool for graph in graphs)
+    assert all(graph.sizes == [1, 2, 4] for graph in graphs)
 
 
 def test_long_chunk_splits_at_decoder_limit(backend):

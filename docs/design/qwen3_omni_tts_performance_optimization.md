@@ -358,7 +358,9 @@ Qwen3-TTS-specific execution path on CUDA with BF16 weights:
   codes then append to the convolution history and sliding attention KV rings.
   The segmented CUDA graph backend and its `decode_streaming` selection switch
   have been removed. Non-CUDA and non-async decoding retain the eager decoder.
-  Reference lengths not captured at startup still trigger lazy graph capture.
+  Reference priming pre-captures the observed hot lengths, 55 and 72 frames, for each
+  configured graph batch bucket, with larger frame and batch shapes captured
+  first in a shared graph pool. Other reference lengths still trigger lazy capture.
 - `decode_cudnn_benchmark` selects convolution algorithms during streaming
   Code2Wav startup warmup and graph capture. The process's cuDNN flags are
   restored afterwards, including on capture failure. Captured graphs retain

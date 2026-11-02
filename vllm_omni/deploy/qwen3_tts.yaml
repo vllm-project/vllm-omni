@@ -25,7 +25,7 @@ connectors:
     name: SharedMemoryConnector
     extra:
       # CUDA async-chunk decoding uses the stateful streaming backend.
-      # New ICL reference lengths trigger lazy graph capture and may increase
+      # Uncaptured ICL reference lengths trigger lazy graph capture and may increase
       # first-packet latency; warm up with representative references before measuring.
       talker_first_audio: true
       codec_streaming: true
@@ -57,8 +57,9 @@ connectors:
       # codec_chunk_ramp_delta_min: 2
       # Decoder CUDA Graph sizing: suffix shapes follow the configured chunk
       # ramp, or initial_codec_chunk_frames and codec_chunk_frames. Reference
-      # priming captures the attention-window length at startup; other lengths
-      # are captured lazily in a shared graph pool.
+      # priming pre-captures [55, 72] frames for every
+      # graph batch bucket, largest first. Other reference lengths are captured
+      # lazily in the same shared graph pool.
       # Graph batch size defaults to 1. Use [1, 2, 4] to cover batches up to
       # decode_batch_max_size (B3 pads to B4). Extra buckets increase warmup
       # time and graph memory.

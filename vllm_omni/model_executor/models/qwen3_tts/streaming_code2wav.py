@@ -65,14 +65,17 @@ class StreamingCode2Wav:
         if capture:
             sizes = sorted({size for size in batch_sizes if 0 < size <= min(num_slots, self.max_batch_size)})
             self.capture_batch_sizes = sizes
-            captured_frames = {min(size, self.decoder.max_frames) for size in frame_sizes if size > 0}
-            for frames in sorted(captured_frames):
-                self.graphs[frames] = StreamingDecodeGraphs(self.decoder, sizes, frames=frames, pool=self.graph_pool)
             if "icl" in self.decode_modes:
-                frames = min(self.decoder.window, self.decoder.RING)
-                self.prefix_graphs[frames] = StreamingDecodeGraphs(
-                    self.decoder, sizes, frames=frames, pool=self.graph_pool, initial=True
-                )
+                # Capture larger priming shapes first so smaller graphs can
+                # reuse their allocator blocks in the shared pool.
+                for frames in (72, 55):
+                    if frames <= self.decoder.RING:
+                        self.prefix_graphs[frames] = StreamingDecodeGraphs(
+                            self.decoder, sizes, frames=frames, pool=self.graph_pool, initial=True
+                        )
+            captured_frames = {min(size, self.decoder.max_frames) for size in frame_sizes if size > 0}
+            for frames in sorted(captured_frames, reverse=True):
+                self.graphs[frames] = StreamingDecodeGraphs(self.decoder, sizes, frames=frames, pool=self.graph_pool)
 
         if capture and self.capture_batch_sizes and (self.graphs or self.prefix_graphs):
             # Process allocator totals after initial capture, excluding later lazy captures.
