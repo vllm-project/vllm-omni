@@ -537,7 +537,7 @@ _OMNI_MODELS = {
     ## YuE2-3B (text-to-music; single-stage native-AR with terminal NAR/VAE)
     "Yue2ForCausalLM": (
         "yue2",
-        "yue2",
+        "runtime",
         "Yue2ForCausalLM",
     ),
 }
