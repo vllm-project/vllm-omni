@@ -26,6 +26,31 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_qwen3_thinker_embedding_adapter_materializes_only_committed_ids() -> None:
+    """The model-side A2 adapter maps verifier IDs to Thinker embeddings."""
+    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni import (
+        Qwen3OmniMoeForConditionalGeneration,
+    )
+
+    class _Thinker(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.arange(12, dtype=torch.float32).reshape(6, 2))
+
+        def embed_input_ids(self, *, input_ids):
+            return self.weight[input_ids]
+
+    model = object.__new__(Qwen3OmniMoeForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "thinker"
+    model.thinker = _Thinker()
+    model.thinker_config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=2))
+
+    rows = model.materialize_thinker_token_embeddings([4, -1, 1])
+    assert torch.equal(rows, torch.tensor([[8.0, 9.0], [2.0, 3.0]]))
+    assert model.materialize_thinker_token_embeddings([]).shape == (0, 2)
+
+
 @pytest.mark.parametrize(
     ("prompt_lens", "computed", "scheduled", "expected"),
     [
