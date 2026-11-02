@@ -58,6 +58,9 @@ EXCLUDED_MODELS = [
     # handoff tests and real-checkpoint disaggregated E2E validation.
     "MiniMaxH3DecoderPipeline",
     "StableAudioPipeline",
+    # Loads a single upstream model.safetensors + T5Gemma, no diffusers tiny
+    # config; covered by the gated-checkpoint offline/online E2E tests.
+    "StableAudio3Pipeline",
     "WanImageToVideoPipeline",
     "WanS2VPipeline",
     "WanT2VDMD2Pipeline",
