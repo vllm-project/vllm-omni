@@ -215,3 +215,100 @@ def test_cache_reset_failure_is_serialized_and_pool_remains_usable(method, failu
         assert await pool.collective_rpc(0, "is_sleeping") == {"via": "collective"}
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("invoke_with_kwargs", [False, True], ids=["positional", "keyword"])
+def test_collective_rpc_add_lora_routes_through_typed_client_helper(invoke_with_kwargs):
+    """#9242: the generic collective path nests the LoRARequest in an untyped
+    args tuple and the worker decodes it as a plain list. Positional and keyword
+    calls must both use the typed utility call so the adapter stays a struct."""
+
+    from vllm.lora.request import LoRARequest
+
+    async def run() -> None:
+        add_lora = AsyncMock(return_value=True)
+        pool, client = _make_pool(add_lora_async=add_lora)
+        request = LoRARequest(lora_name="adapter", lora_int_id=1, lora_path="/tmp/adapter")
+
+        if invoke_with_kwargs:
+            result = await pool.collective_rpc(0, "add_lora", kwargs={"lora_request": request})
+        else:
+            result = await pool.collective_rpc(0, "add_lora", args=(request,))
+
+        assert result is True
+        add_lora.assert_awaited_once()
+        delivered = add_lora.await_args
+        assert (delivered.args or (delivered.kwargs.get("lora_request"),))[0] is request
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_collective_rpc_add_lora_on_diffusion_stage_keeps_generic_path():
+    """Diffusion stages keep the generic collective path; only LLM/AR stages
+    take the typed helper (their current not-implemented shape is unchanged)."""
+
+    from vllm.lora.request import LoRARequest
+
+    async def run() -> None:
+        add_lora = AsyncMock(return_value=True)
+        pool, client = _make_pool(stage_type="diffusion", add_lora_async=add_lora)
+        request = LoRARequest(lora_name="adapter", lora_int_id=1, lora_path="/tmp/adapter")
+
+        result = await pool.collective_rpc(0, "add_lora", args=(request,))
+
+        assert result == {"via": "collective"}
+        add_lora.assert_not_awaited()
+        client.collective_rpc_async.assert_awaited_once_with(
+            method="add_lora",
+            timeout=None,
+            args=(request,),
+            kwargs={},
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_collective_rpc_add_lora_without_a_typed_helper_fails_loud():
+    """Falling back to the generic path would reintroduce #9242 silently: the
+    request would arrive at the worker as a plain list. A client that cannot
+    take the typed call has to say so."""
+
+    from vllm.lora.request import LoRARequest
+
+    async def run() -> None:
+        pool, client = _make_pool(collective_rpc_async=AsyncMock(return_value={"via": "collective"}))
+        request = LoRARequest(lora_name="adapter", lora_int_id=1, lora_path="/tmp/adapter")
+
+        result = await pool.collective_rpc(0, "add_lora", args=(request,))
+
+        assert result == {"supported": False, "error": "EngineCore helper add_lora_async is unavailable"}
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_collective_rpc_add_lora_propagates_a_timeout():
+    """add_lora rides with the EngineCore control methods, so a failed load
+    reaches the caller instead of being flattened into an error dict. That
+    matters because AsyncOmni.add_lora reduces the stage result with
+    bool(result), and a non-empty error dict would read as success."""
+
+    from vllm.lora.request import LoRARequest
+
+    async def run() -> None:
+        async def slow_add(*_args, **_kwargs):
+            await asyncio.sleep(1.0)
+            return True
+
+        pool, _client = _make_pool(add_lora_async=AsyncMock(side_effect=slow_add))
+        request = LoRARequest(lora_name="adapter", lora_int_id=1, lora_path="/tmp/adapter")
+
+        with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+            await pool.collective_rpc(0, "add_lora", timeout=0.01, args=(request,))
+
+    asyncio.run(run())

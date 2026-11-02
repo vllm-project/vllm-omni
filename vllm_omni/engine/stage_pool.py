@@ -145,6 +145,12 @@ class StagePool:
             "reset_prefix_cache",
             "reset_encoder_cache",
             "reset_mm_cache",
+            # add_lora carries a LoRARequest, which the generic collective path
+            # nests in an untyped args tuple. The worker's generic decoder only
+            # converts top-level msgspec-annotated arguments, so the adapter
+            # would arrive as a plain list with no lora_int_id (#9242). Routing
+            # it through the typed helper keeps the request a struct.
+            "add_lora",
         }
     )
 
@@ -1646,7 +1652,7 @@ class StagePool:
                     if timeout is not None:
                         return await asyncio.wait_for(result, timeout=timeout)
                     return await result
-                if method in self._CACHE_RESET_METHODS or method == "release_kv_cache_memory":
+                if method in self._CACHE_RESET_METHODS or method == "release_kv_cache_memory" or method == "add_lora":
                     return {"supported": False, "error": f"EngineCore helper {method}_async is unavailable"}
 
             return await client.collective_rpc_async(
