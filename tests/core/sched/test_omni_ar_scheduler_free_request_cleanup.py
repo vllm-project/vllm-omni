@@ -31,6 +31,7 @@ def _make_scheduler(*, chunk_transfer_adapter=None) -> OmniARScheduler:
     """Minimal OmniARScheduler exercising _free_request()'s no-KV-transfer
     happy path."""
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._model_input_streams = {}
     sched._omits_kv_transfer_cache = {}
     sched._connector_finished = lambda request: (False, None)
     sched.encoder_cache_manager = MagicMock()

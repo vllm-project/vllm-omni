@@ -41,6 +41,7 @@ def _make_free_request_sched(*, ec_connector) -> tuple[OmniARScheduler, MagicMoc
     firing relative to the encoder-cache free."""
     order = MagicMock()
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._model_input_streams = {}
     sched._omits_kv_transfer_cache = {}
     sched._connector_finished = lambda request: (False, None)
     sched.ec_connector = ec_connector

@@ -147,6 +147,7 @@ def test_voxcpm2_unified_decode_graph_does_not_defer_without_cuda_graph(monkeypa
 
 def test_unified_decode_graph_deferral_restores_waiting_queue(monkeypatch) -> None:
     scheduler = _make_scheduler()
+    scheduler._model_input_streams = {}
     scheduler.max_num_active_reqs = 8
     scheduler.max_num_running_reqs = 8
     scheduler.running = [_MockRequest("decode")]
