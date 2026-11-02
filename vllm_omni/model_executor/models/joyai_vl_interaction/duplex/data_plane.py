@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -18,6 +18,45 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation impo
     delegation_arguments,
 )
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
+    RECENT_MESSAGES,
+    SUMMARY_CHUNK_MESSAGES,
+    EncodedVisualImage,
+    JoyAISummaryMemory,
+    JoyAIVisualMemory,
+    VisualMemorySource,
+)
+
+
+@dataclass(frozen=True)
+class ResponseReference:
+    item_id: str
+    time_s: float
+    source_frame_id: int
+
+
+@dataclass(frozen=True)
+class QueryReference:
+    # None identifies initial_user_text, which has no conversation item.
+    item_id: str | None
+    text_digest: str
+    time_s: float
+    first_frame_id: int
+    responses: tuple[ResponseReference, ...] = ()
+
+
+@dataclass(frozen=True)
+class WorkingObservation:
+    """Accepted visual input order; frame pixels and played answers have other owners."""
+
+    request_id: str
+    frame_ids: tuple[int, ...]
+    query: str
+    query_index: int = -1
+    silent: bool = False
+    query_item_id: str | None = None
+    history_anchor_item_ids: tuple[str, ...] = ()
+    response_item_id: str | None = None
 
 
 @dataclass
@@ -26,6 +65,12 @@ class JoyAISessionState(DefaultDuplexModelSessionState):
     frames: list[str] = field(default_factory=list)
     conversation_images: tuple[str, ...] = ()
     last_response_text: str = ""
+    memory: JoyAISummaryMemory = field(default_factory=JoyAISummaryMemory)
+    visual_memory: JoyAIVisualMemory = field(default_factory=JoyAIVisualMemory)
+    visual_source: VisualMemorySource | None = None
+    observations: list[WorkingObservation] = field(default_factory=list)
+    queries: list[QueryReference] = field(default_factory=list)
+    closed_frame_id: int = -1
 
 
 def advance_chunk(*, current: object, spoken: bool, has_camera: bool) -> tuple[str, bool]:
@@ -56,11 +101,21 @@ class Observation:
     conversation_images: tuple[str, ...] = ()
     modalities: tuple[str, ...] = ("text", "audio")
     previous_response: str = ""
+    new_frames: list[tuple[EncodedVisualImage, int]] = field(default_factory=list)
+    frame_time_s: float = 0.0
+    query: str = ""
+    query_index: int = -1
+    query_item_id: str | None = None
+    history_anchor_item_ids: tuple[str, ...] = ()
+    visual_generation: int = 0
     delegation_tools: bool = False
     chunk_id: str | None = None
     text_sent: bool = False
     call_sent: bool = False
     response_text: str = ""
+    query_reference: QueryReference | None = None
+    response_frame_id: int = -1
+    response_time_s: float = 0.0
 
     def parse(self, output: object) -> ParsedAction:
         completion = next(iter(output.outputs or ()), None)
@@ -139,11 +194,53 @@ class JoyAIDataPlane(DuplexDataPlane):
                     # suppressing a repeat keeps the last spoken response.
                     if observation.state is not None and not observation.is_repeat(action):
                         observation.state.last_response_text = ""
+                    # Keep the model's silent decision next to its accepted
+                    # visual input. Spoken Q&A continues to come exclusively
+                    # from the Session's playback-committed conversation.
+                    if (
+                        observation.state is not None
+                        and observation.visual_generation == observation.state.visual_memory.generation
+                    ):
+                        observation.state.observations = [
+                            replace(item, silent=True) if item.request_id == request_id else item
+                            for item in observation.state.observations
+                        ]
                     # A completed observation, not a resumable LISTEN unit:
                     # the ordinary terminal path advances the turn identity.
                     event["end_of_turn"] = True
                 else:
                     observation.response_text = action.text
+                    if (
+                        observation.state is not None
+                        and observation.visual_generation == observation.state.visual_memory.generation
+                        and context.active_response_id is not None
+                    ):
+                        # Resolve only the Session's committed portion when a
+                        # later prompt is built; generated speech may be unheard.
+                        observation.state.observations = [
+                            replace(item, response_item_id=f"item_{context.active_response_id}")
+                            if item.request_id == request_id
+                            else item
+                            for item in observation.state.observations
+                        ]
+                        if observation.query_reference is not None:
+                            response = ResponseReference(
+                                f"item_{context.active_response_id}",
+                                observation.response_time_s,
+                                observation.response_frame_id,
+                            )
+                            observation.state.queries = [
+                                replace(
+                                    query,
+                                    responses=(*query.responses, response)[
+                                        -(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :
+                                    ],
+                                )
+                                if (query.item_id, query.text_digest)
+                                == (observation.query_reference.item_id, observation.query_reference.text_digest)
+                                else query
+                                for query in observation.state.queries
+                            ]
                     event["text"] = action.text
                     event["model_context_text"] = action.text
                     event["text_requires_complete_audio"] = "audio" in context.modalities

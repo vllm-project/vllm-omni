@@ -382,7 +382,9 @@ class AudioVAE(PreTrainedModel):
         waveform_length,
         *,
         generator: torch.Generator | None = None,
+        encoder_output: torch.Tensor | None = None,
     ):
+        """Sample prompt latents; ``encoder_output`` may supply a precomputed ``self.encoder(waveform)[0]``."""
         if self.encoder is None:
             raise RuntimeError("AudioVAE encoder is unavailable in decoder-only mode.")
         if waveform.ndim != 2:
@@ -401,7 +403,7 @@ class AudioVAE(PreTrainedModel):
         frame_num = torch.ceil(waveform_length / self.config.enc_kwargs["input_dim"]).to(torch.int32)
         if self.config.patch_size != -1:
             frame_num = torch.ceil(frame_num / self.config.patch_size)
-        h, _ = self.encoder(waveform)
+        h = self.encoder(waveform)[0] if encoder_output is None else encoder_output
         h = h.transpose(1, 2)
 
         mean, scale = torch.chunk(h, 2, dim=1)

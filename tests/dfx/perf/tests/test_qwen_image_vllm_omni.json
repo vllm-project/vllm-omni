@@ -1,5 +1,6 @@
 [
   {
+    "comment": "H100 uses the optional fa3-fwd dense kernel for unmasked BF16 when the dev extra is installed (#9201). B200 stays on the auto-selected dispatcher; this job does not pin DIFFUSION_ATTENTION_BACKEND.",
     "test_name": "test_qwen_image_single_device",
     "mark": [
       {
