@@ -149,9 +149,8 @@ def test_gpu_propose_uses_scheduled_width_for_tensor_rows(short):
     scheduler = SimpleNamespace(scheduled_spec_decode_tokens={"a": [0] * 3, "b": [0] * 3})
     samples = torch.tensor([[0, 0, 0, 0], [0, 0, -1, -1] if short else [0, 0, 0, 0]])
     drafts = GPUARModelRunner.propose_draft_token_ids(runner, scheduler, samples, None, None, None)
-    # Under async scheduling the draft must be a device tensor
-    # (torch.int32): `_prepare_input_ids` asserts isinstance(..., torch.Tensor)
-    # and the async event copy only arms for tensors.
+    # The draft must be a device tensor (torch.int32): `_prepare_input_ids`
+    # asserts isinstance(..., torch.Tensor) and scatters it directly.
     assert isinstance(drafts, torch.Tensor)
     assert drafts.dtype == torch.int32
     if short:

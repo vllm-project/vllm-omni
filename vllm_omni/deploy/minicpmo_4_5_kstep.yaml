@@ -10,9 +10,16 @@
 #
 # Stage 1 books the constant continue-draft K span (1 sampled + 7 drafted codec
 # frames per step, mirroring the NPU block) and the two-wide continue/stop id.
-# ``async_scheduling: false`` is required: the K-step scaffolding assumes the
-# synchronous model-runner contract. Stage 2 merges the ragged K-step CFM shapes
-# into one solve per step, otherwise every ragged bucket captures its own graph.
+# ``async_scheduling: false`` is part of the contract, not a tuning knob: K-step
+# and async scheduling cannot be used together. Async books the spec span one
+# step ahead, while the multi-frame loop only executes steps whose decode spans
+# are uniform and whose booked positions stay inside the prompt. Measured at
+# c16/256: the booking first outruns the prompt ("prefill span exceeds
+# condition"), and once those slots are padded the step still arrives with
+# non-uniform spans ("multi-frame Talker decode not engaged: request token
+# spans are not uniform"), which kills the stage-1 replica and fails every
+# in-flight request. Stage 2 merges the ragged K-step CFM shapes into one solve
+# per step, otherwise every ragged bucket captures its own graph.
 #
 # Escape hatches while K-step is enabled (environment variables):
 #   KSTEP_PLAIN_STEP=1     run plain single-frame steps (no K-span booking)

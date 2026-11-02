@@ -470,42 +470,6 @@ def test_enforce_drops_uneven_decode_spans_to_single_frame():
     assert out.total_num_scheduled_tokens == 5
 
 
-def test_async_booked_k_span_survives_the_uniformity_rewrite():
-    """Under async scheduling upstream books every steady decode request at
-    1+num_spec rows with an EMPTY ``scheduled_spec_decode_tokens``: the
-    booking arithmetic nets <= 0 for a placeholder-armed request, so the
-    spec dict stays empty and the drafts for those slots come back through
-    the runner's async propose instead of the scheduler. Reading that shape
-    as a mixed prefill/decode step collapsed every async K-span to a
-    single-frame step -- the rows must pass through untouched."""
-    sched = _make_scheduler(num_spec=7, waiting=[], running=[])
-    sched._spec_token_placeholders = [-1] * 7
-    out = _sched_out({"a": 8, "b": 8}, {})
-
-    sched._enforce_kstep_span_uniformity(out)
-
-    assert out.num_scheduled_tokens == {"a": 8, "b": 8}
-    assert out.scheduled_spec_decode_tokens == {}
-
-
-def test_async_booked_k_span_with_a_genuinely_short_row_folds_the_k_rows():
-    """A row narrower than the K span next to full 1+num_spec rows cannot run
-    the frame loop: ``applies()`` refuses non-uniform spans and
-    ``_model_forward`` raises rather than let a multi-token decode take the
-    single-forward path (it samples one frame from the last row of a span the
-    scheduler accounted K frames for). The K rows therefore fall back to one
-    scheduled token; the short row keeps its width (it is the prefill/extend
-    row that made the step non-uniform), so the step stays executable."""
-    sched = _make_scheduler(num_spec=7, waiting=[], running=[])
-    sched._spec_token_placeholders = [-1] * 7
-    out = _sched_out({"a": 8, "b": 5}, {})
-
-    sched._enforce_kstep_span_uniformity(out)
-
-    assert out.num_scheduled_tokens == {"a": 1, "b": 5}
-    assert out.scheduled_spec_decode_tokens == {}
-
-
 def test_enforce_drops_drafts_when_a_plain_row_joins():
     """A width-1 decode row (cold or drained buffer) booked next to drafted
     rows is still uneven; the whole batch goes single-frame."""

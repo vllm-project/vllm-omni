@@ -610,12 +610,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         if not self._talker_kstep_armed():
             return
-        if isinstance(self, AsyncVLLMScheduler):
-            # Async scheduling re-arms the placeholders after every step and
-            # delivers the draft inside the worker, so clearing here would
-            # fight the bookkeeping; _enforce_kstep_span_uniformity handles
-            # the scheduled output instead.
-            return
         num_spec = int(getattr(self, "num_spec_tokens", 0) or 0)
         max_len = getattr(self, "max_model_len", None)
         try:
@@ -754,40 +748,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 return
         changed = False
         min_frames = None
-        async_scheduler = getattr(self, "_spec_token_placeholders", None) is not None
-        k_span = 1 + int(getattr(self, "num_spec_tokens", 0) or 0)
-        if async_scheduler:
-            # Under async scheduling a placeholder-armed request books
-            # 1+num_spec rows with an empty ``scheduled_spec_decode_tokens``
-            # (the drafts arrive via the runner's async propose). Such a row
-            # is the full executable shape, not a mixed/prefill row.
-            mixed = any(n > 1 and n != k_span and rid not in spec_tokens for rid, n in num_scheduled_tokens.items())
-        else:
-            mixed = any(n > 1 and rid not in spec_tokens for rid, n in num_scheduled_tokens.items())
-        if mixed:
-            # A prefill/extend row next to a drafted decode row is the
-            # non-uniform shape the runner refuses. Fold drafted rows (and
-            # async K-width placeholders) to width 1; leave genuine prefill
-            # rows alone or prompt tokens are dropped.
-            fold_ids = set(spec_tokens)
-            if async_scheduler:
-                # Only fold placeholder-armed decode rows: upstream skips the
-                # arming for ``is_prefill_chunk`` rows, so a genuine prefill
-                # row that happens to book k_span positions must keep them or
-                # the prompt loses positions.
-                requests = getattr(self, "requests", None) or {}
-                fold_ids.update(
-                    rid
-                    for rid, n in num_scheduled_tokens.items()
-                    if rid not in spec_tokens
-                    and n == k_span
-                    and not getattr(requests.get(rid), "is_prefill_chunk", False)
-                )
-            for rid in fold_ids:
-                num_scheduled_tokens[rid] = 1
-            for rid in list(spec_tokens):
-                spec_tokens.pop(rid, None)
-            if fold_ids:
+        if any(n > 1 and rid not in spec_tokens for rid, n in num_scheduled_tokens.items()):
+            # Mixed step: a prefill/extend row next to a drafted decode row
+            # is exactly the non-uniform shape the runner dies on.
+            if spec_tokens:
+                for rid in spec_tokens:
+                    num_scheduled_tokens[rid] = 1
+                spec_tokens.clear()
                 changed = True
                 min_frames = 0
         elif spec_tokens:
@@ -882,12 +849,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if os.environ.get("KSTEP_PLAIN_STEP", "1") == "0":
             return None
         if not self._talker_kstep_armed():
-            return None
-        if isinstance(self, AsyncVLLMScheduler):
-            # The placeholder mechanism already sizes every decode request at
-            # 1+num_spec; zeroing here would desynchronise that bookkeeping.
-            # Keep the width and leave uneven steps to
-            # _enforce_kstep_span_uniformity.
             return None
         device_config = getattr(getattr(self, "vllm_config", None), "device_config", None)
         if getattr(device_config, "device_type", None) != "cuda":
@@ -2447,23 +2408,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 class OmniARAsyncScheduler(OmniARScheduler, AsyncVLLMScheduler):
     """Asynchronous AutoRegressive scheduler."""
 
-    def _update_after_schedule(self, scheduler_output):
-        # MRO: OmniARScheduler._update_after_schedule (runs the K-step span
-        # rewrite before the in-flight booking) -> AsyncVLLMScheduler
-        # (booking + placeholder re-arm).
-        super()._update_after_schedule(scheduler_output)
-        if not self._talker_kstep_armed():
-            return
-        placeholders = getattr(self, "_spec_token_placeholders", None)
-        if not placeholders:
-            return
-        # Talker streaming keeps requests in is_prefill_chunk state while the
-        # stage-0 backlog drains, and upstream only arms placeholders for
-        # non-prefill requests. Arm them here too: the schedule guard keeps
-        # backlog steps at width 1 and the spec width takes over once drained.
-        for req_id in scheduler_output.num_scheduled_tokens:
-            request = self.requests.get(req_id)
-            if request is None or request.spec_token_ids:
-                continue
-            if request.is_prefill_chunk:
-                request.spec_token_ids = placeholders
+
+# K-step multi-frame decode requires async_scheduling off: the booking it relies
+# on is written by the synchronous runner contract (the step that reserves
+# 1 + num_spec positions and the drafts that fill them are decided together).
+# Under async scheduling the scheduler books the spec span one step ahead, and
+# the multi-frame loop refuses the resulting steps (mixed spans, and the
+# booked positions outrunning the prompt). Measured: stage-1 dies inside a
+# request with "multi-frame Talker decode not engaged: request token spans are
+# not uniform" (and, before that, "prefill span exceeds condition"), which
+# fails every in-flight request. So the K-step overlay keeps
+# async_scheduling: false and does not carry async-specific code paths.

@@ -178,55 +178,6 @@ def test_dynamic_cuda_insufficient_budget_keeps_single_frame_fallback():
     assert output.scheduled_spec_decode_tokens == {}
 
 
-def test_async_mixed_folds_placeholder_and_draft_rows_preserving_prefill():
-    """Mixed async steps fold decode rows, never truncate prompt extension."""
-    sched = _dynamic_sched()
-    sched._spec_token_placeholders = [-1] * 7
-    output = _booked_output([7, 7, 7])
-    # Request 0 is a real drafted decode row, request 1 is an async
-    # placeholder-armed K-width row with no scheduler spec entry, and request 2
-    # is a genuine prompt extension that must remain fully booked.
-    output.scheduled_spec_decode_tokens = {0: list(range(7))}
-    output.num_scheduled_tokens[2] = 20
-    output.total_num_scheduled_tokens = 7 + 8 + 20
-
-    OmniARScheduler._enforce_kstep_span_uniformity(sched, output)
-
-    assert output.num_scheduled_tokens == {0: 1, 1: 1, 2: 20}
-    assert output.scheduled_spec_decode_tokens == {}
-    assert output.total_num_scheduled_tokens == 22
-
-
-def test_async_prefill_chunk_booked_at_k_span_width_is_not_folded():
-    """A prefill chunk that exactly fills a k_span row keeps its positions.
-
-    Upstream arms the ``-1`` placeholders only for rows it will sample; a
-    ``is_prefill_chunk`` row skips that arming. Such a row can book exactly
-    ``1 + num_spec`` tokens when the chunk budget happens to match, and folding
-    it to width 1 would silently drop prompt positions.
-    """
-    sched = _dynamic_sched()
-    sched._spec_token_placeholders = [-1] * 7
-    sched.requests = {
-        0: SimpleNamespace(is_prefill_chunk=False),
-        1: SimpleNamespace(is_prefill_chunk=True),
-        2: SimpleNamespace(is_prefill_chunk=True),
-    }
-    output = SimpleNamespace(
-        num_scheduled_tokens={0: 8, 1: 8, 2: 20},
-        scheduled_spec_decode_tokens={},
-        total_num_scheduled_tokens=36,
-        num_spec_tokens_to_schedule=7,
-    )
-
-    OmniARScheduler._enforce_kstep_span_uniformity(sched, output)
-
-    # Only the placeholder-armed decode row folds; the k_span-wide prefill
-    # chunk and the regular prefill row keep every booked position.
-    assert output.num_scheduled_tokens == {0: 1, 1: 8, 2: 20}
-    assert output.total_num_scheduled_tokens == 29
-
-
 def test_dynamic_cuda_does_not_trim_prefill_rows():
     output = _booked_output([7])
     output.num_scheduled_tokens[1] = 20

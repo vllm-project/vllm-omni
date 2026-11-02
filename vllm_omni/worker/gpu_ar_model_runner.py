@@ -462,85 +462,24 @@ class GPUARModelRunner(
 
         frames = talker_multiframe.drafts_this_step(self)
         if frames > 1:
-            if getattr(self, "use_async_scheduling", False):
-                # Under async scheduling the sampled ids and this step's spec
-                # booking are both unreadable here (GPU copy / one step late),
-                # so deriving the split folds on empty rows and severs the
-                # K-span feedback loop. Propose the constant draft for every
-                # row and let the scheduler trim to what it booked.
-                draft_tensor = self._kstep_constant_draft_tensor(int(self.input_batch.num_reqs), frames - 1)
-            else:
-                if isinstance(sampled_token_ids, torch.Tensor):
-                    sampled_token_ids = sampled_token_ids.cpu().tolist()
-                    sampled_token_ids = [[token for token in row if token >= 0] for row in sampled_token_ids]
-                scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", {})
-                drafts = talker_multiframe.constant_drafts(
-                    sampled_token_ids,
-                    frames,
-                    self.input_batch.num_reqs,
-                    scheduled_draft_counts=[len(scheduled.get(req_id, [])) for req_id in self.input_batch.req_ids],
-                    fold_short_rows=True,
-                )
-                # The draft must be a device tensor: `_prepare_input_ids`
-                # scatters it directly and `_copy_draft_token_ids_to_cpu` only
-                # arms the async req-ids/event copy for tensors. The value is a
-                # constant, so one cached tensor per live shape is enough.
-                draft_tensor = self._kstep_constant_draft_tensor(
-                    int(self.input_batch.num_reqs),
-                    len(drafts[0]) if drafts and drafts[0] else 0,
-                )
-            if (
-                getattr(self, "use_async_scheduling", False)
-                and getattr(self, "draft_token_ids_event", None) is not None
-                and getattr(self, "draft_token_ids_copy_stream", None) is not None
-                and getattr(self, "draft_token_ids_cpu", None) is not None
-            ):
-                # The upstream ngram_gpu branch never arms the draft CPU copy
-                # once this override returns, which leaves the rejection sampler
-                # on the scheduler's [-1] placeholders and drops 7 of the 8
-                # frames. Arm the copy here.
-                self._draft_token_ids = draft_tensor
-                self._draft_token_req_ids = self.input_batch.req_ids.copy()
-                default_stream = torch.cuda.current_stream()
-                with torch.cuda.stream(self.draft_token_ids_copy_stream):
-                    self.draft_token_ids_copy_stream.wait_stream(default_stream)
-                    n_reqs, n_drafts = draft_tensor.shape
-                    self.draft_token_ids_cpu[:n_reqs, :n_drafts].copy_(draft_tensor, non_blocking=True)
-                    self.draft_token_ids_event.record()
-            # Publish the per-request valid draft count too: the worker path
-            # trims every booking to `1 + valid_k`, and a CPU buffer that is
-            # never written reads as zero. Every booked slot is a constant
-            # CONTINUE, so report the full count.
-            _valid_cpu = getattr(self, "_num_valid_draft_tokens_cpu", None)
-            if (
-                _valid_cpu is not None
-                and getattr(self, "_num_valid_draft_tokens_event", None) is not None
-                and getattr(self, "_num_valid_draft_tokens_copy_stream", None) is not None
-            ):
-                from vllm.v1.spec_decode.ngram_proposer_gpu import (
-                    copy_num_valid_draft_tokens,
-                )
-
-                n_reqs, n_drafts = draft_tensor.shape
-                cache = getattr(self, "_kstep_valid_draft_cache", None)
-                if cache is None:
-                    cache = self._kstep_valid_draft_cache = {}
-                valid_tensor = cache.get(int(n_drafts))
-                if valid_tensor is None:
-                    valid_tensor = torch.full(
-                        (int(self.max_num_reqs),),
-                        int(n_drafts),
-                        dtype=torch.int32,
-                        device=draft_tensor.device,
-                    )
-                    cache[int(n_drafts)] = valid_tensor
-                copy_num_valid_draft_tokens(
-                    _valid_cpu,
-                    self._num_valid_draft_tokens_copy_stream,
-                    self._num_valid_draft_tokens_event,
-                    valid_tensor,
-                    n_reqs,
-                )
+            if isinstance(sampled_token_ids, torch.Tensor):
+                sampled_token_ids = sampled_token_ids.cpu().tolist()
+                sampled_token_ids = [[token for token in row if token >= 0] for row in sampled_token_ids]
+            scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", {})
+            drafts = talker_multiframe.constant_drafts(
+                sampled_token_ids,
+                frames,
+                self.input_batch.num_reqs,
+                scheduled_draft_counts=[len(scheduled.get(req_id, [])) for req_id in self.input_batch.req_ids],
+                fold_short_rows=True,
+            )
+            # The draft must be a device tensor: `_prepare_input_ids` scatters
+            # it directly. The value is a constant, so one cached tensor per
+            # live shape is enough.
+            draft_tensor = self._kstep_constant_draft_tensor(
+                int(self.input_batch.num_reqs),
+                len(drafts[0]) if drafts and drafts[0] else 0,
+            )
             return draft_tensor
         # Plain steps keep the n-gram drafter: mixed batches (concurrent
         # arrivals, stops) are single-frame steps that the uniform-span K-step
@@ -2456,16 +2395,6 @@ class GPUARModelRunner(
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
-        # A K-span step samples one id per booked row, so the sampler returns
-        # ``[rows, 1 + num_spec]`` while `_bookkeeping_sync`'s async branch
-        # expects the single-wide stash (normally written by the n-gram
-        # drafter, which this runner bypasses). Stash column 0 ourselves.
-        sampled_ids = sampler_output.sampled_token_ids
-        if isinstance(sampled_ids, torch.Tensor):
-            if sampled_ids.ndim == 2 and sampled_ids.shape[-1] > 1:
-                self.input_batch.prev_sampled_token_ids = sampled_ids[:, :1]
-        elif isinstance(sampled_ids, list) and sampled_ids and len(sampled_ids[0]) > 1:
-            self.input_batch.prev_sampled_token_ids = [row[:1] for row in sampled_ids]
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
