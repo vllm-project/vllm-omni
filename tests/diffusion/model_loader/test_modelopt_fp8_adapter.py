@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from itertools import permutations
 from types import SimpleNamespace
 
 import pytest
@@ -232,6 +233,7 @@ def test_modelopt_nvfp4_adapter_remaps_quantized_weights_and_scales():
     assert [name for name, _ in adapted] == [
         name.replace(f"{prefix}.", "runtime.proj.") for name, _ in checkpoint_tensors
     ]
+    assert all(actual is original for (_, actual), (_, original) in zip(adapted, checkpoint_tensors))
 
 
 def test_modelopt_nvfp4_adapter_rejects_unconsumed_pre_quant_scale():
@@ -239,3 +241,126 @@ def test_modelopt_nvfp4_adapter_rejects_unconsumed_pre_quant_scale():
 
     with pytest.raises(ValueError, match="does not consume pre_quant_scale"):
         list(adapter.adapt(iter([("transformer.proj.pre_quant_scale", torch.tensor([1.0]))])))
+
+
+class _FullPrecisionNvFp4TargetModel(nn.Module):
+    def __init__(self, dtype: torch.dtype = torch.bfloat16) -> None:
+        super().__init__()
+        self.transformer = nn.Module()
+        self.transformer.proj = nn.Linear(32, 2, bias=False, dtype=dtype)
+
+
+def _nvfp4_checkpoint_tensors() -> list[tuple[str, torch.Tensor]]:
+    # Low nibble comes first: these bytes enumerate every E2M1 value twice
+    # per row. The second row reverses the order to catch row/block mixups.
+    packed = torch.tensor(
+        [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE] * 2, [0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01] * 2],
+        dtype=torch.uint8,
+    )
+    return [
+        ("transformer.proj.weight", packed),
+        ("transformer.proj.weight_scale", torch.tensor([[0.5, 2.0], [1.0, 4.0]]).to(torch.float8_e4m3fn)),
+        ("transformer.proj.weight_scale_2", torch.tensor(0.25)),
+    ]
+
+
+@pytest.mark.parametrize("order", list(permutations(range(3))))
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_modelopt_nvfp4_dequantizes_all_codepoints_with_either_scale_order(order, dtype):
+    model = _FullPrecisionNvFp4TargetModel(dtype)
+    adapter = ModelOptNvFp4CheckpointAdapter(model, _make_source())
+    tensors = _nvfp4_checkpoint_tensors()
+    adapted = list(adapter.adapt([tensors[i] for i in order] + [("transformer.proj.input_scale", torch.tensor(1.0))]))
+
+    assert [name for name, _ in adapted] == ["transformer.proj.weight"]
+    weight = adapted[0][1]
+    # Independent reference: unpacked values and scaled blocks are explicit,
+    # not produced by the adapter's nibble lookup or reshape implementation.
+    values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    expected = torch.stack(
+        [
+            torch.cat([values * 0.125, values * 0.5]),
+            torch.cat([values.flip(0) * 0.25, values.flip(0) * 1.0]),
+        ]
+    ).to(dtype)
+    assert weight.dtype == dtype
+    assert weight.shape == model.transformer.proj.weight.shape
+    assert torch.equal(weight, expected)
+    assert torch.equal(torch.signbit(weight), torch.signbit(expected))
+
+
+@pytest.mark.parametrize("missing_index", [1, 2], ids=["block-scale", "global-scale"])
+def test_modelopt_nvfp4_requires_both_scales(missing_index):
+    adapter = ModelOptNvFp4CheckpointAdapter(_FullPrecisionNvFp4TargetModel(), _make_source())
+    tensors = _nvfp4_checkpoint_tensors()
+    missing_name = tensors[missing_index][0]
+    with pytest.raises(ValueError, match=missing_name):
+        list(adapter.adapt([tensor for i, tensor in enumerate(tensors) if i != missing_index]))
+
+
+@pytest.mark.parametrize(
+    "index,bad_scale,error",
+    [
+        (1, torch.ones(2, 1), "weight_scale shape"),
+        (1, torch.ones(1, 2), "weight_scale shape"),
+        (2, torch.ones(2), "weight_scale_2 shape"),
+    ],
+)
+def test_modelopt_nvfp4_rejects_invalid_scale_shapes(index, bad_scale, error):
+    adapter = ModelOptNvFp4CheckpointAdapter(_FullPrecisionNvFp4TargetModel(), _make_source())
+    tensors = _nvfp4_checkpoint_tensors()
+    tensors[index] = (tensors[index][0], bad_scale)
+    with pytest.raises(ValueError, match=error):
+        list(adapter.adapt(tensors))
+
+
+def test_modelopt_nvfp4_keeps_fp8_dequantization_path():
+    adapter = ModelOptNvFp4CheckpointAdapter(_PackedModelOptModel(), _make_source())
+    weight = torch.tensor([[2.0, -4.0], [1.0, 3.0]]).to(torch.float8_e4m3fn)
+    adapted = list(
+        adapter.adapt(
+            [
+                ("transformer.block.to_q.weight", weight),
+                ("transformer.block.to_q.weight_scale", torch.tensor(0.5)),
+            ]
+        )
+    )
+    assert [name for name, _ in adapted] == ["transformer.block.to_q.weight"]
+    assert torch.equal(adapted[0][1], weight.float() * 0.5)
+
+
+def test_modelopt_nvfp4_preserves_bf16_and_unknown_weights():
+    adapter = ModelOptNvFp4CheckpointAdapter(_FullPrecisionNvFp4TargetModel(), _make_source())
+    known = torch.ones(2, 32, dtype=torch.bfloat16)
+    unknown = torch.ones(2, 16, dtype=torch.uint8)
+    adapted = list(adapter.adapt([("transformer.proj.weight", known), ("unknown.weight", unknown)]))
+    assert [name for name, _ in adapted] == ["transformer.proj.weight", "unknown.weight"]
+    assert adapted[0][1] is known
+    assert adapted[1][1] is unknown
+
+
+class _FullPrecisionRemappedNvFp4TargetModel(_FullPrecisionNvFp4TargetModel):
+    @staticmethod
+    def remap_checkpoint_key(name: str) -> str:
+        return name.replace("checkpoint.", "transformer.")
+
+
+def test_modelopt_nvfp4_dequantizes_remapped_full_precision_weight():
+    adapter = ModelOptNvFp4CheckpointAdapter(_FullPrecisionRemappedNvFp4TargetModel(), _make_source())
+    tensors = [(name.replace("transformer.", "checkpoint."), tensor) for name, tensor in _nvfp4_checkpoint_tensors()]
+    adapted = list(adapter.adapt(tensors))
+    assert [name for name, _ in adapted] == ["transformer.proj.weight"]
+    assert adapted[0][1].dtype == torch.bfloat16
+    assert adapted[0][1].shape == (2, 32)
+    assert adapted[0][1][0, 7].item() == 0.75
+    assert adapted[0][1][1, 0].item() == -1.5
+
+
+def test_modelopt_nvfp4_rejects_partial_blocks():
+    model = _FullPrecisionNvFp4TargetModel()
+    model.transformer.proj = nn.Linear(30, 2, bias=False, dtype=torch.bfloat16)
+    adapter = ModelOptNvFp4CheckpointAdapter(model, _make_source())
+    tensors = _nvfp4_checkpoint_tensors()
+    tensors[0] = (tensors[0][0], torch.zeros(2, 15, dtype=torch.uint8))
+    with pytest.raises(ValueError, match="weight_scale shape"):
+        list(adapter.adapt(tensors))
