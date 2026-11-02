@@ -268,7 +268,9 @@ async def wait_for_admission(adapter: ChatterboxAdapter, requests: list[asyncio.
     async def admitted() -> None:
         while len(adapter.conditioning_pending) < len(requests):
             if ended := [request for request in requests if request.done()]:
-                ended[0].result()
+                # A failed request raises its error; a cancelled one falls through to the assertion.
+                if failed := [request for request in ended if not request.cancelled()]:
+                    failed[0].result()
                 raise AssertionError(f"{len(ended)} of {len(requests)} requests ended before all were admitted")
             await asyncio.sleep(0.01)
 
