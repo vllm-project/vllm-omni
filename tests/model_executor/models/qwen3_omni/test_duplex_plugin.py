@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import base64
+import logging
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -36,6 +37,7 @@ from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.session import history_calibration as history_calibration_module
 from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin
@@ -1990,7 +1992,11 @@ async def test_calibrated_tool_settlement_failure_closes_session(monkeypatch, ca
 
     h = await open_qwen(calibrate=calibrate)
     commit = None
+    # init_logger() does not propagate, so the root caplog handler never sees this warning.
+    calibration_logger = history_calibration_module.logger
+    calibration_logger.addHandler(caplog.handler)
     try:
+        caplog.set_level(logging.WARNING, logger=calibration_logger.name)
         response_id = await _interrupt_tool_answer(h)
         await asyncio.wait_for(entered.wait(), 1)
         controller = h.runner.ctx.history_calibration
@@ -2044,6 +2050,7 @@ async def test_calibrated_tool_settlement_failure_closes_session(monkeypatch, ca
             assert h.session.history_item_ids[f"item_{response_id}"]["content"] == ""
             assert "Duplex history calibration failed" in caplog.text
     finally:
+        calibration_logger.removeHandler(caplog.handler)
         release.set()
         if commit is not None:
             await asyncio.gather(commit, return_exceptions=True)
