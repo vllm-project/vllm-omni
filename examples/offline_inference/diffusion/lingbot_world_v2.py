@@ -169,7 +169,7 @@ def build_omni_kwargs(
         "tensor_parallel_size": args.tensor_parallel_size,
         "ulysses_degree": args.ulysses_degree,
         "enforce_eager": args.enforce_eager,
-        "model_config": {"lingbot_action_root": str(paths.action_root)},
+        "stage_0_model_config": {"lingbot_action_root": str(paths.action_root)},
     }
 
 
