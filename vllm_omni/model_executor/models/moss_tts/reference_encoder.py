@@ -874,8 +874,12 @@ class MossRealtimeReferenceEncoder(MossReferenceEncoder):
         return wav  # the realtime codec takes the clip at the working rate
 
     def _encode_prepared(self, prepared: list[torch.Tensor], graphs: Any = None) -> list[torch.Tensor]:
+        parameter = next(self._processor.parameters(), None)
+        if parameter is None:
+            raise ValueError("MOSS realtime reference codec must have a parameter to determine its device and dtype")
+        waveforms = [wav.squeeze(0).to(device=parameter.device, dtype=parameter.dtype) for wav in prepared]
         with torch.no_grad():
-            encoded = self._processor.batch_encode([wav.squeeze(0) for wav in prepared], num_quantizers=self._n_vq)
+            encoded = self._processor.batch_encode(waveforms, num_quantizers=self._n_vq)
         return [
             encoded.audio_codes[:, i, : int(length.item())].transpose(0, 1).contiguous()
             for i, length in enumerate(encoded.audio_codes_lengths)
