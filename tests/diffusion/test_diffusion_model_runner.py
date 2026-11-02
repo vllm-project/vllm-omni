@@ -190,6 +190,7 @@ def _make_request_with_params(req_id: str, sampling_params):
 
 def _fake_platform_for_peak_memory():
     return SimpleNamespace(
+        is_available=lambda: False,
         reset_peak_memory_stats=lambda: None,
         max_memory_reserved=lambda: 0,
         max_memory_allocated=lambda: 0,
@@ -256,6 +257,8 @@ def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit
         od_config=runner.od_config,
         device=runner.device,
     )
+    runner._diffusion_kv_metadata_by_request = {}
+    runner.input_batch = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_kv_cache=lambda req, target_device=None: None,
         receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
@@ -347,7 +350,6 @@ def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, 
         request.sampling_params.attention_schedule = list(ranges) if explicit else None
         requests.append(request)
     monkeypatch.setattr(model_runner_module, "set_forward_context", lambda **kwargs: real_set_forward_context())
-
     runner._execute_request_list(
         requests,
         od_config=runner.od_config,
@@ -360,6 +362,169 @@ def test_request_batch_binds_whether_its_requests_sent_their_schedule(explicit, 
     schedule, from_request = runner.pipeline.bound
     assert schedule == runner.od_config.diffusion_attention_schedule.default
     assert from_request is explicit
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_request_forward_allows_mixed_prefix_across_public_requests(monkeypatch):
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata, DiffusionKVSequenceMetadata
+
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.od_config.kv_transfer_config = None
+
+    class _BatchPipeline:
+        supports_request_batch = True
+
+        def forward(self, req):
+            return [DiffusionOutput(output=request.request_id) for request in req.requests]
+
+    runner.pipeline = _BatchPipeline()
+    requests = [_make_request(), _make_request()]
+    requests[0].request_id = "req-short"
+    requests[1].request_id = "req-long"
+    metadata = [
+        DiffusionKVMetadata(
+            request_id=request.request_id,
+            allocation_generation=1,
+            sequences=(
+                DiffusionKVSequenceMetadata(
+                    sequence_id=0,
+                    prefix_len=8,
+                    target_len=4,
+                    seq_len=12,
+                    block_ids=([1, 2, 3],),
+                    cached_prefix_len=prefix,
+                    num_computed_tokens=prefix,
+                ),
+            ),
+        )
+        for request, prefix in zip(requests, (2, 6), strict=True)
+    ]
+    captured = {}
+
+    @contextmanager
+    def capture_context(**kwargs):
+        captured.update(kwargs)
+        yield
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", capture_context)
+    runner.diffusion_kv_backend.activate_paged_attention_metadata = Mock(return_value=(object(), nullcontext()))
+    runner._execute_request_list(
+        requests,
+        od_config=runner.od_config,
+        allow_single_output=False,
+        require_request_batch_support=True,
+        record_name="test",
+        record_output_peak_memory=False,
+        diffusion_kv_metadata=metadata,
+    )
+    assert captured["paged_kv_cached_prefix_len"] == 0
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_request_forward_rejects_mixed_prefix_within_one_request_cfg_rows():
+    from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata, DiffusionKVSequenceMetadata
+
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.od_config.kv_transfer_config = None
+    request = _make_request()
+    metadata = DiffusionKVMetadata(
+        request_id=request.request_id,
+        allocation_generation=1,
+        sequences=tuple(
+            DiffusionKVSequenceMetadata(
+                sequence_id=i,
+                prefix_len=8,
+                target_len=4,
+                seq_len=12,
+                block_ids=([1, 2, 3],),
+                cached_prefix_len=2 + i * 2,
+                num_computed_tokens=2 + i * 2,
+            )
+            for i in range(2)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="uniform cached prefix across its CFG rows"):
+        runner._execute_request_list(
+            [request],
+            od_config=runner.od_config,
+            allow_single_output=True,
+            require_request_batch_support=False,
+            record_name="test",
+            record_output_peak_memory=False,
+            diffusion_kv_metadata=[metadata],
+        )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_stepwise_core_activates_paged_runtime_from_installed_metadata(monkeypatch):
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata, DiffusionKVSequenceMetadata
+
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    runner.pipeline = _FinalOnlyStepPipeline()
+    runner.od_config.diffusion_kv_mode = DiffusionKVCacheMode.PAGED_SCHEDULER
+    runner.od_config.step_execution = True
+    runner.od_config.parallel_config = SimpleNamespace(use_hsdp=False, cfg_parallel_size=1)
+    runner.diffusion_kv_backend.install_diffusion_kv_metadata = Mock(return_value=True)
+    runner.diffusion_kv_backend.remove_diffusion_kv_requests = Mock(return_value=0)
+    runner.diffusion_kv_backend.paged_attention_adapter = object()
+    runtime = object()
+    runner.diffusion_kv_backend.activate_paged_attention_metadata = Mock(return_value=(runtime, nullcontext()))
+
+    request = _make_request()
+    request.request_id = "paged-step"
+    request.use_step_execution = True
+    metadata = DiffusionKVMetadata(
+        request_id="paged-step",
+        allocation_generation=1,
+        sequences=(
+            DiffusionKVSequenceMetadata(
+                sequence_id=0,
+                prefix_len=8,
+                target_len=4,
+                seq_len=12,
+                block_ids=([1, 2],),
+                cached_prefix_len=0,
+            ),
+        ),
+    )
+    captured = {}
+
+    @contextmanager
+    def capture_context(**kwargs):
+        captured.update(kwargs)
+        yield
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", capture_context)
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    monkeypatch.setattr(model_runner_module, "_dit_any_rank_failed", lambda failed: failed)
+
+    result = DiffusionModelRunner.execute_stepwise(
+        runner,
+        DiffusionSchedulerOutput(
+            step_id=0,
+            scheduled_new_reqs=[NewRequestData(request_id="paged-step", req=request, diffusion_kv_metadata=metadata)],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            finished_req_ids=set(),
+            num_running_reqs=1,
+            num_waiting_reqs=0,
+        ),
+    )
+
+    activate = runner.diffusion_kv_backend.activate_paged_attention_metadata
+    activate.assert_called_once()
+    built = activate.call_args.args[0]
+    assert [row.request_id for row in built.prefill_rows] == ["paged-step"]
+    assert [row.request_id for row in built.denoise_rows] == ["paged-step"]
+    assert captured["paged_kv_runtime"] is runtime
+    assert result.get_request_output("paged-step").finished is True
 
 
 def _make_compile_runner(

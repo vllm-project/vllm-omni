@@ -3364,7 +3364,11 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         with self.progress_bar(total=num_inference_steps) as progress_bar, _clear_denoise_progress_on_exit():
             for i, t in enumerate(timesteps):
                 if scheduled_total is None:
-                    set_forward_context_denoise_step_idx(i)
+                    set_forward_context_denoise_step_idx(
+                        i,
+                        request_ids=model_kwargs.get("paged_request_ids"),
+                        paged_step_idx=0 if i == 0 else 1,
+                    )
                 else:
                     self.model.record_denoise_step(i, t, scheduler=self.scheduler, total_steps=scheduled_total)
                 if cfg_parallel_ready:

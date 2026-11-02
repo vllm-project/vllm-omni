@@ -194,6 +194,30 @@ def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_hei
     return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
+def _piecewise_segment_modes(
+    spans: list[tuple[int, int]],
+    query_offset: int,
+    query_len: int,
+) -> tuple[str, ...]:
+    """Return the causal/full mode sequence used to isolate incompatible paged groups."""
+    q_start = query_offset
+    q_end = query_offset + query_len
+    modes: list[str] = []
+    cur = q_start
+    for span_start, span_end in spans:
+        overlap_start = max(span_start, q_start)
+        overlap_end = min(span_end, q_end)
+        if overlap_start >= overlap_end:
+            continue
+        if cur < overlap_start:
+            modes.append("causal")
+        modes.append("full")
+        cur = overlap_end
+    if cur < q_end:
+        modes.append("causal")
+    return tuple(modes)
+
+
 def _shift_full_attn_spans(
     spans: list[tuple[int, int]],
     prefix_len: int | None,
@@ -369,7 +393,7 @@ class HunyuanImage3Pipeline(
     DenoiseProgressMixin,
 ):
     supports_step_execution: ClassVar[bool] = True
-    supports_request_batch = False
+    supports_request_batch = True
     support_image_input = True
     # The warmup request's blank image routes this AR+diffusion model down its
     # image-edit path, where the token block cannot match the latent patch grid.
@@ -585,11 +609,6 @@ class HunyuanImage3Pipeline(
         return self._pipeline
 
     def _validate_step_request(self, state: "StepRequestState") -> None:
-        if self._uses_scheduler_paged_kv():
-            raise ValueError(
-                "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
-                "disable step execution or use dense_legacy."
-            )
         prompt = state.prompt
         sampling = state.sampling
         if prompt is None:
@@ -724,6 +743,8 @@ class HunyuanImage3Pipeline(
         if isinstance(first, torch.Tensor):
             rows = [self._row_from_value(value, branch) for value, branch in zip(values, branches)]
             if key == "attention_mask":
+                if self._uses_scheduler_paged_kv() and prefix_lens is not None:
+                    return None
                 return self._merge_attention_masks(rows, None if first_step else prefix_lens)
             pad_value = self._tkwrapper.pad_token_id if key == "input_ids" else 0
             return self._pad_tensor_rows(rows, pad_value)
@@ -793,6 +814,40 @@ class HunyuanImage3Pipeline(
             is DiffusionKVCacheMode.PAGED_SCHEDULER
         )
 
+    @staticmethod
+    def _row_step_query_len(kwargs: dict[str, Any], branch: int, prefix_len: int | None) -> int:
+        mask = kwargs.get("attention_mask")
+        if isinstance(mask, torch.Tensor) and mask.ndim >= 2:
+            row = mask[branch] if mask.shape[0] > branch else mask[0]
+            return int(row.shape[-2])
+        query_lens = kwargs.get("query_lens")
+        if isinstance(query_lens, list) and query_lens:
+            return int(query_lens[min(branch, len(query_lens) - 1)])
+        num_image_tokens = kwargs.get("num_image_tokens")
+        if num_image_tokens is not None:
+            return int(num_image_tokens)
+        if prefix_len is None:
+            return 0
+        seq_lens = kwargs.get("seq_lens")
+        if isinstance(seq_lens, list) and seq_lens:
+            return max(int(seq_lens[min(branch, len(seq_lens) - 1)]) - prefix_len, 0)
+        return 0
+
+    def _step_segment_structure(self, state: "StepRequestState") -> tuple[str, ...]:
+        kwargs = state.extra.get(_STEP_MODEL_KWARGS) or {}
+        spans = kwargs.get("full_attn_spans") or []
+        row_spans = spans[0] if spans else []
+        if state.step_index == 0:
+            query_offset = 0
+            query_len = self._row_step_query_len(kwargs, 0, None)
+        else:
+            prompt_kv = state.extra.get(_STEP_PROMPT_KV)
+            query_offset = int(prompt_kv[0]["lens"][0].item()) if prompt_kv is not None else 0
+            query_len = self._row_step_query_len(kwargs, 0, query_offset)
+        if query_len <= 0:
+            return ()
+        return _piecewise_segment_modes(row_spans, query_offset, query_len)
+
     def _merge_step_model_inputs(
         self,
         states: list["StepRequestState"],
@@ -817,15 +872,18 @@ class HunyuanImage3Pipeline(
                 continue
             values = [kwargs.get(key) for kwargs in per_row_kwargs]
             if key == "full_attn_spans" and values[0] is not None:
-                merged[key] = [
-                    self._shift_full_attn_spans(value[branch], prefix_len, max_prefix_len)
-                    for value, branch, prefix_len in zip(
-                        values,
-                        row_branches,
-                        prefix_lens or [None] * len(row_branches),
-                        strict=True,
-                    )
-                ]
+                if self._uses_scheduler_paged_kv():
+                    merged[key] = [list(value[branch]) for value, branch in zip(values, row_branches, strict=True)]
+                else:
+                    merged[key] = [
+                        self._shift_full_attn_spans(value[branch], prefix_len, max_prefix_len)
+                        for value, branch, prefix_len in zip(
+                            values,
+                            row_branches,
+                            prefix_lens or [None] * len(row_branches),
+                            strict=True,
+                        )
+                    ]
                 continue
             merged[key] = self._merge_rows(
                 values,
@@ -835,7 +893,16 @@ class HunyuanImage3Pipeline(
                 prefix_lens=prefix_lens,
             )
 
-        if "attention_mask" in merged:
+        if self._uses_scheduler_paged_kv() and prefix_lens is not None:
+            query_lens: list[int] = []
+            seq_lens: list[int] = []
+            for kwargs, branch, prefix_len in zip(per_row_kwargs, row_branches, prefix_lens, strict=True):
+                query_len = self._row_step_query_len(kwargs, branch, prefix_len)
+                query_lens.append(query_len)
+                seq_lens.append(prefix_len + query_len)
+            merged["query_lens"] = query_lens
+            merged["seq_lens"] = seq_lens
+        elif merged.get("attention_mask") is not None:
             b, _, q_len, seq_len = merged["attention_mask"].shape
             merged["query_lens"] = [q_len] * b
             merged["seq_lens"] = [seq_len] * b
@@ -854,6 +921,8 @@ class HunyuanImage3Pipeline(
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
+        if self._uses_scheduler_paged_kv():
+            return
         if states[0].step_index == 0:
             for layer in self.model.layers:
                 mgr = layer.self_attn.image_attn
@@ -881,6 +950,9 @@ class HunyuanImage3Pipeline(
         row_state_indexes: list[int],
         row_branches: list[int],
     ) -> None:
+        if self._uses_scheduler_paged_kv():
+            self._capture_paged_prefix_lens(states)
+            return
         by_state: dict[int, list[dict[str, torch.Tensor]]] = {i: [] for i in range(len(states))}
         for layer in self.model.layers:
             mgr = layer.self_attn.image_attn
@@ -903,6 +975,32 @@ class HunyuanImage3Pipeline(
                 )
         for state_idx, cache in by_state.items():
             states[state_idx].extra[_STEP_PROMPT_KV] = cache
+
+    def _capture_paged_prefix_lens(self, states: list["StepRequestState"]) -> None:
+        for state in states:
+            kwargs = state.extra[_STEP_MODEL_KWARGS]
+            cfg_factor = int(state.extra[_STEP_CFG_FACTOR])
+            num_image_tokens = kwargs.get("num_image_tokens")
+            seq_lens = kwargs.get("seq_lens")
+            mask = kwargs.get("attention_mask")
+            prefixes: list[int] = []
+            for branch in range(cfg_factor):
+                if isinstance(seq_lens, list) and seq_lens:
+                    seq_len = int(seq_lens[min(branch, len(seq_lens) - 1)])
+                elif isinstance(mask, torch.Tensor) and mask.ndim >= 1:
+                    seq_len = int(mask.shape[-1])
+                else:
+                    raise ValueError(
+                        f"Missing Hunyuan sequence length for request {state.request_id} "
+                        "while recording paged prefix lens."
+                    )
+                query_len = (
+                    int(num_image_tokens)
+                    if num_image_tokens is not None
+                    else self._row_step_query_len(kwargs, branch, None)
+                )
+                prefixes.append(max(seq_len - query_len, 0))
+            state.extra[_STEP_PROMPT_KV] = [{"lens": torch.tensor(prefixes, dtype=torch.long)}]
 
     @staticmethod
     def get_pos_emb(custom_pos_emb, position_ids):
@@ -1307,11 +1405,7 @@ class HunyuanImage3Pipeline(
 
             if mode == "gen_image":
                 if prepared_layout is not None:
-                    # TODO: Support batch_size > 1 once prepared layouts can
-                    # preserve the public-request-to-CFG-branch mapping.
-                    if batch_size != 1:
-                        raise ValueError("Hunyuan prepared layout currently supports one public request at a time.")
-                    batch_gen_image_info = [prepared_layout.generated_image_info]
+                    batch_gen_image_info = [prepared_layout.generated_image_info] * batch_size
                 else:
                     batch_gen_image_info = [
                         self.image_processor.build_image_info(
@@ -1660,6 +1754,8 @@ class HunyuanImage3Pipeline(
         }
         if "full_attn_spans" in model_kwargs:
             updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
+        if "paged_request_ids" in model_kwargs:
+            updated_model_kwargs["paged_request_ids"] = model_kwargs["paged_request_ids"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -2025,8 +2121,8 @@ class HunyuanImage3Pipeline(
             k, v = kv["key"], kv["value"]
             cache_mgr._injected_ar_kv = [(k[:positive_reuse_len], v[:positive_reuse_len])]
 
-    def _extract_ar_kv_from_request(self, req) -> dict[str, Any]:
-        kv = getattr(getattr(req, "sampling_params", None), "past_key_values", None)
+    def _extract_ar_kv_from_request(self, request: OmniDiffusionRequest) -> dict[str, Any]:
+        kv = getattr(getattr(request, "sampling_params", None), "past_key_values", None)
         if kv is None:
             return {}
         key_cache = getattr(kv, "key_cache", None)
@@ -2206,10 +2302,23 @@ class HunyuanImage3Pipeline(
             model_kwargs.get("num_image_tokens"),
             model_kwargs.get("ar_kv_reuse_len", 0),
             state.extra.get(_STEP_AR_KV) is not None,
+            self._row_step_query_len(
+                model_kwargs,
+                0,
+                None if state.step_index == 0 else self._step_prefix_len(state),
+            ),
+            self._step_segment_structure(state),
         )
 
+    @staticmethod
+    def _step_prefix_len(state: "StepRequestState") -> int | None:
+        prompt_kv = state.extra.get(_STEP_PROMPT_KV)
+        if prompt_kv is None:
+            return None
+        return int(prompt_kv[0]["lens"][0].item())
+
     def _ensure_grouped_attention_backend_supported(self, num_states: int) -> None:
-        if num_states <= 1:
+        if num_states <= 1 or self._uses_scheduler_paged_kv():
             return
         spec, source = self.od_config.diffusion_attention_config.resolve_with_source(role="self")
         backend = spec.backend.upper() if spec is not None else "AUTO"
@@ -2322,10 +2431,13 @@ class HunyuanImage3Pipeline(
                     next_kwargs[key] = value
             if len(state_rows) != cfg_factor:
                 raise ValueError("Hunyuan step split lost CFG rows while updating request state.")
-            if "attention_mask" in next_kwargs:
+            if isinstance(next_kwargs.get("attention_mask"), torch.Tensor):
                 bsz, _, query_len, seq_len = next_kwargs["attention_mask"].shape
                 next_kwargs["query_lens"] = [query_len] * bsz
                 next_kwargs["seq_lens"] = [seq_len] * bsz
+            elif "query_lens" in merged_kwargs and "seq_lens" in merged_kwargs:
+                next_kwargs["query_lens"] = [merged_kwargs["query_lens"][row_idx] for row_idx in state_rows]
+                next_kwargs["seq_lens"] = [merged_kwargs["seq_lens"][row_idx] for row_idx in state_rows]
             state.extra[_STEP_MODEL_KWARGS] = next_kwargs
             state.extra[_STEP_INPUT_IDS] = None
 
@@ -2376,9 +2488,18 @@ class HunyuanImage3Pipeline(
             **model_kwargs,
         )
 
+        # Paged ensure_active only distinguishes first-step prefill from later
+        # denoise rows, so it gets the phase. Step-gated consumers keep the
+        # real index when the group agrees on one; a mixed later-step group
+        # has no single real index and leaves it unset rather than claiming
+        # step 1.
         step_indexes = {state.step_index for state in states}
         context_step_index = next(iter(step_indexes)) if len(step_indexes) == 1 else None
-        set_forward_context_denoise_step_idx(context_step_index)
+        set_forward_context_denoise_step_idx(
+            context_step_index,
+            request_ids=[state.request_id for state in states],
+            paged_step_idx=0 if first_step else 1,
+        )
         try:
             with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
                 model_output = self.forward_call(**model_inputs, first_step=first_step)
@@ -2420,11 +2541,6 @@ class HunyuanImage3Pipeline(
         states = list(input_batch.states)
         if not states:
             raise ValueError("HunyuanImage3 denoise_step received an empty batch.")
-        if self._uses_scheduler_paged_kv():
-            raise ValueError(
-                "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
-                "disable step execution or use dense_legacy."
-            )
         # A bound schedule selects attention from each request's own step and total, so requests
         # run one at a time and the batch-wide backend check, which reads the baseline config, is skipped.
         scheduled = is_forward_context_available() and bool(get_forward_context().attention_schedule)
@@ -2520,19 +2636,100 @@ class HunyuanImage3Pipeline(
             stage_durations=getattr(self, "stage_durations", None),
         )
 
-    def forward(
+    def _request_cached_prefix_len(self, request: OmniDiffusionRequest) -> int:
+        computed = getattr(request, "kv_computed_tokens", None)
+        if computed:
+            return int(computed[0])
+        if is_forward_context_available():
+            runtime = getattr(get_forward_context(), "paged_kv_runtime", None)
+            if runtime is not None:
+                rows = [row for row in runtime.metadata.prefill_rows if row.request_id == request.request_id]
+                if rows:
+                    return int(rows[0].kv_start_pos)
+        return 0
+
+    def _layout_branch_spans(
         self,
-        req: DiffusionRequestBatch,
-        prompt: str | list[str] = "",
-        image_size="auto",
-        height: int = 1024,
-        width: int = 1024,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 5.0,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        **kwargs,
-    ) -> DiffusionOutput:
-        extra_args = getattr(getattr(req, "sampling_params", None), "extra_args", {}) or {}
+        layout: request_layout_utils.HunyuanPreparedLayout,
+        branch: int,
+    ) -> list[tuple[int, int]]:
+        output = layout.tokenizer_output
+        joint_rows = output.joint_image_slices or [[] for _ in range(layout.num_branches)]
+        gen_rows = output.gen_image_slices or [[] for _ in range(layout.num_branches)]
+        spans = []
+        for image_slice in list(joint_rows[branch]) + list(gen_rows[branch]):
+            start = int(image_slice.start or 0)
+            stop = int(image_slice.stop or 0)
+            if start < stop:
+                spans.append((start, stop))
+        spans.sort(key=lambda item: item[0])
+        return spans
+
+    def _request_group_key(self, request: OmniDiffusionRequest) -> tuple[Any, ...]:
+        sampling = request.sampling_params
+        layout = request_layout_utils.get_hunyuan_prepared_layout(request)
+        guidance_scale = request_layout_utils.resolve_hunyuan_guidance_scale(sampling)
+        has_ar_kv = bool(self._extract_ar_kv_from_request(request))
+        if layout is None:
+            seq_lens: tuple[int, ...] = ()
+            token_width = 0
+            num_image_tokens = 0
+            branch_spans: tuple[tuple[tuple[int, int], ...], ...] = ()
+            cfg_factor = 1 + int(guidance_scale > 1.0)
+        else:
+            seq_lens = tuple(int(row[-1].item()) for row in layout.tokenizer_output.real_pos)
+            token_width = int(layout.tokenizer_output.tokens.shape[1])
+            num_image_tokens = request_layout_utils.hunyuan_num_image_tokens(layout.generated_image_info)
+            branch_spans = tuple(
+                tuple(self._layout_branch_spans(layout, branch)) for branch in range(layout.num_branches)
+            )
+            cfg_factor = request_layout_utils.hunyuan_cfg_factor(layout.generated_image_info, guidance_scale)
+        cached_prefix = self._request_cached_prefix_len(request)
+        if self._uses_scheduler_paged_kv():
+            structure: tuple[Any, ...] = tuple(
+                _piecewise_segment_modes(list(spans), cached_prefix, max(seq_len - cached_prefix, 0))
+                for spans, seq_len in zip(branch_spans, seq_lens, strict=True)
+            )
+        else:
+            structure = branch_spans
+        return (
+            cfg_factor,
+            guidance_scale,
+            int(sampling.num_inference_steps or 50),
+            int(sampling.height or 1024),
+            int(sampling.width or 1024),
+            num_image_tokens,
+            token_width,
+            has_ar_kv,
+            request.request_id if has_ar_kv else None,
+            seq_lens,
+            cached_prefix,
+            structure,
+        )
+
+    def _split_request_groups(
+        self,
+        requests: list[OmniDiffusionRequest],
+    ) -> list[list[OmniDiffusionRequest]]:
+        grouped: dict[tuple[Any, ...], list[OmniDiffusionRequest]] = {}
+        for request in requests:
+            grouped.setdefault(self._request_group_key(request), []).append(request)
+        return list(grouped.values())
+
+    def _forward_request_group(
+        self,
+        requests: list[OmniDiffusionRequest],
+        *,
+        prompt: str | list[str],
+        height: int,
+        width: int,
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator: torch.Generator | list[torch.Generator] | None,
+        kwargs: dict[str, Any],
+    ) -> list[DiffusionOutput]:
+        batch = DiffusionRequestBatch(requests=requests)
+        extra_args = getattr(requests[0].sampling_params, "extra_args", {}) or {}
         (
             prompt_from_req,
             cot_text_list,
@@ -2540,29 +2737,43 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info,
             tokenizer_bot_task,
         ) = request_layout_utils.extract_hunyuan_prompt_inputs(
-            req.prompts,
+            batch.prompts,
             extra_args,
-            request_id=req.request_id,
+            request_id=requests[0].request_id,
             allow_cond_image=True,
         )
         prompt = prompt_from_req or prompt
         cot_text = (
-            [request_layout_utils.normalize_hunyuan_cot_text(t) for t in cot_text_list]
-            if any(t is not None for t in cot_text_list)
+            [request_layout_utils.normalize_hunyuan_cot_text(text) for text in cot_text_list]
+            if any(text is not None for text in cot_text_list)
             else None
         )
-
-        generator = req.sampling_params.generator or generator
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        guidance_scale = request_layout_utils.resolve_hunyuan_guidance_scale(req.sampling_params, guidance_scale)
+        sampling = requests[0].sampling_params
+        generator = batch.collate_request_generators(1, generator)
+        height = sampling.height or height
+        width = sampling.width or width
+        num_inference_steps = sampling.num_inference_steps or num_inference_steps
+        guidance_scale = request_layout_utils.resolve_hunyuan_guidance_scale(sampling, guidance_scale)
         if guidance_scale <= 1.0:
             logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
         image_size = (height, width)
+        layouts = [request_layout_utils.get_hunyuan_prepared_layout(request) for request in requests]
+        if any(layout is None for layout in layouts):
+            if any(layout is not None for layout in layouts):
+                raise ValueError("Cannot mix Hunyuan prepared and unprepared requests in one request batch.")
+            prepared_layout = None
+        else:
+            prepared_layout = request_layout_utils.pack_hunyuan_prepared_layouts(
+                layouts,
+                pad_token_id=self._tkwrapper.pad_token_id or 0,
+            )
+        ar_kv_kwargs = self._extract_ar_kv_from_request(requests[0])
+        if ar_kv_kwargs and len(requests) > 1:
+            raise ValueError("Hunyuan native AR-KV connector stays single-request until that workstream lands.")
 
-        # ---- AR KV Reuse: extract injected KV from request ----
-        ar_kv_kwargs = self._extract_ar_kv_from_request(req)
+        cached_prefix = self._request_cached_prefix_len(requests[0])
+        if is_forward_context_available():
+            get_forward_context().paged_kv_cached_prefix_len = cached_prefix
 
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
@@ -2575,23 +2786,80 @@ class HunyuanImage3Pipeline(
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
-            prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(req.requests[0]),
-            kv_computed_tokens=getattr(req.requests[0], "kv_computed_tokens", ()),
+            prepared_layout=prepared_layout,
+            kv_computed_tokens=getattr(requests[0], "kv_computed_tokens", ()),
+            paged_request_ids=[request.request_id for request in requests],
             **ar_kv_kwargs,
         )
-
         model_inputs.update(ar_kv_kwargs)
+        model_inputs["paged_request_ids"] = [request.request_id for request in requests]
 
-        outputs = self._generate(**model_inputs, **kwargs)
-        image = outputs[0]
-        metadata = {}
-        if any(t is not None for t in cot_text_list):
-            metadata["text"] = {"ar_generated_text": cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list}
+        self._ensure_grouped_attention_backend_supported(len(requests))
+        image = self._generate(**model_inputs, **kwargs)
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        if image.shape[0] != len(requests):
+            raise ValueError(
+                "Hunyuan request-batch decode produced "
+                f"{int(image.shape[0])} images for {len(requests)} public requests."
+            )
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
-        return DiffusionOutput(
-            output={
-                "payload": {"image": image},
-                "metadata": metadata,
-            },
-            stage_durations=stage_durations,
-        )
+        results: list[DiffusionOutput] = []
+        for request_idx, request in enumerate(requests):
+            metadata: dict[str, Any] = {}
+            if request_idx < len(cot_text_list) and cot_text_list[request_idx] is not None:
+                metadata["text"] = {"ar_generated_text": cot_text_list[request_idx]}
+            results.append(
+                DiffusionOutput(
+                    output={
+                        "payload": {"image": image[request_idx]},
+                        "metadata": metadata,
+                    },
+                    stage_durations=stage_durations,
+                )
+            )
+        return results
+
+    def forward(
+        self,
+        req: DiffusionRequestBatch,
+        prompt: str | list[str] = "",
+        image_size="auto",
+        height: int = 1024,
+        width: int = 1024,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 5.0,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        **kwargs,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        del image_size
+        requests = list(req.requests)
+        if not requests:
+            raise ValueError("HunyuanImage3 forward received an empty request batch.")
+        if len(requests) == 1:
+            return self._forward_request_group(
+                requests,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                kwargs=kwargs,
+            )[0]
+
+        outputs_by_id: dict[str, DiffusionOutput] = {}
+        for group in self._split_request_groups(requests):
+            group_outputs = self._forward_request_group(
+                group,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                kwargs=kwargs,
+            )
+            for request, output in zip(group, group_outputs, strict=True):
+                outputs_by_id[request.request_id] = output
+        return [outputs_by_id[request.request_id] for request in requests]

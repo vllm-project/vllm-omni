@@ -86,6 +86,35 @@ def test_build_segments_full_span_retains_global_kv_end():
     assert segments == [Segment(q_start=4, q_end=6, kv_end=7, mode="full")]
 
 
+def test_paged_piecewise_plan_requires_cfg_major_seq_lens_for_grouped_later_step():
+    # Hunyuan `_step_row_order` is CFG-major: cond of every request, then uncond.
+    # Request-major Scheduler seq_lens zip the long request's image span onto the
+    # short uncond row and reject it as out of range.
+    spans = [[(9, 17)], [(5, 13)], [(9, 17)], [(5, 13)]]
+    query_offsets = [9, 5, 9, 5]
+    query_lens = [8, 8, 8, 8]
+    cfg_major_seq_lens = [17, 13, 17, 13]
+    request_major_seq_lens = [17, 17, 13, 13]
+
+    with pytest.raises(ValueError, match="within the sequence"):
+        build_paged_piecewise_plan(
+            spans,
+            query_offsets=query_offsets,
+            query_lens=query_lens,
+            seq_lens=request_major_seq_lens,
+            device=DEVICE,
+        )
+
+    plan = build_paged_piecewise_plan(
+        spans,
+        query_offsets=query_offsets,
+        query_lens=query_lens,
+        seq_lens=cfg_major_seq_lens,
+        device=DEVICE,
+    )
+    assert plan.homogeneous_batch_shape == (4, 8)
+
+
 def test_paged_piecewise_runner_uses_packed_indices_and_kv_endpoints():
     full_attn_spans = [[(2, 5)], [(4, 7)]]
     plan = build_paged_piecewise_plan(
