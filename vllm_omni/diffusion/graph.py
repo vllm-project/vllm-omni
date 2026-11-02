@@ -26,7 +26,8 @@ former; the refusals below cover the configurations that break the latter.
 from __future__ import annotations
 
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -94,6 +95,35 @@ def invalidate_denoise_graphs(reason: str) -> None:
         if runner.num_graphs:
             logger.debug("%s: dropping %d captured denoise graph(s) (%s)", runner.name, runner.num_graphs, reason)
             runner.clear()
+
+
+def release_denoise_graphs_after_denoise(od_config: Any, runner: GraphedForward | None) -> None:
+    """Free ``runner``'s graph pools before decode if ``diffusion_graph_release_after_denoise`` is set.
+
+    Resident graphs keep their memory pools through VAE decode, which can tip a
+    request that fits eager into OOM. Dropping them returns that memory, and the
+    next request recaptures.
+    """
+    if runner is None or not runner.num_graphs:
+        return
+    if not getattr(od_config, "diffusion_graph_release_after_denoise", False):
+        return
+    logger.debug("%s: releasing %d captured denoise graph(s) before decode", runner.name, runner.num_graphs)
+    runner.clear()
+    current_omni_platform.empty_cache()
+
+
+@contextmanager
+def _cache_emptied_first() -> Iterator[None]:
+    """Capture context with ``diffusion_graph_release_after_denoise``.
+
+    The previous request's decode left its blocks cached in the default pool,
+    which a new graph's private pool cannot reuse; returning them first keeps
+    the recapture from stacking on top of them.
+    """
+    if not current_omni_platform.is_graph_capturing():
+        current_omni_platform.empty_cache()
+    yield
 
 
 def _step_dependent_attention(od_config: Any) -> str | None:
@@ -182,6 +212,7 @@ def build_denoise_graph_runner(
         return None
     device = get_local_device()
     graph_cls = current_omni_platform.get_graphed_forward_cls()
+    release = bool(getattr(od_config, "diffusion_graph_release_after_denoise", False))
     runner = graph_cls(
         _StepForward(fn),
         device=device,
@@ -189,6 +220,7 @@ def build_denoise_graph_runner(
         warmup_iters=1,
         group=_capture_agreement_group(),
         name=name,
+        capture_context=_cache_emptied_first if release else None,
     )
     if not runner.enabled:
         logger.warning(

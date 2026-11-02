@@ -34,7 +34,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.graph import build_denoise_graph_runner
+from vllm_omni.diffusion.graph import build_denoise_graph_runner, release_denoise_graphs_after_denoise
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -733,6 +733,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                 negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
 
+        release_denoise_graphs_after_denoise(self.od_config, getattr(self, "_denoise_graph_runner", None))
         if output_type == "latent":
             image = latents
         else:

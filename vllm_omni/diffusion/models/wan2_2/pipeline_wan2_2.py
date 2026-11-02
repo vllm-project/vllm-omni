@@ -31,7 +31,7 @@ from vllm_omni.diffusion.forward_context import (
     begin_scheduled_denoise,
     clear_scheduled_denoise_step_on_exit,
 )
-from vllm_omni.diffusion.graph import build_denoise_graph_runner
+from vllm_omni.diffusion.graph import build_denoise_graph_runner, release_denoise_graphs_after_denoise
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -1497,6 +1497,7 @@ class Wan22Pipeline(
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
+        release_denoise_graphs_after_denoise(self.od_config, getattr(self, "_denoise_graph_runner", None))
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
         self._current_timestep = None

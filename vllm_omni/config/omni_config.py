@@ -884,6 +884,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     # shared engine config.
     enable_cuda_graph_decode: bool = True
     diffusion_use_graph: bool = False
+    diffusion_graph_release_after_denoise: bool = False
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False

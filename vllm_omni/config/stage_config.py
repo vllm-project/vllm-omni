@@ -643,6 +643,7 @@ class StageDeployConfig:
     # enforce_eager=True also disables it.
     enable_cuda_graph_decode: bool | None = None
     diffusion_use_graph: bool | None = None
+    diffusion_graph_release_after_denoise: bool | None = None
     fa_deterministic: bool | None = None
     cache_backend: str | None = None
     cache_config: dict[str, Any] | None = None

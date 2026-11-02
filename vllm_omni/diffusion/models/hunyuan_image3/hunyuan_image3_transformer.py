@@ -84,7 +84,7 @@ from vllm_omni.diffusion.forward_context import (
     paged_kv_prefill,
     set_forward_context_denoise_step_idx,
 )
-from vllm_omni.diffusion.graph import is_capturing, write_through
+from vllm_omni.diffusion.graph import is_capturing, release_denoise_graphs_after_denoise, write_through
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -3499,6 +3499,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
+
+        release_denoise_graphs_after_denoise(
+            getattr(self.model, "od_config", None), getattr(self.model, "_denoise_graph_runner", None)
+        )
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor
