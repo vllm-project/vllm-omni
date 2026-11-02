@@ -102,7 +102,7 @@ def _late_output(monkeypatch, scheduler, request):
 
 def _aborted_once(scheduler, request, freed):
     assert request.status == RequestStatus.FINISHED_ABORTED
-    assert getattr(request, "_minicpmo45_terminal_row", None) is None
+    assert request.request_id not in scheduler._minicpmo45_terminal_rows
     assert freed == [request.request_id]
     assert request.request_id not in scheduler.requests and request not in scheduler.running
 

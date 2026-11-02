@@ -32,10 +32,6 @@ def unpack_handoff_tensor(value: object) -> object:
     return tensor
 
 
-# Ordinary-turn speech ends before these ids, so they need no Thinker row.
-TURN_TTS_END_TOKEN_IDS = (151704, 151645)
-
-
 def ends_with_own_row(payload: object, position: int, token_id: int) -> bool:
     """Whether a forward's rows end at ``token_id``'s own row at ``position``.
 

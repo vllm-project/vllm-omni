@@ -15,6 +15,7 @@ import pytest
 import torch
 from vllm.v1.request import RequestStatus
 
+import vllm_omni.core.sched.omni_ar_scheduler as ar_sched_mod
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
@@ -109,6 +110,7 @@ def _scheduler(
     scheduler._hold_payloadless_outputs = False
     scheduler._native_data_plane = False
     scheduler.max_model_len = 4096
+    scheduler._minicpmo45_terminal_rows = {}
     scheduler._talker_kstep_armed = lambda: False
     scheduler.make_spec_decoding_stats = lambda stats, **kwargs: stats
     scheduler._maybe_decode_pooling_output = lambda *args: None
@@ -303,12 +305,35 @@ def test_other_models_are_never_held(monkeypatch):
     assert _held(scheduler, request) == ([], 0)
 
 
-def test_final_token_at_the_model_length_fails_instead_of_hanging(monkeypatch):
-    # schedule() cannot admit an input at position max_model_len - 1.
-    scheduler, request = _scheduler(monkeypatch)
-    scheduler.max_model_len = 4
-    _step(scheduler, request, [], [12])
-    assert request.status == RequestStatus.FINISHED_ERROR
+@pytest.mark.parametrize(
+    "speculative,drafts,sampled",
+    [(False, [], [12]), (True, [12, 99, 98], [12, 13])],
+    ids=["ordinary", "correction"],
+)
+def test_context_limit_stop_keeps_the_length_finish(monkeypatch, speculative, drafts, sampled):
+    """No position is left for the final token as an input: finish as before, with a warning."""
+    scheduler, request = _scheduler(monkeypatch, speculative=speculative)
+    scheduler.max_model_len = 2 + 1 + len(sampled)
+    warnings = []
+    monkeypatch.setattr(ar_sched_mod.logger, "warning", lambda *args: warnings.append(args))
+    _step(scheduler, request, drafts, sampled)
+    assert request.output_token_ids == [11, *sampled]
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler._minicpmo45_terminal_rows == {}
+    assert [w[1] for w in warnings if "max_model_len" in w[0]] == [request.request_id]
+
+
+def test_release_keeps_an_eligible_step_written_during_schedule(monkeypatch):
+    scheduler, request = _scheduler(monkeypatch, speculative=True)
+    request.max_tokens = 5
+    request.num_output_placeholders = 4
+    held, _ = _held(scheduler, request)
+    scheduler._release_minicpmo45_terminal_holds(held)
+    assert request.next_decode_eligible_step == 0
+    held, _ = _held(scheduler, request)
+    request.next_decode_eligible_step = 9
+    scheduler._release_minicpmo45_terminal_holds(held)
+    assert request.next_decode_eligible_step == 9
 
 
 def test_resumable_session_keeps_the_existing_length_stop(monkeypatch):
