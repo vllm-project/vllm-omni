@@ -9,6 +9,7 @@ import logging
 import queue
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -2341,7 +2342,10 @@ async def test_stage_pool_requested_replica_selects_exact_live_replica(requested
 def test_stage_pool_requested_replica_rejects_unknown_id(requested_replica_id: int) -> None:
     pool, clients, _ = _distributed_routing_pool()
 
-    with pytest.raises(OmniClientError, match=rf"replica_id {requested_replica_id} does not exist"):
+    with pytest.raises(
+        OmniClientError,
+        match=rf"replica_id {requested_replica_id} does not exist or is not available",
+    ):
         pool.bind_requested_replica("requested", requested_replica_id)
 
     assert pool.get_bound_replica_id("requested") is None
@@ -2351,7 +2355,7 @@ def test_stage_pool_requested_replica_rejects_unknown_id(requested_replica_id: i
 def test_stage_pool_requested_replica_rejects_down_replica_without_fallback() -> None:
     pool, clients, _ = _distributed_routing_pool((ReplicaStatus.UP, ReplicaStatus.DOWN))
 
-    with pytest.raises(OmniClientError, match="replica_id 1 is not UP and attached"):
+    with pytest.raises(OmniClientError, match="replica_id 1 does not exist or is not available"):
         pool.bind_requested_replica("requested", 1)
 
     assert pool.get_bound_replica_id("requested") is None
@@ -2362,7 +2366,7 @@ def test_stage_pool_requested_replica_rejects_locally_unavailable_replica() -> N
     pool, clients, _ = _distributed_routing_pool()
     pool.mark_replica_unavailable(1)
 
-    with pytest.raises(OmniClientError, match="replica_id 1 is not UP and attached"):
+    with pytest.raises(OmniClientError, match="replica_id 1 does not exist or is not available"):
         pool.bind_requested_replica("requested", 1)
 
     assert pool.get_bound_replica_id("requested") is None
@@ -2391,7 +2395,7 @@ async def test_stage_pool_requested_replica_down_race_does_not_fallback() -> Non
         final_stage_id=0,
     )
 
-    with pytest.raises(OmniClientError, match="replica_id 1 is not UP and attached"):
+    with pytest.raises(OmniClientError, match="replica_id 1 does not exist or is not available"):
         await pool.submit_initial(
             "requested",
             state,
@@ -2407,7 +2411,6 @@ async def test_stage_pool_requested_replica_down_race_does_not_fallback() -> Non
 async def test_explicit_run_request_detached_before_admission_returns_client_error() -> None:
     pool, clients, hub = _distributed_routing_pool()
     request_id = "requested"
-    assert pool.reserve_requested_replica(request_id, 1) == 1
 
     hub.replicas[1].status = ReplicaStatus.DOWN
     pool.remove_client("tcp://replica-1")
@@ -2439,8 +2442,156 @@ async def test_explicit_run_request_detached_before_admission_returns_client_err
     assert isinstance(error, ErrorMessage)
     assert error.status_code == 400
     assert error.fatal is False
-    assert error.error == "stage 0 replica_id 1 is not UP and attached"
+    assert error.error == "stage 0 replica_id 1 does not exist or is not available"
+    assert pool._requested_replica_ids == {}
     assert all(not client.add_request_calls for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_explicit_run_rejected_before_admission_releases_reservation() -> None:
+    pool, clients, _ = _distributed_routing_pool()
+    request_id = "requested"
+    output_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+        async_chunk=True,
+    )
+
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id=request_id,
+            prompt=FakePromptRequest(request_id=request_id, prompt_token_ids=[1]),
+            original_prompt={},
+            output_prompt_text=None,
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+            yield_stage_id=0,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+            requested_replica_id=1,
+        )
+    )
+
+    error = output_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.status_code == 400
+    assert error.fatal is False
+    assert error.error == "Async chunking is not supported for individual stage processing"
+    assert pool._requested_replica_ids == {}
+    assert pool.get_bound_replica_id(request_id) is None
+    assert all(not client.add_request_calls for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_explicit_entry_stage_replica_down_before_preselection_returns_client_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id = "requested"
+    stage0_pool = StagePool(0, [FakeStageClient()], output_processor=FakeOutputProcessor())
+    stage1_clients = [FakeStageClient(final_output=True), FakeStageClient(final_output=True)]
+    stage1_pool = StagePool(
+        1,
+        stage1_clients,
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_processor_cache_gb=4))
+        ),
+    )
+    output_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[stage0_pool, stage1_pool],
+    )
+    # Input-cache rollback has dedicated coverage; this test isolates the
+    # preselection error mapping and reservation cleanup.
+    monkeypatch.setattr(orchestrator, "_stage_input_submission", lambda _stage_id: nullcontext())
+    reserve_requested_replica = stage1_pool.reserve_requested_replica
+
+    def reserve_then_drop_replica(reserved_request_id: str, replica_id: int) -> int:
+        result = reserve_requested_replica(reserved_request_id, replica_id)
+        stage1_pool.mark_replica_unavailable(replica_id)
+        return result
+
+    monkeypatch.setattr(stage1_pool, "reserve_requested_replica", reserve_then_drop_replica)
+    prompt = {"prompt": "describe", "multi_modal_data": {"image": ["frame-0"]}}
+
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id=request_id,
+            prompt=prompt,
+            original_prompt=prompt,
+            output_prompt_text=None,
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            entry_stage_id=1,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+            requested_replica_id=1,
+        )
+    )
+
+    error = output_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.status_code == 400
+    assert error.fatal is False
+    assert error.error == "stage 1 replica_id 1 does not exist or is not available"
+    assert request_id not in orchestrator.request_states
+    assert stage1_pool._requested_replica_ids == {}
+    assert stage1_pool.get_bound_replica_id(request_id) is None
+    assert all(not client.add_request_calls for client in stage1_clients)
+
+
+@pytest.mark.asyncio
+async def test_explicit_replica_cfg_companion_inherits_parent_affinity() -> None:
+    pool, clients, _ = _distributed_routing_pool()
+    output_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+    )
+
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id="parent",
+            prompt=FakePromptRequest(request_id="parent", prompt_token_ids=[1]),
+            original_prompt={"prompt": "parent"},
+            output_prompt_text=None,
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+            requested_replica_id=1,
+        )
+    )
+    await orchestrator._handle_add_companion(
+        AddCompanionRequestMessage(
+            companion_id="parent-neg",
+            parent_id="parent",
+            role="negative",
+            prompt=FakePromptRequest(request_id="parent-neg", prompt_token_ids=[9]),
+            companion_prompt_text={"prompt": "negative"},
+            sampling_params_list=[_sampling_params()],
+        )
+    )
+
+    assert pool.get_bound_replica_id("parent") == 1
+    assert pool.get_bound_replica_id("parent-neg") == 1
+    assert not clients[0].add_request_calls
+    assert [call[0].request_id for call in clients[1].add_request_calls] == ["parent", "parent-neg"]
+    assert output_queue.empty()
 
 
 def test_stage_pool_requested_replica_supports_sparse_stable_ids() -> None:
@@ -2461,8 +2612,79 @@ def test_stage_pool_requested_replica_supports_sparse_stable_ids() -> None:
     pool.attach_load_balancer(RoundRobinBalancer())
 
     assert pool.clients[1] is None
+    assert pool._replica_id_to_addr == {0: "tcp://replica-0", 2: "tcp://replica-2"}
     assert pool.bind_requested_replica("requested", 2) == 2
     assert pool.get_bound_client("requested") is client2
+
+
+def test_stage_pool_replacing_replica_address_updates_both_maps() -> None:
+    pool = StagePool(0, [])
+    pool.add_client("tcp://old-replica", FakeStageClient(), replica_id=2)
+
+    replacement = FakeStageClient()
+    pool.add_client("tcp://new-replica", replacement, replica_id=2)
+
+    assert pool.clients[2] is replacement
+    assert pool._addr_to_replica_id == {"tcp://new-replica": 2}
+    assert pool._replica_id_to_addr == {2: "tcp://new-replica"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["submit_initial", "submit_update"])
+async def test_requested_replica_rejects_conflicting_internal_pin(operation: str) -> None:
+    clients = [FakeStageClient(), FakeStageClient()]
+    processor = FakeOutputProcessor()
+    pool = StagePool(0, clients, output_processor=processor)
+    state = OrchestratorRequestState(
+        request_id="requested",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    request = FakePromptRequest(request_id="requested", prompt_token_ids=[1])
+
+    with pytest.raises(
+        OmniClientError,
+        match="requested_replica_id 1 conflicts with pinned_replica_id 0",
+    ):
+        await getattr(pool, operation)(
+            "requested",
+            state,
+            request,
+            requested_replica_id=1,
+            pinned_replica_id=0,
+        )
+
+    assert pool._requested_replica_ids == {}
+    assert pool.get_bound_replica_id("requested") is None
+    assert not processor.add_request_calls
+    assert all(not client.add_request_calls for client in clients)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["submit_initial", "submit_update"])
+async def test_requested_replica_accepts_matching_internal_pin(operation: str) -> None:
+    clients = [FakeStageClient(), FakeStageClient()]
+    processor = FakeOutputProcessor()
+    pool = StagePool(0, clients, output_processor=processor)
+    state = OrchestratorRequestState(
+        request_id="requested",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    request = FakePromptRequest(request_id="requested", prompt_token_ids=[1])
+
+    replica_id = await getattr(pool, operation)(
+        "requested",
+        state,
+        request,
+        requested_replica_id=1,
+        pinned_replica_id=1,
+    )
+
+    assert replica_id == 1
+    assert pool.get_bound_replica_id("requested") == 1
+    assert not clients[0].add_request_calls
+    assert len(clients[1].add_request_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -2537,13 +2759,13 @@ def test_stage_pool_pinned_binding_rejects_distributed_mode(distributed_hook: st
 @pytest.mark.asyncio
 async def test_stage_pool_failed_replica_releases_distributed_affinity_and_stops_polling() -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0.client_addresses = {"input_address": "tcp://replica-0"}
     pool = StagePool(
         0,
         [stage0],
         output_processor=FakeOutputProcessor(),
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
-    pool._addr_to_replica_id["tcp://replica-0"] = 0
     pool.bind("distributed-request", "tcp://replica-0")
     pool._request_bindings["legacy-request"] = 0
 
@@ -2558,14 +2780,14 @@ async def test_stage_pool_failed_replica_releases_distributed_affinity_and_stops
 def test_stage_pool_reattached_replica_becomes_available_again() -> None:
     failed_client = FakeStageClient(stage_type="llm", final_output=False)
     replacement_client = FakeStageClient(stage_type="llm", final_output=False)
+    input_addr = "tcp://replica-0"
+    failed_client.client_addresses = {"input_address": input_addr}
     pool = StagePool(
         0,
         [failed_client],
         output_processor=FakeOutputProcessor(),
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
-    input_addr = "tcp://replica-0"
-    pool._addr_to_replica_id[input_addr] = 0
     pool.mark_replica_unavailable(0)
     removed = pool.remove_client(input_addr)
 
@@ -2575,6 +2797,8 @@ def test_stage_pool_reattached_replica_becomes_available_again() -> None:
     assert replica_id == 0
     assert len(pool.clients) == 1
     assert pool.clients[0] is replacement_client
+    assert pool._addr_to_replica_id == {input_addr: 0}
+    assert pool._replica_id_to_addr == {0: input_addr}
     assert pool.available_replica_ids() == [0]
 
 

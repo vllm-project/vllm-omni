@@ -158,11 +158,15 @@ class AsyncOmniEngine(OmniEngineBase):
         self,
         request_id: str,
         prompt: Any,
+        *,
+        requested_replica_id: int | None = None,
     ) -> tuple[int | None, Any]:
-        """Return the preselected stage-0 replica and the prompt to process.
+        """Return the stage-0 replica used to scope the prompt before processing.
 
         The returned prompt is a scoped copy when scoping applies, else
-        ``prompt`` itself.
+        ``prompt`` itself. An explicit replica is already part of the request,
+        so use it directly instead of publishing routing state from the caller
+        thread. Automatic routing still preselects a replica as before.
         """
         stage_pools = getattr(self, "stage_pools", None)
         if isinstance(prompt, EngineCoreRequest) or not stage_pools:
@@ -178,7 +182,9 @@ class AsyncOmniEngine(OmniEngineBase):
         if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
             return None, prompt
 
-        if self._stage_pool_is_distributed(stage0_pool):
+        if requested_replica_id is not None:
+            replica_id = requested_replica_id
+        elif self._stage_pool_is_distributed(stage0_pool):
             preselect_replica_id = getattr(stage0_pool, "preselect_replica_id", None)
             if not callable(preselect_replica_id):
                 logger.debug(
@@ -318,16 +324,18 @@ class AsyncOmniEngine(OmniEngineBase):
             preselected_stage0_replica, prompt = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,
                 prompt,
+                requested_replica_id=requested_replica_id,
             )
 
             # Full input processing (tokenization, multimodal, etc.)
             assert self.input_processor is not None
 
             def _release_failed_preprocess() -> None:
-                """Undo a failed stage-0 preprocess: free the reserved replica
-                binding and drop artifacts the transform already wrote. Reads
-                only server-tracked state — never the client prompt."""
-                if preselected_stage0_replica is not None and self.stage_pools:
+                """Undo a failed stage-0 preprocess: free an automatic-route
+                preselection and drop artifacts the transform already wrote.
+                Explicit routing creates no frontend binding. Reads only
+                server-tracked state — never the client prompt."""
+                if preselected_stage0_replica is not None and requested_replica_id is None and self.stage_pools:
                     self.stage_pools[0].release_binding(request_id)
                 for artifact_dir in request_artifact_dirs:
                     shutil.rmtree(artifact_dir, ignore_errors=True)

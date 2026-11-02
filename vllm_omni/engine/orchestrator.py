@@ -3700,8 +3700,8 @@ class Orchestrator(OrchestratorBase):
         """Fail the request if it can't be submitted to `stage_id`; return whether it failed."""
         if not self.stage_pools[stage_id].live_replica_ids():
             # The stage lost all replicas between the HTTP-layer errored check and
-            # dispatch. Runs before request state / running counter registration,
-            # so the helper's cleanup is a no-op here.
+            # dispatch. Request-state cleanup is a no-op before registration,
+            # but binding cleanup still releases any explicit-route reservation.
             await self._fail_request_dead_stage(req_id, stage_id)
             return True
         if is_run_request and self.async_chunk:
@@ -3871,8 +3871,10 @@ class Orchestrator(OrchestratorBase):
             expected_replica_id = None
             if stage_id != 0:
                 _t_preprocess = _time.perf_counter()
+                preprocessing_started = False
                 try:
                     expected_replica_id = self._preselect_stage_mm_cache_replica(request_id, stage_id, prompt)
+                    preprocessing_started = True
                     prompt = await self._build_entry_stage_request(
                         request_id,
                         stage_id,
@@ -3883,6 +3885,21 @@ class Orchestrator(OrchestratorBase):
                     )
                 except StageUnavailableError:
                     await self._fail_request_dead_stage(request_id, stage_id)
+                    return
+                except OmniClientError as exc:
+                    if preprocessing_started:
+                        await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
+                    # Preserve request-scoped metadata both when preselection
+                    # revalidates a disappeared explicit replica and when the
+                    # input processor raises another OmniClientError.
+                    logger.warning("[Orchestrator] req=%s: stage-%s rejected the prompt: %s", request_id, stage_id, exc)
+                    await self._fail_request_client_error(
+                        request_id,
+                        stage_id,
+                        str(exc),
+                        status_code=exc.status_code,
+                        error_type=exc.error_type,
+                    )
                     return
                 except (ValueError, VLLMClientError) as exc:
                     await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
@@ -4006,6 +4023,10 @@ class Orchestrator(OrchestratorBase):
                 companion_state,
                 companion_prompt,
                 prompt_text=msg.companion_prompt_text,
+                # The parent has already been admitted when this FIFO message
+                # is handled. Inherit its active binding so an explicit parent
+                # route also colocates every CFG companion without giving the
+                # companion a separate caller-selected route.
                 affinity_request_id=parent_id,
                 **route_kwargs,
             )

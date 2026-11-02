@@ -484,6 +484,32 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     assert seen_uuids[0].removeprefix("stage0:rep0:") == seen_uuids[1].removeprefix("stage0:rep1:")
 
 
+def test_explicit_replica_scopes_mm_uuids_without_frontend_reservation(mocker: MockerFixture):
+    engine, seen_uuids = _two_replica_engine_recording_uuids(mocker)
+    params = SamplingParams(max_tokens=8)
+    pool = engine.stage_pools[0]
+    select_replica = mocker.patch.object(
+        pool,
+        "select_replica_id",
+        side_effect=AssertionError("explicit routing must not run frontend replica selection"),
+    )
+
+    msg = engine._build_add_request_message(
+        request_id="req-explicit",
+        prompt={"prompt": "describe", "multi_modal_data": {"image": "image-a"}},
+        sampling_params_list=[params],
+        final_stage_id=0,
+        requested_replica_id=1,
+    )
+
+    assert msg.requested_replica_id == 1
+    assert len(seen_uuids) == 1
+    assert seen_uuids[0].startswith("stage0:rep1:")
+    select_replica.assert_not_called()
+    assert pool._requested_replica_ids == {}
+    assert pool.get_bound_replica_id("req-explicit") is None
+
+
 def _two_replica_engine_recording_uuids(mocker: MockerFixture) -> tuple[AsyncOmniEngine, list[str]]:
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)

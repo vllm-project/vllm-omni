@@ -185,10 +185,10 @@ class StagePool:
         self._watermark_lock = asyncio.Lock()
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
-        # Caller-selected replicas are reserved before preprocessing, but are
-        # not active affinities until admission.  Keeping the intent separate
-        # prevents membership cleanup from reporting a pre-admission request as
-        # a running request whose replica disappeared.
+        # The orchestrator records caller-selected replicas before admission,
+        # but they are not active affinities until submission. Keeping the
+        # intent separate prevents membership cleanup from reporting a
+        # pre-admission request as a running request whose replica disappeared.
         self._requested_replica_ids: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
         # Invoked whenever the replica set changes, so the event-driven loop can
@@ -204,13 +204,15 @@ class StagePool:
         # Tracks which requests should apply watermarking
         self._request_watermarking: dict[str, bool] = {}
 
-        # Distributed-mode state. Populated by add_client / remove_client.
+        # Distributed-mode stable IDs. Address mappings survive client removal
+        # so reattaching the same address restores its previous slot.
         self._addr_to_replica_id: dict[str, int] = {}
+        self._replica_id_to_addr: dict[int, str] = {}
         for replica_id, client in enumerate(self.clients):
             if client is not None:
                 addr = self._client_input_addr(client)
                 if addr is not None:
-                    self._addr_to_replica_id[addr] = replica_id
+                    self._set_replica_address(replica_id, addr)
 
         # Distributed-mode dispatch hooks (injected by Orchestrator on bring-up).
         self._hub: OmniCoordClientForHub | None = None
@@ -320,6 +322,19 @@ class StagePool:
         if listener is not None:
             listener()
 
+    def _set_replica_address(self, replica_id: int, input_addr: str) -> None:
+        """Update the stable replica/address bijection in both directions."""
+        previous_replica_id = self._addr_to_replica_id.get(input_addr)
+        if previous_replica_id is not None and previous_replica_id != replica_id:
+            self._replica_id_to_addr.pop(previous_replica_id, None)
+
+        previous_addr = self._replica_id_to_addr.get(replica_id)
+        if previous_addr is not None and previous_addr != input_addr:
+            self._addr_to_replica_id.pop(previous_addr, None)
+
+        self._addr_to_replica_id[input_addr] = replica_id
+        self._replica_id_to_addr[replica_id] = input_addr
+
     def add_client(self, input_addr: str, client: Any, *, replica_id: int | None = None) -> int:
         """Register a head-side client for ``input_addr``.
 
@@ -349,11 +364,8 @@ class StagePool:
         while len(self.clients) <= replica_id:
             self.clients.append(None)
             self._replica_metrics.append(_ReplicaMetrics())
-        for known_addr, known_replica_id in list(self._addr_to_replica_id.items()):
-            if known_replica_id == replica_id and known_addr != input_addr:
-                self._addr_to_replica_id.pop(known_addr, None)
         self.clients[replica_id] = client
-        self._addr_to_replica_id[input_addr] = replica_id
+        self._set_replica_address(replica_id, input_addr)
         self._unavailable_replicas.discard(replica_id)
         self._notify_membership_changed()
         return replica_id
@@ -560,25 +572,17 @@ class StagePool:
         return replica_id
 
     def _validate_requested_replica(self, replica_id: int) -> str | None:
-        """Validate a caller-selected replica without creating an affinity."""
+        """Validate a caller-selected replica without creating an affinity.
+
+        Returns its input address in distributed mode and ``None`` otherwise.
+        """
         input_addr: str | None = None
-        if self.is_distributed:
-            input_addr = next(
-                (addr for addr, known_id in self._addr_to_replica_id.items() if known_id == replica_id),
-                None,
-            )
-            if replica_id < 0 or input_addr is None:
-                raise OmniClientError(f"stage {self.stage_id} replica_id {replica_id} does not exist")
-            if (
-                not self.is_replica_available(replica_id)
-                or self._serviceable_replica_id_for_addr(input_addr) != replica_id
-            ):
-                raise OmniClientError(f"stage {self.stage_id} replica_id {replica_id} is not UP and attached")
-        else:
-            if replica_id < 0 or replica_id >= len(self.clients):
-                raise OmniClientError(f"stage {self.stage_id} replica_id {replica_id} does not exist")
-            if not self.is_replica_available(replica_id):
-                raise OmniClientError(f"stage {self.stage_id} replica_id {replica_id} is not available")
+        available = self.is_replica_available(replica_id)
+        if available and self.is_distributed:
+            input_addr = self._replica_id_to_addr.get(replica_id)
+            available = input_addr is not None and self._serviceable_replica_id_for_addr(input_addr) == replica_id
+        if not available:
+            raise OmniClientError(f"stage {self.stage_id} replica_id {replica_id} does not exist or is not available")
         return input_addr
 
     def reserve_requested_replica(self, request_id: str, replica_id: int) -> int:
@@ -1174,6 +1178,22 @@ class StagePool:
 
     # ---- Stage-local admission ----
 
+    def _validate_requested_replica_pin(
+        self,
+        requested_replica_id: int | None,
+        pinned_replica_id: int | None,
+    ) -> None:
+        """Reject contradictory external and internal route requirements."""
+        if (
+            requested_replica_id is not None
+            and pinned_replica_id is not None
+            and requested_replica_id != pinned_replica_id
+        ):
+            raise OmniClientError(
+                f"stage {self.stage_id} requested_replica_id {requested_replica_id} "
+                f"conflicts with pinned_replica_id {pinned_replica_id}"
+            )
+
     async def submit_initial(
         self,
         request_id: str,
@@ -1189,6 +1209,7 @@ class StagePool:
         expected_replica_id: int | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
+        self._validate_requested_replica_pin(requested_replica_id, pinned_replica_id)
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
@@ -1297,6 +1318,7 @@ class StagePool:
         submit_kwargs: DiffusionSubmitKwargs | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
+        self._validate_requested_replica_pin(requested_replica_id, pinned_replica_id)
         submit_kwargs = submit_kwargs or DiffusionSubmitKwargs()
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
