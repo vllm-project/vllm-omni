@@ -3,6 +3,7 @@
 """VoxCPM2 serving adapter (AR base-LM + diffusion side-computation)."""
 
 import time
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -12,9 +13,25 @@ from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechReques
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest, apply_max_new_tokens
 from vllm_omni.entrypoints.openai.tts_adapters.capabilities import load_precomputed_speakers
+from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import (
+    normalize_voxcpm2_text,
+    shape_voxcpm2_edge_digits,
+)
 from vllm_omni.utils.speaker_cache import validate_voxcpm2_profile
 
 logger = init_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _text_normalizer():
+    """Lazy TextNormalizer singleton (None when unavailable = TN off)."""
+    try:
+        from voxcpm.utils.text_normalize import TextNormalizer
+
+        return TextNormalizer()
+    except Exception:
+        logger.warning("VoxCPM2 TextNormalizer unavailable, TN disabled")
+        return None
 
 
 @register_tts_adapter
@@ -77,11 +94,16 @@ class VoxCPM2Adapter(ARTTSAdapter):
             ref_audio = np.ascontiguousarray(wav_np, dtype=np.float32).tobytes()
         elif request.voice is not None:
             voice_profile = self.capabilities.precomputed_speakers.get(request.voice.lower())
+        # Edge digit-run prosody shaping (comma lead-in / sentence-final stop /
+        # lone-zero sentinel) BEFORE tokenization, then TextNormalizer on the
+        # shaped text; see voxcpm2_digits for the measured rationale.
+        text = shape_voxcpm2_edge_digits(request.input)
+        text = normalize_voxcpm2_text(text, _text_normalizer())
         return build_voxcpm2_prompt(
             hf_config=self.ctx.engine_client.model_config.hf_config,
             tokenizer=self._tokenizer,
             split_map=self._split_map,
-            text=request.input,
+            text=text,
             ref_audio=ref_audio,
             ref_sr=ref_sr,
             ref_text=request.ref_text,
