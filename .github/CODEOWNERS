@@ -94,6 +94,7 @@
 # primary_code_path_owners. Last-match-wins, so these must stay after /platforms/.
 /vllm_omni/platforms/npu/ @gcanlin @tjtanaa @xuechendi @FayeSpica
 /vllm_omni/platforms/rocm/ @gcanlin @tjtanaa @xuechendi @haic0
+/vllm_omni/platforms/musa/ @yeahdongcn
 /vllm_omni/attention/ @gcanlin @tjtanaa @xuechendi @david6666666 @lishunyang12
 
 # Configuration & deploy — docs/design/module/vllm_omni_config.md
