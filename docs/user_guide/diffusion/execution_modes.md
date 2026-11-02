@@ -119,7 +119,10 @@ continuous batching by packing co-batched requests into one sequence that keeps
 a separate attention document per request; that layout needs a backend which
 honors the packed `cu_seqlens` metadata, so run it with
 `--diffusion-attention-backend FLASH_ATTN` (other backends stay correct but
-fall back to one transformer forward per request). Batching H3 does not improve
+fall back to one transformer forward per request). A scheduled H3 step batch
+stays packed only when every request is at the same step and sigma and the selected
+profile's backends isolate packed requests; otherwise it runs one forward per
+request. Batching H3 does not improve
 its throughput — see the measured numbers in the
 [MiniMax-H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md)
 — so keep `--max-num-seqs 1` unless you need step-level scheduling. Consult the
