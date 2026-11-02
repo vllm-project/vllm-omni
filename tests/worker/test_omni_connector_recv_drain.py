@@ -168,7 +168,16 @@ def _legacy_loop(host: _Host) -> None:
             host._wait_for_next_payload(generation)
 
 
-def _burst(loop) -> tuple[int, int, int]:
+_BURST_ROWS = 96
+_BURST_TIMEOUT_S = 60.0
+
+
+def _burst(loop) -> tuple[int, float, int]:
+    """Run until ``_BURST_ROWS`` chunks land, not for a fixed time window.
+
+    A loaded runner can starve the receive thread for a whole short window,
+    so both loops would finish only their first full scan and look the same.
+    """
     connector = _Connector()
     host = _host(connector)
     stop = threading.Event()
@@ -186,12 +195,17 @@ def _burst(loop) -> tuple[int, int, int]:
     producer = threading.Thread(target=produce, daemon=True)
     producer.start()
     iters = 0
-    deadline = time.perf_counter() + 0.2
+    start = time.perf_counter()
+    deadline = start + _BURST_TIMEOUT_S
     try:
-        while time.perf_counter() < deadline:
-            iters += 1
+        rows = 0
+        while rows < _BURST_ROWS:
+            assert time.perf_counter() < deadline, f"only {rows}/{_BURST_ROWS} chunks in {_BURST_TIMEOUT_S}s"
+            for _ in range(1000):
+                iters += 1
+            rows = _rows(host)
         gets = connector.gets
-        return gets, iters, _rows(host)
+        return gets, iters / (time.perf_counter() - start), rows
     finally:
         stop.set()
         producer.join(timeout=1)
@@ -300,14 +314,13 @@ def test_registered_request_that_missed_is_polled_again_during_a_burst():
 
 
 def test_burst_receive_yields_the_model_thread():
-    legacy_gets, legacy_iters, legacy_rows = _burst(_legacy_loop)
-    drain_gets, drain_iters, drain_rows = _burst(_Host._recv_loop)
+    legacy_gets, legacy_rate, legacy_rows = _burst(_legacy_loop)
+    drain_gets, drain_rate, drain_rows = _burst(_Host._recv_loop)
     print(
         f"burst: gets {legacy_gets} -> {drain_gets}, "
-        f"model-thread iters {legacy_iters} -> {drain_iters}, "
+        f"model-thread iters/s {legacy_rate:.0f} -> {drain_rate:.0f}, "
         f"chunks {legacy_rows} -> {drain_rows}"
     )
-    assert legacy_rows > 0 and drain_rows > 0
-    # Poll count is the stable signal. The iteration count shows the model
-    # thread got more of the GIL, but it moves with machine load.
-    assert drain_gets < legacy_gets * 0.85
+    # Polls per received chunk is the stable signal. The iteration rate shows
+    # the model thread got more of the GIL, but it moves with machine load.
+    assert drain_gets / drain_rows < legacy_gets / legacy_rows * 0.85
