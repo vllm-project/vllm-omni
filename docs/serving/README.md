@@ -54,6 +54,8 @@ the default wrapper for every generation task.
 | Sound, music, or ambient audio generation | `POST /v1/audio/generate` | JSON | Audio bytes | [Audio Generation](audio_generate_api.md) |
 | Text-to-image | `POST /v1/images/generations` | JSON | Base64 JSON or an image file | [Image Generation](image_generation_api.md) |
 | Image editing | `POST /v1/images/edits` | Multipart form | Base64 JSON or SSE | [Image Edit](image_edit_api.md) |
+| Promptable image segmentation | `POST /v1/images/segmentations` | Multipart form | Instance masks, boxes, scores (JSON) | [Image Segmentation](image_segmentation_api.md) |
+| Video concept segmentation and tracking | `POST /v1/videos/segmentations` | Multipart form | Per-frame tracked instance masks, boxes, scores (JSON); optional mask videos | [Video Segmentation](video_segmentation_api.md) |
 | Video generation (recommended) | `POST /v1/videos` | Multipart form | Asynchronous job JSON | [Videos](videos_api.md) |
 | Video generation (blocking) | `POST /v1/videos/sync` | Multipart form | Video bytes | [Videos](videos_api.md#synchronous-response) |
 
@@ -180,6 +182,7 @@ the other protocol.
 | TTS voice management | `GET/POST /v1/audio/voices`, `DELETE /v1/audio/voices/{name}` | [Voices](speech_api.md#voices-endpoint) |
 | Video job lifecycle | `GET /v1/videos`, `GET/DELETE /v1/videos/{video_id}`, `GET /v1/videos/{video_id}/content` | [Video endpoints](videos_api.md#endpoints) |
 | Release and restore stage memory | `POST /v1/omni/sleep`, `POST /v1/omni/wakeup` | [Sleep Mode](../features/sleep_mode.md) |
+| Run one stage per call (experimental) | `POST /v1/run` | [Independent Stage Execution](../features/independent_stage_execution.md) |
 
 ## Standalone Experimental Servers
 

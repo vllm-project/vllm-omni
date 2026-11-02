@@ -182,12 +182,27 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._prev_step_idle = False
+        self._failed_optional_model_hooks: set[str] = set()
         self._gen_model_output: Any = None
         self._gen_input_batch: Any = None
         # Placeholder for ExecuteModelState.hidden_states — allocated
         # once and reused every step to avoid per-forward allocation.
         self._dummy_hidden = torch.zeros(1, dtype=self.dtype, device=self.device)
         self._retains_state_across_chunks = bool(getattr(self.model_config, "retains_state_across_chunks", False))
+
+    def _call_optional_model_hook(self, name: str, *args: object) -> None:
+        """Keep optional cache warmup failures from terminating the engine."""
+        hook = getattr(self.model, name, None)
+        if not callable(hook):
+            return
+        try:
+            hook(*args)
+        except Exception:
+            # Idle polling is frequent; retain diagnostics without log flooding.
+            log = logger.debug if name in self._failed_optional_model_hooks else logger.warning
+            self._failed_optional_model_hooks.add(name)
+            log("Optional model hook %s failed; continuing without it.", name, exc_info=True)
 
     # ------------------------------------------------------------------
     # Async-chunk support: replace prompt_token_ids for cached requests
@@ -334,10 +349,17 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        prev_step_idle = self._prev_step_idle
+        # Dummy forwards also break consecutive idle polls: their device work
+        # may still be in flight when the next real idle step arrives.
+        self._prev_step_idle = scheduler_output.total_num_scheduled_tokens == 0
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
+            # Finish old state before queuing a prewarm for a reused request id.
+            if prewarms := getattr(scheduler_output, "pending_request_prewarms", None):
+                self._call_optional_model_hook("on_requests_added", prewarms)
             if (
                 scheduler_output.total_num_scheduled_tokens == 0
                 and not scheduler_output.scheduled_new_reqs
@@ -348,6 +370,11 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 self._apply_block_table_staged_writes_if_available()
                 if self.aux_output_connector is not None:
                     self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
+                # The first idle step may still overlap the previous output.
+                # Match V1: warm only on a subsequent idle poll, in the same
+                # inference mode and stream as the model forward.
+                if prev_step_idle:
+                    self._call_optional_model_hook("run_idle_prefetch")
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return self._attach_native_data_plane_signals(
                     self._merge_ec_connector_no_forward(scheduler_output, empty_output)
@@ -363,6 +390,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             if self.aux_output_connector is not None:
                 self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
             if scheduler_output.total_num_scheduled_tokens == 0:
+                if prev_step_idle:
+                    self._call_optional_model_hook("run_idle_prefetch")
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return self._attach_native_data_plane_signals(
                     self._merge_ec_connector_no_forward(scheduler_output, empty_output)

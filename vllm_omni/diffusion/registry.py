@@ -266,6 +266,18 @@ _DIFFUSION_MODELS = {
         "pipeline_pi05",
         "Pi05Pipeline",
     ),
+    # SAM3 image checkpoints report ``Sam3Model``; the released combined
+    # image/video checkpoint reports ``Sam3VideoModel``. Both carry the detector.
+    "Sam3Model": (
+        "sam3",
+        "pipeline_sam3",
+        "Sam3Pipeline",
+    ),
+    "Sam3VideoModel": (
+        "sam3",
+        "pipeline_sam3",
+        "Sam3Pipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -461,6 +473,9 @@ _NO_CACHE_ACCELERATION = {
     # instead of erroring.
     "Pi0Pipeline",
     "Pi05Pipeline",
+    # SAM3 is a single forward pass with no denoising steps to cache.
+    "Sam3Model",
+    "Sam3VideoModel",
     "LingBotWorldCausalDMDPipeline",
     "TaoMateH3Pipeline",
     "CausVidWanPipeline",
