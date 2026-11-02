@@ -156,3 +156,16 @@ MiniMax-H3 supplies `MiniMaxH3VSAImpl` through `impl_overrides`.
 `models/minimax_h3/attention/fastvideo_h3.py` owns its prefix layout, video tiling, and
 learned compression gate. Pooling, block-map construction, and tile64 provider
 calls are shared through `attention/ops/block_sparse.py`.
+
+## CosyVoice3 Ascend graph region
+
+CosyVoice3 has an opt-in, model-owned NPU graph adapter around the complete
+Flow Euler solve. The adapter directly calls the FIA inference API for dense,
+noncausal FP16/BF16 DiT attention with a boolean key-padding mask. It converts
+keep-mask semantics to FIA's blocked-mask semantics and preserves masking of
+padded query outputs in the model. FIA also serves the adapter's eager warmup
+and graph-limit fallback paths. Selecting another backend does not replace FIA
+while the adapter is enabled. Disable the adapter to exercise the generic
+backend path. The ordinary selector and other models are unchanged.
+See the [CosyVoice3 serving guide](../../user_guide/examples/online_serving/text_to_speech.md#ascend-stage-1-graph-regions)
+for enablement, supported dtypes, capture limits, and failure behavior.
