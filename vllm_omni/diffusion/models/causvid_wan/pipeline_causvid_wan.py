@@ -53,7 +53,11 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     cfg_step_replicas,
 )
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
-from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import ARDiffusionNoisyKVSpec
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
+    ARDiffusionNoisyKVSpec,
+    clean_history_cells,
+    prior_history_in_pool,
+)
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
 logger = init_logger(__name__)
@@ -315,7 +319,7 @@ class CausVidWanPipeline(nn.Module):
         length = int(mask.gt(0).sum().item())
         return torch.cat([hidden[:, :length], hidden.new_zeros(1, max_length - length, hidden.shape[2])], dim=1)
 
-    def _plan_for(self, req: OmniDiffusionRequest):
+    def _plan_for(self, req: OmniDiffusionRequest, *, chunk_base: int = 0, prior_history=None):
         sp = req.sampling_params
         extra = dict(sp.extra_args or {}) if sp is not None else {}
         if "shift" not in extra:
@@ -390,8 +394,9 @@ class CausVidWanPipeline(nn.Module):
             kv_history_chunks=history,
             blocks=num_blocks if num_blocks > 0 else None,
             blocks_per_rank=local_blocks if local_blocks > 0 else None,
+            chunk_base=chunk_base,
         )
-        return build_cell_plan(schedule), extra, denoise
+        return build_cell_plan(schedule, prior_history=prior_history), extra, denoise
 
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         assert self.vae is not None
@@ -505,10 +510,25 @@ class CausVidWanPipeline(nn.Module):
         device, dtype = param.device, param.dtype
         outputs: list[DiffusionOutput] = []
         for item in requests:
-            plan, extra, denoise = self._plan_for(item)
-            req_id = str(getattr(item, "request_id", None) or extra.get("request_id") or "")
+            req_id = str(getattr(item, "request_id", None) or "")
+            sp = item.sampling_params
+            extra_peek = dict(sp.extra_args or {}) if sp is not None else {}
+            raw_session = extra_peek.get("session_id")
+            persist = raw_session is not None and str(raw_session) != ""
+            # Pool key is the outer session id when present; otherwise the request id.
+            kv_id = str(raw_session) if persist else req_id
+            if not kv_id:
+                raise ValueError("CausVidWan path requires a non-empty request_id or session_id")
+            chunk_base = int(extra_peek.get("chunk_base", 0) or 0)
+            if chunk_base < 0:
+                raise ValueError(f"chunk_base must be non-negative, got {chunk_base}")
+            prior = frozenset()
+            if persist and chunk_base > 0:
+                prior = prior_history_in_pool(ctx.kv.cache, kv_id, chunk_base=chunk_base)
+            plan, extra, denoise = self._plan_for(item, chunk_base=chunk_base, prior_history=prior)
+            schedule = plan.schedule
             if not req_id:
-                raise ValueError("CausVidWan path requires a non-empty request_id")
+                req_id = kv_id
             shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
             if len(shape) != 5:
                 raise ValueError(f"latent_shape must be B,C,T,H,W; got {shape}")
@@ -522,7 +542,11 @@ class CausVidWanPipeline(nn.Module):
                     f"latent_shape token count {chunk_tokens} does not match preallocated NoisyKV "
                     f"max_chunk_tokens={spec.max_chunk_tokens}"
                 )
-            ctx.enqueue(req_id, plan, chunk_tokens=chunk_tokens)
+            num_blocks = int(schedule.num_blocks)
+            retain = set(prior)
+            if persist:
+                retain |= clean_history_cells(schedule, num_blocks=num_blocks)
+            ctx.enqueue(kv_id, plan, chunk_tokens=chunk_tokens, retain=retain)
 
             prompt = self._prompt_text(item.prompt)
             prompt_embeds = self._encode_prompt(prompt, device, dtype)
@@ -546,7 +570,7 @@ class CausVidWanPipeline(nn.Module):
                 stream_job = start_async_stream_decode(
                     vae=self.vae,
                     decoder=self._get_streaming_decoder(),
-                    session_id=req_id,
+                    session_id=kv_id,
                     n_chunks=plan.schedule.chunks,
                     latent_shape=shape,
                     dtype=dtype,
@@ -572,6 +596,10 @@ class CausVidWanPipeline(nn.Module):
             )
             # DiT tick loop; stream_job decode/send threads overlap on the side.
             run_cell_pipeline(ctx=ctx, adapter=adapter)
+            if persist:
+                # Keep only the trailing clean window; outer session owns when to release.
+                kept = clean_history_cells(schedule, num_blocks=num_blocks)
+                ctx.kv.end_request(kv_id, retain=kept)
             if stream_job is not None:
                 video = stream_job.join()
                 if video is not None:
@@ -580,7 +608,7 @@ class CausVidWanPipeline(nn.Module):
                     outputs.append(self._placeholder_output(device, dtype))
                 continue
             finished = self._gather_finished(adapter.finished, pp_group)
-            chunk_map = finished.get(req_id, {})
+            chunk_map = finished.get(kv_id, {})
             if pp_rank == 0 and chunk_map:
                 ordered = [chunk_map[c] for c in sorted(chunk_map)]
                 latents = torch.cat(ordered, dim=2)

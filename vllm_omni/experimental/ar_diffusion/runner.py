@@ -466,6 +466,32 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         """
         self.release_step_requests(getattr(scheduler_output, "finished_req_ids", None) or ())
 
+    @staticmethod
+    def _noisy_kv_id(req: OmniDiffusionRequest) -> tuple[str, bool, bool, bool]:
+        """Return ``(kv_id, persist, reset, close)`` from request fields only.
+
+        Lifecycle belongs outside this runner. An explicit ``session_id`` is the
+        pool key and may retain history across requests; otherwise the request
+        id is ephemeral and versions are released after the forward.
+        """
+        session_id, extra_args, tick = ARDiffusionModelRunner._request_session(req)
+        if tick is not None:
+            return tick.session_id, not bool(tick.close_session), bool(tick.reset), bool(tick.close_session)
+        raw = extra_args.get("session_id")
+        explicit = raw is not None and str(raw) != ""
+        kv_id = str(raw) if explicit else str(getattr(req, "request_id", None) or session_id)
+        reset = bool(extra_args.get("reset", False))
+        close_session = bool(extra_args.get("close_session", False))
+        persist = explicit and not close_session
+        return kv_id, persist, reset, close_session
+
+    def release_noisy_kv(self, kv_id: str) -> None:
+        """Drop retained Noisy KV versions for ``kv_id`` (outer session reset/close)."""
+        if self.noisy_kv_cache is None:
+            return
+        NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
+        logger.debug("AR-Diffusion released noisy KV id=%s", kv_id)
+
     def _make_chunk_context(self):
         from vllm_omni.experimental.ar_diffusion.cell_executor import (
             ARDiffusionCellContext,
@@ -499,6 +525,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     ) -> DiffusionOutput:
         if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
             started = time.perf_counter()
+            kv_id, persist, reset, close_session = self._noisy_kv_id(req)
+            if reset:
+                self.release_noisy_kv(kv_id)
             ctx = self._make_chunk_context()
             try:
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
@@ -506,9 +535,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                         req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
                     )
             except Exception:
-                ctx.kv.reset_all()
-                logger.warning("AR-Diffusion chunk forward failed; NoisyKV versions were released fail-closed")
+                self.release_noisy_kv(kv_id)
+                logger.warning(
+                    "AR-Diffusion chunk forward failed for kv_id=%s; NoisyKV versions were released fail-closed",
+                    kv_id,
+                )
                 raise
+            if close_session or not persist:
+                # Ephemeral requests and explicit close drop the pool key; a
+                # persistent session_id leaves retained history for the outer owner.
+                self.release_noisy_kv(kv_id)
             self._perf_e2e_times.append(time.perf_counter() - started)
             return output
         if self.kv_cache is None:

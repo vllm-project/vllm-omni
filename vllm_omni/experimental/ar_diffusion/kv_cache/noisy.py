@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection, Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -14,6 +15,7 @@ import torch.distributed as dist
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
     CellPlan,
+    CellSchedule,
     Inflight,
     Ordering,
     RequestKVTransfer,
@@ -511,14 +513,42 @@ class NoisyKVCache:
         self.reserved_bytes = self.capacity * bytes_all_layers
 
 
+def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]:
+    """Clean ``(chunk, T, block)`` cells in the trailing history window of ``schedule``."""
+    h = schedule.kv_history_chunks
+    if h < 1 or num_blocks < 1:
+        return set()
+    end = schedule.chunk_end
+    start = max(0, end - h)
+    t_clean = schedule.num_denoise_steps
+    return {(chunk, t_clean, block) for chunk in range(start, end) for block in range(num_blocks)}
+
+
+def prior_history_in_pool(
+    cache: NoisyKVCache,
+    kv_id: str,
+    *,
+    chunk_base: int,
+) -> frozenset[Cell]:
+    """Resident cells for ``kv_id`` with ``chunk < chunk_base`` (outer session supplies base)."""
+    if chunk_base <= 0:
+        return frozenset()
+    return frozenset(
+        (chunk, step, block)
+        for sid, chunk, step, block in cache.pool.keys
+        if sid == kv_id and chunk < chunk_base
+    )
+
+
 class NoisyKVState:
-    """Per-request bridge used by the chunk executor."""
+    """Per-invocation bridge used by the chunk executor over a shared pool."""
 
     def __init__(self, cache: NoisyKVCache) -> None:
         self.cache = cache
         self._plans: dict[str, CellPlan] = {}
         self._chunk_tokens: dict[str, int] = {}
         self._last_use_global: dict[str, dict[Cell, int]] = {}
+        self._retain: dict[str, set[Cell]] = {}
         self.bytes_sent = 0
         self.bytes_received = 0
         self.transfers_deduped = 0
@@ -548,7 +578,20 @@ class NoisyKVState:
     def wait_sends(self) -> None:
         self.cache.transport.wait_sends()
 
-    def begin_request(self, req: str, plan: CellPlan, *, chunk_tokens: int, t0: int = 0) -> None:
+    def protect(self, req: str, cells: Iterable[Cell]) -> None:
+        """Keep ``cells`` for ``req`` out of last-use eviction and end_request release."""
+        bucket = self._retain.setdefault(req, set())
+        bucket.update(cells)
+
+    def begin_request(
+        self,
+        req: str,
+        plan: CellPlan,
+        *,
+        chunk_tokens: int,
+        t0: int = 0,
+        retain: Collection[Cell] | None = None,
+    ) -> None:
         if chunk_tokens <= 0 or chunk_tokens % self.cache.spec.block_size != 0:
             raise ValueError("chunk_tokens must be a positive multiple of block_size")
         if chunk_tokens > self.cache.spec.max_chunk_tokens:
@@ -557,13 +600,21 @@ class NoisyKVState:
         self._chunk_tokens[req] = chunk_tokens
         mapped = {version: t0 + slot for version, slot in plan.last_use(self._rank).items()}
         self._last_use_global[req] = mapped
+        if retain:
+            self.protect(req, retain)
 
     def set_inflight(self, inflight: tuple[Inflight, ...]) -> None:
         self._inflight = inflight
 
-    def end_request(self, req: str) -> None:
+    def _is_retained(self, req: str, version: Cell) -> bool:
+        return version in self._retain.get(req, ())
+
+    def end_request(self, req: str, *, retain: Collection[Cell] | None = None) -> None:
         self.cache.transport.wait_sends()
-        drop = [key for key in self.cache.pool.keys if key[0] == req]
+        if retain is not None:
+            self._retain[req] = set(retain)
+        keep = {_version_key(req, cell) for cell in self._retain.get(req, ())}
+        drop = [key for key in self.cache.pool.keys if key[0] == req and key not in keep]
         for key in drop:
             self.cache.transport.discard(key)
         for key in drop:
@@ -571,10 +622,21 @@ class NoisyKVState:
         self._plans.pop(req, None)
         self._chunk_tokens.pop(req, None)
         self._last_use_global.pop(req, None)
+        if not keep:
+            self._retain.pop(req, None)
+
+    def release_session(self, session_id: str) -> None:
+        """Drop every pool version and bookkeeping for one session id."""
+        self.end_request(session_id, retain=())
+        leftover = [key for key in self.cache.pool.keys if key[0] == session_id]
+        for key in leftover:
+            self.cache.transport.discard(key)
+            self.cache.pool.release(key)
+        self._retain.pop(session_id, None)
 
     def reset_all(self) -> None:
-        for req in list(self._plans):
-            self.end_request(req)
+        for req in list(set(self._plans) | set(self._retain)):
+            self.end_request(req, retain=())
         leftover = list(self.cache.pool.keys)
         for key in leftover:
             self.cache.transport.discard(key)
@@ -582,6 +644,7 @@ class NoisyKVState:
         self._plans.clear()
         self._chunk_tokens.clear()
         self._last_use_global.clear()
+        self._retain.clear()
         self._inflight = ()
         self._clear_prepare_caches()
 
@@ -734,7 +797,7 @@ class NoisyKVState:
         drop: list[VersionKey] = []
         for req, used in self._last_use_global.items():
             for version, last in used.items():
-                if last == slot:
+                if last == slot and not self._is_retained(req, version):
                     drop.append(_version_key(req, version))
         for key in drop:
             self.cache.transport.discard(key)
