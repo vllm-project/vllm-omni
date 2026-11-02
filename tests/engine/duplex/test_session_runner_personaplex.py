@@ -51,12 +51,14 @@ def _fake_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(stage0, "personaplex_prefill_slots", lambda model_path, voice, persona: PREFILL_SLOTS)
 
 
-async def open_personaplex_harness(*, extra_body: dict[str, object] | None = None) -> Harness:
+async def open_personaplex_harness(
+    *, extra_body: dict[str, object] | None = None, runtime_config: DuplexSessionRuntimeConfig | None = None
+) -> Harness:
     plugin = PersonaPlexDuplexPlugin(_fake_encode_audio)
     port = RecordingStagePort(stage_count=2)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
-    limits = DuplexSessionRuntimeConfig()
+    limits = runtime_config or DuplexSessionRuntimeConfig()
     output_buffer = DuplexOutputBuffer(
         max_bytes=limits.max_pending_output_bytes_per_session,
         max_events=limits.max_pending_output_events_per_session,
@@ -177,10 +179,13 @@ async def test_half_frames_are_buffered_until_a_whole_frame_exists() -> None:
     try:
         await h.run(frame(FRAME_SIZE // 2))
         assert h.port.submissions == []
+        assert h.session.audio_delivery is None
         assert h.runner.model_state.audio_buffer.pending_byte_count == FRAME_SIZE * 2
 
         await h.run(frame(FRAME_SIZE // 2))
         assert len(h.port.submissions) == 1
+        assert h.session.audio_delivery is not None
+        assert h.session.audio_delivery.accepted_seq == 1
         assert h.runner.model_state.audio_buffer.pending_byte_count == 0
         payload = submitted_duplex(h.port)[0]["payload"]
         assert isinstance(payload, dict)

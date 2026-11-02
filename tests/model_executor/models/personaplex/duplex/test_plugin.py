@@ -347,17 +347,22 @@ def test_data_plane_context_is_the_framework_default() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_sampling_params_are_greedy_on_stage0_and_delta_on_code2wav() -> None:
-    defaults = (SamplingParams(temperature=0.8, top_k=10, max_tokens=10), SamplingParams(max_tokens=1024))
+@pytest.mark.parametrize("skip_clone", [False, True])
+def test_sampling_is_greedy_stage0_and_delta_stage1_without_mutating_defaults(skip_clone) -> None:
+    defaults = (
+        SamplingParams(temperature=0.8, top_k=10, max_tokens=10, skip_clone=skip_clone),
+        SamplingParams(max_tokens=1024, skip_clone=skip_clone),
+    )
 
     configured = _plugin().configure_sampling_params(runtime_config={}, defaults=defaults)
 
     assert configured[0].temperature == 0.0
     assert configured[0].top_k == 1
     assert configured[0].max_tokens == 1
-    assert configured[0].output_kind == RequestOutputKind.CUMULATIVE
     assert configured[1] is not defaults[1]
     assert configured[1].output_kind == RequestOutputKind.DELTA
+    assert defaults[0].temperature == 0.8 and defaults[0].top_k == 10
+    assert configured[0].output_kind == RequestOutputKind.CUMULATIVE
     assert configured[1].max_tokens == 1024
     assert defaults[0].max_tokens == 10
     assert defaults[1].output_kind == RequestOutputKind.CUMULATIVE
@@ -365,8 +370,9 @@ def test_sampling_params_are_greedy_on_stage0_and_delta_on_code2wav() -> None:
     assert _plugin().configure_sampling_params(runtime_config={}, defaults=()) == ()
 
 
-def test_only_the_final_stage_switches_to_delta_output() -> None:
-    defaults = (SamplingParams(), SamplingParams(), SamplingParams())
+@pytest.mark.parametrize("skip_clone", [False, True])
+def test_only_the_final_stage_switches_to_delta_output(skip_clone) -> None:
+    defaults = tuple(SamplingParams(skip_clone=skip_clone) for _ in range(3))
 
     configured = _plugin().configure_sampling_params(runtime_config={}, defaults=defaults)
 
@@ -375,6 +381,9 @@ def test_only_the_final_stage_switches_to_delta_output() -> None:
         RequestOutputKind.CUMULATIVE,
         RequestOutputKind.DELTA,
     ]
+    assert all(params.output_kind == RequestOutputKind.CUMULATIVE for params in defaults)
+    assert configured[1] is defaults[1]
+    assert configured[-1] is not defaults[-1]
 
 
 def test_plan_append_reserves_one_slot_plus_prefill_on_the_first_seq() -> None:

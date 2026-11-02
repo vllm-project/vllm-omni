@@ -21,9 +21,11 @@ orchestrator loop (the session is never touched from another thread):
 from __future__ import annotations
 
 import asyncio
+import math
 import sys
 import time
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
 from copy import deepcopy
@@ -36,6 +38,7 @@ from vllm_omni.engine.duplex.commands import (
     AckPlayback,
     AppendAudio,
     AppendText,
+    AudioSendCompleted,
     BargeIn,
     CancelInput,
     CancelResponse,
@@ -62,6 +65,7 @@ from vllm_omni.engine.duplex.config import (
     resolve_tool_result_timeout_s,
 )
 from vllm_omni.engine.duplex.contracts import (
+    AudioDrainTarget,
     DuplexOutputContext,
     DuplexOutputDecision,
     DuplexStagePort,
@@ -140,6 +144,12 @@ class _Internal:
 
     kind: str
     payload: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class _AudioDrainRequest:
+    epoch: int
+    frozen: asyncio.Future[AudioDrainTarget]
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +247,15 @@ class DuplexSessionRunner:
         self._worker_stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._audio_progress = asyncio.Event()
+        self._audio_drain_result: asyncio.Future[AudioDrainTarget] | None = None
+        self._audio_drain_barrier: asyncio.Task[bool] | None = None
+        # Generation notifications arrive in order, but their append commits
+        # can still be pending. One FIFO pump keeps later notifications from
+        # overtaking a deferred predecessor; only the mailbox credits them.
+        self._audio_generation_receipts: deque[tuple[_Internal, asyncio.Task[bool] | None]] = deque()
+        self._audio_generation_task: asyncio.Task[None] | None = None
+        self._audio_generation_progress = asyncio.Event()
         #: Flags more than one component reads and writes (see session_context).
         self.run = DuplexRunState()
         # Delivery fences for immutable decisions, not another admission book.
@@ -318,6 +337,144 @@ class DuplexSessionRunner:
             self._pending_input_appends += 1
         self._mailbox.put_nowait(command)
 
+    def begin_audio_drain(self, *, timeout: float) -> asyncio.Future[AudioDrainTarget]:
+        """Queue a prefix barrier in caller order, then wait off the mailbox.
+
+        At most one bounded drain exists per session. Partial input that has
+        not submitted is excluded; later appends remain admitted. This does
+        not close Stage 0 or claim client playback.
+        """
+        if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("audio drain requires a finite positive timeout")
+        if self.closing:
+            raise RuntimeError("audio drain session is closed")
+        if self.plugin.audio_drain_samples(0) is None:
+            raise NotImplementedError("model has no acoustic drain contract")
+        if (self._audio_drain_result is not None and not self._audio_drain_result.done()) or (
+            self._audio_drain_barrier is not None and not self._audio_drain_barrier.done()
+        ):
+            raise RuntimeError("an audio drain is already pending")
+        loop = asyncio.get_running_loop()
+        result: asyncio.Future[AudioDrainTarget] = loop.create_future()
+        request = _AudioDrainRequest(self.session.epoch, loop.create_future())
+        self._audio_drain_result = result
+        self._mailbox.put_nowait(_Internal("audio_drain", {"request": request}))
+        task = loop.create_task(self._finish_audio_drain(request, result, timeout), name="duplex-audio-drain")
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        def done(completed: asyncio.Future[AudioDrainTarget]) -> None:
+            if self._audio_drain_result is completed:
+                self._audio_drain_result = None
+            if not task.done():
+                task.cancel()
+
+        result.add_done_callback(done)
+        return result
+
+    def _queue_audio_drain_barrier(self, request: _AudioDrainRequest) -> None:
+        if request.frozen.done():
+            return
+        predecessor = self.tasks.append_tail
+
+        async def capture() -> bool:
+            try:
+                if predecessor is not None and not await asyncio.shield(predecessor):
+                    raise RuntimeError("audio drain preceding append failed")
+                if request.frozen.done():
+                    return True
+                if self.closing or self.session.epoch != request.epoch:
+                    raise RuntimeError("audio drain prefix was invalidated or closed")
+                state = self.session.audio_delivery
+                sequence = state.accepted_seq if state is not None and state.epoch == request.epoch else 0
+                expected = self.plugin.audio_drain_samples(sequence)
+                if expected is None or expected < 0:
+                    raise RuntimeError("model has no valid acoustic drain target")
+                request.frozen.set_result(
+                    AudioDrainTarget(
+                        state.request_id if state is not None and sequence else None, request.epoch, sequence, expected
+                    )
+                )
+            except asyncio.CancelledError:
+                if not request.frozen.done():
+                    request.frozen.set_exception(RuntimeError("audio drain prefix was invalidated or closed"))
+                raise
+            except Exception as exc:
+                if not request.frozen.done():
+                    request.frozen.set_exception(exc)
+            # A drain failure must not poison later explicit input appends.
+            return True
+
+        barrier = asyncio.create_task(capture(), name="duplex-audio-drain-prefix")
+        self._audio_drain_barrier = barrier
+        self.tasks.append_tail = barrier
+        self.tasks.track_append_task(barrier, epoch=request.epoch, final=False, response_bound=False)
+
+        def done(completed: asyncio.Task[bool]) -> None:
+            if self._audio_drain_barrier is completed:
+                self._audio_drain_barrier = None
+
+        barrier.add_done_callback(done)
+
+    async def _finish_audio_drain(
+        self, request: _AudioDrainRequest, result: asyncio.Future[AudioDrainTarget], timeout: float
+    ) -> None:
+        def valid_state(target: AudioDrainTarget):
+            state = self.session.audio_delivery
+            if self.closing or self.session.epoch != target.epoch:
+                raise RuntimeError("audio drain target was invalidated or closed")
+            if target.accepted_seq and (
+                state is None or (state.request_id, state.epoch) != (target.request_id, target.epoch)
+            ):
+                raise RuntimeError("audio drain request was invalidated")
+            return state
+
+        async def wait_for(target: AudioDrainTarget, *, sent: bool) -> None:
+            while True:
+                self._audio_progress.clear()
+                state = valid_state(target)
+                current = (state.completed_samples if sent else state.generated_seq) if state is not None else 0
+                required = target.expected_samples if sent else target.accepted_seq
+                if current >= required:
+                    return
+                await self._audio_progress.wait()
+
+        async def drain() -> AudioDrainTarget:
+            target = await request.frozen
+            await wait_for(target, sent=False)
+            if target.accepted_seq:
+                assert target.request_id is not None
+                flushed = await self.stage_port.flush_audio_prefix(
+                    target.request_id, epoch=target.epoch, sequence=target.accepted_seq
+                )
+                if isinstance(flushed, bool) or not isinstance(flushed, int) or flushed != target.accepted_seq:
+                    raise RuntimeError("audio drain codec prefix was not flushed")
+            await wait_for(target, sent=True)
+            return target
+
+        try:
+            target = await asyncio.wait_for(drain(), timeout=timeout)
+            if not result.done():
+                result.set_result(target)
+        except asyncio.CancelledError:
+            if not result.done():
+                result.set_exception(RuntimeError("audio drain was invalidated or closed"))
+            raise
+        except asyncio.TimeoutError:
+            if not result.done():
+                result.set_exception(TimeoutError("audio drain timed out"))
+        except Exception as exc:
+            if not result.done():
+                result.set_exception(exc)
+        finally:
+            if not request.frozen.done():
+                request.frozen.cancel()
+
+    def _invalidate_audio_drain(self) -> None:
+        result = self._audio_drain_result
+        if result is not None and not result.done():
+            result.set_exception(RuntimeError("audio drain target was invalidated"))
+
     def on_stage_work(self, rows: Sequence[tuple[int, int, int, int, int]]) -> None:
         """Record ``(stage_id, epoch, seq, start_ns, duration_ns)`` step spans (orchestrator loop).
 
@@ -360,6 +517,14 @@ class DuplexSessionRunner:
                 )
             )
             return True
+        completed_sequence = self.plugin.completed_audio_append(stage_id=stage_id, context=context)
+        if completed_sequence is not None and not self.run.closing:
+            self._mailbox.put_nowait(
+                _Internal(
+                    "audio_generation_completed",
+                    {"request_id": request_id, "epoch": context.identity.fence.epoch, "sequence": completed_sequence},
+                )
+            )
         decision: DuplexOutputDecision | None = None
         project = False
         if stage_id < context.final_stage_id:
@@ -603,6 +768,7 @@ class DuplexSessionRunner:
                     self._pending_input_appends -= 1
                     if self._pending_input_appends == 0 and self._deferred_silence is not None:
                         self.spawn(self._rearm_deferred_silence(), name="duplex-continue")
+                self._audio_progress.set()
 
     async def _stop_worker(self) -> None:
         self.memory.cancel_retry()
@@ -614,6 +780,7 @@ class DuplexSessionRunner:
         # runs inside it): its loop exits after the current item instead of
         # parking on the mailbox forever.
         self._worker_stopped = True
+        self._audio_generation_receipts.clear()
         for task in list(self._background_tasks):
             task.cancel()
         if self._background_tasks:
@@ -667,6 +834,29 @@ class DuplexSessionRunner:
         await self._on_command(item)
 
     async def _on_internal(self, item: _Internal) -> None:
+        if item.kind == "audio_drain":
+            request = item.payload.get("request")
+            if isinstance(request, _AudioDrainRequest):
+                self._queue_audio_drain_barrier(request)
+            return
+        if item.kind in {"audio_generation_completed", "audio_generation_committed"}:
+            request_id, epoch, sequence = (item.payload[name] for name in ("request_id", "epoch", "sequence"))
+            if isinstance(request_id, str) and isinstance(epoch, int) and isinstance(sequence, int):
+                if self.closing or epoch != self.session.epoch:
+                    return
+                if item.kind == "audio_generation_completed":
+                    state = self.session.audio_delivery
+                    tail = self.tasks.append_tail if state is None or sequence > state.accepted_seq else None
+                    self._audio_generation_receipts.append((item, tail))
+                    task = self._audio_generation_task
+                    if task is None or task.done():
+                        task = asyncio.create_task(self._generation_after_append(), name="duplex-generation-receipt")
+                        self._audio_generation_task = task
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
+                    return
+                self.session.complete_audio_generation(request_id, epoch=epoch, sequence=sequence)
+            return
         if self.memory.handle_event(item.kind, item.payload):
             return
         if item.kind == "stage_metrics":
@@ -702,6 +892,42 @@ class DuplexSessionRunner:
             await self._on_tool_call_settlement(item.payload)
             return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
+
+    async def _generation_after_append(self) -> None:
+        """Publish generation receipts in ingress order, after append commit.
+
+        Waiting stays off the mailbox; close and epoch checks still happen at
+        the final mailbox consumer. The captured tail can include later input;
+        its failure or continued wait must not erase or delay an earlier
+        committed sequence. Acceptance is checked by the final session consumer,
+        never inferred from the tail.
+        """
+        while self._audio_generation_receipts and not self.closing:
+            item, tail = self._audio_generation_receipts.popleft()
+            request_id, epoch, sequence = (item.payload[name] for name in ("request_id", "epoch", "sequence"))
+            if tail is not None:
+                tail.add_done_callback(self._wake_audio_generation)
+                try:
+                    while not tail.done() and not self.closing:
+                        self._audio_generation_progress.clear()
+                        state = self.session.audio_delivery
+                        if epoch != self.session.epoch:
+                            break
+                        if (
+                            state is not None
+                            and (state.request_id, state.epoch) == (request_id, epoch)
+                            and isinstance(sequence, int)
+                            and sequence <= state.accepted_seq
+                        ):
+                            break
+                        await self._audio_generation_progress.wait()
+                finally:
+                    tail.remove_done_callback(self._wake_audio_generation)
+            if not self.closing:
+                self._mailbox.put_nowait(_Internal("audio_generation_committed", item.payload))
+
+    def _wake_audio_generation(self, _append: asyncio.Future[bool]) -> None:
+        self._audio_generation_progress.set()
 
     def _settle_stored_answer(self, response_id: str | None) -> None:
         """Settle only a nonempty stored answer; close on unsafe tool state."""
@@ -762,7 +988,18 @@ class DuplexSessionRunner:
     async def _on_command(self, command: DuplexCommand) -> None:
         session = self.session
         projector = self._require_projector()
-        if isinstance(command, AppendAudio):
+        if (
+            isinstance(command, ClearOutputAudio)
+            or (
+                isinstance(command, CancelResponse)
+                and (command.response_id is None or command.response_id == session.active_response_id)
+            )
+            or (isinstance(command, BargeIn) and session.capabilities.supports_barge_in)
+        ):
+            self._invalidate_audio_drain()
+        if isinstance(command, AudioSendCompleted):
+            session.complete_audio_send(command.receipt)
+        elif isinstance(command, AppendAudio):
             # The manager charged the wire size (audio + video) at admission.
             # Keep it charged across decoding/VAD and release it once: at the
             # PCM handoff, or on an earlier return, error or cancellation.
@@ -1156,6 +1393,7 @@ class DuplexSessionRunner:
         if self.ctx.history_calibration is not None:
             self.ctx.history_calibration.close()
         self.run.closing = True
+        self._audio_progress.set()
         self.run.close_reason = self.run.close_reason or reason
         self.session.mark_closing()
         self.memory.close()
@@ -1682,6 +1920,7 @@ class DuplexSessionRunner:
         self._reset_failed_append_tail()
         task = asyncio.create_task(attempt.run_in_wire_order(self.tasks.append_tail))
         task.add_done_callback(attempt.release_on_failure)
+        task.add_done_callback(self._wake_audio_generation)
         self.tasks.append_tail = task
         self.tasks.track_append_task(
             task,

@@ -352,19 +352,20 @@ async def test_streaming_update_carries_explicit_parent(resumable):
 async def test_duplex_session_and_overlapping_turns_end(recording, terminal):
     from tests.engine.duplex.test_session_manager import Harness
     from vllm_omni.engine.duplex.config import DuplexSessionConfig
-    from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
-    from vllm_omni.engine.duplex.events import ResponseCreated, ResponseDone
+    from vllm_omni.engine.duplex.delivery import AudioSampleWatermark, DuplexOutputBuffer
+    from vllm_omni.engine.duplex.events import AudioDelta, ResponseCreated, ResponseDone
     from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 
     tracer, exporter = recording
     async with Harness.create() as harness:
         harness.manager.tracer = tracer
+        output = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
         await harness.manager.open(
             OpenDuplexSessionMessage(
                 control_id="open",
                 session_id="session",
                 session_config=DuplexSessionConfig(model="fake-model"),
-                output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
+                output_buffer=output,
                 trace_headers=HEADERS,
             )
         )
@@ -372,6 +373,19 @@ async def test_duplex_session_and_overlapping_turns_end(recording, terminal):
         session = harness.session("session")
         for response_id in ("first", "second"):
             harness.manager.emit(session, [ResponseCreated(response_id=response_id)])
+        audio = AudioDelta(response_id="first", delta="AAAA")
+        watermark = AudioSampleWatermark(request_id="audio-request", epoch=session.epoch, samples=1920)
+        harness.manager.emit(session, [audio], audio_watermark=watermark)
+        while True:
+            delivered = await asyncio.wait_for(output.get(), timeout=1)
+            if isinstance(delivered, AudioDelta):
+                break
+        assert delivered.event_id == audio.event_id
+        assert (delivered.session_id, delivered.epoch) == (session.session_id, session.epoch)
+        receipt = output.send_receipt(delivered)
+        assert receipt is not None and receipt.event_id == audio.event_id
+        assert receipt.watermark == watermark
+        assert harness.output_sink.empty()
         harness.manager.emit(session, [ResponseDone(response_id="first", response={"status": "completed"})])
         # A duplicate admission must leave the existing session and its spans alive.
         assert not (await harness.open("session")).ok

@@ -146,7 +146,7 @@ class Harness:
         return self.runner.session
 
     def submit(self, command: DuplexCommand) -> None:
-        self.manager.dispatch(DuplexSessionCommandMessage(session_id=SESSION_ID, command=command))
+        self.manager.dispatch(DuplexSessionCommandMessage(session_id=self.session.session_id, command=command))
 
     async def settle(self, *, idle_s: float = 0.05, timeout_s: float = 3.0) -> list[DuplexEvent]:
         """Run the loop until the runner mailbox and append tasks are quiet; return new events."""
@@ -204,9 +204,9 @@ class Harness:
         output_chunk: tuple[int, int] | None = None,
     ) -> bool:
         session = self.session
-        fence = session.fence if epoch is None else session.fence.__class__(SESSION_ID, epoch=epoch)
+        fence = session.fence if epoch is None else session.fence.__class__(session.session_id, epoch=epoch)
         context = DuplexOutputContext(
-            identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=fence),
+            identity=DuplexRequestIdentity(session_id=session.session_id, fence=fence),
             final_stage_id=self.port.stage_count - 1,
             segment_finished=segment_finished,
             segment_token_ids=tuple(segment_token_ids),
@@ -225,7 +225,9 @@ class Harness:
         return await self.settle()
 
     def stage0_request_id(self, epoch: int | None = None) -> str:
-        fence = self.session.fence if epoch is None else self.session.fence.__class__(SESSION_ID, epoch=epoch)
+        fence = (
+            self.session.fence if epoch is None else self.session.fence.__class__(self.session.session_id, epoch=epoch)
+        )
         return duplex_resource_request_id(fence, "stage0")
 
 

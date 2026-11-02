@@ -1557,6 +1557,27 @@ class StagePool:
 
         return abort_outputs
 
+    async def flush_codec_prefix(self, request_id: str, sequence: int) -> int:
+        """Send scheduler control to the live bound replica, never rebalance.
+
+        Broadcasting or choosing a fresh replica would address a different
+        codec buffer. Revalidate the route after the deferred utility result.
+        """
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None or not self.is_replica_available(replica_id):
+            raise RuntimeError(f"no live bound replica for codec flush: {request_id}")
+        client = self._llm_client(replica_id)
+        result = await client.flush_codec_prefix_async(request_id, sequence)
+        if (
+            self.get_bound_replica_id(request_id) != replica_id
+            or not self.is_replica_available(replica_id)
+            or self.clients[replica_id] is not client
+        ):
+            raise RuntimeError(f"codec flush binding was invalidated: {request_id}")
+        if isinstance(result, bool) or not isinstance(result, int) or result != sequence:
+            raise RuntimeError(f"invalid codec flush result for {request_id}: {result!r}")
+        return result
+
     def schedule_release_request_resources(self, request_ids: list[str]) -> None:
         """Queue a best-effort release of *request_ids* on every live replica.
 

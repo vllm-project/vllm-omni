@@ -14,6 +14,8 @@ import contextlib
 import math
 import os
 import signal
+from collections.abc import Callable
+from concurrent.futures import Future
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -139,12 +141,25 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    _omni_shutdown_signal_handler: Callable[[int, Any], None] | None = None
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         current_omni_platform.prepare_stage_engine()
         super().__init__(*args, **kwargs)
         _bind_first_audio_sink(self.model_executor, self.output_queue, self.scheduler)
         if _bind_native_data_plane_ready_sink(self.model_executor, self.scheduler):
             logger.info("Bound native MRv2 connector readiness directly to the scheduler inbox.")
+
+    def _process_input_queue(self) -> None:
+        # Native JIT compilers can restore the same handler with SA_RESTART
+        # enabled. Restore our interruptible shutdown policy before the next
+        # idle wait; Python's cached handler identity alone misses that change.
+        handler = self._omni_shutdown_signal_handler
+        if handler is not None and hasattr(signal, "siginterrupt"):
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                if signal.getsignal(signum) is handler:
+                    signal.siginterrupt(signum, True)
+        super()._process_input_queue()
 
     def _handle_client_request(self, request_type: EngineCoreRequestType, request: Any) -> None:
         super()._handle_client_request(request_type, request)
@@ -169,6 +184,25 @@ class StageEngineCoreProc(EngineCoreProc):
                 adapter.release_shm_resources(request_id)
             except Exception as e:
                 logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
+
+    def omni_flush_codec_prefix(self, external_req_id: str, prefix: int) -> Future[int]:
+        """UTILITY control for the scheduler-owned V1 codec send queue.
+
+        EngineCore's existing Future handling keeps the busy loop responsive.
+        Never route this to a worker: V1's processor buffer lives in the
+        scheduler adapter. This is not an acoustic or client-playback ACK.
+        """
+        adapter = getattr(self.scheduler, "chunk_transfer_adapter", None)
+        if adapter is None:
+            raise RuntimeError("This stage has no scheduler codec send queue")
+        requests = [
+            request
+            for request in self.scheduler.requests.values()
+            if getattr(request, "external_req_id", None) == external_req_id
+        ]
+        if len(requests) != 1:
+            raise RuntimeError("Codec prefix request is unknown or ambiguous")
+        return adapter.flush_prefix_async(requests[0], prefix)
 
     def preprocess_add_request(self, request: OmniEngineCoreRequest) -> tuple[Any, int]:
         """Preserve omni payloads when vLLM builds its scheduler request."""
@@ -322,6 +356,7 @@ class StageEngineCoreProc(EngineCoreProc):
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
+            engine_core._omni_shutdown_signal_handler = signal_handler
 
             engine_core.run_busy_loop()
 

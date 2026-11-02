@@ -1610,6 +1610,7 @@ class GPUARModelRunner(
         selected_indices: list[int] = []
         selected_req_ids: list[str] = []
         selected_req_infos: list[dict[str, Any]] = []
+        completed_appends: list[tuple[int, int]] = []
         duplex_indices: list[int] = []
         invalid_indices = set(invalid_req_indices)
         use_async_scheduling = bool(getattr(self, "use_async_scheduling", False))
@@ -1634,6 +1635,9 @@ class GPUARModelRunner(
             selected_indices.append(idx)
             selected_req_ids.append(req_id)
             selected_req_infos.append(cast(dict[str, Any], req_info))
+            # Snapshot the append being sampled, before the model hook or a
+            # later scheduler update can replace the request's input state.
+            completed_appends.append((int(duplex.get("epoch", -1)), int(duplex.get("seq", 0))))
 
         if not selected_indices:
             return multimodal_outputs
@@ -1711,6 +1715,16 @@ class GPUARModelRunner(
         # frame while a chunked prefill has not sampled a token yet.
         codes_payload["audio"] = per_request_audio
         merged["codes"] = codes_payload
+        if any(epoch >= 0 and sequence > 0 for epoch, sequence in completed_appends):
+            existing_meta = merged.get("meta")
+            meta = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+            epochs = [torch.tensor([-1], dtype=torch.long) for _ in req_ids]
+            sequences = [torch.tensor([0], dtype=torch.long) for _ in req_ids]
+            for idx, (epoch, sequence) in zip(selected_indices, completed_appends, strict=True):
+                epochs[idx] = torch.tensor([epoch], dtype=torch.long)
+                sequences[idx] = torch.tensor([sequence], dtype=torch.long)
+            meta.update(duplex_epoch=epochs, duplex_generated_seq=sequences)
+            merged["meta"] = meta
         return merged
 
     def _build_multimodal_outputs(

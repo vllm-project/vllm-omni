@@ -292,6 +292,7 @@ class DuplexSessionAttachmentRegistry:
         *,
         journal: bool = True,
         on_accepted: Callable[[], None] | None = None,
+        on_sent: Callable[[], Awaitable[None]] | None = None,
         event_guard: Callable[[], AbstractContextManager[bool]] | None = None,
     ) -> JournalEntry | None:
         """Sequence and dispatch one event to the current attachment.
@@ -304,6 +305,11 @@ class DuplexSessionAttachmentRegistry:
         after a successful transport send when journaling is disabled. A later
         send failure cannot undo acceptance into the journal. Detached,
         non-journaled events do not invoke it. The callback must not raise.
+
+        ``on_sent`` is awaited only after the socket send returns successfully,
+        while this attachment and the consumer-held event are still valid.
+        Journal acceptance, detached output and failed sends never invoke it.
+        This internal callback does not acknowledge client playback.
         """
         async with self._lock:
             state = self._require(session_id)
@@ -326,6 +332,13 @@ class DuplexSessionAttachmentRegistry:
                 await attachment.send(wire_payload)
                 if entry is None and on_accepted is not None:
                     on_accepted()
+                if on_sent is not None:
+                    async with self._lock:
+                        current = self._sessions.get(session_id) is state and state.attachment is attachment
+                        with event_guard() if event_guard is not None else nullcontext(True) as valid:
+                            completed = current and valid
+                    if completed:
+                        await on_sent()
             return entry
 
     async def acknowledge(self, session_id: str, sequence: int) -> int:
