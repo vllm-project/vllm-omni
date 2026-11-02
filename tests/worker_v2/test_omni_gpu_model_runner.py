@@ -302,10 +302,12 @@ def test_load_model_builds_omni_state_through_hook_or_factory_swap(monkeypatch, 
 
     import vllm_omni.worker_v2.omni_model_runner as omni_mr
 
+    assert omni_mr._UPSTREAM_HAS_MODEL_STATE_HOOK == hasattr(GPUModelRunner, "_init_model_state")
     upstream_factory = mr.init_model_state
     model = SimpleNamespace(logits_vocab_size=7)
     omni_state = object()
     factory_seen_by_load = []
+    factory_args = []
 
     def upstream_load_model(self, *args, **kwargs):
         self.model = model
@@ -314,18 +316,26 @@ def test_load_model_builds_omni_state_through_hook_or_factory_swap(monkeypatch, 
             self.model_state = self._init_model_state()
         else:
             self.model_state = mr.init_model_state(self.vllm_config, self.model, self.encoder_cache, self.device)
+        # Upstream sizes the sampler from vocab_size after the state is built.
+        assert self.vocab_size == self.req_states.vocab_size == 7
+
+    def omni_factory(*args):
+        factory_args.append(args)
+        return omni_state
 
     monkeypatch.setattr(omni_mr, "_UPSTREAM_HAS_MODEL_STATE_HOOK", upstream_hook)
     monkeypatch.setattr(GPUModelRunner, "load_model", upstream_load_model)
-    monkeypatch.setattr(omni_mr, "init_omni_model_state", lambda *args: omni_state)
+    monkeypatch.setattr(omni_mr, "init_omni_model_state", omni_factory)
     runner = _make_runner()
-    runner.vllm_config, runner.encoder_cache, runner.device = object(), None, torch.device("cpu")
+    vllm_config, encoder_cache, device = object(), object(), torch.device("cpu")
+    runner.vllm_config, runner.encoder_cache, runner.device = vllm_config, encoder_cache, device
     runner.vocab_size = runner.req_states.vocab_size = 10
     runner.supports_mm_inputs = False
 
     runner.load_model()
 
     assert runner.model_state is omni_state
+    assert factory_args == [(vllm_config, model, encoder_cache, device)]
     assert runner.vocab_size == runner.req_states.vocab_size == 7
     assert (factory_seen_by_load[0] is upstream_factory) is upstream_hook
     assert mr.init_model_state is upstream_factory
