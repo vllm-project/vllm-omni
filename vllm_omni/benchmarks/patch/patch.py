@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import argparse
 import asyncio
 import contextlib
 import io
@@ -261,12 +262,19 @@ _LEGACY_REQUEST_TIMEOUT_S = 6 * 60 * 60.0
 # Set from the ``--omni-request-timeout-s`` CLI flag by ``vllm bench serve``
 # before the benchmark session is built (``None`` = use the default above).
 _REQUEST_TIMEOUT_OVERRIDE_S: float | None = None
+_FAIL_FAST_ON_TIMEOUT = False
 
 
 def set_request_timeout_s(value: float) -> None:
     """Record the explicitly requested per-request timeout (from the CLI)."""
     global _REQUEST_TIMEOUT_OVERRIDE_S
     _REQUEST_TIMEOUT_OVERRIDE_S = float(value)
+
+
+def set_fail_fast_on_timeout(enabled: bool) -> None:
+    """Enable cancellation of the remaining benchmark requests after a timeout."""
+    global _FAIL_FAST_ON_TIMEOUT
+    _FAIL_FAST_ON_TIMEOUT = bool(enabled)
 
 
 def _omni_request_timeout_s() -> float:
@@ -953,6 +961,8 @@ if _serve_mod is not None:
 
 @dataclass
 class MixRequestFuncOutput(RequestFuncOutput):
+    timed_out: bool = False
+    cancelled_after_timeout: bool = False
     audio_ttfp: float = 0.0
     audio_duration: float = 0.0
     audio_frames: int = 0
@@ -1988,6 +1998,8 @@ async def async_request_openai_chat_omni_completions(
         output.output_tokens = 0
         output.error = ""
         output.success = False
+        output.timed_out = False
+        output.cancelled_after_timeout = False
         output.stage_metrics = {}
         output.stage_id = None
         output.final_output_type = None
@@ -2254,6 +2266,13 @@ async def async_request_openai_chat_omni_completions(
                 )
                 await asyncio.sleep(retry_delay)
                 continue
+            break
+        except (asyncio.TimeoutError, TimeoutError, aiohttp.ServerTimeoutError):
+            output.success = False
+            output.timed_out = True
+            output.error = traceback.format_exc()
+            output.latency = time.perf_counter() - st
+            logger.error("Omni benchmark request timed out after %.1fs", output.latency)
             break
         except aiohttp.ClientError as e:
             # transient transport error: may retry
@@ -3201,6 +3220,73 @@ class _RealtimeTTSProbe:
         assert self._client is not None
         await self._client.close(timeout_s=timeout_s)
 
+    async def turn_session_stats(self, response_id: str, *, timeout_s: float = 5.0) -> dict[str, object]:
+        """Server-side busy RTF and stall ratio of the turn that produced ``response_id`` (RFC #8325).
+
+        Empty when the server does not collect session stats. Polls until the
+        turn's metrics are final, within one overall ``timeout_s``. The stats are
+        auxiliary: a query that times out, a closed session or a server error
+        leaves the turn's client metrics intact and reports ``server_stats_final:
+        False``, never a number.
+        """
+        from vllm_omni.benchmarks.duplex_session_metrics import session_stats_turn_metrics
+        from vllm_omni.clients.duplex import DuplexClientError
+
+        assert self._client is not None
+        capabilities = (self._client.session_info or {}).get("capabilities")
+        if not isinstance(capabilities, Mapping) or capabilities.get("supports_session_stats") is not True:
+            return {}
+        deadline = time.monotonic() + timeout_s
+        metrics: dict[str, object] = {"final": False}
+        turn: Mapping[str, object] | None = None
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                stats = await self._client.get_session_stats(timeout_s=remaining)
+            except (asyncio.TimeoutError, DuplexClientError) as exc:
+                logger.warning("Seed-TTS session stats unavailable for %s: %s", response_id, exc)
+                break
+            turns = stats.get("turns")
+            turn = next(
+                (
+                    candidate
+                    for candidate in (turns if isinstance(turns, list) else ())
+                    if isinstance(candidate, Mapping) and response_id in (candidate.get("response_ids") or ())
+                ),
+                None,
+            )
+            stages = stats.get("stages")
+            stage_ids = (
+                [stage["stage_id"] for stage in stages if isinstance(stage, Mapping)]
+                if isinstance(stages, list)
+                else None
+            )
+            metrics = session_stats_turn_metrics(turn, stage_ids=stage_ids) if turn is not None else {"final": False}
+            if metrics.get("final") or metrics.get("missing_stage_ids"):
+                # Missing stages will not report later: the turn is already final.
+                break
+            await asyncio.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        chunks = turn.get("chunks") if turn is not None else None
+        stage_ids = sorted(
+            {
+                work["stage_id"]
+                for chunk in (chunks if isinstance(chunks, list) else ())
+                for work in chunk.get("stage_work") or ()
+                if work.get("spans")
+            }
+        )
+        return {
+            "busy_rtf": metrics.get("busy_rtf"),
+            "stall_ratio": metrics.get("stall_ratio"),
+            "server_generation_ms": metrics.get("generation_ms"),
+            "server_turn_span_ms": metrics.get("turn_span_ms"),
+            "server_stall_ms": metrics.get("stall_ms"),
+            "server_audio_ms": metrics.get("audio_ms"),
+            "server_stats_final": bool(metrics.get("final")),
+            "server_missing_stage_ids": metrics.get("missing_stage_ids", []),
+            # Stages that reported work for the turn: shows the chunk id reached each stage.
+            "server_stage_ids": stage_ids,
+        }
+
 
 async def async_request_openai_realtime_duplex(
     request_func_input: RequestFuncInput,
@@ -3327,6 +3413,7 @@ async def async_request_openai_realtime_duplex(
                 )
                 if client_rtf is not None:
                     metric["client_rtf"] = client_rtf
+                metric.update(await client.turn_session_stats(response_id))
                 turn_metrics.append(metric)
                 response_audio = client.events.audio_bytes(response_id)
                 turn_pcm_bytes.append(
@@ -3470,11 +3557,22 @@ from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
     has_metric_samples,
+    validate_goodput_config,
 )
 
 # ruff: noqa: E402
 
 benchmark_old = serve.benchmark
+
+
+def check_goodput_args(args: argparse.Namespace) -> dict[str, float]:
+    """Parse goodput SLOs with vLLM-Omni request-level metrics."""
+    if not args.goodput:
+        return {}
+
+    goodput_config_dict = serve.parse_goodput(args.goodput)
+    validate_goodput_config(goodput_config_dict)
+    return goodput_config_dict
 
 
 def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
@@ -3488,6 +3586,73 @@ def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
     merged = dict(base or {})
     merged.update(overrides or {})
     return merged
+
+
+def _cancelled_after_timeout_output(request: RequestFuncInput) -> MixRequestFuncOutput:
+    output = MixRequestFuncOutput(
+        success=False,
+        prompt_len=request.prompt_len,
+        error="Cancelled after another benchmark request timed out.",
+        cancelled_after_timeout=True,
+    )
+    output.start_time = time.perf_counter()
+    return output
+
+
+async def _gather_request_outputs(
+    tasks: list[asyncio.Task[MixRequestFuncOutput]],
+    request_inputs: list[RequestFuncInput],
+    *,
+    pbar: tqdm | None = None,
+) -> list[MixRequestFuncOutput]:
+    """Gather in request order and cancel unfinished work after the first timeout."""
+    if len(tasks) != len(request_inputs):
+        raise ValueError("request task and input counts must match")
+    outputs: list[MixRequestFuncOutput | None] = [None] * len(tasks)
+    task_indexes = {task: index for index, task in enumerate(tasks)}
+    pending = set(tasks)
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            timed_out = False
+            for task in done:
+                output = task.result()
+                outputs[task_indexes[task]] = output
+                timed_out |= bool(getattr(output, "timed_out", False))
+            if not timed_out:
+                continue
+
+            ordered_pending = [task for task in tasks if task in pending]
+            logger.error(
+                "Benchmark request timed out; cancelling %d queued or in-flight requests",
+                len(ordered_pending),
+            )
+            for task in ordered_pending:
+                task.cancel()
+            settled = await asyncio.gather(*ordered_pending, return_exceptions=True)
+            unexpected: BaseException | None = None
+            for task, result in zip(ordered_pending, settled, strict=True):
+                index = task_indexes[task]
+                if isinstance(result, asyncio.CancelledError):
+                    outputs[index] = _cancelled_after_timeout_output(request_inputs[index])
+                    if pbar is not None:
+                        pbar.update(1)
+                elif isinstance(result, BaseException):
+                    unexpected = unexpected or result
+                else:
+                    outputs[index] = result
+            pending.clear()
+            if unexpected is not None:
+                raise unexpected
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    if any(output is None for output in outputs):
+        raise RuntimeError("benchmark request gathering produced incomplete outputs")
+    return [output for output in outputs if output is not None]
 
 
 async def benchmark(
@@ -3672,6 +3837,7 @@ async def benchmark(
     _prepare_omniinteract_batch(input_requests)
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    request_func_inputs: list[RequestFuncInput] = []
 
     rps_change_events = []
     last_int_rps = -1
@@ -3732,14 +3898,24 @@ async def benchmark(
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract_to_request_func_input(request, request_func_input)
         attach_duplex_eval(request, request_func_input)
+        request_func_inputs.append(request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
-    outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
+    if _FAIL_FAST_ON_TIMEOUT:
+        outputs = await _gather_request_outputs(tasks, request_func_inputs, pbar=pbar)
+    else:
+        outputs = await asyncio.gather(*tasks)
+    fail_fast_triggered = any(getattr(output, "timed_out", False) for output in outputs)
 
     if probe_task is not None:
         probe_stop.set()
-        await probe_task
+        if _FAIL_FAST_ON_TIMEOUT and fail_fast_triggered:
+            probe_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await probe_task
+        else:
+            await probe_task
 
     if pbar is not None:
         pbar.close()
@@ -3855,6 +4031,10 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    result["timed_out_requests"] = sum(bool(getattr(output, "timed_out", False)) for output in outputs)
+    result["cancelled_after_timeout_requests"] = sum(
+        bool(getattr(output, "cancelled_after_timeout", False)) for output in outputs
+    )
     # Preserve request order, including missing snapshots, so CI can verify
     # fixed stage workloads without parsing logs or storing audio payloads.
     request_stage_metrics = [
@@ -4031,3 +4211,4 @@ async def benchmark(
 
 
 serve.benchmark = benchmark
+serve.check_goodput_args = check_goodput_args

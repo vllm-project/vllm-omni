@@ -23,7 +23,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     WholeEulerCFMGraphWrapper,
 )
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)]
 
 
 class _F0Predictor(nn.Module):
@@ -2664,6 +2664,7 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush() -> None:
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_vocoder_restores_tf32_policy(fail, monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.code2wav_watchdog import Code2WavWatchdog
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
     from vllm_omni.platforms import current_omni_platform
 
@@ -2680,7 +2681,11 @@ def test_vocoder_restores_tf32_policy(fail, monkeypatch):
 
     # `_tf32_mode` is resolved in `__init__` now, so the stub model carries the
     # resolved value instead of a config the policy would re-read per forward.
-    model = SimpleNamespace(_tf32_mode="tf32", _forward_impl=forward)
+    model = SimpleNamespace(
+        _tf32_mode="tf32",
+        _watchdog=Code2WavWatchdog(),
+        _forward_impl=forward,
+    )
     if fail:
         with pytest.raises(RuntimeError, match="injected"):
             MiniCPMO45Code2Wav.forward(model)

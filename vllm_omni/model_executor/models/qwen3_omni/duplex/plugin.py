@@ -19,8 +19,8 @@ from pathlib import Path
 
 import numpy as np
 import pybase64 as base64
-from PIL import Image
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
@@ -1130,7 +1130,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                     for part in content:
                         if part.get("type") == "image_url":
                             encoded = part["image_url"]["url"].split(",", 1)[1]
-                            with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as image:
+                            with open_image(io.BytesIO(base64.b64decode(encoded, validate=True))) as image:
                                 image.thumbnail((448, 448))
                                 images.append(image.convert("RGB").copy())
                             parts.append({"type": "image"})

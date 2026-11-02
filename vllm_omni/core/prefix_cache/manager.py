@@ -443,6 +443,8 @@ class OmniPrefixCacheManager:
         # old rows into ``_SlotRef.preserved`` before overwriting (COW). Guarded
         # by ``_state_lock``; each ref is dropped when its fetch completes.
         self._pending_reads: list[_SlotRef] = []
+        # Pending refs per (key, slot), so a write checks its slots with one gather.
+        self._pending_slot_refs: dict[TensorName, torch.Tensor] = {}
         # Sticky fatal set on the first drained write failure; every later
         # facade entry re-raises it (see _commit_drained_writes).
         self._fatal_write_failure: str | None = None
@@ -1003,6 +1005,7 @@ class OmniPrefixCacheManager:
                     write_ctx, tuple(tensors.keys()), slots, req_order, query_start, num_sched
                 )
                 continue
+            spans: list[tuple[int, int, int]] = []
             for req_id in req_order:
                 start = query_start[req_id]
                 end = start + num_sched[req_id]
@@ -1020,7 +1023,8 @@ class OmniPrefixCacheManager:
                     )
                     self._request_tasks.track(req_id, handle.tid)
                     self._request_tasks.deferred[req_id] = handle
-                self._map_slots(slots[start:end], handle.tid, tensors.keys())
+                spans.append((handle.tid, start, end))
+            self._claim_slots(slots, tuple(tensors.keys()), spans)
 
     def _register_immediate_write(
         self,
@@ -1054,19 +1058,23 @@ class OmniPrefixCacheManager:
         for req_id in written:
             self._request_tasks.track(req_id, handle.tid)
         self._join_next_step_tids.append(handle.tid)
-        self._map_slots(slots[start:end], handle.tid, keys)
+        self._claim_slots(slots, keys, [(handle.tid, start, end)])
 
     # ----------------------------------------------------- occupancy
 
-    def _map_slots(self, slots: torch.Tensor, tid: int, keys: Iterable[str]) -> None:
-        """Caller holds ``_state_lock``. Record `tid` on these (slot, key);
-        if another write still owns them, mark those rows skipped on it."""
-        keys = tuple(keys)
-        # Copy committed rows aside before this claim overwrites them.
+    def _claim_slots(self, slots: torch.Tensor, keys: tuple[str, ...], spans: list[tuple[int, int, int]]) -> None:
+        """Caller holds ``_state_lock``. Hand each ``(tid, start, end)`` span of
+        ``slots`` to that write for ``keys``; a write that still owns some of
+        them has those rows marked skipped. Slots are claimed only here, so
+        pending reads of the reused rows are always copied aside first (COW).
+        """
+        if not spans:
+            return
         if self._pending_reads:
-            self._preserve_for_pending_reads(slots, keys)
-        for old, key, stolen in self._slot_status.map_slots(slots, tid, keys):
-            self._controller.mark_reassigned(old, key, stolen)
+            self._preserve_for_pending_reads(torch.cat([slots[start:end] for _, start, end in spans]), keys)
+        for tid, start, end in spans:
+            for old, key, stolen in self._slot_status.map_slots(slots[start:end], tid, keys):
+                self._controller.mark_reassigned(old, key, stolen)
 
     def _preserve_for_pending_reads(self, new_slots: torch.Tensor, keys: tuple[str, ...]) -> None:
         """Caller holds ``_state_lock``. Copy still-valid committed rows into
@@ -1077,23 +1085,33 @@ class OmniPrefixCacheManager:
         before claiming, and JOIN_ON_FINISH in-transit rows are read through
         ``staged_list`` task refs directly.
         """
-        new_set = {int(s) for s in new_slots.tolist()}
+        if not self._pending_reads:
+            return
+        new_slots = new_slots.to(device="cpu", dtype=torch.long)  # counts and status tables live on CPU
+        keys = tuple(
+            k for k in keys if (counts := self._pending_slot_refs.get(k)) is not None and bool(counts[new_slots].any())
+        )
+        if not keys:
+            return
         for ref in self._pending_reads:
             if ref.key not in keys or ref.reserved_version is None or not self._pool.has_key(ref.key):
                 continue
-            status = self._slot_status.get_slot_status(ref.key)
-            take: list[tuple[int, int]] = []  # (row index in ref, slot)
-            for i, s in enumerate(ref.slots.tolist()):
-                s = int(s)
-                if s not in new_set or s in ref.preserved:
-                    continue
-                committed = int(status.state[s]) == _Occupancy.COMMITTED
-                if committed and int(status.slot_version[s]) == int(ref.reserved_version[i]):
-                    take.append((i, s))
-            if not take:
+            reclaimed = torch.isin(ref.slots, new_slots)
+            if ref.preserved:
+                reclaimed &= ~torch.isin(ref.slots, torch.tensor(list(ref.preserved), dtype=torch.long))
+            if not bool(reclaimed.any()):
                 continue
-            rows = self._pool.rows(ref.key, torch.tensor([s for _, s in take], dtype=torch.long))
-            for j, (_, s) in enumerate(take):
+            status = self._slot_status.get_slot_status(ref.key)
+            idx = reclaimed.nonzero().flatten()
+            slots = ref.slots[idx]
+            valid = (status.state[slots] == _Occupancy.COMMITTED) & (
+                status.slot_version[slots] == ref.reserved_version[idx]
+            )
+            if not bool(valid.any()):
+                continue
+            slots = slots[valid]
+            rows = self._pool.rows(ref.key, slots)
+            for j, s in enumerate(slots.tolist()):
                 ref.preserved[s] = rows[j].clone()
 
     @torch.inference_mode()
@@ -1196,7 +1214,18 @@ class OmniPrefixCacheManager:
             absent=absent if bool(absent.any()) else None,
         )
         self._pending_reads.append(ref)
+        self._count_pending_slots(ref, 1)
         return ref
+
+    def _count_pending_slots(self, ref: _SlotRef, delta: int) -> None:
+        """Caller holds ``_state_lock``. Add `delta` to the pending-ref count of `ref`'s slots."""
+        counts = self._pending_slot_refs.get(ref.key)
+        if counts is None:
+            # Updated in and out of inference mode (hit planning vs. prefetch release).
+            with torch.inference_mode(False):
+                counts = self._pending_slot_refs[ref.key] = torch.zeros(self._slot_status.num_slots, dtype=torch.int32)
+        slots = ref.slots.to(torch.long)
+        counts.index_add_(0, slots, torch.full((slots.numel(),), delta, dtype=torch.int32))
 
     def _apply_preserved_rows(self, src: _SlotRef, out: torch.Tensor) -> torch.Tensor:
         """Write ``src.preserved`` rows over the matching slots in ``out``."""
@@ -1212,7 +1241,10 @@ class OmniPrefixCacheManager:
         """Drop ``src`` from ``_pending_reads``. Identity, not dataclass eq
         (tensors in the ref make ``==`` unusable). Safe if already removed."""
         with self._state_lock:
+            n = len(self._pending_reads)
             self._pending_reads = [ref for ref in self._pending_reads if ref is not src]
+            if len(self._pending_reads) < n:
+                self._count_pending_slots(src, -1)
 
     def _fetch_source(self, src: _SlotRef) -> torch.Tensor:
         """Fetch a planned row source (execute phase, no lock).

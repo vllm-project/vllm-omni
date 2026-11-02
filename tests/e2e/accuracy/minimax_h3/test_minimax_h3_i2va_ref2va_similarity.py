@@ -102,6 +102,11 @@ SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 34.0
 # The worker RPC spans the full generation and shares the HTTP request budget.
 REQUEST_TIMEOUT_SECONDS = 60 * 60
+# A cold MI325 FL2VA load reached 11/13 shards before the previous 30-minute
+# deadline (AMD Buildkite #14272). Keep startup bounded while allowing the
+# retained four-GPU accuracy workload to finish loading.
+ENGINE_INIT_TIMEOUT_SECONDS = 60 * 60
+SERVER_STARTUP_TIMEOUT_SECONDS = 65 * 60
 
 
 def _model_name(model_env_var: str = MODEL_ENV_VAR, component: str = "FL2VA") -> str:
@@ -118,7 +123,7 @@ def _model_name(model_env_var: str = MODEL_ENV_VAR, component: str = "FL2VA") ->
 
 
 def _server_args() -> list[str]:
-    return [
+    args = [
         "--trust-remote-code",
         # Both official-reference requests use fixed shapes. Keep regional
         # compilation static so cold Inductor codegen is stable across CI nodes.
@@ -129,21 +134,33 @@ def _server_args() -> list[str]:
         "4",
         "--ring",
         "1",
-        "--use-hsdp",
-        "--hsdp-shard-size",
-        "4",
-        "--text-encoder-tp-size",
-        "4",
-        "--vae-patch-parallel-size",
-        "4",
-        "--vae-parallel-mode",
-        "tile",
-        "--vae-use-tiling",
-        "--stage-init-timeout",
-        "1800",
-        "--init-timeout",
-        "1800",
     ]
+    if torch.version.hip is None:
+        # Preserve the CUDA configuration qualified by build #17716. H100 needs
+        # the four-way HSDP shard to leave enough memory for generation.
+        args.extend(["--use-hsdp", "--hsdp-shard-size", "4"])
+    else:
+        # The FL2VA checkpoint is about 62 GiB, which fits on each MI325 GPU.
+        # Loading directly onto the accelerators avoids the full CPU-resident
+        # model copy held by every HSDP worker. Sequential reads also bound the
+        # remaining per-rank safetensors staging memory in the shared pod.
+        args.append("--disable-multithread-weight-load")
+    args.extend(
+        [
+            "--text-encoder-tp-size",
+            "4",
+            "--vae-patch-parallel-size",
+            "4",
+            "--vae-parallel-mode",
+            "tile",
+            "--vae-use-tiling",
+            "--stage-init-timeout",
+            str(ENGINE_INIT_TIMEOUT_SECONDS),
+            "--init-timeout",
+            str(ENGINE_INIT_TIMEOUT_SECONDS),
+        ]
+    )
+    return args
 
 
 def _download_reference_asset(
@@ -227,7 +244,7 @@ def _assert_official_video(
     )
 
 
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=4)
 def test_minimax_h3_i2va_matches_official_reference(
     accuracy_artifact_root: Path,
 ) -> None:
@@ -284,6 +301,7 @@ def test_minimax_h3_i2va_matches_official_reference(
         _server_args(),
         env_dict=server_env,
         use_omni=True,
+        startup_timeout=SERVER_STARTUP_TIMEOUT_SECONDS,
     ) as server:
         with image_path.open("rb") as image_file:
             response = requests.post(
@@ -304,7 +322,7 @@ def test_minimax_h3_i2va_matches_official_reference(
     )
 
 
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=4)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=4)
 def test_minimax_h3_ref2va_matches_official_reference(
     accuracy_artifact_root: Path,
 ) -> None:
@@ -367,6 +385,7 @@ def test_minimax_h3_ref2va_matches_official_reference(
         _server_args(),
         env_dict=server_env,
         use_omni=True,
+        startup_timeout=SERVER_STARTUP_TIMEOUT_SECONDS,
     ) as server:
         with input_video_path.open("rb") as video_file, input_audio_path.open("rb") as audio_file:
             response = requests.post(

@@ -19,7 +19,7 @@ For each stage, vLLM-Omni calculates the requested memory as:
 requested_memory = total_gpu_memory × gpu_memory_utilization
 ```
 
-When other stages already occupy the same GPU, Omni caps this requested budget:
+On discrete GPUs, when other stages already occupy the same GPU, Omni caps this requested budget:
 
 ```text
 requested_memory = min(requested_memory, free_memory)
@@ -29,6 +29,13 @@ The worker logs a warning when it caps the budget. Model and runtime allocations
 are subtracted from that budget when sizing the KV cache. Initialization can
 still fail if the remaining budget cannot hold the required cache. Raising
 `gpu_memory_utilization` does not increase a budget already capped to free memory.
+
+On integrated GPUs, GPU allocations share memory with the host OS and other
+processes. Omni preserves upstream startup validation: if the requested budget
+exceeds free memory, initialization raises `ValueError` instead of capping the
+budget. Reduce `gpu_memory_utilization` for each stage and leave headroom for the
+host, other stages, and runtime allocations. A budget equal to free memory passes
+this check, but the check itself does not reserve any headroom.
 
 ### Memory Components
 
@@ -115,10 +122,13 @@ stages:
   - stage_id: 1
     devices: "0"
     gpu_memory_utilization: 0.3  # Uses 30% of GPU 0
-    # Total: 90% of GPU 0 (safe, leaves 10% buffer)
+    # Total: 90% of GPU 0; check whether the remaining 10% is enough headroom
 ```
 
-**Important:** If stages run on different GPUs, each can use up to 1.0 independently.
+**Important:** Stages on discrete GPUs with separate memory pools can budget
+independently, while leaving headroom on each GPU. Devices that share a host memory
+pool must also account for their combined allocations and host memory use; separate
+device IDs do not make those budgets independent.
 
 ### Step 4: Account for Tensor Parallelism
 
@@ -166,6 +176,8 @@ each device.
 ### Error: "Free memory is less than desired GPU memory utilization"
 
 This means the GPU doesn't have enough free memory when the stage starts.
+Integrated GPUs raise this error when the requested budget exceeds free memory;
+discrete GPUs use the capped budget described above.
 
 **Solutions:**
 
