@@ -14,10 +14,15 @@ import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
 from vllm_omni.config.stage_config import DiffusionStageRole
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
-from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    Wan22Pipeline,
+    build_wan_scheduler,
+    resolve_wan_flow_shift,
+)
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -215,6 +220,69 @@ def test_forward_passes_request_shift_without_mutating_scheduler_config(solver: 
         else:
             reference.set_timesteps(5, device="cpu")
         torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "config_shift", "expected"),
+    [({"flow_shift": "12"}, 5.0, 12.0), ({}, 3.0, 3.0), ({}, None, 5.0)],
+)
+def test_resolve_wan_flow_shift_keeps_finite_values(extra_args: dict, config_shift, expected: float) -> None:
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args=extra_args))
+
+    assert resolve_wan_flow_shift(request, SimpleNamespace(flow_shift=config_shift)) == expected
+
+
+@pytest.mark.parametrize("flow_shift", ["nan", "inf", "-inf", float("nan"), float("-inf")])
+def test_resolve_wan_flow_shift_rejects_non_finite_request_value(flow_shift: object) -> None:
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"flow_shift": flow_shift}))
+
+    with pytest.raises(OmniClientError, match="flow_shift must be finite"):
+        resolve_wan_flow_shift(request, SimpleNamespace(flow_shift=5.0))
+
+
+def test_resolve_wan_flow_shift_rejects_non_finite_config_value() -> None:
+    request = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={}))
+
+    with pytest.raises(ValueError, match="flow_shift must be finite") as exc_info:
+        resolve_wan_flow_shift(request, SimpleNamespace(flow_shift=float("nan")))
+    assert not isinstance(exc_info.value, OmniClientError)
+
+
+@pytest.mark.parametrize("bad_shift", ["nan", float("nan"), "inf"])
+def test_forward_never_caches_non_finite_flow_shift(bad_shift: object) -> None:
+    pipeline = _make_pipeline()
+    pipeline.scheduler = build_wan_scheduler("unipc", 5.0)
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]
+
+    def run(solver: str, shift: object) -> None:
+        sampling = _make_sampling(num_inference_steps=5, extra_args={"sample_solver": solver, "flow_shift": shift})
+        request = OmniDiffusionRequest(prompt="prompt", request_id="schedule", sampling_params=sampling)
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+    def assert_euler_sigmas(shift: float) -> None:
+        reference = build_wan_scheduler("euler", shift)
+        reference.set_timesteps(5, device="cpu")
+        torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
+
+    # Cached UniPC + Euler/non-finite: rejected before the scheduler is rebuilt.
+    unipc_scheduler = pipeline.scheduler
+    with pytest.raises(OmniClientError, match="flow_shift must be finite"):
+        run("euler", bad_shift)
+    assert pipeline.scheduler is unipc_scheduler
+    assert (pipeline._sample_solver, pipeline._flow_shift) == ("unipc", 5.0)
+
+    # A following valid Euler request runs on its own shift, not a cached NaN one.
+    run("euler", 12.0)
+    assert_euler_sigmas(12.0)
+
+    # Cached Euler(5) + Euler/non-finite: rejected instead of silently running with shift 5.
+    run("euler", 5.0)
+    euler_scheduler = pipeline.scheduler
+    with pytest.raises(OmniClientError, match="flow_shift must be finite"):
+        run("euler", bad_shift)
+    assert pipeline.scheduler is euler_scheduler
+    assert (pipeline._sample_solver, pipeline._flow_shift) == ("euler", 5.0)
+    assert_euler_sigmas(5.0)
 
 
 def test_forward_batches_text_generators_latents_and_splits_outputs() -> None:

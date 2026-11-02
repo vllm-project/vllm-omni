@@ -17,6 +17,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
     get_wan22_i2v_pre_process_func,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -385,6 +386,68 @@ def test_i2v_forward_batches_conditions_random_inputs_and_outputs(monkeypatch, s
     assert len(outputs) == 2
     torch.testing.assert_close(outputs[0].output, latents_a)
     torch.testing.assert_close(outputs[1].output, latents_b)
+
+
+@pytest.mark.parametrize("bad_shift", ["nan", float("nan"), "inf"])
+def test_i2v_forward_never_caches_non_finite_flow_shift(monkeypatch, bad_shift: object) -> None:
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v.current_omni_platform",
+        SimpleNamespace(is_available=lambda: False),
+    )
+    pipeline = _make_i2v_pipeline(expand_timesteps=True)
+    pipeline.scheduler = build_wan_scheduler("unipc", 5.0)
+    pipeline.od_config = SimpleNamespace(flow_shift=5.0)
+    pipeline._sample_solver = "unipc"
+    pipeline._flow_shift = 5.0
+    pipeline.boundary_ratio = 0.875
+    pipeline.has_image_encoder = False
+    pipeline._guidance_scale = None
+    pipeline._guidance_scale_2 = None
+    pipeline._num_timesteps = None
+    pipeline._current_timestep = None
+    pipeline.check_inputs = lambda **kwargs: None
+    pipeline.encode_prompt = lambda **kwargs: (torch.zeros(1, 2, 3), None)  # type: ignore[method-assign]
+    pipeline.prepare_latents = lambda **kwargs: (  # type: ignore[method-assign]
+        torch.zeros(1, 4, 2, 2, 2),
+        torch.zeros(1, 4, 1, 2, 2),
+        torch.ones(1, 1, 2, 2, 2),
+    )
+    pipeline.diffuse = lambda **kwargs: kwargs["latents"]  # type: ignore[method-assign]
+
+    def run(solver: str, shift: object) -> None:
+        request = SimpleNamespace(
+            request_id="schedule",
+            prompt={"prompt": "prompt", "multi_modal_data": {"image": torch.zeros(1, 3, 16, 16)}},
+            sampling_params=_make_i2v_sampling(
+                num_inference_steps=5, extra_args={"sample_solver": solver, "flow_shift": shift}
+            ),
+        )
+        pipeline.forward(DiffusionRequestBatch(requests=[request]))
+
+    def assert_euler_sigmas(shift: float) -> None:
+        reference = build_wan_scheduler("euler", shift)
+        reference.set_timesteps(5, device="cpu")
+        torch.testing.assert_close(pipeline.scheduler.sigmas, reference.sigmas, rtol=0, atol=0)
+
+    # Cached UniPC + Euler/non-finite: rejected before the scheduler is rebuilt.
+    unipc_scheduler = pipeline.scheduler
+    with pytest.raises(OmniClientError, match="flow_shift must be finite"):
+        run("euler", bad_shift)
+    assert pipeline.scheduler is unipc_scheduler
+    assert (pipeline._sample_solver, pipeline._flow_shift) == ("unipc", 5.0)
+
+    # A following valid Euler request runs on its own shift, not a cached NaN one.
+    run("euler", 12.0)
+    assert_euler_sigmas(12.0)
+
+    # Cached Euler(5) + Euler/non-finite: rejected instead of silently running with shift 5.
+    run("euler", 5.0)
+    euler_scheduler = pipeline.scheduler
+    with pytest.raises(OmniClientError, match="flow_shift must be finite"):
+        run("euler", bad_shift)
+    assert pipeline.scheduler is euler_scheduler
+    assert (pipeline._sample_solver, pipeline._flow_shift) == ("euler", 5.0)
+    assert_euler_sigmas(5.0)
 
 
 def test_i2v_forward_rejects_mismatched_tensor_condition_shapes(monkeypatch) -> None:

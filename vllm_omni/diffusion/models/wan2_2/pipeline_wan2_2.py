@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import Iterable
@@ -65,6 +66,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -153,13 +155,19 @@ def resolve_wan_sample_solver(req: OmniDiffusionRequest, default: str = "unipc")
 def resolve_wan_flow_shift(req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> float:
     extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
     raw_flow_shift = extra_args.get("flow_shift")
+    # A bad request value is a client error (HTTP 400); a bad server config is not.
+    error_cls = OmniClientError if raw_flow_shift is not None else ValueError
     if raw_flow_shift is None:
         raw_flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
 
     try:
-        return float(raw_flow_shift)
+        flow_shift = float(raw_flow_shift)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+        raise error_cls(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be a float.") from exc
+    # NaN would also defeat the scheduler-cache comparison in forward().
+    if not math.isfinite(flow_shift):
+        raise error_cls(f"Invalid flow_shift={raw_flow_shift!r}. flow_shift must be finite.")
+    return flow_shift
 
 
 def resolve_wan_boundary_ratio(
