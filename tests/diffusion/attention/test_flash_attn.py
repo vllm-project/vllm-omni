@@ -668,6 +668,16 @@ def test_varlen_masked_routing_by_role(monkeypatch):
 
 
 @pytest.mark.cpu
+def test_flash_attn_rejects_dense_qk_mask_with_actionable_error():
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    metadata = AttentionMetadata(attn_mask=torch.ones(1, 1, 4, 4, dtype=torch.bool))
+
+    with pytest.raises(NotImplementedError, match="TORCH_SDPA"):
+        impl._forward_varlen_masked(query, query, query, metadata.attn_mask)
+
+
+@pytest.mark.cpu
 def test_published_noop_mask_uses_dense_path(monkeypatch):
     calls = []
 

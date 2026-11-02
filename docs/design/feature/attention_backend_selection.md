@@ -56,6 +56,16 @@ The active `OmniPlatform` owns compatibility policy through
 The selector must not duplicate device capability or package-availability
 policy that belongs to the platform.
 
+For calls with a dense four-dimensional attention mask, `Attention` checks
+`supports_dense_4d_mask()` before dispatch. An unsupported automatic
+selection falls back to SDPA when available and paged KV is inactive; an
+unsupported explicit selection, active paged KV, or missing fallback raises.
+Backends that support piecewise spans use `full_attn_spans` in preference to
+the dense mask, so those calls retain their selected backend.
+This capability is platform-dependent: `FLASH_ATTN` preserves the NPU path
+that forwards dense masks to MindIE-SD (or `torch_npu` for causal attention),
+while its CUDA padding-only varlen path cannot consume dense QK masks.
+
 ## Typed backend options
 
 Backend-specific settings remain typed fields on `AttentionSpec` rather than

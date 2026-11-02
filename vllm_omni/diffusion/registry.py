@@ -480,10 +480,6 @@ _NO_CACHE_ACCELERATION = {
     "TaoMateH3Pipeline",
     "CausVidWanPipeline",
     "ABotWorldCausalPipeline",
-    # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
-    # branch) across denoising steps, which conflicts with cache_dit / tea_cache
-    # step-skipping hooks.
-    "QwenImage21Pipeline",
 }
 
 

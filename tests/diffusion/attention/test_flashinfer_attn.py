@@ -86,7 +86,9 @@ def test_explicit_cute_dsl_is_not_mask_capable(monkeypatch):
     spec = AttentionSpec(backend="FLASHINFER_ATTN")
 
     assert FlashInferAttentionBackend.supports_attention_mask() is True
+    assert FlashInferAttentionBackend.supports_dense_4d_mask() is True
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is False
+    assert FlashInferAttentionBackend.supports_dense_4d_mask(spec) is False
 
 
 @pytest.mark.cpu
@@ -95,6 +97,7 @@ def test_explicit_fa2_flashinfer_is_mask_capable(monkeypatch):
     spec = AttentionSpec(backend="FLASHINFER_ATTN", quant=AttnQuantSpec(flashinfer_backend="fa2"))
 
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
+    assert FlashInferAttentionBackend.supports_dense_4d_mask(spec) is True
 
 
 @pytest.mark.cpu
@@ -127,6 +130,7 @@ def test_hopper_explicit_flashinfer_is_mask_capable(monkeypatch):
     spec = AttentionSpec(backend="FLASHINFER_ATTN")
 
     assert FlashInferAttentionBackend.supports_attention_mask(spec) is True
+    assert FlashInferAttentionBackend.supports_dense_4d_mask(spec) is True
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
