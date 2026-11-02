@@ -35,8 +35,8 @@ connectors:
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
       enable_hift_graph: true
-      # Capture batch-1 continuation/tail shapes without padding: with the
-      # 8-frame mel cache these codec widths cover 16-64 mel frames.
+      # Capture batch-1 continuation/tail shapes without padding; K-step hands
+      # codec frames over in 8-frame quanta, so tails reach mel widths 14-76.
       hift_graph_continuation_frames: [4, 28]
       hift_graph_exact_batch_sizes: [1]
       enable_cfm_graph: true
@@ -75,6 +75,9 @@ connectors:
       # startup instead of the first request. Overlays that still set
       # cfm_graph_precapture_after_load get a warning; it no longer has any effect.
       cfm_graph_precapture_at_init: true
+      # Merge ragged K-step CFM shapes into one solve per step instead of
+      # one solve per bucket, so the bucket grid does not fill cfm_max_graphs.
+      cfm_cross_bucket_merge: true
       # Default CUDA speaker path: CPU-reference TensorRT, not full DiT TensorRT.
       # Missing TensorRT falls back to the Torch speaker. Non-CUDA ignores the
       # flag. Set false in an overlay to keep Torch. token2wav_trt /
@@ -186,6 +189,17 @@ platforms:
         # (2 GiB holds ~35k tokens). The explicit cap leaves device headroom
         # for concurrent Stage 2.
         kv_cache_memory_bytes: 4294967296  # 4 GiB
+        # Multi-frame decode: 8 codec frames per step, mirroring the NPU
+        # block. The CUDA runner intercepts the step and injects the constant
+        # continue drafts; stop_token_ids is the two-wide continue/stop id.
+        speculative_config:
+          method: ngram
+          num_speculative_tokens: 7
+          prompt_lookup_min: 1
+          prompt_lookup_max: 1
+        async_scheduling: false
+        default_sampling_params:
+          stop_token_ids: [1]
 
   npu:
     stages:

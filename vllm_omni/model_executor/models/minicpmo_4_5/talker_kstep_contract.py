@@ -37,7 +37,7 @@ def talker_kstep_frames(model_stage: Any, speculative_config: Any) -> int:
     else:
         method = getattr(speculative_config, "method", None)
         num_spec = getattr(speculative_config, "num_speculative_tokens", 0) or 0
-    if method != "ngram":
+    if method not in ("ngram", "ngram_gpu"):
         return 0
     frames = int(num_spec) + 1
     if frames < 2:

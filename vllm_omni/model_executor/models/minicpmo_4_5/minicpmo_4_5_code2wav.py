@@ -539,6 +539,11 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "NPU cross-reference batching will remain inactive and existing dispatch will be used",
                 self._min_batch_size,
             )
+        # Merge the step's exact-shape buckets into one ragged solve: serving
+        # steps hold one chunk per request, so per-bucket decoding would run CFM
+        # once per row and never fill the wider graph buckets.
+        self._cross_bucket_merge = read_bool_flag(extra, "cfm_cross_bucket_merge", False)
+        self._cross_bucket_merge_limit = int(extra.get("cfm_cross_bucket_merge_limit", 0) or 0)
         self._row_offset_merge = self._cfm_graph_config["row_offset_merge"]
         self._precapture_empty_cache = read_bool_flag(extra, "cfm_precapture_empty_cache", False)
 
@@ -1389,6 +1394,20 @@ class MiniCPMO45Code2Wav(nn.Module):
             decode_buckets = merged
         else:
             decode_buckets = buckets.values()
+        merged_ragged = False
+        if (
+            self._cross_bucket_merge
+            and self.backend is not None
+            and self.backend._whole_euler_ragged_active()
+            and len(buckets) > 1
+        ):
+            # One solve for the whole step: every row keeps its own caches and
+            # reference, which is what the ragged Whole-Euler path supports.
+            merge_items = [item for bucket in buckets.values() for item in bucket]
+            merge_limit = self._cross_bucket_merge_limit or int(self._cfm_graph_config.get("max_graph_batch") or 0)
+            if not merge_limit or len(merge_items) <= merge_limit:
+                decode_buckets = [merge_items]
+                merged_ragged = True
         for bucket in self._iter_decode_batches(decode_buckets):
             batch_size = len(bucket)
             try:
@@ -1410,9 +1429,15 @@ class MiniCPMO45Code2Wav(nn.Module):
                 offset_mix = False
                 if npu_same_shape and batch_size > 1:
                     row_groups = self._npu_same_shape_groups(bucket, states, features, cross_turn=cross_turn)
-                elif isinstance(features, list):
+                if merged_ragged and len(bucket) > 1:
+                    # Keep the merged rows in one solve: re-splitting by cache
+                    # signature is exactly what the merge removed.
+                    offset_mix = True
+                if isinstance(features, list):
                     # Each reference has its own cache lengths and conditioning.
                     # The ragged path handles them in one solve.
+                    pass
+                elif merged_ragged and len(bucket) > 1:
                     pass
                 elif onset_mix and not onset_ready:
                     # Cache layouts ragged Whole-Euler cannot take split back into signature buckets.
