@@ -107,6 +107,7 @@ omni = Omni(
 | `diffusion_offload_config.mode` | `module` or `layer` granularity | required |
 | `diffusion_offload_config.components` | Non-empty list containing `dit`, `text_encoder`, or both | required |
 | `layer_options.NAME.weight_transfer` | `rank-local` or `allgather` | `rank-local` |
+| `layer_options.NAME.block_paths` | Block lists to stream instead of the model-declared ones; see [Layerwise Offloading](layerwise_offload.md#choosing-block-lists-from-the-command-line) | model plan |
 | `layer_options.dit.resident_layers` | Leading main-DiT blocks kept on device; requires `rank-local` and model-declared resident paths | `0` |
 | `diffusion_offload_config.pin_memory` | Pin streamed host memory for faster H2D copies | `true` |
 | `--data-parallel-size N` | DP ranks; DP is the DLO group when greater than one, otherwise SP is used | `1` |

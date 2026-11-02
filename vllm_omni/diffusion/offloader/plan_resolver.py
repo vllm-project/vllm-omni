@@ -15,7 +15,8 @@ here, so plan-dependent failures happen before a backend mutates the model.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from functools import cache
 from operator import attrgetter
 from typing import TYPE_CHECKING
@@ -26,9 +27,14 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
 from .block_discovery import get_blocks_from_dit
-from .component_utils import get_encoder_block_groups, validate_on_demand_component
+from .component_utils import (
+    encoder_component_type,
+    get_encoder_block_groups,
+    supports_layerwise_staging,
+    validate_on_demand_component,
+)
 from .config import DIT_COMPONENT, TEXT_ENCODER_COMPONENT, OffloadStrategy
-from .module_collector import ModuleDiscovery
+from .module_collector import ModuleDiscovery, PipelineModules
 from .offload_plan import OffloadPlan, get_offload_plan
 
 if TYPE_CHECKING:
@@ -298,6 +304,80 @@ def _resolve_encoder_stacks(
     return tuple(BlockStack(blocks=tuple(blocks)) for blocks in groups)
 
 
+def streamable_block_candidates(module: nn.Module) -> list[str]:
+    """List the attribute paths of a module that look like streamable block lists."""
+    return [
+        name for name, child in module.named_modules() if name and isinstance(child, nn.ModuleList) and len(child) > 1
+    ]
+
+
+def _check_block_path_override(module: nn.Module, component: str, path: str, block_path: str) -> None:
+    try:
+        blocks = attrgetter(block_path)(module)
+    except AttributeError:
+        blocks = None
+    if isinstance(blocks, nn.ModuleList) and len(blocks) > 1:
+        return
+    candidates = ", ".join(streamable_block_candidates(module)) or "none"
+    raise ValueError(
+        f"layer_options[{component!r}].block_paths names {path}.{block_path}, which is not a "
+        f"streamable block list (an nn.ModuleList with at least two blocks). Candidates on {path}: {candidates}"
+    )
+
+
+def _apply_block_path_overrides(
+    declaration: OffloadPlan | None,
+    config: OffloadConfig,
+    modules: PipelineModules,
+) -> OffloadPlan | None:
+    """Merge user ``block_paths`` over the model-declared block lists.
+
+    Every override is validated here, so a typo fails before any placement
+    instead of silently falling back to the model's own plan.
+    """
+    if not config.block_paths:
+        return declaration
+    base = declaration if declaration is not None else OffloadPlan()
+    encoder_paths = [
+        (path, module)
+        for path, module in zip(modules.encoder_names, modules.encoders)
+        if encoder_component_type(path, base) == TEXT_ENCODER_COMPONENT
+    ]
+    targets = {
+        DIT_COMPONENT: list(zip(modules.dit_names, modules.dits)),
+        TEXT_ENCODER_COMPONENT: encoder_paths,
+    }
+    overrides: dict[str, dict[str, tuple[str, ...]]] = {DIT_COMPONENT: {}, TEXT_ENCODER_COMPONENT: {}}
+    for component, paths in config.block_paths.items():
+        discovered = targets[component]
+        if isinstance(paths, Mapping):
+            unknown = sorted(set(paths) - {path for path, _ in discovered})
+            if unknown:
+                known = ", ".join(path for path, _ in discovered) or "none"
+                raise ValueError(
+                    f"layer_options[{component!r}].block_paths names unknown {component} path(s) "
+                    f"{', '.join(unknown)}; discovered: {known}"
+                )
+        for path, module in discovered:
+            block_paths = config.block_paths_for(component, path)
+            if block_paths is None:
+                continue
+            if component == TEXT_ENCODER_COMPONENT and path in base.on_demand_component_paths:
+                if not supports_layerwise_staging(module):
+                    raise ValueError(
+                        f"Text encoder {path!r} stages itself on demand and does not support "
+                        "streaming its blocks; layer_options['text_encoder'].block_paths cannot apply to it"
+                    )
+            for block_path in block_paths:
+                _check_block_path_override(module, component, path, block_path)
+            overrides[component][path] = block_paths
+    return replace(
+        base,
+        block_attrs={**base.block_attrs, **overrides[DIT_COMPONENT]},
+        encoder_block_attrs={**base.encoder_block_attrs, **overrides[TEXT_ENCODER_COMPONENT]},
+    )
+
+
 def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> ResolvedOffloadPlan:
     """Resolve and validate one pipeline's offload topology.
 
@@ -305,7 +385,7 @@ def resolve_offload_plan(pipeline: nn.Module, config: OffloadConfig) -> Resolved
     cannot serve, before the caller places a module or installs a hook.
     """
     modules = ModuleDiscovery.discover(pipeline)
-    declaration = get_offload_plan(pipeline)
+    declaration = _apply_block_path_overrides(get_offload_plan(pipeline), config, modules)
     if not isinstance(pipeline, SupportsComponentDiscovery) and (modules.dits or modules.encoders or modules.vaes):
         pipeline_class = type(pipeline)
         _warn_legacy_discovery(f"{pipeline_class.__module__}.{pipeline_class.__qualname__}")

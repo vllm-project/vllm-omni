@@ -67,6 +67,30 @@ Encoder categories are resolved from `OffloadPlan.encoder_component_types`
 first. A name-based fallback is retained for pipelines that predate
 `OffloadPlan`.
 
+## Choosing block lists from the command line
+
+`layer_options.NAME.block_paths` names the block lists to stream when a model
+declares none for a component, or declares different ones. Each entry is
+an attribute path, relative to the component module, of an `nn.ModuleList`
+with at least two blocks. A list applies to every discovered module of the
+component; a mapping keys the lists by component path.
+
+```bash
+# Stream MAGI-2's Qwen text encoder decoder layers next to the DiT
+vllm serve /path/to/MAGI-2 --omni \
+  --diffusion-offload-config \
+  '{"mode":"layer","components":["dit","text_encoder"],
+    "layer_options":{"text_encoder":{"block_paths":{"text_encoder":["module.text_model.layers"]}}}}'
+```
+
+User paths replace the model's own declaration for that component path and are
+validated at startup. A wrong path fails and lists the candidate block lists
+found on the module. DiT entries must name direct DiT attributes.
+Components that stage themselves on demand accept `block_paths` only when they
+stage around layerwise hooks (`LayerwiseAwareStager`). Prefer a model-declared
+`OffloadPlan` for supported models; module paths are internal names and can
+change between releases.
+
 ## Model integration
 
 Transformer classes declare containers of executable blocks:
