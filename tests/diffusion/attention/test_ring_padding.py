@@ -134,6 +134,57 @@ def test_flash_ring_trims_padding_from_each_kv_block(monkeypatch):
     assert captured["v"].shape[1] == 3
 
 
+def test_flash_ring_trims_circulated_blocks_by_source_rank(monkeypatch):
+    observed_lengths = []
+    blocks = [torch.randn(1, 4, 2, 8) for _ in range(4)]
+
+    class FakeRingComm:
+        rank = 2
+        world_size = 3
+
+        def __init__(self, _group):
+            self._next_block = 0
+
+        def send_recv(self, _tensor, recv_tensor=None):
+            # The flash forward packs K and V into one transfer per hop.
+            block = blocks[self._next_block]
+            self._next_block += 1
+            return torch.stack([block, block])
+
+        def commit(self):
+            pass
+
+        def wait(self):
+            pass
+
+    def fake_attention(q, k, v, **kwargs):
+        observed_lengths.append(k.shape[1])
+        return _fake_attention_result(q, k, v, **kwargs)
+
+    monkeypatch.setattr(ring_flash_attn, "RingComm", FakeRingComm)
+    monkeypatch.setattr(ring_flash_attn, "select_flash_attn_impl", lambda *_args, **_kwargs: fake_attention)
+    qkv = torch.randn(1, 4, 2, 8)
+
+    output, lse = ring_flash_attn.ring_flash_attn_forward(
+        object(),
+        qkv,
+        qkv,
+        qkv,
+        softmax_scale=0.25,
+        causal=False,
+        attn_type=AttnType.FA,
+        valid_kv_length=5,
+    )
+
+    # Rank 2 starts with global block 2, then receives blocks 1 and 0. The
+    # first block is empty, so it launches no attention and does not
+    # initialize the accumulators -- the second hop does.
+    assert observed_lengths == [1, 4]
+    assert output.shape == qkv.shape
+    assert output.dtype == qkv.dtype
+    assert lse.shape == (qkv.shape[0], qkv.shape[2], qkv.shape[1])
+
+
 def test_ring_dispatch_forwards_global_valid_kv_length(monkeypatch):
     captured: dict[str, Any] = {}
 
