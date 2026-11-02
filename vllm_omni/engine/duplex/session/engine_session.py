@@ -39,6 +39,7 @@ from vllm_omni.engine.duplex.config import (
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
+from vllm_omni.engine.duplex.memory_types import DuplexMemoryAdmission, DuplexMemoryCardBatch
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
 from vllm_omni.engine.duplex.session.context_view import DuplexHistoryView
 from vllm_omni.engine.duplex.session.context_view import render_history_view as render_context_view
@@ -139,6 +140,7 @@ class HistorySource:
     source_id: int
     # Keep identity alive until the source is explicitly forgotten.
     message: dict[str, object] = field(repr=False, compare=False)
+    slot_order: int = 0
     revision: int = 0
     item_id: str | None = None
     # Authoritative playback metadata also versions assistant-derived context,
@@ -152,6 +154,7 @@ class ConversationHistory:
     messages: list[dict[str, object]] = field(default_factory=list)
     revision: int = 0
     next_source_id: int = 0
+    next_slot_order: int = 0
     # Keys are identities of live message dictionaries, never public item IDs.
     sources: dict[int, HistorySource] = field(default_factory=dict)
     #: User items added by ``conversation.item.create`` that no response has
@@ -160,6 +163,7 @@ class ConversationHistory:
     unanswered_user_items: int = 0
     item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_placeholders: dict[str, dict[str, object]] = field(default_factory=dict)
+    placeholder_slot_orders: dict[str, int] = field(default_factory=dict)
     item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
     # Preserve audio provenance with stored history after releasing its cursor.
     retired_audio_item_ids: set[str] = field(default_factory=set)
@@ -518,6 +522,13 @@ class DuplexEngineSession:
         """Derived context nodes; they live and die with this session object."""
         return self._context_ledger
 
+    def admit_memory_cards(self, batch: DuplexMemoryCardBatch) -> DuplexMemoryAdmission:
+        """Admit owner-bound card candidates against current session authority."""
+        snapshot = self.history_snapshot()
+        self._context_ledger.refresh(snapshot)
+        orders = {source.source_id: source.slot_order for source in self._conversation.sources.values()}
+        return self._context_ledger.admit_card_batch(snapshot, source_orders=orders, batch=batch)
+
     def render_history_view(
         self, policy: DuplexContextViewPolicy, *, snapshot: DuplexHistorySnapshot | None = None
     ) -> DuplexHistoryView:
@@ -533,13 +544,19 @@ class DuplexEngineSession:
         return source
 
     def _track_history_message(
-        self, message: dict[str, object], *, item_id: str | None = None, changed: bool = False
+        self,
+        message: dict[str, object],
+        *,
+        item_id: str | None = None,
+        changed: bool = False,
+        slot_order: int | None = None,
     ) -> None:
         source = self._conversation.sources.get(id(message))
         if source is None:
             source = HistorySource(
                 source_id=self._conversation.next_source_id,
                 message=message,
+                slot_order=self._allocate_history_slot() if slot_order is None else slot_order,
                 item_id=item_id,
                 hard_cutoff_ms=self._conversation.hard_truncations_ms.get(item_id) if item_id is not None else None,
             )
@@ -555,6 +572,11 @@ class DuplexEngineSession:
                 return
             source.revision += 1
         self._conversation.revision += 1
+
+    def _allocate_history_slot(self) -> int:
+        order = self._conversation.next_slot_order
+        self._conversation.next_slot_order += 1
+        return order
 
     def _forget_history_message(self, message: dict[str, object]) -> None:
         if id(message) in self._conversation.sources:
@@ -644,6 +666,7 @@ class DuplexEngineSession:
             return
         placeholder: dict[str, object] = {}
         self._conversation.history_item_placeholders[item_id] = placeholder
+        self._conversation.placeholder_slot_orders[item_id] = self._allocate_history_slot()
         self._conversation.messages.append(placeholder)
 
     def _store_history_item_message(
@@ -662,6 +685,7 @@ class DuplexEngineSession:
             return existing
 
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
+        slot_order = self._conversation.placeholder_slot_orders.pop(item_id, None)
         if placeholder is not None:
             for index, candidate in enumerate(self._conversation.messages):
                 if candidate is placeholder:
@@ -672,11 +696,12 @@ class DuplexEngineSession:
         elif not any(candidate is message for candidate in self._conversation.messages):
             self._conversation.messages.append(message)
         self._conversation.item_ids[item_id] = message
-        self._track_history_message(message, item_id=item_id)
+        self._track_history_message(message, item_id=item_id, slot_order=slot_order)
         return message
 
     def _discard_history_item_placeholder(self, item_id: str) -> bool:
         placeholder = self._conversation.history_item_placeholders.pop(item_id, None)
+        self._conversation.placeholder_slot_orders.pop(item_id, None)
         if placeholder is None:
             return False
         self._conversation.messages = [
