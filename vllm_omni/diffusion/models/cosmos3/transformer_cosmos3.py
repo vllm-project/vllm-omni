@@ -1598,7 +1598,9 @@ class Cosmos3VFMTransformer(nn.Module):
         def build_gen_layer(layer_idx: int, prefix: str) -> Cosmos3GenDecoderLayer:
             return self._gen_layer_cls(
                 layer_idx=layer_idx,
-                operation=AttentionOperation(f"gen.{layer_idx}", layer_idx, "cosmos3.gen", "self", component=attention_component)
+                operation=AttentionOperation(
+                    f"gen.{layer_idx}", layer_idx, "cosmos3.gen", "self", component=attention_component
+                )
                 if attention_strategy_enabled
                 else None,
                 hidden_size=self.hidden_size,
@@ -2090,7 +2092,7 @@ class Cosmos3VFMTransformer(nn.Module):
             # indices stay global and each rank runs only [start_layer, end_layer).
             # Without PP, zip the full lists (they may even be replaced at runtime,
             # e.g. by tests or cache wrappers).
-            if _pp_parallel_active():
+            if not self.attention_execution.strategy_enabled and _pp_parallel_active():
                 own_layers = self.gen_layers[self.start_layer : self.end_layer]
                 own_kv = cached_kv[self.start_layer : self.end_layer]
             else:
@@ -2111,7 +2113,11 @@ class Cosmos3VFMTransformer(nn.Module):
         else:
             # Cache-dit patches gen_layers to a grouped wrapper holding every
             # layer, so a PP rank would run foreign stages' layers.
-            if _pp_parallel_active() and (self.start_layer, self.end_layer) != (0, len(self.cached_kv)):
+            if (
+                not self.attention_execution.strategy_enabled
+                and _pp_parallel_active()
+                and (self.start_layer, self.end_layer) != (0, len(self.cached_kv))
+            ):
                 raise NotImplementedError(
                     "Cosmos3 Cache-Dit is not supported together with pipeline parallelism; disable one of them."
                 )
@@ -2178,7 +2184,7 @@ class Cosmos3VFMTransformer(nn.Module):
         if kwargs:
             raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
 
-        is_pp_first, is_pp_last = _pp_stage_flags()
+        is_pp_first, is_pp_last = (True, True) if self.attention_execution.strategy_enabled else _pp_stage_flags()
         if is_pp_first:
             prep = self._gen_preprocess(
                 hidden_states,
