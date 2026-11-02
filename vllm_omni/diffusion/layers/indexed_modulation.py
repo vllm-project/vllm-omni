@@ -32,6 +32,7 @@ def _indexed_scale_shift_kernel(
     scale_ptr,
     indices_ptr,
     hidden_size,
+    stride_output_row,
     stride_x_row,
     stride_shift_row,
     stride_scale_row,
@@ -48,11 +49,10 @@ def _indexed_scale_shift_kernel(
     shift = tl.load(shift_ptr + index * stride_shift_row + columns, mask=mask, other=0.0).to(tl.float32)
     scale = tl.load(scale_ptr + index * stride_scale_row + columns, mask=mask, other=0.0).to(tl.float32)
 
-    tl.store(
-        output_ptr + row * stride_x_row + columns,
-        x * (1.0 + scale) + shift,
-        mask=mask,
-    )
+    # Preserve the input-dtype rounding even when storing directly to FP32.
+    # This matches an input-dtype affine output followed by Tensor.float().
+    output = (x * (1.0 + scale) + shift).to(x_ptr.dtype.element_ty)
+    tl.store(output_ptr + row * stride_output_row + columns, output, mask=mask)
 
 
 @triton.jit
@@ -197,6 +197,7 @@ def indexed_scale_shift_(
         indices,
         hidden_size,
         x.stride(0),
+        x.stride(0),
         shift.stride(0),
         scale.stride(0),
         indices.stride(0),
@@ -204,6 +205,43 @@ def indexed_scale_shift_(
         num_warps=8,
     )
     return x
+
+
+def indexed_scale_shift_to_fp32(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse indexed affine and FP32 promotion, retaining input-dtype rounding.
+
+    Columns must be contiguous, as in :func:`indexed_scale_shift_`. The
+    returned FP32 tensor owns its storage; the input is not modified.
+    """
+    if x.is_cpu:
+        return (x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(x.dtype).float()
+    rows, hidden_size = x.shape
+    output = torch.empty((rows, hidden_size), dtype=torch.float32, device=x.device)
+    if rows:
+        _launch_row_chunks(
+            _indexed_scale_shift_kernel,
+            rows,
+            x.device.type,
+            output,
+            x,
+            shift,
+            scale,
+            indices,
+            hidden_size,
+            output.stride(0),
+            x.stride(0),
+            shift.stride(0),
+            scale.stride(0),
+            indices.stride(0),
+            block_n=triton.next_power_of_2(hidden_size),
+            num_warps=8,
+        )
+    return output
 
 
 def indexed_gate(
@@ -338,5 +376,6 @@ __all__ = [
     "indexed_gate",
     "indexed_gate_rms_norm_scale_shift",
     "indexed_scale_shift_",
+    "indexed_scale_shift_to_fp32",
     "rms_norm_indexed_scale_shift",
 ]
