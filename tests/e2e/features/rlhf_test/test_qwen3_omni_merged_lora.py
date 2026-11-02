@@ -72,7 +72,7 @@ async def test_qwen3_omni_merged_lora_ipc_preserves_graph_storage_and_restores_o
         (after_merge,) = await engine.collective_rpc("merged_q_projection", stage_ids=[0])
         assert after_merge[0]["data_ptr"] == projection["data_ptr"]
         assert after_merge[0]["sample"] != projection["sample"]
-        await _generate_text(engine, "merged")
+        assert await _generate_text(engine, "merged") != baseline_tokens
 
         await _publish_adapter(
             engine, [(f"{prefix}.lora_A.weight", a), (f"{prefix}.lora_B.weight", torch.zeros_like(b))]

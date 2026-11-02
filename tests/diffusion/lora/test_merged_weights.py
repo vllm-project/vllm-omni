@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import socket
+
 import pytest
 import torch
 
-from vllm_omni.lora.merged_weights import MergedLinearWeights
+from vllm_omni.lora.merged_weights import MergedLinearWeights, check_merge_error
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -134,3 +136,31 @@ def test_forward_is_dense_with_no_adapter_operations():
         output = layer.base_layer(x)
     torch.testing.assert_close(output, torch.nn.functional.linear(x, layer.base_layer.weight))
     assert sum(event.count for event in trace.key_averages() if event.key == "aten::mm") == 1
+
+
+def _failed_prepare_rank(rank: int, port: int) -> None:
+    torch.distributed.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
+    try:
+        layer = _layer()
+        bank = MergedLinearWeights()
+        bank.apply(bank.prepare({"proj": layer}))
+        previous = layer.base_layer.weight.detach().clone()
+        if rank == 1:
+            layer.lora_b_stacked = (torch.ones(1, 1, 2, 2), *layer.lora_b_stacked[1:])
+        error = None
+        try:
+            bank.prepare({"proj": layer})
+        except ValueError as exc:
+            error = exc
+        with pytest.raises((ValueError, RuntimeError)):
+            check_merge_error(error, torch.distributed.group.WORLD)
+        torch.testing.assert_close(layer.base_layer.weight, previous, rtol=0, atol=0)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_prepare_failure_aborts_both_ranks_without_changing_policy():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    torch.multiprocessing.spawn(_failed_prepare_rank, args=(port,), nprocs=2)

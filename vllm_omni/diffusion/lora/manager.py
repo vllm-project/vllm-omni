@@ -396,7 +396,7 @@ class DiffusionLoRAManager:
             raise RuntimeError("Diffusion LoRA manager is closed")
         if self.lora_application == "merged":
             if lora_request is None:
-                self.reset_merged_adapter()
+                return
             else:
                 self.merge_adapter(lora_request, lora_scale)
             return

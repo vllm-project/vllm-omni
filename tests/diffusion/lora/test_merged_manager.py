@@ -61,6 +61,7 @@ def test_native_merge_reuses_tp_packing_without_replacing_live_modules(pipeline)
     for _ in range(3):
         manager.merge_adapter(request)
         manager.set_request_adapter(None)
+        manager.set_active_adapter(None)
         assert model.transformer.gate_up is layer
         assert layer.weight.data_ptr() == pointer
         torch.testing.assert_close(layer.weight, expected.bfloat16(), rtol=0, atol=0)

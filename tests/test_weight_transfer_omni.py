@@ -93,6 +93,20 @@ def test_ar_worker_still_inherits_upstream_gpu_worker():
         )
 
 
+def test_ar_merged_backend_rejects_runtime_lora_before_model_load():
+    from vllm.config.weight_transfer import WeightTransferConfig
+
+    from vllm_omni.worker.base import OmniGPUWorkerBase
+
+    worker = object.__new__(OmniGPUWorkerBase)
+    worker.vllm_config = SimpleNamespace(
+        weight_transfer_config=WeightTransferConfig(backend="omni_lora_ipc"),
+        lora_config=object(),
+    )
+    with pytest.raises(ValueError, match="requires enable_lora=False"):
+        worker.load_model()
+
+
 # --- Diffusion stage: implemented on DiffusionWorker ---
 
 

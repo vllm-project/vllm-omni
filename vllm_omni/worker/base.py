@@ -147,6 +147,13 @@ class OmniGPUWorkerBase(GPUWorker):
         return result
 
     def load_model(self, *args, **kwargs):
+        weight_transfer = self.vllm_config.weight_transfer_config
+        if (
+            weight_transfer is not None
+            and weight_transfer.backend == "omni_lora_ipc"
+            and self.vllm_config.lora_config is not None
+        ):
+            raise ValueError("omni_lora_ipc requires enable_lora=False on AR stages")
         with self._maybe_get_memory_pool_context("weights"):
             res = super().load_model(*args, **kwargs)
             current_omni_platform.synchronize()
