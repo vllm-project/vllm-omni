@@ -134,6 +134,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     kv_holding_waiting: RequestQueue
     max_num_active_reqs: int
     max_num_scheduled_tokens: int
+    prev_step_scheduled_req_ids: set[str]
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
@@ -948,16 +949,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
         original_token_budget = None
+        previous_batch_ids = None
         if defer_generation:
             # Both runners still process control/completion work on empty
             # steps. Defer before allocation, never discard a scheduled batch.
             original_token_budget = self.max_num_scheduled_tokens
             self.max_num_scheduled_tokens = 0
+            if not self.use_v2_model_runner:
+                previous_batch_ids = self.prev_step_scheduled_req_ids.copy()
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
             if original_token_budget is not None:
                 self.max_num_scheduled_tokens = original_token_budget
+            if previous_batch_ids is not None:
+                # Upstream clears these on empty steps, causing the next V1
+                # execution to copy full histories for otherwise retained rows.
+                self.prev_step_scheduled_req_ids = previous_batch_ids
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
@@ -965,6 +973,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 original_kv_holding.prepend_requests(self.kv_holding_waiting)
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
+
+        if previous_batch_ids is not None:
+            previous_batch_ids.difference_update(scheduler_output.finished_req_ids)
 
         # Backstop: a step built without ``_update_after_schedule`` (nothing
         # booked, so nothing to reconcile) still leaves here uniform. On the
@@ -981,6 +992,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
+            preserve_v1_batch=previous_batch_ids is not None,
         )
 
     def update_from_output(

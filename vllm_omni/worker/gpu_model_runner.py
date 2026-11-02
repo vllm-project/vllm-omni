@@ -666,7 +666,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # that case we include the resumed_req_ids in the unscheduled set so
         # that they get cleared from the persistent batch before being re-scheduled
         # in the normal resumed request path.
-        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        preserve_batch = (
+            getattr(scheduler_output, "preserve_v1_batch", False) and scheduler_output.total_num_scheduled_tokens == 0
+        )
+        unscheduled_req_ids = set() if preserve_batch else cached_req_ids - (scheduled_req_ids - resumed_req_ids)
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -797,7 +800,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 scheduler_output,
                 self.input_batch.req_id_to_index,
             )
-        if self.use_async_spec_decode:
+        if self.use_async_spec_decode and not preserve_batch:
             self.prev_num_draft_tokens.np.fill(0)
 
         for i, req_id in enumerate(req_data.req_ids):
@@ -925,7 +928,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()
         # Allow attention backend to reorder the batch, potentially
-        self._may_reorder_batch(scheduler_output)
+        if not preserve_batch:
+            self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
