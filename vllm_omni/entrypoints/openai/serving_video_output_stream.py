@@ -35,7 +35,7 @@ import json
 import math
 import time
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 from http import HTTPStatus
 from typing import Any, cast
 
@@ -57,7 +57,9 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.entrypoints.openai.utils import is_video_generation_pipeline, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import (
+    FragmentedMP4VideoEncoder,
     StreamingVideoFormat,
+    _resolve_audio_sample_rate,
     create_streaming_video_encoder,
     decode_input_reference,
 )
@@ -854,22 +856,10 @@ class OmniStreamingVideoOutputHandler:
             async for result in self._iter_generation_outputs(prompt, gen_params, request_id, progress):
                 if result.error:
                     raise RuntimeError(str(result.error))
-                videos = self._extract_video_outputs(result)
-                for video in videos:
-                    chunk = encoder.encode(video)
-                    if max_output_bytes is not None and len(chunk or b"") > max_output_bytes:
+                for chunk, metadata in self._encode_generation_result(result, request_id, encoder):
+                    if max_output_bytes is not None and len(chunk) > max_output_bytes:
                         raise ValueError("encoded streaming chunk exceeds streaming_pacing.max_output_bytes")
-                    if chunk:
-                        yield (
-                            chunk,
-                            self._build_chunk_metadata(
-                                request_id=request_id,
-                                kind="media",
-                                byte_length=len(chunk),
-                                num_frames=self._num_video_frames(video),
-                                stream_metadata=self._extract_stream_metadata(result),
-                            ),
-                        )
+                    yield (chunk, metadata)
 
             completed = True
             final_chunk = encoder.close()
@@ -889,6 +879,32 @@ class OmniStreamingVideoOutputHandler:
         finally:
             if not completed:
                 encoder.close()
+
+    def _encode_generation_result(
+        self,
+        result: OmniRequestOutput,
+        request_id: str,
+        encoder: FragmentedMP4VideoEncoder,
+    ) -> Iterator[tuple[bytes, dict[str, Any]]]:
+        """Encode one result, preserving metadata even when the muxer buffers all bytes."""
+        videos = self._extract_video_outputs(result)
+        audio, audio_sample_rate = self._extract_audio_output(result)
+        if audio is not None and len(videos) != 1:
+            raise ValueError("A streaming result with audio must contain exactly one video.")
+        stream_metadata = self._extract_stream_metadata(result)
+        for index, video in enumerate(videos):
+            chunk = encoder.encode(video, audio, audio_sample_rate=audio_sample_rate)
+            metadata = self._build_chunk_metadata(
+                request_id=request_id,
+                kind="media",
+                byte_length=len(chunk),
+                num_frames=self._num_video_frames(video),
+                stream_metadata=stream_metadata if index == 0 else {},
+            )
+            if audio is not None:
+                metadata["num_audio_samples"] = self._num_audio_samples(audio)
+                metadata["audio_sample_rate"] = encoder.audio_sample_rate
+            yield (chunk, metadata)
 
     async def _build_prompt_and_sampling_params(
         self,
@@ -1080,6 +1096,37 @@ class OmniStreamingVideoOutputHandler:
         return normalized
 
     @staticmethod
+    def _extract_audio_output(result: OmniRequestOutput) -> tuple[Any | None, int | None]:
+        """Return the chunk's audio payload and sample rate, if the model streams audio."""
+        multimodal_output = result.multimodal_output
+        if not isinstance(multimodal_output, dict):
+            return None, None
+        audio = multimodal_output.get("audio")
+        if audio is None:
+            return None, None
+        if isinstance(audio, list) and len(audio) == 1 and isinstance(audio[0], (np.ndarray, torch.Tensor)):
+            audio = audio[0]
+        metadata = multimodal_output.get("metadata")
+        sample_rate = None
+        if isinstance(metadata, dict):
+            audio_metadata = metadata.get("audio")
+            if isinstance(audio_metadata, dict):
+                sample_rate = audio_metadata.get("sample_rate")
+        return audio, _resolve_audio_sample_rate(audio, sample_rate) if sample_rate is not None else None
+
+    @staticmethod
+    def _num_audio_samples(audio: Any) -> int:
+        if isinstance(audio, (np.ndarray, torch.Tensor)):
+            if audio.ndim == 0:
+                return 0
+            if audio.ndim == 1:
+                return int(audio.shape[0])
+            return int(max(audio.shape[0], audio.shape[-1]))
+        if isinstance(audio, list):
+            return len(audio)
+        return 0
+
+    @staticmethod
     def _extract_stream_metadata(result: OmniRequestOutput) -> dict[str, Any]:
         multimodal_output = result.multimodal_output
         if not isinstance(multimodal_output, dict):
@@ -1107,6 +1154,12 @@ class OmniStreamingVideoOutputHandler:
         num_frames: int,
         stream_metadata: dict[str, Any],
     ) -> dict[str, Any]:
+        """Describe submitted media and emitted byte length, not a standalone fragment.
+
+        Frame/sample counts and event IDs refer to the source generation chunk.
+        Codec/muxer buffering can move its media into a later binary frame;
+        a trailer reports zero submitted frames while flushing buffered media.
+        """
         return {
             "type": "video.chunk_metadata",
             "request_id": request_id,
