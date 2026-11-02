@@ -200,14 +200,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             and request.num_in_flight_tokens == 0
         }
 
-    def _generation_batch_ready(self, runnable: set[str]) -> bool:
-        """Optionally cap the target at the registered request population."""
-        target = self._generation_min_batch_size
-        if getattr(self, "_generation_always_wait_target_batch", False):
-            target = min(target, len(self.requests))
-            return len(runnable) >= target
-        return len(runnable) >= target or len(self.requests) < target
-
     def _process_pending_omni_inputs(self, model_mode: str) -> None:
         """Process inputs for either runner, then apply V1-only batch waiting."""
         super()._process_pending_omni_inputs(model_mode)
