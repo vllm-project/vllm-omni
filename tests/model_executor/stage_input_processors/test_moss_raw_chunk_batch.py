@@ -90,9 +90,15 @@ def test_batch_matches_scalar(extra, direct_first, as_numpy):
     for _ in range(120):
         host: list[torch.Tensor] = []
         requests = [SimpleNamespace(external_req_id=req_id, request_id=f"internal-{req_id}") for req_id in live]
+        for request in requests:
+            if int(request.external_req_id[1:]) % 2:
+                continue
+            request.additional_information = {"codes": {"ref": torch.full((2, _NQ), 9)}, "meta": {"ref_code_len": 2}}
         outputs = [_output(rng, host, as_numpy) for _ in live]
         if direct_first:
-            for output in outputs:
+            for request, output in zip(requests, outputs):
+                if hasattr(request, "additional_information"):
+                    continue
                 if output is not None and rng.random() < 0.15:
                     output["meta"] = {"first_audio": torch.tensor(True)}
         finished = [rng.random() < 0.04 for _ in live]
