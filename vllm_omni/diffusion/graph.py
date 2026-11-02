@@ -185,6 +185,15 @@ def _capture_agreement_group() -> torch.distributed.ProcessGroup | None:
     return world.device_group if world.world_size > 1 else None
 
 
+def _multi_rank_refusal(group: torch.distributed.ProcessGroup | None) -> str | None:
+    # torch 2.14.0+xpu / oneCCL 2022.1.2: an XPU graph never frees the buffers of
+    # the collectives it recorded, so every recapture leaks activation-sized memory
+    # until the device runs out (HunyuanImage3 TP4 dies within a few requests).
+    if group is not None and current_omni_platform.device_type == "xpu":
+        return "XPU graphs leak the buffers of every captured collective, so a multi-rank DiT runs out of memory"
+    return None
+
+
 def build_denoise_graph_runner(
     od_config: Any,
     fn: Callable[..., Any],
@@ -207,6 +216,8 @@ def build_denoise_graph_runner(
     if not requested:
         return None
     refusal = refusal or _refusal(od_config)
+    group = _capture_agreement_group()
+    refusal = refusal or _multi_rank_refusal(group)
     if refusal is not None:
         logger.warning("%s: diffusion_use_graph ignored because %s", name, refusal)
         return None
@@ -218,7 +229,7 @@ def build_denoise_graph_runner(
         device=device,
         max_entries=DENOISE_GRAPH_MAX_ENTRIES,
         warmup_iters=1,
-        group=_capture_agreement_group(),
+        group=group,
         name=name,
         capture_context=_cache_emptied_first if release else None,
     )

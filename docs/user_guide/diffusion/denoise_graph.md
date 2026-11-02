@@ -65,6 +65,10 @@ value. In these cases the runner is not built, a warning starting with
 - Any CPU offload strategy, including layerwise, distributed layerwise, and
   `diffusion_offload_config`.
 - Pipeline parallelism.
+- Intel XPU with the DiT on more than one rank (tensor, sequence or expert
+  parallelism): with torch 2.14.0+xpu and oneCCL 2022.1.2, an XPU graph never
+  frees the buffers of the collectives it captured, so every recapture leaks
+  device memory until the card runs out.
 
 Changing the active LoRA adapter, its scale, or its buffers drops the captured
 graphs, and the next step recaptures.
