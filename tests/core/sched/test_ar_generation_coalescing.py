@@ -19,6 +19,12 @@ from vllm_omni.outputs import OmniConnectorOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def _init_policies(s):
+    extra = s._get_scheduler_extra_config()
+    s._init_prefill_admission_policy(extra)
+    s._init_generation_coalescing(extra)
+
+
 def scheduler(*, native=False, extras=None, population=4, async_scheduling=False):
     scheduler_cls = OmniARAsyncScheduler if async_scheduling else OmniARScheduler
     s = scheduler_cls.__new__(scheduler_cls)
@@ -37,7 +43,7 @@ def scheduler(*, native=False, extras=None, population=4, async_scheduling=False
     s.use_v2_model_runner = native
     s.max_num_active_reqs = 128
     s.max_num_scheduled_tokens = 128
-    s._init_prefill_admission_policy()
+    _init_policies(s)
     return s
 
 
@@ -46,10 +52,34 @@ def knobs(**overrides):
 
 
 @pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("policy", ["generation", "admission", "conflict"])
+def test_constructor_initializes_both_policies(monkeypatch, mocker, native, policy):
+    def upstream_init(self, config):
+        self.vllm_config = config
+        self.max_num_running_reqs = config.scheduler_config.max_num_seqs
+        self.kv_cache_manager = mocker.Mock(spec=KVCacheManager)
+
+    monkeypatch.setattr(VLLMScheduler, "__init__", upstream_init)
+    mocker.patch("vllm_omni.core.sched.omni_ar_scheduler.install_decode_allocate_fast_path")
+    mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter", return_value=FakeAdapter())
+    extras = knobs() if policy != "admission" else {}
+    if policy != "generation":
+        extras.update(ar_prefill_admission_min_batch=4, ar_prefill_admission_max_wait_ms=12)
+    config = _config(native=native, extras=extras)
+    if policy == "conflict":
+        with pytest.raises(ValueError, match="cannot be enabled together"):
+            OmniARScheduler(config)
+    else:
+        s = OmniARScheduler(config)
+        assert s._generation_min_batch_size == (4 if policy == "generation" else 1)
+        assert s._prefill_admission_min_batch == (4 if policy == "admission" else 0)
+
+
+@pytest.mark.parametrize("native", [False, True])
 def test_configuration_supports_both_runners_and_additional_config(native):
     s = scheduler(native=native)
     s.vllm_config.additional_config = knobs()
-    s._init_prefill_admission_policy()
+    _init_policies(s)
     assert s._generation_min_batch_size == 4
     assert s._generation_max_wait_s == 0.012
     assert s._generation_always_wait_target_batch is False
@@ -58,7 +88,7 @@ def test_configuration_supports_both_runners_and_additional_config(native):
 @pytest.mark.parametrize(
     "key,value,message",
     [
-        ("generation_min_batch_size", 0, "positive"),
+        ("generation_min_batch_size", 0, "max_num_seqs"),
         ("generation_min_batch_size", 129, "max_num_seqs"),
         ("generation_max_wait_ms", -1, "finite and nonnegative"),
         ("generation_max_wait_ms", float("nan"), "finite and nonnegative"),
@@ -70,6 +100,15 @@ def test_configuration_supports_both_runners_and_additional_config(native):
 def test_rejects_invalid_configuration(key, value, message):
     with pytest.raises(ValueError, match=message):
         scheduler(extras=knobs(**{key: value}))
+
+
+@pytest.mark.parametrize("max_wait_ms", [0, 12])
+def test_batch_size_upper_bound_applies_even_when_waiting_is_disabled(max_wait_ms):
+    with pytest.raises(ValueError, match="max_num_seqs"):
+        scheduler(extras=knobs(generation_min_batch_size=129, generation_max_wait_ms=max_wait_ms))
+    s = scheduler(extras=knobs(generation_min_batch_size=128, generation_max_wait_ms=max_wait_ms))
+    assert s._generation_min_batch_size == 128
+    assert s._generation_batch_deadline is None
 
 
 @pytest.mark.parametrize(
@@ -199,7 +238,7 @@ def test_rejects_unsupported_topology(tp, pp):
     s.vllm_config.parallel_config.pipeline_parallel_size = pp
     s.vllm_config.additional_config = knobs()
     with pytest.raises(ValueError, match="TP1/PP1"):
-        s._init_prefill_admission_policy()
+        _init_policies(s)
 
 
 @pytest.mark.parametrize("native", [False, True])
@@ -208,7 +247,7 @@ def test_unsupported_input_source_disables_waiting(native):
     s.vllm_config.additional_config = knobs()
     s.chunk_transfer_adapter = None
     s.input_coordinator = OmniSchedulingCoordinator(stage_id=0, async_chunk=True) if native else None
-    s._init_prefill_admission_policy()
+    _init_policies(s)
     assert s._generation_max_wait_s == 0
 
 
@@ -302,7 +341,7 @@ def test_orchestrator_readiness_override_enables_ar_gate(monkeypatch):
     monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready.copy())
     s.chunk_transfer_adapter = None
     s.vllm_config.additional_config = knobs()
-    s._init_prefill_admission_policy()
+    _init_policies(s)
     assert s._generation_max_wait_s == 0.012
     s.requests["0"].status = RequestStatus.RUNNING
     s.requests["0"].num_computed_tokens = s.requests["0"].num_prompt_tokens
