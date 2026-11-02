@@ -100,6 +100,25 @@ duration and decoded-memory limits remain enforced by upstream media helpers,
 and recognized-format corruption errors propagate. Tests in
 `tests/inputs/test_audio_decode.py` cover these compatibility boundaries.
 
+## Chat output waveform layout
+
+Chat audio producers use one-dimensional mono waveforms or channels-first
+`(channels, frames)` waveforms by default, with optional leading singleton
+batch axes. The serving boundary also accepts an explicit
+`multimodal_output["audio_layout"]` of `"channels_last"` for `(frames, channels)`
+input. A shape such as `(2, 1)` is ambiguous without this metadata: by default
+it means one stereo frame; with `"channels_last"` it means two mono frames.
+The layout must stay consistent across a choice's chunks. Audio chunk lists
+received by chat serving concatenate along their declared frame axis.
+Upstream waveform accumulation continues to use channels-first, with time on
+the last axis.
+
+Chat serving passes the declared layout to `CreateAudio`, whose encoder
+normalizes to channels-last before producing PCM and `audio_metadata`. The
+first nonempty streamed WAV chunk for each choice writes its only header from
+that metadata; later chunks contain PCM only. Other `CreateAudio` callers
+without an explicit layout retain the existing compatibility behavior.
+
 ## Runner scheduling metadata
 
 `SchedulingMetadataUpdate`, carried by
