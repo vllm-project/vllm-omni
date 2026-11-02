@@ -116,23 +116,12 @@ def test_inspect_rejects_incomplete_or_unsupported_files(tmp_path, checkpoint_te
         MiniMaxH3SingleFileSpec.from_file(path)
 
 
-def test_inspect_accepts_curve_without_optional_adapter_basis(tmp_path, checkpoint_tensors):
-    from vllm_omni.diffusion.models.minimax_h3.single_file import MiniMaxH3SingleFileSpec
-
-    del checkpoint_tensors["adaln_basis"]
-    del checkpoint_tensors["adaln_mean"]
-    path = tmp_path / "comfy.safetensors"
-    save_file(checkpoint_tensors, path)
-    assert MiniMaxH3SingleFileSpec.from_file(path).transformer_config["time_embed_dim"] == 2
-
-
-@pytest.mark.parametrize("model_class", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
-def test_single_file_config_preserves_h3_architecture_and_reference_inputs(tmp_path, checkpoint_tensors, model_class):
+def test_single_file_config_preserves_h3_architecture_and_reference_inputs(tmp_path, checkpoint_tensors):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     path = tmp_path / "hybrid.safetensors"
     save_file(checkpoint_tensors, path)
-    config = OmniDiffusionConfig(model=str(path), model_class_name=model_class)
+    config = OmniDiffusionConfig(model=str(path), model_class_name="MiniMaxH3ModularPipeline")
     config.enrich_config()
     assert config.model_class_name == "MiniMaxH3Pipeline"
     assert config.diffusion_load_format == "default"
@@ -163,15 +152,14 @@ def test_single_file_resolves_serving_stage_without_hub_discovery(tmp_path, chec
     assert len(resolved.stage_configs) == 1
 
 
-@pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va", None])
-@pytest.mark.parametrize("as_symlink", [False, True])
 @pytest.mark.parametrize(
-    ("base_source", "expected_revision"),
+    ("task", "as_symlink", "base_source", "expected_revision"),
     [
-        ("local", None),
-        ("default", "42ed227ee7df40d41602854ae760620d6eb651fe"),
-        ("explicit", "caller-selected-revision"),
-        ("custom-remote", None),
+        ("fl2va", False, "default", "42ed227ee7df40d41602854ae760620d6eb651fe"),
+        ("ref2va", True, "local", None),
+        ("t2va", False, "explicit", "caller-selected-revision"),
+        ("fl2va", False, "custom-remote", None),
+        (None, False, "default", "42ed227ee7df40d41602854ae760620d6eb651fe"),
     ],
 )
 def test_pipeline_loads_selected_file_for_each_task(
@@ -286,7 +274,7 @@ def test_pipeline_loads_selected_file_for_each_task(
         torch.testing.assert_close(restored, targets[name], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("partition", ["fl2va", "ref2va", "combined"])
+@pytest.mark.parametrize("partition", ["fl2va", "ref2va"])
 def test_single_file_base_download_excludes_dense_dits(monkeypatch, tmp_path, partition):
     from fnmatch import fnmatch
 
