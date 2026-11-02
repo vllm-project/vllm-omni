@@ -1042,7 +1042,7 @@ def _merge_platforms(
 ) -> dict[str, Any] | None:
     """Deep-merge two ``platforms:`` blocks per-platform, stages by stage_id,
     connectors by name. An overlay cannot clear a platform's inherited
-    connectors; deep merge keeps the base restores."""
+    connectors; omitted keys keep the base connector restores."""
     if not base and not overlay:
         return None
     base = base or {}
