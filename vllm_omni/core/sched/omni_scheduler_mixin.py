@@ -358,9 +358,10 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         """Snapshot input-ready IDs without consuming input or notifications.
 
         Return None for an unsupported input source, or an empty set for a
-        supported source with no ready input. Subclasses receiving input from
-        the orchestrator can override this hook. It is also queried during
-        coalescing policy initialization, before requests are registered.
+        supported source with no ready input. Orchestrator-fed stage zero uses
+        queued request state; subclasses can override other input sources.
+        It is also queried during coalescing policy initialization, before
+        requests are registered.
 
         Native notifications may not yet be applied to the coordinator, so
         include the supplied outputs. Terminal signals allow final work to
@@ -371,10 +372,21 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         adapter = self.chunk_transfer_adapter
         if adapter is not None and adapter.receives_chunks:
             return set(adapter.requests_with_ready_chunks)
-        # V2: combine native coordinator state with unapplied notifications.
+        # Check for native connector input before using the shared fallback.
         coordinator = self.input_coordinator
         if not self._native_data_plane or coordinator is None or not coordinator.receives_chunks:
+            # V1 and V2: Stage zero receives prompts/appends from the orchestrator.
+            # Parked streams stay excluded until an append resumes admission.
+            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+            if getattr(model_config, "stage_id", None) == 0:
+                return {
+                    request.request_id
+                    for queue_name in ("waiting", "kv_holding_waiting")
+                    for request in getattr(self, queue_name, ())
+                    if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                }
             return None
+        # V2: combine native coordinator state with unapplied notifications.
         ready = set(coordinator.requests_with_ready_chunks)
         ready.update(coordinator.finished_requests)
         ready.update(coordinator.input_terminal_req_ids)
