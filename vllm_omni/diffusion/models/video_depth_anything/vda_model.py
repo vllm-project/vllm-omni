@@ -327,9 +327,7 @@ class DPTHeadTemporal(nn.Module):
         )
         self.scratch = nn.Module()
         for index, channels in enumerate(out_channels, 1):
-            setattr(
-                self.scratch, f"layer{index}_rn", nn.Conv2d(channels, width, kernel_size=3, padding=1, bias=False)
-            )
+            setattr(self.scratch, f"layer{index}_rn", nn.Conv2d(channels, width, kernel_size=3, padding=1, bias=False))
         for index in range(1, 5):
             setattr(self.scratch, f"refinenet{index}", FeatureFusionBlock(width))
         self.scratch.output_conv1 = nn.Conv2d(width, width // 2, kernel_size=3, padding=1)
