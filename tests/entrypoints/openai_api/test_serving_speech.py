@@ -2978,6 +2978,28 @@ class TestTTSMethods:
         assert additional["voice_name"] == "alice"
         assert additional["voice_created_at"] == 0
 
+    def test_voxcpm2_voice_reupload_changes_default_cache_salt(self, speech_server, mocker):
+        """A re-upload under the same voice name must mint a fresh salt."""
+        speech_server._tts_model_type = "voxcpm2"
+        speech_server._adapter = speech_server._get_tts_adapter()
+        speech_server._adapter.capabilities = replace(
+            speech_server._adapter.capabilities,
+            precomputed_speakers={},
+        )
+        speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+        speech_server.engine_client.generate = mocker.MagicMock(return_value=iter(()))
+        speech_server._adapter._build_prompt = mocker.AsyncMock(side_effect=lambda *a, **kw: {"prompt_token_ids": [1]})
+
+        speech_server.uploaded_speakers = {"bob": {"created_at": 100}}
+        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Bob")))
+        salt_first = speech_server.engine_client.generate.call_args.kwargs["prompt"]["cache_salt"]
+
+        speech_server.uploaded_speakers = {"bob": {"created_at": 200}}
+        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Bob")))
+        salt_second = speech_server.engine_client.generate.call_args.kwargs["prompt"]["cache_salt"]
+
+        assert salt_first != salt_second
+
     def test_build_tts_params(self, speech_server):
         """Test TTS parameter building."""
         req = OpenAICreateSpeechRequest(input="Hello", voice="Ryan", language="English")
@@ -3415,7 +3437,10 @@ class TestTTSMethods:
         assert prepared.prompt["additional_information"]["speaker_count"] == 1
         assert prepared.model_type == "ming_tts"
 
-    def test_ming_adapter_uploaded_audio_forwards_worker_cache_metadata(self, speech_server, mocker: MockerFixture):
+    @pytest.mark.parametrize("x_vector_only_mode", [None, False, True])
+    def test_ming_adapter_uploaded_audio_forwards_worker_cache_metadata(
+        self, speech_server, mocker: MockerFixture, x_vector_only_mode
+    ):
         """Ming audio voices defer extraction and cache ownership to Stage-0."""
         speech_server.uploaded_speakers = {
             "audio_voice": {
@@ -3437,13 +3462,14 @@ class TestTTSMethods:
         )
         adapter = MingTTSAdapter(SpeechServingContext(server=speech_server))
         speech_server._adapter = adapter
-        mock_prompt = mocker.patch.object(
-            speech_server._adapter,
-            "_build_ming_dense_prompt",
-            return_value={"additional_information": {"speaker_count": 1}},
+        speech_server._tts_tokenizer = mocker.Mock(unk_token_id=-1)
+        speech_server._tts_tokenizer.encode.return_value = [1]
+        speech_server._tts_tokenizer.convert_tokens_to_ids.side_effect = (
+            lambda token: 888 if token == "<audioPatch>" else -1
         )
+        mock_prompt = mocker.spy(adapter, "_build_ming_dense_prompt")
 
-        req = OpenAICreateSpeechRequest(input="Hello", voice="audio_voice")
+        req = OpenAICreateSpeechRequest(input="Hello", voice="audio_voice", x_vector_only_mode=x_vector_only_mode)
         prepared = asyncio.run(adapter.build(req, [], False))
 
         mock_prompt.assert_called_once_with(
@@ -3455,6 +3481,13 @@ class TestTTSMethods:
         assert req.ref_text == "Reference transcript."
         assert req.speaker_embedding is None
         assert prepared.model_type == "ming_tts"
+        info = prepared.prompt["additional_information"]
+        assert ("prompt_waveform" in info) == (not x_vector_only_mode)
+        assert ("prompt_text" in info) == (not x_vector_only_mode)
+        assert prepared.prompt["prompt_token_ids"].count(888) == (0 if x_vector_only_mode else 1)
+        torch.testing.assert_close(info[KEY_SPEAKER_WAVEFORM], torch.tensor([[0.0, 0.1]]))
+        assert info["voice_name"] == "audio_voice"
+        assert info["voice_created_at"] == 123
 
     def test_build_ming_prompt_forwards_audio_segments_and_worker_cache_metadata(self, speech_server):
         class FakeTokenizer:
@@ -3498,7 +3531,13 @@ class TestTTSMethods:
         assert info["voice_created_at"] == 123
         assert prompt["prompt_token_ids"].count(777) == 2
 
-    def test_build_ming_prompt_forwards_speaker_waveform_without_ref_text(self, speech_server):
+    @pytest.mark.parametrize(
+        ("ref_text", "x_vector_only_mode"),
+        [(None, None), (None, False), (None, True), ("Reference transcript.", True)],
+    )
+    def test_build_ming_prompt_forwards_speaker_waveform_without_prompt_latents(
+        self, speech_server, ref_text, x_vector_only_mode
+    ):
         class FakeTokenizer:
             unk_token_id = -1
 
@@ -3511,7 +3550,7 @@ class TestTTSMethods:
         speech_server._tts_model_type = "ming_tts"
         speech_server._adapter = speech_server._get_tts_adapter()
         speech_server._tts_tokenizer = FakeTokenizer()
-        request = OpenAICreateSpeechRequest(input="Hello")
+        request = OpenAICreateSpeechRequest(input="Hello", ref_text=ref_text, x_vector_only_mode=x_vector_only_mode)
 
         prompt = speech_server._adapter._build_ming_dense_prompt(
             request,
@@ -3523,6 +3562,7 @@ class TestTTSMethods:
         assert info[KEY_SPEAKER_WAVEFORM_LENGTHS].tolist() == [3]
         assert info[KEY_SPEAKER_SAMPLE_RATES].tolist() == [16000]
         assert "prompt_waveform" not in info
+        assert "prompt_text" not in info
         assert KEY_SPEAKER_EMBEDDING not in info
 
     def test_ming_adapter_legacy_audio_only_voice_forwards_audio_to_worker(

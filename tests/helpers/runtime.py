@@ -85,6 +85,20 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     ) from last_exc
 
 
+def assign_ephemeral_master_port() -> int:
+    """Point ``MASTER_ADDR`` / ``MASTER_PORT`` at a free local port.
+
+    A literal port is shared by every xdist worker, so concurrent
+    ``init_process_group(env://)`` calls fail with ``EADDRINUSE``.
+    ``setdefault`` does not help: the first test on a worker leaves
+    ``MASTER_PORT`` set, and every later test keeps that occupied port.
+    """
+    port = get_open_port()
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    return port
+
+
 def dummy_messages_from_mix_data(
     system_prompt: dict[str, Any] | None = None,
     video_data_url: Any = None,
