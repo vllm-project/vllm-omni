@@ -18,7 +18,7 @@ fixes.
     a position-dependent (cumsum) encoder proves the bucketed path ran and is
     not the eager fallback: per-row prefix equals the solo result, the bucketed
     tail semantics hold, the output width is the largest rung (not raw T), and
-    the call replayed captured graphs without re-entering Python forward.
+    the call computed each rung eagerly with window shapes, not the full batch.
 * test_published_lengths_apply_alongside_positional_mask
     call sites that pass ``(features, mask)`` positionally (no lengths
     argument) must still bucket using the published lengths, and stay exact
@@ -28,9 +28,8 @@ fixes.
     encoders outside the built-in name pattern can opt in without model
     changes.
 
-All encoder calls run under ``torch.inference_mode()`` — the production
-context: graph capture stores inference tensors, so replay outside
-inference_mode raises and the wrapper silently falls back.
+All encoder calls run under ``torch.inference_mode()`` (the production
+context); the bucketed path is eager — no CUDA graphs.
 """
 
 import dataclasses
@@ -115,7 +114,6 @@ def expected_bucketed(feats: torch.Tensor, lengths=LENGTHS) -> torch.Tensor:
 def bucket_env(monkeypatch):
     # Real env names from the code (not the drifted names in the commit message).
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "0.4,1,2")
-    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_BATCH_SIZES", "1,2,4")
     if not torch.cuda.is_available():
         pytest.skip("bucketed encoder requires CUDA")
 
@@ -143,33 +141,21 @@ def test_real_installer_publishes_lengths_through_embed_multimodal(bucket_env):
     assert encoder_wrapper._lengths == tuple(LENGTHS)
 
     # Functional echo: a follow-up call without positional lengths is grouped
-    # by the published lengths -> per-rung padded executions hit the pool.
-    assert encoder_wrapper.pool is not None, "graph pool was not captured"
-    seen: list[tuple] = []
-    original_execute = encoder_wrapper.pool.execute
-
-    def counting_execute(*args, **kwargs):
-        seen.append(tuple(args[0].shape))
-        return original_execute(*args, **kwargs)
-
-    encoder_wrapper.pool.execute = counting_execute
+    # by the published lengths -> the encoder runs one eager window per rung.
     calls_before = len(model.encoder.calls)
     with torch.inference_mode():
         model.encoder(feats)
-    # Grouping evidence: one padded execution per length rung present.
-    assert sorted(seen) == sorted([(1, 40, D), (2, 200, D), (1, 100, D)]), seen
-    # Replay does not re-enter Python forward; a fallback would have.
-    assert len(model.encoder.calls) == calls_before
+    new_shapes = model.encoder.calls[calls_before:]
+    assert sorted(new_shapes) == sorted([(1, 40, D), (2, 200, D), (1, 100, D)]), new_shapes
 
 
 def test_cumsum_encoder_runs_bucketed_path_not_fallback(bucket_env):
     model = ToyModel().cuda()
     assert install_bucketed_encoders(model) == ["encoder"]
-    wrapper = model.encoder.forward
 
     feats = make_features()
     with torch.inference_mode():
-        # First eligible call: eager (learns output type + captures the pool).
+        # First eligible call: eager (learns the output type).
         model.embed_multimodal(
             audio_features=feats,
             encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64),
@@ -197,14 +183,10 @@ def test_cumsum_encoder_runs_bucketed_path_not_fallback(bucket_env):
     fallback_tail = feats.cumsum(dim=1)[:, 40:200]
     assert not torch.allclose(out[0, 40:200], fallback_tail[0], atol=1e-3)
 
-    # (c) Execution evidence: the run happened as per-rung graph replays
-    #     (checked before any solo runs below that call the original forward).
-    assert wrapper.pool is not None and wrapper.pool.entries, "no captured graphs"
-    for key in ((1, 40), (2, 200), (1, 100)):
-        assert key in wrapper.pool.entries, f"missing captured entry {key}"
-    assert calls_after_bucketed == calls_after_prime, (
-        "Python forward re-entered during the bucketed call (fallback path)"
-    )
+    # (c) Execution evidence: the bucketed call re-entered the encoder with
+    #     per-rung window shapes (eager path), not the full-batch fallback.
+    bucketed_shapes = model.encoder.calls[calls_after_prime:calls_after_bucketed]
+    assert sorted(bucketed_shapes) == sorted([(1, 40, D), (2, 200, D), (1, 100, D)]), bucketed_shapes
 
 
 class MaskConsumingEncoder(nn.Module):
@@ -276,9 +258,8 @@ def test_fixed_window_encoder_contract_engages(bucket_env, monkeypatch):
     WhisperEncoder, lengths published via embed_multimodal. The module's
     time-axis handling and fixed-window recipe must engage the bucketed path
     with zero model-side changes: fixed-window forward untouched, windows
-    captured per rung, and exact output where rung == true length."""
+    computed per rung, and exact output where rung == true length."""
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_SECONDS", "3,8,30")  # rungs 300/800/3000
-    monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_BATCH_SIZES", "1,2,4")
     from transformers.models.whisper.configuration_whisper import WhisperConfig
     from transformers.models.whisper.modeling_whisper import WhisperEncoder
 
@@ -318,13 +299,9 @@ def test_fixed_window_encoder_contract_engages(bucket_env, monkeypatch):
         assert wrapper._lengths == tuple(lengths)
         out = model.encoder(feats)
 
-    # Engaged: per-rung windows were captured and replayed (fallback never
-    # captures a 300/800-frame window, and calls the fixed-window forward).
-    assert wrapper.pool is not None and wrapper.pool.entries
-    for key in ((1, 300), (1, 800), (1, 3000)):
-        assert key in wrapper.pool.entries, f"missing captured entry {key}"
-    # The untouched forward may run once at the eager prime (full 3000-frame
-    # input); the bucketed rung windows must never hit it (they use the shim).
+    # Engaged: the bucketed rung windows use the variable-length recipe; the
+    # fixed-window forward only runs once, at the eager prime, with the full
+    # 3000-frame input.
     assert raw_calls == [(3, 80, 3000)], f"fixed-window forward calls: {raw_calls}"
 
     # Exact where the rung equals the true length (no padding involved).
