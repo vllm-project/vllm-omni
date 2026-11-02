@@ -335,7 +335,13 @@ stages with `generation_coalescing_policy: fixed` (the default). V1 polls
 readiness on scheduler ticks; it does not block the scheduler thread or consume
 deferred chunks. Its dispatch time includes scheduler tick granularity.
 `generation_coalescing_policy: idle_wait` remains native MRV2-only. Sender-only
-stages and plain prompt inputs do not acquire V1 batch waiting.
+stages and plain prompt inputs do not acquire V1 batch waiting by default.
+Custom schedulers can override `OmniSchedulerMixin._get_coalescing_ready_request_ids()`
+to supply input-ready IDs, for example from orchestrator-fed inputs. The hook
+returns `None` for unsupported input sources and a set (possibly empty) for
+supported sources; execution eligibility remains scheduler-specific. It is
+also queried during generation scheduler initialization. This hook does not
+itself enable AR coalescing.
 
 V1 input executions that yield `pending_generation` continue without another
 batch wait for that same input. Cancellation, completion, input errors, and

@@ -44,6 +44,19 @@ def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128
     )
 
 
+def test_v1_custom_readiness_enables_batch_waiting(construct_scheduler):
+    class OrchestratorScheduler(OmniGenerationScheduler):
+        def _get_coalescing_ready_request_ids(self, connector_outputs=()):
+            return set()
+
+    config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
+    config.model_config.async_chunk = False
+    scheduler = OrchestratorScheduler(config)
+    assert scheduler.chunk_transfer_adapter is None
+    assert scheduler._generation_min_batch_size == 4
+    assert scheduler._generation_max_wait_s == 0.012
+
+
 @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
 def test_moss_profile_generation_constructor_after_platform_resolution(
     construct_scheduler, monkeypatch, mocker, platform
