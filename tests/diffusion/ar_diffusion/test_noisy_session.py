@@ -128,6 +128,43 @@ def test_prior_history_and_clean_window_helpers():
         chunk_base=2,
     )
     assert clean_history_cells(schedule, num_blocks=1) == {(2, 1, 0)}
+    same = CellSchedule(
+        chunks=1,
+        num_denoise_steps=2,
+        step_replicas=2,
+        layer_groups=1,
+        ordering=Ordering.SAME_STEP,
+        kv_history_chunks=1,
+        chunk_base=3,
+    )
+    # Trailing window keeps chunk 3; Same-Step also pins absolute chunk-0 clean.
+    assert clean_history_cells(same, num_blocks=1) == {(0, 2, 0), (3, 2, 0)}
+
+
+def test_session_structural_key_fail_closed_on_mismatch():
+    cache = _cache(history=1)
+    first = CellSchedule(
+        chunks=1,
+        num_denoise_steps=1,
+        step_replicas=1,
+        layer_groups=1,
+        ordering=Ordering.SELF_FORCING,
+        kv_history_chunks=1,
+    )
+    cache.bind_session_structure("world", first.structural_key())
+    cache.bind_session_structure("world", first.structural_key())  # idempotent
+    changed = CellSchedule(
+        chunks=1,
+        num_denoise_steps=2,
+        step_replicas=1,
+        layer_groups=1,
+        ordering=Ordering.SELF_FORCING,
+        kv_history_chunks=1,
+    )
+    with pytest.raises(ValueError, match="structural_key mismatch"):
+        cache.bind_session_structure("world", changed.structural_key())
+    NoisyKVState(cache).release_session("world")
+    cache.bind_session_structure("world", changed.structural_key())
 
 
 def test_request_chunk_base_continues_from_pool_history():
@@ -147,6 +184,7 @@ def test_request_chunk_base_continues_from_pool_history():
         kv_history_chunks=1,
     )
     plan = build_cell_plan(first)
+    cache.bind_session_structure("world", first.structural_key())
     retain = clean_history_cells(first, num_blocks=1)
     ctx.enqueue("world", plan, chunk_tokens=4, retain=retain)
     run_cell_pipeline(ctx=ctx, adapter=_CountingAdapter())
@@ -164,6 +202,8 @@ def test_request_chunk_base_continues_from_pool_history():
         chunk_base=2,
     )
     prior = prior_history_in_pool(cache, "world", chunk_base=2)
+    assert prior
+    cache.bind_session_structure("world", second.structural_key())
     plan2 = build_cell_plan(second, prior_history=prior)
     retain2 = set(prior) | clean_history_cells(second, num_blocks=1)
     ctx.enqueue("world", plan2, chunk_tokens=4, retain=retain2)
@@ -191,6 +231,29 @@ def _bare_noisy_runner() -> ARDiffusionModelRunner:
     runner._stepwise_chunk_started = {}
     runner._active_stepwise_request_id = None
     return runner
+
+
+def test_same_step_end_request_keeps_chunk0_clean_sink():
+    cache = _cache(history=1)
+    state = NoisyKVState(cache)
+    schedule = CellSchedule(
+        chunks=2,
+        num_denoise_steps=2,
+        step_replicas=2,
+        layer_groups=1,
+        ordering=Ordering.SAME_STEP,
+        kv_history_chunks=1,
+        chunk_base=3,
+    )
+    # Simulate resident sink + recent clean after a continuation request.
+    cache.pool.alloc(("world", 0, 2, 0))
+    cache.pool.alloc(("world", 3, 2, 0))
+    cache.pool.alloc(("world", 2, 2, 0))  # outside trailing window; should drop
+    kept = clean_history_cells(schedule, num_blocks=1)
+    state.end_request("world", retain=kept)
+    assert cache.pool.has(("world", 0, 2, 0))
+    assert cache.pool.has(("world", 3, 2, 0))
+    assert not cache.pool.has(("world", 2, 2, 0))
 
 
 def test_runner_ephemeral_request_releases_pool_key(monkeypatch):

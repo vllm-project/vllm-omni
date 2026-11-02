@@ -525,8 +525,15 @@ class CausVidWanPipeline(nn.Module):
             prior = frozenset()
             if persist and chunk_base > 0:
                 prior = prior_history_in_pool(ctx.kv.cache, kv_id, chunk_base=chunk_base)
+                if not prior:
+                    raise ValueError(
+                        f"session continuation chunk_base={chunk_base} for {kv_id!r} has no prior "
+                        "history in the Noisy KV pool; restart with chunk_base=0 or fix retain/release"
+                    )
             plan, extra, denoise = self._plan_for(item, chunk_base=chunk_base, prior_history=prior)
             schedule = plan.schedule
+            if persist:
+                ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())
             if not req_id:
                 req_id = kv_id
             shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))

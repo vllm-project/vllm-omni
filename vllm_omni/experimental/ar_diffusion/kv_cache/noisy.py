@@ -511,17 +511,46 @@ class NoisyKVCache:
         self.resident_peak = 0
         self.bytes_per_version = bytes_per_version
         self.reserved_bytes = self.capacity * bytes_all_layers
+        # First-request schedule fingerprint per outer session_id / pool key.
+        self._session_structural_keys: dict[str, tuple[object, ...]] = {}
+
+    def bind_session_structure(self, kv_id: str, key: tuple[object, ...]) -> None:
+        """Record or check the schedule fingerprint for a persistent session pool key."""
+        existing = self._session_structural_keys.get(kv_id)
+        if existing is None:
+            self._session_structural_keys[kv_id] = key
+            return
+        if existing != key:
+            raise ValueError(
+                f"session {kv_id!r} schedule structural_key mismatch: "
+                f"retained={existing!r} request={key!r}; "
+                "release_noisy_kv and restart, or keep D/S/ordering/H/blocks fixed"
+            )
+
+    def clear_session_structure(self, kv_id: str) -> None:
+        self._session_structural_keys.pop(kv_id, None)
 
 
 def clean_history_cells(schedule: CellSchedule, *, num_blocks: int) -> set[Cell]:
-    """Clean ``(chunk, T, block)`` cells in the trailing history window of ``schedule``."""
-    h = schedule.kv_history_chunks
-    if h < 1 or num_blocks < 1:
+    """Clean cells to retain across requests for ``schedule``.
+
+    Always keeps the trailing ``H`` window ``[chunk_end-H, chunk_end)``.
+    Same-Step additionally keeps absolute chunk-0 clean sink cells for the
+    whole session — later plans still demand ``(0, D, *)`` even after the
+    trailing window has moved past chunk 0.
+    """
+    if num_blocks < 1:
         return set()
-    end = schedule.chunk_end
-    start = max(0, end - h)
     t_clean = schedule.num_denoise_steps
-    return {(chunk, t_clean, block) for chunk in range(start, end) for block in range(num_blocks)}
+    cells: set[Cell] = set()
+    h = schedule.kv_history_chunks
+    if h >= 1:
+        end = schedule.chunk_end
+        start = max(0, end - h)
+        cells |= {(chunk, t_clean, block) for chunk in range(start, end) for block in range(num_blocks)}
+    if schedule.ordering is Ordering.SAME_STEP:
+        cells |= {(0, t_clean, block) for block in range(num_blocks)}
+    return cells
 
 
 def prior_history_in_pool(
@@ -633,6 +662,7 @@ class NoisyKVState:
             self.cache.transport.discard(key)
             self.cache.pool.release(key)
         self._retain.pop(session_id, None)
+        self.cache.clear_session_structure(session_id)
 
     def reset_all(self) -> None:
         for req in list(set(self._plans) | set(self._retain)):
@@ -645,6 +675,7 @@ class NoisyKVState:
         self._chunk_tokens.clear()
         self._last_use_global.clear()
         self._retain.clear()
+        self.cache._session_structural_keys.clear()
         self._inflight = ()
         self._clear_prepare_caches()
 
