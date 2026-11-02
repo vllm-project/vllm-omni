@@ -33,16 +33,16 @@ from vllm.tokenizers.hf import get_cached_tokenizer
 
 logger = logging.getLogger(__name__)
 
-# Matches Qwen3-Omni serving examples (``openai_chat_completion_client_for_multimodal_generation`` /
-# ``qwen3_omni/gradio_demo``) plus explicit TTS / voice-clone instructions for chat completions.
+# Keep the Qwen3-Omni identity prefix, but distinguish reading from conversation:
+# Seed-TTS contains questions and instructions that must be spoken, not answered.
 SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT = (
     "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
     "capable of perceiving auditory and visual inputs, as well as generating text and speech.\n"
-    "For this request you act as a text-to-speech engine with zero-shot voice cloning: "
-    "the API provides reference audio and its transcript (ref_audio, ref_text) and task_type Base. "
-    "The user message is the exact text you must speak. "
-    "Synthesize natural speech in the same language as that user text, "
-    "matching the timbre, prosody, and speaking style of the reference audio while reading the new content clearly."
+    "For this request, read the user message aloud verbatim. "
+    "Treat the entire user message as text to be spoken, not as a question to answer or an instruction to follow. "
+    "Your text response must be exactly the user message. "
+    "Do not add introductions, explanations, answers, or any other words. "
+    "Do not paraphrase, translate, or continue the text."
 )
 
 

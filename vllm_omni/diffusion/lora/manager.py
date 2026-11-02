@@ -85,6 +85,7 @@ class DiffusionLoRAManager:
     # Adapter whose weights are still uploaded while gated off. Class-level so
     # a manager built without __init__ (some tests use object.__new__) reads as
     # "nothing suspended" instead of raising.
+    _active_adapter_id: int | None = None
     _suspended_adapter_id: int | None = None
     _max_num_batched_tokens: int | None = None
 
@@ -116,18 +117,13 @@ class DiffusionLoRAManager:
         ):
             raise ValueError("max_num_batched_tokens must be a positive integer")
         self._max_num_batched_tokens = max_num_batched_tokens
-        # Imported here: vllm_omni.diffusion.data imports this package while it
-        # is still initializing, and the offloader package imports that module.
-        from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
-
-        od_config = getattr(pipeline, "od_config", None)
-        # DLO owns the base-weight lifecycle. Keep request-switchable LoRA
-        # sidecars resident instead of rebuilding DLO host shards per request.
-        self._resident_lora_device = (
-            device
-            if od_config is not None and resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
-            else None
-        )
+        # LoRA sidecars are allocated outside the base-weight lifecycle, so no
+        # sleep/offload path knows to move them. Keep them resident on the
+        # execution device under every offload strategy: buffers created or
+        # re-created while the base weights sit on CPU (the standard RL
+        # weight-sync moment) would otherwise stay there after wake, and
+        # apply() would matmul device activations against host buffers.
+        self._resident_lora_device = device
 
         # Cache supported/expected module suffixes once, before any layer
         # replacement happens. After LoRA layers are injected, the original
@@ -187,6 +183,11 @@ class DiffusionLoRAManager:
                 self.set_active_adapter(init_request, 1.0 if self._fixed_adapter else lora_scale)
                 if self._fixed_adapter:
                     self.pin_adapter(init_request.lora_int_id)
+            # MoE kernels are LoRA-capable as soon as vllm_config.lora_config is
+            # set, including HunyuanImage3 baseline generate() before any
+            # adapter is loaded. Wrap runners and publish a no-adapter mapping
+            # so TRTLLM LoRA experts have a context on that first forward.
+            self._ensure_moe_lora_context()
             bind = getattr(pipeline, "_bind_diffusion_lora_manager", None)
             if callable(bind):
                 bind(self)
@@ -505,6 +506,30 @@ class DiffusionLoRAManager:
             return ["0", "1"]
         return []
 
+    def _iter_lora_components(self) -> Iterator[tuple[str, nn.Module]]:
+        """Yield named denoiser modules that may contain LoRA-capable layers.
+
+        Framework defaults only cover generic diffusers names: ``transformer``
+        (plus ``transformer_2`` for dual-DiT pipelines such as Wan2.2) and
+        ``unet`` for SDXL-style pipelines. Model-specific attribute names must
+        be declared via ``_dit_modules`` or ``_lora_components``. If the
+        denoiser is not scanned, adapters can load while applying to zero
+        layers and produce base-identical output.
+        """
+        default_components = (
+            "transformer",
+            "transformer_2",
+            "unet",
+        )
+        declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
+        extra_components = tuple(getattr(self.pipeline, "_lora_components", ()) or ())
+        for component_name in dict.fromkeys((*default_components, *declared_components, *extra_components)):
+            if not hasattr(self.pipeline, component_name):
+                continue
+            component = getattr(self.pipeline, component_name)
+            if isinstance(component, nn.Module):
+                yield component_name, component
+
     def _replace_layers_with_lora(self, peft_helper: PEFTHelper) -> None:
         self._ensure_max_lora_rank(peft_helper.r)
 
@@ -534,32 +559,7 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        # Components scanned for LoRA-capable layers: framework defaults,
-        # declared DiT components, and any a pipeline opts into via
-        # ``_lora_components``. The defaults only cover the generic diffusers
-        # naming convention: ``transformer`` (plus ``transformer_2`` for
-        # dual-DiT pipelines such as Wan2.2) and ``unet`` for SDXL-style
-        # pipelines. Model-specific attribute names must be declared by the
-        # pipeline itself via ``_dit_modules`` or ``_lora_components``.
-        #
-        # NOTE: if the denoiser component is not scanned here, adapters can
-        # load/activate while effectively applying to zero layers, producing
-        # base-identical output.
-        default_components = (
-            "transformer",
-            "transformer_2",
-            "unet",
-        )
-        declared_components = tuple(getattr(self.pipeline, "_dit_modules", ()) or ())
-        extra_components = tuple(getattr(self.pipeline, "_lora_components", ()) or ())
-        component_names = dict.fromkeys((*default_components, *declared_components, *extra_components))
-        for component_name in component_names:
-            if not hasattr(self.pipeline, component_name):
-                continue
-            component = getattr(self.pipeline, component_name)
-            if not isinstance(component, nn.Module):
-                continue
-
+        for component_name, component in self._iter_lora_components():
             # Collect replacements first to avoid mutating the module tree
             # while iterating over named_modules().
             pending_replacements: list[tuple[str, str, nn.Module, list[str]]] = []
@@ -629,16 +629,71 @@ class DiffusionLoRAManager:
                 )
 
                 if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
-                    if self._resident_lora_device is not None:
-                        set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
-                        if not callable(set_buffer_device):
-                            raise RuntimeError(
-                                f"{type(lora_layer).__name__} cannot keep dynamic LoRA buffers resident for DLO"
-                            )
+                    # Layers without the re-homing hook keep the legacy
+                    # placement (buffers follow the base weight device).
+                    set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
+                    if callable(set_buffer_device):
                         set_buffer_device(self._resident_lora_device)
                     replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
+
+    def _ensure_moe_lora_context(self) -> None:
+        """Wrap MoE runners and publish mapping before the first forward.
+
+        ``configure_diffusion_vllm_config`` sets ``lora_config`` for MoE + PEFT
+        even when no adapter is loaded. TRTLLM LoRA experts then require a
+        context on every apply(), including HunyuanImage3 baseline generate().
+        """
+        if self._max_num_batched_tokens is None:
+            return
+        if self._max_lora_rank <= 0:
+            self._ensure_max_lora_rank(min(self._VALID_MAX_RANKS))
+        self._replace_moe_runners_with_lora()
+        self._publish_moe_lora_context()
+
+    def _replace_moe_runners_with_lora(self) -> None:
+        """Replace every MoE runner so LoRA-capable kernels get a mapping."""
+        from vllm.model_executor.layers.fused_moe import MoERunner
+
+        lora_config = LoRAConfig(
+            max_lora_rank=self._max_lora_rank,
+            max_loras=1,
+            max_cpu_loras=self.max_cached_adapters,
+            lora_dtype=self.dtype,
+            fully_sharded_loras=False,
+        )
+        for component_name, component in self._iter_lora_components():
+            pending: list[tuple[str, str, nn.Module]] = []
+            runner_names: set[str] = set()
+            for module_name, module in component.named_modules(remove_duplicate=False):
+                if isinstance(module, BaseLayerWithLoRA) or "base_layer" in module_name.split("."):
+                    continue
+                if any(module_name == p or module_name.startswith(p + ".") for p in runner_names):
+                    continue
+                if not isinstance(module, MoERunner):
+                    continue
+                full_module_name = f"{component_name}.{module_name}"
+                if full_module_name in self._lora_modules:
+                    continue
+                runner_names.add(module_name)
+                pending.append((module_name, full_module_name, module))
+            for module_name, full_module_name, module in pending:
+                lora_layer = from_layer_diffusion(
+                    layer=module,
+                    max_loras=1,
+                    lora_config=lora_config,
+                    packed_modules_list=[],
+                    model_config=None,
+                    max_num_batched_tokens=self._max_num_batched_tokens,
+                )
+                if lora_layer is not module and isinstance(lora_layer, BaseLayerWithLoRA):
+                    set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
+                    if callable(set_buffer_device):
+                        set_buffer_device(self._resident_lora_device)
+                    replace_submodule(component, module_name, lora_layer)
+                    self._lora_modules[full_module_name] = lora_layer
+                    logger.debug("Replaced MoE runner: %s -> %s", full_module_name, type(lora_layer).__name__)
 
     def _ensure_max_lora_rank(self, min_rank: int) -> None:
         """Ensure LoRA buffers can accommodate adapters up to `min_rank`.
@@ -1052,6 +1107,24 @@ class DiffusionLoRAManager:
             lora_layer.reset_lora(0)
         self._suspended_adapter_id = None
 
+    def _moe_token_lora_mapping(self) -> tuple[LoRAMapping, list[int | None]]:
+        """Build a uniform token mapping for the current adapter state.
+
+        Slot 0 is the no-adapter sentinel. Punica maps it to ``-1``, which sets
+        ``no_lora_flag`` so TRTLLM LoRA experts take the base-model fast path.
+        """
+        max_tokens = self._max_num_batched_tokens
+        if max_tokens is None:
+            raise RuntimeError("MoE LoRA token capacity was not configured")
+        slot = 1 if self._active_adapter_id is not None else 0
+        mapping = LoRAMapping(
+            index_mapping=(slot,) * max_tokens,
+            prompt_mapping=(slot,),
+            is_prefill=False,
+        )
+        lora_index_to_id: list[int | None] = [1] if slot == 1 else [None]
+        return mapping, lora_index_to_id
+
     def _get_moe_punica_wrapper(self):
         """Lazily create the shared MoE token-to-slot mapping."""
         if self._moe_punica_wrapper is not None:
@@ -1070,12 +1143,8 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
         punica = get_punica_wrapper(max_tokens, max_batches=1, device=self.device, lora_config=lora_config)
-        mapping = LoRAMapping(
-            index_mapping=(1,) * max_tokens,
-            prompt_mapping=(1,),
-            is_prefill=False,
-        )
-        punica.update_metadata(mapping, [1], 1, 0)
+        mapping, lora_index_to_id = self._moe_token_lora_mapping()
+        punica.update_metadata(mapping, lora_index_to_id, 1, 0)
         self._moe_punica_wrapper = punica
         return punica
 
@@ -1083,6 +1152,8 @@ class DiffusionLoRAManager:
         """Publish weight buffers and enablement through each MoE wrapper's mapping.
 
         Republish after buffer reallocation so kernels reference the current tensors.
+        Refresh the punica token mapping so baseline (no adapter) and adapted
+        forwards select the matching TRTLLM path.
         """
         from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
 
@@ -1090,6 +1161,8 @@ class DiffusionLoRAManager:
         if not moe_wrappers:
             return
         punica = self._get_moe_punica_wrapper()
+        mapping, lora_index_to_id = self._moe_token_lora_mapping()
+        punica.update_metadata(mapping, lora_index_to_id, 1, 0)
         for lora_layer in moe_wrappers:
             lora_layer.set_mapping(punica)
         logger.debug("Published MoE LoRA context on %d wrapper(s)", len(moe_wrappers))
@@ -1112,6 +1185,7 @@ class DiffusionLoRAManager:
                     lora_layer.resume_lora()
             self._suspended_adapter_id = None
             self._active_adapter_id = adapter_id
+            self._publish_moe_lora_context()
             logger.debug("Re-armed suspended adapter %d", adapter_id)
             return
 
@@ -1145,11 +1219,19 @@ class DiffusionLoRAManager:
             if bank is not None:
                 bank.close()
             self._reset_lora_layers()
+            # Roll back to the no-adapter mapping: the token mapping is derived
+            # from ``_active_adapter_id``, which is still None here.
+            self._publish_moe_lora_context()
             raise
 
         self._active_adapter_id = adapter_id
         self._active_scale = scale
         self._update_adapter_scale(adapter_id, scale)
+        # Republish now that the adapter state is committed. The mapping is
+        # derived from ``_active_adapter_id``, so the publish inside ``try``
+        # still binds slot 0; without this the MoE kernels would keep taking
+        # the no-LoRA path and silently skip the expert contribution.
+        self._publish_moe_lora_context()
 
     def _deactivate_all_adapters(self) -> None:
         if self._active_adapter_id is None:
@@ -1163,6 +1245,7 @@ class DiffusionLoRAManager:
             lora_layer.suspend_lora()
         self._suspended_adapter_id = self._active_adapter_id
         self._active_adapter_id = None
+        self._publish_moe_lora_context()
         logger.debug("All adapters deactivated")
 
     def _evict_for_new_adapter(self) -> None:
