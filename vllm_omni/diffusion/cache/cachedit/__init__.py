@@ -9,6 +9,7 @@ from vllm_omni.diffusion.cache.cachedit.backend import (
     CacheDiTEnableResult,
     cache_summary,
     enable_cache_for_dit,
+    set_separate_cfg,
 )
 from vllm_omni.diffusion.cache.cachedit.config import (
     CacheDiTAdapterConfig,
@@ -40,4 +41,5 @@ __all__ = [
     "SensenovaCachedAdapter",
     "cache_summary",
     "enable_cache_for_dit",
+    "set_separate_cfg",
 ]
