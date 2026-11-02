@@ -21,12 +21,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
         ("joyai-turn", {"speechInput": True, "turnMode": "vad"}),
         ("aura-ptt", {}),
         ("qwen3-turn", {"turnMode": "vad"}),
+        ("qwen3-turn", {"turnMode": "semantic_vad"}),
     ],
 )
 def test_browser_profile_session_update_passes_public_validator(profile_name, config):
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is required to generate the real browser profile payload")
+    assert node is not None
     profiles = Path(__file__).resolve().parents[2] / "examples/online_serving/realtime_web/app/static/profiles"
     result = subprocess.run(
         [

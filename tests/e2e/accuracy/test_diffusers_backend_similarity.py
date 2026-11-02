@@ -53,12 +53,13 @@ pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 def _flash_attempt_backends() -> list[str]:
     """Backends in ``CUDA_FLASH_ATTENTION_BACKEND_ATTEMPTS`` that can actually launch.
 
-    Those names are Hopper FA2/FA3. ``set_attention_backend`` only checks import,
-    so a newer GPU still "selects" them and then dies with "no kernel image".
-    Do not probe by launching: a missing cubin can leave the CUDA context dead.
-    Capability >= 10 is outside that wheel, including future SKUs in that family.
+    Those names are NVIDIA Hopper FA2/FA3. ``set_attention_backend`` only checks
+    import, so ROCm or a newer CUDA GPU can still "select" one and then die when
+    it launches. Do not probe by launching: an incompatible kernel can leave the
+    accelerator context dead. Capability >= 10 is outside that CUDA wheel,
+    including future SKUs in that family.
     """
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.version.hip is not None:
         return []
     major, _ = torch.cuda.get_device_capability()
     if major >= 10:
@@ -87,9 +88,10 @@ SEED = 42
 SSIM_THRESHOLD = 0.97
 PSNR_THRESHOLD = 30.0
 
-# A single-shot latency measurement on this benchmark is dominated by CI variance
-# (see issue #5108). Warm up once, then report the median of several timed runs.
-NUM_TIMED_RUNS = 2
+# Warm up once, then take the median of an odd number of timed requests.
+# Two samples make np.median their mean, so one spike still moves the gate
+# (issues #5108, #9449).
+NUM_TIMED_RUNS = 3
 
 VIDEO_PROMPT = "The bear in the image dances happily"
 VIDEO_WIDTH = 832
@@ -307,7 +309,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("model_id", ["Qwen/Qwen-Image"])
 def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifact_root: Path) -> None:
     output_dir = model_output_dir(accuracy_artifact_root, model_id + "-diffusers-backend")
@@ -334,10 +336,9 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
         ssim_threshold=SSIM_THRESHOLD,
         psnr_threshold=PSNR_THRESHOLD,
     )
-    # Latency is checked against a warmed median of NUM_TIMED_RUNS runs (see the
-    # _run_* helpers), so the assertion reflects steady-state rather than a single
-    # cold shot -- which is what previously made this check flaky (issue #5108).
-    # Correctness is additionally gated by the SSIM/PSNR assertions above.
+    # Latency is the median of NUM_TIMED_RUNS warmed requests. The count is odd,
+    # so one spiked sample is dropped (issues #5108, #9449). Correctness is
+    # additionally gated by the SSIM/PSNR assertions above.
     assert vllm_latency <= latency_threshold, (
         f"VLLM latency ({vllm_latency:.2f}ms) is greater than "
         f"{latency_threshold_factor * 100}% more than Diffusers latency "

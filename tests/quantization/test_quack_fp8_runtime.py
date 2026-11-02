@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU regressions for Quack compilation and warmup."""
 
+import gc
 import sys
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -188,6 +190,38 @@ def test_compiled_dispatch_falls_back_on_quack_failure(monkeypatch, quack_dispat
         torch.testing.assert_close(out, expected)
         assert quack_dispatch.fallback.call_count == 2
     assert len(graphs) == 1
+
+
+def test_failed_gemm_logging_releases_tensors(monkeypatch):
+    from vllm.logger import _print_warning_once, init_logger
+
+    references = []
+
+    def failing_gemm(a, b, scale_a, scale_b, out_dtype, bias):
+        temporary = torch.empty_like(a)
+        references.append(weakref.ref(temporary))
+        raise RuntimeError("test autotuning failure")
+
+    def fallback(a, b, *, out_dtype, **kwargs):
+        return torch.zeros(a.shape[0], b.shape[1], dtype=out_dtype)
+
+    monkeypatch.setattr(quack_fp8, "quack_scaled_fp8_mm", failing_gemm)
+    monkeypatch.setattr(quack_fp8, "_scales_valid", lambda *args: True)
+    monkeypatch.setattr(quack_fp8, "logger", init_logger("quack-retention-test"))
+    monkeypatch.setitem(sys.modules, "vllm.utils.flashinfer", SimpleNamespace(flashinfer_scaled_fp8_mm=fallback))
+    _print_warning_once.cache_clear()
+    try:
+        with torch.inference_mode():
+            a, b = torch.ones(4, 8), torch.ones(8, 6)
+            scale = torch.ones(1)
+            for _ in range(8):
+                out = quack_fp8._quack_fp8_scaled_mm(a, b, scale, scale, torch.bfloat16)
+                assert out.shape == (4, 6)
+        gc.collect()
+        assert len(references) == 8
+        assert all(ref() is None for ref in references)
+    finally:
+        _print_warning_once.cache_clear()
 
 
 @pytest.mark.parametrize("scale_index", [0, 1])

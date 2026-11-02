@@ -101,6 +101,11 @@ class RealtimeEventCollector:
     response_audio: dict[str, list[bytes]] = field(default_factory=dict)
     response_ids: list[str] = field(default_factory=list)
     output_sample_rate_hz: int = 24_000
+    client_appends: list[dict[str, object]] = field(default_factory=list)
+
+    def note_client_append(self, record: dict[str, object]) -> None:
+        """Record one successful append send (same monotonic clock as ``add``)."""
+        self.client_appends.append(record)
 
     @staticmethod
     def response_id(event: dict[str, object]) -> str | None:
@@ -240,6 +245,15 @@ class RealtimeDuplexClient:
 
     async def send(self, event: dict[str, object]) -> None:
         await self._ws.send(json.dumps(event))
+        if event.get("type") != "input_audio_buffer.append":
+            return
+        event_id = event.get("event_id")
+        self.events.note_client_append(
+            {
+                "sent_at_s": time.monotonic(),
+                "event_id": event_id if isinstance(event_id, str) else "",
+            }
+        )
 
     def raise_if_reader_stopped(self) -> None:
         """Fail a caller waiting on events after the WebSocket reader exits."""
