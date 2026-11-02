@@ -236,6 +236,10 @@ class DiffusionLoRAManager:
             replace_submodule(self.pipeline, name, layer.base_layer)
         self._merged_adapters.clear()
         self._lora_modules.clear()
+        remove_model_adapter = getattr(self.pipeline, "_remove_diffusion_lora_adapter", None)
+        if callable(remove_model_adapter):
+            for adapter_id in self._registered_adapters:
+                remove_model_adapter(adapter_id)
         self._registered_adapters.clear()
         self._adapter_scales.clear()
         self._adapter_access_order.clear()
@@ -1168,6 +1172,11 @@ class DiffusionLoRAManager:
         logger.debug("Published MoE LoRA context on %d wrapper(s)", len(moe_wrappers))
 
     def _activate_adapter(self, adapter_id: int, scale: float) -> None:
+        # Validate before fast paths or state changes: rejection must preserve
+        # the currently active adapter and must not reset its live buffers.
+        validate_activation = getattr(self.pipeline, "_validate_diffusion_lora_activation", None)
+        if callable(validate_activation):
+            validate_activation(lora_model=self._registered_adapters[adapter_id])
         if self._is_active_at_scale(adapter_id, scale):
             logger.debug("Adapter %d already active at scale %.3f skipping", adapter_id, scale)
             return
@@ -1320,6 +1329,11 @@ class DiffusionLoRAManager:
         bank = self._merged_adapters.pop(adapter_id, None)
         if bank is not None:
             bank.close()
+
+        # Model-specific loaders may own tensors outside the generic cache.
+        remove_model_adapter = getattr(self.pipeline, "_remove_diffusion_lora_adapter", None)
+        if callable(remove_model_adapter):
+            remove_model_adapter(adapter_id)
 
         del self._registered_adapters[adapter_id]
         self._adapter_scales.pop(adapter_id, None)
