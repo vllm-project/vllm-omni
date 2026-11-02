@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
+import torch
+
+from vllm_omni.diffusion.attention.ops.block_sparse import require_fastvideo_sparse, resolve_block_sparse_provider
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -18,7 +22,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 from .fasth3 import FASTH3_BASE_MODEL
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.data import AttentionSpec, OmniDiffusionConfig
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 FASTH3_V2_MODEL_ID = "FastVideo/FastVideo-FastH3-8-Step-V2"
@@ -26,6 +30,19 @@ FASTH3_V2_BASE_SCHEDULE = DMD2SigmaSchedule.from_positions((0.999, 0.874, 0.749,
 # The public V2 export omits provenance.json. This is the Omni adapter's native
 # VAE compatibility pin, not a claim about the release's training provenance.
 FASTH3_V2_NATIVE_VAE_REVISION = "9bfb6693f2cf6de171db46d1aa586f67d773a1da"
+
+
+def _scheduled_vsa_specs(od_config: OmniDiffusionConfig) -> list[tuple[str, AttentionSpec]]:
+    """The self-attention spec of each schedule profile that selects FASTVIDEO_VSA, with its name."""
+    schedule = od_config.diffusion_attention_schedule
+    if schedule is None:
+        return []
+    specs = []
+    for name, profile in schedule.profiles.items():
+        spec, _ = profile.resolve_with_source("self")
+        if spec is not None and spec.backend.upper() == "FASTVIDEO_VSA":
+            specs.append((name, spec))
+    return specs
 
 
 @dataclass(frozen=True)
@@ -121,6 +138,36 @@ class FastH3CheckpointSpec:
         parallel = od_config.parallel_config
         if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
             raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
+        self._check_base_vsa_provider(attention, od_config)
+        # Warm-up runs only the base, so each scheduled VSA profile is resolved here on this checkpoint's tile.
+        for name, spec in _scheduled_vsa_specs(od_config):
+            if spec.fastvideo_vsa_topk is not None:
+                raise ValueError(
+                    f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk "
+                    f"override from attention schedule profile {name!r}"
+                )
+            try:
+                # The runtime resolves with the query dtype, which H3 fixes to BF16 whatever --dtype is.
+                self._resolve_vsa_provider(spec, torch.bfloat16)
+            except (ImportError, ValueError) as exc:
+                raise ValueError(f"{self.name} cannot run attention schedule profile {name!r}: {exc}") from exc
+
+    def _check_base_vsa_provider(self, attention: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
+        """Warm-up checks V2's base provider."""
+
+    def _resolve_vsa_provider(self, spec: AttentionSpec, dtype: torch.dtype) -> None:
+        """Resolve the sparse provider and precision ``spec`` runs with on this worker's device and tile."""
+        provider = resolve_block_sparse_provider(
+            spec.fastvideo_vsa_provider,
+            spec.fastvideo_vsa_precision,
+            get_local_device(),
+            dtype,
+            128,
+            block_size=self.vsa_tile_size,
+        )
+        if provider == "fastvideo" and self.vsa_tile_size == 64:
+            # The resolver returns an explicit tile64 provider unchecked; the profile's step imports this kernel.
+            require_fastvideo_sparse()
 
     def check_request(self, sampling: OmniDiffusionSamplingParams, *, step_execution: bool = False) -> None:
         if step_execution:
@@ -164,21 +211,8 @@ class FastH3OmniCheckpointSpec(FastH3CheckpointSpec):
     vsa_sparsity: float = 0.9
     base_revision: str = ""
 
-    def check_serving_contract(self, *, partition: str, od_config: OmniDiffusionConfig) -> None:
-        super().check_serving_contract(partition=partition, od_config=od_config)
-        from vllm_omni.diffusion.attention.ops.block_sparse import resolve_block_sparse_provider
-        from vllm_omni.diffusion.distributed.utils import get_local_device
-
-        attention, _ = od_config.diffusion_attention_config.resolve_with_source("self")
-        assert attention is not None  # The base contract requires an explicit VSA spec.
-        resolve_block_sparse_provider(
-            attention.fastvideo_vsa_provider,
-            attention.fastvideo_vsa_precision,
-            get_local_device(),
-            od_config.dtype,
-            128,
-            block_size=self.vsa_tile_size,
-        )
+    def _check_base_vsa_provider(self, attention: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
+        self._resolve_vsa_provider(attention, od_config.dtype)
 
     @classmethod
     def from_metadata(cls, metadata: Mapping[str, object]) -> FastH3OmniCheckpointSpec:

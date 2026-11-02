@@ -24,6 +24,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import (
+    begin_scheduled_denoise,
+    check_scheduler_sigmas,
+    clear_scheduled_denoise_step_on_exit,
+)
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
@@ -237,10 +242,13 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     ) -> torch.Tensor:
         if attention_kwargs is None:
             attention_kwargs = {}
-        with self.progress_bar(total=len(timesteps)) as pbar:
+        # Checks a bound attention schedule against the actual sequence and returns its length; None
+        # without a schedule, so unscheduled runs publish no total.
+        total_steps = begin_scheduled_denoise(len(timesteps))
+        with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t)
+                self.record_denoise_step(step_idx, t, total_steps=total_steps)
 
                 if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
                     current_model = self.transformer_2
@@ -708,6 +716,8 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
+        # Bound sigma windows read these sigmas at every step; reject unusable ones before the first forward.
+        check_scheduler_sigmas(self.scheduler, len(timesteps))
 
         # MoE boundary: only the two-expert checkpoints (Wan2.2 A14B) have a
         # transformer_2 to switch to. For single-expert VACE (e.g. Wan2.1) this

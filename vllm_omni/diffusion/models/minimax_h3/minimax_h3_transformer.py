@@ -89,8 +89,10 @@ def _supports_reference_kv_compaction(blocks: nn.ModuleList) -> bool:
         # AllGather variants would gather target K/V without the cached rows.
         if attention_layer._get_active_parallel_strategy().name not in {"none", "ulysses"}:
             return False
-        backend = getattr(attention_layer, "attn_backend", None)
-        if backend is None or backend.get_name() == "FASTVIDEO_VSA":
+        backends = [getattr(attention_layer, "attn_backend", None)]
+        # A scheduled step runs its profile's backend on the same compacted Q and cached K/V.
+        backends += [record.backend_cls for record in getattr(attention_layer, "_schedule_candidates", {}).values()]
+        if any(backend is None or backend.get_name() == "FASTVIDEO_VSA" for backend in backends):
             return False
     return True
 
@@ -1246,7 +1248,10 @@ class MiniMaxH3DiTModel(nn.Module):
         if getattr(self, "vdn_config", None) is not None:
             raise ValueError("MiniMax H3 reference-KV offload does not support VDN-H3 hybrid attention")
         if global_reference_rows > 0 and not _supports_reference_kv_compaction(self.blocks):
-            raise ValueError("MiniMax H3 reference-KV reuse requires no SP or pure Ulysses attention")
+            raise ValueError(
+                "MiniMax H3 reference-KV reuse requires no SP or pure Ulysses attention, and FASTVIDEO_VSA "
+                "in neither the base attention nor any attention schedule profile"
+            )
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier2State
         from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache_dit import iter_minimax_h3_blocks
 
