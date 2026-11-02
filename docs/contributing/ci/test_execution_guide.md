@@ -29,6 +29,13 @@ uv pip check
 apt-get install -y espeak-ng jq
 ```
 
+The CUDA CI image bootstraps from vLLM 0.32, then installs the selected runtime.
+It rebuilds LMCache 0.5.6 from source against that runtime's Torch using
+LMCache's `--no-build-isolation` workflow; the bootstrap wheel's Torch 2.13
+CUDA extension is incompatible with Torch 2.14. The GPU runtime check imports
+`lmcache.cuda_ops` before model tests. Dependency metadata checks alone do not
+verify native ABI or connector functionality.
+
 ## Running Tests
 
 Our test scripts use the pytest framework. First, please use `git clone https://github.com/vllm-project/vllm-omni.git` to download the vllm-omni source code. Then, in the root directory of vllm-omni, you can run the following commands in your local test environment to execute the corresponding test cases.

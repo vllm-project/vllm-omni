@@ -62,6 +62,25 @@ RUN VLLM_WHEEL_VERSION=$(printf '%s' "${VLLM_VERSION}" | sed 's/+/%2B/g') && \
     /tmp/gradio-pillow13/gradio-6.31.0+omni.pillow13-py3-none-any.whl \
     "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_WHEEL_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
     -e ".[dev]"
+# The bootstrap's LMCache wheel was compiled against Torch 2.13. Its CUDA
+# extension references a c10 symbol removed in Torch 2.14. Follow LMCache's
+# source workflow so the unchanged release is compiled against this runtime.
+RUN uv pip install --system -r /tmp/vllm-otel-roots.txt \
+    ninja "packaging>=24.2" "setuptools>=77.0.3,<81.0.0" \
+    "setuptools_scm>=8" "grpcio==1.78.0" "grpcio-tools==1.78.0" wheel
+# CUDA builder images can lack the math-library headers supplied by the
+# installed NVIDIA packages. Keep all published LMCache CUDA architectures.
+# Disable the installer cache so an older Torch-specific source wheel cannot
+# satisfy this rebuild merely because its Python package version is unchanged.
+RUN PYTHON_SITE=$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))') && \
+    test -f "${PYTHON_SITE}/nvidia/cu13/include/cusparse.h" && \
+    test -f "${PYTHON_SITE}/nvidia/cusparselt/include/cusparseLt.h" && \
+    CUDA_VISIBLE_DEVICES="" CUDA_HOME=/usr/local/cuda BUILD_WITH_CUDA=1 MAX_JOBS=3 NVCC_THREADS=1 \
+    TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;10.0;11.0;12.0" \
+    CPATH="${PYTHON_SITE}/nvidia/cu13/include:${PYTHON_SITE}/nvidia/cusparselt/include${CPATH:+:${CPATH}}" \
+    uv pip install --system --no-cache --no-binary lmcache \
+    --no-build-isolation-package lmcache --reinstall-package lmcache \
+    -r /tmp/vllm-otel-roots.txt "lmcache==0.5.6"
 RUN uv pip check --system && rm -rf /tmp/gradio-pillow13 /tmp/vllm-otel-roots.txt /tmp/vllm-otel-orphans.txt
 # Fail the image build if dependency resolution replaced the selected vLLM.
 # The CPU builder has no NVIDIA driver; CUDA imports are checked at the start

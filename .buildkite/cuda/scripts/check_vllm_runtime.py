@@ -32,7 +32,9 @@ def main() -> None:
         f"Expected vLLM {expected_commit}, got {__commit_id__} ({vllm.__version__})"
     )
     assert torch.cuda.is_available(), "vLLM runtime check requires a GPU worker"
-    for module in ("flashinfer", "vllm._C_stable_libtorch"):
+    # Python dependency metadata cannot detect a retained connector wheel's
+    # Torch ABI mismatch. Import it on the GPU worker before running models.
+    for module in ("flashinfer", "vllm._C_stable_libtorch", "lmcache.cuda_ops"):
         importlib.import_module(module)
     print(
         f"Verified vLLM CUDA runtime: vllm={vllm.__version__} "
