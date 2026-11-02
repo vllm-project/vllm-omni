@@ -3452,6 +3452,56 @@ def test_qwen3_tts_ready_pins_selected_customvoice_core_nodes() -> None:
     assert source.count('"rocm": "MI325"') == 4
 
 
+_CUSTOMVOICE_MERGE_LABEL = "Qwen3-TTS CustomVoice E2E Test · Shard %N/%t"
+_CUSTOMVOICE_QUARANTINE_LABEL = "Qwen3-TTS CustomVoice async_chunk Test (quarantined)"
+_CUSTOMVOICE_MERGE_NODES = (
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_default_cuda_graph_startup[async_chunk]",
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_text_to_audio_002[async_chunk]",
+    "tests/e2e/offline_inference/test_qwen3_tts_customvoice.py::test_text_to_audio_001[no_cuda_graph]",
+    "tests/e2e/online_serving/test_qwen3_tts_customvoice.py::test_text_to_audio_001[async_chunk]",
+)
+
+
+def test_customvoice_merge_restores_async_chunk_to_the_blocking_shard() -> None:
+    """The async_chunk speech node is the fourth blocking MERGE shard.
+
+    Timeouts stay at the previous shard values. The speech helper still
+    transcribes at advanced_model.
+    """
+    step = _find_step(_CUSTOMVOICE_MERGE_LABEL, AMD_MERGE_PIPELINE)
+    command = "\n".join(step["commands"])
+    pipeline = yaml.safe_load(AMD_MERGE_PIPELINE.read_text(encoding="utf-8"))
+    labels = [item.get("label") for item in _walk_steps(pipeline["steps"])]
+    source = _QWEN3_TTS_CUSTOMVOICE.read_text(encoding="utf-8")
+    function = source.split("def test_text_to_audio_001", 1)[1].split("\ndef ", 1)[0]
+    assertions = Path("tests/helpers/assertions.py").read_text(encoding="utf-8")
+    speech = assertions.split("def assert_audio_speech_response", 1)[1].split("\ndef ", 1)[0]
+    body = command.split("TESTS=(", 1)[1].split(")", 1)[0]
+    quoted = tuple(re.findall(r'"(tests/[^"]+)"', body))
+
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["depends_on"] == "amd-build"
+    assert step["grade"] == "Blocking"
+    assert step["parallelism"] == 4
+    assert step["timeout_in_minutes"] == 80
+    assert "retry" not in step
+    assert "timeout --signal=TERM --kill-after=2m 80m" in command
+    assert "75m" not in command
+    assert _marker_expressions(step) == ["advanced_model"]
+    assert command.count('--run-level "advanced_model"') == 1
+    assert quoted == _CUSTOMVOICE_MERGE_NODES
+    for node in _CUSTOMVOICE_MERGE_NODES:
+        assert command.count(node) == 1
+        assert AMD_MERGE_PIPELINE.read_text(encoding="utf-8").count(node) == 1
+    assert _CUSTOMVOICE_QUARANTINE_LABEL not in labels
+    assert "test_chunked_prefill_tail" not in command
+    assert "send_audio_speech_request(request_config, request_num=get_max_batch_size())" in function
+    assert "pytest.skip" not in function
+    assert 'run_level in {"advanced_model", "full_model"}' in speech
+    assert "_assert_transcript_matches" in speech
+
+
 _WORKER_ONE_CARD_MARKER = "core_model and rocm and MI325 and cards_1"
 _WORKER_ONE_CARD_FILES = (
     "tests/worker/test_batched_omni_output.py",
