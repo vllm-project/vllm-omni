@@ -218,6 +218,11 @@ _MODEL_PROMOTE = (
     "VLLM_OMNI_SENSENOVA_PAGED_DECODE",
     "VLLM_OMNI_WAN_VAE_ENCODE_MARGIN",
     "VLLM_OMNI_WAN_VAE_ENCODE_SPLIT",
+    # ZONOS2 asset/cache selection and router mode belong in typed model config.
+    "VLLM_ZONOS2_DAC_PATH",
+    "VLLM_ZONOS2_ROUTER_REPLAY",
+    "VLLM_ZONOS2_SPEAKER_PATH",
+    "VLLM_ZONOS2_TN_CACHE_DIR",
     "YUE2_VAE",  # VAE checkpoint selection belongs in typed model configuration.
 )
 

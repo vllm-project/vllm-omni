@@ -114,6 +114,8 @@ def install():
                         "request": str(key),
                         "frames": len(codes),
                         "eos_frame": int(state.eos_frame),
+                        "countdown": int(state.countdown),
+                        "max_tokens": state.params.max_tokens,
                         "time": time.perf_counter(),
                     }
                 )

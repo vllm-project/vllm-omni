@@ -206,6 +206,7 @@ def test_missing_dac_package(monkeypatch, tmp_path):
 
 
 def test_corrupt_dac_checkpoint_and_dtype_restored(monkeypatch, tmp_path):
+    pytest.importorskip("dac", reason="The dedicated ZONOS2 core CI step installs codec extras")
     path = tmp_path / "codec.pth"
     path.write_bytes(b"bad")
     monkeypatch.setenv("VLLM_ZONOS2_DAC_PATH", str(path))
@@ -322,6 +323,7 @@ def test_decode_exception_drops_state():
 
 @pytest.mark.parametrize("metadata", [[], {"kwargs": []}])
 def test_invalid_checkpoint_metadata_restores_default_dtype(monkeypatch, tmp_path, metadata):
+    pytest.importorskip("dac", reason="The dedicated ZONOS2 core CI step installs codec extras")
     path = tmp_path / "invalid-metadata.pth"
     torch.save({"metadata": metadata, "state_dict": {}}, path)
     monkeypatch.setenv("VLLM_ZONOS2_DAC_PATH", str(path))

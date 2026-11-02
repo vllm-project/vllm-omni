@@ -898,8 +898,8 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
         """
         params = dict(self.named_parameters())
         moe_w13 = {
-            f"layers.{i}.feed_forward.experts.w13": layer.feed_forward
-            for i, layer in enumerate(self.layers)
+            id(layer.feed_forward.experts.w13): layer.feed_forward
+            for layer in self.layers
             if isinstance(layer.feed_forward, Zonos2MoE)
         }
         loaded: set[str] = set()
@@ -922,11 +922,12 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
                     f"[Zonos2] L0 dtype mismatch for {name}: checkpoint {w.dtype} vs model {target.dtype}"
                 )
             target.data.copy_(w)
-            if name in moe_w13:
+            moe = moe_w13.get(id(target))
+            if moe is not None:
                 # Only a successful w13 write restores checkpoint row order.
                 # Untouched layers keep their packed layout on a failed reload.
-                moe_w13[name]._expert_weights_packed = False
-                moe_w13[name]._experts_kernel = None
+                moe._expert_weights_packed = False
+                moe._experts_kernel = None
             loaded.add(name)
         missing = sorted(set(params) - loaded)
         if skipped or missing or duplicates:
@@ -937,8 +938,7 @@ class Zonos2TalkerForConditionalGeneration(nn.Module):
                 f"  missing (uninitialized model params): {missing[:20]}\n"
                 f"  duplicates: {duplicates[:20]}"
             )
-        for layer in self.layers:
-            if isinstance(layer.feed_forward, Zonos2MoE):
-                layer.feed_forward.prepare_expert_weights()
+        for moe in moe_w13.values():
+            moe.prepare_expert_weights()
         logger.info("ZONOS2 L0 complete: consumed %d tensors, no residue", len(loaded))
         return loaded

@@ -42,6 +42,17 @@ THRESHOLDS = {
 }
 
 
+def generation_termination(*, frames: int, max_tokens: int, eos_frame: int, countdown: int) -> dict[str, str | bool]:
+    """Classify a completed run; natural codec EOS takes priority at the cap."""
+    if not 0 < frames <= max_tokens:
+        raise ValueError("Benchmark termination has an invalid generated-frame count")
+    if eos_frame >= 0 and countdown == 0:
+        return {"termination_reason": "eos", "reached_cap": False}
+    if frames == max_tokens:
+        return {"termination_reason": "length", "reached_cap": True}
+    raise ValueError("Benchmark termination occurred before codec EOS or the generation budget")
+
+
 def quantiles_ci(values, *, samples: int = 2000, seed: int = 42) -> dict:
     values = np.asarray(values, dtype=np.float64)
     if not values.size or not np.isfinite(values).all():

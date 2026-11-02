@@ -99,6 +99,28 @@ def test_checkpoint_reload_restores_interleaved_order_before_repacking():
         assert moe._expert_weights_packed
 
 
+def test_checkpoint_reload_uses_parameter_identity_under_wrapped_names():
+    class WrappedTalker(Zonos2TalkerForConditionalGeneration):
+        @property
+        def layers(self):
+            return self.backbone.layers
+
+    model = WrappedTalker.__new__(WrappedTalker)
+    nn.Module.__init__(model)
+    model.backbone = nn.Module()
+    layer = nn.Module()
+    layer.feed_forward = _moe(2)
+    model.backbone.layers = nn.ModuleList([layer])
+    checkpoint = {name: value.detach().clone() for name, value in model.named_parameters()}
+    assert "backbone.layers.0.feed_forward.experts.w13" in checkpoint
+    inputs = torch.ones((2, 2))
+    expected, _ = layer.feed_forward(inputs, None)
+    for _ in range(2):
+        assert model.load_weights(checkpoint.items()) == set(checkpoint)
+        actual, _ = layer.feed_forward(inputs, None)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("failure", ["missing", "duplicate", "shape", "dtype"])
 def test_failed_reload_preserves_each_experts_actual_layout_and_can_retry(failure, mocker):
     model = Zonos2TalkerForConditionalGeneration.__new__(Zonos2TalkerForConditionalGeneration)

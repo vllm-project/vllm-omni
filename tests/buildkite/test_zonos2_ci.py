@@ -32,6 +32,9 @@ def test_zonos2_job_selected_for_model_and_shared_runner_changes(tier, mirror, c
     assert expected in jobs[0]["agents"]["queue"]
     command = "\n".join(jobs[0]["commands"])
     assert "cards_1" in command
-    if tier != "ready":
+    if tier == "ready":
+        assert "pytest -sv tests/model_executor/models/zonos2/test_codec.py -m 'core_model and cpu'" in command
+        assert command.index("requirements/zonos2.txt") < command.index("test_codec.py")
+    else:
         assert command.index("prepare_zonos2_ci.py") < command.index("pytest -sv")
         assert "asset.env" in command

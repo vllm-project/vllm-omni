@@ -305,4 +305,6 @@ steps:
       TRANSFORMERS_OFFLINE: "1"
     commands:
       - uv pip install --system -r requirements/zonos2.txt --overrides requirements/zonos2-overrides.txt
+      # Generic Simple jobs omit codec extras; retain the dependent CPU coverage here.
+      - pytest -sv tests/model_executor/models/zonos2/test_codec.py -m 'core_model and cpu' --run-level core_model
       - pytest -sv tests/model_executor/models/zonos2 -m 'core_model and cuda and (L4 or B200) and cards_1' --run-level core_model

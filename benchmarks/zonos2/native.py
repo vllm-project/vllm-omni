@@ -24,7 +24,7 @@ async def run(args):
     import yaml
     from vllm import SamplingParams
 
-    from benchmarks.zonos2.protocol import PARAMS
+    from benchmarks.zonos2.protocol import PARAMS, generation_termination
     from tests.e2e.zonos2.runtime import deployment
     from vllm_omni.entrypoints.async_omni import AsyncOmni
 
@@ -134,8 +134,14 @@ async def run(args):
             ttfc_s=code["time"] - row["start"],
             frames=finish["frames"],
             eos_frame=finish["eos_frame"],
-            reached_cap=finish["frames"] >= 1024,
+            countdown=finish["countdown"],
             request=code["request"],
+            **generation_termination(
+                frames=finish["frames"],
+                max_tokens=finish["max_tokens"],
+                eos_frame=finish["eos_frame"],
+                countdown=finish["countdown"],
+            ),
         )
         dac_events = [r for r in records if r["kind"] == "dac" and r["request"] == code["request"] and r["samples"] > 0]
         row["ttfp_consumer_s"] = row["ttfp_s"]

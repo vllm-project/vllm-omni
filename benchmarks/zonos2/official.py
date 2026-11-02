@@ -24,7 +24,7 @@ def main():
     from zonos2.message.tts import TTSSamplingParams
     from zonos2.tts.llm import TTSLLM
 
-    from benchmarks.zonos2.protocol import PARAMS
+    from benchmarks.zonos2.protocol import PARAMS, generation_termination
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -67,6 +67,10 @@ def main():
     original_forward = model.engine.forward_batch_tts
 
     def forward(batch):
+        # Keep the real scheduler request so its completed EOS countdown is
+        # observable after the scheduler releases the request's cache slots.
+        for req in batch.reqs:
+            active[req.uid]["request"] = req
         a, b = cuda.Event(enable_timing=True), cuda.Event(enable_timing=True)
         a.record(model.engine.stream)
         start = time.perf_counter()
@@ -110,7 +114,13 @@ def main():
                     status["first_audio"] = now
                 status["audio"].append(chunk)
             if message.finished:
-                status.update(end=now, eos_frame=message.eos_frame)
+                req = status["request"]
+                status.update(
+                    end=now,
+                    eos_frame=message.eos_frame,
+                    countdown=req.eos_countdown,
+                    max_tokens=req.sampling_params.max_tokens,
+                )
 
     model.offline_send_result = send
     model.send_result = send
@@ -163,7 +173,13 @@ def main():
                 "samples": len(audio),
                 "frames": len(codes),
                 "eos_frame": status["eos_frame"],
-                "reached_cap": len(codes) >= 1024,
+                "countdown": status["countdown"],
+                **generation_termination(
+                    frames=len(codes),
+                    max_tokens=status["max_tokens"],
+                    eos_frame=status["eos_frame"] if status["eos_frame"] is not None else -1,
+                    countdown=status["countdown"],
+                ),
             }
             rows.append(row)
             outputs.append(row)

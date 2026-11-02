@@ -78,3 +78,31 @@ def test_quality_noninferiority_gate_rejects_regression():
     worse = {**baseline, "zh_cer": 0.05}
     result = quality_gate(baseline, worse)
     assert not result["pass"] and not result["checks"]["zh_cer"]
+
+
+@pytest.mark.parametrize(
+    "frames,eos_frame,countdown,reason,reached_cap",
+    [
+        (1023, 1013, 0, "eos", False),
+        (1024, 1014, 0, "eos", False),
+        (1024, 1006, 0, "eos", False),
+        (1024, -1, -1, "length", True),
+        (1024, 1023, 9, "length", True),
+        (1024, 1015, 1, "length", True),
+    ],
+)
+def test_generation_termination_uses_completed_eos_at_budget(frames, eos_frame, countdown, reason, reached_cap):
+    from benchmarks.zonos2.protocol import generation_termination
+
+    result = generation_termination(frames=frames, max_tokens=1024, eos_frame=eos_frame, countdown=countdown)
+    assert result == {"termination_reason": reason, "reached_cap": reached_cap}
+    row = {"language": "cmn", "zh_cer": 0, "utmos": 4, "duration_s": 3, **result}
+    assert failures(row) == (["token_cap"] if reached_cap else [])
+
+
+@pytest.mark.parametrize("frames,eos_frame,countdown", [(1023, -1, -1), (1023, 1014, 1), (0, -1, -1), (1025, 1014, 0)])
+def test_generation_termination_rejects_incomplete_or_out_of_budget_records(frames, eos_frame, countdown):
+    from benchmarks.zonos2.protocol import generation_termination
+
+    with pytest.raises(ValueError, match="termination"):
+        generation_termination(frames=frames, max_tokens=1024, eos_frame=eos_frame, countdown=countdown)

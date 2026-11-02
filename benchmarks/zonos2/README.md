@@ -17,6 +17,13 @@ min-p=.18, repetition=1.2/window50/CB0–7, seed42, max1024, CFG1.
 Native top-p=1 and official top-p=0 both mean disabled. Their RNG
 implementations differ; this comparison does not promise equal random draws.
 
+Both drivers record the terminal EOS countdown and `termination_reason`
+(`eos` or `length`). `reached_cap` means budget exhaustion with an unfinished
+EOS countdown, including runs with no EOS detected. Natural EOS completing on
+the last allowed frame remains complete speech. Fresh native recording output
+is required: older records lack countdown metadata and cannot establish this
+distinction. A run ending before either condition is rejected.
+
 Each performance operating point has two single-request warmups and three
 repeats of the fixed set, giving 30 measured requests. C1, C4 and C8 remain
 separate. The last partial wave is retained. Initialization/frontend time is
