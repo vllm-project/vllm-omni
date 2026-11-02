@@ -91,6 +91,7 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     projected_config = CacheDiTConfig.from_diffusion_config(cache_config)
     db_cache_config = projected_config.to_db_cache_config()
     calibrator_config = projected_config.to_calibrator_config()
+    pipeline._cache_dit_requires_paired_cfg = True  # has_separate_cfg: passes are told apart by forward parity
 
     transformer = getattr(pipeline, "transformer", None)
     transformer_2 = getattr(pipeline, "transformer_2", None)
@@ -181,7 +182,7 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
     )
 
     refresh_trans_one = _build_cache_context_refresh(cache_config)
-    refresh_trans_two = _build_cache_context_refresh(cache_config, lambda pipeline: pipeline.transformer_2)
+    refresh_trans_two = _build_cache_context_refresh(cache_config, _make_pipeline_transformer_getter("transformer_2"))
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context for both transformers with new num_inference_steps.
