@@ -77,6 +77,70 @@ def get_rdma_host() -> str:
     return "127.0.0.1"
 
 
+_SYSFS_INFINIBAND = "/sys/class/infiniband"
+
+# Set by _detect_rdma_device() when RDMA devices are visible but none of them
+# can carry a loopback QP from this process. Used to skip the transfer tests
+# with a precise reason instead of an opaque ``get() returned None``.
+RDMA_LOOPBACK_BLOCKER: str = ""
+
+
+def _read_sysfs(path: str) -> str:
+    try:
+        with open(path) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _sysfs_rdma_devices() -> list[dict]:
+    """Enumerate RDMA devices through sysfs (no ``ibdev2netdev`` needed).
+
+    ``ibdev2netdev`` is an MLNX_OFED script that is not shipped by rdma-core,
+    so plain rdma-core hosts (and most containers) do not have it. It only
+    reads sysfs, so do the same here. Each entry:
+
+        {"name", "link_layer" ("Ethernet"|"InfiniBand"), "active" (bool),
+         "netdevs": [(ifname, operstate), ...]}
+
+    ``netdevs`` lists the network interfaces bound to the HCA *as visible from
+    the current network namespace*. Inside a container without hostNetwork
+    the RoCE netdev lives in the host namespace, so the list is empty even
+    though the ib device node exists -- and in that case the kernel rejects
+    every RoCE QP INIT->RTR transition with ENODEV ("No such device").
+    """
+    devices: list[dict] = []
+    try:
+        names = sorted(os.listdir(_SYSFS_INFINIBAND))
+    except OSError:
+        return devices
+    for name in names:
+        dev_dir = os.path.join(_SYSFS_INFINIBAND, name)
+        ports_dir = os.path.join(dev_dir, "ports")
+        try:
+            ports = sorted(os.listdir(ports_dir), key=lambda p: int(p) if p.isdigit() else 0)
+        except OSError:
+            ports = []
+        port_dir = os.path.join(ports_dir, ports[0]) if ports else ""
+        link_layer = _read_sysfs(os.path.join(port_dir, "link_layer")) if port_dir else ""
+        state = _read_sysfs(os.path.join(port_dir, "state")) if port_dir else ""
+        net_dir = os.path.join(dev_dir, "device", "net")
+        try:
+            ifnames = sorted(os.listdir(net_dir))
+        except OSError:
+            ifnames = []
+        netdevs = [(ifname, _read_sysfs(f"/sys/class/net/{ifname}/operstate")) for ifname in ifnames]
+        devices.append(
+            {
+                "name": name,
+                "link_layer": link_layer or "unknown",
+                "active": state.upper().endswith("ACTIVE"),
+                "netdevs": netdevs,
+            }
+        )
+    return devices
+
+
 def _detect_rdma_device() -> str:
     """Auto-detect a usable RDMA device for single-node loopback testing.
 
@@ -86,10 +150,16 @@ def _detect_rdma_device() -> str:
 
     Priority:
       1. RDMA_DEVICE_NAME / RDMA_DEVICE environment variable
-      2. ibdev2netdev: pick first RoCE device whose netdev is UP
-      3. Mooncake TransferEngine topology (if available)
-      4. Empty string (Mooncake uses all devices — risky on multi-NIC)
+      2. sysfs (/sys/class/infiniband): first RoCE device whose netdev is UP
+         in this network namespace; sets RDMA_LOOPBACK_BLOCKER when RoCE
+         devices exist but none has a netdev here (container without
+         hostNetwork -> QP INIT->RTR fails with ENODEV on every GID)
+      3. ibdev2netdev: pick first RoCE device whose netdev is UP
+      4. Mooncake TransferEngine topology (if available)
+      5. Empty string (Mooncake uses all devices — risky on multi-NIC)
     """
+    global RDMA_LOOPBACK_BLOCKER
+
     # 1. Explicit env override
     for env_key in ("RDMA_DEVICE_NAME", "RDMA_DEVICE"):
         env_val = os.environ.get(env_key, "").strip()
@@ -97,7 +167,43 @@ def _detect_rdma_device() -> str:
             print(f"[_detect_rdma_device] Using {env_key}={env_val}")
             return env_val
 
-    # 2. ibdev2netdev: most reliable, no Mooncake dependency
+    # 2. sysfs: what ibdev2netdev reads, minus the MLNX_OFED dependency.
+    sysfs_devs = _sysfs_rdma_devices()
+    if sysfs_devs:
+        roce_devs = [d for d in sysfs_devs if d["link_layer"] == "Ethernet"]
+        for dev in roce_devs:
+            if not dev["active"]:
+                continue
+            up = [ifname for ifname, oper in dev["netdevs"] if oper == "up"]
+            if up:
+                print(f"[_detect_rdma_device] sysfs selected RoCE: {dev['name']} (netdev {up[0]} up)")
+                return dev["name"]
+        if roce_devs and len(roce_devs) == len(sysfs_devs) and not any(d["netdevs"] for d in roce_devs):
+            # Every HCA is RoCE and none exposes a netdev in this netns. The
+            # GID table is bound to host-namespace interfaces, so the kernel
+            # cannot resolve a source netdev for any QP: ibv_modify_qp(RTR)
+            # returns ENODEV for every GID index, loopback included.
+            RDMA_LOOPBACK_BLOCKER = (
+                f"{len(roce_devs)} RoCE device(s) visible ({', '.join(d['name'] for d in roce_devs)}) "
+                "but none has a network interface in this network namespace "
+                "(container/pod without hostNetwork or an SR-IOV/macvlan RDMA netdev); "
+                "RoCE QP INIT->RTR fails with ENODEV on every GID, so RDMA loopback is "
+                "impossible from this process. Run with hostNetwork or pass the RoCE netdev "
+                "into the namespace; set RDMA_DEVICE_NAME to force the tests anyway."
+            )
+            print(f"[_detect_rdma_device] {RDMA_LOOPBACK_BLOCKER}")
+            return ""
+        print(
+            "[_detect_rdma_device] sysfs: no RoCE device with an UP netdev; devices="
+            + ", ".join(
+                f"{d['name']}({d['link_layer']},{'active' if d['active'] else 'down'},netdevs={d['netdevs']})"
+                for d in sysfs_devs
+            )
+        )
+    else:
+        print(f"[_detect_rdma_device] sysfs: {_SYSFS_INFINIBAND} is empty or missing")
+
+    # 3. ibdev2netdev (MLNX_OFED hosts).
     #    Prefer RoCE (Ethernet-backed) over IB for loopback reliability.
     try:
         result = subprocess.run(["ibdev2netdev"], capture_output=True, text=True, timeout=5)
@@ -110,21 +216,21 @@ def _detect_rdma_device() -> str:
                 if len(parts) == 2:
                     iface = parts[1].strip().split()[0]  # e.g. "enp75s0f0"
                     if not iface.startswith("ib"):
-                        dev = line.split()[0]
-                        print(f"[_detect_rdma_device] ibdev2netdev selected RoCE: {dev} ({line})")
-                        return dev
+                        device_name = line.split()[0]
+                        print(f"[_detect_rdma_device] ibdev2netdev selected RoCE: {device_name} ({line})")
+                        return device_name
             # Fallback: any Up device (IB)
             if up_lines:
-                dev = up_lines[0].split()[0]
-                print(f"[_detect_rdma_device] ibdev2netdev selected IB: {dev} ({up_lines[0]})")
-                return dev
+                device_name = up_lines[0].split()[0]
+                print(f"[_detect_rdma_device] ibdev2netdev selected IB: {device_name} ({up_lines[0]})")
+                return device_name
             print("[_detect_rdma_device] ibdev2netdev: no device with (Up) link found")
     except FileNotFoundError:
         print("[_detect_rdma_device] ibdev2netdev not found, skipping")
     except Exception as exc:
         print(f"[_detect_rdma_device] ibdev2netdev failed: {exc}")
 
-    # 3. Mooncake topology query
+    # 4. Mooncake topology query
     if TransferEngine is not None:
         try:
             import json
@@ -135,23 +241,33 @@ def _detect_rdma_device() -> str:
                 topo_str = getattr(eng, "get_local_topology", lambda: None)()
                 if topo_str:
                     topo = json.loads(topo_str)
-                    # Prefer RoCE (IPv4-mapped GID)
+                    # Two formats exist:
+                    #  (a) {hca_name: {"gid": ..., ...}, ...}           (old)
+                    #  (b) {compute_unit: [[preferred_hcas], [avail]]} (>= 0.3.x)
+                    hca_names: list[str] = []
                     for name, info in topo.items():
                         if isinstance(info, dict):
                             gid = info.get("gid", "")
                             if gid.startswith("00:00:00:00:00:00:00:00:00:00:ff:ff"):
                                 print(f"[_detect_rdma_device] Mooncake topology selected RoCE: {name}")
                                 return name
+                            hca_names.append(name)
+                        elif isinstance(info, list):
+                            for group in info:
+                                if isinstance(group, list):
+                                    hca_names.extend(h for h in group if isinstance(h, str))
+                    # Preserve order, drop duplicates.
+                    hca_names = list(dict.fromkeys(hca_names))
                     # Prefer bonded device
-                    for name in topo:
+                    for name in hca_names:
                         if "bond" in name:
                             print(f"[_detect_rdma_device] Mooncake topology selected bond: {name}")
                             return name
                     # First available
-                    for name, info in topo.items():
-                        if isinstance(info, dict):
-                            print(f"[_detect_rdma_device] Mooncake topology fallback: {name}")
-                            return name
+                    if hca_names:
+                        print(f"[_detect_rdma_device] Mooncake topology fallback: {hca_names[0]}")
+                        return hca_names[0]
+                    print(f"[_detect_rdma_device] Mooncake topology has no HCA names: {topo_str[:200]!r}")
                 else:
                     print("[_detect_rdma_device] get_local_topology() returned None/empty")
         except Exception as exc:
@@ -163,6 +279,16 @@ def _detect_rdma_device() -> str:
 
 RDMA_HOST = get_rdma_host()
 RDMA_DEVICE = _detect_rdma_device()
+
+# Tests that move data between two connectors need a working loopback QP.
+# They are skipped -- with the kernel-level reason -- only when
+# _detect_rdma_device() established that no visible RDMA device can reach
+# RTR from this network namespace. Everything else in this file (engine init,
+# put, allocator, lifecycle) never opens a QP and keeps running.
+requires_rdma_loopback = pytest.mark.skipif(
+    bool(RDMA_LOOPBACK_BLOCKER),
+    reason=f"RDMA loopback unavailable: {RDMA_LOOPBACK_BLOCKER}",
+)
 
 
 def _connector_config(
@@ -261,6 +387,7 @@ class TestEndToEnd:
         c = MooncakeTransferEngineConnector(_connector_config(get_open_port(RDMA_HOST), pool_size))
         return p, c
 
+    @requires_rdma_loopback
     def test_tensor_e2e(self):
         p, c = self._pair()
         try:
@@ -279,6 +406,7 @@ class TestEndToEnd:
             p.close()
             c.close()
 
+    @requires_rdma_loopback
     def test_bytes_e2e(self):
         p, c = self._pair()
         try:
@@ -297,6 +425,7 @@ class TestEndToEnd:
             p.close()
             c.close()
 
+    @requires_rdma_loopback
     def test_object_e2e(self):
         p, c = self._pair()
         try:
@@ -313,6 +442,7 @@ class TestEndToEnd:
             p.close()
             c.close()
 
+    @requires_rdma_loopback
     def test_zero_copy_e2e(self):
         p, c = self._pair()
         try:
@@ -338,6 +468,7 @@ class TestEndToEnd:
             p.close()
             c.close()
 
+    @requires_rdma_loopback
     def test_large_tensor_100mb(self):
         """Transfer ~100 MB tensor and verify MD5 integrity."""
         p, c = self._pair(pool_size=128 * 1024 * 1024)
@@ -357,6 +488,7 @@ class TestEndToEnd:
             p.close()
             c.close()
 
+    @requires_rdma_loopback
     def test_mixed_types_sequential(self):
         """Transfer different dtypes and data types in sequence."""
         p, c = self._pair(pool_size=32 * 1024 * 1024)
@@ -419,6 +551,7 @@ class TestEndToEnd:
                 t.join()
             assert len(errors) == 0, f"errors: {errors}"
 
+    @requires_rdma_loopback
     def test_auto_cleanup(self):
         """Producer buffer should be released after consumer get."""
         p, c = self._pair()
@@ -496,6 +629,7 @@ class TestGPUPool:
             assert ok
             assert meta["is_fast_path"]
 
+    @requires_rdma_loopback
     def test_gpu_e2e_transfer(self):
         p = MooncakeTransferEngineConnector(self._gpu_cfg(get_open_port(RDMA_HOST)))
         c = MooncakeTransferEngineConnector(self._gpu_cfg(get_open_port(RDMA_HOST)))
@@ -535,6 +669,7 @@ class TestStressCorrectness:
 
     # -- Concurrent put + get with data integrity --
 
+    @requires_rdma_loopback
     def test_concurrent_put_get_integrity(self):
         """
         10 threads each put a unique tensor; a single consumer thread gets all
@@ -594,6 +729,7 @@ class TestStressCorrectness:
             p.close()
             c.close()
 
+    @requires_rdma_loopback
     def test_concurrent_put_get_threaded_both_sides(self):
         """
         True overlapping concurrency: producer threads put items one by
@@ -685,6 +821,7 @@ class TestStressCorrectness:
 
     # -- Edge cases --
 
+    @requires_rdma_loopback
     def test_small_tensor_1_element(self):
         """Transfer a single-element tensor."""
         p, c = self._pair()
@@ -712,6 +849,7 @@ class TestStressCorrectness:
 
     # -- Large payload stress (500 MB) --
 
+    @requires_rdma_loopback
     def test_large_tensor_500mb(self):
         """Transfer ~500 MB tensor and verify MD5 integrity."""
         p, c = self._pair(pool_size=600 * 1024 * 1024)

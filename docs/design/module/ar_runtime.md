@@ -32,6 +32,26 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+After applying sampled output, the AR scheduler publishes only completed KV
+blocks to upstream prefix caching, including on its plain-decode path. Async
+placeholders and speculative steps use `num_computed_tokens - num_in_flight_tokens`
+as the materialized frontier. Stale output and requests that were not running
+before the update do not publish blocks. Publication precedes stop cleanup so
+the last completed blocks remain reusable after a request finishes.
+
+For Bagel image editing, the vLLM 0.33 prefix-range helper receives shallow
+`image` views of the custom `img2img` features so both VAE and ViT embedding
+spans retain bidirectional attention. The original features keep their modality,
+encoder data, cache identifiers and placeholder masks. Upstream still computes
+the ranges and applies sliding-window and padding rules. This adapter is installed
+from `vllm_omni.patch` for both upstream runner implementations; it is unnecessary
+with vLLM versions that build the ranges inline.
+
+MOSS Local's fused and separate depth-attention paths share an explicitly
+rounded initial weighted value and the same FMA accumulation order. This
+preserves bitwise parity when the compiler inlines attention into sampling,
+including SM89 code generation affected by LLVM SLP reduction reordering.
+
 ## Full-payload input scheduling
 
 For a downstream, non-async stage with `requires_full_payload_input`,

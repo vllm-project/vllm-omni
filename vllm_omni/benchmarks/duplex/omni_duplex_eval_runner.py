@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -67,6 +68,8 @@ MIX_SOUNDTRACK = "soundtrack"
 MIX_MODES = (MIX_QUESTION, MIX_SOUNDTRACK)
 _SERVER_TURN_SETTLE_S = 2.0
 _COMPLETION_SETTLE_S = 2.0
+_COMPLETION_TRACE_LIMIT = 256
+_COMPLETION_TRACE_STRING_LIMIT = 128
 # Events that can still open or extend a response after the commit. Playback
 # acknowledgements are omitted: the runner sends one every 250 ms for any
 # response that produced audio, and the server echoes each one, so counting
@@ -285,6 +288,40 @@ def _completion_activity(events: list[dict[str, object]], start: int) -> int:
     return sum(event.get("type") in _COMPLETION_ACTIVITY for event in events[start:])
 
 
+def _completion_trace_event(event: dict[str, object], index: int) -> dict[str, object]:
+    """Copy bounded identity and timing fields from an already collected event."""
+    row: dict[str, object] = {"event_index": index, "type": event["type"]}
+    response = event.get("response")
+    metadata = response.get("metadata") if isinstance(response, dict) else None
+    if not isinstance(metadata, dict):
+        metadata = event.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    for name in ("server_event_seq", "epoch", "turn_id"):
+        value = event.get(name, metadata.get(name))
+        if isinstance(value, int) and not isinstance(value, bool):
+            row[name] = value
+    received_at_s = event.get("_client_received_at_s")
+    if isinstance(received_at_s, int | float) and not isinstance(received_at_s, bool) and math.isfinite(received_at_s):
+        row["client_received_at_s"] = received_at_s
+    for name, value in (
+        ("response_id", _event_response_id(event)),
+        ("session_id", event.get("session_id", metadata.get("session_id"))),
+        ("reason", event.get("reason", metadata.get("reason"))),
+    ):
+        if isinstance(value, str):
+            row[name] = value[:_COMPLETION_TRACE_STRING_LIMIT]
+    runtime = metadata.get("vllm_omni", event.get("vllm_omni"))
+    if isinstance(runtime, dict):
+        model_turn_id = runtime.get("model_turn_id")
+        if isinstance(model_turn_id, int) and not isinstance(model_turn_id, bool):
+            row["model_turn_id"] = model_turn_id
+    for name in ("model_listen", "buffering"):
+        value = metadata.get(name)
+        if isinstance(value, bool):
+            row[name] = value
+    return row
+
+
 def _completion_diagnostics(
     events: list[dict[str, object]],
     start: int,
@@ -302,6 +339,7 @@ def _completion_diagnostics(
     finished: set[str] = set()
     created_after: set[str] = set()
     state_events: list[dict[str, object]] = []
+    event_trace: deque[dict[str, object]] = deque(maxlen=_COMPLETION_TRACE_LIMIT)
     event_type_counts: dict[str, int] = {}
     for index, event in enumerate(events):
         event_type = event.get("type")
@@ -324,6 +362,7 @@ def _completion_diagnostics(
             continue
         if event_type in _COMPLETION_ACTIVITY:
             event_type_counts[event_type] = event_type_counts.get(event_type, 0) + 1
+            event_trace.append(_completion_trace_event(event, index))
         if event_type not in {
             "input_audio_buffer.committed",
             "response.created",
@@ -359,6 +398,12 @@ def _completion_diagnostics(
         "settled_silence_terminal_decision": _residual_unit_decided(events, start, settled_silence_is_terminal=True),
         "completion_event_type_counts": event_type_counts,
         "completion_state_events": state_events,
+        "completion_event_trace": {
+            "events": list(event_trace),
+            "event_count": sum(event_type_counts.values()),
+            "omitted_event_count": sum(event_type_counts.values()) - len(event_trace),
+            "limit": _COMPLETION_TRACE_LIMIT,
+        },
     }
 
 
@@ -652,12 +697,14 @@ async def generate_sample(
         events = list(client.events.events)
         collector = _event_collector_from_realtime(client.events)
     if drain_timeout_state is not None:
-        drain_timeout_state["completion_state_events_after_timeout"] = _completion_diagnostics(
+        after_timeout = _completion_diagnostics(
             events,
             drain_timeout_event_count,
             response_ids=client.events.response_ids,
             stable_since=time.monotonic(),
-        )["completion_state_events"]
+        )
+        drain_timeout_state["completion_state_events_after_timeout"] = after_timeout["completion_state_events"]
+        drain_timeout_state["completion_event_trace_after_timeout"] = after_timeout["completion_event_trace"]
     timed = [sentence.as_dict() for sentence in extract_timed_sentences(events, clock=clock)]
     chunks = [chunk.as_dict() for chunk in extract_timed_chunks(events, clock=clock)]
     meta = {

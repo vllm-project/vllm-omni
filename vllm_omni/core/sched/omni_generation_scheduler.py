@@ -405,7 +405,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             request.status = RequestStatus.WAITING
             self._enqueue_waiting_request(request)
             return False
-        return super()._handle_stopped_request(request)
+        finished = super()._handle_stopped_request(request)
+        if not finished:
+            # The pin no longer enqueues inside the base stop handler.
+            self._admit_continuing_request(request)
+        return finished
 
     def _requeue_completed_native_chunks(self) -> None:
         """Return completed native generation chunks to the admission queue.
@@ -877,6 +881,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             self.processed_step_seq += 1
             self._drain_deferred_frees()
+            # HiSparse async loads must wait for the same completed-step fence.
+            if getattr(self, "defer_async_loads", False):
+                self._drain_deferred_loads()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -910,6 +917,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        # Resumable stops to admit after queue cleanup. See OmniARScheduler.
+        continuing_reqs: list[Request] = []
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1060,6 +1069,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 is_segment_finished = not finished
+                if not finished:
+                    continuing_reqs.append(request)
                 if finished and self._native_data_plane:
                     self._pending_data_plane_terminal_req_ids.add(req_id)
                 if not finished:
@@ -1121,6 +1132,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finish_reason = request.get_finished_reason()
             finished = self._handle_stopped_request(request)
             is_segment_finished = not finished
+            if not finished:
+                continuing_reqs.append(request)
             kv_transfer_params = None
             ec_transfer_params = None
             if finished:
@@ -1148,6 +1161,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             stopped_running_reqs,
             stopped_preempted_reqs,
         )
+        self._requeue_continuing_requests(continuing_reqs)
 
         OmniSchedulerMixin._finish_error_requests(self, outputs)
 

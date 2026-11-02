@@ -158,18 +158,65 @@ class TestForwardCudaQuantDispatch:
         def _fail(self, q, k, v, m):
             raise AssertionError("quant path must not be entered")
 
+        calls = []
+
+        def _varlen_forward(self, q, k, v):
+            calls.append((q, k, v))
+            return q
+
         monkeypatch.setattr(FlashAttentionImpl, "forward_fa_quant_cuda", _fail)
-        monkeypatch.setattr(FlashAttentionImpl, "_forward_varlen_dense", lambda self, q, k, v: q)
-        # forward_cuda imports these names at call time. bf16 prefers the optional
-        # fa3-fwd binding, and FA4 then ignores that callable and runs the real op.
+        monkeypatch.setattr(FlashAttentionImpl, "_forward_varlen_dense", _varlen_forward)
+        # Both dense providers can be installed; explicitly force the varlen-dense fallback.
         monkeypatch.setattr(fa_utils, "HAS_FLASH_ATTN", True)
+        monkeypatch.setattr(fa_utils, "IS_FLASH_ATTN_4", False)
+        monkeypatch.setattr(fa_utils, "dense_flash_attn_func_for", lambda _dtype: None)
         monkeypatch.setattr(fa_utils, "IS_FLASH_ATTN_4", False)
         monkeypatch.setattr(fa_utils, "optional_fa3_fwd_dense_func", None)
         monkeypatch.setattr(fa_utils, "flash_attn_func", None)
-        monkeypatch.setattr(fa_utils, "dense_flash_attn_func_for", lambda _dtype: None)
+        monkeypatch.setattr(fa_utils, "optional_fa3_fwd_dense_func", None)
         extra = {} if dtype_value is None else {"kv_cache_dtype": dtype_value}
         metadata = AttentionMetadata(extra=extra)
-        impl.forward_cuda(_randn_bshd(1, 8), _randn_bshd(1, 8), _randn_bshd(1, 8), metadata)
+        query, key, value = _randn_bshd(1, 8), _randn_bshd(1, 8), _randn_bshd(1, 8)
+
+        output = impl.forward_cuda(query, key, value, metadata)
+
+        assert len(calls) == 1
+        assert calls[0][0] is query
+        assert calls[0][1] is key
+        assert calls[0][2] is value
+        assert output is query
+
+    @pytest.mark.parametrize("dtype_value", [None, "float", "auto"])
+    @pytest.mark.parametrize("provider", ["generic", "optional"])
+    def test_float_extra_routes_to_selected_dense_provider(self, monkeypatch, dtype_value, provider):
+        impl = _make_impl()
+        query, key, value = _randn_bshd(1, 8), _randn_bshd(1, 11), _randn_bshd(1, 11)
+        expected = torch.full_like(query, 0.25)
+        calls = []
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("the selected dense float provider must handle this request")
+
+        def _dense(q, k, v, **kwargs):
+            calls.append((q, k, v, kwargs))
+            return expected
+
+        monkeypatch.setattr(FlashAttentionImpl, "forward_fa_quant_cuda", _fail)
+        monkeypatch.setattr(FlashAttentionImpl, "_forward_varlen_dense", _fail)
+        monkeypatch.setattr(fa_utils, "HAS_FLASH_ATTN", True)
+        monkeypatch.setattr(fa_utils, "IS_FLASH_ATTN_4", False)
+        monkeypatch.setattr(fa_utils, "flash_attn_func", _dense if provider == "generic" else _fail)
+        monkeypatch.setattr(fa_utils, "optional_fa3_fwd_dense_func", _dense if provider == "optional" else None)
+        extra = {} if dtype_value is None else {"kv_cache_dtype": dtype_value}
+
+        output = impl.forward_cuda(query, key, value, AttentionMetadata(extra=extra))
+
+        assert len(calls) == 1
+        assert calls[0][0] is query
+        assert calls[0][1] is key
+        assert calls[0][2] is value
+        assert calls[0][3] == {"causal": False, "softmax_scale": 64**-0.5}
+        assert output is expected
 
 
 class TestQuantValidation:

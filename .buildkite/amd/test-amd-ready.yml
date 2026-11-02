@@ -1131,7 +1131,7 @@ steps:
           marker="core_model and omni and rocm and MI325 and cards_1"
           pytest --collect-only -q "$${nodes[@]}" \
             --shard-id=0 --num-shards=1 \
-            -m "$$marker" --run-level core_model \
+            -m "$$marker" --run-level advanced_model \
             > "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt"
           count=$$(awk '/::/ { n++ } END { print n + 0 }' \
             "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/collection.txt")
@@ -1155,7 +1155,7 @@ steps:
           timeout --signal=TERM --kill-after=1m 35m \
             pytest -s -v "$${nodes[@]}" \
             --shard-id=0 --num-shards=1 \
-            -m "core_model and omni and rocm and MI325 and cards_1" --run-level core_model \
+            -m "core_model and omni and rocm and MI325 and cards_1" --run-level advanced_model \
             --junitxml="$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.xml" || status=$$?
           if [[ "$$status" -eq 0 ]]; then
             if python -c 'import sys, xml.etree.ElementTree as ET; root = ET.parse(sys.argv[1]).getroot(); suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite")); tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites); skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites); ok = tests == 2 and skipped == 0; print(f"Expected exactly two executed MiniCPM-o duplex tests; reported tests={tests}, skipped={skipped}.", file=sys.stderr) if not ok else None; raise SystemExit(0 if ok else 5)' "$$ROCM_MINICPMO_DUPLEX_ARTIFACT_DIR/pytest.xml"

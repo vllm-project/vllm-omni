@@ -102,13 +102,18 @@ def _npu_worker_class(monkeypatch):
 @pytest.mark.parametrize("kind", ["ar", "diffusion", "npu"])
 @pytest.mark.parametrize("controls", [{}, {"delay_iterations": 2, "max_iterations": 3}])
 def test_worker_profile_forwards_controls_and_preserves_default_call(monkeypatch, mocker, kind, controls):
-    profiler = SimpleNamespace(start=mocker.Mock(), stop=mocker.Mock())
+    profiler = RecordingProfiler()
+    profiler.start = mocker.Mock(wraps=profiler.start)
+    profiler.stop = mocker.Mock(wraps=profiler.stop)
+    profiler.set_profiler_kwargs = mocker.Mock(wraps=profiler.set_profiler_kwargs)
     worker = SimpleNamespace(profiler=profiler, _get_profiler=lambda: profiler)
     cls = {"ar": OmniGPUWorkerBase, "diffusion": DiffusionWorker}.get(kind)
     if cls is None:
         cls = _npu_worker_class(monkeypatch)
     cls.profile(worker, True, "test-profile", **controls)
     profiler.start.assert_called_once_with(**controls)
+    if kind == "ar":
+        profiler.set_profiler_kwargs.assert_called_once_with(None)
     cls.profile(worker, False)
     profiler.stop.assert_called_once_with()
 

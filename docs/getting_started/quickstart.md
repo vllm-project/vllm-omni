@@ -20,21 +20,22 @@ source .venv/bin/activate
 
 # On CUDA (Linux x86_64, CUDA 13.0)
 uv pip install --torch-backend=cu130 \
-  "vllm @ https://wheels.vllm.ai/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm-0.32.0-cp38-abi3-manylinux_2_28_x86_64.whl"
+  "vllm @ https://wheels.vllm.ai/4ba787ec9959e566d3b587a796dff07673324da5/vllm-0.33.0rc3.dev3%2Bg4ba787ec9-cp38-abi3-manylinux_2_28_x86_64.whl"
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 uv pip install -e .
 ```
 
-These commands install the vLLM 0.32.0 release-branch wheel at the exact
-tested tag commit, with PyTorch 2.13.0 and CUDA 13.0. The
-[vLLM 0.32.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.32.0),
-PyPI wheel and matching ROCm wheel are published. ROCm runtime validation
-with this checkout remains pending. A vLLM-Omni 0.32 wheel is not yet
-published; install Omni from source as shown above. For published
-vLLM-Omni wheels and additional installation methods, see the
+These commands select vLLM 0.33.0rc3.dev3+g4ba787ec9 at the frozen release-branch commit,
+with PyTorch 2.14.0 and CUDA 13.0. This is a release candidate; full CI and
+ROCm/XPU runtime validation remain pending. Install Omni from this source
+checkout. For published Omni wheels and other installation methods, see the
 [installation guide](installation/README.md).
+
+For source development or Gradio demos, also follow the
+[source dependency instructions](installation/README.md#source-development-and-demo-dependencies)
+to install the temporary Gradio wheel together with the requested extras.
 
 !!! note
     It is important to install the same major & minor version of vLLM and vLLM Omni, otherwise things may not work as expected. If the versions are misaligned, you will see a warning when you import vLLM Omni.

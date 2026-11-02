@@ -1430,7 +1430,7 @@ _DIFFUSION_DEFAULT_FACTORY_FIELDS = frozenset({"default_sampling_params", "devic
 
 def _frontend_cli_fields() -> frozenset[str]:
     """Return vLLM server fields that are consumed before stage startup."""
-    from vllm.entrypoints.launchers.cli_args import FrontendArgs
+    from vllm.entrypoints.common.cli_args import FrontendArgs
 
     return frozenset(config_field.name for config_field in fields(FrontendArgs))
 

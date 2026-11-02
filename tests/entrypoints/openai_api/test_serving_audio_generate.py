@@ -84,7 +84,12 @@ def _make_server(engine_client=None):
 
 
 @pytest.fixture
-def test_app():
+def test_app(monkeypatch):
+    # Exercise seeded request wiring with a CPU generator in this CPU API test.
+    monkeypatch.setattr(
+        "vllm_omni.platforms.current_omni_platform",
+        SimpleNamespace(device_type="cpu"),
+    )
     server = _make_server()
 
     original_fn = server.create_audio_generate
@@ -95,7 +100,7 @@ def test_app():
     async def patched_create_audio_generate(*args, **kwargs):
         return await original_fn(*args, **kwargs)
 
-    patched_create_audio_generate.__signature__ = new_sig
+    setattr(patched_create_audio_generate, "__signature__", new_sig)
     server.create_audio_generate = patched_create_audio_generate
 
     app = FastAPI()
@@ -641,7 +646,11 @@ class TestErrorHandling:
     @pytest.mark.parametrize(
         ("exc", "expected_message", "expected_stage_id"),
         [
-            (OmniEngineDeadError("engine dead", error_stage_id=2), "engine dead", 2),
+            (
+                OmniEngineDeadError("engine dead", error_stage_id=2),
+                OmniEngineDeadError.CLIENT_MESSAGE,
+                2,
+            ),
             (EngineGenerateError("engine generate failed"), "engine generate failed", None),
         ],
     )
@@ -693,7 +702,7 @@ class TestAudioGenerateAPI:
         assert response.headers["content-type"] == "audio/wav"
 
     def test_missing_input_rejected(self, client):
-        payload = {}
+        payload: dict[str, object] = {}
         response = client.post("/v1/audio/generate", json=payload)
         assert response.status_code == 422
 

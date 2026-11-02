@@ -12,7 +12,7 @@ from threading import Lock
 
 import torch
 from vllm.triton_utils import tl, triton
-from vllm.v1.sample.ops import topk_topp_sampler
+from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.seeded_exponential import torch_exponential_noise, torch_exponential_policy
@@ -165,7 +165,7 @@ def _use_triton(probs: torch.Tensor) -> bool:
 def categorical_sample(probs: torch.Tensor, generators: dict[int, torch.Generator]) -> torch.Tensor:
     """Return an int64 token vector; replacements supply only rejected rows."""
     if not _use_triton(probs):
-        return topk_topp_sampler.random_sample(probs, generators).reshape(-1).long()
+        return random_sample(probs, generators).reshape(-1).long()
     return _cuda_sample(probs, generators)[0]
 
 
@@ -191,7 +191,7 @@ def nucleus_sample(
     keep = (cumulative - probs) < top_p.unsqueeze(1)
     ranks = torch.arange(probs.shape[1], device=probs.device)
     keep &= (top_k.unsqueeze(1) <= 0) | (ranks.unsqueeze(0) < top_k.unsqueeze(1))
-    draws = topk_topp_sampler.random_sample(probs * keep.to(probs.dtype), generators).reshape(-1, 1).long()
+    draws = random_sample(probs * keep.to(probs.dtype), generators).reshape(-1, 1).long()
     sampled = indices.gather(1, draws).squeeze(1)
     repeated = None
     if history is not None:

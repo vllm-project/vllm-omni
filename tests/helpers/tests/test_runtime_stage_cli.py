@@ -78,6 +78,49 @@ def test_stage_cli_launches_one_process_per_stage(tmp_path: Path, monkeypatch: p
     assert launched == [(0, False), (1, True)]
 
 
+def test_stage_cli_keeps_http_and_registration_ports_distinct(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
+    server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
+    # Two bind(0)/close allocations may return the same port. A TCP readiness
+    # probe would then accept the registration socket and send HTTP to ZeroMQ.
+    server.master_port = server.port
+    replacement = runtime.get_open_port()
+    while replacement == server.port:
+        replacement = runtime.get_open_port()
+    monkeypatch.setattr(runtime, "get_open_port", lambda *args: replacement)
+    commands: list[list[str]] = []
+
+    def launch(stage_id: int, *, headless: bool) -> None:
+        commands.append(server._build_stage_cmd(stage_id, headless=headless))
+        raise RuntimeError("stop before spawning")
+
+    monkeypatch.setattr(server, "_launch_stage", launch)
+    with pytest.raises(RuntimeError, match="stop before spawning"):
+        with server:
+            pass
+    command = commands[0]
+    assert command[command.index("--port") + 1] != command[command.index("--omni-master-port") + 1]
+    assert server._port_lock is None
+
+
+def test_stage_cli_repeated_port_collision_fails_before_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
+    server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
+    server.master_port = server.port
+    monkeypatch.setattr(runtime, "get_open_port", lambda *args: server.port)
+
+    def launch(stage_id: int, *, headless: bool) -> None:
+        raise AssertionError("A repeated port collision must fail before launching any stage")
+
+    monkeypatch.setattr(server, "_launch_stage", launch)
+
+    with pytest.raises(RuntimeError, match="distinct HTTP and stage registration ports after 128 attempts"):
+        with server:
+            pass
+
+    assert server._port_lock is None
+
+
 def test_stage_cli_loads_stage_ids_and_replica_counts(tmp_path: Path) -> None:
     server = OmniServerStageCli("fake-model", _write_stage_config(tmp_path), [])
 

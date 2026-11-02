@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import replace
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -34,6 +34,13 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
 logger = init_logger(__name__)
+
+
+class _ChunkSaveKwargs(TypedDict, total=False):
+    new_token_ids: list[int]
+    confirmed_num_computed_tokens: int | None
+    duplex_perf_chunk: tuple[int, int]
+    segment_generation: int | None
 
 
 def _should_emit_engine_output(
@@ -123,6 +130,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     """
 
     max_num_active_reqs: int
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+    ) -> tuple[list[int], bool]:
+        status_before_update = request.status
+        has_output_placeholders = request.num_output_placeholders > 0
+        new_token_ids, stopped = super()._update_request_with_output(request, new_token_ids, is_stale=is_stale)
+        # vLLM 0.33 moved this publication into update_from_output, which
+        # Omni overrides. Keep both the plain-decode and general paths on
+        # the upstream frontier: materialized KV only, never in-flight KV.
+        if (
+            not is_stale
+            and status_before_update == RequestStatus.RUNNING
+            and (has_output_placeholders or self.num_spec_tokens > 0)
+        ):
+            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens - request.num_in_flight_tokens)
+        return new_token_ids, stopped
 
     def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
         model_config = self.vllm_config.model_config
@@ -848,6 +872,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         ):
             self.processed_step_seq += 1
             self._drain_deferred_frees()
+            # HiSparse async loads must wait for the same completed-step fence.
+            if getattr(self, "defer_async_loads", False):
+                self._drain_deferred_loads()
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -905,6 +932,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        # Resumable stops to admit after queue cleanup. Upstream enqueues these
+        # in update_from_output; the base _handle_stopped_request no longer does.
+        continuing_reqs: list[Request] = []
         # The per-request emit policy only varies with stop/control state: look the config up once.
         emit_every_step: bool | None = None
         spec_decode_tokens = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
@@ -1258,6 +1288,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         boundary_generation = 0
                 finished = self._handle_stopped_request(request)
                 is_segment_finished = not finished
+                if not finished:
+                    continuing_reqs.append(request)
                 if finished:
                     request.resumable = False
                     if self._native_data_plane:
@@ -1394,7 +1426,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     or finished
                 )
             ):
-                save_kwargs = {
+                save_kwargs: _ChunkSaveKwargs = {
                     "new_token_ids": new_token_ids,
                     "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
                 }
@@ -1429,6 +1461,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             stopped_running_reqs,
             stopped_preempted_reqs,
         )
+        self._requeue_continuing_requests(continuing_reqs)
 
         OmniSchedulerMixin._finish_error_requests(self, outputs)
 
@@ -1689,6 +1722,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self._streaming_update_overflows(session, update):
             return
         session._omni_segment_generation = int(getattr(session, "_omni_segment_generation", 0) or 0) + 1
+        # The pin truncates at ``num_tokens - 1`` and asserts that
+        # ``num_computed_tokens`` does not pass that index. Omni still keeps
+        # every computed token: when the computed span already includes the
+        # final token, append a sentinel so the truncation drops the copy
+        # and the ``hash_block_size`` slice stays in range.
+        if session.num_computed_tokens >= session.num_tokens and session._all_token_ids:
+            session._all_token_ids.append(session._all_token_ids[-1])
+        if session.num_tokens > 0 and session.num_computed_tokens > session.num_tokens - 1:
+            session.num_computed_tokens = session.num_tokens - 1
         super()._update_request_as_session(session, update)
         if hasattr(update, "model_intermediate_buffer"):
             session.model_intermediate_buffer = update.model_intermediate_buffer
@@ -2008,13 +2050,18 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if finished:
             return True
         overflow = getattr(self, "_streaming_context_overflow", None)
-        if not overflow or request.request_id not in overflow:
-            return False
-        # Whether the overflow was recorded by this call's queued update or
-        # earlier makes no difference: a session in the overflow map is
-        # terminal, and upstream has just put it back into admission.
-        self._finish_overflowed_streaming_session(request)
-        return True
+        if overflow and request.request_id in overflow:
+            # Whether the overflow was recorded by this call's queued update or
+            # earlier makes no difference: a session in the overflow map is
+            # terminal. Baseline upstream enqueued before returning; this pin
+            # does not, but a prior admission must still be taken back out.
+            self._finish_overflowed_streaming_session(request)
+            return True
+        # Baseline ``Scheduler._handle_stopped_request`` enqueued here. The pin
+        # moved that enqueue into ``update_from_output``, which omni replaces.
+        # Direct callers still need the request in a waiting queue.
+        self._admit_continuing_request(request)
+        return False
 
     def _finish_overflowed_streaming_session(self, request: Request) -> None:
         """Take a terminal session back out of admission.

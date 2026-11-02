@@ -25,6 +25,8 @@ dependency_files=(
     pyproject.toml
     setup.py
     tools/install_torchcodec_rocm.sh
+    tools/build_gradio_pillow13.py
+    tools/gradio_pillow13/*
 )
 while IFS= read -r dependency_file; do
     dependency_files+=("$dependency_file")

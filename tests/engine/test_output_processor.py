@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
-from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.outputs import PoolingRequestOutput, RequestError, RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
@@ -841,6 +841,15 @@ def test_no_detokenizer_make_request_output():
     assert AUDIO in result.outputs[0].multimodal_output
 
 
+def test_pooling_error_accepts_upstream_positional_argument():
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    error = RequestError(code="multimodal_cache_miss", message="retry this request", retryable=True)
+    output = state.make_request_output([], torch.empty(0), FinishReason.ERROR, None, None, None, error)
+    assert isinstance(output, PoolingRequestOutput)
+    assert output.error is error
+    assert output.finished
+
+
 @pytest.mark.parametrize("cache_miss", [False, True])
 def test_pooling_completion_uses_upstream_output_and_finishes_request(cache_miss):
     """Native pooling success and cache-miss errors retain their output types."""
@@ -888,6 +897,41 @@ def test_pooling_completion_uses_upstream_output_and_finishes_request(cache_miss
         torch.testing.assert_close(output.outputs.data, timestamps)
     assert request.request_id not in processor.request_states
     assert request.external_req_id not in processor.external_req_ids
+
+
+def test_admission_error_returns_external_pause_message():
+    """A queue=None generation request must surface RequestError, not a chunk."""
+    kwargs = dict(_NO_DETOK_STATE_KWARGS)
+    kwargs["request_id"] = "internal"
+    kwargs["external_req_id"] = "ext"
+    state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE, stream_input=True)
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False, engine_core_output_type="audio")
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+    pause = "Generation is paused. Please retry after it resumes."
+
+    processed = processor.process_outputs(
+        [
+            OmniEngineCoreOutput(
+                request_id="internal",
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                error=RequestError(code="engine_paused", message=pause, retryable=True),
+                multimodal_output={"audio": torch.tensor([1.0, 2.0])},
+            )
+        ]
+    )
+
+    assert processed.reqs_to_abort == ["internal"]
+    assert len(processed.request_outputs) == 1
+    output = processed.request_outputs[0]
+    assert output.request_id == "ext"
+    assert output.error == pause
+    assert output.error_type == "engine_paused"
+    assert output.finished is True
+    assert output.outputs == []
+    assert state.mm_accumulated.is_empty
+    assert "internal" not in processor.request_states
 
 
 def test_no_detokenizer_generation_cache_miss_keeps_multimodal_completion():
@@ -950,6 +994,7 @@ def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypa
         ec_transfer_params=None,
         routed_experts=None,
         num_cached_tokens=0,
+        error=None,
     )
 
     result = processor.process_outputs([engine_output])
@@ -997,6 +1042,7 @@ def _audio_engine_output(*, is_segment_finished: bool, is_last_chunk: bool):
         routed_experts=None,
         num_cached_tokens=0,
         is_segment_finished=is_segment_finished,
+        error=None,
     )
 
 
@@ -1665,3 +1711,11 @@ def test_native_finished_stats_preserve_watermark_status(watermarked, skipped, s
     assert stats.num_watermarked_reqs == int(watermarked)
     assert stats.num_watermark_skipped_reqs == int(skipped)
     assert stats.num_not_watermarked_reqs == int(not watermarked and not skipped)
+
+
+def test_output_processor_forwards_shared_admission_stats():
+    stats = MagicMock()
+    processor = MultimodalOutputProcessor(None, log_stats=False, admission_stats=stats)
+    processor._update_admission_stats()
+    assert processor.admission_stats is stats
+    stats.set_num_requests.assert_called_once_with(0)

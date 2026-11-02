@@ -1,8 +1,11 @@
+<!-- markdownlint-disable MD001 MD025 -->
+
 # --8<-- [start:requirements]
 
 For detailed hardware and software requirements, please refer to the [vLLM-Ascend installation documentation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
 # --8<-- [end:requirements]
+
 # --8<-- [start:installation-release]
 
 The recommended way to use vLLM-Omni on NPU is through the vLLM-Ascend pre-built Docker images:
@@ -72,9 +75,9 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 # --8<-- [start:installation-main]
 
 You can also install vLLM-Omni from source if you want to use the latest features
-or bug fixes. This alignment checkout targets vLLM 0.32.0 and requires a
+or bug fixes. This alignment checkout targets vLLM 0.33.0rc3.dev3+g4ba787ec9 and requires a
 matching vLLM-Ascend runtime validated on your NPU. The v0.30.0 Ascend images
-above do not establish compatibility with this vLLM 0.32.0 checkout. Check
+above do not establish compatibility with this vLLM 0.33.0rc3.dev3+g4ba787ec9 checkout. Check
 [issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for aligned
 versions and NPU validation before selecting a development image.
 
@@ -97,7 +100,7 @@ vLLM-Omni offers Docker images for Ascend NPU deployment. You can just pull the 
 Supported images as following.
 
 | image name | Hardware | OS |
-|-|-|-|
+| - | - | - |
 | image-tag | A2 | Ubuntu |
 | image-tag-a3 | A3 | Ubuntu |
 | image-tag-a5 | A5 | Ubuntu |

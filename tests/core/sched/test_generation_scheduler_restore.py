@@ -15,6 +15,7 @@ from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerCo
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, _has_async_chunk_payload_to_run
@@ -127,8 +128,21 @@ def _make_generation_scheduler(waiting_request, *, use_v2_model_runner=False):
 def test_generation_scheduler_preserves_auxiliary_output_metadata() -> None:
     request = Request("aux-contract", [1, 2], SamplingParams(max_tokens=2), pooling_params=None)
     request.block_hashes.append(b"block-hash")
+    # Hashes are emitted only for a completed hash block. One scheduled token
+    # does not cover the default 16-token block, so count a full block computed.
+    request.num_computed_tokens = 16
     scheduler = _make_generation_scheduler(request, use_v2_model_runner=True)
-    scheduler.aux_output_connector = AuxOutputSchedulerConnector()
+    manager = SimpleNamespace(block_size=16)
+    scheduler.aux_output_connector = AuxOutputSchedulerConnector(
+        SimpleNamespace(
+            coordinator=SimpleNamespace(
+                full_attention_group_id=0,
+                single_type_managers={0: manager},
+            ),
+            block_pool=SimpleNamespace(hash_block_size=16),
+            kv_cache_config=KVCacheConfig(num_blocks=8, kv_cache_tensors=[], kv_cache_groups=[]),
+        )
+    )
 
     output = scheduler._build_generation_scheduler_output(
         new_reqs_data=[],

@@ -512,7 +512,7 @@ def _run_fused_qkv_matches_three_4d(
 def test_fused_qkv_all_to_all_matches_three_4d_exchanges_cpu(world_size: int) -> None:
     start_collective_workers(
         _run_fused_qkv_matches_three_4d,
-        args=(world_size, "cpu", 29613),
+        args=(world_size, "cpu", get_open_port()),
         nprocs=world_size,
         device_kind="cpu",
     )

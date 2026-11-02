@@ -29,7 +29,12 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    KVConnectorOutput,
+    make_empty_encoder_model_runner_output,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -217,6 +222,9 @@ class _SamplingFeedbackOutput(AsyncModelRunnerOutput):
         output.invalid_logits_req_ids = {output.req_ids[row] for row in self.feedback.invalid_rows()}
         return output
 
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        return self.output.get_kv_connector_output()
+
 
 class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
     def __init__(
@@ -304,6 +312,15 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             self._num_nans_cpu = None
         with record_function_or_nullcontext("omni_async_output:get_output/finalize_async_sampled_tokens"):
             return super().get_output()
+
+    def get_kv_connector_output(self) -> KVConnectorOutput | None:
+        # The background builder assigns this after __init__. Salvage before
+        # that assignment, or after object.__new__ skips __init__, has nothing
+        # to return.
+        output = getattr(self, "_model_runner_output", None)
+        if output is None:
+            return None
+        return output.kv_connector_output
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:

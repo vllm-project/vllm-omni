@@ -309,7 +309,10 @@ python openai_chat_completion_client_for_multimodal_generation.py \
     pip install 'vllm-omni[demo]'
     ```
 
-    Or, if installing from source: `pip install -e '.[demo]'`
+    For this 0.33 source checkout, follow the
+    [source demo dependency instructions](https://docs.vllm.ai/projects/vllm-omni/en/latest/getting_started/installation/#source-development-and-demo-dependencies)
+    from the repository root. Build the temporary Gradio wheel and include it
+    with `.[demo]` in the same normal install command.
 
 This Web UI demo allows users to interact with the model through a web browser.
 

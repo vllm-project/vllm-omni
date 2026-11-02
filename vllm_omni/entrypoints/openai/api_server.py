@@ -35,8 +35,8 @@ from starlette.datastructures import State
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+from vllm.entrypoints.common.cli_args import make_arg_parser, resolve_default_chat_template_kwargs
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
-from vllm.entrypoints.launchers.cli_args import make_arg_parser
 from vllm.entrypoints.launchers.launcher import serve_http
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.mcp.tool_server import DemoToolServer, MCPToolServer, ToolServer
@@ -71,6 +71,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
     validate_json_request,
     with_cancellation,
 )
+from vllm.entrypoints.serve.utils.fingerprint import set_default_fingerprint_mode
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.entrypoints.speech_to_text.transcription.serving import (
@@ -81,6 +82,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
 )
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
+from vllm.renderers.online_derenderer import OnlineDerenderer
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -105,7 +107,6 @@ from vllm_omni.entrypoints.duplex.warmup import (
     _warmup_duplex_realtime,
     lookup_duplex_plugin,
     startup_warmup_kind,
-    wait_for_duplex_warmup,
 )
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 from vllm_omni.entrypoints.openai import app_state as openai_app_state
@@ -778,6 +779,7 @@ async def _init_duplex_app_state(
     state.serving_tokens = None
     # Replaced by the chat init below when the model serves chat.
     state.online_renderer = None
+    state.online_derenderer = None
     for attribute in (
         "openai_serving_chat_batch",
         "openai_serving_completion",
@@ -872,7 +874,20 @@ def _init_chat_services(
     enable_batch: bool,
 ) -> None:
     """Share chat setup while callers retain capability and endpoint gating."""
-    state.online_renderer = OnlineRenderer(
+    # Serving classes cache system_fingerprint at init. Match upstream
+    # init_generate_state: configure the mode before those constructors run.
+    set_default_fingerprint_mode(
+        getattr(args, "fingerprint_mode", "full"),
+        getattr(args, "fingerprint_value", None),
+    )
+    default_chat_template_kwargs = resolve_default_chat_template_kwargs(args)
+    # Pin CLI fields. getattr keeps test namespaces that predate these flags
+    # on the same disabled defaults the upstream constructors use.
+    trust_request_mm_kwargs = getattr(args, "trust_request_mm_kwargs", False)
+    tool_strict_level = getattr(args, "tool_strict_level", None)
+    reasoning_effort_map = getattr(args, "reasoning_effort_map", None)
+    reasoning_parser = args.structured_outputs_config.reasoning_parser
+    renderer_kwargs = dict(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
         request_logger=request_logger,
@@ -882,10 +897,17 @@ def _init_chat_services(
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        tool_strict_level=tool_strict_level,
+        reasoning_parser=reasoning_parser,
+        default_chat_template_kwargs=default_chat_template_kwargs,
+        reasoning_effort_map=reasoning_effort_map,
         log_error_stack=args.log_error_stack,
     )
+    state.online_renderer = OnlineRenderer(
+        **renderer_kwargs,
+        trust_request_mm_kwargs=trust_request_mm_kwargs,
+    )
+    state.online_derenderer = OnlineDerenderer(**renderer_kwargs)
     chat_kwargs = dict(
         engine_client=engine_client,
         models=state.openai_serving_models,
@@ -894,17 +916,19 @@ def _init_chat_services(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        default_chat_template_kwargs=default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
         return_tokens_as_token_ids=args.return_tokens_as_token_ids,
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
+        tool_strict_level=tool_strict_level,
+        reasoning_parser=reasoning_parser,
         enable_prompt_tokens_details=args.enable_prompt_tokens_details,
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
         enable_log_deltas=args.enable_log_deltas,
+        enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
     )
     state.openai_serving_chat = OmniOpenAIServingChat(**chat_kwargs) if enable_chat else None
     state.openai_serving_chat_batch = (
@@ -1062,11 +1086,14 @@ async def omni_init_app_state(
     logger.info("Supported tasks: %s", supported_tasks)
 
     resolved_chat_template = await _resolve_chat_template(engine_client, args)
+    default_chat_template_kwargs = resolve_default_chat_template_kwargs(args)
+    tool_strict_level = getattr(args, "tool_strict_level", None)
 
     chat_template_config = ChatTemplateConfig(
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
         trust_request_chat_template=args.trust_request_chat_template,
+        trust_request_mm_kwargs=getattr(args, "trust_request_mm_kwargs", False),
     )
 
     if args.tool_server == "demo":
@@ -1154,11 +1181,14 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_auto_tools=args.enable_auto_tool_choice,
             tool_parser=args.tool_call_parser,
+            tool_strict_level=tool_strict_level,
             tool_server=tool_server,
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
             enable_log_outputs=args.enable_log_outputs,
+            default_chat_template_kwargs=default_chat_template_kwargs,
         )
         if "generate" in supported_tasks
         else None
@@ -1173,6 +1203,9 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_log_outputs=args.enable_log_outputs,
+            enable_log_deltas=getattr(args, "enable_log_deltas", True),
+            enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
         )
         if "generate" in supported_tasks
         else None
@@ -1226,7 +1259,7 @@ async def omni_init_app_state(
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
+        default_chat_template_kwargs=default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
     )
     state.openai_serving_transcription = (
@@ -1261,10 +1294,14 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_auto_tools=args.enable_auto_tool_choice,
             tool_parser=args.tool_call_parser,
+            tool_strict_level=tool_strict_level,
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
-            default_chat_template_kwargs=args.default_chat_template_kwargs,
+            enable_log_outputs=getattr(args, "enable_log_outputs", False),
+            enable_log_deltas=getattr(args, "enable_log_deltas", True),
+            default_chat_template_kwargs=default_chat_template_kwargs,
+            disabled_thinking_effort=getattr(args, "anthropic_disabled_thinking_effort", "auto"),
         )
         if "generate" in supported_tasks
         else None
@@ -1274,6 +1311,7 @@ async def omni_init_app_state(
             engine_client,
             state.openai_serving_models,
             state.online_renderer,
+            online_derenderer=state.online_derenderer,
             request_logger=request_logger,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
@@ -1906,7 +1944,6 @@ async def realtime_websocket(websocket: WebSocket):
     if use_duplex_realtime and duplex_handler is not None:
         if await _reject_multi_api_duplex(websocket):
             return
-        await wait_for_duplex_warmup(websocket)
         await duplex_handler.handle_realtime_session(websocket)
         return
 
@@ -1936,7 +1973,6 @@ async def duplex_websocket(websocket: WebSocket):
     """Alias of ``/v1/realtime?duplex=1``: the same Realtime duplex session protocol."""
     if await _reject_multi_api_duplex(websocket):
         return
-    await wait_for_duplex_warmup(websocket)
     handler = getattr(websocket.app.state, "openai_serving_duplex", None)
     if handler is None:
         await websocket.accept()
@@ -3327,7 +3363,19 @@ async def start_profile(raw_request: Request, request: ProfileRequest | None = N
         stages = request.stages if request else None
         logger.info("Starting profiler for stages: %s", stages if stages else "all")
         engine_client = raw_request.app.state.engine_client
-        await engine_client.start_profile(stages=stages)
+        # Forward only supplied per-session overrides. AsyncOmni.start_profile
+        # already accepts these; a stages-only body stays a stages-only call.
+        profile_kwargs: dict[str, Any] = {}
+        if request is not None:
+            if request.profile_prefix is not None:
+                profile_kwargs["profile_prefix"] = request.profile_prefix
+            if request.delay_iterations is not None:
+                profile_kwargs["delay_iterations"] = request.delay_iterations
+            if request.max_iterations is not None:
+                profile_kwargs["max_iterations"] = request.max_iterations
+            if request.profiler_kwargs is not None:
+                profile_kwargs["profiler_kwargs"] = request.profiler_kwargs
+        await engine_client.start_profile(stages=stages, **profile_kwargs)
         logger.info("Profiler started.")
         return JSONResponse(content={"status": "SUCCESS"})
     except Exception as e:

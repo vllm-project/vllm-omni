@@ -522,7 +522,8 @@ def generate_synthetic_image(
     """
     Random colored squares on white background. Caches JPEG by ``width`` /
     ``height`` unless ``force_regenerate`` is true. Cache root: ``cache_dir``
-    if given, else the default temp subdirectory.
+    if given, else the default temp subdirectory. Encoded JPEGs are published
+    atomically so concurrent collection workers cannot read a partial file.
     """
     if seed is not None:
         random.seed(seed)
@@ -534,11 +535,12 @@ def generate_synthetic_image(
     if not force_regenerate and cache_path.is_file():
         from PIL import Image as PILImage
 
-        image = PILImage.open(cache_path)
-        image.load()
         image_bytes = cache_path.read_bytes()
+        with PILImage.open(io.BytesIO(image_bytes)) as image:
+            image.load()
+            pixels = np.array(image).copy()
         return {
-            "np_array": np.array(image).copy(),
+            "np_array": pixels,
             "base64": base64.b64encode(image_bytes).decode("utf-8"),
             "file_path": str(cache_path.resolve()),
         }
@@ -556,8 +558,18 @@ def generate_synthetic_image(
         border_width = random.randint(1, 5)
         draw.rectangle([x, y, x + square_size, y + square_size], fill=color, outline=(0, 0, 0), width=border_width)
 
-    image.save(str(cache_path), format="JPEG", quality=85, optimize=True)
-    image_bytes = cache_path.read_bytes()
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=85, optimize=True)
+    image_bytes = buffer.getvalue()
+    temp_cache_path = root / f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
+    # Collection workers must only see complete JPEGs, including on replacement.
+    temp_cache = temp_cache_path.open("xb")
+    try:
+        with temp_cache:
+            temp_cache.write(image_bytes)
+        os.replace(temp_cache_path, cache_path)
+    finally:
+        temp_cache_path.unlink(missing_ok=True)
 
     return {
         "np_array": np.array(image).copy(),

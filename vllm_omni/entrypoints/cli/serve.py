@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import uvloop
 from vllm.entrypoints.cli.types import CLISubcommand
-from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
+from vllm.entrypoints.common.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.entrypoints.common.startup import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -388,6 +388,17 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
+        omni_config_group.add_argument(
+            "--pipeline",
+            type=str,
+            default=None,
+            help=(
+                "Registered Omni pipeline key, such as lance. "
+                "This selects the stage topology. Degree of pipeline "
+                "parallelism is --pipeline-parallel-size / -pp."
+            ),
+        )
+
         serve_parser.maybe_override_argument(
             omni_config_group,
             "--watermark-config",

@@ -225,6 +225,10 @@ def test_duplex_kv_reanchor_runs_after_block_table_writes():
         apply_duplex_kv_reanchor=lambda r, scheduler_output: order.append(("reanchor", r, scheduler_output))
     )
     runner.aux_output_connector = None
+    # Real disabled defaults. execute_model calls the upstream PP and encoder
+    # hooks, which no-op when these are unset.
+    runner.pp_handler = None
+    runner.encoder_cache = None
     output = object()
     runner.kv_connector = SimpleNamespace(no_forward=lambda _s: output)
     runner._merge_ec_connector_no_forward = lambda _s, value: value
@@ -577,6 +581,8 @@ def test_dummy_forward_uses_upstream_execution_state(runner_kind, randomize_inpu
     runner.is_encoder_decoder = False
     runner.eplb = MagicMock()
     runner.kv_connector = MagicMock()
+    runner.pcp_manager = None
+    runner.dcp_size = 1
     runner.input_buffers = object()
     runner.kv_cache_config = object()
     runner.attn_groups = []
@@ -646,6 +652,8 @@ def test_drafter_target_layers_reach_execute_state(cg_mode, monkeypatch):
     runner.cudagraph_manager = MagicMock()
     runner.cudagraph_manager.run_fullgraph.return_value = (hidden, aux)
     runner.use_aux_hidden_state_outputs = True
+    runner.pcp_manager = None
+    runner.dcp_size = 1
     runner.model_config = SimpleNamespace()
     runner.vllm_config = SimpleNamespace()
     runner.req_states = SimpleNamespace()

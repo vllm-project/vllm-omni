@@ -4,6 +4,7 @@
 
 import io
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,6 +76,44 @@ def result(tmp_path, config):
             "accuracy": summary,
         },
     }
+
+
+@pytest.mark.parametrize("score_root_provided", [False, True])
+@pytest.mark.parametrize("score_directory_exists", [False, True])
+def test_dfx_retains_failed_sessions_without_scores_or_recursive_exports(
+    tmp_path, score_root_provided, score_directory_exists
+):
+    from tests.dfx import conftest as dfx
+
+    response_root = tmp_path / "run"
+    failed_root = response_root / "failed_sessions" / "RTD_OCR"
+    failed_root.mkdir(parents=True)
+    failure = '{"error": "Timed out waiting for response.done", "diagnostics": {"events": []}}'
+    (failed_root / "561.json").write_text(failure)
+    (failed_root / "561.mp4").write_bytes(b"temporary video")
+    score_root = response_root / "evaluation"
+    if score_directory_exists:
+        score_root.mkdir()
+        (score_root / "evaluation_summary.json").write_text('{"status": "partial"}')
+    accuracy_parent = score_root if score_directory_exists else response_root / "exports"
+    accuracy_path = accuracy_parent / "published" / "result_acc_probe.json"
+    previous = accuracy_path.parent / "diagnostics" / "previous-export.json"
+    previous.parent.mkdir(parents=True)
+    previous.write_text('{"previous": true}')
+    assert score_root.is_dir() == score_directory_exists
+    for _ in range(2):
+        dfx._save_duplex_eval_diagnostics(
+            str(score_root) if score_root_provided else None,
+            accuracy_path,
+            response_root=str(response_root),
+        )
+    exported = accuracy_path.parent / "diagnostics" / "result_acc_probe-run"
+    assert (exported / "failed_sessions/RTD_OCR/561.json").read_text() == failure
+    assert not list(exported.rglob("*.mp4"))
+    assert not list(exported.rglob("previous-export.json"))
+    score_files = list(exported.rglob("evaluation_summary.json"))
+    assert len(score_files) == int(score_root_provided and score_directory_exists)
+    assert len(list(exported.rglob("*.json"))) == 1 + len(score_files)
 
 
 def test_complete_scores_pass(result, config):
@@ -327,6 +366,23 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
         accuracy_dir = tmp_path / "tests/e2e/accuracy/omni_duplex_eval/results"
         monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
     monkeypatch.setenv("BUILDKITE_BRANCH", "test-branch")
+    trace_text = '{"raw_response": "No score returned"}\n'
+    failed_session_text = json.dumps(
+        {"error": "Timed out waiting for response.done", "diagnostics": {"unfinished_response_ids": ["response-561"]}}
+    )
+    if failure == "judge":
+        score_root = Path(result["omni_duplex_eval"]["accuracy"]["score_root"])
+        result["omni_duplex_eval"]["response_root"] = str(score_root.parent)
+        failed_sessions = score_root.parent / "failed_sessions" / "RTD_OCR"
+        failed_sessions.mkdir(parents=True)
+        (failed_sessions / "561.json").write_text(failed_session_text)
+        (failed_sessions / "561.mp4").write_bytes(b"temporary video")
+        trace_path = score_root / "RTD_world_knowledge/362.judge.jsonl"
+        trace_path.write_text(trace_text)
+        trace_path.with_name("362.json").unlink()
+        media = score_root / ".media" / "362.mp4"
+        media.parent.mkdir()
+        media.write_bytes(b"temporary video")
     if failure == "quality":
         result["omni_duplex_eval"]["accuracy"]["pr"]["mean_all_success"] = 0.0
     elif failure == "judge":
@@ -380,6 +436,21 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
             runner.test_performance_benchmark(ServerEndpoint(), case)
     else:
         runner.test_performance_benchmark(ServerEndpoint(), case)
+
+    if failure == "judge":
+        # The accuracy fixture removes this directory after evaluation. The
+        # original reply must survive there being no valid score to summarize.
+        shutil.rmtree(result["omni_duplex_eval"]["accuracy"]["score_root"])
+        traces = list(accuracy_dir.glob("diagnostics/*/RTD_world_knowledge/362.judge.jsonl"))
+        assert len(traces) == 1
+        assert traces[0].read_text() == trace_text
+        assert (traces[0].parent / "360.json").is_file()
+        assert not (traces[0].parent / "362.json").exists()
+        shutil.rmtree(score_root.parent / "failed_sessions")
+        failures = list(accuracy_dir.glob("diagnostics/*/failed_sessions/RTD_OCR/561.json"))
+        assert len(failures) == 1
+        assert failures[0].read_text() == failed_session_text
+        assert not list(accuracy_dir.glob("diagnostics/**/*.mp4"))
 
     assert len(commands) == 1
     accuracy_paths = list(accuracy_dir.glob("result_acc_*.json"))

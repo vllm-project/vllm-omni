@@ -20,6 +20,7 @@ from .omni_duplex_eval_clock import (
 )
 from .omni_duplex_eval_dataset import DuplexSample
 from .omni_duplex_eval_judge import DuplexJudge, JudgeResponseError
+from .omni_duplex_eval_judge_capture import capture_judge_request, save_failed_judge_request
 from .omni_duplex_eval_media import extract_jpeg, materialize_media, video_duration
 from .omni_duplex_eval_metrics import (
     PROTOCOL_PIN,
@@ -91,22 +92,37 @@ def evaluate_sample(
     trace_path = score_path.with_suffix(".judge.jsonl")
     trace_path.write_text("", encoding="utf-8")
 
+    judge_call_index = 0
+
     def judge_result(call: Callable[[], str], required: tuple[str, ...]) -> dict[str, Any]:
-        try:
-            raw_response = call()
-        except JudgeResponseError as exc:
-            with trace_path.open("a", encoding="utf-8") as trace:
-                trace.write(
-                    json.dumps(
-                        {"raw_response": exc.raw_response, "finish_reason": exc.finish_reason, "error": str(exc)},
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-            raise
-        with trace_path.open("a", encoding="utf-8") as trace:
-            trace.write(json.dumps({"raw_response": raw_response}, ensure_ascii=False) + "\n")
-        return parse_judge_json(raw_response, required=required)
+        nonlocal judge_call_index
+        call_index = judge_call_index
+        judge_call_index += 1
+        with capture_judge_request() as captured:
+            try:
+                try:
+                    raw_response = call()
+                except JudgeResponseError as exc:
+                    with trace_path.open("a", encoding="utf-8") as trace:
+                        trace.write(
+                            json.dumps(
+                                {
+                                    "raw_response": exc.raw_response,
+                                    "finish_reason": exc.finish_reason,
+                                    "error": str(exc),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                    raise
+                with trace_path.open("a", encoding="utf-8") as trace:
+                    trace.write(json.dumps({"raw_response": raw_response}, ensure_ascii=False) + "\n")
+                return parse_judge_json(raw_response, required=required)
+            except Exception:
+                # Preserve the original judge/parser error after best-effort evidence capture.
+                save_failed_judge_request(captured, trace_path, call_index)
+                raise
 
     raw = _read(response_path)
     meta = (

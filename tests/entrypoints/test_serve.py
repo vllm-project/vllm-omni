@@ -68,6 +68,28 @@ def _resolved(*stages: SimpleNamespace) -> OmniConfigResolution:
     return OmniConfigResolution(config_path="/fake/stages.yaml", stage_configs=tuple(stages))
 
 
+def test_serve_parser_pipeline_is_not_pipeline_parallel_size() -> None:
+    """``--pipeline lance`` is the registry key, not ``-pp``."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "bytedance-research/Lance",
+            "--omni",
+            "--pipeline",
+            "lance",
+            "--pipeline-parallel-size",
+            "1",
+        ]
+    )
+    assert args.pipeline == "lance"
+    assert args.pipeline_parallel_size == 1
+    assert args.get_explicit_kwargs_dict()["pipeline"] == "lance"
+
+
 def test_serve_parser_accepts_nested_watermark_config() -> None:
     """Ensure the CLI parses Omni's nested watermark config."""
     parser = TrackingArgumentParser()

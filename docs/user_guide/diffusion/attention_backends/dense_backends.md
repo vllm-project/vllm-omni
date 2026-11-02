@@ -18,6 +18,16 @@ conservative reference when validating another backend.
 vllm-omni serve <model> --diffusion-attention-backend TORCH_SDPA
 ```
 
+For Qwen-Image transformers, CUDA BF16 with `--enforce-eager` and the resolved
+`TORCH_SDPA` backend also uses the Diffusers normalization and FP32 complex
+rotary rounding order. Its dense text QKV projections use three GEMMs while
+retaining packed checkpoint weights, tensor-parallel sharding, and LoRA routing.
+Quantized projection methods and an explicitly configured batch-invariant GEMM
+policy keep their existing dispatch. This reference path uses more kernel
+launches than the fused path; benchmark it separately when choosing a backend.
+Compiled execution, other attention backends, CPU, FP16, and ROCm retain the
+existing fused or activation-dtype rotary paths.
+
 ## `FLASH_ATTN`
 
 `FLASH_ATTN` uses the installed FlashAttention implementation. On Blackwell it

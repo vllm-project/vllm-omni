@@ -1,6 +1,10 @@
 ARG BASE_IMAGE=vllm/vllm-openai:v0.32.0
 FROM ${BASE_IMAGE}
 
+# Release-candidate images are not published yet. Upgrade the bootstrap
+# runtime from the same frozen wheel used by CUDA CI.
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=4ba787ec9959e566d3b587a796dff07673324da5
+ARG VLLM_VERSION=0.33.0rc3.dev3+g4ba787ec9
 ARG COMMON_WORKDIR=/app
 
 WORKDIR ${COMMON_WORKDIR}
@@ -15,7 +19,10 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 
 # Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
-RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+RUN VLLM_WHEEL_VERSION=$(printf '%s' "${VLLM_VERSION}" | sed 's/+/%2B/g') && \
+    cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir \
+    "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_WHEEL_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
+    "."
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 

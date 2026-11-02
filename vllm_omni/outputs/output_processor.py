@@ -3,7 +3,7 @@
 
 from collections.abc import Iterable
 from dataclasses import fields as dataclass_fields
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -31,6 +31,9 @@ from vllm_omni.outputs.multimodal_accumulation import (
     replace_snapshot_keys,
 )
 from vllm_omni.outputs.output_modality import OutputModality
+
+if TYPE_CHECKING:
+    from vllm.v1.engine.admission_control import SharedAdmissionStats
 
 logger = init_logger(__name__)
 
@@ -203,9 +206,9 @@ class OmniRequestState(RequestState):
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
+        error: RequestError | None = None,
         *,
         routed_experts: Any = None,
-        error: RequestError | None = None,
     ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
@@ -226,6 +229,7 @@ class OmniRequestState(RequestState):
                 attached to the completion output for generation stages
                 (omni-specific keyword; upstream moved this accumulation
                 into RequestState.routed_experts_chunks).
+            error: Optional request error (7th positional argument upstream).
 
         Returns:
             OmniRequestOutput or PoolingRequestOutput if output should be
@@ -441,6 +445,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         log_stats: bool,
         stream_interval: int = 1,
         tracing_enabled: bool = False,
+        admission_stats: "SharedAdmissionStats | None" = None,
         engine_core_output_type: str | None = None,
         output_modality: OutputModality = OutputModality.TEXT,
     ):
@@ -463,6 +468,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats=log_stats,
             stream_interval=stream_interval,
             tracing_enabled=tracing_enabled,
+            admission_stats=admission_stats,
         )
         # Convert string-based engine_core_output_type to OutputModality
         if engine_core_output_type is not None:
@@ -710,6 +716,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
+        weight_version: str | None = None,
     ) -> OutputProcessorOutput:
         default_mm_type = _modality_to_type_string(self.output_modality)
 
@@ -718,10 +725,38 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         # that would trigger upstream's `assert detokenizer is not None`.
         upstream_outputs: list[EngineCoreOutput] = []
         mm_only_outputs: list[EngineCoreOutput] = []
+        admission_outputs: list[OmniRequestOutput] = []
+        admission_aborts: list[str] = []
 
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None:
+                continue
+
+            # Paused-engine and other pre-execution failures ship RequestError
+            # and nothing was run. StagePool registers queue=None, so upstream's
+            # queue.put short-circuit does not run here or in super(). Key on
+            # error, not finish_reason: pooling cache misses use ERROR with
+            # error is None and must stay on the normal path. weight_version is
+            # forwarded only into super(), which is the detokenizer path.
+            error = getattr(eco, "error", None)
+            if error is not None:
+                if req_state.queue is not None:
+                    req_state.queue.put(error.to_exception())
+                else:
+                    message = getattr(error, "message", None)
+                    code = getattr(error, "code", None)
+                    external_id = getattr(req_state, "external_req_id", None) or eco.request_id
+                    admission_outputs.append(
+                        OmniRequestOutput.from_error(
+                            external_id,
+                            message if isinstance(message, str) and message else str(error),
+                            error_type=code if isinstance(code, str) else None,
+                        )
+                    )
+                if req_state.streaming_input:
+                    admission_aborts.append(eco.request_id)
+                self._finish_request(req_state)
                 continue
 
             # Accumulate multimodal tensors regardless of path.
@@ -770,10 +805,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
+            weight_version=weight_version,
         )
         return OutputProcessorOutput(
-            request_outputs=mm_request_outputs + upstream_processed.request_outputs,
-            reqs_to_abort=mm_reqs_to_abort + upstream_processed.reqs_to_abort,
+            request_outputs=admission_outputs + mm_request_outputs + upstream_processed.request_outputs,
+            reqs_to_abort=admission_aborts + mm_reqs_to_abort + upstream_processed.reqs_to_abort,
         )
 
     def _process_mm_only_outputs(

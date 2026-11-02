@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 if TYPE_CHECKING:
-    from tests.helpers.client import DiffusionResponse
+    from tests.helpers.client import DiffusionResponse, OmniResponse
 
 import av
 import numpy as np
@@ -855,6 +855,35 @@ def _resolve_audio_transcript(
     )
 
 
+def _save_omni_audio_failure(response: "OmniResponse", transcript: str, request_config: dict[str, Any]) -> None:
+    """Retain original audio for a failed gate only when CI requests artifacts."""
+    destination = os.environ.get("VLLM_OMNI_TEST_FAILURE_DIR")
+    if not destination or not response.audio_bytes:
+        return
+    try:
+        root = Path(destination)
+        root.mkdir(parents=True, exist_ok=True)
+        output = Path(tempfile.mkdtemp(prefix="omni-audio-", dir=root))
+        (output / "response.audio").write_bytes(response.audio_bytes)
+        metadata = {
+            "test_id": os.environ.get("PYTEST_CURRENT_TEST"),
+            "request_id": response.request_id,
+            "model": request_config.get("model"),
+            "text": response.text_content,
+            "transcript": transcript,
+            "audio_format": response.audio_format,
+            "audio_sha256": hashlib.sha256(response.audio_bytes).hexdigest(),
+            "similarity_threshold": request_config.get("similarity_threshold", 0.8),
+            "transcript_model": request_config.get("transcript_model", "small"),
+            "transcript_language": request_config.get("transcript_language"),
+        }
+        (output / "response.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Failed Omni audio retained at {output}")
+    except (OSError, TypeError, ValueError) as exc:
+        # Diagnostic storage must not replace the original quality assertion.
+        print(f"Could not retain failed Omni audio: {exc}")
+
+
 def assert_omni_response(response: Any, request_config: dict[str, Any], run_level):
     """
     Validate response results.
@@ -926,6 +955,8 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
 
                     shorter_clean = _re.sub(r"[^\w\s]", "", shorter).strip()
                     longer_clean = _re.sub(r"[^\w\s]", "", longer).strip()
+                    if not (shorter_clean and shorter_clean in longer_clean):
+                        _save_omni_audio_failure(response, transcript, request_config)
                     assert shorter_clean and (shorter_clean in longer_clean), (
                         f"{AUDIO_MISMATCH_MESSAGE} "
                         f"(short-text containment check failed: "
@@ -947,6 +978,8 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                             f"transcript={transcript!r}"
                         )
                     else:
+                        if not similarity > similarity_threshold:
+                            _save_omni_audio_failure(response, transcript, request_config)
                         assert similarity > similarity_threshold, AUDIO_MISMATCH_MESSAGE
             if audio_ref_text:
                 assert transcript is not None, "No audio transcript for reference-text validation"
@@ -954,6 +987,8 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     transcript.strip().lower(),
                     str(audio_ref_text).lower(),
                 )
+                if not audio_similarity > similarity_threshold:
+                    _save_omni_audio_failure(response, transcript, request_config)
                 assert audio_similarity > similarity_threshold, (
                     f"The audio content does not match reference text: similarity={audio_similarity:.3f}"
                 )

@@ -477,7 +477,13 @@ judging, `content_score` (finite number 0–3) for content judging, or `success_
 score JSON is valid: a parseable score does not establish that generation finished.
 Missing or invalid scores also fail evaluation; a valid zero from a completed
 reply still counts as an evaluated sample. Raw judge replies are saved beside each score in
-`<sample>.judge.jsonl`. Retrying evaluation archives an existing score as
+`<sample>.judge.jsonl`. Failed calls also retain request evidence under
+`judge_requests/`, including the HTTP status and exact response bytes encoded as
+base64. Responses larger than 64 KiB retain their byte count and SHA-256 hash
+with an explicit `response_byte_limit` status instead of a partial body. The
+existing 16 MiB capture limit per split still applies. Successful calls do not
+write these captures; request headers and credentials are not included.
+Retrying evaluation archives an existing score as
 `<sample>.json.<unique-id>.previous`, which summaries exclude, and resets the
 reply trace. A failed retry leaves no active score; a new score is published only
 after all required judge calls succeed.

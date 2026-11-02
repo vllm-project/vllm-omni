@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import hashlib
 import io
 import json
 import wave
@@ -423,6 +424,61 @@ def test_minicpmo_mix_runaway_repetition_still_fails():
     assert not assertions._transcript_has_bounded_tail(transcript, expected)
     with pytest.raises(AssertionError, match=assertions.AUDIO_MISMATCH_MESSAGE):
         assertions.assert_omni_response(response, {"modalities": ["text", "audio"]}, "advanced_model")
+
+
+@pytest.mark.parametrize("gate", ["long_text", "short_text", "reference_text"])
+def test_omni_audio_mismatch_retains_original_waveform(tmp_path, monkeypatch, gate):
+    destination = tmp_path / "failures"
+    monkeypatch.setenv("VLLM_OMNI_TEST_FAILURE_DIR", str(destination))
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "original-test-id (call)")
+    original_audio = b"original waveform bytes, without transcoding"
+    transcript = "Unrelated words repeated without the expected spoken answer."
+    response = OmniResponse(
+        success=True,
+        request_id="request-5",
+        text_content="The squares in this image are black.",
+        audio_content=transcript,
+        audio_bytes=original_audio,
+        audio_format="audio/wav",
+    )
+    config = {"model": "test-model", "modalities": ["text", "audio"], "similarity_threshold": 0.8}
+    if gate == "short_text":
+        response.text_content = "Hello."
+    elif gate == "reference_text":
+        config.update(modalities=["audio"], audio_ref_text="The squares in this image are black.")
+    with pytest.raises(AssertionError):
+        assertions.assert_omni_response(response, config, "full_model")
+    saved = list(destination.glob("*/response.audio"))
+    assert len(saved) == 1
+    assert saved[0].read_bytes() == original_audio
+    metadata = json.loads(saved[0].with_name("response.json").read_text())
+    assert metadata["test_id"] == "original-test-id (call)"
+    assert metadata["request_id"] == "request-5"
+    assert metadata["transcript"] == transcript
+    assert metadata["text"] == response.text_content
+    assert metadata["audio_format"] == "audio/wav"
+    assert metadata["audio_sha256"] == hashlib.sha256(original_audio).hexdigest()
+    assert metadata["model"] == "test-model"
+    assert metadata["similarity_threshold"] == 0.8
+
+
+def test_omni_audio_diagnostics_do_not_change_success_or_mask_failure(tmp_path, monkeypatch):
+    destination = tmp_path / "failures"
+    monkeypatch.setenv("VLLM_OMNI_TEST_FAILURE_DIR", str(destination))
+    response = OmniResponse(
+        success=True,
+        text_content="The squares in this image are black.",
+        audio_content="The squares in this image are black.",
+        audio_bytes=b"unchanged audio",
+    )
+    config = {"modalities": ["text", "audio"]}
+    assertions.assert_omni_response(response, config, "full_model")
+    assert not destination.exists()
+    destination.write_text("a file prevents creating the diagnostics directory")
+    response.audio_content = "Unrelated words repeated without the expected spoken answer."
+    with pytest.raises(AssertionError, match=assertions.AUDIO_MISMATCH_MESSAGE):
+        assertions.assert_omni_response(response, config, "full_model")
+    assert destination.is_file()
 
 
 def test_bounded_tail_exact_match_passes():

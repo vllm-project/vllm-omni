@@ -20,7 +20,7 @@ from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple
 
 import av
 import pytest
@@ -699,7 +699,7 @@ def mock_async_omni(
 
 
 @pytest.fixture
-def api_server(server_case: ServerCase, mock_async_omni, tmp_path, single_threaded_cpu):
+def api_server(server_case: ServerCase, mock_async_omni, tmp_path, request: pytest.FixtureRequest, single_threaded_cpu):
     """Set up a API server in background process from command line with parametrized model name and mocked AsyncOmni."""
     # Override the STORAGE_MANAGER path to a writable temp directory before
     # forking the server subprocess.  The default /tmp/storage may be owned
@@ -708,6 +708,8 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path, single_thread
     from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 
     old_storage_path = STORAGE_MANAGER.storage_path
+    # Restore even when server setup fails before this fixture reaches yield.
+    request.addfinalizer(lambda: setattr(STORAGE_MANAGER, "storage_path", old_storage_path))
     new_storage_path = tmp_path / "omni_storage"
     new_storage_path.mkdir(exist_ok=True)
     STORAGE_MANAGER.storage_path = str(new_storage_path)
@@ -724,25 +726,27 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path, single_thread
         # libgomp is not fork-safe: once the parent has used OpenMP, a parallel
         # op in this forked child segfaults. Keep the child's torch ops inline.
         torch.set_num_threads(1)
-        try:
-            cmd.cmd(args)
-        except Exception:
-            traceback.print_exc()
+        from concurrent.futures import ThreadPoolExecutor
 
-    # The mocks live in this process, so the server must be forked, not spawned.
-    # xdist workers may already have switched the global start method to spawn.
-    # single_threaded_cpu caps the parent thread pools before this fork and
-    # restores them after the test, so later tests on the worker are unaffected.
-    del single_threaded_cpu
-    if "fork" not in multiprocessing.get_all_start_methods():
-        pytest.skip("API server fixture forks so the child inherits the mocked engine")
-    # typeshed types get_context() as BaseContext, which does not declare Process.
-    fork_context = cast(Any, multiprocessing.get_context("fork"))
-    server_process = fork_context.Process(target=run_server)
+        from vllm import envs
+        from vllm.multimodal.media import connector
+
+        # Fork inherits executor bookkeeping, but the parent's threads do not
+        # survive in this mock server. Keep actual media decoding in a fresh pool.
+        with ThreadPoolExecutor(max_workers=envs.VLLM_MEDIA_LOADING_THREAD_COUNT) as media_pool:
+            connector.global_thread_pool = media_pool
+            try:
+                cmd.cmd(args)
+            except Exception:
+                traceback.print_exc()
+
+    # This local target must inherit the in-process engine mocks. Other tests
+    # can configure the global default as spawn while preparing real engines.
+    server_process = multiprocessing.get_context("fork").Process(target=run_server)
     server_process.start()
 
     # Wait for the server to be ready by polling the health endpoint.
-    wait_time = 60
+    wait_time = 30
     wait_poll_interval = 1
     for _ in range(wait_time // wait_poll_interval):
         try:
@@ -762,9 +766,6 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path, single_thread
         pytest.fail(f"API server failed to start within {wait_time} seconds")
 
     yield f"http://127.0.0.1:{port}/v1"
-
-    # Restore the original storage path after the test.
-    STORAGE_MANAGER.storage_path = old_storage_path
 
     if server_process.is_alive():
         server_process.terminate()

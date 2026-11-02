@@ -27,6 +27,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 # the lightweight stub so direct method calls still exercise the real paths.
 _MIXIN_UPDATE_HELPERS = (
     "_remove_stopped_requests_from_queues",
+    "_requeue_continuing_requests",
     "_handle_failed_kv_load_outputs",
     "_aggregate_kv_connector_stats",
     "_publish_kv_cache_events",

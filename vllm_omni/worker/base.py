@@ -141,6 +141,7 @@ class OmniGPUWorkerBase(GPUWorker):
         *,
         delay_iterations: int | None = None,
         max_iterations: int | None = None,
+        profiler_kwargs: dict | None = None,
     ):
         """Override to set trace filename before starting the profiler.
 
@@ -149,6 +150,7 @@ class OmniGPUWorkerBase(GPUWorker):
             profile_prefix: Optional prefix for trace filename (vLLM compat).
             delay_iterations: Optional per-session delayed start (vLLM compat).
             max_iterations: Optional per-session iteration cap (vLLM compat).
+            profiler_kwargs: Optional per-session profiler constructor overrides.
 
         Generate a stage-specific trace filename before delegating the
         lifecycle and iteration controls to the profiler.
@@ -167,6 +169,9 @@ class OmniGPUWorkerBase(GPUWorker):
                 stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
                 filename = profile_prefix or f"stage{stage_id}_rank{self.rank}_{int(time.time())}"
                 self.profiler.set_trace_filename(filename)
+            # WorkerProfiler.start accepts only the iteration bounds.
+            # Session kwargs go through set_profiler_kwargs, matching Worker.profile.
+            self.profiler.set_profiler_kwargs(profiler_kwargs)
             kwargs: dict[str, int] = {}
             if delay_iterations is not None:
                 kwargs["delay_iterations"] = delay_iterations

@@ -205,6 +205,10 @@ def resolve_omni_config(
     """Resolve registry/deploy inputs through the single public entrypoint."""
     normalized_overrides = _convert_dataclasses_to_dict(dict(cli_overrides or {}))
     normalized_overrides = with_trust_remote_code_override(normalized_overrides, trust_remote_code)
+    # ``--pipeline`` names a registry key. It must not fall through into
+    # stage engine args, and argparse would otherwise bind the same prefix
+    # to ``--pipeline-parallel-size``.
+    pipeline_name = normalized_overrides.pop("pipeline", None)
     native_single_file_model = resolve_native_single_file(normalized_overrides.get("model_class_name"))
     is_native_single_file = native_single_file_model is not None and Path(model).is_file()
     if is_native_single_file:
@@ -222,6 +226,7 @@ def resolve_omni_config(
             cli_overrides=registry_overrides,
             deploy_config_path=deploy_config_path,
             strategy_specs=strategy_specs,
+            pipeline_name=pipeline_name,
         )
     if structured_config is not None:
         return _build_registered_resolution(structured_config)
