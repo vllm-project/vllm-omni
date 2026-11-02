@@ -604,6 +604,26 @@ def _set_ulysses_allgather_pg(
     return ulysses_pg, ring_pg, allgather_pg
 
 
+def _new_ring_group(ranks: list[int]) -> torch.distributed.ProcessGroup:
+    """Create a Ring attention group whose NCCL work runs on a high-priority stream.
+
+    Ring attention issues the next K/V send/recv before the local attention block. With
+    equal stream priorities, the already-queued attention kernel's remaining CTAs are
+    dispatched first, so the P2P kernel starts near the end of that block and the next
+    block waits for it. A high-priority stream lets the P2P CTAs take the first free SMs.
+    """
+    if (
+        len(ranks) > 1
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_backend() == "nccl"
+        and torch.distributed.is_nccl_available()
+    ):
+        options = torch.distributed.ProcessGroupNCCL.Options()
+        options.is_high_priority_stream = True
+        return torch.distributed.new_group(ranks, pg_options=options)
+    return torch.distributed.new_group(ranks)
+
+
 # adapted from https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
 def set_seq_parallel_pg(
     sp_ulysses_degree: int,
@@ -733,7 +753,7 @@ def set_seq_parallel_pg(
                         local_ulysses = list(ulysses_ranks)
                 for i in range(num_ring_pgs):
                     ring_ranks = group_ranks[i::num_ring_pgs]
-                    group = torch.distributed.new_group(ring_ranks)
+                    group = _new_ring_group(ring_ranks)
                     if rank in ring_ranks:
                         ring_pg = group
                         local_ring = list(ring_ranks)
@@ -741,7 +761,7 @@ def set_seq_parallel_pg(
                 # Ring groups are contiguous chunks; Ulysses groups are strided.
                 for i in range(num_ring_pgs):
                     ring_ranks = group_ranks[i * sp_ring_degree : (i + 1) * sp_ring_degree]
-                    group = torch.distributed.new_group(ring_ranks)
+                    group = _new_ring_group(ring_ranks)
                     if rank in ring_ranks:
                         ring_pg = group
                         local_ring = list(ring_ranks)
@@ -776,7 +796,7 @@ def set_seq_parallel_pg(
 
                 for i in range(num_ring_pgs):
                     ring_ranks = list(range(i + offset, sp_size + offset, num_ring_pgs))
-                    group = torch.distributed.new_group(ring_ranks)
+                    group = _new_ring_group(ring_ranks)
                     if rank in ring_ranks:
                         ring_pg = group
 
@@ -785,7 +805,7 @@ def set_seq_parallel_pg(
                 offset = dp_rank * sp_size
                 for i in range(num_ring_pgs):
                     ring_ranks = list(range(i * sp_ring_degree + offset, (i + 1) * sp_ring_degree + offset))
-                    group = torch.distributed.new_group(ring_ranks)
+                    group = _new_ring_group(ring_ranks)
                     if rank in ring_ranks:
                         ring_pg = group
 
