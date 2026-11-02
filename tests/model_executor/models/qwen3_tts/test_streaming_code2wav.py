@@ -68,7 +68,7 @@ def backend(monkeypatch):
     )
 
 
-def _decode(backend, values, request_ids, caches, *, terminal=None, legacy=None):
+def _decode(backend, values, request_ids, caches, *, terminal=None, eager=None):
     lengths = [len(row) for row in values]
     codes = torch.zeros(len(values), 1, max(lengths), dtype=torch.long)
     for index, row in enumerate(values):
@@ -79,7 +79,7 @@ def _decode(backend, values, request_ids, caches, *, terminal=None, legacy=None)
         request_ids=request_ids,
         caches=caches,
         terminal=terminal or [False] * len(values),
-        legacy_decoder=legacy,
+        eager_decoder=eager,
         chunk_size=300,
         left_context_size=25,
     )
@@ -92,10 +92,10 @@ def test_long_chunk_splits_at_decoder_limit(backend):
     assert [call[2] for call in backend.decoder.calls] == [[0], [3], [6]]
 
 
-def test_dummy_run_uses_legacy_decoder_without_allocating_request_state(backend, mocker):
-    legacy = mocker.Mock(spec=module.Qwen3TTSTokenizerV2Decoder)
-    legacy.batched_chunked_decode.return_value = [torch.ones(1, 7)]
-    actual = _decode(backend, [[1]], ["dummy"], [{"_is_dummy_run": True}], legacy=legacy)[0]
+def test_dummy_run_uses_eager_decoder_without_allocating_request_state(backend, mocker):
+    eager = mocker.Mock(spec=module.Qwen3TTSTokenizerV2Decoder)
+    eager.batched_chunked_decode.return_value = [torch.ones(1, 7)]
+    actual = _decode(backend, [[1]], ["dummy"], [{"_is_dummy_run": True}], eager=eager)[0]
     torch.testing.assert_close(actual, torch.ones(1, 7))
     assert not backend.request_states and len(backend.free_slots) == 2
     assert not backend.decoder.calls
@@ -178,7 +178,7 @@ def test_icl_segment_boundary_resends_reference_and_reprimes(backend):
             request_ids=["icl"],
             caches=[{"prefix_frames": 2}],
             terminal=[True],
-            legacy_decoder=None,
+            eager_decoder=None,
             chunk_size=300,
             left_context_size=25,
         )[0]

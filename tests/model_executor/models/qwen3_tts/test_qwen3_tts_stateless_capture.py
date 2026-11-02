@@ -75,26 +75,3 @@ def test_stateless_decoder_capture_replays_new_inputs(batch_size, input_mode):
         torch.testing.assert_close(captured_output, expected, atol=1e-5, rtol=1e-4)
         outputs.append(captured_output.clone())
     assert not torch.equal(outputs[0], outputs[1]), "replay must consume the new input"
-
-
-@pytest.mark.parametrize("batch_size", [1, 2])
-@torch.inference_mode()
-def test_stateless_codec_wrapper_captures_and_replays_waveform(batch_size):
-    from tests.model_executor.models.qwen3_tts.test_qwen3_tts_incremental_decode import _make_small_decoder
-    from vllm_omni.model_executor.models.qwen3_tts.segmented_graph_wrapper import CUDAGraphDecoderWrapper
-
-    torch.manual_seed(42)
-    decoder = _make_small_decoder().cuda().eval()
-    wrapper = CUDAGraphDecoderWrapper(decoder, num_quantizers=2, async_chunk=False)
-    # Exercise the production capture method, including quantization and
-    # waveform convolutions, without accepting warmup's eager fallback.
-    wrapper._capture_stateless(batch_size, 8, torch.device("cuda"), torch.long)
-    state = wrapper.stateless_states[(batch_size, 8)]
-    for _ in range(3):
-        codes = torch.randint(0, 32, (batch_size, 2, 8), device="cuda")
-        expected = decoder._forward_exact(codes)
-        state["input"]["codes"].copy_(codes)
-        state["graph"].replay()
-        torch.accelerator.synchronize()
-        torch.testing.assert_close(state["output"], expected, atol=1e-5, rtol=1e-4)
-        assert torch.isfinite(state["output"]).all()

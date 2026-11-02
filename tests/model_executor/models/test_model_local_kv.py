@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """A declaration must match the cache that actually gets allocated.
 
 Two earlier versions of this file could not fail. The first asserted hand-typed
@@ -208,13 +208,10 @@ def test_qwen3_tts_declares_nothing_on_the_stateless_path():
     )
     setattr_(decoder, "parameters", lambda: iter([torch.zeros(1, dtype=torch.float32)]))
 
-    setattr_(decoder, "_cudagraph_wrapper", None)
+    setattr_(decoder, "_async_chunk", False)
     assert decoder.model_local_kv_specs() == []
 
-    setattr_(decoder, "_cudagraph_wrapper", SimpleNamespace(async_chunk=False, model_local_kv_specs=lambda: []))
-    assert decoder.model_local_kv_specs() == []
-
-    setattr_(decoder, "_cudagraph_wrapper", SimpleNamespace(async_chunk=True, model_local_kv_specs=lambda: []))
+    setattr_(decoder, "_async_chunk", True)
     names = [s.name for s in decoder.model_local_kv_specs()]
     assert names == ["codec_decoder_request", "codec_decoder_working_copy"], names
 
@@ -383,7 +380,7 @@ def test_protocol_is_structural():
 @pytest.mark.parametrize(
     ("relative_path", "owner"),
     [
-        ("qwen3_tts/segmented_graph_wrapper.py", "CUDAGraphDecoderWrapper"),
+        ("qwen3_tts/qwen3_tts_code2wav.py", "Qwen3TTSCode2Wav"),
         ("qwen3_tts/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py", "Qwen3TTSTokenizerV2Decoder"),
         ("mimo_audio/mimo_audio_llm.py", "MiMoAudioLLMForConditionalGeneration"),
         ("minicpmo_4_5/minicpmo_4_5_omni_llm.py", "MiniCPMWhisperEncoder"),

@@ -14,9 +14,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 UPSAMPLE = 4
 
 
-def _decoder(skip: bool):
+def _decoder():
     decoder = Qwen3TTSTokenizerV2Decoder.__new__(Qwen3TTSTokenizerV2Decoder)
-    decoder.__dict__["capture_first_audio_state_only"] = skip
     decoder.__dict__["total_upsample"] = UPSAMPLE
     calls = []
 
@@ -35,13 +34,13 @@ def _decoder(skip: bool):
 
 
 def test_one_frame_first_chunk_only_builds_state():
-    decoder, calls = _decoder(skip=True)
+    decoder, calls = _decoder()
     out = decoder._decode_stream_first_chunk(torch.zeros(1, 16, 1, dtype=torch.long), {"skip_first_audio": True})
     assert out.shape[-1] == 0 and calls == ["state"]
 
 
 def test_longer_first_chunk_keeps_all_but_the_delivered_frame():
-    decoder, calls = _decoder(skip=True)
+    decoder, calls = _decoder()
     out = decoder._decode_stream_first_chunk(
         torch.zeros(1, 16, 3, dtype=torch.long),
         {"skip_first_audio": True},
@@ -51,15 +50,9 @@ def test_longer_first_chunk_keeps_all_but_the_delivered_frame():
 
 
 def test_without_skip_the_whole_first_chunk_is_decoded():
-    decoder, calls = _decoder(skip=False)
+    decoder, calls = _decoder()
     out = decoder._decode_stream_first_chunk(
         torch.zeros(1, 16, 3, dtype=torch.long),
         {"skip_first_audio": False},
     )
     assert calls == ["full"] and out.shape[-1] == 3 * UPSAMPLE
-
-
-def test_request_without_first_audio_uses_regular_decoder_even_when_graph_skip_is_enabled():
-    decoder, calls = _decoder(skip=True)
-    out = decoder._decode_stream_first_chunk(torch.zeros(1, 16, 1, dtype=torch.long), {})
-    assert calls == ["full"] and out.shape[-1] == UPSAMPLE

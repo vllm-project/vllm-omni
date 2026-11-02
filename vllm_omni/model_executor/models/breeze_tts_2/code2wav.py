@@ -10,4 +10,4 @@ class BreezeCode2Wav(Qwen3TTSCode2Wav):
     tokenizer_subfolder = "audio_tokenizer"
     # Reference conditioning is consumed by the AR stage. The codec receives
     # generated codes only, so it never decodes an ICL reference prefix.
-    decoder_cudagraph_modes = ("xvec",)
+    streaming_decode_modes = ("xvec",)

@@ -32,7 +32,7 @@ class StreamingCode2Wav:
 
     Slots belong to scheduler request IDs across chunk scheduling/preemption.
     ICL primes reference codes once, then appends generated frames just like
-    xvec. Requests beyond the slot budget use the legacy decoder for their
+    xvec. Requests beyond the slot budget use the eager decoder for their
     entire lifetime.
     """
 
@@ -140,7 +140,7 @@ class StreamingCode2Wav:
         request_ids: list[str],
         caches: list[dict[str, Any]],
         terminal: list[bool],
-        legacy_decoder: Qwen3TTSTokenizerV2Decoder,
+        eager_decoder: Qwen3TTSTokenizerV2Decoder,
         chunk_size: int,
         left_context_size: int,
     ) -> list[torch.Tensor]:
@@ -195,7 +195,7 @@ class StreamingCode2Wav:
 
         if fallback_rows:
             selected = index_to_device(fallback_rows, codes.device)
-            fallback = legacy_decoder.batched_chunked_decode(
+            fallback = eager_decoder.batched_chunked_decode(
                 codes.index_select(0, selected),
                 [lengths[row] for row in fallback_rows],
                 caches=[caches[row] for row in fallback_rows],

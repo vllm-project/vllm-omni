@@ -27,9 +27,9 @@ The consumer therefore reports and does not subtract.
 ## What the four models declare
 
 | Model | Cache | Bounded by | Per row | Rows |
-|---|---|---|---|---|
-| Qwen3-TTS codec decoder (async-chunk only) | sliding `DynamicCache` | `sliding_window - 1 = 71` | 4.44 MiB | `max_num_seqs`, x2 for the working copy |
-| Qwen3-TTS graph pool | retained captures | same | 4.44 MiB | fixed, from captured shapes |
+| --- | --- | --- | --- | --- |
+| Qwen3-TTS eager codec decoder (async-chunk fallback) | sliding `DynamicCache` | `sliding_window - 1 = 71` | 4.44 MiB | `max_num_seqs`, x2 for the working copy |
+| Qwen3-TTS streaming decoder (CUDA async-chunk) | shared KV rings | `StreamingCodecDecoder.RING = 128` | 8 MiB (BF16) | fixed `max_num_seqs + 1`, including the padding scratch slot |
 | MiMo-Audio local transformer | `DynamicCache` | `group_size + max(delay_pattern) = 11` | 704 KiB | `max_num_seqs` |
 | MiMo-Audio graph pool | captured | same | 704 KiB | fixed 261 (bucket sum) |
 | MiniCPM-o Whisper encoder (streaming only) | `EncoderDecoderCache` | `embed_positions` rows = 1500 | 140.62 MiB | fixed 1, per session |
@@ -42,6 +42,11 @@ sliding window, a decode-loop trip count, an encoder frame limit, a constant.
 `Qwen2Config` from the checkpoint, so layers, kv-heads, head-dim and dtype are
 only knowable after load. That is what makes this a runtime query rather than a
 table.
+
+The streaming decoder allocates its rings during weight loading, with or without
+CUDA graph capture. All suffix and reference graphs use those same rings; graph
+buckets do not introduce additional KV copies. Eager fallback declarations
+describe the request-local allocations that can still occur outside this path.
 
 ## Lifetime is not multiplicity
 
@@ -103,7 +108,7 @@ would have to guess at.
   works either way, but entering through both the wrapper and its runnable would
   count a root-level declarer twice. The collector calls the supported
   `unwrap()` accessor first.
-- An owner that is not a submodule at all (Qwen3-TTS's graph wrapper, ming's
+- An owner that is not a submodule at all (Qwen3-TTS's streaming codec, ming's
   `MingAudioGenerator`) is reached by one explicit hop from the module that
   holds it.
 
