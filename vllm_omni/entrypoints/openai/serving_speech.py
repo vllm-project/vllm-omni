@@ -2801,7 +2801,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._diffusion_error_response(str(e), status_code=400)
         except Exception as e:
             logger.exception("Diffusion speech generation failed: %s", e)
-            return self._diffusion_error_response(f"Speech generation failed: {e}")
+            return self._diffusion_error_response("Speech generation failed")
 
     @staticmethod
     def _diffusion_error_response(message: str, status_code: int = 500) -> Response:

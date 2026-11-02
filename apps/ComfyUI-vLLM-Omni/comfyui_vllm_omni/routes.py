@@ -8,6 +8,10 @@ browser-side ``localhost`` resolves to the user's own machine, not to the host
 running ComfyUI.
 """
 
+import ipaddress
+import socket
+from urllib.parse import urlparse
+
 import aiohttp
 from aiohttp import web
 
@@ -20,6 +24,28 @@ MODELS_ROUTE = "/vllm_omni/models"
 # The dropdown is a convenience, not a request path: keep the proxy snappy so
 # a dead server degrades to a free-text field instead of freezing the node.
 _TIMEOUT = aiohttp.ClientTimeout(total=5.0)
+
+
+def _is_private_ip(host: str) -> bool:
+    """Return True when ``host`` resolves to a private/loopback/link-local address."""
+    try:
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+                return True
+    except socket.gaierror:
+        return True  # Treat unresolvable as unsafe
+    return False
+
+
+async def _validate_url(base_url: str) -> None:
+    """Raise ValueError when ``base_url`` targets a non-public host (SSRF guard)."""
+    parsed = urlparse(base_url)
+    if not parsed.hostname:
+        raise ValueError("missing host")
+    # Block IP-literal localhost variants like http://[::1]/ or http://0.0.0.0/
+    if parsed.hostname in {"localhost", "0.0.0.0"} or _is_private_ip(parsed.hostname):
+        raise ValueError("URL must target a public host")
 
 
 async def fetch_served_models(base_url: str) -> list[str]:
@@ -40,10 +66,14 @@ async def models_proxy_response(base_url: str) -> tuple[int, dict]:
     if not base_url.startswith(("http://", "https://")):
         return 400, {"error": "an http(s) 'url' query parameter is required"}
     try:
+        await _validate_url(base_url)
+    except ValueError:
+        return 400, {"error": "URL must target a public host"}
+    try:
         return 200, {"models": await fetch_served_models(base_url)}
     except Exception as e:  # any upstream failure degrades the dropdown to free text
         logger.warning("model list proxy failed for %s: %s", base_url, e)
-        return 502, {"error": str(e)}
+        return 502, {"error": "upstream request failed"}
 
 
 def register_routes(prompt_server) -> None:

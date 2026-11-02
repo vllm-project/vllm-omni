@@ -22,7 +22,7 @@ from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import Sen
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.sensenova_u1 import SenseNovaU1Config, SenseNovaU1VisionConfig
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 class _BranchProbe(nn.Module):

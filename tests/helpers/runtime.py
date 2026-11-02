@@ -69,10 +69,12 @@ def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
     last_exc: OSError | None = None
     for _ in range(max_attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            # codeql[py/bind_socket_to_all_interfaces]: host defaults to 127.0.0.1
             s.bind((host, 0))
             port = int(s.getsockname()[1])
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                # codeql[py/bind_socket_to_all_interfaces]: host defaults to 127.0.0.1
                 probe.bind((host, port))
         except OSError as exc:
             last_exc = exc

@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from vllm_omni.diffusion.models.causvid_wan.weights import (
     iter_causvid_diffusers_weights,
     remap_causvid_key,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def test_remap_core_block_and_head_keys():
