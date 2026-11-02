@@ -389,7 +389,7 @@ def _install_processor_hook() -> None:
         if _BUCKET_FRAMES_KEY in hf_inputs and _BUCKET_FRAMES_KEY not in fields:
             from vllm.multimodal.inputs import MultiModalFieldConfig
 
-            fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio")
+            fields[_BUCKET_FRAMES_KEY] = MultiModalFieldConfig.batched("audio", keep_on_cpu=True)
         return fields
 
     OmniMultiModalProcessor._apply_hf_processor_main = _apply_hf_processor_main

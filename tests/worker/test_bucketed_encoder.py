@@ -491,3 +491,53 @@ def test_empty_batch_falls_back_to_original(bucket_env):
 
     assert wrapper._disabled is False
     assert out.shape == (0, 240, D), out.shape
+
+
+def test_encoder_bucket_frames_keep_on_cpu(bucket_env):
+    """encoder_bucket_frames must be registered keep_on_cpu, so the serving path
+    never moves it to device and frames.tolist() stays a CPU op (no D2H sync)."""
+
+    from vllm_omni.model_executor.models.covo_audio.covo_audio import CovoAudioMultiModalProcessor
+
+    class _Tok:
+        def encode(self, s):
+            return [1, 2, 3]
+
+    class _FeatExt:
+        def __call__(self, raw_audios, sampling_rate, return_tensors):
+            return {"input_features": torch.zeros(len(raw_audios), 128, 3000)}
+
+    class _Info:
+        def get_tokenizer(self):
+            return _Tok()
+
+        def get_feature_extractor(self):
+            return _FeatExt()
+
+    # Concrete CovoAudio processor registers the field keep_on_cpu.
+    proc = CovoAudioMultiModalProcessor.__new__(CovoAudioMultiModalProcessor)
+    proc.info = _Info()
+    proc.dummy_inputs = None
+    fields = proc._get_mm_fields_config({}, {})
+    assert fields["encoder_bucket_frames"].field.keep_on_cpu is True
+
+    # The D2H hazard this avoids: .tolist() on a CUDA tensor syncs.
+    model = ToyModel().cuda()
+    install_bucketed_encoders(model)
+    feats = make_features()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        with torch.inference_mode():
+            # CPU frames (the keep_on_cpu delivery) must not sync.
+            model.embed_multimodal(
+                audio_features=feats,
+                encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64),
+            )
+            # CUDA frames would sync -> raises under sync-debug-error.
+            with pytest.raises(RuntimeError):
+                model.embed_multimodal(
+                    audio_features=feats,
+                    encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64, device="cuda"),
+                )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")

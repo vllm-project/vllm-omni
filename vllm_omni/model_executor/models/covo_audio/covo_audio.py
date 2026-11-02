@@ -150,7 +150,7 @@ class CovoAudioMultiModalProcessor(OmniMultiModalProcessor[CovoAudioProcessingIn
         return {
             "audio_features": MultiModalFieldConfig.batched("audio"),
             "audio_num_tokens": MultiModalFieldConfig.batched("audio"),
-            "encoder_bucket_frames": MultiModalFieldConfig.batched("audio"),
+            "encoder_bucket_frames": MultiModalFieldConfig.batched("audio", keep_on_cpu=True),
         }
 
     def _get_prompt_updates(
