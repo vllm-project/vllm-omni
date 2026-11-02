@@ -1184,6 +1184,7 @@ class OmniStreamingSpeechHandler:
             stream=config.stream_audio,
             word_timestamps=config.word_timestamps,
             seed=config.seed,
+            watermarking=config.watermarking,
         )
 
         start_payload = {

@@ -92,6 +92,27 @@ async def test_open_session_runs_the_correlated_rpc_with_the_typed_config() -> N
 
 
 @pytest.mark.asyncio
+async def test_open_uses_the_cold_start_budget_and_controls_keep_the_short_one() -> None:
+    # #9072: the first open on a cold engine also initializes per-session runner
+    # state, which can exceed the 10 s control budget. Only open gets the longer
+    # budget; control ops on a live session keep the short one.
+    from vllm_omni.engine.duplex_omni_engine import _DEFAULT_CONTROL_TIMEOUT_S, _DEFAULT_OPEN_TIMEOUT_S
+
+    assert _DEFAULT_OPEN_TIMEOUT_S > _DEFAULT_CONTROL_TIMEOUT_S
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+
+    open_engine = _engine(
+        _ok("open", capabilities=DuplexCapabilities(), public_session={"id": "sid"}, lease_generation=0)
+    )
+    await open_engine.open_session_async("sid", DuplexSessionConfig(), output_buffer=output_buffer)
+    assert open_engine.rpc_client.calls[-1][2] == _DEFAULT_OPEN_TIMEOUT_S
+
+    control_engine = _engine(_ok("close"))
+    await control_engine.close_session_async("sid")
+    assert control_engine.rpc_client.calls[-1][2] == _DEFAULT_CONTROL_TIMEOUT_S
+
+
+@pytest.mark.asyncio
 async def test_close_resume_and_touch_build_their_messages_without_incarnation() -> None:
     engine = _engine(_ok("close"))
     await engine.close_session_async("sid", reason="bye")

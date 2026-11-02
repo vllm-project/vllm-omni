@@ -1,0 +1,149 @@
+meta:
+  title: "Cosmos3-Super-Image2Video"
+  slug: "cosmos3-super-image2video"
+  provider: "NVIDIA"
+  description: "64B Cosmos3-Super specialization for temporally coherent image-to-video generation"
+  date_added: 2026-06-02
+  date_updated: 2026-06-02
+  tasks:
+    - omni
+  performance_headline: "Temporally coherent image-to-video — ~55s/video on 8×H200"
+  related_recipes:
+    - nvidia/Cosmos3-Super
+    - nvidia/Cosmos3-Nano
+    - nvidia/Cosmos3-Super-Text2Image
+  hardware:
+    h200: verified
+    h100: verified
+
+model:
+  model_id: "nvidia/Cosmos3-Super-Image2Video"
+  min_vllm_version: "0.21.0"
+  docker_image: "vllm/vllm-omni:cosmos3"
+  install:
+    docker:
+      note: "Release-tested vLLM-Omni image bundling the Cosmos3 omni handlers."
+    pip:
+  architecture: dense
+  parameter_count: "64B"
+  active_parameters: "64B"
+  context_length: 262144
+  base_args:
+    - "--host"
+    - "0.0.0.0"
+    - "--port"
+    - "8000"
+    - "--cfg-parallel-size"
+    - "2"
+    - "--ulysses-degree"
+    - "4"
+    - "--use-hsdp"
+    - "--hsdp-shard-size"
+    - "8"
+    - "--init-timeout"
+    - "1800"
+  base_env: {}
+
+omni:
+  # Image-to-video specialization. Documented profile is an 8×H200/H100/A100 node
+  # with CFG-parallel + ulysses + HSDP (encoded in base_args). Video comes back
+  # from /v1/videos/sync with the conditioning frame supplied via input_reference.
+  tasks:
+    - id: i2v
+      description: "Image → temporally coherent video"
+      curl: |
+        curl -X POST http://localhost:8000/v1/videos/sync \
+          -H "Accept: video/mp4" \
+          -F "input_reference=@assets/example_first_frame.png" \
+          -F "prompt=$(cat assets/example_prompt.json)" \
+          -F "size=1280x720" \
+          -F "num_frames=189" \
+          -F "fps=24" \
+          -F "num_inference_steps=35" \
+          -F "guidance_scale=6.0" \
+          -F "max_sequence_length=4096" \
+          -F "flow_shift=10.0" \
+          -F "seed=1111" \
+          --output output.mp4
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 154
+    description: "BF16 weights — 8×H200/H100/A100 node recommended"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  **Cosmos3-Super-Image2Video** is a 64B specialization of NVIDIA's Cosmos3-Super
+  omnimodal world model, tuned for **temporally coherent image-to-video
+  generation**: given one input image and text instructions, it produces video
+  sequences consistent with the provided visual content. It is served via
+  **vLLM-Omni**.
+
+  For best quality, text prompts should be JSON-upsampled (see the
+  `scripts/upsample_prompt.py` helper in the model repo).
+
+  ## Prerequisites
+
+  - 8× H200, H100, or A100 for the documented full-node profile
+  - The release-tested `vllm/vllm-omni:cosmos3` container, or vLLM-Omni installed
+    on top of `vllm==0.21.0`
+
+  ## Launch command (vLLM-Omni)
+
+  Recommended configuration on 8×H200, 8×H100, or 8×A100:
+
+  ```bash
+  docker pull vllm/vllm-omni:cosmos3
+
+  vllm serve nvidia/Cosmos3-Super-Image2Video \
+    --omni \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --cfg-parallel-size 2 \
+    --ulysses-degree 4 \
+    --use-hsdp \
+    --hsdp-shard-size 8 \
+    --init-timeout 1800
+  ```
+
+  With this configuration, 50-step video generation takes ~55 seconds on H200.
+  For **2×H200**, use `--cfg-parallel-size 2 --use-hsdp --hsdp-shard-size 2`
+  (a video takes ~3 minutes). Tensor parallelism is also supported via
+  `--tensor-parallel-size`. On memory-constrained GPUs,
+  `--enable-layerwise-offload` reduces VRAM usage at a performance cost.
+
+  ### Example: image-to-video
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/videos/sync \
+    -H "Accept: video/mp4" \
+    -F "input_reference=@assets/example_first_frame.png" \
+    -F "prompt=$(cat assets/example_prompt.json)" \
+    -F "size=1280x720" \
+    -F "num_frames=189" \
+    -F "fps=24" \
+    -F "num_inference_steps=35" \
+    -F "guidance_scale=6.0" \
+    -F "max_sequence_length=4096" \
+    -F "flow_shift=10.0" \
+    -F "seed=1111" \
+    --output output.mp4
+  ```
+
+  ## References
+
+  - [Model card](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video)
+  - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)
+  - [Cosmos](https://github.com/nvidia/cosmos)

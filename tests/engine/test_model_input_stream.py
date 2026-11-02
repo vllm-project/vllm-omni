@@ -4,11 +4,9 @@
 """Ordered input append, wire transport, and request ownership contracts."""
 
 import asyncio
-from concurrent.futures import Future
-from threading import Event, Thread
+from queue import Queue
 from types import SimpleNamespace
 
-import janus
 import msgspec
 import pytest
 
@@ -26,47 +24,16 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.asyncio
 async def test_append_uses_the_sender_side_of_the_cross_thread_queue():
     engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
-    engine.request_queue = janus.Queue()
-    ready: Future[None] = Future()
-    released = Event()
-    received: Future[list[TextInputUpdate]] = Future()
+    engine.request_queue = SimpleNamespace(sync_q=Queue())
+    tokens = [32]
+    await engine.append_text_async("request", tokens)
+    tokens.clear()
+    await engine.append_text_async("request", [], final=True)
 
-    async def receive():
-        await engine.request_queue.async_q.put(None)
-        await engine.request_queue.async_q.get()
-        ready.set_result(None)
-        try:
-            assert released.wait(5)
-            return [engine.request_queue.async_q.get_nowait(), engine.request_queue.async_q.get_nowait()]
-        finally:
-            engine.request_queue.close()
-            await engine.request_queue.wait_closed()
-
-    def consume():
-        try:
-            received.set_result(asyncio.run(receive()))
-        except Exception as exc:
-            if not ready.done():
-                ready.set_exception(exc)
-            received.set_exception(exc)
-
-    thread = Thread(target=consume, daemon=True)
-    thread.start()
-    try:
-        await asyncio.wait_for(asyncio.wrap_future(ready), 5)
-        tokens = [32]
-        await engine.append_text_async("request", tokens)
-        tokens.clear()
-        await engine.append_text_async("request", [], final=True)
-        released.set()
-        assert await asyncio.wait_for(asyncio.wrap_future(received), 5) == [
-            TextInputUpdate(request_id="request", token_ids=[32]),
-            TextInputUpdate(request_id="request", token_ids=[], final=True),
-        ]
-    finally:
-        released.set()
-        await asyncio.to_thread(thread.join, 5)
-        assert not thread.is_alive()
+    assert [engine.request_queue.sync_q.get(), engine.request_queue.sync_q.get()] == [
+        TextInputUpdate(request_id="request", token_ids=[32]),
+        TextInputUpdate(request_id="request", token_ids=[], final=True),
+    ]
 
 
 @pytest.mark.asyncio

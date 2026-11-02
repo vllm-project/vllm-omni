@@ -133,6 +133,53 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
             AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_topk=96)
 
+    def test_sparge_serialized_with_overrides(self):
+        spec = AttentionSpec(
+            backend="SPARGE_ATTN",
+            sparge={
+                "topk": 0.25,
+                "q_block_tokens": 256,
+                "k_block_tokens": 64,
+                "q_tile_override": 256,
+            },
+        )
+        assert spec.backend_kwargs() == {
+            "sparge_topk": 0.25,
+            "sparge_q_block_tokens": 256,
+            "sparge_k_block_tokens": 64,
+            "sparge_q_tile_override": 256,
+        }
+
+    def test_sparge_defaults_are_applied_by_backend(self):
+        spec = AttentionSpec(backend="SPARGE_ATTN")
+        assert spec.sparge is None
+        assert spec.backend_kwargs() is None
+        assert AttentionSpec(backend="SPARGE_ATTN", sparge={}).backend_kwargs() == {"sparge_topk": 0.5}
+
+    def test_sparge_q_block_is_serialized_without_implicit_tile(self):
+        spec = AttentionSpec(backend="SPARGE_ATTN", sparge={"q_block_tokens": 64})
+        assert spec.backend_kwargs() == {"sparge_topk": 0.5, "sparge_q_block_tokens": 64}
+
+    def test_sparge_rejected_for_other_backend(self):
+        with pytest.raises(ValueError, match="only supported by the SPARGE_ATTN"):
+            AttentionSpec(backend="TORCH_SDPA", sparge={"topk": 0.25})
+
+    @pytest.mark.parametrize(
+        "sparge",
+        [
+            {"topk": 0.0},
+            {"topk": None},
+            {"topk": 1.5},
+            {"q_block_tokens": 32},
+            {"q_block_tokens": 128},
+            {"k_block_tokens": 128},
+            {"q_tile_override": 32},
+        ],
+    )
+    def test_sparge_invalid_values(self, sparge):
+        with pytest.raises(ValueError):
+            AttentionSpec(backend="SPARGE_ATTN", sparge=sparge)
+
     def test_block_sparse_defaults_applied_when_backend_selected(self):
         spec = AttentionSpec(backend="RAINFUSION_ATTN")
         assert spec.block_sparse.sparsity == 0.8
@@ -248,6 +295,13 @@ class TestAttentionConfig:
             "precision": "sage",
             "topk": 32,
         }
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_sparge_config_in_per_role_mapping(self, nested):
+        spec = {"backend": "SPARGE_ATTN", "sparge": {"topk": 0.25}}
+        roles: dict[str, Any] = {"wan": {"self": spec}} if nested else {"wan.self": spec}
+        config = AttentionConfig(per_role=roles)
+        assert config.per_role["wan.self"].backend_kwargs() == {"sparge_topk": 0.25}
 
     def test_constructor_normalizes_auto_to_unset(self):
         config = AttentionConfig(
@@ -977,6 +1031,17 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         with pytest.raises(ValueError, match="Ring attention does not support attn_mask"):
             Attention._run_ring_attention(fake_attention, query, query, query, metadata)
 
+    def test_ring_attention_rejects_sparge_instead_of_running_dense(self):
+        fake_attention = SimpleNamespace(
+            attn_backend=SimpleNamespace(get_name=lambda: "SPARGE_ATTN"),
+            attention=SimpleNamespace(skip=None),
+            ring_runner=None,
+        )
+        query = torch.randn(1, 2, 4, 8)
+
+        with pytest.raises(NotImplementedError, match="SPARGE_ATTN is not supported with ring sequence parallelism"):
+            Attention._run_ring_attention(fake_attention, query, query, query, None)
+
 
 class TestOptInFloat32Fallback:
     @staticmethod
@@ -1256,3 +1321,194 @@ class TestDiffusionKvCacheQuantization:
                     causal=False,
                     softmax_scale=1.0,
                 )
+
+
+class TestDense4DMaskRouting:
+    """Route a dense 4D mask away from backends that only implement a 2D mask.
+
+    ``Attention._run_local_attention`` must divert exactly one call to
+    ``sdpa_fallback`` when an automatically selected backend reports
+    ``supports_dense_4d_mask() is False``. An explicit selection, an active
+    paged-KV adapter, or a missing SDPA fallback must fail closed instead of
+    reaching the backend kernel. Without these cases the original
+    FlashAttention "attention_mask must be 2D" assertion can come back
+    unnoticed.
+    """
+
+    @staticmethod
+    def _backend(*, supports_4d_mask: bool, piecewise: bool = False):
+        class _Backend:
+            supports_piecewise_spans = piecewise
+
+            @classmethod
+            def supports_dense_4d_mask(cls, attention_spec=None):
+                del attention_spec
+                return supports_4d_mask
+
+            @classmethod
+            def supports_attention_mask(cls, attention_spec=None):
+                del attention_spec
+                return True
+
+            @staticmethod
+            def get_name() -> str:
+                return "FAKE_FLASH_BACKEND"
+
+        return _Backend
+
+    def _make_attention(
+        self,
+        monkeypatch,
+        *,
+        supports_4d_mask: bool = False,
+        piecewise: bool = False,
+        backend_explicit: bool = False,
+        paged_kv: bool = False,
+        with_sdpa: bool = True,
+    ):
+        attention = Attention.__new__(Attention)
+        attention._has_custom_attention = False
+        attention._explicit_cross_contract = False
+        attention.allow_fp32_fallback = False
+        attention._scheduler_paged_kv = False
+        attention.role = "self"
+        attention.attn_spec = None
+        attention.attn_backend = self._backend(supports_4d_mask=supports_4d_mask, piecewise=piecewise)
+        attention.backend_explicit = backend_explicit
+        attention.paged_kv_cache_role = "primary" if paged_kv else None
+        backend_forward = Mock(return_value=torch.ones(1))
+        sdpa_forward = Mock(return_value=torch.zeros(1))
+        attention.attention = SimpleNamespace(forward=backend_forward)
+        attention.sdpa_fallback = SimpleNamespace(forward=sdpa_forward) if with_sdpa else None
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(paged_kv_adapter=object(), in_diffusion_kv_memory_profile=False),
+        )
+        return attention, backend_forward, sdpa_forward
+
+    @staticmethod
+    def _tensors():
+        return torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8)
+
+    @staticmethod
+    def _dense_4d_mask():
+        return torch.zeros(2, 1, 4, 4, dtype=torch.bool)
+
+    def test_auto_selected_backend_diverts_dense_4d_mask_to_sdpa(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is sdpa_forward.return_value
+        sdpa_forward.assert_called_once()
+        forwarded = sdpa_forward.call_args.args
+        assert forwarded[0] is query
+        assert forwarded[1] is key
+        assert forwarded[2] is value
+        assert forwarded[3] is metadata
+        backend_forward.assert_not_called()
+
+    def test_explicit_backend_fails_closed_on_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, backend_explicit=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+        sdpa_forward.assert_not_called()
+
+    def test_active_paged_kv_fails_closed_on_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, paged_kv=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with pytest.raises(NotImplementedError, match="paged_kv=True"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+        sdpa_forward.assert_not_called()
+
+    def test_missing_sdpa_fallback_fails_closed_on_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, _ = self._make_attention(monkeypatch, with_sdpa=False)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+
+    def test_2d_mask_is_not_diverted(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False, True, False]]))
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    def test_dense_4d_mask_capable_backend_is_not_diverted(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, supports_4d_mask=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    @pytest.mark.parametrize("backend_explicit", [False, True])
+    def test_piecewise_spans_reach_backend_despite_dense_4d_mask(self, monkeypatch, backend_explicit):
+        # HunyuanImage3 sends a dense 4D mask together with full_attn_spans; a piecewise
+        # backend honors the spans and never reads the mask, so the call must not be
+        # diverted to SDPA or rejected for an explicit FLASH_ATTN selection.
+        attention, backend_forward, sdpa_forward = self._make_attention(
+            monkeypatch, piecewise=True, backend_explicit=backend_explicit
+        )
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=[[(1, 3)], [(1, 3)]])
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    def test_piecewise_backend_without_spans_still_diverts_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, piecewise=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is sdpa_forward.return_value
+        backend_forward.assert_not_called()
+
+    def test_spans_on_non_piecewise_backend_still_fail_closed(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, backend_explicit=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=[[(1, 3)], [(1, 3)]])
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+        sdpa_forward.assert_not_called()
+
+    @pytest.mark.parametrize("is_npu", [False, True])
+    def test_flash_attention_capability_matches_platform(self, monkeypatch, is_npu):
+        from vllm_omni.diffusion.attention.backends import flash_attn as flash_attn_mod
+
+        # Tie the capability bit to the shipped backend so the routing branch
+        # above cannot become dead code after a platform check regresses.
+        monkeypatch.setattr(flash_attn_mod.current_omni_platform, "is_npu", lambda: is_npu)
+        assert FlashAttentionBackend.supports_dense_4d_mask() is is_npu

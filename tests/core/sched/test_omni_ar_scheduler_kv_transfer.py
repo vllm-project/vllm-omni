@@ -13,6 +13,7 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.outputs import OmniModelRunnerOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -67,7 +68,8 @@ def test_cfg_companion_forces_kv_transfer_without_downstream_payload():
 
 
 class _ChunkRequest(SimpleNamespace):
-    def __hash__(self):
+    # Scheduler sets require hashable requests; the request ID stays fixed.
+    def __hash__(self) -> int:  # type: ignore[override]
         return hash(self.request_id)
 
     def __eq__(self, other):
@@ -143,19 +145,18 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
     scheduler_output.scheduled_spec_decode_tokens = {}
     scheduler_output.num_invalid_spec_tokens = 0
 
-    model_runner_output = mocker.MagicMock()
-    model_runner_output.sampled_token_ids = [[42]]
-    model_runner_output.logprobs = None
-    model_runner_output.prompt_logprobs_dict = {}
-    model_runner_output.pooler_output = None
-    model_runner_output.num_nans_in_logits = None
-    model_runner_output.kv_connector_output = None
-    model_runner_output.cudagraph_stats = None
-    model_runner_output.req_id_to_index = {request.request_id: 0}
-    model_runner_output.routed_experts = None
-    model_runner_output.inter_stage_outputs = inter_stage_outputs
+    model_runner_output = OmniModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[42]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        inter_stage_outputs=inter_stage_outputs,
+    )
 
     OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+    sched._update_request_with_output.assert_called_once_with(request, [42])
     return adapter
 
 
@@ -191,7 +192,7 @@ def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
     tagged = apply_omni_final_stage_metadata(_make_engine_request(), final_stage_id=0)
 
     class Session(SimpleNamespace):
-        __hash__ = object.__hash__
+        __hash__ = object.__hash__  # type: ignore[assignment]
 
     session = Session(
         request_id="req",
