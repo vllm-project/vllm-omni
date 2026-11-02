@@ -430,7 +430,14 @@ def _wrap_embed_multimodal(model: nn.Module, encoders: Sequence[_BucketedEncoder
         # lengths left over from a previous request of the same batch size.
         for encoder in encoders:
             encoder.publish(lengths)
-        return original(**kwargs)
+        try:
+            return original(**kwargs)
+        finally:
+            # Consume-once: a request's lengths must not outlive its
+            # embed_multimodal call — a later direct encoder call must not
+            # reuse them.
+            for encoder in encoders:
+                encoder.publish(None)
 
     model.embed_multimodal = embed_multimodal
 

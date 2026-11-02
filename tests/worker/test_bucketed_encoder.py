@@ -132,19 +132,22 @@ def test_real_installer_publishes_lengths_through_embed_multimodal(bucket_env):
 
     feats = make_features()
     with torch.inference_mode():
+        # First call: eager prime (learns the output type). Lengths are
+        # published for this call and consumed on return.
         model.embed_multimodal(
             audio_features=feats,
             encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64),
         )
+        # Consume-once: lengths do not outlive the embed_multimodal call.
+        assert encoder_wrapper._lengths is None
 
-    # Core regression assertion: the published lengths ARRIVE at the wrapper.
-    assert encoder_wrapper._lengths == tuple(LENGTHS)
-
-    # Functional echo: a follow-up call without positional lengths is grouped
-    # by the published lengths -> the encoder runs one eager window per rung.
-    calls_before = len(model.encoder.calls)
-    with torch.inference_mode():
-        model.encoder(feats)
+        # Second call: lengths are re-published, so the bucketed path groups by
+        # rung — proving the published lengths ARRIVE at the wrapper.
+        calls_before = len(model.encoder.calls)
+        model.embed_multimodal(
+            audio_features=feats,
+            encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64),
+        )
     new_shapes = model.encoder.calls[calls_before:]
     assert sorted(new_shapes) == sorted([(1, 40, D), (2, 200, D), (1, 100, D)]), new_shapes
 
@@ -161,7 +164,10 @@ def test_cumsum_encoder_runs_bucketed_path_not_fallback(bucket_env):
             encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64),
         )
         calls_after_prime = len(model.encoder.calls)
-        out = model.encoder(feats).last_hidden_state
+        out = model.embed_multimodal(
+            audio_features=feats,
+            encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64),
+        )
         calls_after_bucketed = len(model.encoder.calls)
 
     expected = expected_bucketed(feats)
@@ -226,8 +232,11 @@ def test_published_lengths_apply_alongside_positional_mask(bucket_env):
             feature_attention_mask=mask,
             encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64),
         )
-        assert wrapper._lengths == tuple(LENGTHS)
-        out = model.encoder(feats, mask)
+        out = model.embed_multimodal(
+            audio_features=feats,
+            feature_attention_mask=mask,
+            encoder_bucket_frames=torch.tensor(LENGTHS, dtype=torch.int64),
+        )
 
     assert out.shape == (len(LENGTHS), 200, D), out.shape
     for row, length in enumerate(LENGTHS):
@@ -296,8 +305,7 @@ def test_fixed_window_encoder_contract_engages(bucket_env, monkeypatch):
     feats = torch.randn(len(lengths), 80, 3000, device="cuda")  # (B, mel, T) padded to 30s
     with torch.inference_mode():
         model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(lengths))
-        assert wrapper._lengths == tuple(lengths)
-        out = model.encoder(feats)
+        hidden = model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(lengths))
 
     # Engaged: the bucketed rung windows use the variable-length recipe; the
     # fixed-window forward only runs once, at the eager prime, with the full
@@ -305,7 +313,6 @@ def test_fixed_window_encoder_contract_engages(bucket_env, monkeypatch):
     assert raw_calls == [(3, 80, 3000)], f"fixed-window forward calls: {raw_calls}"
 
     # Exact where the rung equals the true length (no padding involved).
-    hidden = out.last_hidden_state
     assert hidden.shape[0] == len(lengths) and hidden.shape[2] == 64
     solo_row0 = wrapper._shim(feats[0:1, :, :300])
     torch.testing.assert_close(hidden[0, :150], solo_row0.last_hidden_state[0], rtol=0, atol=1e-5)
@@ -415,7 +422,7 @@ def test_whisper_shim_short_audio_uses_channels_first_axis(bucket_env):
     feats = torch.randn(1, 128, 3000, device="cuda")
     with torch.inference_mode():
         model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor([100]))
-        out = model.encoder(feats).last_hidden_state
+        out = model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor([100]))
 
     # Bucketed: rung 100 -> 50 output frames; fallback would be 3000/2 = 1500.
     assert out.shape == (1, 50, 64), out.shape
@@ -450,9 +457,10 @@ def test_positional_lengths_clamp_to_rung(bucket_env):
     assert torch.equal(out, torch.tensor([200, 100]))
 
 
-def test_stale_lengths_are_cleared(bucket_env):
-    """A later embed_multimodal call without the length field must clear stale
-    lengths instead of reusing the previous request's."""
+def test_lengths_do_not_outlive_embed_multimodal(bucket_env):
+    """Published lengths are consumed within the embed_multimodal call; a direct
+    encoder call afterwards must not reuse them (it falls back to the full
+    batch)."""
     model = ToyModel().cuda()
     install_bucketed_encoders(model)
     wrapper = model.encoder.forward
@@ -460,9 +468,13 @@ def test_stale_lengths_are_cleared(bucket_env):
     feats = make_features()
     with torch.inference_mode():
         model.embed_multimodal(audio_features=feats, encoder_bucket_frames=torch.tensor(LENGTHS))
-        assert wrapper._lengths == tuple(LENGTHS)
-        model.embed_multimodal(audio_features=feats)  # no length field
-        assert wrapper._lengths is None
+        assert wrapper._lengths is None  # consumed on return
+
+        # A direct call without fresh lengths falls back to the full width.
+        calls_before = len(model.encoder.calls)
+        out = model.encoder(feats).last_hidden_state
+    assert out.shape == (len(LENGTHS), 240, D), out.shape
+    assert model.encoder.calls[calls_before:] == [(len(LENGTHS), 240, D)]
 
 
 def test_empty_batch_falls_back_to_original(bucket_env):
