@@ -2878,6 +2878,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._diffusion_mode:
             if request.model is not None and request.model not in self._diffusion_model_names:
                 return self._diffusion_error_response(f"The model `{request.model}` does not exist.", status_code=404)
+            if request.word_timestamps:
+                return self._diffusion_error_response(
+                    "word_timestamps is not supported by diffusion speech models.", status_code=400
+                )
             return await self._create_diffusion_speech(request)
 
         error_check_ret = await self._check_model(request)
