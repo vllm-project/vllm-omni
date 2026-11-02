@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-import math
 import queue
 import time
 from collections import defaultdict
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -69,21 +69,17 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if isinstance(connector_config, dict)
             else getattr(connector_config, "extra", None)
         ) or {}
-        self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
-        self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
-        self._generation_always_wait_target_batch = extra.get("generation_always_wait_target_batch", False)
-        if not isinstance(self._generation_always_wait_target_batch, bool):
-            raise ValueError("generation_always_wait_target_batch must be a boolean")
+        self._init_generation_coalescing(extra)
+
+    def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
+        """Initialize generation-specific batch and express scheduling policy."""
+        super()._init_generation_coalescing(extra)
         self._generation_coalescing_policy = extra.get("generation_coalescing_policy", "fixed")
         self._generation_max_regular_batch = int(extra.get("generation_max_regular_batch", 0) or 0)
         if self._generation_max_regular_batch < 0:
             raise ValueError("generation_max_regular_batch must be nonnegative")
         if self._generation_coalescing_policy not in ("fixed", "idle_wait"):
             raise ValueError("generation_coalescing_policy must be fixed or idle_wait")
-        if not 1 <= self._generation_min_batch_size <= self.max_num_running_reqs:
-            raise ValueError("generation_min_batch_size must be in [1, max_num_seqs]")
-        if not math.isfinite(self._generation_max_wait_s) or self._generation_max_wait_s < 0:
-            raise ValueError("generation_max_wait_ms must be finite and nonnegative")
         if self._generation_max_wait_s and self._generation_min_batch_size > 1:
             parallel = self.vllm_config.parallel_config
             v1_ready_inputs = not self.use_v2_model_runner and self._get_coalescing_ready_request_ids() is not None
