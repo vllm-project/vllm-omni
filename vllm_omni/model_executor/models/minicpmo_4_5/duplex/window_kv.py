@@ -425,6 +425,7 @@ def rotate_cached_keys(
     plan: PositionReanchor,
     inv_freq: torch.Tensor,
     block_size: int | None = None,
+    head_dim: int | None = None,
 ) -> int:
     """Re-RoPE the retained tail where it stands; return the rows touched.
 
@@ -453,10 +454,17 @@ def rotate_cached_keys(
     # Ascend's standard paged layout can flatten heads into the last axis:
     # (num_blocks, block_size, num_kv_heads * head_dim).
     if k_pool.dim() == 3:
-        head_dim = inv_freq.numel() * 2
+        if head_dim is None or head_dim != inv_freq.numel() * 2:
+            raise ValueError("flattened key cache requires explicit head_dim and full rotary")
         if block_size is None or k_pool.shape[1] != block_size or k_pool.shape[2] % head_dim:
             raise ValueError(f"unsupported flattened key cache shape {tuple(k_pool.shape)}")
-        k_pool = k_pool.view(k_pool.shape[0], block_size, -1, head_dim)
+        try:
+            k_pool = k_pool.view(k_pool.shape[0], block_size, -1, head_dim)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"cannot view flattened key cache in place: shape={tuple(k_pool.shape)}, "
+                f"stride={k_pool.stride()}, head_dim={head_dim}"
+            ) from exc
 
     if k_pool.dim() == 5:
         if k_pool.shape[0] == 2:
@@ -937,6 +945,9 @@ class MiniCPMO45DuplexWorkerHelper:
                         plan=plan,
                         inv_freq=inv_freq,
                         block_size=block_size,
+                        head_dim=runner.model_config.get_head_size()
+                        if (kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache).dim() == 3
+                        else None,
                     )
 
             # Evict worker-held unit history so state.window_units remains bounded

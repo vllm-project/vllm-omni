@@ -1668,9 +1668,46 @@ def test_split_kv_reanchor_updates_original_storage(container, flattened):
         plan=plan,
         inv_freq=inv_freq,
         block_size=block_size,
+        head_dim=head_dim,
     )
     assert touched == 16
     torch.testing.assert_close(keys[1], expected)
     torch.testing.assert_close(keys[0], original[0])
     torch.testing.assert_close(keys[2:], original[2:])
     torch.testing.assert_close(values, original_values)
+
+
+def test_flattened_cache_rejects_partial_rotary():
+    with pytest.raises(ValueError, match="explicit head_dim and full rotary"):
+        rotate_cached_keys(
+            torch.zeros(4, 16, 32),
+            block_ids=[0, 1, 2, 3],
+            positions=torch.arange(32, 48),
+            plan=PositionReanchor(delta=16, moved_from=32, sink_blocks=1),
+            inv_freq=torch.ones(4),
+            block_size=16,
+            head_dim=16,
+        )
+
+
+def test_flattened_split_cache_noncontiguous_storage():
+    # Splitting the last axis of a combined allocation leaves gaps between rows,
+    # but splitting the head axis with view is still valid and must not copy.
+    storage = torch.randn(4, 16, 32)
+    keys, values = storage[..., :16], storage[..., 16:]
+    before = storage.clone()
+    assert not keys.is_contiguous()
+    frequencies = torch.ones(4)
+    rotate_cached_keys(
+        (keys, values),
+        block_ids=[0, 1, 2, 3],
+        positions=torch.arange(32, 48),
+        plan=PositionReanchor(delta=16, moved_from=32, sink_blocks=1),
+        inv_freq=frequencies,
+        block_size=16,
+        head_dim=8,
+    )
+    expected = rotate_keys(before[1, :, :16].view(16, 2, 8), 16, frequencies)
+    torch.testing.assert_close(keys[1].view(16, 2, 8), expected)
+    torch.testing.assert_close(values, before[..., 16:])
+    torch.testing.assert_close(keys[0], before[0, :, :16])

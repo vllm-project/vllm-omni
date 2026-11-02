@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Exercise NPU state-update orchestration without importing vllm-ascend."""
+"""CPU coverage for shared dispatch and backend ordering.
+
+AST extraction is limited to runner wiring because importing the NPU runner
+requires vllm-ascend. Dispatch behavior is exercised directly, without patching
+imports; update the wiring checks if runner orchestration is refactored.
+"""
 
 import ast
-import builtins
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -36,11 +39,6 @@ def test_reanchor_runs_after_state_install_and_propagates_failure():
         if runner.fail:
             raise RuntimeError("rotation failed")
 
-    def import_hook(name, *args, **kwargs):
-        if name == "vllm_omni.worker.gpu_ar_model_runner":
-            return SimpleNamespace(GPUARModelRunner=SimpleNamespace(_maybe_apply_duplex_window_reanchor=reanchor))
-        return builtins.__import__(name, *args, **kwargs)
-
     # Execute the actual method in a minimal class: zero-argument super() must
     # retain its real ordering and return semantics, including deferred updates.
     cls = ast.ClassDef(
@@ -49,7 +47,7 @@ def test_reanchor_runs_after_state_install_and_propagates_failure():
     namespace: dict[str, Any] = {
         "Parent": Parent,
         "SchedulerOutput": object,
-        "__builtins__": dict(vars(builtins), __import__=import_hook),
+        "apply_duplex_window_reanchor": reanchor,
     }
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), str(path), "exec"), namespace)
     runner = namespace["Runner"]()
@@ -61,3 +59,48 @@ def test_reanchor_runs_after_state_install_and_propagates_failure():
     runner.fail = True
     with pytest.raises(RuntimeError, match="rotation failed"):
         runner._update_states(output)
+
+
+@pytest.mark.parametrize("backend", ["npu", "gpu"])
+def test_backend_reanchor_order(backend):
+    root = Path(__file__).resolve().parents[3] / "vllm_omni"
+    path = root / (
+        "platforms/npu/worker/npu_ar_model_runner.py" if backend == "npu" else "worker/gpu_ar_model_runner.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == ("NPUARModelRunner" if backend == "npu" else "GPUARModelRunner")
+    )
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_update_states")
+    calls = [
+        n.func.attr if isinstance(n.func, ast.Attribute) else n.func.id
+        for stmt in method.body
+        for n in ast.walk(stmt)
+        if isinstance(n, ast.Call) and isinstance(n.func, (ast.Attribute, ast.Name))
+    ]
+    dispatch = "apply_duplex_window_reanchor" if backend == "npu" else "_maybe_apply_duplex_window_reanchor"
+    assert calls.index("_update_states") < calls.index("_update_duplex_sampling_states") < calls.index(dispatch)
+
+
+@pytest.mark.parametrize("use_helper", [False, True])
+def test_shared_dispatch(use_helper):
+    from types import SimpleNamespace
+
+    path = Path(__file__).resolve().parents[3] / "vllm_omni/worker/duplex_reanchor.py"
+    namespace: dict[str, Any] = {}
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)
+    events = []
+
+    def hook(runner, scheduler_output=None):
+        events.append((runner, scheduler_output))
+
+    runner = SimpleNamespace(model=SimpleNamespace())
+    if use_helper:
+        runner._duplex_window_helper = SimpleNamespace(maybe_apply_reanchor=hook)
+    else:
+        runner.model.apply_duplex_kv_reanchor = hook
+    output = object()
+    namespace["apply_duplex_window_reanchor"](runner, output)
+    assert events == [(runner, output)]

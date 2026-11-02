@@ -52,6 +52,7 @@ from vllm_omni.model_executor.models.interfaces import supports_multi_frame_deco
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -345,9 +346,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # The parent installs the scheduler's compacted block table and token
         # counts. Apply the matching worker-side rotation/history eviction before
         # forward, without compacting or decrementing the logical state again.
-        from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
-        GPUARModelRunner._maybe_apply_duplex_window_reanchor(self, scheduler_output)
+        apply_duplex_window_reanchor(self, scheduler_output)
         return deferred_state_corrections_fn
 
     def _make_buffer(self, *size, dtype, numpy=True):
