@@ -441,9 +441,11 @@ def test_run_request_entry_stage_returns_payload_only_for_a_full_payload_next_st
         sampling_params_list=[params, params],
         final_stage_id=1,
         yield_stage_id=0,
+        requested_replica_id=0,
     )
 
     assert returns_stage_payload(msg.prompt.additional_information) is returns_payload
+    assert msg.requested_replica_id == 0
 
 
 def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mocker: MockerFixture):

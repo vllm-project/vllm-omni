@@ -26,6 +26,12 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.data_entry_keys import returns_stage_payload
+from vllm_omni.distributed.omni_coordinator import (
+    ReplicaInfo,
+    ReplicaList,
+    ReplicaStatus,
+    RoundRobinBalancer,
+)
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
@@ -51,6 +57,7 @@ from vllm_omni.engine.orchestrator import (
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
@@ -142,6 +149,7 @@ class FakeStageClient:
     ) -> None:
         self.stage_id = 0
         self.replica_id = 0
+        self.client_addresses: dict[str, str] = {}
         self.stage_type = stage_type
         self.final_output = final_output
         self.final_output_type = final_output_type
@@ -258,6 +266,7 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[Any] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
+        self.request_states: dict[str, object] = {}
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
 
@@ -2261,6 +2270,199 @@ async def test_stage_pool_pinned_submit_preserves_route_and_legacy_round_robin(s
         assert await pool.submit_initial(request_id, state, request) == index
         assert await pool.submit_update(request_id, state, request) == index
     assert pool.select_replica_id("companion", affinity_request_id="ordinary-1") == 1
+
+
+class _RoutingHub:
+    def __init__(self, replicas: list[ReplicaInfo]) -> None:
+        self.replicas = replicas
+
+    def get_replicas_for_stage(self, stage_id: int) -> ReplicaList:
+        return ReplicaList(
+            replicas=[replica for replica in self.replicas if replica.stage_id == stage_id],
+            timestamp=0.0,
+        )
+
+
+def _routing_replica(input_addr: str, status: ReplicaStatus = ReplicaStatus.UP) -> ReplicaInfo:
+    return ReplicaInfo(
+        input_addr=input_addr,
+        output_addr=f"{input_addr}-output",
+        stage_id=0,
+        status=status,
+        queue_length=0,
+        last_heartbeat=0.0,
+        registered_at=0.0,
+    )
+
+
+def _distributed_routing_pool(
+    statuses: tuple[ReplicaStatus, ...] = (ReplicaStatus.UP, ReplicaStatus.UP),
+) -> tuple[StagePool, list[FakeStageClient], _RoutingHub]:
+    clients = [FakeStageClient() for _ in statuses]
+    addresses = [f"tcp://replica-{index}" for index in range(len(statuses))]
+    for client, address in zip(clients, addresses, strict=True):
+        client.client_addresses = {"input_address": address}
+    pool = StagePool(0, clients, output_processor=FakeOutputProcessor())
+    hub = _RoutingHub([_routing_replica(address, status) for address, status in zip(addresses, statuses, strict=True)])
+    pool.attach_hub(hub)
+    pool.attach_load_balancer(RoundRobinBalancer())
+    return pool, clients, hub
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_replica_id", [0, 1])
+async def test_stage_pool_requested_replica_selects_exact_live_replica(requested_replica_id: int) -> None:
+    pool, clients, _ = _distributed_routing_pool()
+    request_id = f"requested-{requested_replica_id}"
+    state = OrchestratorRequestState(
+        request_id=request_id,
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    request = FakePromptRequest(request_id=request_id, prompt_token_ids=[1])
+
+    assert pool.reserve_requested_replica(request_id, requested_replica_id) == requested_replica_id
+    assert pool.preselect_replica_id(request_id) == requested_replica_id
+    assert pool.get_bound_replica_id(request_id) is None
+    assert (
+        await pool.submit_initial(
+            request_id,
+            state,
+            request,
+            requested_replica_id=requested_replica_id,
+        )
+        == requested_replica_id
+    )
+    assert len(clients[requested_replica_id].add_request_calls) == 1
+    assert not clients[1 - requested_replica_id].add_request_calls
+
+
+@pytest.mark.parametrize("requested_replica_id", [-1, 99])
+def test_stage_pool_requested_replica_rejects_unknown_id(requested_replica_id: int) -> None:
+    pool, clients, _ = _distributed_routing_pool()
+
+    with pytest.raises(OmniClientError, match=rf"replica_id {requested_replica_id} does not exist"):
+        pool.bind_requested_replica("requested", requested_replica_id)
+
+    assert pool.get_bound_replica_id("requested") is None
+    assert all(not client.add_request_calls for client in clients)
+
+
+def test_stage_pool_requested_replica_rejects_down_replica_without_fallback() -> None:
+    pool, clients, _ = _distributed_routing_pool((ReplicaStatus.UP, ReplicaStatus.DOWN))
+
+    with pytest.raises(OmniClientError, match="replica_id 1 is not UP and attached"):
+        pool.bind_requested_replica("requested", 1)
+
+    assert pool.get_bound_replica_id("requested") is None
+    assert all(not client.add_request_calls for client in clients)
+
+
+def test_stage_pool_requested_replica_rejects_locally_unavailable_replica() -> None:
+    pool, clients, _ = _distributed_routing_pool()
+    pool.mark_replica_unavailable(1)
+
+    with pytest.raises(OmniClientError, match="replica_id 1 is not UP and attached"):
+        pool.bind_requested_replica("requested", 1)
+
+    assert pool.get_bound_replica_id("requested") is None
+    assert all(not client.add_request_calls for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_automatic_routing_still_skips_down_replica() -> None:
+    pool, _, _ = _distributed_routing_pool((ReplicaStatus.DOWN, ReplicaStatus.UP))
+
+    assert await pool._pick_or_select("automatic") == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_requested_replica_down_race_does_not_fallback() -> None:
+    pool, clients, hub = _distributed_routing_pool()
+    assert pool.reserve_requested_replica("requested", 1) == 1
+
+    # A pre-admission reservation is not a running affinity, so membership
+    # removal must not emit a generic "replica disappeared" 500 for it.
+    assert pool.invalidate_addr("tcp://replica-1") == []
+    hub.replicas[1].status = ReplicaStatus.DOWN
+    state = OrchestratorRequestState(
+        request_id="requested",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+
+    with pytest.raises(OmniClientError, match="replica_id 1 is not UP and attached"):
+        await pool.submit_initial(
+            "requested",
+            state,
+            FakePromptRequest(request_id="requested", prompt_token_ids=[1]),
+            requested_replica_id=1,
+        )
+
+    assert pool.get_bound_replica_id("requested") is None
+    assert all(not client.add_request_calls for client in clients)
+
+
+@pytest.mark.asyncio
+async def test_explicit_run_request_detached_before_admission_returns_client_error() -> None:
+    pool, clients, hub = _distributed_routing_pool()
+    request_id = "requested"
+    assert pool.reserve_requested_replica(request_id, 1) == 1
+
+    hub.replicas[1].status = ReplicaStatus.DOWN
+    pool.remove_client("tcp://replica-1")
+    output_queue: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output_queue,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+    )
+    await orchestrator._handle_add_request(
+        StageSubmissionMessage(
+            type="add_request",
+            request_id=request_id,
+            prompt=FakePromptRequest(request_id=request_id, prompt_token_ids=[1]),
+            original_prompt={},
+            output_prompt_text=None,
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+            yield_stage_id=0,
+            preprocess_ms=0,
+            request_timestamp=0,
+            enqueue_ts=0,
+            requested_replica_id=1,
+        )
+    )
+
+    error = output_queue.get_nowait()
+    assert isinstance(error, ErrorMessage)
+    assert error.status_code == 400
+    assert error.fatal is False
+    assert error.error == "stage 0 replica_id 1 is not UP and attached"
+    assert all(not client.add_request_calls for client in clients)
+
+
+def test_stage_pool_requested_replica_supports_sparse_stable_ids() -> None:
+    client0 = FakeStageClient()
+    client0.client_addresses = {"input_address": "tcp://replica-0"}
+    client2 = FakeStageClient()
+    client2.client_addresses = {"input_address": "tcp://replica-2"}
+    pool = StagePool(0, [client0])
+    pool.add_client("tcp://replica-2", client2, replica_id=2)
+    pool.attach_hub(
+        _RoutingHub(
+            [
+                _routing_replica("tcp://replica-0"),
+                _routing_replica("tcp://replica-2"),
+            ]
+        )
+    )
+    pool.attach_load_balancer(RoundRobinBalancer())
+
+    assert pool.clients[1] is None
+    assert pool.bind_requested_replica("requested", 2) == 2
+    assert pool.get_bound_client("requested") is client2
 
 
 @pytest.mark.asyncio

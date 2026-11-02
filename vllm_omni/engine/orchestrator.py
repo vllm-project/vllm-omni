@@ -3230,6 +3230,7 @@ class OrchestratorBase:
         submit_kwargs: DiffusionSubmitKwargs | None = None,
         params_override: OmniSamplingParams | None = None,
         pinned_replica_id: int | None = None,
+        requested_replica_id: int | None = None,
     ) -> None:
         """Submit requests built from the source stage's output to the receiver stage."""
         if req_state.yield_stage_id == source_stage_id:
@@ -3245,6 +3246,8 @@ class OrchestratorBase:
             return
         to_pool = self.stage_pools[receiver_stage_id]
         update_kwargs: dict[str, Any] = {"pinned_replica_id": pinned_replica_id}
+        if requested_replica_id is not None:
+            update_kwargs["requested_replica_id"] = requested_replica_id
         if submit_kwargs is not None:
             update_kwargs["submit_kwargs"] = submit_kwargs
         initial_kwargs = dict(update_kwargs)
@@ -3717,6 +3720,18 @@ class Orchestrator(OrchestratorBase):
         except ValueError as exc:
             await self._fail_request_client_error(req_id, receiver_stage_id, str(exc))
             return
+        if msg.requested_replica_id is not None:
+            try:
+                self.stage_pools[receiver_stage_id].reserve_requested_replica(req_id, msg.requested_replica_id)
+            except OmniClientError as exc:
+                await self._fail_request_client_error(
+                    req_id,
+                    receiver_stage_id,
+                    str(exc),
+                    status_code=exc.status_code,
+                    error_type=exc.error_type,
+                )
+                return
         if await self._fail_if_cannot_submit(req_id, receiver_stage_id, is_run_request=True):
             return
 
@@ -3756,6 +3771,7 @@ class Orchestrator(OrchestratorBase):
                 already_submitted=False,
                 t_submit_start=_time.perf_counter(),
                 submit_kwargs=msg.submit_kwargs,
+                requested_replica_id=msg.requested_replica_id,
             ),
             req_id=req_id,
             stage_id=receiver_stage_id,
@@ -3786,6 +3802,18 @@ class Orchestrator(OrchestratorBase):
         final_stage_id = msg.final_stage_id
         final_output_stage_ids = set(msg.final_output_stage_ids or [final_stage_id])
 
+        if msg.requested_replica_id is not None:
+            try:
+                self.stage_pools[stage_id].reserve_requested_replica(request_id, msg.requested_replica_id)
+            except OmniClientError as exc:
+                await self._fail_request_client_error(
+                    request_id,
+                    stage_id,
+                    str(exc),
+                    status_code=exc.status_code,
+                    error_type=exc.error_type,
+                )
+                return
         if await self._fail_if_cannot_submit(request_id, stage_id, is_run_request=msg.yield_stage_id is not None):
             return
 
@@ -3876,6 +3904,7 @@ class Orchestrator(OrchestratorBase):
                     prompt,
                     prompt_text=msg.output_prompt_text,
                     expected_replica_id=expected_replica_id,
+                    requested_replica_id=msg.requested_replica_id,
                 ),
                 req_id=request_id,
                 stage_id=stage_id,
