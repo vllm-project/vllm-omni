@@ -68,6 +68,21 @@ def test_v1_releases_when_more_chunks_arrive(monkeypatch):
     assert s._generation_batch_deadline is None
 
 
+def test_v1_wait_uses_overridden_readiness_without_receiver(monkeypatch):
+    s, clock = scheduler(monkeypatch)
+    s.chunk_transfer_adapter.receives_chunks = False
+    ready = {"0"}
+    monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready)
+    s._process_v1_pending_omni_inputs()
+    assert s._generation_defer_batch
+    assert s._generation_batch_deadline == pytest.approx(10.012)
+    clock[0] += 0.003
+    ready.update({"1", "2", "3"})
+    s._process_v1_pending_omni_inputs()
+    assert not s._generation_defer_batch
+    assert s._generation_batch_deadline is None
+
+
 def test_v1_cancelled_request_is_not_restored(monkeypatch):
     s, clock = scheduler(monkeypatch)
     assert not s.schedule().num_scheduled_tokens
