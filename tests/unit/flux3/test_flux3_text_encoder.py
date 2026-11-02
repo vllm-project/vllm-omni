@@ -129,8 +129,8 @@ class TestMockHead:
         ctx, vector = enc._build_outputs(_layers(5))
         assert ctx.shape == (1, N_TOKENS, CONTEXT_IN_DIM)
         assert vector.shape == (1, VEC_IN_DIM)
-        assert ctx.dtype == torch.bfloat16
-        assert vector.dtype == torch.bfloat16
+        assert ctx.dtype == enc.dtype
+        assert vector.dtype == enc.dtype
 
     def test_vector_is_zero(self):
         enc = _make_encoder()
@@ -141,13 +141,13 @@ class TestMockHead:
         enc = _make_encoder(vec_in_dim=None)
         _, vector = enc._build_outputs(_layers(5))
         assert vector.shape == (1, 0)
-        assert vector.dtype == torch.bfloat16
+        assert vector.dtype == enc.dtype
 
     def test_ctx_uses_fixed_output_layers(self):
         enc = _make_encoder()
         layers = _layers(5)  # indices 0–4, TEST_OUTPUT_LAYER = [0,1,2,3]
         ctx, _ = enc._build_outputs(layers)
-        expected = torch.cat([layers[k] for k in TEST_OUTPUT_LAYER], dim=-1).to(torch.bfloat16)
+        expected = torch.cat([layers[k] for k in TEST_OUTPUT_LAYER], dim=-1).to(enc.dtype)
         assert torch.equal(ctx, expected)
 
     def test_raises_when_layer_count_mismatches_context_dim(self):
@@ -234,7 +234,7 @@ class TestDefaultOutputLayer:
         assert enc.output_layer == custom
         layers = _layers(6)
         ctx, _ = enc._build_outputs(layers)
-        expected = torch.cat([layers[k] for k in custom], dim=-1).to(torch.bfloat16)
+        expected = torch.cat([layers[k] for k in custom], dim=-1).to(enc.dtype)
         assert torch.equal(ctx, expected)
 
 

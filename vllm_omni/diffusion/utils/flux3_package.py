@@ -93,10 +93,7 @@ def _resolve_flux3_package_selection(
     if direct_config is None:
         raise ValueError("Flux3 model path must point at a flux3 package root")
     if direct_config.get("quantization") is not None:
-        raise ValueError(
-            "Flux3 model path must point at the shared package root; "
-            "select quantized packages with additional_config['variant'] instead"
-        )
+        raise ValueError("Flux3 model path must point at the shared package root, not a quantized variant package")
 
     if variant is not None:
         available = _available_flux3_variants(model_path)

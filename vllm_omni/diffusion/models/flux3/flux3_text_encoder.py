@@ -220,9 +220,9 @@ class Flux3TextEncoder(nn.Module):
                 f"output_layer index {max_idx} out of range; model exposes "
                 f"{len(hidden_states)} hidden-state tensors (indices 0–{len(hidden_states) - 1})."
             )
-        ctx = torch.cat([hidden_states[k] for k in self.output_layer], dim=-1).to(torch.bfloat16)
+        ctx = torch.cat([hidden_states[k] for k in self.output_layer], dim=-1).to(self.dtype)
         vector_dim = 0 if self.vec_in_dim is None else self.vec_in_dim
-        vector = torch.zeros(ctx.shape[0], vector_dim, device=ctx.device, dtype=torch.bfloat16)
+        vector = torch.zeros(ctx.shape[0], vector_dim, device=ctx.device, dtype=self.dtype)
         return ctx, vector
 
     @torch.inference_mode()

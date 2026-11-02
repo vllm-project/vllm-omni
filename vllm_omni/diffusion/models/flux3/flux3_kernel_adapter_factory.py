@@ -4,20 +4,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from vllm_omni.diffusion.models.flux3.flux3_kernel_adapter import Flux3KernelAdapter, QKNormRopeFn
 
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-
-def build_flux3_kernel_adapter(
-    *,
-    qk_norm_rope: QKNormRopeFn,
-    od_config: OmniDiffusionConfig | None,
-    quant_config: object | None,
-) -> Flux3KernelAdapter:
+def build_flux3_kernel_adapter(*, qk_norm_rope: QKNormRopeFn) -> Flux3KernelAdapter:
     """Return the default Flux3 kernel adapter backed by vLLM kernels."""
     return Flux3KernelAdapter(qk_norm_rope)
 
