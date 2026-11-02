@@ -98,7 +98,8 @@ class CosyVoice3HiFTGraphs:
         )
 
     def run(self, mel: torch.Tensor, source: torch.Tensor, finalize: bool) -> torch.Tensor:
-        autocast = torch.is_autocast_enabled("npu")
+        device_type = mel.device.type
+        autocast = torch.is_autocast_enabled(device_type)
         captures_before = self.runner.stats["captures"]
         touched_keys: set[tuple[object, ...]] = set()
         self.hift._npu_istft_envelope_accesses = touched_keys
@@ -106,7 +107,7 @@ class CosyVoice3HiFTGraphs:
             output = self.runner.run(
                 "hift_decode",
                 (mel, source),
-                (finalize, autocast, torch.get_autocast_dtype("npu") if autocast else None),
+                (finalize, autocast, torch.get_autocast_dtype(device_type) if autocast else None),
                 lambda x, s: (self.hift._decode_eager(x, s, finalize=finalize),),
             )[0]
         finally:
