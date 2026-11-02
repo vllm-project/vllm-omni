@@ -335,6 +335,38 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         session.num_prompt_tokens = len(new_prompt)
         self._finish_streaming_session_update(session, update)
 
+    def _get_coalescing_ready_request_ids(
+        self, connector_outputs: Iterable[OmniConnectorOutput] = ()
+    ) -> set[str] | None:
+        """Snapshot input-ready IDs without consuming input or notifications.
+
+        Return None for an unsupported input source, or an empty set for a
+        supported source with no ready input. Subclasses receiving input from
+        the orchestrator can override this hook. It is also queried during
+        generation scheduler initialization, before requests are registered.
+
+        Native notifications may not yet be applied to the coordinator, so
+        include the supplied outputs. Terminal signals allow final work to
+        participate in coalescing. Callers retain responsibility for filtering
+        stale, finished or in-flight requests and deciding execution eligibility.
+        """
+        # V1: readiness is tracked by the legacy chunk-transfer adapter.
+        adapter = self.chunk_transfer_adapter
+        if adapter is not None and adapter.receives_chunks:
+            return set(adapter.requests_with_ready_chunks)
+        # V2: combine native coordinator state with unapplied notifications.
+        coordinator = self.input_coordinator
+        if not self._native_data_plane or coordinator is None or not coordinator.receives_chunks:
+            return None
+        ready = set(coordinator.requests_with_ready_chunks)
+        ready.update(coordinator.finished_requests)
+        ready.update(coordinator.input_terminal_req_ids)
+        for output in connector_outputs:
+            ready.update(output.chunk_ready_req_ids)
+            ready.update(output.chunk_finished_req_ids)
+            ready.update(req_id for req_id, update in output.request_metadata.items() if update.input_terminal)
+        return ready
+
     def _async_chunk_transport_enabled(self) -> bool:
         return getattr(self, "chunk_transfer_adapter", None) is not None or bool(
             getattr(self, "_native_data_plane", False)

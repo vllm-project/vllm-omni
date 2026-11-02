@@ -86,15 +86,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             raise ValueError("generation_max_wait_ms must be finite and nonnegative")
         if self._generation_max_wait_s and self._generation_min_batch_size > 1:
             parallel = self.vllm_config.parallel_config
-            legacy_receiver = (
-                not self.use_v2_model_runner
-                and self.chunk_transfer_adapter is not None
-                and self.chunk_transfer_adapter.receives_chunks
-            )
-            if not self._native_data_plane and not legacy_receiver:
+            v1_ready_inputs = not self.use_v2_model_runner and self._get_coalescing_ready_request_ids() is not None
+            if not self._native_data_plane and not v1_ready_inputs:
                 logger.warning(
                     "Generation batch waiting and regular-batch limit ignored: "
-                    "requires a native MRV2 stage or V1 async-chunk receiver."
+                    "requires a native MRV2 stage or V1 input readiness support."
                 )
                 self._generation_min_batch_size = 1
                 self._generation_max_wait_s = 0.0
@@ -103,7 +99,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 raise ValueError("Generation batch waiting requires TP1/PP1")
             elif self._native_data_plane and not self._retains_state_across_chunks:
                 raise ValueError("Native MRV2 generation batch waiting requires a stateful stage")
-            elif legacy_receiver and self._generation_coalescing_policy != "fixed":
+            elif v1_ready_inputs and self._generation_coalescing_policy != "fixed":
                 raise ValueError("V1 generation batch waiting supports only the fixed coalescing policy")
             else:
                 logger.info(
@@ -224,23 +220,20 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def _process_v1_pending_omni_inputs(self) -> None:
         """Coalesce received V1 inputs without blocking completion processing.
 
-        V1 readiness comes from the legacy adapter after input processing.
+        V1 readiness comes from the mixin hook after input processing.
         Revisit its batch deadline on scheduler ticks; native V2 waiting is
         handled separately by _drain_omni_connector_outputs().
         """
         self._generation_defer_batch = False
-        adapter = self.chunk_transfer_adapter
         max_wait = getattr(self, "_generation_max_wait_s", 0.0)
-        if (
-            not max_wait
-            or self._generation_min_batch_size <= 1
-            or adapter is None
-            or not adapter.receives_chunks
-            or self._pause_state != PauseState.UNPAUSED
-        ):
+        if not max_wait or self._generation_min_batch_size <= 1 or self._pause_state != PauseState.UNPAUSED:
             self._generation_batch_deadline = None
             return
-        runnable = self._generation_runnable_ids(set(adapter.requests_with_ready_chunks))
+        ready = self._get_coalescing_ready_request_ids()
+        if ready is None:
+            self._generation_batch_deadline = None
+            return
+        runnable = self._generation_runnable_ids(ready)
         if not runnable or self._generation_batch_ready(runnable) or runnable & self._generation_pending_inputs:
             # A model yielding part of an input must keep executing that input;
             # its retained ready marker is not a newly arrived chunk.
@@ -272,22 +265,18 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # chunks whose previous execution still owns their state. Waiting here
         # precedes allocation and metadata replacement. Do not schedule a batch
         # and then discard it to try to accumulate more input.
-        ready = set(coordinator.requests_with_ready_chunks)
-        terminal = set(coordinator.finished_requests) | set(coordinator.input_terminal_req_ids)
+        ready = self._get_coalescing_ready_request_ids(outputs)
+        if ready is None:
+            return outputs
         deadline = getattr(self, "_generation_batch_deadline", None)
         if deadline is None:
             deadline = time.monotonic() + max_wait
         in_flight = any(
             not request.is_finished() and request.num_in_flight_tokens > 0 for request in self.requests.values()
         )
-        new_outputs = outputs
         waited_without_input = False
         while True:
-            for output in new_outputs:
-                ready.update(output.chunk_ready_req_ids)
-                terminal.update(output.chunk_finished_req_ids)
-                terminal.update(req_id for req_id, update in output.request_metadata.items() if update.input_terminal)
-            runnable = self._generation_runnable_ids(ready | terminal)
+            runnable = self._generation_runnable_ids(ready)
             if runnable and waited_without_input:
                 # Idle waiting must not eat the ready batch's coalescing budget.
                 # Start that budget at its first arrival, once only. The two
@@ -343,6 +332,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     break
                 outputs.append(output)
                 new_outputs.append(output)
+            ready.update(self._get_coalescing_ready_request_ids(new_outputs) or ())
         self._generation_batch_deadline = None
         return outputs
 
