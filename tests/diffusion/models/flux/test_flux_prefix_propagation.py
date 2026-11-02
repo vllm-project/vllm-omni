@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that FLUX transformer blocks correctly propagate `quant_config` and
 `prefix` through all sub-layers.
 
@@ -8,8 +8,6 @@ aware sub-layers (AdaLayerNorm, FeedForward, Attention projections) receive the
 prefix rooted at the block prefix.  This is critical for quantized weight loading
 to match checkpoint keys to the correct model parameters.
 """
-
-import os
 
 import pytest
 
@@ -31,8 +29,9 @@ def _init_distributed():
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29502")
+    from tests.helpers.runtime import assign_ephemeral_master_port
+
+    assign_ephemeral_master_port()
     init_distributed_environment(
         world_size=1,
         rank=0,
