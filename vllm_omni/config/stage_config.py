@@ -101,6 +101,7 @@ def build_stage_runtime_overrides(
     cli_overrides: dict[str, Any],
     *,
     internal_keys: set[str] | frozenset[str] | None = None,
+    warn_dropped: bool = True,
 ) -> dict[str, Any]:
     """Build per-stage runtime overrides from global and ``stage_<id>_*`` kwargs.
 
@@ -132,8 +133,17 @@ def build_stage_runtime_overrides(
         if match is not None:
             override_stage_id = int(match.group(1))
             param_name = match.group(2)
-            if override_stage_id == stage_id and param_name not in internal_keys:
-                result[param_name] = value
+            if override_stage_id == stage_id:
+                if param_name in internal_keys:
+                    if not warn_dropped:
+                        continue
+                    logger.warning(
+                        "Ignoring --stage-overrides[%s].%s: this field is not a per-stage override.",
+                        stage_id,
+                        param_name,
+                    )
+                else:
+                    result[param_name] = value
             continue
 
         result[key] = value
@@ -901,6 +911,23 @@ _STAGE_RESERVED_KEYS = frozenset(
     }
 )
 
+# These fields need a deploy-config route. They do not have a supported
+# --stage-overrides route. Keep env and default_sampling_params out: env has a
+# runtime owner, and default_sampling_params is valid for generic diffusion.
+NON_STAGE_OVERRIDE_FIELDS = frozenset(
+    {
+        "session_mode",
+        "connectors",
+        "edges",
+        "stages",
+        "platforms",
+        "pipeline",
+        "duplex_session",
+        "input_connectors",
+        "output_connectors",
+    }
+)
+
 # Pipeline-wide DeployConfig fields that are propagated to every stage's
 # engine args during merge. These live at top level of the deploy YAML.
 PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
@@ -916,8 +943,6 @@ PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "custom_voice_dir",
     "weight_transfer_config",
 )
-
-
 # Fields on StageDeployConfig that are populated from engine_args dict
 _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
 

@@ -75,6 +75,9 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             "--stage-overrides must be a JSON object mapping stage_id -> overrides, "
             f"got {type(parsed).__name__}: {parsed!r}"
         )
+    from vllm_omni.config.stage_config import NON_STAGE_OVERRIDE_FIELDS
+
+    filtered: dict[str, dict[str, Any]] = {}
     for stage_id, overrides in parsed.items():
         if not isinstance(stage_id, str) or not stage_id.isascii() or not stage_id.isdigit():
             raise ValueError(
@@ -84,8 +87,21 @@ def parse_stage_overrides(value: Any) -> dict[str, dict[str, Any]] | None:
             raise ValueError(
                 f"--stage-overrides[{stage_id!r}] must be an object, got {type(overrides).__name__}: {overrides!r}"
             )
+        kept_overrides = {}
+        for key, value in overrides.items():
+            config_key = key.partition(".")[0]
+            if config_key in NON_STAGE_OVERRIDE_FIELDS:
+                logger.warning(
+                    "Ignoring --stage-overrides[%r][%r]: set %r in the deploy config instead.",
+                    stage_id,
+                    key,
+                    config_key,
+                )
+                continue
+            kept_overrides[key] = value
+        filtered[stage_id] = kept_overrides
 
-    return parsed
+    return filtered
 
 
 @dataclass(frozen=True)
@@ -247,11 +263,6 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
     filtered_kwargs = {}
     for k, v in kwargs.items():
         if k not in valid_fields:
-            logger.warning(
-                "Dropping unknown %s field %r (not declared on the dataclass)",
-                cls.__name__,
-                k,
-            )
             continue
         field = valid_fields[k]
         filtered_kwargs[k] = _filter_value(v, field.type)
