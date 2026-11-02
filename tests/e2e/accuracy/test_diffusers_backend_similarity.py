@@ -27,20 +27,13 @@ from benchmarks.accuracy.common import pil_to_base64
 from tests.e2e.accuracy.helpers import (
     apply_ftfy_mock,
     assert_similarity,
+    assert_video_similarity_metrics,
     env_to_apply_ftfy_mock_in_subproc,
     measure_image_similarity,
+    measure_video_similarity_metrics,
     model_output_dir,
     resolve_device_threshold,
     write_accuracy_result,
-)
-from tests.e2e.accuracy.helpers import (
-    parse_psnr_score as _parse_psnr_score,
-)
-from tests.e2e.accuracy.helpers import (
-    parse_ssim_score as _parse_ssim_score,
-)
-from tests.e2e.accuracy.helpers import (
-    run_ffmpeg_similarity as _run_ffmpeg_similarity,
 )
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
@@ -398,19 +391,15 @@ def test_diffusers_backend_i2v_matches_diffusers(
     )
     latency_threshold = diffusers_latency * (1 + latency_threshold_factor)
 
-    ssim_output = _run_ffmpeg_similarity("ssim", vllm_path, diffusers_path)
-    psnr_output = _run_ffmpeg_similarity("psnr", vllm_path, diffusers_path)
-    ssim_score = _parse_ssim_score(ssim_output)
-    psnr_score = _parse_psnr_score(psnr_output)
     print(f"{model_id} latency metrics:")
     print(
         f"  Latency={vllm_latency:.2f}ms, threshold<={latency_threshold:.2f}ms, "
         f"diffusers latency={diffusers_latency:.2f}ms, slack={latency_threshold_factor:.0%} ({gpu_key}), lower is better"
     )
-    print(f"{model_id} similarity metrics:")
-    print(f"  SSIM: value={ssim_score:.6f}, threshold>={VIDEO_SSIM_THRESHOLD:.6f}, range=[-1, 1], higher is better")
-    print(
-        f"  PSNR: value={psnr_score:.6f} dB, threshold>={VIDEO_PSNR_THRESHOLD:.6f} dB, range=[0, +inf), higher is better"
+    ssim_score, psnr_score = measure_video_similarity_metrics(
+        label=model_id,
+        online_path=vllm_path,
+        offline_path=diffusers_path,
     )
     write_accuracy_result(
         model_id=model_id,
@@ -423,12 +412,14 @@ def test_diffusers_backend_i2v_matches_diffusers(
             "latency_ms": vllm_latency,
         },
     )
-
-    assert ssim_score >= VIDEO_SSIM_THRESHOLD, (
-        f"SSIM below threshold for {model_id}: got {ssim_score:.6f}, expected >= {VIDEO_SSIM_THRESHOLD:.6f}."
-    )
-    assert psnr_score >= VIDEO_PSNR_THRESHOLD, (
-        f"PSNR below threshold for {model_id}: got {psnr_score:.6f}, expected >= {VIDEO_PSNR_THRESHOLD:.6f}."
+    assert_video_similarity_metrics(
+        label=model_id,
+        online_path=vllm_path,
+        offline_path=diffusers_path,
+        ssim_threshold=VIDEO_SSIM_THRESHOLD,
+        psnr_threshold=VIDEO_PSNR_THRESHOLD,
+        ssim_score=ssim_score,
+        psnr_score=psnr_score,
     )
     assert vllm_latency <= latency_threshold, (
         f"VLLM latency ({vllm_latency:.2f}ms) is greater than {latency_threshold_factor * 100}% more than Diffusers latency ({diffusers_latency:.2f}ms)."

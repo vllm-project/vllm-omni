@@ -97,8 +97,9 @@ def _generate_edit(client, *, model, images, prompt, output_path, capfd, **gener
 def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
     from tests.e2e.accuracy.helpers import (
         CLIPScorer,
-        compute_image_ssim_psnr,
+        assert_similarity_metrics,
         download_images,
+        measure_image_similarity,
         model_output_dir,
         write_accuracy_result,
     )
@@ -193,16 +194,19 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
 
     # Score every mode against the official output, not an uncached Omni output.
     clip_scorer = CLIPScorer()
-    metrics, failures = {}, []
+    metrics, clip_failures = {}, []
     for (mode, case), image in results.items():
-        ssim, psnr = compute_image_ssim_psnr(prediction=image, reference=reference)
         label = f"{mode}_{case} vs official_ref"
-        metrics[label] = {"clip_score": clip_scorer.image_image_score(image, reference), "ssim": ssim, "psnr": psnr}
-        for name, threshold in _ACCURACY_THRESHOLDS.items():
-            value = metrics[label][name]
-            print(f"{label} {name}: {value:.6f}, required >= {threshold}")
-            if not value >= threshold:
-                failures.append(f"{label}: {name}={value:.6f} < {threshold}")
+        ssim, psnr = measure_image_similarity(
+            model_name=label,
+            vllm_image=image,
+            diffusers_image=reference,
+        )
+        clip_score = clip_scorer.image_image_score(image, reference)
+        metrics[label] = {"clip_score": clip_score, "ssim": ssim, "psnr": psnr}
+        print(f"{label} clip_score: {clip_score:.6f}, required >= {_ACCURACY_THRESHOLDS['clip_score']}")
+        if clip_score < _ACCURACY_THRESHOLDS["clip_score"]:
+            clip_failures.append(f"{label}: clip_score={clip_score:.6f} < {_ACCURACY_THRESHOLDS['clip_score']}")
     metrics_path = output_dir / "quality_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
     write_accuracy_result(
@@ -212,4 +216,12 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
         baseline=dict(_ACCURACY_THRESHOLDS),
         extra={"tp_size": tp_size, "sp_size": sp_size, "metrics_json": str(metrics_path)},
     )
-    assert not failures, "\n".join(failures)
+    assert not clip_failures, "\n".join(clip_failures)
+    for label, scores in metrics.items():
+        assert_similarity_metrics(
+            model_name=label,
+            ssim_score=scores["ssim"],
+            psnr_score=scores["psnr"],
+            ssim_threshold=_ACCURACY_THRESHOLDS["ssim"],
+            psnr_threshold=_ACCURACY_THRESHOLDS["psnr"],
+        )

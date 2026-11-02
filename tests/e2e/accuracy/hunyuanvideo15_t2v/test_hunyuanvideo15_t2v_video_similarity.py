@@ -14,6 +14,7 @@ from tests.e2e.accuracy.helpers import (
     assert_video_metadata,
     assert_video_similarity_metrics,
     measure_video_similarity_metrics,
+    model_output_dir,
     probe_binary,
     probe_video,
     send_video_request_with_timeout,
@@ -42,7 +43,6 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 WORKSPACE_ROOT = REPO_ROOT.parent
 RUNNER_PATH = REPO_ROOT / "examples" / "offline_inference" / "text_to_video" / "text_to_video.py"
 RESULT_ROOT = Path(__file__).parent / "result"
-ARTIFACT_DIR = RESULT_ROOT / "cat_grass"
 VIDEO_TIMEOUT_SECONDS = 60 * 60
 # A cold MI325 load can spend more than ten minutes reading the seven DiT
 # shards (AMD Buildkite #14270). Bound real hangs without failing that path.
@@ -83,8 +83,8 @@ def _runner_env() -> dict[str, str]:
 
 
 def _artifact_paths() -> tuple[Path, Path]:
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    return ARTIFACT_DIR / "online.mp4", ARTIFACT_DIR / "offline.mp4"
+    artifact_dir = model_output_dir(RESULT_ROOT, "cat_grass")
+    return artifact_dir / "online.mp4", artifact_dir / "offline.mp4"
 
 
 def _build_offline_command(*, output_path: Path) -> list[str]:

@@ -53,7 +53,7 @@ from tests.e2e.accuracy.helpers import (
     SimilarityThresholds,
     assert_similarity_metrics,
     baseline_from_similarity_thresholds,
-    compute_image_ssim_psnr,
+    measure_image_similarity,
     model_output_dir,
     resolve_device_profile,
     resolve_similarity_thresholds,
@@ -194,7 +194,12 @@ def _native(request: dict, output: Path) -> None:
 
 
 def _scores(prediction: Image.Image, reference: Image.Image) -> dict[str, float]:
-    ssim, psnr = compute_image_ssim_psnr(prediction=prediction, reference=reference, compare_mode="RGBA")
+    ssim, psnr = measure_image_similarity(
+        model_name="Qwen-Image 2.1",
+        vllm_image=prediction,
+        diffusers_image=reference,
+        compare_mode="RGBA",
+    )
     alpha = (
         np.abs(np.asarray(prediction, dtype=np.float32)[..., 3] - np.asarray(reference, dtype=np.float32)[..., 3]) / 255
     )

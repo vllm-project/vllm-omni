@@ -24,7 +24,7 @@ from tests.e2e.accuracy.helpers import (
     CLIPScorer,
     SemanticSimilarityScorer,
     assert_similarity,
-    compute_image_ssim_psnr,
+    assert_similarity_metrics,
     download_images,
     measure_image_similarity,
     model_output_dir,
@@ -469,7 +469,13 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
     cot_results = scorer.text_similarity(online_cot, cot_ref)
     image_ref = Image.open(HUNYUAN_IMAGE_REF_PATH).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(online_image, image_ref)
-    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=online_image, reference=image_ref, compare_mode="RGB")
+    model_label = f"{MODEL_NAME} [ONLINE] vs reference"
+    ssim_value, psnr_value = measure_image_similarity(
+        model_name=model_label,
+        vllm_image=online_image,
+        diffusers_image=image_ref,
+        compare_mode="RGB",
+    )
 
     thresholds = _get_thresholds()
     table = [
@@ -492,9 +498,23 @@ def test_image_to_image_alignment_online(accuracy_artifact_root: Path) -> None:
     assert image_clip_score >= thresholds["clip_score"], (
         f"[ONLINE] Image-Image similarity {image_clip_score:.4f} below threshold {thresholds['clip_score']}"
     )
-    assert ssim_value >= thresholds["ssim"], f"[ONLINE] SSIM {ssim_value:.4f} below threshold {thresholds['ssim']}"
-    assert psnr_value >= thresholds["psnr"], (
-        f"[ONLINE] PSNR {psnr_value:.2f} dB below threshold {thresholds['psnr']} dB"
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={"ssim": ssim_value, "psnr": psnr_value, "clip_score": image_clip_score},
+        baseline={
+            "ssim": thresholds["ssim"],
+            "psnr": thresholds["psnr"],
+            "clip_score": thresholds["clip_score"],
+        },
+        extra={"label": "online_vs_reference"},
+    )
+    assert_similarity_metrics(
+        model_name=model_label,
+        ssim_score=ssim_value,
+        psnr_score=psnr_value,
+        ssim_threshold=thresholds["ssim"],
+        psnr_threshold=thresholds["psnr"],
     )
 
 
@@ -585,7 +605,13 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
     cot_results = scorer.text_similarity(omni_cot, cot_ref)
     image_ref = Image.open(HUNYUAN_IMAGE_REF_PATH).convert("RGB")
     image_clip_score = clip_scorer.image_image_score(omni_image, image_ref)
-    ssim_value, psnr_value = compute_image_ssim_psnr(prediction=omni_image, reference=image_ref, compare_mode="RGB")
+    model_label = f"{MODEL_NAME} [OFFLINE] vs reference"
+    ssim_value, psnr_value = measure_image_similarity(
+        model_name=model_label,
+        vllm_image=omni_image,
+        diffusers_image=image_ref,
+        compare_mode="RGB",
+    )
 
     thresholds = _get_thresholds()
     table = [
@@ -609,8 +635,24 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path) -> None:
     assert image_clip_score >= thresholds["clip_score"], (
         f"Image-Image similarity{image_clip_score:.4f} is below threshold {thresholds['clip_score']}"
     )
-    assert ssim_value >= thresholds["ssim"], f"SSIM {ssim_value:.4f} is below threshold {thresholds['ssim']}"
-    assert psnr_value >= thresholds["psnr"], f"PSNR {psnr_value:.2f} dB is below threshold {thresholds['psnr']} dB"
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={"ssim": ssim_value, "psnr": psnr_value, "clip_score": image_clip_score},
+        baseline={
+            "ssim": thresholds["ssim"],
+            "psnr": thresholds["psnr"],
+            "clip_score": thresholds["clip_score"],
+        },
+        extra={"label": "offline_vs_reference"},
+    )
+    assert_similarity_metrics(
+        model_name=model_label,
+        ssim_score=ssim_value,
+        psnr_score=psnr_value,
+        ssim_threshold=thresholds["ssim"],
+        psnr_threshold=thresholds["psnr"],
+    )
 
 
 @pytest.mark.parametrize("case", _quant_accuracy_cases())
@@ -640,10 +682,6 @@ def test_quantized_dit_matches_bf16_accuracy(
             nvfp4_backend=case.nvfp4_backend,
         )
 
-    ssim_score, psnr_score = compute_image_ssim_psnr(
-        prediction=quant_image,
-        reference=bf16_image,
-    )
     quant_thresholds = _get_quant_thresholds()
     model_label = f"{MODEL_NAME} {case.name} vs bf16"
     ssim, psnr = measure_image_similarity(
@@ -689,8 +727,8 @@ def test_quantized_dit_matches_bf16_accuracy(
         "guidance_scale": 4.0,
         "bf16_elapsed_s": bf16_time,
         "quant_elapsed_s": quant_time,
-        "ssim": ssim_score,
-        "psnr": psnr_score,
+        "ssim": ssim,
+        "psnr": psnr,
         "bf16_clip_score": bf16_clip_score,
         "quant_clip_score": quant_clip_score,
         "clip_score_drop": clip_score_drop,
