@@ -420,6 +420,69 @@ Guide uploads use the same request-scoped temporary storage and cleanup as
 latent-mask editing sources. Models that do not declare timeline-guide support
 reject these fields.
 
+### MiniMax H3 Continuation Across Requests
+
+A MiniMax H3 job can continue a previous job's clip so picture and sound carry
+across the cut. Set `continue_from` to that job's id. The server keeps each
+finished H3 job's denoised video and audio latents, keyed by its job id, in the
+DiT worker, and samples the new request as a window whose first
+`continue_overlap_frames` frames repeat the end of the previous clip. Those
+frames are hidden: they are guided by the cached latents (no decode and
+re-encode, the same guides as in-request
+[latent-tail continuation](gh-file:recipes/MiniMaxAI/MiniMax-H3.md#latent-tail-continuation-with-global-temporal-positions-ab))
+and trimmed after decoding, on the chain's global AV timeline.
+
+Everything else in the request describes only the clip it returns, exactly as
+without `continue_from`:
+
+- Task inference, references, `<Picture N>` labels, LoRA, sampling, quality,
+  `num_outputs_per_prompt`, `preencode_mp4`, latent upscale, long-video
+  windows and step execution work unchanged. `latent_refine` is rejected with
+  `continue_from`, because the refine pass would re-denoise the window without
+  the hidden tail.
+- Continuations run on the base canvas: a job is cached as the latents it
+  decodes (after `latent_refine`), or, when it was upscaled, as its latents
+  before the upscale. A T2VA continuation that sets neither a size nor an
+  `aspect_ratio` keeps the source canvas; an explicit size or aspect ratio
+  must match it, and a lone `height` or `width` is rejected. Timeline guides
+  on a T2VA continuation need that explicit size or aspect ratio unless the
+  source has the default 16:9 canvas (1344x768), since guide frames are
+  encoded before the source canvas is known.
+- Timeline guide `frame_index`, FL2VA `frame_indices`, latent-edit masks and
+  source media, and `audio_mode=lock_source` driving audio refer to the returned
+  clip: frame 0 is its first new frame, and negative indices count from its end.
+
+```bash
+first=$(curl -s http://localhost:8091/v1/videos \
+  -F 'prompt=A lighthouse keeper climbs the stairs at dusk.' \
+  -F 'input_reference=@keeper.png;type=image/png' -F 'num_frames=124' | jq -r .id)
+# ...poll until completed...
+curl -s http://localhost:8091/v1/videos \
+  -F 'prompt=At the top, the keeper lights the lamp and the beam sweeps the sea.' \
+  -F 'num_frames=124' \
+  -F "extra_params={\"continue_from\":\"$first\"}"
+```
+
+- The tail rides as a frame-0 timeline guide. The FL2VA checkpoint (T2VA and
+  FL2VA requests) follows it closely; the Ref2VA checkpoint follows it far more
+  loosely, so a Ref2VA continuation can start with a visible cut. Prefer T2VA
+  or FL2VA continuations, which need the FL2VA partition (or a combined
+  service).
+- The returned length is the requested length rounded to whole 17-frame groups
+  (`124` requests return 119 frames), because the hidden overlap occupies the
+  first `17n+5` frames of the sampled window.
+- `continue_overlap_frames` defaults to `22`, must be on the `17n+5` grid and no
+  longer than the source clip. Use the source clip's canvas; a different `size`
+  is rejected, since latents cannot change size.
+- The source must be a completed job of this server. `/v1/videos/sync` can
+  continue such a job, but its own output is not addressable. With
+  `num_outputs_per_prompt > 1`, the first output is the one a later request
+  continues. A chain may span up to 300 seconds of global timeline.
+- Latents live in each DiT worker process, in an LRU of 16 clips; serve with
+  `--additional-config '{"latent_cache_clips": N}'` to change it (`0` disables
+  it). They are lost on restart and not shared across data-parallel replicas.
+  A missing or evicted source returns 400; regenerate it or start a new chain.
+
 ### Speech-to-Video
 
 For models that support audio-driven generation (e.g., Wan2.2-S2V), pass both

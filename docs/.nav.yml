@@ -55,6 +55,7 @@ nav:
     - Runtime and Stage Execution:
       - Execution Modes and Streaming: user_guide/diffusion/execution_modes.md
       - Prefill-Decode Disaggregation (experimental): features/pd_disaggregation.md
+      - Independent Stage Execution (experimental): features/independent_stage_execution.md
       - Sleep Mode: features/sleep_mode.md
       - HF Numerics for RL Rollouts: features/hf_numerics.md
     - Watermarking: features/watermarking.md
@@ -106,6 +107,7 @@ nav:
         - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
         - VDN-H3 Hybrid Attention: user_guide/diffusion/attention_backends/vdnh3_attn.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
+      - MiniMax-H3 LiteVAE Decoder: user_guide/diffusion/light_vae.md
       - Wan VAE Decoder Fast Path: user_guide/diffusion/vae_fast_path.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md

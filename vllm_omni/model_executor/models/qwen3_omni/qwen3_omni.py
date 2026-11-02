@@ -63,6 +63,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.qwen3_omni.talker_rows import talker_placeholder_token_ids
+from vllm_omni.model_executor.models.qwen3_omni.talker_sampler import mrv2_talker_sampler
 from vllm_omni.model_executor.models.qwen3_omni.tool_speech import spoken_span_end
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
@@ -245,6 +246,9 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Speculative sampling can change the token width between steps.
             # Keep the existing capture-stream handoff for the entire request.
             self.publishes_sampled_embeddings = self.is_staged_run and vllm_config.speculative_config is None
+            # MRv2: every Thinker output row is on the token axis before
+            # sampling, so prefix-cache hits can be merged from cached rows.
+            self.supports_mrv2_prefix_cache_outputs = True
             # Initialize thinker model (multimodal processing + text generation)
             # Create a new vllm_config with thinker_config as the hf_config
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -310,6 +314,17 @@ class Qwen3OmniMoeForConditionalGeneration(
             # next text step (see ``talker_mtp``).
             self.has_talker_mtp = True
             self._codec_codebook_size = int(talker_config.code_predictor_config.vocab_size)
+            # Codebook 0 uses V1's per-request CUDA generator (see
+            # Qwen3OmniTalkerSampler). Residual codebooks draw inside talker_mtp,
+            # which is also what V1 captures: replay advances Philox, so each
+            # step gets a fresh stream. An external uniform buffer is a different
+            # stream and, together with MRv2's murmur3 codebook-0 sampler, raises
+            # Seed-TTS word error by about 0.4 percentage points.
+            self.mtp_sample_uniforms = False
+            self.mrv2_custom_sampler = mrv2_talker_sampler
+            self.mtp_sample_steps = max(0, int(talker_config.code_predictor_config.num_code_groups) - 1)
+            self.mtp_sample_vocab_size = self._codec_codebook_size
+            self.talker_mtp_accepts_per_row_generators = True
             self._apply_subtalker_sampling_params(getattr(vllm_config.model_config, "subtalker_sampling_params", None))
 
             # Decode each stream's first frame here (see talker_first_audio_enabled).
@@ -1052,6 +1067,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
+        sample_uniforms: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+        generators: Any = None,
         **kwargs: Any,
     ):
         # TODO(Peiqi): not support intermediate_tensors now
@@ -1064,8 +1082,16 @@ class Qwen3OmniMoeForConditionalGeneration(
         # for profiling
         if inputs_embeds.shape[-1] == 2048:
             inputs_embeds = self.text_projection(inputs_embeds)
+        # One decode row per request. A longer span still samples inside the
+        # predictor; the static uniform buffer is shaped for a single step.
+        sampling_noise = sample_uniforms if input_ids.shape[-1] == 1 else None
         code_predictor_codes, summed_embeddings = self.talker.code_predictor_forward(
-            input_ids, inputs_embeds, last_talker_hidden=last_talker_hidden
+            input_ids,
+            inputs_embeds,
+            last_talker_hidden=last_talker_hidden,
+            sample_uniforms=sampling_noise,
+            generator=None if sampling_noise is not None else generator,
+            generators=None if sampling_noise is not None else generators,
         )
         # summed_embeddings is [B, seq_len, H] (3D) while text_step is [B, H] (2D).
         # Flatten to 2D first to avoid wrong broadcasting: [B,1,H]+[B,H] → [B,B,H]

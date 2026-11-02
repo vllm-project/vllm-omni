@@ -253,7 +253,8 @@ Which stages may set `enable_prefix_caching: true`:
 
 | Stage | `enable_prefix_caching` | Why |
 | --- | --- | --- |
-| AR stage with one full-attention kv group whose hidden states / per-token mm feed the next stage (Qwen3-Omni thinker and talker) | supported | The case the cache is built for: full-prompt hidden states are merged from the pool on a hit. |
+| AR stage with one full-attention kv group whose hidden states / per-token mm feed the next stage (Qwen3-Omni thinker and talker; on Model Runner V2 the thinker only) | supported | The case the cache is built for: full-prompt hidden states are merged from the pool on a hit. |
+| Model Runner V2 stage whose model does not set `supports_mrv2_prefix_cache_outputs = True` (Qwen3-Omni talker / MTP, MOSS-TTS local) | native cache only | MTP stages complete their frames after sampling and model-owned output snapshots are not mergeable, so the runner reuses native KV and never builds the stage-output cache. |
 | AR stage that sets `requires_full_prefix_cached_hidden_states = False`, optionally with `deferred_prefix_cache_mm_keys` (Qwen3-TTS talker, Higgs v3 talker) | supported | Hidden is not cached; deferred codec rows are written once on finish. |
 | AR stage that appends its mm outputs in `sample()` and sets `mm_outputs_written_in_sample = True` together with `requires_full_prefix_cached_hidden_states = False` (YuE2) | supported | The step snapshot is taken before `sample()` and cannot hold those outputs, so the runner discards the step context and builds the payload from the live outputs. KV blocks are still reused on a hit. Setting the flag without the hidden-state opt-out is refused when the policy is built. |
 | Token-only AR stage with `uses_native_kv_cache_only = True` and `requires_full_prefix_cached_hidden_states = False` (Ming3 Thinker) | native cache only | Bypasses the Omni stage-output tensor cache; native vLLM KV and aligned recurrent-state caching retain their own validation. No prefix hidden states or deferred multimodal outputs may be requested by this policy. |
@@ -289,8 +290,9 @@ Hit spans come from adapter-classified `STARTED` events for new requests:
   request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal
   to what it already computed itself. The adapter classifies an observed ID as
   `EXTENDED`, so the manager does not mark a hit: those rows were delivered in
-  earlier steps and re-emitting them would duplicate output. A
-  `delivered_upto` span for this case is Phase 2.
+  earlier steps and re-emitting them would duplicate output. On Model
+  Runner V2 the adapter also tracks a delivery watermark (below); an
+  in-order continuation starts exactly at it and produces no delivery.
 - Preemption + reschedule: for stages with `recompute_preemption="allow"`
   (the default), vLLM resets `num_computed_tokens` to 0 on
   preemption and re-runs prefix matching on resume, so the resumed request
@@ -301,9 +303,10 @@ Hit spans come from adapter-classified `STARTED` events for new requests:
   resumed request gets only the rows it recomputes, and its still-open
   deferred write keeps appending (a slot written twice keeps the later
   chunk). Cache integrity holds either way — the hit blocks already have
-  rows, from this request or the one it hit. Stages that need full prompt
-  hidden states should be sized so preemption does not occur while prefix
-  caching is on. Same as before this refactor; tracked for Phase 2.
+  rows, from this request or the one it hit. On V1, stages that need full
+  prompt hidden states should be sized so preemption does not occur while
+  prefix caching is on. On Model Runner V2 the delivery watermark keeps the
+  resumed output gapless and duplicate-free (below).
 
 Stages whose decode state cannot be reconstructed from token IDs declare
 `recompute_preemption="fail"` in their AR pipeline topology. Capacity
@@ -315,6 +318,55 @@ its reset scope, rather than the shared `drop_stale_output` flag, identifies
 that exception. Fail-mode preemption also notifies the auxiliary-output
 connector before removing the request, so the worker receives its finished
 notification and subsequent metadata assembly cannot reference a freed request.
+
+#### Model Runner V2
+
+MRv2 keeps its block table on the device only (`BlockTables` is a staged
+device tensor), so the runner does not mirror it on the host. Instead the
+adapter is built with `track_requests=True` and keeps, per live request,
+its group-0 block ids from the scheduler output it already translates: a new
+request (or a resume re-entering `scheduled_new_reqs`) sets the list,
+`new_block_ids` of a running request extends it, `resumed_req_ids` replaces
+it, preemption drops it. `MRv2FullAttentionGroupView` derives step slots
+from that ledger and the `InputBatch` bound for the step being saved
+(`num_computed_tokens_np`, `num_scheduled_tokens`), with no device read.
+`check_mrv2_prefix_cache_layout` refuses DCP and a block-size mismatch at
+kv-cache init.
+
+The same adapter tracks a delivery watermark: the number of leading rows
+already emitted for each request. A re-entry whose first position differs
+from it yields a `PrefixCacheDelivery`:
+
+- start above the watermark (a resume that hit more than it had delivered):
+  the manager registers a replay span `[watermark, start)` over the new
+  blocks, so the gap is served from the cache ahead of this step's rows;
+- start below it (a resume that recomputes delivered rows): `trim` leading
+  rows of this step's slice are dropped from the merged output.
+
+Only steps with a hit, replay or trim keep their step id
+(`step_rewrite_req_ids`). The rewrite rides the async output's existing
+`finalize_output` hook: once the host payloads are built, and before they are
+published to the next stage, it materializes the step with
+`include_uncached=False` and replaces the cached keys in the rewritten
+requests' payloads (`hidden` plus flattened mm keys, in the full-payload and
+`async_chunk` channels alike). Every other step is discarded in
+`sample_tokens`, so misses keep the plain output path. An output that fails
+before its finalizer is fatal to the engine; its step id is released with the
+manager at shutdown. A rewrite on an output the runner cannot merge (a
+post-sample finalizer, which includes model-owned `RequestOutputSnapshot`s,
+or in-stage streaming audio) raises `OmniPrefixCacheUnmatchError`. Staging
+depth is raised to `2 * max_concurrent_batches + 1` to cover outputs still in
+flight.
+
+All of this lives in `MRv2PrefixCacheMixin`
+(`vllm_omni/worker_v2/prefix_cache.py`), which takes the cache lifecycle
+through the runner's `load_model` / `initialize_kv_cache` / `shutdown`
+chain. The runners only call `_prefix_cache_step_begin` before retiring
+finished requests, `_prefix_cache_save_mrv2` after postprocess, and
+`_prefix_cache_output_finalizer` when building the async output.
+
+Duplex sessions on MRv2 commit each utterance as a fresh request, so they
+use this path unchanged. The NPU MRv2 runner does not build the cache.
 
 Fish Omni retains the default `allow` policy: its MRv2 model state saves the
 generated codebooks before a slot is reused and restores full frame rows on
@@ -446,5 +498,6 @@ Threads, locks, and what each may block on:
 
 - `vllm_omni/core/prefix_cache/`
 - `vllm_omni/worker/gpu_model_runner.py` (`_ensure_omni_prefix_cache`)
-- `tests/core/test_prefix_cache.py`
+- `vllm_omni/worker_v2/prefix_cache.py` (`MRv2PrefixCacheMixin`, `PrefixCacheRewrite`)
+- `tests/core/test_prefix_cache.py`, `tests/core/test_prefix_cache_mrv2.py`
 - [Async Omni Output Materialization](omni_async_output_materialization.md)

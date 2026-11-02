@@ -92,6 +92,7 @@ def test_graph_vae_updates_only_active_context_and_keeps_last_patch():
     owner.active_slots = torch.tensor([True, False, False])
     owner.model = SimpleNamespace(
         _patch_size=2,
+        _vae_dtype=torch.float32,
         _get_vae_decode_sr_cond=lambda _: None,
         tts=SimpleNamespace(
             audio_vae=SimpleNamespace(
@@ -179,6 +180,8 @@ def test_incremental_tail_flush_rejects_already_scheduled_extra_step(monkeypatch
     owner.model = SimpleNamespace(
         _patch_size=2,
         _audio_emit_every=3,
+        # decode_patch reads the deployment-dtype contract unconditionally.
+        _vae_dtype=torch.float32,
         tts=SimpleNamespace(audio_vae=vae),
         _get_vae_decode_sr_cond=lambda _: None,
         _audio_length_limit_reached=lambda computed, scheduled, limits: computed + scheduled + 1 >= limits,
