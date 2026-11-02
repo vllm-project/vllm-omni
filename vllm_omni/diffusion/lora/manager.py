@@ -30,6 +30,8 @@ from vllm_omni.diffusion.lora.utils import (
     _match_target_modules,
     from_layer_diffusion,
 )
+from vllm_omni.lora.merged_weights import MergedLinearWeights
+from vllm_omni.lora.request import TensorLoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
@@ -88,6 +90,8 @@ class DiffusionLoRAManager:
     _active_adapter_id: int | None = None
     _suspended_adapter_id: int | None = None
     _max_num_batched_tokens: int | None = None
+    lora_application: str = "runtime"
+    _merged_bank: MergedLinearWeights | None = None
 
     def __init__(
         self,
@@ -98,6 +102,7 @@ class DiffusionLoRAManager:
         lora_path: str | None = None,
         lora_scale: float = 1.0,
         max_num_batched_tokens: int | None = None,
+        lora_application: str = "runtime",
     ):
         """
         Initialize the DiffusionLoRAManager.
@@ -108,10 +113,15 @@ class DiffusionLoRAManager:
                 exposed to users via `OmniDiffusionConfig.max_cpu_loras`.
             max_num_batched_tokens: Preallocated token-mapping capacity for MoE
                 LoRA forwards.
+            lora_application: Runtime adapters or one globally merged policy.
         """
         self.pipeline = pipeline
         self.device = device
-        self.dtype = dtype
+        if lora_application not in ("runtime", "merged"):
+            raise ValueError("lora_application must be 'runtime' or 'merged'")
+        self.lora_application = lora_application
+        self.dtype = torch.float32 if lora_application == "merged" else dtype
+        self._merged_bank = MergedLinearWeights() if lora_application == "merged" else None
         if max_num_batched_tokens is not None and (
             type(max_num_batched_tokens) is not int or max_num_batched_tokens <= 0
         ):
@@ -163,6 +173,8 @@ class DiffusionLoRAManager:
         self._fixed_adapter = getattr(pipeline, "diffusion_lora_fixed_adapter", False) is True
         self._fixed_adapter_request: LoRARequest | None = None
         self._scale_in_epilogue = getattr(pipeline, "diffusion_lora_scale_in_epilogue", False) is True
+        if lora_application == "merged" and (self._fixed_adapter or self._scale_in_epilogue):
+            raise ValueError("Generic merged LoRA does not support a pipeline's fixed-adapter specialization")
 
         logger.info(
             "Initializing DiffusionLoRAManager: device=%s, dtype=%s, max_cached_adapters=%d, static_lora_path=%s",
@@ -197,6 +209,10 @@ class DiffusionLoRAManager:
 
     def set_request_adapter(self, request: LoRARequest | None, scale: float = 1.0) -> None:
         """Apply request selection, preserving a pipeline's fixed student."""
+        if self.lora_application == "merged":
+            if request is not None:
+                raise ValueError("Merged LoRA uses a global policy; generate without a LoRARequest")
+            return
         if self._fixed_adapter:
             request, scale = self._fixed_adapter_request, 1.0
         self.set_active_adapter(request, scale)
@@ -221,6 +237,8 @@ class DiffusionLoRAManager:
         if self._closed:
             return
         self._closed = True
+        if self._merged_bank is not None:
+            self._merged_bank.close()
         unbind = getattr(self.pipeline, "_bind_diffusion_lora_manager", None)
         try:
             if callable(unbind):
@@ -232,8 +250,9 @@ class DiffusionLoRAManager:
                 bank.close()
             except Exception:
                 logger.exception("Failed to release merged diffusion LoRA weights")
-        for name, layer in self._lora_modules.items():
-            replace_submodule(self.pipeline, name, layer.base_layer)
+        if self.lora_application == "runtime":
+            for name, layer in self._lora_modules.items():
+                replace_submodule(self.pipeline, name, layer.base_layer)
         self._merged_adapters.clear()
         self._lora_modules.clear()
         self._registered_adapters.clear()
@@ -375,6 +394,12 @@ class DiffusionLoRAManager:
         """
         if self._closed:
             raise RuntimeError("Diffusion LoRA manager is closed")
+        if self.lora_application == "merged":
+            if lora_request is None:
+                self.reset_merged_adapter()
+            else:
+                self.merge_adapter(lora_request, lora_scale)
+            return
         if lora_request is None:
             if self._active_adapter_id is None:
                 logger.debug("No lora_request provided and adapters are already inactive")
@@ -410,6 +435,71 @@ class DiffusionLoRAManager:
 
         self._activate_adapter(adapter_id, lora_scale)
 
+    def prepare_merged_adapter(
+        self, request: LoRARequest, scale: float = 1.0
+    ) -> tuple[LoRAModel, dict[str, torch.Tensor]]:
+        """Prepare an adapter without changing the live dense policy.
+
+        Args:
+            request: A checkpoint or native tensor adapter request.
+            scale: External multiplier applied in fp32.
+
+        Returns:
+            Loaded adapter and complete dense values for ``commit_merged_adapter``.
+
+        Raises:
+            ValueError: Adapter configuration, names, shapes or values are invalid.
+        """
+        if self._merged_bank is None or self._closed:
+            raise ValueError("An open manager with lora_application='merged' is required")
+        if not math.isfinite(scale):
+            raise ValueError("Merged LoRA scale must be finite")
+        model, config = self._load_adapter(request)
+        self._replace_layers_with_lora(config)
+        try:
+            self._bind_adapter_weights(model, scale)
+            prepared = self._merged_bank.prepare(self._lora_modules)
+        finally:
+            for layer in self._lora_modules.values():
+                layer.suspend_lora()
+        return model, prepared
+
+    def commit_merged_adapter(
+        self,
+        model: LoRAModel,
+        prepared: dict[str, torch.Tensor],
+        group: torch.distributed.ProcessGroup | None = None,
+    ) -> None:
+        """Commit a prepared adapter after every participating rank validated it.
+
+        Args:
+            model: Adapter returned by ``prepare_merged_adapter``.
+            prepared: Dense values returned alongside that adapter.
+            group: Optional CPU process group coordinating commit failures.
+        """
+        assert self._merged_bank is not None
+        self._merged_bank.apply(prepared, group=group)
+        self._registered_adapters = {model.id: model}
+
+    def merge_adapter(self, request: LoRARequest, scale: float = 1.0) -> None:
+        """Merge a static adapter while inference is quiescent.
+
+        Args:
+            request: Checkpoint or tensor adapter request.
+            scale: External multiplier applied in fp32.
+        """
+        model, prepared = self.prepare_merged_adapter(request, scale)
+        self.commit_merged_adapter(model, prepared)
+
+    def reset_merged_adapter(self) -> None:
+        """Restore the pristine base and discard policy state before a base reload."""
+        if self._merged_bank is not None:
+            self._merged_bank.close()
+        self._registered_adapters.clear()
+        self._adapter_scales.clear()
+        self._adapter_access_order.clear()
+        self._pinned_adapters.clear()
+
     def _touch_adapter_info(self, adapter_id):
         """Update the current caching ordering info."""
         self._adapter_access_order[adapter_id] = time.time()
@@ -439,6 +529,37 @@ class DiffusionLoRAManager:
 
         logger.debug("Supported LoRA modules: %s", self._expected_lora_modules)
 
+        if isinstance(lora_request, TensorLoRARequest):
+            if self.lora_application != "merged":
+                raise ValueError("TensorLoRARequest requires lora_application='merged'")
+            if not lora_request.lora_tensors or not lora_request.peft_config:
+                raise ValueError("TensorLoRARequest requires lora_tensors and peft_config")
+            peft_helper = PEFTHelper.from_dict(lora_request.peft_config)
+            peft_helper.validate_legal(
+                LoRAConfig(max_lora_rank=self._get_smallest_valid_max_rank(peft_helper.r), lora_dtype=self.dtype)
+            )
+            if peft_helper.modules_to_save:
+                raise ValueError("Merged LoRA supports A/B adapters only, without modules_to_save")
+            lora_model = LoRAModel.from_lora_tensors(
+                lora_model_id=lora_request.lora_int_id,
+                tensors={
+                    name: tensor.to(device="cpu", dtype=self.dtype, copy=True)
+                    for name, tensor in lora_request.lora_tensors.items()
+                },
+                peft_helper=peft_helper,
+                device="cpu",
+                dtype=self.dtype,
+                weights_mapper=getattr(self.pipeline, "hf_to_vllm_mapper", None),
+            )
+            for weights in lora_model.loras.values():
+                if weights.lora_a is None or weights.lora_b is None:
+                    raise ValueError(f"Missing A/B pair for {weights.module_name}")
+                if weights.lora_a.ndim != 2 or weights.lora_b.ndim != 2:
+                    raise ValueError(f"LoRA factors must be matrices: {weights.module_name}")
+                if weights.lora_a.shape[0] != weights.rank or weights.lora_b.shape[1] != weights.rank:
+                    raise ValueError(f"LoRA factor rank does not match PEFT config: {weights.module_name}")
+            return lora_model, peft_helper
+
         lora_path = get_adapter_absolute_path(lora_request.lora_path)
         logger.debug("Resolved LoRA path: %s", lora_path)
 
@@ -465,7 +586,7 @@ class DiffusionLoRAManager:
                 device="cpu",  # consistent w/ vllm's behavior
                 dtype=self.dtype,
                 model_vocab_size=None,
-                weights_mapper=None,
+                weights_mapper=getattr(self.pipeline, "hf_to_vllm_mapper", None),
             )
         else:
             lora_model, peft_helper = loaded
@@ -484,7 +605,7 @@ class DiffusionLoRAManager:
             list(lora_model.loras.keys()),
         )
 
-        if not getattr(self, "_scale_in_epilogue", False):
+        if self.lora_application == "runtime" and not getattr(self, "_scale_in_epilogue", False):
             for lora in lora_model.loras.values():
                 lora.optimize()  # ref: _create_merged_loras_inplace, internal scaling
 
@@ -579,7 +700,7 @@ class DiffusionLoRAManager:
                 if any(module_name == p or module_name.startswith(p + ".") for p in moe_runner_module_names):
                     continue
 
-                full_module_name = f"{component_name}.{module_name}"
+                full_module_name = f"{component_name}.{module_name}" if component_name else module_name
                 if full_module_name in self._lora_modules:
                     logger.debug("Layer %s already replaced, skipping", full_module_name)
                     continue
@@ -619,6 +740,13 @@ class DiffusionLoRAManager:
                 pending_replacements.append((module_name, full_module_name, module, packed_modules_list))
 
             for module_name, full_module_name, module, packed_modules_list in pending_replacements:
+                if self.lora_application == "merged":
+                    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+                    if isinstance(module, MoERunner) or not isinstance(
+                        getattr(module, "quant_method", None), UnquantizedLinearMethod
+                    ):
+                        raise ValueError(f"Merged LoRA requires unquantized linear layers: {full_module_name}")
                 lora_layer = from_layer_diffusion(
                     layer=module,
                     max_loras=1,
@@ -634,7 +762,8 @@ class DiffusionLoRAManager:
                     set_buffer_device = getattr(lora_layer, "_set_diffusion_lora_buffer_device", None)
                     if callable(set_buffer_device):
                         set_buffer_device(self._resident_lora_device)
-                    replace_submodule(component, module_name, lora_layer)
+                    if self.lora_application == "runtime":
+                        replace_submodule(component, module_name, lora_layer)
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
 
@@ -649,6 +778,8 @@ class DiffusionLoRAManager:
             return
         if self._max_lora_rank <= 0:
             self._ensure_max_lora_rank(min(self._VALID_MAX_RANKS))
+        if self.lora_application == "merged":
+            return
         self._replace_moe_runners_with_lora()
         self._publish_moe_lora_context()
 
@@ -799,6 +930,7 @@ class DiffusionLoRAManager:
         # Track successful bindings for generic and model-specific validation.
         lora_names_by_id = {id(weights): name for name, weights in lora_model.loras.items()}
         bound_lora_names: set[str] = set()
+        binding_scale = 1.0 if self.lora_application == "merged" else scale
 
         def _record_bound(weights: LoRALayerWeights | PackedLoRALayerWeights) -> None:
             name = lora_names_by_id.get(id(weights))
@@ -808,6 +940,13 @@ class DiffusionLoRAManager:
         # activate weights in each LoRA layer
         for full_module_name, lora_layer in self._lora_modules.items():
             lora_weights = self._get_lora_weights(lora_model, full_module_name)
+            if self.lora_application == "merged" and lora_weights is not None:
+                scaling = (
+                    lora_weights.scaling
+                    if isinstance(lora_weights, PackedLoRALayerWeights)
+                    else [lora_weights.scaling] * getattr(lora_layer, "n_slices", 1)
+                )
+                lora_layer._merged_lora_scales = tuple(0.0 if value is None else value * scale for value in scaling)
             # MoE weights need per-expert gathering before the dense binding path.
             if self._bind_moe_adapter_weights(
                 full_module_name=full_module_name,
@@ -851,9 +990,13 @@ class DiffusionLoRAManager:
                             lora_b_list.append(None)
                             continue
                         lora_a_list.append(sub_lora.lora_a)
-                        lora_b_list.append(sub_lora.lora_b * scale)
+                        lora_b_list.append(sub_lora.lora_b * binding_scale)
 
                     lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
+                    if self.lora_application == "merged":
+                        lora_layer._merged_lora_scales = tuple(
+                            0.0 if sub is None else sub.scaling * scale for sub in sub_loras
+                        )
                     for sub_lora in sub_loras:
                         if sub_lora is not None:
                             _record_bound(sub_lora)
@@ -879,7 +1022,7 @@ class DiffusionLoRAManager:
             if isinstance(lora_weights, PackedLoRALayerWeights):
                 lora_a_list = lora_weights.lora_a
                 lora_b_list = [
-                    None if b is None else b * scale  # type: ignore[operator]
+                    None if b is None else b * binding_scale  # type: ignore[operator]
                     for b in lora_weights.lora_b
                 ]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
@@ -942,7 +1085,7 @@ class DiffusionLoRAManager:
                     b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
 
                 lora_a_list = [lora_weights.lora_a] * n_slices
-                lora_b_list = [b * scale for b in b_splits]
+                lora_b_list = [b * binding_scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
                 _record_bound(lora_weights)
                 logger.debug(
@@ -952,7 +1095,7 @@ class DiffusionLoRAManager:
                 )
                 continue
 
-            scaled_lora_b = lora_weights.lora_b * scale
+            scaled_lora_b = lora_weights.lora_b * binding_scale
             lora_layer.set_lora(index=0, lora_a=lora_weights.lora_a, lora_b=scaled_lora_b)
             _record_bound(lora_weights)
             logger.debug(
@@ -1275,6 +1418,8 @@ class DiffusionLoRAManager:
         """
         Add a new adapter to the cache without activating it.
         """
+        if self.lora_application == "merged":
+            raise ValueError("Use a weight-update session for merged LoRA; add_lora is for runtime adapters")
         adapter_id = lora_request.lora_int_id
 
         if adapter_id in self._registered_adapters:
@@ -1306,6 +1451,9 @@ class DiffusionLoRAManager:
         if adapter_id not in self._registered_adapters:
             logger.debug("Adapter %d not found, cannot remove", adapter_id)
             return False
+        if self.lora_application == "merged":
+            self.reset_merged_adapter()
+            return True
         if self._fixed_adapter_request is not None and adapter_id == self._fixed_adapter_request.lora_int_id:
             return False
 
