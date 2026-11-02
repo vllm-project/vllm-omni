@@ -29,7 +29,11 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 imp
     DistributedAutoencoderKLQwenImage21,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -1623,8 +1627,10 @@ class QwenImage21Pipeline(
             negative_kwargs = None
 
         step_indices = {state.step_index for state in states}
-        set_forward_context_denoise_step_idx(next(iter(step_indices)) if len(step_indices) == 1 else None)
+        forward_context = get_forward_context() if is_forward_context_available() else None
+        previous_step = forward_context.denoise_step_idx if forward_context is not None else None
         try:
+            set_forward_context_denoise_step_idx(next(iter(step_indices)) if len(step_indices) == 1 else None)
             noise_pred = self.predict_noise_maybe_with_cfg(
                 input_batch.do_true_cfg,
                 input_batch.true_cfg_scale,
@@ -1634,7 +1640,9 @@ class QwenImage21Pipeline(
                 output_slice=latents.size(1),
             )
         finally:
-            set_forward_context_denoise_step_idx(None)
+            if forward_context is not None:
+                # Do not reactivate paged KV (or mask an error) while restoring.
+                forward_context.denoise_step_idx = previous_step
 
         if take_ownership:
             # Remember the padded VLM length baked into the per-request KV so a

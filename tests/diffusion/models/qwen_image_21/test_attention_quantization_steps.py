@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise step selectors through both Qwen2.1 denoising entry points."""
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from torch import nn
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.forward_context import get_forward_context, set_forward_context
+from vllm_omni.diffusion.forward_context import get_forward_context, override_forward_context, set_forward_context
 from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import QwenImage21CFGParallelMixin
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import QwenImage21Pipeline
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -86,28 +88,30 @@ def _diffuse(pipe: _Loop, do_true_cfg: bool = False) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("do_true_cfg", [False, True])
-def test_loop_publishes_step_indices_and_resets_between_requests(do_true_cfg):
+@pytest.mark.parametrize("previous_step", [None, 0, 9])
+def test_loop_publishes_step_indices_and_restores_between_requests(do_true_cfg, previous_step):
     config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0,2")
     pipe = _Loop(_attention(config))
     expected = [(0, "float"), (1, "mxfp8"), (2, "float"), (3, "mxfp8")]
     if do_true_cfg:
         expected = [entry for entry in expected for _ in range(2)]
-    with set_forward_context(omni_diffusion_config=config):
+    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=previous_step):
         for _ in range(2):
             pipe.seen.clear()
             _diffuse(pipe, do_true_cfg)
             assert pipe.seen == expected
-            assert get_forward_context().denoise_step_idx is None
+            assert get_forward_context().denoise_step_idx == previous_step
     assert pipe.transformer.releases == 2
 
 
-def test_loop_clears_step_context_after_failure():
+@pytest.mark.parametrize("previous_step", [None, 0, 9])
+def test_loop_restores_step_context_after_failure(previous_step):
     config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0")
     pipe = _Loop(_attention(config), fail_at=1)
-    with set_forward_context(omni_diffusion_config=config):
+    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=previous_step):
         with pytest.raises(RuntimeError, match="denoise failed"):
             _diffuse(pipe)
-        assert get_forward_context().denoise_step_idx is None
+        assert get_forward_context().denoise_step_idx == previous_step
     assert pipe.transformer.releases == 1
 
 
@@ -156,7 +160,8 @@ def test_step_mode_publishes_request_step(monkeypatch, step, expected):
 
 
 @pytest.mark.parametrize("skip_steps", [None, "0,2"])
-def test_step_mode_separates_quantization_steps_without_reordering_rows(monkeypatch, skip_steps):
+@pytest.mark.parametrize("previous_step", [None, 0, 9])
+def test_step_mode_separates_quantization_steps_without_reordering_rows(monkeypatch, skip_steps, previous_step):
     config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps=skip_steps)
     pipe = _step_pipeline(config)
     attention = _attention(config)
@@ -175,8 +180,9 @@ def test_step_mode_separates_quantization_steps_without_reordering_rows(monkeypa
         return hidden
 
     monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
-    with set_forward_context(omni_diffusion_config=config):
+    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=previous_step):
         result = pipe.denoise_step(InputBatch.make_batch(states))
+        assert get_forward_context().denoise_step_idx == previous_step
     torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 2.0, 3.0]))
     expected: list[tuple[int | None, str, int]]
     if skip_steps:
@@ -214,7 +220,8 @@ def test_native_decode_ignores_step_selector_but_preserves_prefix_groups(monkeyp
     torch.testing.assert_close(result[:, 0, 0], torch.tensor([1.0, 2.0, 2.0, 3.0], dtype=torch.bfloat16))
 
 
-def test_step_mode_clears_context_after_failure(monkeypatch):
+@pytest.mark.parametrize("previous_step", [None, 0, 9])
+def test_step_mode_restores_context_after_failure(monkeypatch, previous_step):
     config = OmniDiffusionConfig(diffusion_kv_cache_dtype="mxfp8", diffusion_kv_cache_skip_steps="0")
     pipe = _step_pipeline(config)
 
@@ -223,10 +230,85 @@ def test_step_mode_clears_context_after_failure(monkeypatch):
         raise RuntimeError("denoise failed")
 
     monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
-    with set_forward_context(omni_diffusion_config=config):
+    with set_forward_context(omni_diffusion_config=config, denoise_step_idx=previous_step):
         with pytest.raises(RuntimeError, match="denoise failed"):
             pipe.denoise_step(InputBatch.make_batch([_state("a", 1, 1.0)]))
-        assert get_forward_context().denoise_step_idx is None
+        assert get_forward_context().denoise_step_idx == previous_step
+
+
+def _entry_point(monkeypatch, config, mode, predict):
+    pipe = _Loop(_attention(config)) if mode == "request" else _step_pipeline(config)
+    monkeypatch.setattr(pipe, "predict_noise_maybe_with_cfg", predict)
+    if mode == "request":
+        return lambda: _diffuse(pipe)
+    return lambda: pipe.denoise_step(InputBatch.make_batch([_state("inner", 1, 1.0)]))
+
+
+@pytest.mark.parametrize("mode", ["request", "step"])
+@pytest.mark.parametrize("failure", [None, "activation", "forward"])
+@pytest.mark.parametrize("previous_step", [None, 0, 9])
+def test_restoration_does_not_reactivate_runtime(monkeypatch, mode, failure, previous_step):
+    config = OmniDiffusionConfig()
+    runtime = Mock()
+    if failure == "activation":
+        runtime.ensure_active.side_effect = RuntimeError("activation failed")
+
+    def predict(*args, **kwargs):
+        if failure == "forward":
+            raise RuntimeError("forward failed")
+        return args[2]["hidden_states"]
+
+    run = _entry_point(monkeypatch, config, mode, predict)
+    with set_forward_context(denoise_step_idx=previous_step, paged_kv_runtime=runtime):
+        if failure:
+            with pytest.raises(RuntimeError, match=f"{failure} failed"):
+                run()
+        else:
+            run()
+        assert get_forward_context().denoise_step_idx == previous_step
+    expected_steps = [0, 1, 2, 3] if mode == "request" else [1]
+    if failure:
+        expected_steps = expected_steps[:1]
+    assert [call.args[0] for call in runtime.ensure_active.call_args_list] == expected_steps
+
+
+@pytest.mark.parametrize("mode", ["request", "step"])
+@pytest.mark.parametrize("inner_fails", [False, True])
+def test_nested_calls_restore_outer_step(monkeypatch, mode, inner_fails):
+    config = OmniDiffusionConfig()
+
+    def inner_predict(*args, **kwargs):
+        assert get_forward_context().denoise_step_idx in (0, 1, 2, 3)
+        if inner_fails:
+            raise RuntimeError("inner failed")
+        return args[2]["hidden_states"]
+
+    inner = _entry_point(monkeypatch, config, mode, inner_predict)
+
+    def outer_predict(*args, **kwargs):
+        outer_step = get_forward_context().denoise_step_idx
+        if inner_fails:
+            with pytest.raises(RuntimeError, match="inner failed"):
+                inner()
+        else:
+            inner()
+        assert get_forward_context().denoise_step_idx == outer_step
+        return args[2]["hidden_states"]
+
+    outer = _entry_point(monkeypatch, config, mode, outer_predict)
+    with set_forward_context(denoise_step_idx=9):
+        outer()
+        assert get_forward_context().denoise_step_idx == 9
+
+
+@pytest.mark.parametrize("mode", ["request", "step"])
+def test_entry_without_forward_context(monkeypatch, mode):
+    def predict(*args, **kwargs):
+        return args[2]["hidden_states"]
+
+    run = _entry_point(monkeypatch, OmniDiffusionConfig(), mode, predict)
+    with override_forward_context(None):
+        assert run().shape == (1, 2, 4)
 
 
 def test_step_mode_groups_mixed_prefix_lengths_and_steps(monkeypatch):
