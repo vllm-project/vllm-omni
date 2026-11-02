@@ -111,7 +111,6 @@ def test_resolved_wan_stage_fails_before_device_discovery(monkeypatch):
 @pytest.mark.parametrize(
     ("factory_function", "module_name", "class_name"),
     (
-        ("_create_shm_connector", "shm_connector", "SharedMemoryConnector"),
         ("_create_mooncake_store_connector", "mooncake_store_connector", "MooncakeStoreConnector"),
         ("_create_yuanrong_connector", "yuanrong_connector", "YuanrongConnector"),
         (
@@ -136,17 +135,15 @@ def test_factory_preserves_lazy_backend_import_paths(
     constructor = mocker.Mock(return_value=object())
     backend = ModuleType(module_name)
     setattr(backend, class_name, constructor)
-    package = ModuleType("connectors")
-    setattr(package, module_name, backend)
     original_import = builtins.__import__
     attempts = []
 
     def import_backend(name, globals=None, locals=None, fromlist=(), level=0):
-        if globals and globals.get("__name__") == factory.__name__ and module_name in (fromlist or ()):
+        if globals and globals.get("__name__") == factory.__name__ and class_name in (fromlist or ()):
             attempts.append((name, level))
             if level == 1 and use_fallback:
                 raise ImportError("exercise the existing fallback")
-            return package
+            return backend
         return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", import_backend)
@@ -154,7 +151,9 @@ def test_factory_preserves_lazy_backend_import_paths(
     result = getattr(factory, factory_function)(config)
     assert result is constructor.return_value
     constructor.assert_called_once_with(config)
-    assert attempts == ([("connectors", 1), ("omni_connectors.connectors", 0)] if use_fallback else [("connectors", 1)])
+    relative = (f"connectors.{module_name}", 1)
+    fallback = (f"omni_connectors.connectors.{module_name}", 0)
+    assert attempts == ([relative, fallback] if use_fallback else [relative])
 
 
 def test_factory_fallback_preserves_exported_types(monkeypatch):
@@ -192,3 +191,78 @@ def test_factory_fallback_preserves_exported_types(monkeypatch):
     assert probe.OmniConnectorBase is base.OmniConnectorBase
     assert probe.ConnectorSpec is config.ConnectorSpec
     assert fallbacks == ["omni_connectors.connectors", "omni_connectors.utils"]
+
+
+def test_shm_factory_uses_platform_hook(mocker):
+    from vllm_omni.distributed.omni_connectors import factory
+    from vllm_omni.platforms import current_omni_platform
+
+    constructor = mocker.Mock(return_value=object())
+    select = mocker.patch.object(current_omni_platform, "get_shared_memory_connector_cls", return_value=constructor)
+    config = {"host": "127.0.0.1"}
+    assert factory._create_shm_connector(config) is constructor.return_value
+    select.assert_called_once_with()
+    constructor.assert_called_once_with(config)
+
+
+@pytest.mark.parametrize("connector_config", ({}, {"host": "127.0.0.1"}, {"type": None}, {"type": ""}, {"type": 42}))
+def test_payload_connector_requires_explicit_type(connector_config):
+    with pytest.raises(ValueError, match="Stage 1.*requires.*'type'"):
+        OmniDiffusionConfig(
+            stage_id=1,
+            stage_input_payload_keys=("prompt_embeds",),
+            omni_kv_config={"connector_config": connector_config},
+        )
+
+
+def test_unknown_payload_connector_is_not_reported_as_unsupported():
+    with pytest.raises(ValueError, match="Unknown connector: UnknownPayloadConnector.*Available:.*NixlConnector"):
+        _config("UnknownPayloadConnector", stage_input_payload_keys=("prompt_embeds",))
+
+
+def test_custom_payload_error_explains_registration():
+    with pytest.raises(ValueError, match="supports_deadline_receive=True"):
+        _config("MooncakeConnector", stage_input_payload_keys=("prompt_embeds",))
+
+
+@pytest.mark.parametrize(
+    ("name", "module_name", "class_name"),
+    (
+        ("SharedMemoryConnector", "shm_connector", "SharedMemoryConnector"),
+        ("NixlConnector", "nixl_connector", "NixlConnector"),
+        ("MooncakeStoreConnector", "mooncake_store_connector", "MooncakeStoreConnector"),
+        ("MooncakeConnector", "mooncake_store_connector", "MooncakeStoreConnector"),
+        ("MooncakeTransferEngineConnector", "mooncake_transfer_engine_connector", "MooncakeTransferEngineConnector"),
+        ("MoriTransferEngineConnector", "mori_transfer_engine_connector", "MoriTransferEngineConnector"),
+        ("YuanrongConnector", "yuanrong_connector", "YuanrongConnector"),
+        ("YuanrongTransferEngineConnector", "yuanrong_transfer_engine_connector", "YuanrongTransferEngineConnector"),
+    ),
+)
+def test_builtin_deadline_capability_matches_implementation(name, module_name, class_name):
+    import importlib
+
+    from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
+
+    prefix = (
+        "vllm_omni.platforms.npu.omni_connectors"
+        if name == "YuanrongTransferEngineConnector"
+        else "vllm_omni.distributed.omni_connectors.connectors"
+    )
+    try:
+        module = importlib.import_module(f"{prefix}.{module_name}")
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.split(".")[0] in {"mooncake", "mori", "datasystem", "yr", "torch_npu", "nixl"}:
+            pytest.skip(f"optional native dependency unavailable: {exc.name}")
+        raise
+    connector_cls = getattr(module, class_name)
+    assert OmniConnectorFactory.supports_deadline_receive(name) == (
+        connector_cls.get_with_deadline is not OmniConnectorBase.get_with_deadline
+    )
+
+
+def test_platform_shm_implements_deadline_receive():
+    from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
+    from vllm_omni.platforms import current_omni_platform
+
+    connector_cls = current_omni_platform.get_shared_memory_connector_cls()
+    assert connector_cls.get_with_deadline is not OmniConnectorBase.get_with_deadline

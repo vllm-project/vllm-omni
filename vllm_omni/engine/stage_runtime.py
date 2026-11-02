@@ -74,6 +74,7 @@ from vllm_omni.engine.stage_init_utils import (
     prepare_engine_environment,
     release_device_locks,
     stage_runtime_env,
+    validate_diffusion_stage_payload_topology,
 )
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
@@ -696,6 +697,7 @@ class StageRuntime:
         replicas_per_stage, replica_devices_map = compute_replica_layout(self._stage_configs)
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self._model, self._config_path)
+        validate_diffusion_stage_payload_topology(self._stage_configs, omni_transfer_config)
         stage_plans = self._build_logical_stage_init_plans(
             omni_transfer_config,
             replicas_per_stage,
