@@ -35,6 +35,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _FakeToken2Wav:
     def __init__(self, path, **kwargs):
+        self.device = (
+            "cuda"
+            if current_omni_platform.is_cuda()
+            else "npu"
+            if current_omni_platform.is_npu()
+            else current_omni_platform.device_type or "cpu"
+        )
         self.path = path
         self.kwargs = kwargs
         self.device_spk_calls = 0
@@ -57,8 +64,9 @@ class _FakeToken2Wav:
     def flow(self):
         estimator = SimpleNamespace()
         decoder = SimpleNamespace(estimator=estimator)
+        device = torch.device("privateuseone" if self.device == "npu" else self.device)
         return SimpleNamespace(
-            parameters=lambda: iter([SimpleNamespace(device="cuda")]),
+            parameters=lambda: iter([SimpleNamespace(device=device)]),
             decoder=decoder,
         )
 
@@ -78,6 +86,7 @@ def tensorrt_importable(monkeypatch):
 @pytest.fixture(params=["cuda", "npu"])
 def device_platform(monkeypatch, request):
     """Exercise each device speaker backend without loading model assets."""
+    monkeypatch.setattr(current_omni_platform, "device_type", request.param)
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: request.param == "npu")
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: request.param == "cuda")
 
@@ -128,6 +137,17 @@ def test_unset_or_true_enables_the_device_embedding(tmp_path, monkeypatch, devic
 def test_invalid_value_is_rejected(tmp_path, monkeypatch, device_platform, value):
     with pytest.raises(ValueError, match="token2wav_device_spk"):
         _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": value})
+
+
+@pytest.mark.parametrize("value", [None, False, True])
+def test_other_torch_accelerator_honors_device_speaker_flag(tmp_path, monkeypatch, value):
+    monkeypatch.setattr(current_omni_platform, "device_type", "mps")
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    extra = {} if value is None else {"token2wav_device_spk": value}
+    _, token2wav = _build_backend(tmp_path, monkeypatch, extra)
+    assert token2wav.device_spk_calls == int(value is True)
+    assert token2wav.trt_spk_calls == 0
 
 
 def test_invalid_value_is_rejected_off_device_too(tmp_path, monkeypatch):
