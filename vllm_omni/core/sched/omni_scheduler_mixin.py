@@ -352,6 +352,14 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         if not isinstance(self._generation_always_wait_target_batch, bool):
             raise ValueError("generation_always_wait_target_batch must be a boolean")
 
+    def _generation_batch_ready(self, runnable: set[str]) -> bool:
+        """Optionally cap the target at the registered request population."""
+        target = self._generation_min_batch_size
+        if getattr(self, "_generation_always_wait_target_batch", False):
+            target = min(target, len(self.requests))
+            return len(runnable) >= target
+        return len(runnable) >= target or len(self.requests) < target
+
     def _get_coalescing_ready_request_ids(
         self, connector_outputs: Iterable[OmniConnectorOutput] = ()
     ) -> set[str] | None:

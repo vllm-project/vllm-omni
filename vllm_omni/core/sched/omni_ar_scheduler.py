@@ -456,7 +456,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             for req_id in ready
             if (request := self.requests.get(req_id)) is not None
             and request.status in (RequestStatus.RUNNING, RequestStatus.WAITING, RequestStatus.PREEMPTED)
-            and not request.is_finished()
         }
 
     def _should_defer_ar_generation(self, ready_ids: set[str]) -> bool:
@@ -466,12 +465,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not max_wait or target <= 1 or self._pause_state != PauseState.UNPAUSED:
             self._generation_batch_deadline = None
             return False
-        if self._generation_always_wait_target_batch:
-            target = min(target, len(self.requests))
-            release = len(ready_ids) >= target
-        else:
-            release = len(ready_ids) >= target or len(self.requests) < target
-        if not ready_ids or release:
+        if not ready_ids or self._generation_batch_ready(ready_ids):
             self._generation_batch_deadline = None
             return False
         now = time.monotonic()
