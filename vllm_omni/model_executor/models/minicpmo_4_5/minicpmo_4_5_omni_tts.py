@@ -32,6 +32,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.minicpmo_4_5 import (
@@ -489,6 +490,8 @@ def _apply_codec_window_penalty_gpu(
     *,
     window_size: int,
     history_prefix: torch.Tensor | None = None,
+    draft_ids: torch.Tensor | None = None,
+    local_pos: torch.Tensor | None = None,
 ) -> None:
     """In place: ``_apply_batched_repetition_penalty`` on the runner's device token history.
 
@@ -499,18 +502,34 @@ def _apply_codec_window_penalty_gpu(
     total_len)``: the codes sampled so far, exactly the history the V1 path
     builds in ``make_omni_output``. Same arithmetic as the V1 helper, so the
     penalized logits are identical.
+
+    When draft codes are verified, the row at ``local_pos`` ``j`` of a request
+    also follows the step's first ``j`` drafts, which only exist in
+    ``draft_ids`` (the input id of every logits row, as the upstream penalty
+    reads them): its window ends ``j`` codes after ``total_len``.
     """
     num_rows, vocab_size = logits.shape
     if num_rows == 0:
         return
     slots = slots.long()
-    end = total_len.index_select(0, slots).long()
+    confirmed = total_len.index_select(0, slots).long()
+    end = confirmed if local_pos is None else confirmed + local_pos.long()
     start = torch.maximum(end - window_size, prompt_len.index_select(0, slots).long())
     offsets = torch.arange(window_size, device=logits.device, dtype=torch.long)
     positions = end.unsqueeze(1) - window_size + offsets.unsqueeze(0)
     valid = positions >= start.unsqueeze(1)
     rows = all_token_ids.index_select(0, slots)
-    history = rows.gather(1, positions.clamp_min(0)).long()
+    # ``total_len`` never exceeds the row width (max_model_len), so the clamp
+    # only bounds draft positions, which are taken from ``draft_ids`` below.
+    history = rows.gather(1, positions.clamp(0, rows.shape[1] - 1)).long()
+    if draft_ids is not None and local_pos is not None:
+        # Draft k of the step (k >= 1) is the input id of logits row k of the request.
+        drafted = positions - confirmed.unsqueeze(1)
+        row_ids = torch.arange(num_rows, device=logits.device).unsqueeze(1)
+        draft_rows = (row_ids - local_pos.long().unsqueeze(1) + drafted + 1).clamp(0, num_rows - 1)
+        history = torch.where(
+            drafted >= 0, draft_ids.long().index_select(0, draft_rows.reshape(-1)).view_as(history), history
+        )
     if history_prefix is not None:
         prompt = prompt_len.index_select(0, slots).long().unsqueeze(1)
         prefix_positions = (positions - prompt + window_size).clamp(0, window_size - 1)
@@ -598,6 +617,8 @@ class _CodecWindowPenaltiesState(LogitsProcessor):
                 self.repetition_penalty.gpu,
                 window_size=self.window_size,
                 history_prefix=self.history_prefix,
+                draft_ids=ctx.input_ids,
+                local_pos=ctx.expanded_local_pos,
             )
         return self.base.apply(logits, ctx)
 
@@ -656,6 +677,98 @@ class MiniCPMO45TalkerSampler(OmniSampler):
             sampled = output.sampled_token_ids
             sampled.masked_fill_(forced.view(-1, *([1] * (sampled.ndim - 1))), int(self.talker._codec_eos_id))
         return output
+
+
+class _ForcedEosSampling:
+    """The stock sampler as draft verification sees it, with forced codec EOS applied last.
+
+    Forcing after the logits processors keeps a forced row's target codec EOS
+    alone even where ``min_tokens`` masks EOS, so acceptance counts follow it.
+    """
+
+    def __init__(self, sampler: Any, eos_id: int, forced: torch.Tensor) -> None:
+        self._sampler = sampler
+        self._eos_id = eos_id
+        # This step's forced rows by request slot and draft position.
+        self.forced = forced
+
+    def __getattr__(self, name: str) -> Any:
+        # Reads only: RejectionSampler never writes to its sampler.
+        if name == "_sampler":
+            raise AttributeError(name)
+        return getattr(self._sampler, name)
+
+    def apply_sampling_params(
+        self,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        idx_mapping_np: np.ndarray,
+        pos: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        processed = self._sampler.apply_sampling_params(
+            logits,
+            expanded_idx_mapping,
+            idx_mapping,
+            idx_mapping_np,
+            pos,
+            input_ids,
+            expanded_local_pos,
+            *args,
+            **kwargs,
+        )
+        num_logits = processed.shape[0]
+        forced = self.forced[expanded_idx_mapping[:num_logits].long(), expanded_local_pos[:num_logits].long()]
+        eos_only = torch.full_like(processed[:1], float("-inf"))
+        eos_only[:, self._eos_id] = 0.0
+        return torch.where(forced.unsqueeze(1), eos_only, processed)
+
+
+class MiniCPMO45TalkerRejectionSampler(RejectionSampler):
+    """Verifies draft codes with the Talker's codec EOS control.
+
+    ``make_omni_output_mrv2`` decides EOS per logits row. A forced row's target
+    distribution is codec EOS alone, so a draft is accepted there only if it is
+    EOS and otherwise the row samples EOS, as ``MiniCPMO45TalkerSampler`` does
+    for a step without drafts.
+    """
+
+    def __init__(self, sampler: Any, spec_config: Any, talker: "MiniCPMO45OmniTTSForConditionalGeneration") -> None:
+        req_states = sampler.req_states
+        super().__init__(sampler, spec_config, req_states.device)
+        self.talker = talker
+        forced = torch.zeros(
+            (int(req_states.max_num_reqs), int(spec_config.num_speculative_tokens) + 1),
+            dtype=torch.bool,
+            device=req_states.device,
+        )
+        self.sampler = _ForcedEosSampling(sampler, int(talker._codec_eos_id), forced)
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        input_batch: Any,
+        draft_logits: torch.Tensor | None = None,
+        invalid_drafts: torch.Tensor | None = None,
+    ) -> Any:
+        num_logits = logits.shape[0]
+        forced = self.talker.take_mrv2_forced_eos(input_batch, self.sampler.req_states, num_logits)
+        masked = getattr(self.talker, "_mrv2_masked_eos", None)
+        self.talker._mrv2_masked_eos = None
+        if masked is not None and masked.shape[0] == num_logits:
+            logits[:, int(self.talker._codec_eos_id)].masked_fill_(masked, float("-inf"))
+        table = self.sampler.forced
+        table.zero_()
+        if forced is not None:
+            table[
+                input_batch.expanded_idx_mapping[:num_logits].long(),
+                input_batch.expanded_local_pos[:num_logits].long(),
+            ] = forced
+        return super().__call__(logits, input_batch, draft_logits, invalid_drafts)
 
 
 class _MiniCPMTTSProjector(nn.Module):
@@ -789,6 +902,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Model Runner V2 keeps the sampled id, codec history and EOS state on
         # the GPU (see make_omni_output_mrv2 and mrv2_custom_sampler).
         self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
+        self._check_v1_draft_method(vllm_config, self._use_v2_model_runner, self._k_step_frames)
         # Per request slot: the Thinker handed over an empty condition.
         self._mrv2_empty_speech: torch.Tensor | None = None
         # Rows the sampler must force to codec EOS, computed with this step's output.
@@ -835,6 +949,29 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if frames > 0:
             logger.info("[minicpmo] Talker multi-frame decode armed: %d codec frames per step", frames)
         return frames
+
+    @staticmethod
+    def _check_v1_draft_method(vllm_config: Any, use_v2_model_runner: bool, k_step_frames: int) -> None:
+        """On Model Runner V1 a stage-1 ``speculative_config`` has to arm the multi-frame loop.
+
+        The V1 codec window penalty and forced EOS are per request
+        (``_apply_codec_repetition_penalty`` and ``_force_eos_on_sampled_ids``
+        skip a batch whose row count differs), so draft rows the K-step loop
+        does not consume would be sampled without them. MRv2 turn sessions
+        verify draft codes (``mrv2_custom_sampler``).
+        """
+        spec = getattr(vllm_config, "speculative_config", None)
+        if spec is None or use_v2_model_runner or k_step_frames > 0:
+            return
+        if isinstance(spec, dict):
+            method, num_spec = spec.get("method"), spec.get("num_speculative_tokens")
+        else:
+            method, num_spec = getattr(spec, "method", None), getattr(spec, "num_speculative_tokens", None)
+        raise NotImplementedError(
+            "MiniCPM-o 4.5 Talker on model_runner: v1 takes a stage-1 speculative_config only when it arms "
+            f"multi-frame decode (method ngram, num_speculative_tokens >= 1); got method={method!r}, "
+            f"num_speculative_tokens={num_spec!r}. Run the Talker on model_runner: v2 to verify draft codes"
+        )
 
     def _init_native_talker(self, prefix: str) -> None:
         if self._tts_config is None:
@@ -1403,8 +1540,49 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         empty = input_embeds.new_empty((num_rows, 0))
         return input_ids, input_embeds, empty, empty, [{} for _ in range(num_rows)]
 
-    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, None]:
-        return _install_mrv2_talker_sampler(sampler, self), None
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any]:
+        talker_sampler = _install_mrv2_talker_sampler(sampler, self)
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
+        if spec_config is None:
+            return talker_sampler, None
+        if not self._mrv2_turn_drafts():
+            # Any draft method, not only drafters that read Talker layers.
+            raise NotImplementedError(
+                "MiniCPM-o 4.5 Talker on model_runner: v2 verifies draft codes in turn sessions only; "
+                "remove the stage-1 speculative_config for duplex or K-step"
+            )
+        # Verification reuses the stock sampler, whose penalty stage is the codec window.
+        return talker_sampler, MiniCPMO45TalkerRejectionSampler(sampler, spec_config, self)
+
+    def _mrv2_turn_drafts(self) -> bool:
+        """Whether this Talker can verify draft codes: turn sessions without the K-step loop.
+
+        ``session_mode`` is the stage model config's (set from the deploy for
+        every stage), the same field the MiniCPM-o model picks its duplex path
+        from.
+        """
+        session_mode = getattr(self.vllm_config.model_config, "session_mode", "turn")
+        return session_mode != "duplex" and self._k_step_frames == 0
+
+    def get_language_model(self) -> Any:
+        """The Talker's codec table, where drafter loading looks for a target's embedding.
+
+        No head is exposed, so a drafter never shares ``head_code`` (a plain
+        Linear, not a ParallelLMHead). The stage config reports a text
+        vocabulary, so vLLM does not share the table with a codec drafter
+        either; such a draft checkpoint ships its own embedding and head.
+        """
+        return SimpleNamespace(model=SimpleNamespace(embed_tokens=self.emb_code[0]))
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # Draft codes are verified per row for turn sessions only; the native
+        # duplex chunk budget and turn-end drain advance one code per step.
+        if not self._use_v2_model_runner or not self._mrv2_turn_drafts():
+            raise NotImplementedError(
+                "MiniCPM-o 4.5 Talker drafters that read its hidden layers (DSpark) need "
+                "turn sessions with the Talker on model_runner: v2"
+            )
+        self.tts_model._set_aux_hidden_state_layers(layers)
 
     def make_omni_output_mrv2(
         self,
@@ -1456,15 +1634,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 )
         num_tokens = int(hidden.shape[0])
         token_ids = input_batch.input_ids[:num_tokens]
-        last_rows = input_batch.logits_indices[:num_reqs].long()
-        slot_ids = input_batch.idx_mapping[:num_reqs].long()
+        # One entry per logits row. A request verifying k draft codes has k + 1
+        # rows; the runner hands the next stage only the rows it accepts.
+        last_rows = input_batch.logits_indices.long()
+        num_rows = int(last_rows.shape[0])
+        slot_ids = input_batch.expanded_idx_mapping[:num_rows].long()
+        local_pos = input_batch.expanded_local_pos[:num_rows].long()
         prompt_len = req_states.prompt_len.gpu.index_select(0, slot_ids).long()
-        # Codes emitted before this step's input (V1's ``state["step"]``).
-        step = input_batch.seq_lens[:num_reqs].long() - prompt_len
+        # Codes emitted up to and including this row's input (V1's ``state["step"]``).
+        step = input_batch.positions.index_select(0, last_rows).long() + 1 - prompt_len
         last_ids = token_ids.index_select(0, last_rows)
         empty = empty_speech.index_select(0, slot_ids)
         decode = step > 0
-        eos_input = decode & (last_ids == int(self._codec_eos_id))
+        # A request's codes end at its first EOS input, drafts included.
+        eos_seen = (decode & (last_ids == int(self._codec_eos_id))).long().cumsum(0)
+        first_row = torch.arange(num_rows, device=device) - local_pos
+        eos_before = torch.where(first_row > 0, eos_seen.index_select(0, (first_row - 1).clamp_min(0)), 0)
+        eos_input = eos_seen > eos_before
         valid = decode & ~eos_input & ~empty
         # MiniCPMTTS.generate's max_new_token, clamped to the Talker context
         # (see ``preprocess``); the sample after the last allowed code is EOS.
@@ -1479,6 +1665,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._mrv2_forced_eos = empty | eos_input | (step >= limit)
             self._mrv2_masked_eos = None
         else:
+            if num_rows != num_reqs:
+                raise NotImplementedError("MiniCPM-o native duplex Talker does not verify draft codes")
             limits, minimums, drains = [], [], []
             for i in range(num_reqs):
                 info = model_intermediate_buffer[i] if i < len(model_intermediate_buffer) else {}

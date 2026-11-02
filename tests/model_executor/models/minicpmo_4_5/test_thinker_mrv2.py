@@ -291,3 +291,14 @@ def test_v1_thinker_refuses_drafter_layers(mocker):
     with pytest.raises(NotImplementedError, match="model_runner: v2"):
         model.set_aux_hidden_state_layers((1, 9, 17))
     assert model._returns_aux_hidden_states is False
+
+
+def test_talker_stage_hands_drafter_hooks_to_the_talker(mocker):
+    model = object.__new__(omni.MiniCPMO45OmniForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model_stage = "tts"
+    model.thinker = None
+    model.talker = mocker.Mock()
+    assert model.get_language_model() is model.talker.get_language_model.return_value
+    model.set_aux_hidden_state_layers((2, 10, 17))
+    model.talker.set_aux_hidden_state_layers.assert_called_once_with((2, 10, 17))
