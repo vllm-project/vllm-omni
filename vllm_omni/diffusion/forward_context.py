@@ -388,8 +388,8 @@ def clear_scheduled_denoise_step_on_exit(total_steps: int | None):
     finally:
         if total_steps is not None and _forward_context is not None:
             set_forward_context_denoise_step_idx(None)
-            _forward_context.denoise_timestep = None
-            _forward_context.total_denoise_steps = None
+            set_forward_context_denoise_timestep(None)
+            set_forward_context_denoise_total_steps(None)
 
 
 @contextmanager
