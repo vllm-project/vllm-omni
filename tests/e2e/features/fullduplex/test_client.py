@@ -194,6 +194,58 @@ async def test_realtime_client_close_waits_for_a_new_session_closed_event():
 
 
 @pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_returns_stats():
+    class Client(RealtimeDuplexClient):
+        def __init__(self):
+            super().__init__("ws://unused")
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+            self.events.add(
+                {
+                    "type": "session.stats",
+                    "request_event_id": event["event_id"],
+                    "stats": {"turns": []},
+                }
+            )
+
+    client = Client()
+    stats = await client.get_session_stats(timeout_s=1.0)
+
+    assert stats == {"turns": []}
+    assert client.sent[0]["type"] == "session.stats.get"
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_raises_on_related_error():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            self.events.add(
+                {
+                    "type": "error",
+                    "related_event_id": event["event_id"],
+                    "error": {"code": "session_stats_disabled", "message": "disabled"},
+                }
+            )
+
+    client = Client("ws://unused")
+    with pytest.raises(ConnectionError, match="disabled"):
+        await client.get_session_stats(timeout_s=1.0)
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_times_out():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            return
+
+    client = Client("ws://unused")
+    with pytest.raises(TimeoutError, match="session.stats"):
+        await client.get_session_stats(timeout_s=0.05)
+
+
+@pytest.mark.asyncio
 async def test_realtime_client_configure_sends_seed_tts_text_condition():
     class Client(RealtimeDuplexClient):
         def __init__(self):
