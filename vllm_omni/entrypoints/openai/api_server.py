@@ -508,7 +508,7 @@ async def omni_run_server_worker(
         is_pure_diffusion = vllm_config is None
         if is_pure_diffusion:
             logger.info(
-                "Starting vLLM API server (pure diffusion mode) on %s",
+                "Starting vLLM API server without a frontend LLM configuration on %s",
                 listen_address,
             )
             # The vLLM 0.27 launcher's shutdown path reads
@@ -744,9 +744,14 @@ async def build_async_omni_from_stage_config(
             kwargs.setdefault("log_stats", True)
         if client_config is not None:
             kwargs["client_config"] = client_config
+        backend_as_process = kwargs.pop("duplex_engine_backend_as_process", False)
         if _should_serve_duplex(model, kwargs):
+            if backend_as_process:
+                kwargs["duplex_engine_backend_as_process"] = True
             async_omni = DuplexOmni(model=model, **kwargs)
         else:
+            if backend_as_process:
+                raise ValueError("--duplex-engine-backend-as-process requires a session_mode: duplex deployment")
             async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
@@ -755,7 +760,10 @@ async def build_async_omni_from_stage_config(
         yield async_omni
     finally:
         if async_omni:
-            async_omni.shutdown()
+            if isinstance(async_omni, DuplexOmni) and backend_as_process:
+                await async_omni.aclose()
+            else:
+                async_omni.shutdown()
 
 
 async def _init_duplex_app_state(
@@ -769,11 +777,14 @@ async def _init_duplex_app_state(
     """Minimal app state for a duplex server: only the surfaces a duplex session backs."""
     state.vllm_config = vllm_config
     state.diffusion_engine = None
-    state.openai_serving_models = OpenAIServingModels(
-        engine_client=engine_client,  # type: ignore[arg-type]
-        base_model_paths=base_model_paths,
-        lora_modules=None,
-    )
+    if engine_client.session_only:
+        state.openai_serving_models = openai_models_serving.SessionServingModels(base_model_paths)
+    else:
+        state.openai_serving_models = OpenAIServingModels(
+            engine_client=engine_client,  # type: ignore[arg-type]
+            base_model_paths=base_model_paths,
+            lora_modules=None,
+        )
     state.serving_tokenization = None
     state.serving_tokens = None
     # Replaced by the chat init below when the model serves chat.
@@ -833,7 +844,7 @@ async def _init_duplex_chat(
     answering badly. ``endpoint_restrictions`` remains the per-deployment
     opt-out on top of this.
     """
-    if not engine_client.duplex_capabilities.supports_chat_completions:
+    if engine_client.session_only or not engine_client.duplex_capabilities.supports_chat_completions:
         return None
     supported_tasks: set[str] = {"generate"}
     if hasattr(engine_client, "get_supported_tasks"):
