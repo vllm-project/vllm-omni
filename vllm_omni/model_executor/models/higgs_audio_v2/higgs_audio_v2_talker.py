@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-0 talker for higgs-audio v2 (vLLM-native, DualFFN-aware).
 
 Architecture summary (verified against `transformers.models.higgs_audio_v2`
@@ -1164,6 +1164,18 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         sampler_output = sampler(logits=logits, sampling_metadata=sampling_metadata)
 
         hidden = getattr(self, "_last_logits_hidden", None)
+        return self._dispatch_audio_codes(sampler_output, hidden, sampling_metadata)
+
+    def _dispatch_audio_codes(self, sampler_output, hidden, sampling_metadata):
+        """Delay-pattern post-processing: turn this step's LM samples into per-request audio codes.
+
+        Shared by the V1 model sampler and the MRV2 sampler hook. Both callers
+        finish LM token sampling on their own — the V1 metadata sampler here,
+        the native staged sampler under MRV2 — while audio-code sampling and
+        per-request state progression stay identical. ``hidden`` holds this
+        step's logits rows; the ``_last_logits_hidden`` stash is cleared on
+        entry.
+        """
         self._last_logits_hidden = None
         if hidden is None:
             self._last_audio_codes = None
@@ -1451,6 +1463,49 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         self._last_audio_codes = codes_full
         self._postprocess_cursor = 0
         return sampler_output
+
+    def mrv2_custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
+        """MRV2 sampling step: delegate LM token sampling to the native staged sampler.
+
+        The V1 AR runner honors ``prefer_model_sampler`` and calls
+        :meth:`sample` directly; under MRV2 the stock OmniModelState
+        dispatches to this hook instead. LM tokens are sampled by the native
+        gpu sampler, so its staged per-request state — temperature, top-k,
+        top-p, min-p, penalties and logprobs — applies unchanged. Audio codes
+        flow through :meth:`_dispatch_audio_codes` and the ``postprocess``
+        lifecycle, exactly as on V1.
+        """
+        from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+
+        from vllm_omni.worker_v2.omni_sampler import OmniSampler, OmniSamplingOutput
+        from vllm_omni.worker_v2.warmup import is_warmup_request
+
+        talker = self
+
+        class _StepSampler(OmniSampler):
+            def sample_step(self, hidden_states, input_batch, req_states, grammar_output, standard_sample):
+                if all(is_warmup_request(r) for r in input_batch.req_ids):
+                    return super().sample_step(hidden_states, input_batch, req_states, grammar_output, standard_sample)
+                if grammar_output is not None or input_batch.num_draft_tokens:
+                    raise ValueError("Higgs Audio v2 MRV2 does not support grammar or speculative sampling")
+                hidden = hidden_states[input_batch.logits_indices]
+                logits = talker.compute_logits(hidden, None)
+                talker._apply_audio_mode_bias(logits, None)
+                out = self.base_sampler(logits, input_batch)
+                out = talker._dispatch_audio_codes(out, hidden, None)
+                count = getattr(out, "num_sampled", None)
+                rejected = getattr(out, "num_rejected", None)
+                if count is None or rejected is None:
+                    count, rejected = get_num_sampled_and_rejected(
+                        torch.ones(input_batch.num_reqs, dtype=torch.int32, device=hidden.device),
+                        input_batch.seq_lens,
+                        input_batch.cu_num_logits,
+                        input_batch.idx_mapping,
+                        req_states.prefill_len.gpu,
+                    )
+                return OmniSamplingOutput(out, count, rejected)
+
+        return _StepSampler(sampler), None
 
     @staticmethod
     def _sample_audio_codes_upstream(

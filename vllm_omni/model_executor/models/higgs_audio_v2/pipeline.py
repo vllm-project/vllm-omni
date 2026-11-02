@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """higgs-audio v2 pipeline: Talker (text -> 8-codebook codec) -> Code2Wav (codec -> 24 kHz PCM)."""
 
 from vllm_omni.config.stage_config import (

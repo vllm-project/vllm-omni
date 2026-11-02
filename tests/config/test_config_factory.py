@@ -3342,6 +3342,30 @@ class TestPlatformOverrides:
         deploy_v1.stages[0].default_sampling_params["repetition_penalty"] = 1.1
         merge_pipeline_deploy(pipeline, deploy_v1)
 
+    def test_higgs_audio_v2_mrv2_opt_in_runs_talker_on_v2_only(self):
+        """The opt-in MRV2 profile runs stage 0 on v2 with stage 1 kept on v1.
+
+        The stage-level ``model_runner`` key selects the talker's runner; the
+        codec stage has no MRV2 path, so it stays on v1 and the talker's
+        outputs ride the legacy transport. The pipeline declares no
+        ``mrv2_unsupported_sampling_params``, so the full staged sampling
+        surface — penalties included — stays available under v2.
+        """
+        deploy_path = Path(get_deploy_config_path("higgs_audio_v2_mrv2.yaml"))
+        pipeline = resolve_pipeline_config("higgs_audio_v2")
+
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        assert deploy.model_runner == "v1"
+        assert deploy.stages[0].model_runner == "v2"
+        assert deploy.stages[1].model_runner is None
+
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in stages] == [True, False]
+        assert pipeline.stages[0].mrv2_unsupported_sampling_params == ()
+
+        # Neutral sampling defaults pass the v2 startup validation unchanged.
+        assert deploy.stages[0].default_sampling_params["repetition_penalty"] == 1.0
+
     def test_qwen3_omni_cuda_uses_thinker_rotary_custom_op(self):
         deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
         pipeline = resolve_pipeline_config(
