@@ -59,6 +59,7 @@ class SessionMemoryRuntime:
         self._history: tuple[dict[str, object], ...] = ()
         self._retry_source: tuple[int, int, Hashable] | None = None
         self._failures = 0
+        self._retry_exhausted = False
         self._retry_timer: asyncio.TimerHandle | None = None
         self._input_pending = False
         self._pending_user_items: set[str] = set()
@@ -224,6 +225,15 @@ class SessionMemoryRuntime:
             self._retry_timer = None
         self._retry_source = None
         self._failures = 0
+        self._retry_exhausted = False
+
+    def _pause_context_retry(self) -> None:
+        """Pause scheduling without replenishing the same coverage unit."""
+        if self._retry_timer is not None:
+            self._retry_timer.cancel()
+            self._retry_timer = None
+        if not self._retry_exhausted or self._retry_source != self._source:
+            self._source = None
 
     def _interactive_input(self, payload: Mapping[str, object], *, has_new_user_input: bool) -> bool:
         """Record input intent without cancelling work needed to admit it."""
@@ -239,10 +249,13 @@ class SessionMemoryRuntime:
         Capacity rejection happens before this point: an inadmissible frame
         must leave the summary that frees visual memory running.
         """
-        self.cancel_retry()
+        if self._ctx.plugin.supports_context_auxiliary_requests:
+            self._pause_context_retry()
+        else:
+            self.cancel_retry()
+            self._source = None
         self._generation += 1
         self._completion_pending = False
-        self._source = None
         if self._task is not None and not self._task.done():
             if not helpers.task_is_cancelling(self._task):
                 self._task.cancel()
@@ -250,15 +263,17 @@ class SessionMemoryRuntime:
     def _schedule_retry(self, request: DuplexAuxiliaryRequest) -> None:
         """Back off submitted failures without letting traffic reset the budget."""
         source = self._source
-        if source is None or (not request.retry_delays_s and request.retry_cooldown_s is None):
+        context_mode = request.context_work is not None
+        if source is None or (not context_mode and not request.retry_delays_s and request.retry_cooldown_s is None):
             return
         if self._retry_source != source:
             self.cancel_retry()
             self._retry_source = source
         self._failures = min(self._failures + 1, len(request.retry_delays_s) + 1)
-        if self._failures > len(request.retry_delays_s):
+        self._retry_exhausted = self._failures > len(request.retry_delays_s)
+        if self._retry_exhausted:
             logger.warning("Duplex background memory exhausted its short retry budget")
-            delay = request.retry_cooldown_s
+            delay = None if context_mode else request.retry_cooldown_s
             if delay is None:
                 return
         else:
@@ -308,6 +323,8 @@ class SessionMemoryRuntime:
         if self._task is not None and not self._task.done():
             if self._ctx.session.epoch != self._epoch:
                 self._task.cancel()
+                if context_mode:
+                    self._pause_context_retry()
             return
         # A failed abort retains its resource for teardown retry. Do not build
         # an unbounded collection of abandoned background requests behind it.
@@ -333,10 +350,15 @@ class SessionMemoryRuntime:
                 if context is not None:
                     policy = DuplexAuxiliaryPolicy(context.work_key, context_policy.allow_during_response)
         if policy is None:
-            self._source = None
-            self.cancel_retry()
+            if context_mode:
+                self._pause_context_retry()
+            else:
+                self._source = None
+                self.cancel_retry()
             return
-        source = (self._ctx.session.epoch, self._ctx.session.config_revision, policy.source_key)
+        # Context execution still fences the actual epoch in _run. Its retry
+        # budget follows stable coverage, not a new input's execution fence.
+        source = (0 if context_mode else self._ctx.session.epoch, self._ctx.session.config_revision, policy.source_key)
         if self._retry_source is not None and self._retry_source != source:
             self.cancel_retry()
         if self._interaction_pending or self._interaction_active:

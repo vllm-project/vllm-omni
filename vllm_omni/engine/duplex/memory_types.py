@@ -116,9 +116,23 @@ class DuplexContextAuxiliaryInput:
     barriers: tuple["DuplexContextBarrier", ...] = ()
 
     @property
-    def work_key(self) -> DuplexContextAuxiliaryWork:
-        """Stable across unrelated history appends and retries of this window."""
-        return self.work
+    def work_key(self) -> tuple[object, ...]:
+        """Coverage identity, independent of execution epochs and pass nonces."""
+        work = self.work
+        return (
+            work.scope_id,
+            work.config_revision,
+            work.progress_generation,
+            work.start,
+            work.end,
+            work.read_set,
+            work.catalog_revision,
+            work.catalog_page,
+            work.suppression_version,
+            work.reconciliation_id,
+            work.reconciliation_target,
+            work.rewrite_epoch,
+        )
 
 
 @dataclass(frozen=True)

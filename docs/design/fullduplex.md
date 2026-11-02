@@ -434,6 +434,11 @@ result advances only its coverage unit. Own card admissions retain the current
 page pass; external catalogue changes discard it. New keys require extension
 coverage, and earlier source edits requeue their slots. Unrelated tail appends
 do not invalidate captured evidence or replenish a failed unit's retry budget.
+Epoch changes fence in-flight results while preserving completed coverage and
+the failure budget of unchanged work. Foreground input and temporary policy
+idleness pause scheduling without replenishing that budget. Context work stops
+after its finite retry delays; recurring legacy cooldown remains specific to
+the original auxiliary path.
 Explicit barrier resolutions and card mutations are preflighted together;
 rejection commits neither. A partial page or text fragment cannot clear a global
 barrier.

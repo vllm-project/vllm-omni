@@ -12,13 +12,13 @@ import pytest
 from tests.engine.duplex.test_session_auxiliary import auxiliary_submissions, wait_until
 from tests.engine.duplex.test_session_runner import close_harness, open_harness
 from vllm_omni.engine.duplex.commands import CreateItem, Heartbeat
-from vllm_omni.engine.duplex.contracts import duplex_is_auxiliary_request
+from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_is_auxiliary_request
 from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryRequest, duplex_history_digest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def install_context_work(h, mocker, *, retry_delays_s=(), empty=False):
+def install_context_work(h, mocker, *, retry_delays_s=(), retry_cooldown_s=None, empty=False):
     from vllm_omni.engine.duplex.memory_types import (
         DuplexContextAuxiliaryPolicy,
         DuplexMemoryEvidenceSelection,
@@ -52,6 +52,7 @@ def install_context_work(h, mocker, *, retry_delays_s=(), empty=False):
             history_length=0,
             history_digest=duplex_history_digest(()),
             retry_delays_s=retry_delays_s,
+            retry_cooldown_s=retry_cooldown_s,
         )
 
     def decode(*, request, output):
@@ -309,5 +310,140 @@ async def test_context_failed_cleanup_keeps_resource_and_prevents_admission(mock
         h.submit(Heartbeat())
         await h.settle()
         assert len(auxiliary_submissions(h)) == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_delays", [(), (0,)])
+async def test_foreground_turn_does_not_replenish_exhausted_context_work(mocker, retry_delays):
+    h = await open_harness(auto_response=False)
+    try:
+        work = install_context_work(h, mocker, retry_delays_s=retry_delays)
+        mocker.patch.object(
+            h.runner.plugin,
+            "auxiliary_preempted_by_input",
+            side_effect=lambda *, payload, state, has_new_user_input: has_new_user_input,
+        )
+        mocker.patch.object(
+            h.runner.plugin, "prepare_append_plan", return_value=DuplexAppendPlan(prompt={"prompt_token_ids": [1]})
+        )
+        h.submit(Heartbeat())
+        attempts = len(retry_delays) + 1
+        for index in range(attempts):
+            await wait_until(lambda: len(auxiliary_submissions(h)) == index + 1)
+            finish_context(h, accepted=False)
+            await wait_until(lambda: len(work.decodes) == index + 1)
+        await h.settle()
+        original_key = work.contexts[0].work_key
+        await h.run(
+            CreateItem(
+                item={
+                    "id": "question",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "A new question."}],
+                }
+            )
+        )
+        question = await h.runner._start_append({"video_frames": [b"frame"]}, final=True, precreate_response=True)
+        assert await question
+        assert h.runner.memory._interaction_active
+        turn = h.session.active_response_turn_id
+        assert turn is not None
+        h.session.end_response()
+        h.session.complete_model_turn(turn)
+        observation = await h.runner._start_append({"video_frames": [b"next"]}, final=True, precreate_response=True)
+        assert await observation
+        await h.settle(idle_s=0.02, timeout_s=0.2)
+        assert not h.runner.memory._interaction_active
+        assert work.contexts[-1].work_key == original_key
+        assert len(auxiliary_submissions(h)) == attempts
+        assert h.runner.memory._failures == attempts
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_context_cooldown_cannot_restart_exhausted_work(mocker):
+    h = await open_harness()
+    try:
+        work = install_context_work(h, mocker, retry_delays_s=(0,), retry_cooldown_s=0.01)
+        h.submit(Heartbeat())
+        for index in range(2):
+            await wait_until(lambda: len(auxiliary_submissions(h)) == index + 1)
+            finish_context(h, accepted=False)
+            await wait_until(lambda: len(work.decodes) == index + 1)
+        await h.settle(idle_s=0.04, timeout_s=0.3)
+        assert len(auxiliary_submissions(h)) == 2
+        assert work.contexts[0].work_key == work.contexts[-1].work_key
+        assert h.runner.memory._retry_timer is None
+        assert h.runner.memory._failures == 2
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["epoch", "source", "settings"])
+async def test_context_retry_identity_separates_execution_fences_from_new_work(mocker, change):
+    h = await open_harness()
+    try:
+        work = install_context_work(h, mocker)
+        h.submit(Heartbeat())
+        await wait_until(lambda: len(auxiliary_submissions(h)) == 1)
+        finish_context(h, accepted=False)
+        await wait_until(lambda: len(work.decodes) == 1)
+        await h.settle()
+        if change == "epoch":
+            h.session.epoch += 1
+        elif change == "source":
+            h.session.register_history_item("old", {"role": "user", "content": "A changed fact."})
+        else:
+            h.session.replace_config(replace(h.session.config, voice="new"))
+        h.submit(Heartbeat())
+        await h.settle(idle_s=0.02, timeout_s=0.2)
+        assert len(auxiliary_submissions(h)) == (1 if change == "epoch" else 2)
+        if change != "epoch":
+            assert work.contexts[0].work_key != work.contexts[-1].work_key
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_temporary_context_policy_idle_does_not_replenish_failure_budget(mocker):
+    h = await open_harness()
+    try:
+        work = install_context_work(h, mocker)
+        h.submit(Heartbeat())
+        await wait_until(lambda: len(auxiliary_submissions(h)) == 1)
+        finish_context(h, accepted=False)
+        await wait_until(lambda: len(work.decodes) == 1)
+        await h.settle()
+        work.enabled = False
+        await h.run(Heartbeat())
+        work.enabled = True
+        h.submit(Heartbeat())
+        await h.settle(idle_s=0.02, timeout_s=0.2)
+        assert len(auxiliary_submissions(h)) == 1
+        assert h.runner.memory._failures == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_epoch_cancelled_context_attempt_can_resume_without_false_exhaustion(mocker):
+    h = await open_harness()
+    try:
+        work = install_context_work(h, mocker, empty=True)
+        h.submit(Heartbeat())
+        await wait_until(lambda: len(auxiliary_submissions(h)) == 1)
+        first = auxiliary_submissions(h)[0].context.request_id
+        h.session.epoch += 1
+        h.submit(Heartbeat())
+        await wait_until(lambda: len(auxiliary_submissions(h)) == 2)
+        assert ([first], True) in h.port.cleanups
+        finish_context(h)
+        await wait_until(lambda: len(work.decodes) == 1)
+        assert h.runner.memory._failures == 0
     finally:
         await close_harness(h)

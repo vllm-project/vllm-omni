@@ -123,14 +123,13 @@ class DuplexMemoryContextState:
                 return
             cutoff, overflow_generation = session.memory_suppression.begin_reconciliation()
             self._recovery = _ReconciliationPass(
-                self._next_recovery_id,
-                session._conversation.next_slot_order,
-                cutoff,
-                overflow_generation,
-                session.epoch,
-                session.config_revision,
-                session.context_ledger.card_catalog_revision,
-                tuple(head.fact_key for head in session.context_ledger.card_catalog()),
+                reconciliation_id=self._next_recovery_id,
+                target=session._conversation.next_slot_order,
+                barrier_cutoff=cutoff,
+                overflow_generation=overflow_generation,
+                config_revision=session.config_revision,
+                catalog_revision=session.context_ledger.card_catalog_revision,
+                keys=tuple(head.fact_key for head in session.context_ledger.card_catalog()),
             )
             self._next_recovery_id += 1
             self._force_recovery = False
@@ -142,12 +141,10 @@ class DuplexMemoryContextState:
         if (
             recovery.rewrite_pending
             or recovery.catalog_revision != session.context_ledger.card_catalog_revision
-            or recovery.epoch != session.epoch
             or recovery.config_revision != session.config_revision
         ):
             recovery.rewrite_epoch += 1
             recovery.rewrite_pending = False
-            recovery.epoch = session.epoch
             recovery.config_revision = session.config_revision
             recovery.catalog_revision = session.context_ledger.card_catalog_revision
             recovery.keys = tuple(head.fact_key for head in session.context_ledger.card_catalog())
@@ -199,7 +196,6 @@ class DuplexMemoryContextState:
         if self._pass is not None:
             if (
                 self._pass.catalog_revision != session.context_ledger.card_catalog_revision
-                or self._pass.epoch != session.epoch
                 or self._pass.config_revision != session.config_revision
                 or not self._evidence_matches(session, self._pass.evidence)
             ):
@@ -253,7 +249,6 @@ class DuplexMemoryContextState:
         keys = tuple(head.fact_key for head in catalog) if self._recovery is None else self._recovery.keys
         self._pass = _CatalogPass(
             pass_id=self._next_pass_id,
-            epoch=session.epoch,
             config_revision=session.config_revision,
             start=self._cursor,
             end=end,
@@ -506,7 +501,6 @@ class _CatalogPass:
     """Bounded key membership for one source window, independent of live heads."""
 
     pass_id: int
-    epoch: int
     config_revision: int
     start: DuplexMemoryCursor
     end: DuplexMemoryCursor
@@ -522,7 +516,6 @@ class _ReconciliationPass:
     target: int
     barrier_cutoff: int
     overflow_generation: int
-    epoch: int
     config_revision: int
     catalog_revision: int
     keys: tuple[str, ...]

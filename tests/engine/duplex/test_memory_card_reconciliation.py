@@ -285,3 +285,28 @@ def test_internal_config_generation_does_not_restart_recovery(session):
     next_context = session.capture_memory_context(max_chars=3)
     assert next_context.work.reconciliation_id == context.work.reconciliation_id
     assert next_context.evidence[0].char_start == 3
+
+
+@pytest.mark.parametrize("recovering", [False, True])
+def test_epoch_fence_preserves_completed_catalog_coverage(session, recovering):
+    if recovering:
+        edited_trigger(session, cards=17)
+    else:
+        seed_catalog(session, 17)
+    first = session.capture_memory_context()
+    result = session.admit_memory_result(context=first, proposal=DuplexMemoryProposalBatch((), reconciled=recovering))
+    assert result.status == "no_change"
+    pending = session.capture_memory_context()
+    assert pending.work.catalog_page == 1
+    session.epoch += 1
+    assert not session.memory_context_matches(pending)
+    retry = session.capture_memory_context()
+    assert retry.work.epoch == session.epoch
+    assert retry.work_key == pending.work_key
+    assert retry.work.catalog_page == 1
+    assert retry.work.rewrite_epoch == pending.work.rewrite_epoch
+    assert (
+        session.admit_memory_result(context=retry, proposal=DuplexMemoryProposalBatch((), reconciled=recovering)).status
+        == "no_change"
+    )
+    assert session.capture_memory_context() is None

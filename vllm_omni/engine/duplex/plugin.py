@@ -421,7 +421,7 @@ class DuplexAuxiliaryRequest:
     timeout_s: float = 30.0
     model_source: object | None = None
     retry_delays_s: tuple[float, ...] = ()
-    # Continue at this interval after the short retry budget is exhausted.
+    # Legacy path only: continue at this interval after short retry exhaustion.
     retry_cooldown_s: float | None = None
     # Issued and bound by the session owner, never supplied by model output.
     context_work: DuplexContextAuxiliaryWork | None = None
