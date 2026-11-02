@@ -1,0 +1,37 @@
+name: 'Close inactive issues and PRs'
+
+on:
+  schedule:
+    # Daily at 1:30 AM UTC (09:30 Asia/Shanghai).
+    - cron: '30 1 * * *'
+  workflow_dispatch: # for manual trigger and maintainer dry-run testing
+
+jobs:
+  close-issues-and-pull-requests:
+    # Prevents triggering on forks or other repos
+    if: github.repository == 'vllm-project/vllm-omni'
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          DAYS_BEFORE_STALE: '60'
+          DAYS_BEFORE_CLOSE: '14'
+          # Comma-separated accounts whose comments never count as activity.
+          # GitHub user type "Bot" accounts (mergify, github-actions, ...) are
+          # always ignored on top of this list. The triage bot posts as a
+          # regular user account, so it must be listed here explicitly.
+          IGNORE_ACTORS: 'vllm-omni-review-bot'
+          # Timeline data is collected via GraphQL (see the script docstring);
+          # the slice bounds the REST mutation burst, since GITHUB_TOKEN allows
+          # only 1k REST requests/hour. Full coverage completes every
+          # RUNS_PER_CYCLE days.
+          RUNS_PER_CYCLE: '4'
+          MAX_ITEMS_PER_RUN: '600'
+          # Set to 'true' to log the would-be actions without applying them.
+          DRY_RUN: 'false'
+        run: python3 .github/scripts/stale_bot.py
