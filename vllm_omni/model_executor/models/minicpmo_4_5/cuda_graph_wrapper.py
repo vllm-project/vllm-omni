@@ -341,6 +341,14 @@ class HiFTGraphWrapper:
                 speech_feat, cache_source, num_frames, cache_source_len, batch_size
             )
             hop = int(speech.shape[-1]) // int(num_frames)
+            # The generator emits hop source samples per mel frame and grafts
+            # the caller's cache onto the head, so the pad frames' samples sit
+            # on the tail of next_cache_source. Crop them off before the caller
+            # re-slices its fixed cache window, or the replicated tail frames'
+            # samples enter the next chunk's conditioning.
+            pad = num_frames - padded_frames
+            if pad and next_cache_source.shape[-1] >= pad * hop:
+                next_cache_source = next_cache_source[..., : next_cache_source.shape[-1] - pad * hop]
             return speech[..., : padded_frames * hop].contiguous(), next_cache_source
 
         return self._replay_frames(speech_feat, cache_source, num_frames, cache_source_len, batch_size)

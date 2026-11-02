@@ -498,15 +498,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Mixed widths would force the next step onto a single-frame span,
         # wasting stage 1's K-position reservation and halving wide-batch
         # throughput. Fill the short buffers to ``num_spec`` so consecutive
-        # steps all run the multi-frame loop.
+        # steps all run the multi-frame loop. The uniform all-empty set is
+        # filled for the same reason: the step after a bare proposer pass has
+        # no drafts at all, and leaving it at width 1 would keep the K-step
+        # disarmed until something else re-arms it (measured wide-batch
+        # collapse: 16-row batches ran single-frame for entire runs).
         from vllm_omni.platforms.npu.worker.talker_multiframe import CONTINUE_TOKEN_ID
 
         filled = 0
+        max_model_len = getattr(self, "max_model_len", None)
         for req in running:
             have = len(getattr(req, "spec_token_ids", ()) or ())
-            if have < num_spec:
-                req.spec_token_ids = [CONTINUE_TOKEN_ID] * num_spec
-                filled += 1
+            if have >= num_spec:
+                continue
+            # Never book spec slots past the context limit: upstream's
+            # pad_spec_decode applies the same check before widening a row.
+            if max_model_len is not None:
+                num_tokens = len(getattr(req, "all_token_ids", ()) or ())
+                if num_tokens + num_spec > max_model_len:
+                    continue
+            req.spec_token_ids = [CONTINUE_TOKEN_ID] * num_spec
+            filled += 1
         if filled:
             logger.debug(
                 "[kstep] padded %d short draft buffers %s to num_spec=%d across %d running requests",
@@ -718,7 +730,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             and getattr(model_config, "enforce_eager", False)
         )
         if dynamic_cuda:
-            target = int(dynamic_lookup[len(num_scheduled_tokens)])
+            # The table is built for ``max_num_batched_tokens`` worth of rows
+            # and its last entry carries forward; clamp so a batch larger than
+            # the table cannot index past it.
+            batch_index = min(len(num_scheduled_tokens), len(dynamic_lookup) - 1)
+            target = int(dynamic_lookup[batch_index])
             max_drafts = int(getattr(self, "num_spec_tokens", 0) or 0)
             if not 0 <= target <= max_drafts:
                 raise ValueError(f"Dynamic Talker draft count {target} is outside [0, {max_drafts}]")
@@ -755,8 +771,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # rows alone or prompt tokens are dropped.
             fold_ids = set(spec_tokens)
             if async_scheduler:
+                # Only fold placeholder-armed decode rows: upstream skips the
+                # arming for ``is_prefill_chunk`` rows, so a genuine prefill
+                # row that happens to book k_span positions must keep them or
+                # the prompt loses positions.
+                requests = getattr(self, "requests", None) or {}
                 fold_ids.update(
-                    rid for rid, n in num_scheduled_tokens.items() if rid not in spec_tokens and n == k_span
+                    rid
+                    for rid, n in num_scheduled_tokens.items()
+                    if rid not in spec_tokens
+                    and n == k_span
+                    and not getattr(requests.get(rid), "is_prefill_chunk", False)
                 )
             for rid in fold_ids:
                 num_scheduled_tokens[rid] = 1
@@ -849,6 +874,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         Returns the previous ``num_spec_tokens`` when the caller must restore it,
         None when the step keeps its K-step width.
+
+        With the default row budget (``max_num_seqs``) the guard below never
+        fires — every batch the scheduler can hold keeps the K-frame loop — so
+        this only takes effect when ``KSTEP_MAX_ROWS`` is lowered explicitly.
         """
         if os.environ.get("KSTEP_PLAIN_STEP", "1") == "0":
             return None
@@ -868,6 +897,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return None
         if len(self.running) <= self._kstep_row_budget():
             return None
+        # Zeroing only disables upstream's pad_spec_decode width uniformisation
+        # for this step: request buffers keep their per-slot draft accounting
+        # (num_tokens_with_spec), and any uneven row this leaves is folded to
+        # width 1 by _enforce_kstep_span_uniformity instead of being scheduled
+        # at a mixed span.
         self.num_spec_tokens = 0
         return num_spec
 
@@ -930,11 +964,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
-        _wrapped = self._wrap_omni_scheduler_output(
+        return self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
-        return _wrapped
 
     def update_from_output(
         self,

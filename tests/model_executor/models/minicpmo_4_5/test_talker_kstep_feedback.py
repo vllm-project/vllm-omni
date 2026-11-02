@@ -1493,6 +1493,46 @@ def _bias_head_to(model, token_id: int):
         model.head_code[0].weight[token_id] = 1.0
 
 
+def test_frame_loop_repetition_stop_surfaces_as_stop_row():
+    """Repetition detection must surface as a stop row on the next step.
+
+    Review follow-up (PR #9733): ``_codec_repetition_detected`` runs in
+    ``flush_kstep_pending`` after the frame loop, so the detecting step still
+    packs its frame as a continue row. The next step must take the finished
+    early-exit and pack the row as a stop row (batch stop logits argmax at
+    the stop slot), or the scheduler never learns the request ended and it
+    runs on to ``max_tokens``.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42] * 16)
+    state = {
+        "step": 0,
+        "codes": torch.tensor([10, 11]),
+        "codec_full_ids": [10, 11],
+        "codec_repetition_detection": SimpleNamespace(min_pattern_size=1, max_pattern_size=1, min_count=2),
+    }
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+
+    warming = _frame_call(model, hidden)
+    # One sample is not a repetition yet; the frame is a normal continue row.
+    assert state["finished"] is False
+    assert warming.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+
+    detecting = _frame_call(model, hidden)
+    # The flush that notices the repeating tail runs after this step's frames
+    # were packed, so the detecting step still carried audio, not a stop row.
+    assert state["finished"] is True
+    assert detecting.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist() == [42]
+
+    stopping = _frame_call(model, hidden)
+    # The finished early-exit packs the row as a stop row and emits no
+    # further audio; the stop slot wins the batch stop logits lookup.
+    assert stopping.multimodal_outputs["codes"]["audio"][0].numel() == 0
+    logits = model.batch_stop_logits
+    assert logits is not None and logits.shape[0] >= 1
+    assert int(logits[0].argmax()) == 1
+
+
 def test_stop_id_finishes_request_through_device_state_greedy():
     """A codec stop id finishes the request via the device state alone.
 
@@ -1824,7 +1864,7 @@ def test_kstep_flush_discards_stale_request(replaced):
     old_state = {"codes": torch.empty(0, dtype=torch.long)}
     model._request_audio_states["r1"] = {} if replaced else old_state
     model._deferred_cleanup_ids = set() if replaced else {"r1"}
-    model._kstep_pending_packed = [(torch.tensor([42, 0, 1]), "r1", old_state)]
+    model._kstep_pending_packed = [(torch.tensor([42, 0, 1]), "r1", old_state, None, None, 0)]
     model.flush_kstep_pending()
     assert model._request_codec_history == {}
     assert "last_code" not in old_state

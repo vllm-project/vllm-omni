@@ -1429,15 +1429,13 @@ class MiniCPMO45Code2Wav(nn.Module):
                 offset_mix = False
                 if npu_same_shape and batch_size > 1:
                     row_groups = self._npu_same_shape_groups(bucket, states, features, cross_turn=cross_turn)
-                if merged_ragged and len(bucket) > 1:
+                elif merged_ragged and len(bucket) > 1:
                     # Keep the merged rows in one solve: re-splitting by cache
                     # signature is exactly what the merge removed.
                     offset_mix = True
-                if isinstance(features, list):
+                elif isinstance(features, list):
                     # Each reference has its own cache lengths and conditioning.
                     # The ragged path handles them in one solve.
-                    pass
-                elif merged_ragged and len(bucket) > 1:
                     pass
                 elif onset_mix and not onset_ready:
                     # Cache layouts ragged Whole-Euler cannot take split back into signature buckets.

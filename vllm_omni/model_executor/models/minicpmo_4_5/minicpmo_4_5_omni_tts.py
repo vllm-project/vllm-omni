@@ -2336,21 +2336,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 )
             )
             # Commit all request rows before the next frame reads their history.
+            # The per-request delta, the device-side last-code shadow and the
+            # "accumulated" view are all filled from the single host readback
+            # in flush_kstep_pending: a masked_select here would add a second,
+            # data-dependent-size device sync per row per frame, and an
+            # unconditional shadow update would let a suppressed frame become
+            # the next frame's history.
             pending = getattr(self, "_kstep_pending_packed", None)
             if pending is None:
                 pending = self._kstep_pending_packed = []
-            pending.append((packed, request_id, state))
+            pending.append((packed, request_id, state, info, codec_deltas, len(codec_deltas)))
+            codec_deltas.append(empty_delta)
             state["step"] = _codec_int_param(state, "step", 0) + 1
             finished = sample_result.state.finished.reshape(()).to(torch.bool)
-            emit_frame = sample_result.emit.reshape(()).to(torch.bool)
-            delta = sampled.reshape(1, 1).masked_select(emit_frame.reshape(1, 1)).reshape(-1, 1)
-            state["_kstep_last_code"] = sampled.reshape(1)
             info["audio_state"] = state
             info["audio_codes"] = {
                 "current": sampled.reshape(1),
                 "accumulated": codes,
             }
-            codec_deltas.append(delta)
             terminal_flags.append(torch.where(finished, flag_true, flag_false))
             stop_rows.append(torch.where(finished, row_stop, row_continue))
 
@@ -2911,7 +2914,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return
         self._kstep_pending_packed = []
         packed_host = torch.stack([item[0] for item in pending]).cpu().tolist()
-        for (_, request_id, state), (sampled_id, finished, emit) in zip(pending, packed_host):
+        for (_, request_id, state, info, deltas, index), (sampled_id, finished, emit) in zip(pending, packed_host):
             if (
                 request_id in getattr(self, "_deferred_cleanup_ids", ())
                 or self._request_audio_states.get(request_id) is not state
@@ -2933,6 +2936,29 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # here for the decode preprocess and for the confirmed-frame
             # history streaming prompt recompute rebuilds its window from.
             state["last_code"] = sampled_id
+            # Fill the deferred per-request delta from this same readback:
+            # new_tensor keeps the placeholder's device so the runner's row
+            # concat stays on one device.
+            placeholder = deltas[index] if deltas is not None else None
+            if isinstance(placeholder, torch.Tensor):
+                deltas[index] = placeholder.new_tensor([[sampled_id]], dtype=torch.long)
+            # The device-side shadow stays emit-gated (the fused commit path
+            # matches this with torch.where over the emit mask): a suppressed
+            # stop/EOS sample must not become the next frame's "previous
+            # frame" id. Keep it on the delta's device -- the frame loop's
+            # preprocess copies it straight into a device row, so a host
+            # tensor here would add an H2D copy per row per step.
+            if isinstance(placeholder, torch.Tensor):
+                state["_kstep_last_code"] = deltas[index].reshape(1)
+            elif isinstance(codes, torch.Tensor):
+                state["_kstep_last_code"] = codes.new_tensor([sampled_id])
+            else:
+                state["_kstep_last_code"] = torch.tensor([sampled_id], dtype=torch.long)
+            # state["codes"] was just re-created by the cat above, so the
+            # "accumulated" view captured before the flush is one frame
+            # stale for this row.
+            if info is not None and isinstance(info.get("audio_codes"), dict) and "codes" in state:
+                info["audio_codes"]["accumulated"] = state["codes"]
             histories = getattr(self, "_request_codec_history", None)
             if not isinstance(histories, dict):
                 histories = {}
@@ -3409,12 +3435,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Decode tokens live in the codec table. Prefill overwrites these
         # embeddings in preprocess with emb_text + projected thinker hidden.
         weight = self.emb_code[0].weight
-        # Async speculative steps book draft slots as ``PLACEHOLDER_TOKEN_ID``
-        # (-1) until the previous step is sampled; the codec table is far
-        # smaller than the Thinker vocab, so the lookup would trip an index
-        # assert. The rows never contribute semantics, so clamp them.
+        # Async speculative steps book draft slots as -1 placeholders until
+        # the previous step is sampled; the codec table is far smaller than
+        # the Thinker vocab, so the lookup would trip an index assert.
+        # Redirect only the placeholder rows: any other out-of-range id is a
+        # real bug and must stay visible to the embedding's index check
+        # instead of being clamped into a wrong-but-valid table row. The
+        # device-side where keeps this off the host-sync path.
         if weight.numel() and input_ids.numel():
-            input_ids = input_ids.clamp(0, weight.shape[0] - 1)
+            input_ids = torch.where(input_ids == -1, torch.zeros_like(input_ids), input_ids)
         return self.emb_code[0](input_ids)
 
     def embed_input_ids(self, input_ids, **kwargs):
