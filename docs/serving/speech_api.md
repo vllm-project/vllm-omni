@@ -348,10 +348,18 @@ curl -X POST http://localhost:8091/v1/audio/voices \
 ## Streaming Text Input (WebSocket)
 
 The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally.
-Its default `buffered` mode synthesizes all text received before `input.done` as
-one request. For the supported Qwen3-TTS Chinese/English scope, M1
-`commitment` mode can instead start an independent request whenever the
-semantic-readiness policy marks a boundary after accumulated raw text.
+Choose the input policy according to when synthesis should start:
+
+| `text_input_mode` | `split_granularity` | When a TTS request starts | Handling more text during synthesis |
+| --- | --- | --- | --- |
+| `buffered` (default) | `none` (default) | After `input.done`, using all accumulated text. | The handler waits for generation before processing another input message. |
+| `buffered` | `sentence` or `clause` | At each linguistic boundary, before `input.done`; remaining text is flushed at `input.done`. | The handler waits for each segment's generation before processing another input message. |
+| `commitment` | `none` (required) | At each semantic-readiness boundary; `input.done` closes and flushes the policy. | The reader can accept and queue later segments while the synthesis worker runs. M1 supports the documented Qwen3-TTS Chinese/English scope. |
+
+All three configurations submit independent TTS requests. None appends later
+text to the prompt of a model request that is already generating, or preserves
+acoustic/model state between segments. Reusing the WebSocket connection after
+`session.done` also does not imply reuse of a model generation session.
 
 !!! important
     Commitment mode is not a general sentence detector. Its strong-terminator
@@ -366,10 +374,15 @@ arrives incrementally. `stream_audio=false` sends one binary audio frame per
 synthesis request; `stream_audio=true` sends one or more PCM chunks per
 request.
 
-In buffered mode, `split_granularity="sentence"` or `"clause"` enables the
-linguistic splitter and emits requests before EOF. Commitment mode requires
-`split_granularity="none"` because only the readiness policy may decide its
-irreversible boundaries.
+Enabling `stream_audio` changes audio delivery, not the input policy: with the
+default buffered configuration, the first synthesis request still waits for
+`input.done`. Commitment mode requires `split_granularity="none"` because only
+the readiness policy may decide its irreversible boundaries.
+
+For model-native audio input/output sessions, see the separate
+[`/v1/realtime` duplex API](realtime_openai_duplex_api.md). Its model-specific
+support does not make an arbitrary TTS backend support incremental prompt
+extension through `/v1/audio/speech/stream`.
 
 ### WebSocket Protocol
 
