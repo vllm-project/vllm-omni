@@ -19,11 +19,14 @@ import pytest
 import torch
 import zmq
 
+from tests.helpers.runtime import get_open_port
 from vllm_omni.data_entry_keys import HiddenStatesStruct, MetaStruct, OmniPayloadStruct
 
 pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 
-PORT = 47431
+# One port per worker process. A module-level literal is bound by every
+# xdist worker at once when tests from this file are not kept together.
+PORT = get_open_port()
 
 
 def _wait_for_metadata(consumer, key, metadata=None, *, timeout=2.0):
