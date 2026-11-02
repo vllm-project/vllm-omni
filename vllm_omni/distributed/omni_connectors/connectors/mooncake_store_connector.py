@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import time
 from typing import Any
@@ -117,6 +117,23 @@ class MooncakeStoreConnector(OmniConnectorBase):
     def get(
         self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
     ) -> tuple[Any, int] | None:
+        return self._get(from_stage, to_stage, get_key)
+
+    def get_with_deadline(
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        deadline: float,
+    ) -> tuple[Any, int] | None:
+        """Bound retries by a monotonic deadline; native store calls are not preempted."""
+        return self._get(from_stage, to_stage, get_key, deadline=deadline)
+
+    def _get(
+        self, from_stage: str, to_stage: str, get_key: str, *, deadline: float | None = None
+    ) -> tuple[Any, int] | None:
         if not self.store:
             logger.error("Store not initialized")
             return None
@@ -130,6 +147,8 @@ class MooncakeStoreConnector(OmniConnectorBase):
         key = self._make_key(get_key, from_stage, to_stage)
 
         for attempt in range(retries):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             try:
                 _t_fetch_start = _time.perf_counter()
                 raw_data = self.store.get(key)
@@ -158,7 +177,13 @@ class MooncakeStoreConnector(OmniConnectorBase):
                 logger.debug("MooncakeStoreConnector get attempt %s failed: %s", attempt, e)
 
             if attempt < retries - 1:
-                time.sleep(sleep_s)
+                wait_s = sleep_s
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    wait_s = min(wait_s, remaining)
+                time.sleep(wait_s)
 
         self._metrics["timeouts"] += 1
         logger.warning("MooncakeStoreConnector: timeout waiting for %s", key)
