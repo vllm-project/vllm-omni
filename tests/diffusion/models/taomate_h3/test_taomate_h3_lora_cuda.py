@@ -12,7 +12,7 @@ from vllm_omni.diffusion.models.taomate_h3.cuda_graph import GraphedForward
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=1),
+    *hardware_marks(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
 ]
 

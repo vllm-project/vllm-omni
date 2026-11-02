@@ -20,7 +20,7 @@ from vllm_omni.model_executor.models.fish_omni.sampling import EMPTY_RAS_SLOT, R
 
 pytestmark = [
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "H100"}, num_cards=1),
+    *hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
 ]
 

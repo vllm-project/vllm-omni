@@ -13,7 +13,7 @@ downloaded and extracted under ``HF_HOME`` on demand. The tests patch in
 ``--daily-omni-inline-local-video`` so multimodal payloads use data URLs (no
 ``--allowed-local-media-path`` on the server). Use small ``--num-prompts`` defaults suitable for CI
 (override with ``ACC_BENCH_NUM_PROMPTS`` / ``ACC_BENCH_MAX_CONCURRENCY``; see
-:func:`tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core.build_acc_benchmark_cli_argv`).
+:func:`tests.e2e.accuracy.helpers.build_acc_benchmark_cli_argv`).
 
 This package lives under ``tests/e2e/accuracy/qwen3_omni/``, so pytest still loads
 ``tests/e2e/accuracy/conftest.py``, which imports ``tests.conftest`` (heavy deps: ``vllm``, ``torch``, …).
@@ -30,13 +30,9 @@ Only the subprocess accuracy marker::
 
     pytest -sv tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m qwen3_omni_acc
 
-Skip when you do not have GPUs, a server, or datasets (CI opt-out)::
+Skip when you do not have GPUs/NPUs, a server, or datasets (CI opt-out)::
 
     VLLM_SKIP_ACC_BENCH=1 pytest -sv tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py
-
-Standalone CLI (expects a server already up; uses ``ACC_BENCH_*`` env defaults)::
-
-    python tests/e2e/accuracy/qwen3_omni/run_qwen_omni_acc_benchmark.py --help
 """
 
 from __future__ import annotations
@@ -45,14 +41,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.qwen3_omni import run_qwen_omni_acc_benchmark as _acc_bench
-from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
-    build_acc_benchmark_cli_argv,
-    find_vllm_cli,
-)
+from tests.e2e.accuracy import helpers as _acc_bench
+from tests.e2e.accuracy.helpers import build_acc_benchmark_cli_argv, find_vllm_cli
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from vllm_omni.benchmarks.data_modules.seed_tts_dataset import SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
 from vllm_omni.platforms import current_omni_platform
 
 _E2E_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -75,7 +69,7 @@ def get_chunk_config(config_path: str | None = None):
 
 if current_omni_platform.is_xpu():
     stage_configs = [_CI_DEPLOY]
-else:  # CUDA + ROCm MI325 share the same deploy config
+else:  # CUDA, ROCm MI325 and NPU A3 share the same deploy config
     stage_configs = [get_chunk_config()]
 
 test_params = [
@@ -94,9 +88,9 @@ def _require_vllm_cli() -> None:
 def _daily_omni_hub_inline_media(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hub / lazy-cache mode uses local files → default ``file://`` needs server allowlist.
 
-    ``run_qwen_omni_acc_benchmark`` binds ``daily_omni_bench_argv`` at import time; patch that copy
-    so we append ``--daily-omni-inline-local-video`` whenever the core helper did not already set it
-    (local qa.json + video-dir mode already passes the flag).
+    ``tests.e2e.accuracy.helpers.run_daily_omni`` calls ``daily_omni_bench_argv`` on that module;
+    patch that function so we append ``--daily-omni-inline-local-video`` whenever the core helper
+    did not already set it (local qa.json + video-dir mode already passes the flag).
     """
     orig = _acc_bench.daily_omni_bench_argv
 
@@ -110,7 +104,7 @@ def _daily_omni_hub_inline_media(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 
-@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_qwen3_omni_daily_omni_accuracy_bench(omni_server) -> None:
     _require_vllm_cli()
@@ -124,10 +118,61 @@ def test_qwen3_omni_daily_omni_accuracy_bench(omni_server) -> None:
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize(
+    "target",
+    [
+        "I feel sick, what should I do?",
+        "Please search The Best of Steely Dan: Then and Now saga.",
+    ],
+)
+def test_qwen3_omni_seed_tts_reads_questions_verbatim(omni_server, online_client, target: str) -> None:
+    # These Seed-TTS targets produced long answers in nightly build #17816.
+    # Isolate the thinker's reading contract; the full benchmark below checks audio WER.
+    response = online_client.client.chat.completions.create(
+        model=omni_server.model,
+        messages=[
+            {"role": "system", "content": SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT},
+            {"role": "user", "content": target},
+        ],
+        modalities=["text"],
+        temperature=0,
+        max_tokens=128,
+    )
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content == target
+
+
+# Before the verbatim-reading prompt: English Seed-TTS, 1088 utterances,
+# L20X, 2026-10-20: mean WER 0.282,
+# mean SIM 0.824 (median 0.828), mean UTMOS 3.350 (median 3.361).
+# Earlier checked-in runs scored WER 0.217 and 0.223. SIM 0.75 is 0.074
+# under the L20X mean; UTMOS 3.10 is 0.25 under the L20X mean. H100 and
+# B200 still need their own SIM and UTMOS measurement before tightening.
+# Verbatim-reading prompt, 1088 English utterances, L20X, 2026-10-23:
+# mean WER 0.028078. A2,2026-10-23:mean WER 0.035 Require mean WER <= 5%.
+_MAX_SEED_TTS_MEAN_WER = 0.05
+_MIN_SEED_TTS_MEAN_SIM = 0.75
+_MIN_SEED_TTS_MEAN_UTMOS = 3.10
+
+
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325", "npu": "A3"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_qwen3_omni_seed_tts_wer_bench(omni_server) -> None:
     _require_vllm_cli()
     pytest.importorskip("huggingface_hub")
-    ns = _acc_bench.parse_acc_benchmark_args(
-        build_acc_benchmark_cli_argv(omni_server, skip_seed=False, skip_daily=True)
+    argv = build_acc_benchmark_cli_argv(omni_server, skip_seed=False, skip_daily=True)
+    argv.extend(
+        [
+            "--max-seed-tts-mean-wer",
+            str(_MAX_SEED_TTS_MEAN_WER),
+            "--min-seed-tts-mean-sim",
+            str(_MIN_SEED_TTS_MEAN_SIM),
+        ]
     )
+    if not current_omni_platform.is_npu():
+        # The A3 runner is offline and does not cache balacoon/utmos, so
+        # enabling this floor would fail before scoring any clip. CUDA and
+        # ROCm still gate on it.
+        argv.extend(["--min-seed-tts-mean-utmos", str(_MIN_SEED_TTS_MEAN_UTMOS)])
+    ns = _acc_bench.parse_acc_benchmark_args(argv)
     assert _acc_bench.run_acc_benchmark(ns) == 0

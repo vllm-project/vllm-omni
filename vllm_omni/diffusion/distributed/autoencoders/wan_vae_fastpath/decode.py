@@ -51,6 +51,8 @@ def decode_frames(vae, z: torch.Tensor) -> torch.Tensor:
             )
         torch.clamp(chunk, min=-1.0, max=1.0, out=output[:, :, offset:end])
         offset = end
+        # Do not retain the previous chunk while the next decoder call runs.
+        del chunk
 
     if output is None or offset != output.shape[2]:
         expected = None if output is None else output.shape[2]

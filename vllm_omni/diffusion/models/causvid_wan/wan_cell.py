@@ -110,12 +110,12 @@ class WanCell(CellAdapter):
             t = self._timesteps[step] if step < self.num_denoise_steps else self._timestep_clean
             step_key = step if step < self.num_denoise_steps else self.num_denoise_steps
 
-            if block == tf.start_layer and tf.is_stage_first:
+            if block == tf.start_layer and tf.is_layer_group_first:
                 tokens = tf.embed(latent)
             elif tokens is None:
                 raise RuntimeError(f"cell {(chunk, step, block)} missing hidden_states")
             tokens = tf.block(block, tokens, chunk=chunk, step=step_key, latent=latent, timestep=t, kv_ctx=kv_ctx)
-            if not (block == tf.end_layer - 1 and tf.is_stage_last):
+            if not (block == tf.end_layer - 1 and tf.is_layer_group_last):
                 live[chunk] = latent
                 outs.append({"latent": latent, "hidden_states": tokens})
                 continue

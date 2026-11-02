@@ -534,6 +534,28 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             offloaded,
         )
 
+    @staticmethod
+    def _finalize_online_quant_weights_to_cpu(model: nn.Module) -> None:
+        """Bound deferred quantization after the weight consumer has returned."""
+        from vllm.model_executor.model_loader.reload.layerwise import (
+            finalize_layerwise_processing,
+            get_layerwise_info,
+        )
+
+        # A consumer may buffer the iterator before assigning weights. Do not
+        # finalize at generator exhaustion: the last buffered tensors may not
+        # have reached their layers yet.
+        for module in model.modules():
+            if not getattr(getattr(module, "quant_method", None), "uses_meta_device", False):
+                continue
+            if get_layerwise_info(module).can_load():
+                # Padded linears cannot finish during checkpoint consumption.
+                # Finalizing the whole model would accumulate them on device.
+                finalize_layerwise_processing(module, model_config=None)
+            # Also catch the final layer if the consumer processed it after
+            # the streaming generator's last offload_completed() call.
+            module.to("cpu")
+
     def _get_weight_sources(self, model: nn.Module) -> tuple["ComponentSource", ...]:
         return tuple(
             cast(
@@ -1153,6 +1175,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         if stream_online_quant_to_cpu:
             weights = self._stream_online_quant_weights_to_cpu(model, weights)
         loaded_weights = model.load_weights(weights)
+        if stream_online_quant_to_cpu:
+            self._finalize_online_quant_weights_to_cpu(model)
         if loaded_weights is not None:
             loaded_weights = set(loaded_weights).union(planned_weights)
 

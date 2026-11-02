@@ -144,3 +144,22 @@ def test_handshake_wait_is_extended_but_never_shortened(monkeypatch, timeout_s, 
     monkeypatch.setattr(engine_core_module, "HANDSHAKE_TIMEOUT_MINS", 5)
     _extend_handshake_timeout(timeout_s)
     assert engine_core_module.HANDSHAKE_TIMEOUT_MINS == expected_minutes
+
+
+def test_platform_compat_runs_before_engine_construction(monkeypatch):
+    from vllm_omni.engine import stage_engine_core_proc as module
+
+    calls = []
+
+    class ConstructionStoppedError(Exception):
+        pass
+
+    def construct(self, *args, **kwargs):
+        calls.append("engine")
+        raise ConstructionStoppedError
+
+    monkeypatch.setattr(module.current_omni_platform, "prepare_stage_engine", lambda: calls.append("platform"))
+    monkeypatch.setattr(EngineCoreProc, "__init__", construct)
+    with pytest.raises(ConstructionStoppedError):
+        StageEngineCoreProc()
+    assert calls == ["platform", "engine"]

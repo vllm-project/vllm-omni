@@ -20,6 +20,7 @@ from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.memory_utils import request_memory_tolerant
 from vllm_omni.worker.mixins import OmniWorkerMixin
+from vllm_omni.worker.moe_prefill_warmup import warm_up_moe_prefill_kernels
 
 logger = init_logger(__name__)
 
@@ -137,6 +138,12 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def compile_or_warm_up_model(self):
+        # Runs before the upstream warmup so the prefill fused-MoE configs are
+        # compiled before vLLM activates its JIT monitor (#9069).
+        warm_up_moe_prefill_kernels(self)
+        return super().compile_or_warm_up_model()
 
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK:
         """
