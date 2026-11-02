@@ -10,7 +10,8 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
-from vllm.outputs import PoolingRequestOutput
+from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import EngineCoreEvent, EngineCoreEventType, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
@@ -24,7 +25,7 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.outputs import output_processor
 from vllm_omni.outputs.output_modality import OutputModality, OutputModalityNames
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor, OmniRequestState
@@ -543,6 +544,85 @@ def test_delta_audio_non_final_tts_chunk_overrides_spurious_finish():
     assert torch.equal(result.outputs[0].multimodal_output[AUDIO], torch.ones(5))
 
 
+def _nemotron_snapshot(rows: int, *, cols: int = 4, step: int) -> dict:
+    """One Nemotron talker wake: cumulative code stack + its meta marker."""
+    prefix = torch.arange(rows * cols, dtype=torch.long).reshape(rows, cols)
+    return {
+        "codes.audio": prefix,
+        "meta.nvc_logical_prompt_len": 3,
+        "meta.nvc_tts_step": torch.tensor([step], dtype=torch.long),
+    }
+
+
+def test_nemotron_cumulative_codes_snapshot_keeps_latest_prefix():
+    """A re-shipped cumulative prefix replaces, never concatenates, its predecessor."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor(_nemotron_snapshot(2, step=1), mm_type=LATENT)
+    first = s.make_request_output([1], None, None, None)
+    assert first is not None and not isinstance(first, PoolingRequestOutput)
+    assert first.outputs[0].multimodal_output["codes"]["audio"].shape[0] == 2
+
+    s.add_multimodal_tensor(_nemotron_snapshot(5, step=2), mm_type=LATENT)
+    # Storage holds only the latest full prefix (single tensor), never a list
+    # of every prefix seen; total size tracks the current prefix, not the sum.
+    stored = s.mm_accumulated["codes.audio"]
+    assert isinstance(stored, torch.Tensor)
+    assert stored.shape[0] == 5
+
+    second = s.make_request_output([2], None, None, None)
+    assert second is not None and not isinstance(second, PoolingRequestOutput)
+    out = second.outputs[0].multimodal_output["codes"]["audio"]
+    assert out.shape == (5, 4)
+    assert torch.equal(out, _nemotron_snapshot(5, step=2)["codes.audio"])
+    meta = second.outputs[0].multimodal_output["meta"]
+    assert meta["nvc_tts_step"].tolist() == [2]
+    assert meta["nvc_logical_prompt_len"] == 3
+
+
+def test_nemotron_delta_codes_snapshot_retains_only_latest_prefix():
+    s = _make_state(RequestOutputKind.DELTA)
+    for step, rows in enumerate((2, 4, 5), start=1):
+        s.add_multimodal_tensor(_nemotron_snapshot(rows, step=step), mm_type=LATENT)
+        result = s.make_request_output([step], None, None, None)
+        assert result is not None and not isinstance(result, PoolingRequestOutput)
+        out = result.outputs[0].multimodal_output
+        assert out["codes"]["audio"].shape == (rows, 4)
+        assert torch.equal(out["codes"]["audio"], _nemotron_snapshot(rows, step=step)["codes.audio"])
+        # Per-wake tensor metadata is a snapshot, not an accumulated list.
+        assert out["meta"]["nvc_tts_step"].tolist() == [step]
+
+    stored = s.mm_accumulated["codes.audio"]
+    assert isinstance(stored, torch.Tensor)
+    assert stored.shape[0] == 5
+
+
+def test_nemotron_marker_without_codes_key_preserves_prior_prefix():
+    """A marker-only update must not erase content from an earlier wake."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor(_nemotron_snapshot(4, step=1), mm_type=LATENT)
+    s.add_multimodal_tensor(
+        {"meta.nvc_logical_prompt_len": 3, "meta.nvc_tts_step": torch.tensor([2], dtype=torch.long)},
+        mm_type=LATENT,
+    )
+    result = s.make_request_output([1], None, None, None)
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    out = result.outputs[0].multimodal_output["codes"]["audio"]
+    assert isinstance(out, torch.Tensor) and out.shape[0] == 4
+    assert result.outputs[0].multimodal_output["meta"]["nvc_tts_step"].tolist() == [2]
+
+
+def test_codes_audio_without_nemotron_marker_still_accumulates():
+    """Other models keep CONCAT semantics for the same key when unmarked."""
+    s = _make_state(RequestOutputKind.CUMULATIVE)
+    s.add_multimodal_tensor({"codes.audio": torch.ones(2, 4, dtype=torch.long)}, mm_type=LATENT)
+    s.add_multimodal_tensor({"codes.audio": torch.full((3, 4), 2, dtype=torch.long)}, mm_type=LATENT)
+    result = s.make_request_output([1], None, None, None)
+    assert result is not None and not isinstance(result, PoolingRequestOutput)
+    out = result.outputs[0].multimodal_output["codes"]["audio"]
+    assert out.shape == (5, 4)
+    assert out[:2].eq(1).all() and out[2:].eq(2).all()
+
+
 def test_delta_audio_final_tts_chunk_keeps_finish():
     s = _make_state(RequestOutputKind.DELTA)
     s.add_multimodal_tensor(
@@ -759,6 +839,83 @@ def test_no_detokenizer_make_request_output():
     assert result is not None
     assert not isinstance(result, PoolingRequestOutput)
     assert AUDIO in result.outputs[0].multimodal_output
+
+
+@pytest.mark.parametrize("cache_miss", [False, True])
+def test_pooling_completion_uses_upstream_output_and_finishes_request(cache_miss):
+    """Native pooling success and cache-miss errors retain their output types."""
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    request = OmniEngineCoreRequest(
+        request_id="aligner-internal",
+        external_req_id="aligner-external",
+        prompt_token_ids=[10, 11],
+        mm_features=None,
+        sampling_params=None,
+        pooling_params=PoolingParams(task="token_classify"),
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    processor.add_request(request, prompt=None, parent_req=None, request_index=0, queue=None)
+    timestamps = torch.tensor([[0, 125], [125, 300]], dtype=torch.int32)
+
+    processed = processor.process_outputs(
+        [
+            OmniEngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                pooling_output=None if cache_miss else timestamps,
+                finish_reason=FinishReason.ERROR if cache_miss else FinishReason.STOP,
+                mm_cache_miss_hashes=["audio-feature"] if cache_miss else None,
+            )
+        ]
+    )
+
+    assert len(processed.request_outputs) == 1
+    output = processed.request_outputs[0]
+    assert isinstance(output, PoolingRequestOutput)
+    assert output.request_id == request.external_req_id
+    assert output.prompt_token_ids == request.prompt_token_ids
+    assert output.finished
+    if cache_miss:
+        assert output.error is not None
+        assert output.error.code == "multimodal_cache_miss"
+        assert output.error.retryable
+        assert output.outputs.data.numel() == 0
+    else:
+        assert output.error is None
+        torch.testing.assert_close(output.outputs.data, timestamps)
+    assert request.request_id not in processor.request_states
+    assert request.external_req_id not in processor.external_req_ids
+
+
+def test_no_detokenizer_generation_cache_miss_keeps_multimodal_completion():
+    """A generation-stage error must retain its completion type and payload."""
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False, output_modality=OutputModality.AUDIO)
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+    audio = torch.tensor([0.1, 0.2])
+
+    processed = processor.process_outputs(
+        [
+            OmniEngineCoreOutput(
+                request_id=state.request_id,
+                new_token_ids=[],
+                multimodal_output={AUDIO: audio},
+                finish_reason=FinishReason.ERROR,
+                mm_cache_miss_hashes=["audio-feature"],
+            )
+        ]
+    )
+
+    assert len(processed.request_outputs) == 1
+    output = processed.request_outputs[0]
+    assert isinstance(output, RequestOutput)
+    assert output.finished
+    torch.testing.assert_close(output.outputs[0].multimodal_output[AUDIO], audio)
+    assert state.request_id not in processor.request_states
 
 
 def test_no_detokenizer_process_outputs_returns_nonterminal_audio_chunk(monkeypatch):
@@ -1488,3 +1645,23 @@ def test_cumulative_audio_terminal_output_supplies_full_aligner_waveform():
     assert (waveform[800:2000] == 1).all()
     assert (waveform[2000:] == 2).all()
     assert aligned["additional_information"]["aligner_audio_duration_ms"] == [100.0]
+
+
+@pytest.mark.parametrize("streaming_update", [False, True])
+@pytest.mark.parametrize("watermarked,skipped", [(True, False), (False, True), (False, False)])
+def test_native_finished_stats_preserve_watermark_status(watermarked, skipped, streaming_update):
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=True, engine_core_output_type=AUDIO)
+    kwargs = {**_NO_DETOK_STATE_KWARGS, "log_stats": True}
+    state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE)
+    assert state.stats is not None
+    state.stats.is_watermarked = watermarked
+    state.stats.is_watermark_skipped = skipped
+    if streaming_update:
+        state.apply_streaming_update(SimpleNamespace(final=True, prompt=None, prompt_token_ids=[], arrival_time=1.0))
+    stats = IterationStats()
+
+    processor._update_stats_from_finished(state, FinishReason.STOP, stats)
+
+    assert stats.num_watermarked_reqs == int(watermarked)
+    assert stats.num_watermark_skipped_reqs == int(skipped)
+    assert stats.num_not_watermarked_reqs == int(not watermarked and not skipped)

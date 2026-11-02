@@ -1,0 +1,368 @@
+# yaml-language-server: $schema=https://recipes.vllm.ai/recipe.schema.json
+
+meta:
+  title: "MOSS-Image"
+  slug: "moss-image"
+  provider: "OpenMOSS"
+  description: "Serve MOSS-Image-Base and MOSS-Image-SFT with vLLM-Omni for text-to-image generation, Chinese text rendering, and JSON layout prompts."
+  date_added: 2026-10-16
+  date_updated: 2026-10-16
+  tasks: [omni]
+  # The source checkout has inference evidence; the two published containers
+  # have been inspected, but have not yet been run end-to-end on this host.
+  hardware:
+    rtx_pro_6000: supported
+    rtx_pro_6000_8x: supported
+
+model:
+  model_id: "OpenMOSS-Team/MOSS-Image-Base"
+  # This is the vLLM base version in the images. MOSS-Image support is in
+  # vLLM-Omni PR #8926, not the standalone vLLM wheel.
+  min_vllm_version: "0.31.0"
+  docker_image:
+    cu130: "vllm/vllm-omni:mosimage"
+    cu129: "vllm/vllm-omni:mosimage-cu129"
+  install:
+    docker:
+      note: "MOSS-Image preview images with vLLM-Omni PR #8926. Choose CUDA 13.0 or CUDA 12.9 for your host driver."
+    pip: false
+  architecture: dense
+  # Parameter scale refers to the DiT; text encoder and VAE are separate components.
+  parameter_count: "5B"
+  active_parameters: "5B"
+  context_length: 0
+  base_args:
+    - "--enforce-eager"
+  base_env: {}
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    label: "Base"
+    precision: bf16
+    # Deployment memory includes the text encoder and VAE.
+    vram_minimum_gb: 33
+    description: "MOSS-Image-Base; BF16 DiT/text encoder and FP32 VAE. The memory estimate is for batch 1."
+    supported_hardware: &nvidia_hardware
+      - h100
+      - h200
+      - b200
+      - gb200
+      - b300
+      - gb300
+      - rtx_pro_6000
+      - rtx_pro_6000_8x
+    # These images have an empty ENTRYPOINT. Restore the command in Docker
+    # CMD on every selectable profile, including the default variant.
+    hardware_overrides: &image_command
+      h100: { docker_serve_command: "vllm serve" }
+      h200: { docker_serve_command: "vllm serve" }
+      b200: { docker_serve_command: "vllm serve" }
+      gb200: { docker_serve_command: "vllm serve" }
+      b300: { docker_serve_command: "vllm serve" }
+      gb300: { docker_serve_command: "vllm serve" }
+      rtx_pro_6000: { docker_serve_command: "vllm serve" }
+      rtx_pro_6000_8x: { docker_serve_command: "vllm serve" }
+  sft:
+    label: "SFT"
+    model_id: "OpenMOSS-Team/MOSS-Image-SFT"
+    precision: bf16
+    vram_minimum_gb: 33
+    description: "Supervised fine-tune with the same architecture and pipeline."
+    supported_hardware: *nvidia_hardware
+    hardware_overrides: *image_command
+
+compatible_strategies: []
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+omni:
+  port: 8000
+  variant_label: "Checkpoint"
+  variant_hint: "Base and SFT use the same serving command and sampling parameters."
+  tasks:
+    - id: t2i
+      description: "1024x1024, 50 Euler steps, CFG 3, shift 5, negative-branch layer skipping at index 22."
+      # The Images API uses the loaded checkpoint when model is omitted, so
+      # this static example works for both the Base and SFT variant selectors.
+      curl: |
+        curl --fail-with-body -sS http://localhost:8000/v1/images/generations \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "prompt": "A sunlit kitchen with a mint-green refrigerator beside a wooden counter. On the refrigerator, a yellow note has three clearly handwritten Chinese lines:\n记得买牛奶和鸡蛋！\n牛奶两盒，鸡蛋一打。\n顺便带一袋面包。",
+            "size": "1024x1024",
+            "n": 1,
+            "num_inference_steps": 50,
+            "guidance_scale": 3.0,
+            "flow_shift": 5.0,
+            "seed": 0,
+            "negative_prompt": "nsfw, worst quality, bad anatomy, watermark, jpeg artifact",
+            "response_format": "b64_json",
+            "extra_params": {
+              "uncond_skip_layers": [22],
+              "slg_start": 0.01,
+              "slg_stop": 1.0
+            }
+          }' -o response.json && \
+        python3 -c 'import base64,json,pathlib; r=json.loads(pathlib.Path("response.json").read_text()); pathlib.Path("moss-image.png").write_bytes(base64.b64decode(r["data"][0]["b64_json"]))'
+      benchmark: |
+        cat > request.json <<'JSON'
+        {
+          "prompt": "A sunlit kitchen with a mint-green refrigerator beside a wooden counter. On the refrigerator, a yellow note has three clearly handwritten Chinese lines:\n记得买牛奶和鸡蛋！\n牛奶两盒，鸡蛋一打。\n顺便带一袋面包。",
+          "size": "1024x1024",
+          "n": 1,
+          "num_inference_steps": 50,
+          "guidance_scale": 3.0,
+          "flow_shift": 5.0,
+          "seed": 0,
+          "negative_prompt": "nsfw, worst quality, bad anatomy, watermark, jpeg artifact",
+          "response_format": "b64_json",
+          "extra_params": {
+            "uncond_skip_layers": [22],
+            "slg_start": 0.01,
+            "slg_stop": 1.0
+          }
+        }
+        JSON
+        # Warm up, then time one image-generation request.
+        curl --fail-with-body -sS http://localhost:8000/v1/images/generations \
+          -H 'Content-Type: application/json' --data-binary @request.json -o /dev/null && \
+        time curl --fail-with-body -sS http://localhost:8000/v1/images/generations \
+          -H 'Content-Type: application/json' --data-binary @request.json -o /dev/null
+
+guide: |
+  ## Overview
+
+  MOSS-Image supports natural-language prompts, Chinese and English text rendering,
+  and structured JSON layouts. This recipe serves
+  [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) and
+  [MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT)
+  through vLLM-Omni's `/v1/images/generations` API.
+
+  MOSS-Image is a 5B diffusion transformer paired with a Qwen3.5 text encoder
+  and a FLUX.2 VAE. DiT and text-encoder weights use BF16;
+  the VAE, noise, guidance arithmetic, and Euler updates use FP32.
+
+  ## Choose a Docker image
+
+  Install Docker and the NVIDIA Container Toolkit on a Linux GPU host.
+
+  | Image | CUDA runtime | Suggested Linux driver |
+  | --- | --- | --- |
+  | `vllm/vllm-omni:mosimage` | 13.0.2 | R580 or newer |
+  | `vllm/vllm-omni:mosimage-cu129` | 12.9.1 | 575.57.08 or newer |
+
+  The container supplies CUDA libraries; a separate host CUDA Toolkit installation
+  is not required.
+  See NVIDIA's [driver compatibility table](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html#cuda-driver).
+
+  Use image builds containing the `MOSSImagePipeline` registration from
+  [vLLM-Omni PR #8926](https://github.com/vllm-project/vllm-omni/pull/8926).
+  The pipeline is detected automatically for both Base and SFT checkpoints.
+
+  ## Start a single-GPU server
+
+  ```bash
+  export IMAGE=vllm/vllm-omni:mosimage
+  # For CUDA 12.9: export IMAGE=vllm/vllm-omni:mosimage-cu129
+  export MODEL=OpenMOSS-Team/MOSS-Image-Base
+  # For SFT: export MODEL=OpenMOSS-Team/MOSS-Image-SFT
+
+  docker pull "$IMAGE"
+  docker run --rm --name moss-image \
+    --gpus 'device=0' --ipc=host \
+    -p 8000:8000 \
+    -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+    -e HF_TOKEN \
+    "$IMAGE" \
+    vllm serve "$MODEL" --omni \
+      --enforce-eager \
+      --port 8000
+  ```
+
+  `-e HF_TOKEN` forwards an existing host token if one is set. For an existing
+  Hugging Face cache, replace the host side of the mount with its cache root.
+  For a standalone model directory, mount it with `-v /path/to/model:/model:ro`,
+  use `vllm serve /model`, and add `--served-model-name "$MODEL"`.
+
+  These images have no default entrypoint: include `vllm serve` after the image
+  name. Wait for startup to finish, then check the server from another terminal:
+
+  ```bash
+  curl --fail-with-body -sS http://localhost:8000/health
+  curl --fail-with-body -sS http://localhost:8000/v1/models
+  ```
+
+  ## Inference Parameters
+
+  MOSS-Image-Base has no post-training or CFG distillation, preserving its training
+  information for community adaptation such as LoRA. Inference settings therefore
+  matter for image quality. The official
+  [Inference Parameters guide](https://github.com/OpenMOSS/MOSS-Image/blob/main/USERGUIDE.md#inference-parameters)
+  ([中文](https://github.com/OpenMOSS/MOSS-Image/blob/main/USERGUIDE_ZH.md#推理参数配置))
+  recommends:
+
+  | Parameter | Official guidance |
+  | --- | --- |
+  | Resolution (`size`) | Target 1M, 1.5M, or 2M total pixels. The model also supports extrapolation from 0.25M (512 × 512) to 4M (2048 × 2048). |
+  | Aspect ratio | Any ratio; both dimensions must be positive multiples of 16. |
+  | Steps (`num_inference_steps`) | Use at least 50 for best quality. |
+  | CFG (`guidance_scale`) | Default 3.0; recommended range 3.0–6.0. Long prompts generally work at 3.0; increase it as needed for shorter prompts. |
+  | Shift (`flow_shift`) | Default 5.0. |
+  | Sampler | Euler is recommended. |
+
+  The guide describes two forms of **Skip Layer Guidance (SLG)**:
+
+  - **Standard SLG:** use scale 3 over the 0.01–1.0 sampling interval.
+  - **Two-pass sampling SLG:** the recommended `uncond skip` mode skips layer 22
+    (zero-based) in the negative branch. Layers 24 and 26 are also useful alternatives.
+
+  The authors report that disabling SLG can increase realism while degrading details.
+
+  In vLLM-Omni, SLG options belong in `extra_params`. Standard SLG uses `slg_layers`
+  and `slg_scale`; uncond skip uses `uncond_skip_layers` without requiring
+  `slg_scale`. Both use `slg_start` and `slg_stop` to select the sampling interval.
+
+  ## Generate an image
+
+  This example uses 1024 × 1024, 50 steps, CFG 3.0, shift 5.0, and seed 0, with
+  `uncond_skip_layers=[22]` active over `slg_start=0.01` to `slg_stop=1.0`.
+
+  Natural-language descriptions, tag lists, and JSON layouts are supported.
+  English is recommended for scene descriptions; keep visible Chinese text in
+  Chinese and insert explicit line breaks to control its layout. This kitchen
+  example follows the guide's approach to multilingual text rendering:
+
+  ```bash
+  cat > request.json <<'JSON'
+  {
+    "prompt": "A sunlit kitchen with a mint-green refrigerator beside a wooden counter. On the refrigerator, a yellow note has three clearly handwritten Chinese lines:\n记得买牛奶和鸡蛋！\n牛奶两盒，鸡蛋一打。\n顺便带一袋面包。",
+    "size": "1024x1024",
+    "n": 1,
+    "num_inference_steps": 50,
+    "guidance_scale": 3.0,
+    "flow_shift": 5.0,
+    "seed": 0,
+    "negative_prompt": "nsfw, worst quality, bad anatomy, watermark, jpeg artifact",
+    "response_format": "b64_json",
+    "extra_params": {
+      "uncond_skip_layers": [22],
+      "slg_start": 0.01,
+      "slg_stop": 1.0
+    }
+  }
+  JSON
+
+  curl --fail-with-body -sS http://localhost:8000/v1/images/generations \
+    -H 'Content-Type: application/json' \
+    --data-binary @request.json -o response.json && \
+  python3 - <<'PY'
+  import base64
+  import json
+  from pathlib import Path
+  response = json.loads(Path("response.json").read_text())
+  Path("moss-image.png").write_bytes(base64.b64decode(response["data"][0]["b64_json"]))
+  print("Saved moss-image.png")
+  PY
+  ```
+
+  The request uses the server's loaded model, so it also works with SFT.
+  To disable negative-branch skipping, set `uncond_skip_layers` to `[]`.
+
+  ### Layout prompts
+
+  For precise text and object placement, use the guide's experimental Layout format:
+  `summary` describes the scene, and `items` supplies captions, visible `text`, and
+  bounding boxes. Coordinates use `[y_min, x_min, y_max, x_max]` with the canvas
+  center as origin; a 1024 × 1024 canvas spans −512 to +512 on each axis.
+
+  Encode the layout as the API's `prompt` **string** and use the matching canvas size:
+
+  ```bash
+  python3 - <<'PY'
+  import json
+  from pathlib import Path
+  layout = {
+      "summary": {"caption": "A travel poster on ivory paper with teal mountains and a Chinese heading."},
+      "items": [
+          {"label": "text", "caption": "Large teal heading at the top.",
+           "text": "向山而行", "bbox": [-432, -368, -288, 368]},
+          {"label": "object", "caption": "Layered mountain silhouettes below the heading.",
+           "bbox": [-176, -336, 400, 336]}
+      ],
+      "bbox_coord_space": "abs_centralized",
+      "bbox_format": "yxyx"
+  }
+  request = json.loads(Path("request.json").read_text(encoding="utf-8"))
+  request["prompt"] = json.dumps(layout, ensure_ascii=False, separators=(",", ":"))
+  request["size"] = "1024x1024"
+  Path("request-layout.json").write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+  PY
+
+  curl --fail-with-body -sS http://localhost:8000/v1/images/generations \
+    -H 'Content-Type: application/json' \
+    --data-binary @request-layout.json -o response.json
+  ```
+
+  Decode `response.json` with the image-saving snippet above.
+
+  ## Improve prompts with the official skill
+
+  The official [MOSS-Image Prompt Enhancer](https://github.com/OpenMOSS/MOSS-Image/tree/main/skills/moss-image-prompt-enhancer)
+  turns an image idea into a detailed caption or a spatial Layout prompt.
+  Choose a caption for scenes and illustrations, or Layout for posters, panels,
+  and precise text placement. The skill prepares prompts; vLLM-Omni generates the image.
+
+  Copy the complete `skills/moss-image-prompt-enhancer` directory, including its
+  `scripts` and `references`, into your agent's skills directory. See the official
+  [SKILL.md](https://github.com/OpenMOSS/MOSS-Image/blob/main/skills/moss-image-prompt-enhancer/SKILL.md)
+  for its workflow. For example, ask the agent:
+
+  ```text
+  Use $moss-image-prompt-enhancer to create a 1024×1024 Layout prompt for
+  a travel poster with teal mountains on ivory paper. Put the exact Chinese
+  heading “向山而行” at the top. Save the draft as draft.json and compile it
+  to prompt.txt.
+  ```
+
+  The bundled `compile_prompt.py` converts top-left pixel boxes in the draft
+  into MOSS-Image's centered layout coordinates. It also supports caption drafts
+  and needs only Python's standard library. Send the compiled `prompt.txt` as a
+  string, keeping the requested dimensions the same as the draft:
+
+  ```bash
+  python3 - <<'PY'
+  import json
+  from pathlib import Path
+  request = json.loads(Path("request.json").read_text(encoding="utf-8"))
+  request["prompt"] = Path("prompt.txt").read_text(encoding="utf-8").strip()
+  request["size"] = "1024x1024"
+  Path("request-enhanced.json").write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
+  PY
+
+  curl --fail-with-body -sS http://localhost:8000/v1/images/generations \
+    -H 'Content-Type: application/json' \
+    --data-binary @request-enhanced.json -o response.json
+  ```
+
+  ## Troubleshooting
+
+  - **Unexpected sampling behavior:** send `flow_shift: 5.0` explicitly to match
+    the checkpoint's scheduler configuration.
+  - **CUDA driver mismatch:** select the CUDA 12.9 image or update the host driver
+    to the matching supported version.
+
+  ## References
+
+  - [MOSS-Image-Base model card](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base)
+  - [MOSS-Image-SFT model card](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT)
+  - [MOSS-Image project and user guide](https://github.com/OpenMOSS/MOSS-Image)
+  - [Official Chinese user guide](https://github.com/OpenMOSS/MOSS-Image/blob/main/USERGUIDE_ZH.md)
+  - [Official Prompt Enhancer skill](https://github.com/OpenMOSS/MOSS-Image/blob/main/skills/moss-image-prompt-enhancer/SKILL.md)
+  - [vLLM-Omni implementation PR #8926](https://github.com/vllm-project/vllm-omni/pull/8926)
+  - [vLLM-Omni Docker images](https://hub.docker.com/r/vllm/vllm-omni/tags?name=mosimage)

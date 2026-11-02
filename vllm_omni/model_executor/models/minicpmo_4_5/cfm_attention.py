@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Tiled CFM attention: float32 tensors, ordinary TF32 Tensor Core dots."""
+"""Tiled CFM attention with FP32/TF32 or FP16 Tensor Core dots."""
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -80,7 +80,7 @@ def _attention(
             (keys[:, None] < nk) & (ds[None, :] < dim),
             0,
         )
-        accumulator = accumulator * correction[:, None] + tl.dot(prob, values, input_precision="tf32")
+        accumulator = accumulator * correction[:, None] + tl.dot(prob.to(values.dtype), values, input_precision="tf32")
         maximum = new_max
     result = accumulator / tl.where(denominator > 0, denominator, 1.0)[:, None]
     tl.store(
@@ -98,11 +98,11 @@ def cfm_attention(
     mask: torch.Tensor | None = None,
     kv_rows: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Tiled attention with TF32 dots; optional ``kv_rows`` indexes a pooled K/V cache."""
+    """Tiled attention; optional ``kv_rows`` indexes a pooled K/V cache in place."""
     b, heads, nq, dim = q.shape
     nk = k.shape[2]
-    if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
-        raise ValueError("CFM tiled attention requires float32 Q/K/V")
+    if q.dtype not in (torch.float32, torch.float16) or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("CFM tiled attention requires matching float32 or float16 Q/K/V")
     num_stages = 2
     out = torch.empty((b, nq, heads, dim), device=q.device, dtype=q.dtype)
     _attention[(b, heads, triton.cdiv(nq, 32))](

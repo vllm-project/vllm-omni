@@ -33,10 +33,26 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 
 _MASK64 = (1 << 64) - 1
+
+
+def _broadcast_tp_tensor(tensor: torch.Tensor) -> None:
+    """Copy ``tensor`` from tensor-parallel rank 0 when that group exists."""
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_world_size,
+        get_tp_group,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        return
+    if get_tensor_model_parallel_world_size() <= 1:
+        return
+    get_tp_group().broadcast(tensor, src=0)
 
 
 def _frame_seed(seed: int, frame: int) -> int:
@@ -148,7 +164,7 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         req_id = str(new_req_data.req_id)
         prompt_ids = list(new_req_data.prompt_token_ids or [])
         token_ids = list(new_req_data.prefill_token_ids or prompt_ids)
-        if req_id.startswith("_warmup_"):
+        if is_warmup_request(req_id):
             # Warmup requests: text rows with zero codes.
             rows = torch.zeros((len(prompt_ids), self.frame_width), dtype=torch.int64)
             rows[:, 0] = torch.tensor(prompt_ids, dtype=torch.int64)
@@ -223,7 +239,11 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
             event = torch.cuda.Event()
             event.record()
         else:
-            host_history, host_count = history.clone(), count.clone()
+            # Native NPU tensors are not CUDA tensors. Blocking host copies
+            # complete before the slot can be reused; copy=True also keeps CPU
+            # snapshots independent of the original slot storage.
+            host_history = history.to(device="cpu", non_blocking=False, copy=True)
+            host_count = count.to(device="cpu", non_blocking=False, copy=True)
         self._suspended[req_id] = _SuspendedRequest(host_history, host_count, event)
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
@@ -308,16 +328,18 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         batch row) that samples frame ``frames[row]`` draws from that frame's seed."""
         noise = self.buffers.noise
         noise.uniform_()
-        if not self._seeds:
-            return
-        for row, req_id in enumerate(req_ids):
-            seed = self._seeds.get(req_id)
-            if seed is None or not sampling[row]:
-                continue
-            if self._seed_generator is None:
-                self._seed_generator = torch.Generator(device=noise.device)
-            self._seed_generator.manual_seed(_frame_seed(seed, int(frames[row])))
-            noise[row].uniform_(generator=self._seed_generator)
+        if self._seeds:
+            for row, req_id in enumerate(req_ids):
+                seed = self._seeds.get(req_id)
+                if seed is None or not sampling[row]:
+                    continue
+                if self._seed_generator is None:
+                    self._seed_generator = torch.Generator(device=noise.device)
+                self._seed_generator.manual_seed(_frame_seed(seed, int(frames[row])))
+                noise[row].uniform_(generator=self._seed_generator)
+        # Each tensor-parallel rank samples inside the forward. Device RNG is
+        # not shared, so rank 0's noise is the one every rank uses.
+        _broadcast_tp_tensor(noise)
 
     def run_postprocess(self, hidden_states, input_batch) -> None:
         self.model.num_sample_rows = None
@@ -403,4 +425,13 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         return hidden, _FrameRowsSnapshot(frames, valid, partitioned=self._partitioned)
 
 
-__all__ = ["FishOmniModelState"]
+def create_fish_omni_model_state(vllm_config, model, encoder_cache, device):
+    """CUDA keeps the upstream hybrid state; NPU builds Ascend attention metadata."""
+    if getattr(device, "type", None) == "npu":
+        from vllm_omni.platforms.npu.models.fish_omni_model_state import NPUFishOmniModelState
+
+        return NPUFishOmniModelState(vllm_config, model, encoder_cache, device)
+    return FishOmniModelState(vllm_config, model, encoder_cache, device)
+
+
+__all__ = ["FishOmniModelState", "create_fish_omni_model_state"]

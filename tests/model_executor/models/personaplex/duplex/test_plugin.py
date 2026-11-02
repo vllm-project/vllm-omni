@@ -13,7 +13,7 @@ from typing import cast
 
 import numpy as np
 import pytest
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from tests.e2e.online_serving import personaplex_realtime_duplex as e2e_driver
 from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
@@ -293,6 +293,39 @@ def test_runtime_config_update_rejects_changed_voice() -> None:
     assert unchanged["personaplex_voice_prompt"] == "NATF2.pt"
 
 
+def test_runtime_config_update_accepts_an_echoed_voice_spelling() -> None:
+    """A whole-session resend may change case or spacing; the stored voice must survive."""
+    plugin = _plugin()
+    current = {"personaplex_persona": DEFAULT_PERSONA, "personaplex_voice_prompt": "NATF2.pt"}
+
+    for voice in ("natf2.pt", " NATF2.pt "):
+        config = DuplexSessionConfig(voice="NATF2.pt")
+        config.apply_realtime_update({"voice": voice, "temperature": 0.5}, audio_started=False)
+        assert config.voice == "NATF2.pt"
+        unchanged = plugin.runtime_config_for_update(config, current)
+        assert unchanged["personaplex_voice_prompt"] == "NATF2.pt"
+        assert config.temperature == 0.5
+
+
+def test_runtime_config_update_treats_a_blank_voice_as_a_clear() -> None:
+    """A blank clear must match the equivalent null clear at the plugin boundary."""
+    plugin = _plugin()
+    current = {"personaplex_persona": DEFAULT_PERSONA, "personaplex_voice_prompt": "NATM1.pt"}
+
+    blank = DuplexSessionConfig(voice="NATM1.pt")
+    blank.apply_realtime_update({"voice": "   "}, audio_started=False)
+    assert blank.voice is None
+
+    null = DuplexSessionConfig(voice="NATM1.pt")
+    null.apply_realtime_update({"voice": None}, audio_started=False)
+    assert null.voice is None
+
+    for config in (blank, null):
+        with pytest.raises(DuplexRuntimeConfigError, match="voice") as excinfo:
+            plugin.runtime_config_for_update(config, current)
+        assert excinfo.value.code == "voice_update_unsupported"
+
+
 def test_data_plane_context_is_the_framework_default() -> None:
     context = _plugin().data_plane_context(
         epoch=1,
@@ -314,7 +347,7 @@ def test_data_plane_context_is_the_framework_default() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_sampling_params_are_greedy_one_token_on_stage0_only() -> None:
+def test_sampling_params_are_greedy_on_stage0_and_delta_on_code2wav() -> None:
     defaults = (SamplingParams(temperature=0.8, top_k=10, max_tokens=10), SamplingParams(max_tokens=1024))
 
     configured = _plugin().configure_sampling_params(runtime_config={}, defaults=defaults)
@@ -322,9 +355,26 @@ def test_sampling_params_are_greedy_one_token_on_stage0_only() -> None:
     assert configured[0].temperature == 0.0
     assert configured[0].top_k == 1
     assert configured[0].max_tokens == 1
-    assert configured[1] is defaults[1]
+    assert configured[0].output_kind == RequestOutputKind.CUMULATIVE
+    assert configured[1] is not defaults[1]
+    assert configured[1].output_kind == RequestOutputKind.DELTA
+    assert configured[1].max_tokens == 1024
     assert defaults[0].max_tokens == 10
+    assert defaults[1].output_kind == RequestOutputKind.CUMULATIVE
+    assert PersonaPlexDataPlaneSession.audio_output_is_delta is True
     assert _plugin().configure_sampling_params(runtime_config={}, defaults=()) == ()
+
+
+def test_only_the_final_stage_switches_to_delta_output() -> None:
+    defaults = (SamplingParams(), SamplingParams(), SamplingParams())
+
+    configured = _plugin().configure_sampling_params(runtime_config={}, defaults=defaults)
+
+    assert [params.output_kind for params in configured] == [
+        RequestOutputKind.CUMULATIVE,
+        RequestOutputKind.CUMULATIVE,
+        RequestOutputKind.DELTA,
+    ]
 
 
 def test_plan_append_reserves_one_slot_plus_prefill_on_the_first_seq() -> None:

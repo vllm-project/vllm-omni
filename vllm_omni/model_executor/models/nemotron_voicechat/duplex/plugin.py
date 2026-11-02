@@ -81,6 +81,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "nvc_tools_signature",
         "nvc_function_response_generation",
         "nvc_function_response_batches",
+        "nvc_function_response_floor_generation",
     }
 )
 
@@ -523,7 +524,14 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         current: Mapping[str, object],
         output_metadata: Mapping[str, object],
     ) -> dict[str, object] | None:
-        """Retire batches after the thinker takes ownership of their tokens."""
+        """Retire batches after the thinker takes ownership of their tokens.
+
+        The generation it took is recorded in the floor (see
+        :meth:`_function_response_floor`): a batch is per *request*, and the
+        fence a cancelled session moves to is a different request, so the next
+        worker session cannot learn from its own state which generations the
+        previous one already took.
+        """
         consumed = output_metadata.get("nvc_function_response_consumed_generation")
         try:
             consumed_generation = int(consumed)
@@ -532,17 +540,82 @@ class NemotronVoiceChatDuplexPlugin(DuplexModelPlugin):
         if consumed_generation <= 0:
             return None
         batches = current.get("nvc_function_response_batches")
-        if not isinstance(batches, list):
-            return None
-        remaining = [
-            batch
-            for batch in batches
-            if isinstance(batch, dict) and int(batch.get("generation", 0)) > consumed_generation
-        ]
-        if len(remaining) == len(batches):
+        remaining: list[object] | None = None
+        if isinstance(batches, list):
+            remaining = [
+                batch
+                for batch in batches
+                if isinstance(batch, dict) and int(batch.get("generation", 0)) > consumed_generation
+            ]
+        floor = self._function_response_floor(current)
+        if consumed_generation <= floor and (remaining is None or len(remaining) == len(batches)):
             return None
         runtime = deepcopy(dict(current))
-        runtime["nvc_function_response_batches"] = remaining
+        runtime["nvc_function_response_floor_generation"] = max(floor, consumed_generation)
+        if remaining is not None:
+            runtime["nvc_function_response_batches"] = remaining
+        return runtime
+
+    @staticmethod
+    def _function_response_floor(current: Mapping[str, object]) -> int:
+        """Highest generation this session's runtime no longer holds a batch for.
+
+        Everything at or below the floor has left the runtime's queue: the
+        thinker took it (reported back as ``nvc_function_response_consumed_generation``)
+        or a cancellation dropped it. The worker steps its watermark over the
+        floor and over nothing else -- a gap above it is a lost batch, not a
+        consumption.
+        """
+        raw = current.get("nvc_function_response_floor_generation")
+        if raw is None:
+            return 0
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+            # A floor that is present but unreadable is not "no floor": reading
+            # it as zero would silently re-open generations the runtime has
+            # already dropped and let a stale batch be spoken.
+            raise NemotronVoiceChatClientRuntimeConfigError(
+                "Nemotron VoiceChat function-response floor must be a nonnegative integer",
+                code="invalid_function_call_output",
+            )
+        return raw
+
+    def retire_pending_function_output(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Drop function batches the cancelled epoch never let the thinker consume.
+
+        ``nvc_function_response_generation`` is left alone: the worker copies
+        batches whose generation is above its consumed watermark, so lowering it
+        would make a batch that was already taken into model state eligible for
+        a second application. The dropped generation is raised onto the floor
+        instead -- even when no batch is left to drop, so that a result that was
+        accepted and then acknowledged before the cancellation is still named --
+        which is what lets the next epoch's worker session step its own
+        watermark over that generation with nothing queued, and still refuse a
+        generation that neither a batch nor the floor accounts for (a lost
+        batch). The next result is therefore contiguous, and the cancelled
+        epoch's tokens are not speakable in the next one.
+        """
+        del config
+        try:
+            generation = int(current.get("nvc_function_response_generation", 0))
+        except (TypeError, ValueError) as exc:
+            raise NemotronVoiceChatClientRuntimeConfigError(
+                "Nemotron VoiceChat cannot retire a function result without a readable generation",
+                code="invalid_function_call_output",
+            ) from exc
+        floor = self._function_response_floor(current)
+        batches = current.get("nvc_function_response_batches")
+        has_batches = isinstance(batches, list) and bool(batches)
+        if not has_batches and generation <= floor:
+            # Nothing is queued and the floor already names the newest
+            # generation: the runtime already holds what this would write.
+            return None
+        runtime = deepcopy(dict(current))
+        runtime["nvc_function_response_batches"] = []
+        runtime["nvc_function_response_floor_generation"] = max(floor, generation)
         return runtime
 
     def data_plane_context(

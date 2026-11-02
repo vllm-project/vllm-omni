@@ -132,8 +132,11 @@ class _HostSlot:
         self._buffer: torch.Tensor | None = None
         self.held_bytes = 0
 
+    @torch.inference_mode(False)
     def reserve(self, frames: torch.Tensor) -> torch.Tensor:
         """Return a host view shaped like ``frames``, growing the buffer if needed."""
+        # VAE callbacks may run in inference mode while the final flush does
+        # not. Reusable host slots must remain mutable across that boundary.
         needed = frames.numel()
         if self._buffer is None or self._buffer.numel() < needed:
             try:
@@ -354,9 +357,13 @@ class ChunkedVideoMP4Session:
     silent entry), so a caller with several outputs per prompt repeats a
     request's waveform across its entries. ``batch_frames`` coalesces transfers
     for producers that publish finer than a transfer is worth; ``crop`` trims
-    the decoder's padding to the requested output size. ``transfer_slots`` sets
+    the decoder's padding to the requested output size, and ``skip_frames``
+    drops leading frames a producer decodes only as context. ``transfer_slots`` sets
     how many chunks may be in flight to the host at once, while
     ``max_pending_bytes`` bounds their combined uint8 payload size.
+    ``use_segmented_encoder`` opts into the experimental SegmentedFFmpegEncoder
+    backend that runs ``segmented_process_count`` parallel FFmpeg subprocesses
+    instead of PyAV.
     """
 
     def __init__(
@@ -372,11 +379,14 @@ class ChunkedVideoMP4Session:
         crop: tuple[int, int] | None = None,
         transfer_slots: int = 2,
         max_pending_bytes: int | None = _DEFAULT_MAX_PENDING_BYTES,
+        skip_frames: int = 0,
         use_segmented_encoder: bool = False,
         segmented_process_count: int = 4,
     ) -> None:
         if batch_frames <= 0:
             raise ValueError("batch_frames must be positive")
+        if skip_frames < 0:
+            raise ValueError("skip_frames must be non-negative")
         if max_pending_bytes is not None and (type(max_pending_bytes) is not int or max_pending_bytes <= 0):
             raise ValueError("max_pending_bytes must be a positive integer or None")
         if use_segmented_encoder and SegmentedFFmpegEncoder is None:
@@ -391,22 +401,70 @@ class ChunkedVideoMP4Session:
         self._max_pending = max_pending
         self._video_codec_options = video_codec_options
         self._crop = crop
+        self._skip_frames = skip_frames
         self._transfer_slots = transfer_slots
         self._max_pending_bytes = max_pending_bytes
         self._use_segmented_encoder = use_segmented_encoder
         self._segmented_process_count = segmented_process_count
         self._encoders: list[ChunkedMP4Encoder | SegmentedFFmpegEncoder] = []
+        self._output_shape: tuple[int, int, int] | None = None
         self._pending: list[torch.Tensor] = []
         self._pending_frames = 0
         self._ring: PinnedChunkRing | None = None
         self._ring_resolved = False
         self._inflight: deque[ChunkLease] = deque()
 
+    def start(self, *, width: int, height: int, batch_size: int) -> None:
+        """Start muxing ready audio before the first video chunk arrives."""
+        if min(width, height, batch_size) <= 0:
+            raise ValueError("output dimensions and batch_size must be positive")
+        if self._encoders:
+            if self._output_shape != (batch_size, height, width):
+                raise ValueError("output dimensions or batch size changed after encoder start")
+            return
+        waveforms = [self._waveform_for(index, batch_size) for index in range(batch_size)]
+        encoder_cls = SegmentedFFmpegEncoder if self._use_segmented_encoder else ChunkedMP4Encoder
+        kwargs_base = dict(
+            width=width,
+            height=height,
+            fps=self._fps,
+            audio_sample_rate=self._audio_sample_rate,
+            max_pending=self._max_pending,
+            video_codec_options=self._video_codec_options,
+        )
+        try:
+            for waveform in waveforms:
+                if encoder_cls is SegmentedFFmpegEncoder:
+                    self._encoders.append(
+                        SegmentedFFmpegEncoder(
+                            **kwargs_base,
+                            audio_waveform=waveform,
+                            process_count=self._segmented_process_count,
+                        )
+                    )
+                else:
+                    self._encoders.append(
+                        ChunkedMP4Encoder(
+                            **kwargs_base,
+                            audio_waveform=waveform,
+                        )
+                    )
+        except BaseException:
+            self.abort()
+            raise
+        self._output_shape = (batch_size, height, width)
+
     def push(self, chunk: torch.Tensor) -> None:
         """Queue one committed ``BCTHW`` chunk."""
         if self._crop is not None:
             height, width = self._crop
             chunk = chunk[..., :height, :width]
+        if self._skip_frames:
+            skipped = min(self._skip_frames, int(chunk.shape[2]))
+            self._skip_frames -= skipped
+            chunk = chunk[:, :, skipped:]
+            if not chunk.shape[2]:
+                return
         self._pending.append(chunk)
         self._pending_frames += int(chunk.shape[2])
         if self._pending_frames >= self._batch_frames:
@@ -430,6 +488,11 @@ class ChunkedVideoMP4Session:
     def transfer_stats(self) -> ChunkTransferStats | None:
         """Per-request transfer accounting, or ``None`` if no ring was used."""
         return None if self._ring is None else self._ring.stats
+
+    @property
+    def frame_counts(self) -> list[int]:
+        """Actual frame counts, complete after a successful finish()."""
+        return [encoder.frame_count for encoder in self._encoders]
 
     @property
     def ring(self) -> PinnedChunkRing | None:
@@ -476,36 +539,7 @@ class ChunkedVideoMP4Session:
                 raise
 
     def _ensure_encoders(self, frames: torch.Tensor) -> None:
-        if self._encoders:
-            return
-        encoder_cls = SegmentedFFmpegEncoder if self._use_segmented_encoder else ChunkedMP4Encoder
-        kwargs_base = dict(
-            width=int(frames.shape[3]),
-            height=int(frames.shape[2]),
-            fps=self._fps,
-            max_pending=self._max_pending,
-            video_codec_options=self._video_codec_options,
-        )
-        self._encoders = []
-        for index in range(int(frames.shape[0])):
-            waveform = self._waveform_for(index, int(frames.shape[0]))
-            if encoder_cls is SegmentedFFmpegEncoder:
-                self._encoders.append(
-                    SegmentedFFmpegEncoder(
-                        **kwargs_base,
-                        audio_waveform=waveform,
-                        audio_sample_rate=self._audio_sample_rate,
-                        process_count=self._segmented_process_count,
-                    )
-                )
-            else:
-                self._encoders.append(
-                    ChunkedMP4Encoder(
-                        **kwargs_base,
-                        audio_waveform=waveform,
-                        audio_sample_rate=self._audio_sample_rate,
-                    )
-                )
+        self.start(width=int(frames.shape[3]), height=int(frames.shape[2]), batch_size=int(frames.shape[0]))
 
     def _resolve_ring(self, device: torch.device) -> PinnedChunkRing | None:
         if self._ring_resolved:
@@ -538,7 +572,14 @@ class ChunkedVideoMP4Session:
         return self._audio_waveforms[index]
 
 
-def decode_to_mp4(vae: Any, z: torch.Tensor, **session_kwargs: Any) -> list[bytes]:
+def decode_to_mp4(
+    vae: Any,
+    z: torch.Tensor,
+    *,
+    frame_counts: list[int] | None = None,
+    session: ChunkedVideoMP4Session | None = None,
+    **session_kwargs: Any,
+) -> list[bytes]:
     """Decode ``z`` straight into one progressive MP4 per batch entry.
 
     Drives a VAE that declares :class:`SupportsChunkedVAEDecode`, so host
@@ -550,10 +591,15 @@ def decode_to_mp4(vae: Any, z: torch.Tensor, **session_kwargs: Any) -> list[byte
     if not supports_chunked_vae_decode(vae):
         raise TypeError(f"{type(vae).__name__} does not expose the chunked VAE decode capability")
 
-    session = ChunkedVideoMP4Session(value_range=vae.chunk_value_range, **session_kwargs)
+    if session is not None and session_kwargs:
+        raise ValueError("session options cannot accompany an existing session")
+    if session is None:
+        session = ChunkedVideoMP4Session(value_range=vae.chunk_value_range, **session_kwargs)
     try:
         vae.decode_with_chunks(z, on_chunk=session.push)
         videos = session.finish()
+        if frame_counts is not None:
+            frame_counts.extend(session.frame_counts)
     except BaseException:
         session.abort()
         raise
