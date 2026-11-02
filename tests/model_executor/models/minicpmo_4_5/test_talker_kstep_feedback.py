@@ -1486,6 +1486,39 @@ def test_host_pipeline_lg_dev_matches_eager_greedy():
     assert piped == eager == (42, False, True)
 
 
+def test_host_temperature_zero_takes_the_argmax_not_a_draw():
+    """Greedy codec requests short-circuit to an argmax over the penalized logits.
+
+    The host sampler special-cases ``temperature == 0`` instead of dividing by
+    it, so a near tie that a temperature-1 draw would split must come back as
+    the same id for every seed.
+    """
+    model = _real_boundary_talker(0.0)
+    _real_host(model)
+    _set_head_logits(model, {42: 0.250, 43: 0.249})
+    hidden = torch.ones(1, 8)
+    got = {
+        model._sample_audio_code_host(
+            hidden,
+            torch.tensor([10, 11]),
+            f"greedy{seed}",
+            {
+                "codec_seed": seed,
+                "codec_temperature": 0.0,
+                "codec_top_k": 0,
+                "codec_top_p": 1.0,
+                "codec_repetition_penalty": 1.0,
+            },
+            0,
+            0,
+            100,
+            False,
+        )[0]
+        for seed in range(20)
+    }
+    assert got == {42}
+
+
 def test_stop_id_finishes_request_through_device_state_greedy():
     """A codec stop id finishes the request via the device state alone.
 
