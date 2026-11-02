@@ -316,7 +316,7 @@ class OmniMasterServer:
                     # Reserve on every local interface. The advertised address
                     # can be a routable interface IP, but wildcard binding also
                     # protects the route from local NCCL/socket allocations.
-                    # codeql[py/bind_socket_to_all_interfaces]: intentional wildcard
+                    # codeql[py/bind-socket-all-network-interfaces]: intentional wildcard
                     reservation.bind(("", port))
                 except OSError:
                     reservation.close()
