@@ -1103,7 +1103,7 @@ def calculate_metrics(
         # Create second buckets (ceiling to ensure we capture all time)
         duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
         tokens_per_second = np.zeros(duration_seconds)
-        concurrent_requests_per_second = np.zeros(duration_seconds)
+        concurrency_events: list[tuple[float, int]] = []
 
         for i, output in enumerate(successful_outputs):
             session_metrics = getattr(output, "duplex_session_metrics", None)
@@ -1133,21 +1133,30 @@ def calculate_metrics(
                         if 0 <= second_bucket < duration_seconds:
                             tokens_per_second[second_bucket] += 1
 
-            # Track concurrent requests for each second this request was active
-            request_start_second = int(output.start_time - min_start_time)
-            request_end_second = int((output.start_time + output.latency) - min_start_time)
+            # Count overlapping [start, end) intervals, not every request that
+            # touches the same second. Zero-duration intervals are empty.
+            if output.latency > 0:
+                concurrency_events.append((output.start_time, 1))
+                concurrency_events.append((output.start_time + output.latency, -1))
 
-            for second in range(request_start_second, request_end_second + 1):
-                concurrent_requests_per_second[second] += 1
+        # Sort departures before arrivals at the same timestamp so sequential
+        # requests do not overlap at their shared endpoint.
+        concurrency_events.sort()
+        concurrent_requests = 0
+        concurrency_times: list[float] = []
+        concurrency_counts: list[int] = []
+        for timestamp, delta in concurrency_events:
+            concurrent_requests += delta
+            max_concurrent_requests = max(max_concurrent_requests, concurrent_requests)
+            concurrency_times.append(timestamp - min_start_time)
+            concurrency_counts.append(concurrent_requests)
 
-        # Find the maximum tokens per second and corresponding
-        # concurrent requests
+        # Token throughput retains its one-second buckets.
         if len(tokens_per_second) > 0:
             if token_timeline_available:
                 max_output_tokens_per_s = float(np.max(tokens_per_second))
             else:
                 max_output_tokens_per_s = float("nan")
-            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
 
         if TERM_PLOTLIB_AVAILABLE:
             import termplotlib as tpl
@@ -1159,11 +1168,12 @@ def calculate_metrics(
                     tokens_per_second,
                     title="Output tokens per second",
                 )
-            fig.plot(
-                np.arange(len(concurrent_requests_per_second)),
-                concurrent_requests_per_second,
-                title="Concurrent requests per second",
-            )
+            if concurrency_times:
+                fig.plot(
+                    concurrency_times,
+                    concurrency_counts,
+                    title="Concurrent successful requests",
+                )
             fig.show()
         else:
             print("tip: install termplotlib and gnuplot to plot the metrics")

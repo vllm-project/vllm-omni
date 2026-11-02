@@ -137,6 +137,56 @@ def test_unmeasured_audio_ttfp_does_not_pass_goodput() -> None:
     assert combined.request_goodput == 0.0
 
 
+@pytest.mark.parametrize(
+    ("intervals", "expected_peak"),
+    [
+        ([(0.1, 0.2), (0.3, 0.4), (0.5, 0.6)], 1),
+        ([(0.0, 0.5), (0.25, 0.75), (0.625, 0.875)], 2),
+        ([(0.0, 0.5), (0.0, 0.5), (0.5, 1.0), (0.5, 1.0)], 2),
+        ([(0.0, 3.0), (1.0, 2.0), (1.25, 1.75)], 3),
+        ([(0.0, 1.0), (0.5, 0.5)], 1),
+        ([(0.0, 0.0)], 0),
+    ],
+    ids=["sequential-subsecond", "partial-overlap", "tied-events", "nested", "empty-interval", "all-empty"],
+)
+def test_peak_concurrency_counts_overlapping_intervals(intervals, expected_peak):
+    outputs = []
+    for start, end in intervals:
+        output = _make_output(1, output_tokens=1)
+        output.start_time = 100.0 + start
+        output.latency = end - start
+        outputs.append(output)
+
+    # Input order must not affect the sweep.
+    metrics = _calculate_test_metrics(list(reversed(outputs)))
+
+    assert metrics.max_concurrent_requests == expected_peak
+
+
+def test_peak_concurrency_preserves_successful_request_population():
+    successful = _make_output(1, output_tokens=1)
+    failed = _make_output(1, output_tokens=1)
+    failed.success = False
+
+    metrics = _calculate_test_metrics([successful, failed])
+
+    assert metrics.max_concurrent_requests == 1
+    assert metrics.completed == 1
+    assert metrics.failed == 1
+
+
+def test_peak_concurrency_does_not_change_token_throughput():
+    outputs = [_make_output(1, output_tokens=1) for _ in range(3)]
+    for index, output in enumerate(outputs):
+        output.start_time = index * 0.25
+        output.latency = 0.125
+
+    metrics = _calculate_test_metrics(outputs)
+
+    assert metrics.max_concurrent_requests == 1
+    assert metrics.max_output_tokens_per_s == 3
+
+
 # ============================================================================
 # total_input Tests
 # ============================================================================
