@@ -499,6 +499,13 @@ The tile-parallel executor above assigns independent spatial **tiles** to ranks.
 
 Spatial-shard decode swaps the decoder's spatial convolutions/padding for halo-exchanging variants (`WanDistConv2d`, `WanDistCausalConv3d`, `WanDistZeroPad2d`) so each rank only holds a shard of the activations but still sees the correct receptive field at shard boundaries. Implementation lives in `vllm_omni/diffusion/distributed/autoencoders/wan_spatial_shard.py`.
 
+With the fast path installed, eligible BF16 channels-last upsampling assembles
+the padded convolution input directly, then uses the same halo exchange and
+output masking as ordinary spatial Conv2d. Eligible spatial 1x1 shortcuts defer
+bias to residual addition while preserving BF16 rounding and invalid-tail
+masking. These fusions need no additional flag; see the
+[Wan VAE fast-path guide](../../user_guide/diffusion/vae_fast_path.md).
+
 ### Wiring
 
 `vae_parallel_mode` flows through the same path as `vae_patch_parallel_size`:

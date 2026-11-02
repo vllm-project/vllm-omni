@@ -121,6 +121,51 @@ if HAS_TRITON:
             tl.store(out_ptr + (first + out_row_stride), values, mask=mask)
             tl.store(out_ptr + (first + out_row_stride + channels), values, mask=mask)
 
+    @triton.jit
+    def _upsample2x_padded_kernel(
+        X, Y, N: tl.constexpr, C: tl.constexpr, H: tl.constexpr, W: tl.constexpr, BLOCK: tl.constexpr
+    ):
+        # Flat NHWC indexing uses int64 for large video batches.
+        i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        c = i % C
+        row = i // C
+        w = row % (2 * W + 2)
+        h = row // (2 * W + 2) % (2 * H + 2)
+        n = row // ((2 * W + 2) * (2 * H + 2))
+        valid = (n < N) & (h > 0) & (h <= 2 * H) & (w > 0) & (w <= 2 * W)
+        source = ((n * H + (h - 1) // 2) * W + (w - 1) // 2) * C + c
+        value = tl.load(X + source, valid, 0)
+        tl.store(Y + i, value, i < N * C * (2 * H + 2) * (2 * W + 2))
+
+
+def upsample_nearest_2x_padded(x: torch.Tensor, out: torch.Tensor) -> bool:
+    """Write nearest-2x BF16 input into an NHWC buffer with one-cell borders.
+
+    Border values are zero; the spatial wrapper fills received halos afterward.
+    Returns False without writing when the kernel cannot handle the tensors.
+    """
+    if (
+        not HAS_TRITON
+        or not x.is_cuda
+        or x.ndim != 4
+        or x.dtype != torch.bfloat16
+        or x.numel() == 0
+        or not x.is_contiguous(memory_format=torch.channels_last)
+        or out.device != x.device
+        or out.dtype != x.dtype
+        or out.shape != (x.shape[0], x.shape[1], 2 * x.shape[2] + 2, 2 * x.shape[3] + 2)
+        or not out.is_contiguous(memory_format=torch.channels_last)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+    ):
+        return False
+    n, c, h, w = x.shape
+    with torch.get_device_module().device(x.device):
+        _upsample2x_padded_kernel[(triton.cdiv(out.numel(), 4096),)](
+            x, out, N=n, C=c, H=h, W=w, BLOCK=4096, num_warps=4
+        )
+    return True
+
 
 def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
     """``F.interpolate(x, scale_factor=(2.0, 2.0), mode="nearest-exact")`` for 4D ``x``, or ``None``.
@@ -191,4 +236,4 @@ def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
     return None
 
 
-__all__ = ["upsample_nearest_2x"]
+__all__ = ["upsample_nearest_2x", "upsample_nearest_2x_padded"]
