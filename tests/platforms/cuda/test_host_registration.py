@@ -236,6 +236,10 @@ def test_default_platform_reports_no_registration_support() -> None:
 
 
 def test_cuda_platform_delegates_to_the_cuda_implementation(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip(
+        "vllm_omni.platforms.cuda.platform",
+        reason="CudaOmniPlatform needs a vLLM build with a CUDA driver",
+    )
     from vllm_omni.platforms.cuda.platform import CudaOmniPlatform
 
     calls: list[tuple[str, tuple, dict]] = []
