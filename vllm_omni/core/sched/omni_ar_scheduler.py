@@ -2092,6 +2092,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # schedule() can admit one draft-free input only below this bound.
         if request.num_tokens > self.max_model_len - self.num_sampled_tokens_per_step:
             logger.warning_once("MiniCPM-o replies that stop at max_model_len get no Talker row for their final token")
+            logger.debug("MiniCPM-o request %s stopped at max_model_len without a final Talker row", request.request_id)
             return True
         if missing != 1 or request.num_output_placeholders or request.num_in_flight_tokens:
             logger.warning("MiniCPM-o request %s cannot take a draft-free terminal forward", request.request_id)

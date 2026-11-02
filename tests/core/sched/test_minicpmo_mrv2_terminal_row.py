@@ -339,13 +339,15 @@ def test_context_limit_stop_keeps_the_length_finish(monkeypatch, speculative, dr
     """No position is left for the final token as an input: finish as before, with a warning."""
     scheduler, request = _scheduler(monkeypatch, speculative=speculative)
     scheduler.max_model_len = 2 + 1 + len(sampled)
-    warnings = []
+    warnings, debugs = [], []
     monkeypatch.setattr(ar_sched_mod.logger, "warning_once", lambda *args, **kwargs: warnings.append(args))
+    monkeypatch.setattr(ar_sched_mod.logger, "debug", lambda *args, **kwargs: debugs.append(args))
     _step(scheduler, request, drafts, sampled)
     assert request.output_token_ids == [11, *sampled]
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
     assert scheduler._minicpmo45_terminal_rows == {}
     assert [w for w in warnings if "max_model_len" in w[0]] != []
+    assert [d[1] for d in debugs if "max_model_len" in d[0]] == [request.request_id]
 
 
 def test_release_keeps_an_eligible_step_written_during_schedule(monkeypatch):
