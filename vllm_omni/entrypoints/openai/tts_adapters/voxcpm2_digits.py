@@ -49,7 +49,9 @@ _VOXCPM2_ZERO_SENTINEL = "\uee00"
 # one of these - measured: the inserted comma never helps and sometimes
 # garbles those readings (n=3..5 per shape), while standalone edge
 # numbers ("10今天...") need it.
-_VOXCPM2_BOUND_FOLLOW_RE = re.compile(r"[月日年号点分秒万亿两元角块个只条根张片本件台位名次遍趟层楼岁斤米尺寸升斗吨磅周]")
+_VOXCPM2_BOUND_FOLLOW_RE = re.compile(
+    r"[月日年号点分秒万亿两元角块个只条根张片本件台位名次遍趟层楼岁斤米尺寸升斗吨磅周]"
+)
 _VOXCPM2_LEAD_TEN_RE = re.compile(r"^10(?=[\u4e00-\u9fff])")
 _VOXCPM2_LEADING_DIGIT_RUN_RE = re.compile(r"^(\d{1,2})(?=[\u4e00-\u9fff])")
 _VOXCPM2_TRAILING_DIGIT_RUN_RE = re.compile(r"([\u4e00-\u9fff。！？，、；：])(\d{1,2})$")
@@ -58,7 +60,7 @@ _VOXCPM2_LONE_TRAILING_ZERO_RE = re.compile(r"(?<![\d.])0。$")
 _LONE_LEADING_ZERO_RE = re.compile(r"^0，")
 
 
-def _leading_digit_run_pad(m: "re.Match[str]") -> str:
+def _leading_digit_run_pad(m: re.Match[str]) -> str:
     """Pad a leading 1-2 digit run with a comma - but only when the run is a
     standalone edge number, not bound to a following unit/date/measure char
     ("1月1日开会" keeps "1月"; "3点到" keeps "3点"; "10今天..." pads)."""
