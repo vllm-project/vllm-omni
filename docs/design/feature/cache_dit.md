@@ -35,28 +35,29 @@ vLLM-omni integrates cache-dit through the `CacheDiTBackend` class, which provid
 Code outside `vllm_omni/diffusion/cache` must import Cache-DiT symbols from the
 package-level API: `vllm_omni.diffusion.cache.cachedit`.
 
-| Method/Class | Purpose | Behavior |
-|--------------|---------|----------|
-| `CacheDiTBackend` | Unified backend interface | Automatically handles enabler selection and cache refresh |
-| `enable_cache_for_dit()` | Apply caching to transformer | Configures DBCache on transformer blocks |
+| Method/Class             | Purpose                      | Behavior                                                  |
+| ------------------------ | ---------------------------- | --------------------------------------------------------- |
+| `CacheDiTBackend`        | Unified backend interface    | Automatically handles enabler selection and cache refresh |
+| `enable_cache_for_dit()` | Apply caching to transformer | Configures DBCache on transformer blocks                  |
 
 **Key APIs from Cache-DiT:**
 
 [Cache-DiT API Reference](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/)
 
-| API | Description |
-|-----|-------------|
-| `BlockAdapter` | Core abstraction for applying cache-dit to transformers. Specifies transformer module(s), block list(s), and forward signature pattern(s). |
-| `ForwardPattern` | Defines block forward signature patterns: `Pattern_0`, `Pattern_1`, `Pattern_2` |
-| `ParamsModifier` | Per-transformer or per-block-list cache configuration customization |
-| `DBCacheConfig` | Configuration for DBCache parameters (warmup steps, cached steps, thresholds) |
-| `refresh_context()` | Update cache context | Called at every generation boundary |
+| API                 | Description                                                                                                                                |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `BlockAdapter`      | Core abstraction for applying cache-dit to transformers. Specifies transformer module(s), block list(s), and forward signature pattern(s). |
+| `ForwardPattern`    | Defines block forward signature patterns: `Pattern_0`, `Pattern_1`, `Pattern_2`                                                            |
+| `ParamsModifier`    | Per-transformer or per-block-list cache configuration customization                                                                        |
+| `DBCacheConfig`     | Configuration for DBCache parameters (warmup steps, cached steps, thresholds)                                                              |
+| `refresh_context()` | Update cache context at every generation boundary                                                                                          |
 
 ---
 
 ## Standard Models: Automatic Support
 
 Most DiT models follow this pattern:
+
 - Single transformer with one `ModuleList` of blocks
 - Standard forward signature
 - Compatible with cache-dit's automatic detection
@@ -188,6 +189,12 @@ the request-scoped protocol (`adopt_cache_dit_backend` / `is_cache_dit_enabled`)
 `forward()` then reconciles per-request state through
 `RequestScopedCacheDiTRuntime` (MiniMax H3 precedent).
 
+When `--enable-cache-dit-summary` is set, the runner reports active Cache-DiT
+state owned either by the startup backend or by a request-scoped pipeline.
+A request-owned cache does not require `--cache-backend cache_dit` at startup
+to make the explicitly requested summary available. Summaries remain disabled
+without that flag; disable them for unprofiled latency comparisons.
+
 **Key difference:** The enabler caches only the repeated main-layer stack and
 marks the pipeline as requiring paired CFG forwards, because cache-dit's
 separate-CFG accounting distinguishes cond/uncond passes purely by forward
@@ -287,6 +294,7 @@ images = omni.generate(
 - **Cache parameters too aggressive:**
 
 **Solution:**
+
 ```python
 cache_config={
     "residual_diff_threshold": 0.12,  # Lower from 0.24 (try 0.12-0.18)
@@ -303,13 +311,13 @@ Check the [user guide for cache_dit](../../user_guide/diffusion/cache_accelerati
 
 Complete examples in the codebase:
 
-| Model | Path | Pattern | Notes |
-|-------|------|---------|-------|
-| **Standard DiT** | `cachedit.backend::enable_cache_for_dit` | Default enabler | Single transformer, automatic |
-| **Wan2.2** | `cachedit.model_specific::enable_cache_for_wan22` | Single or dual-transformer | Auto-detects mode based on transformer_2 presence |
-| **LongCat** | `cachedit.config::CacheDiTAdapterConfig` | Declarative block adapter | Two block lists in one transformer |
-| **BAGEL** | `cachedit.model_specific::BagelCachedAdapter` | Custom cached adapter | Complex architecture |
-| **MammothModa2** | `cachedit.model_specific::enable_cache_for_mammothmoda2` | Sub-stack + paired CFG | Generation-runner pipeline; lifecycle owned by `pipeline_mammothmoda2_dit.py` |
+| Model            | Path                                                     | Pattern                    | Notes                                                                         |
+| ---------------- | -------------------------------------------------------- | -------------------------- | ----------------------------------------------------------------------------- |
+| **Standard DiT** | `cachedit.backend::enable_cache_for_dit`                 | Default enabler            | Single transformer, automatic                                                 |
+| **Wan2.2**       | `cachedit.model_specific::enable_cache_for_wan22`        | Single or dual-transformer | Auto-detects mode based on transformer_2 presence                             |
+| **LongCat**      | `cachedit.config::CacheDiTAdapterConfig`                 | Declarative block adapter  | Two block lists in one transformer                                            |
+| **BAGEL**        | `cachedit.model_specific::BagelCachedAdapter`            | Custom cached adapter      | Complex architecture                                                          |
+| **MammothModa2** | `cachedit.model_specific::enable_cache_for_mammothmoda2` | Sub-stack + paired CFG     | Generation-runner pipeline; lifecycle owned by `pipeline_mammothmoda2_dit.py` |
 
 ---
 

@@ -37,12 +37,20 @@ Every backend implements `OffloadBackend`:
 
 - `enable(pipeline)` discovers modules, establishes initial residency, and
   installs hooks;
-- `disable()` removes owned hooks and resources; and
+- `disable()` removes owned hooks and resources;
+- `shutdown()` releases resources when the worker disposes of the pipeline; and
 - `is_enabled()` reports lifecycle state.
 
 `disable()` does not promise to restore the pipeline's original device
 placement. It must restore usable parameter and buffer storage before releasing
 backend-owned host weights. The caller owns subsequent device placement.
+
+Terminal `shutdown()` may discard weights instead of reconstructing a reusable
+pipeline. DLO drains pending transfers, detaches managed block storage, and
+releases hooks and backing resources without rebuilding AllGather, rank-local,
+or resident weights. That backend cannot be enabled again: reload the pipeline
+and create a new backend. Failed stream drainage retains backing storage for a
+cleanup retry; it must not unmap memory still used by a transfer.
 
 An enable failure must remove every partially installed hook. Rank-local
 backends restore ordinary tensors so the pipeline can be retried. A failed

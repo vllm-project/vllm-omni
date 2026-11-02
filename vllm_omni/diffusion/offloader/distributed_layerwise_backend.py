@@ -1972,7 +1972,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         except Exception:
             pass
 
-    def _disable(self, *, restore_allgather_weights: bool) -> None:
+    def _disable(self, *, restore_allgather_weights: bool, discard_weights: bool = False) -> None:
         has_open_lease = self._host_weight_lease is not None and not self._host_weight_lease.closed
         has_registration = self._host_registration is not None
         has_carrier = (
@@ -2016,7 +2016,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         allgather_hooks = [hook for hook in unique_hooks if hook.dp_size > 1]
         rank_local_hooks = [hook for hook in unique_hooks if hook.dp_size <= 1]
         skipped_allgather = bool(allgather_hooks) and not restore_allgather_weights
-        if skipped_allgather:
+        if discard_weights:
+            self._poisoned_reason = (
+                "Distributed layerwise offload discarded weights during shutdown; "
+                "recreate the backend and reload the pipeline before retrying"
+            )
+        elif skipped_allgather:
             # Startup rollback cannot safely enter a collective that a failed
             # peer may never reach, and shutdown has no later user. Those blocks
             # cannot be reconstructed, so make accidental reuse explicit
@@ -2033,9 +2038,26 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             collective_error = run_cleanup_steps(
                 ("restoring an AllGather block", hook.restore_next_block_to_cpu) for hook in allgather_hooks
             )
-        rank_local_error = run_cleanup_steps(
-            ("restoring a rank-local block", hook.restore_next_block_to_cpu) for hook in rank_local_hooks
-        )
+        rank_local_error = None
+        discard_error = None
+        if discard_weights:
+            # The worker is disposing of the pipeline. Reconstructing even
+            # rank-local text-encoder weights copies gigabytes per rank and
+            # can outlive the worker shutdown grace. Detach rotating device
+            # buffers before releasing their owners, without a host copy.
+            # Failed stream drainage must retain storage for a cleanup retry.
+            if sync_error is None:
+                discard_error = run_cleanup_steps(
+                    (
+                        "discarding terminal DLO block storage",
+                        partial(clear_tensor_storage, chain(block.parameters(), block.buffers())),
+                    )
+                    for block in chain((hook.next_block for hook in unique_hooks), self._resident_blocks)
+                )
+        else:
+            rank_local_error = run_cleanup_steps(
+                ("restoring a rank-local block", hook.restore_next_block_to_cpu) for hook in rank_local_hooks
+            )
         removal_error = run_cleanup_steps(
             (
                 "removing a distributed block hook",
@@ -2053,7 +2075,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         )
 
         resident_error = None
-        if self._resident_layer_group is not None:
+        if self._resident_layer_group is not None and not discard_weights:
             # Resident layers are always rank-local (the public parser rejects
             # resident DiT layers combined with AllGather).
             resident_error = run_cleanup_steps(
@@ -2067,6 +2089,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     sync_error,
                     collective_error,
                     rank_local_error,
+                    discard_error,
                     removal_error,
                     encoder_error,
                     resident_error,
@@ -2112,9 +2135,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._disable(restore_allgather_weights=True)
 
     def shutdown(self) -> None:
-        # Restoring AllGather blocks rebuilds the full DiT in every rank's host
-        # memory, which can outlast the executor's shutdown grace period.
-        self._disable(restore_allgather_weights=False)
+        # Terminal teardown has no later model user. Ordinary disable() and
+        # startup rollback still restore reusable rank-local weights.
+        self._disable(restore_allgather_weights=False, discard_weights=True)
 
     @staticmethod
     def _allocate_shared_buffers(

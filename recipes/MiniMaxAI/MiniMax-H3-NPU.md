@@ -146,6 +146,7 @@ export PORT=9098
 export MODEL=/path/to/MiniMax-H3
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=4000
+export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=4000
 export PYTHONDONTWRITEBYTECODE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -174,7 +175,26 @@ vllm serve "${MODEL}" \
 Notes:
 
 - Do not add `--enforce-eager`. The first request includes regional
-  compilation; warm the server once before measuring steady-state latency.
+  compilation. For Ref2VA latency comparisons, run two complete warmup
+  requests on both baseline and candidate before measured requests: the first
+  response can return while peer ranks are still finishing cold audio decode.
+  Remove `--enable-diffusion-pipeline-profiler` for the timing runs and retain
+  profiling as a separate diagnostic run.
+- Long requests need both timeout settings above. The HTTP video deadline
+  does not extend the executor's default 600-second execution RPC deadline.
+  Despite its name, `VLLM_OMNI_DLO_DP_WAVE_TIMEOUT` also applies to the ordinary
+  single-group path, including HSDP without DLO. Set it before starting the
+  server, allow enough time for cold requests, and use the same value for both
+  arms of a comparison. Raising a deadline does not improve inference speed.
+  The [Ref2VA experiment records](https://github.com/InferMatrixLab/InferRSI/issues/293)
+  retain requests that exceeded the default deadline; they are failed attempts,
+  not completed latency measurements.
+- NPU shutdown allows 60 seconds for graceful diffusion-worker exit and
+  90 seconds for the enclosing Orchestrator join, including bounded worker
+  termination phases. Both waits return early when cleanup completes. Record
+  actual worker exit codes as well as server exit: a server can exit zero after
+  an outer timeout while worker cleanup is still pending. These shutdown
+  budgets do not affect inference timing.
 - H3 is CFG-distilled, so `--cfg-parallel-size` must remain 1.
 - Keep `--ring 1` when switching to RainFusion attention (below): the
   block-sparse kernel ranks key blocks over the whole sequence, so ring
@@ -214,6 +234,55 @@ vllm serve "${MODEL}" \
 Online INT8 quantization can be combined with distributed layerwise offload
 while AllGather is enabled. Keep AllGather enabled for SP>1; use
 `--dlo-no-use-allgather` only when collective communication is unavailable.
+
+### Measured 5-second Ref2VA profile (8 Ascend 910B1 NPUs)
+
+A repeated A/B/B/A experiment on eight 64-GiB Ascend 910B1 devices measured
+**407.27 ± 15.51 s → 108.12 ± 2.07 s HTTP E2E** (73.45% lower, 3.77× inverse-latency
+speedup) for the following lossy Cache-DiT profile. Each arm has two independent
+servers with two warmups and three measured requests per server; uncertainty is
+sample SD across server means, not a confidence interval. This is the fastest
+passing configuration in this bounded search, not a global optimum.
+
+```bash
+export VLLM_OMNI_DLO_DP_WAVE_TIMEOUT=14400
+export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=30000
+vllm serve "${MODEL}" --omni --host 127.0.0.1 --port "${PORT}" \
+  --trust-remote-code --init-timeout 1800 --stage-init-timeout 1800 \
+  --task-type ref2va --num-gpus 8 --usp 8 --ring 1 --text-encoder-tp-size 8 \
+  --vae-parallel-mode tile --vae-use-tiling --vae-patch-parallel-size 8 \
+  --enable-distributed-layerwise-offload --disable-log-stats \
+  --diffusion-attention-backend FLASH_ATTN --cache-backend cache_dit \
+  --cache-config '{"Fn_compute_blocks":1,"Bn_compute_blocks":0,"max_warmup_steps":4,"residual_diff_threshold":0.48,"max_continuous_cached_steps":8,"enable_taylorseer":false,"scm_steps_mask_policy":null}'
+```
+
+Use the common NPU environment setup above. Send nominal five-second requests
+with 50 steps, seed 0 and concurrency 1, and omit request `quality` to preserve
+the startup profile. Explicit `high` or `lossless` can override it. The portable
+benchmark client uses `--quality server-default --seconds 5 --steps 50 --seeds 0
+--warmups 2 --repeats 3 --timeout 14400`; see the linked report for the full command.
+The baseline omits cache arguments and sends `quality=lossless`. Both arms use
+BF16, 1344×768, 24 fps, 124 actual frames and identical decoded audio volume.
+Profiling and cache summaries are disabled during timing.
+
+All 26 requests and 14 quality comparisons passed the frozen gates. Across nine
+candidate outputs: SSIM 0.975969–0.984037, PSNR 38.62–43.80 dB, LPIPS
+0.018710–0.025843, audio spectral cosine 0.813411–0.987086, and audio RMS ratio
+0.692242–1.093770. The family-reference audio cosine is close to the 0.80 gate;
+this is a material lossy tradeoff, not semantic or lip-sync quality certification.
+Mean sampled whole-server per-device peak HBM rose 25.085 → 25.863 GiB (+3.10%).
+All 32 workers exited zero without forced signals. Baseline teardown used matched
+diagnostic 60/90-second budgets; candidate teardown used native production budgets.
+
+Measured source: baseline `c7f56f0155953c7d4a77276a2f4fcbd844ab0da2`, candidate
+`098b51f6b96dd160a0959e74e8822422527ff06d`. Cache-DiT originates in
+[PR #5853](https://github.com/vllm-project/vllm-omni/pull/5853); parameter selection
+is campaign work. Optional device reference KV is **not enabled** in this result,
+and its separate pilot gain must not be added. The
+[complete report](https://github.com/InferMatrixLab/InferRSI/tree/amy/h3-ref2va-evidence/evidence/h3-ref2va-ascend-293/results/final-5s)
+includes environment/input hashes, raw samples, quality gates, reproduction,
+source attribution and rejected candidates. Fifteen-second qualification is
+pending a separate delivery; do not extrapolate this result to it.
 
 ### Optional optimizations
 
@@ -614,13 +683,28 @@ vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va \
   --kv-offload-config '{"mode":"on","kv_refresh_interval":8,"kv_host_quantization":"int8"}'
 ```
 
-The JSON object accepts three keys:
+The JSON object accepts four keys:
 
 | Key | Values | Default | Meaning |
 | --- | --- | --- | --- |
-| `mode` | `on` | required | Cache reference K/V after Ulysses and prefetch layers into a fixed two-slot device ring. |
+| `mode` | `on` | required | Cache reference K/V after Ulysses using the selected residency. |
 | `kv_refresh_interval` | integer >= 0 | `2` | Refresh every N denoise steps. `0` populates only at step 0 and has the highest quality risk. |
 | `kv_host_quantization` | `none`, `fp8`, `int8` | `none` | Host-cache storage format; quantization may fall back at runtime. |
+| `kv_cache_residency` | `host`, `device` | `host` | Use a pinned host pool with a two-slot device ring, or keep the full unquantized reference pool on the execution device. |
+
+For device residency, pass the following JSON to `--kv-offload-config`:
+
+```json
+{"mode":"on","kv_refresh_interval":2,"kv_cache_residency":"device","kv_host_quantization":"none"}
+```
+
+Device residency avoids synchronous host capture and layerwise H2D staging.
+It requires space for the full reference pool on each rank:
+`2 * layers * reference_rows * local_heads * head_dim * dtype_bytes`.
+It requires `kv_host_quantization=none`; combining device residency with host
+quantization is rejected. The refresh schedule and its quality risks remain
+the same. Check memory headroom and matched output quality for each workload
+before choosing this experimental option.
 
 Reuse steps skip reference-token QKV projection and reference-query attention. This is lossy.
 The current implementation requires one request per forward and either no
@@ -631,8 +715,9 @@ are no longer used. The experimental RainFusion hybrid uses its validated BSA
 kernel and FP16 kernel input only on compact reference-KV reuse steps; the
 ordinary RainFusion path is unchanged when reference-KV offload is disabled.
 Warm up each configuration before comparing timings and inspect per-request
-reference row counts, refresh counts, and effective host quantization in worker
-logs. A successful HTTP response alone does not prove the cache was used.
+reference row counts, refresh counts, residency, device-resident bytes, transfer
+bytes, and effective host quantization in worker logs. A successful HTTP response
+alone does not prove the cache was used.
 
 ## Known limitations
 
