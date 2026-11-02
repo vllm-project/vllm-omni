@@ -156,4 +156,9 @@ def test_flow_graph_metadata_retains_loaded_buffers(monkeypatch, backend, stream
     for name, before in snapshots.items():
         # Check the metadata already handed to the consumer, not a new object.
         assert getattr(attention, name) is getattr(state, name)
-        assert not torch.equal(getattr(attention, name), before)
+        if backend == "fa3" and name == "slot_frames":
+            # One-frame FA3 pages stay in packed order when only row boundaries
+            # change; the graph allocation and padding slots are unchanged.
+            assert torch.equal(attention.slot_frames, before)
+        else:
+            assert not torch.equal(getattr(attention, name), before)
