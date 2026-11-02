@@ -2771,3 +2771,43 @@ def test_vocoder_restores_tf32_policy(fail, monkeypatch):
     else:
         assert MiniCPMO45Code2Wav.forward(model) == "ok"
     assert torch.backends.cuda.matmul.allow_tf32 == previous
+
+
+def test_pack_att_cache_passes_the_cold_start_placeholder_through() -> None:
+    placeholder = [None, None, None]
+    assert wrapper_module._pack_att_cache(None) is None
+    assert wrapper_module._pack_att_cache(placeholder) is placeholder
+
+
+def test_pack_att_cache_lays_the_kv_halves_side_by_side() -> None:
+    split = torch.arange(2 * 2 * 3 * 4 * 5 * 6, dtype=torch.float32).reshape(2, 2, 3, 4, 5, 6)
+    packed = wrapper_module._pack_att_cache(split)
+    assert packed.shape == (2, 3, 4, 5, 12)
+    assert torch.equal(packed[..., :6], split[:, 0])
+    assert torch.equal(packed[..., 6:], split[:, 1])
+
+
+def test_unpack_att_cache_round_trips_the_split_halves() -> None:
+    split = torch.randn(2, 2, 3, 4, 5, 6)
+    packed = wrapper_module._packed_att_buffer(split)
+    assert packed.shape == (2, 3, 4, 5, 12)
+    packed.copy_(wrapper_module._pack_att_cache(split))
+    restored = torch.empty_like(split)
+    wrapper_module._unpack_att_cache(packed, restored)
+    assert torch.equal(restored, split)
+
+
+@pytest.mark.parametrize("rank", [4, 5, 7])
+def test_pack_att_cache_rejects_a_non_split_rank(rank: int) -> None:
+    with pytest.raises(ValueError, match="split K/V cache"):
+        wrapper_module._pack_att_cache(torch.zeros(tuple(range(2, 2 + rank))))
+
+
+def test_pack_att_cache_names_the_row_that_broke_the_pack() -> None:
+    split = torch.zeros(2, 2, 3, 4, 5, 6)
+    with pytest.raises(TypeError) as excinfo:
+        wrapper_module._pack_att_cache([None, split])
+    message = str(excinfo.value)
+    # The offender is the tensor row, not the leading None placeholder.
+    assert "Tensor" in message
+    assert "NoneType" not in message

@@ -1223,10 +1223,10 @@ def _pack_att_cache(att: object) -> object:
     if isinstance(att, (list, tuple)):
         if all(row is None for row in att):
             return att
+        culprit = next(row for row in att if row is not None)
         raise TypeError(
             "_pack_att_cache expects one split K/V tensor per step or a list of "
-            f"None placeholders, got a {type(att).__name__} of "
-            f"{type(att[0]).__name__ if len(att) else 'nothing'}"
+            f"None placeholders, got a {type(att).__name__} of {type(culprit).__name__}"
         )
     if not isinstance(att, torch.Tensor):
         raise TypeError(f"_pack_att_cache expects a tensor or None, got {type(att).__name__}")
