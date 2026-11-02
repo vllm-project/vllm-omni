@@ -294,8 +294,43 @@ def test_modelopt_nvfp4_requires_both_scales(missing_index):
     adapter = ModelOptNvFp4CheckpointAdapter(_FullPrecisionNvFp4TargetModel(), _make_source())
     tensors = _nvfp4_checkpoint_tensors()
     missing_name = tensors[missing_index][0]
-    with pytest.raises(ValueError, match=missing_name):
+    with pytest.raises(ValueError, match="Missing ModelOpt weight scales") as error:
         list(adapter.adapt([tensor for i, tensor in enumerate(tensors) if i != missing_index]))
+    assert missing_name in str(error.value)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e4m3fn, torch.uint8])
+def test_modelopt_nvfp4_matches_vllm_cpu_reference_bitwise(dtype, scale_dtype):
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import dequantize_to_dtype
+
+    adapter = ModelOptNvFp4CheckpointAdapter(_FullPrecisionNvFp4TargetModel(dtype), _make_source())
+    tensors = _nvfp4_checkpoint_tensors()
+    packed = tensors[0][1]
+    block_scale = torch.tensor([[0.3125, 1.75], [0.6875, 3.5]]).to(torch.float8_e4m3fn).view(scale_dtype)
+    global_scale = torch.tensor(0.37)
+    tensors[1] = (tensors[1][0], block_scale)
+    tensors[2] = (tensors[2][0], global_scale)
+
+    adapted = list(adapter.adapt(tensors))
+    assert [name for name, _ in adapted] == ["transformer.proj.weight"]
+    # CPU tensors select the PyTorch reference, not the CUDA Triton kernel.
+    expected = dequantize_to_dtype(packed, block_scale, global_scale, dtype, 16, swizzle=False)
+    actual = adapted[0][1]
+    assert actual.dtype == dtype
+    assert actual.shape == expected.shape
+    # Compare storage bytes so signed zero is covered as well as numeric values.
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("scale_dtype", [torch.float16, torch.float32, torch.int8, torch.float8_e5m2])
+def test_modelopt_nvfp4_rejects_unsupported_block_scale_dtype(scale_dtype):
+    adapter = ModelOptNvFp4CheckpointAdapter(_FullPrecisionNvFp4TargetModel(), _make_source())
+    tensors = _nvfp4_checkpoint_tensors()
+    tensors[1] = (tensors[1][0], tensors[1][1].to(scale_dtype))
+    with pytest.raises(ValueError, match="Unsupported ModelOpt NVFP4 weight_scale dtype") as error:
+        list(adapter.adapt(tensors))
+    assert "transformer.proj.weight" in str(error.value)
 
 
 @pytest.mark.parametrize(

@@ -25,11 +25,15 @@ otherwise.
     quantize BF16 checkpoints at startup.
 
 Some transformer modules, such as modulation linears, intentionally remain in
-full precision. If an NVFP4 checkpoint stores a packed `uint8` weight of shape
-`[N, K/2]` for a full-precision parameter of shape `[N, K]`, the checkpoint
-adapter dequantizes it while loading. This requires both the per-16-element
-`weight_scale` and scalar `weight_scale_2`. The module continues to execute
-in full precision; other quantized layers keep their packed weights and scales.
+full precision. For `modelopt_fp4` checkpoints, the adapter dequantizes packed
+`uint8` weights of shape `[N, K/2]` when the target is a replicated, unfused
+full-precision parameter of shape `[N, K]`. This requires both the
+per-16-element `weight_scale` and scalar `weight_scale_2`. Block scales must be
+`float8_e4m3fn` values or their raw `uint8` byte representation; other dtypes
+are rejected. The module continues to execute in full precision; other
+quantized layers keep their packed weights and scales. This conversion does
+not cover `modelopt_mixed` checkpoints or TP-sharded or fused full-precision
+targets.
 
 ## Supported ModelOpt Checkpoint Formats
 

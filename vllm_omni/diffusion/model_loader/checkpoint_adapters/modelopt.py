@@ -241,14 +241,14 @@ class ModelOptFp8CheckpointAdapter:
             return
 
         missing_scale_names = ", ".join(repr(name) for name in sorted(state.pending_weights))
-        raise ValueError(f"Missing ModelOpt FP8 weight_scale for full-precision target weights: {missing_scale_names}")
+        raise ValueError(f"Missing ModelOpt weight scales for full-precision target weights: {missing_scale_names}")
 
     def _log_adaptation_summary(self, state: _AdaptState) -> None:
         if not state.skipped_scales and not state.dequantized_weights:
             return
 
         logger.info_once(
-            "Adapted ModelOpt FP8 %s weights: dequantized %d full-precision weights, skipped %d scale tensors",
+            "Adapted ModelOpt %s weights: dequantized %d full-precision weights, skipped %d scale tensors",
             self._source_label,
             state.dequantized_weights,
             state.skipped_scales,
@@ -395,6 +395,13 @@ class ModelOptNvFp4CheckpointAdapter(ModelOptFp8CheckpointAdapter):
         if global_scale.numel() != 1:
             raise ValueError(
                 f"Unsupported ModelOpt NVFP4 weight_scale_2 shape {tuple(global_scale.shape)} for weight {name!r}"
+            )
+        if block_scale.dtype == torch.uint8:
+            block_scale = block_scale.view(torch.float8_e4m3fn)
+        elif block_scale.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"Unsupported ModelOpt NVFP4 weight_scale dtype {block_scale.dtype} for weight {name!r}; "
+                "expected torch.float8_e4m3fn or raw torch.uint8 bytes"
             )
 
         from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import break_fp4_bytes
