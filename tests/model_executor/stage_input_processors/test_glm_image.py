@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.inputs.preprocess import OmniRenderer
 from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.glm_image import (
     _first_source_image,
@@ -17,6 +19,7 @@ from vllm_omni.model_executor.stage_input_processors.glm_image import (
     _upsample_token_ids,
     ar2diffusion,
     compute_max_tokens,
+    prepare_ar_prompt,
 )
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
 
@@ -465,3 +468,60 @@ class TestAr2Diffusion:
         assert result["prompt"] == "first"
         assert result["height"] == 1024
         assert result["width"] == 1024
+
+
+# =============================================================================
+# Tests for prepare_ar_prompt (offline / size-less prompts, #7952)
+# =============================================================================
+
+
+def _t2i_64_tokens():
+    # 64x64 target: 16x16 preview + 2x2 target + EOS.
+    return [9] * 256 + [1, 2, 3, 4] + [16385]
+
+
+class TestPrepareArPrompt:
+    def test_stage0_registers_transform(self):
+        assert GLM_IMAGE_PIPELINE.stages[0].prompt_transform_func.endswith("glm_image.prepare_ar_prompt")
+
+    def test_bare_str_gets_size_from_diffusion_params(self):
+        sp_list = [object(), OmniDiffusionSamplingParams(height=768, width=512)]
+        out = prepare_ar_prompt("a cat", sp_list)
+        assert out == {"prompt": "a cat", "mm_processor_kwargs": {"target_h": 768, "target_w": 512}}
+        assert OmniRenderer._routes_no_media_kwargs(out)
+
+    def test_defaults_to_1024_without_diffusion_params(self):
+        out = prepare_ar_prompt({"prompt": "a cat"}, [object()])
+        assert out["mm_processor_kwargs"] == {"target_h": 1024, "target_w": 1024}
+
+    def test_explicit_target_kwargs_untouched(self):
+        prompt = {"prompt": "a cat", "mm_processor_kwargs": {"target_h": 512, "target_w": 512}}
+        sp_list = [object(), OmniDiffusionSamplingParams(height=768, width=768)]
+        assert prepare_ar_prompt(prompt, sp_list) is prompt
+
+    def test_does_not_mutate_input(self):
+        prompt = {"prompt": "a cat", "mm_processor_kwargs": {"foo": 1}}
+        out = prepare_ar_prompt(prompt, [])
+        assert prompt == {"prompt": "a cat", "mm_processor_kwargs": {"foo": 1}}
+        assert out["mm_processor_kwargs"] == {"foo": 1, "target_h": 1024, "target_w": 1024}
+
+    @pytest.mark.parametrize("prompt", [{"prompt_embeds": torch.zeros(1)}, ["a", "b"], None])
+    def test_passthrough(self, prompt):
+        assert prepare_ar_prompt(prompt, []) is prompt
+
+    def test_ar2diffusion_accepts_sampling_params_probe(self):
+        import inspect
+
+        # The orchestrator only passes the diffusion params when this name exists.
+        assert "sampling_params" in inspect.signature(ar2diffusion).parameters
+
+    def test_ar2diffusion_matches_transformed_size_for_bare_str(self):
+        sp = OmniDiffusionSamplingParams(height=64, width=64)
+        stamped = prepare_ar_prompt("a cat", [object(), sp])["mm_processor_kwargs"]
+
+        # ar2diffusion sees the untransformed prompt; it must resolve the same size.
+        result = ar2diffusion([_source_output(_t2i_64_tokens())], prompt="a cat", sampling_params=sp)
+
+        assert result is not None
+        assert (result["height"], result["width"]) == (stamped["target_h"], stamped["target_w"])
+        assert result["prompt"] == "a cat"
