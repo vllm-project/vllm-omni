@@ -17,6 +17,7 @@ from torch.nn import functional as F
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.autoencoders.wan_spatial_shard import halo_exchange
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.model_executor.models.common.ops import fused_group_norm_silu
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,12 @@ class TemporalContext:
 def _frame_norm_silu(norm: nn.GroupNorm, x: torch.Tensor, context: TemporalContext | None = None) -> torch.Tensor:
     if context is not None and context.spatial is not None:
         return F.silu(context.spatial.normalize(norm, x))
+    if x.is_cuda:
+        # Per-frame statistics read straight from NCTHW: no "(b t) c h w"
+        # transpose copy in either direction, and GroupNorm + SiLU in one pass.
+        return fused_group_norm_silu(
+            x, norm.weight, norm.bias, norm.num_groups, norm.eps, per_frame=True, round_norm_output=True
+        )
     return F.silu(_frame_norm(norm, x))
 
 

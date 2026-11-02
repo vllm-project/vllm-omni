@@ -231,6 +231,12 @@ exact halos. GroupNorm and bottleneck attention retain full-frame statistics.
 This bounds convolution workspace; full-frame activations and the DiT's
 whole-clip activations still consume memory.
 
+On CUDA, the replicated VAE computes each frame's GroupNorm and the following
+SiLU with the shared fused GroupNorm + SiLU operator. It reads the frames in
+place instead of transposing the clip, so outputs are numerically close to the
+PyTorch path rather than bitwise identical. The height-sharded VAE and other
+devices use the PyTorch path.
+
 With VAE patch parallelism, each rank owns a band of latent rows and the
 corresponding encoder/decoder rows. Neighbor exchanges supply convolution halos;
 all-reduced centered statistics preserve full-frame GroupNorm. Bottleneck
