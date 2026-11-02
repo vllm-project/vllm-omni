@@ -258,10 +258,8 @@ def test_cfg_value_non_float_yaml_value_names_the_yaml_source(monkeypatch):
 
 @pytest.mark.parametrize("bad", [True, False])
 def test_cfg_value_yaml_boolean_rejected(monkeypatch, bad):
-    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
-
     monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
-    # yaml's cfg_value: true would float()-coerce to 1.0 (CFG effectively off);
-    # it must fail loudly instead.
-    with pytest.raises(ValueError, match="is a boolean"):
-        talker_mod._resolve_cfg_value(bad)
+    # yaml's cfg_value: true would float()-coerce to 1.0 (CFG effectively
+    # off); the coercion entry must reject it before the helper sees it.
+    with pytest.raises(ValueError, match="not a boolean"):
+        _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"cfg_value": bad})))

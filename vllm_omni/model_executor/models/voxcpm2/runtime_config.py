@@ -168,8 +168,17 @@ class _VoxCPM2RuntimeConfig:
                 return max(1, value)
             return value
         if isinstance(default, float):
-            if key == "cfg_value" and not math.isfinite(float(value)):
-                raise ValueError("VoxCPM2 cfg_value must be finite.")
+            if key == "cfg_value":
+                # a yaml boolean parses as a Python bool, which float()
+                # silently accepts (true -> 1.0 = CFG effectively off);
+                # reject it before the coercion.
+                if isinstance(value, bool):
+                    raise ValueError(
+                        "VoxCPM2 cfg_value must be a positive finite float, "
+                        f"not a boolean (got {value!r})"
+                    )
+                if not math.isfinite(float(value)):
+                    raise ValueError("VoxCPM2 cfg_value must be finite.")
             if key == "cfg_cutoff_ratio":
                 return min(1.0, max(0.0, float(value)))
             return float(value)
