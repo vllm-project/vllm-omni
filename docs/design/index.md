@@ -61,6 +61,7 @@ implementation contract; it is not, by itself, a general support claim.
 #### KV cache and memory management
 
 - [Scheduler-Managed Paged KV Cache for Diffusion DiT Stages](feature/diffusion_paged_kv_cache.md)
+- [Paged Independent-Request Batching and Step Execution](feature/diffusion_paged_kv_independent_batching.md)
 
 #### Attention optimization
 
