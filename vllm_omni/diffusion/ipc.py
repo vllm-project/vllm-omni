@@ -82,25 +82,15 @@ def _array_to_shm(array: np.ndarray) -> dict[str, Any]:
         raise TypeError("NumPy object arrays cannot be transferred through raw shared memory")
 
     array = np.ascontiguousarray(array)
-    try:
-        # Torch rejects non-native byte order and some NumPy dtypes, and warns
-        # on read-only arrays. Keep those on the dtype-preserving NumPy path.
-        source = torch.from_numpy(array) if array.flags.writeable and array.dtype.isnative else None
-    except TypeError:
-        source = None
     shm, shm_array, handle = _new_shm_array(array.shape, array.dtype)
-    destination = None
     try:
         try:
-            if source is None:
-                np.copyto(shm_array, array)
-            else:
-                # Torch copies (and faults in the fresh SHM pages) on all
-                # intra-op threads; np.copyto does both on a single thread.
-                destination = torch.from_numpy(shm_array)
-                destination.copy_(source)
+            # Single-threaded on purpose: this runs on the async output thread
+            # while the next forward launches kernels, so it must not wake the
+            # intra-op thread pool.
+            np.copyto(shm_array, array)
         finally:
-            del destination, shm_array
+            del shm_array
             shm.close()
     except BaseException:
         # The caller cannot track this segment until we return its handle.
@@ -295,13 +285,10 @@ def _tensor_to_shm(
 def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     """Reconstruct a tensor from a shared-memory handle and free the segment."""
     tensor = torch.from_numpy(_array_from_shm(handle))
-    # Restore the original dtype if it differs from the numpy-compatible
-    # dtype used for the SHM transfer (e.g. bfloat16 → float32 → bfloat16).
-    torch_dtype_str = handle.get("torch_dtype", "")
-    if torch_dtype_str:
-        original_dtype = getattr(torch, torch_dtype_str.replace("torch.", ""), None)
-        if original_dtype is not None and tensor.dtype != original_dtype:
-            tensor = tensor.view(original_dtype) if handle.get("torch_dtype_view") else tensor.to(original_dtype)
+    if handle.get("torch_dtype_view"):
+        # NumPy has no bfloat16, so bf16 payloads cross as their raw uint16
+        # bits; view them back. Every other dtype already round-trips as is.
+        tensor = tensor.view(getattr(torch, handle["torch_dtype"].removeprefix("torch.")))
     return tensor
 
 

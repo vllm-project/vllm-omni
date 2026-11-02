@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import contextlib
+import gc
 import multiprocessing as mp
 import queue
 import threading
@@ -267,14 +268,12 @@ def test_nested_non_native_endian_numpy_round_trips_through_shm(writeable: bool)
         diffusion_ipc._unlink_shm_handles(created)
 
 
-@pytest.mark.parametrize("copy_backend", ["torch", "numpy"])
 @pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
 def test_numpy_packing_failure_unlinks_all_allocations(
-    monkeypatch: pytest.MonkeyPatch, copy_backend: str, error_type: type[BaseException]
+    monkeypatch: pytest.MonkeyPatch, error_type: type[BaseException]
 ) -> None:
     first = np.arange(300_000, dtype=np.float32)
     second = first.copy()
-    second.flags.writeable = copy_backend == "torch"
     payload = {"nested": [first, second]}
     output = DiffusionOutput(output=payload)
     segments = []
@@ -292,13 +291,9 @@ def test_numpy_packing_failure_unlinks_all_allocations(
             raise error
         return real_copy(*args, **kwargs)
 
+    real_copy = np.copyto
     monkeypatch.setattr(diffusion_ipc, "_new_shm_array", track_allocation)
-    if copy_backend == "torch":
-        real_copy = torch.Tensor.copy_
-        monkeypatch.setattr(torch.Tensor, "copy_", fail_second_copy)
-    else:
-        real_copy = np.copyto
-        monkeypatch.setattr(np, "copyto", fail_second_copy)
+    monkeypatch.setattr(np, "copyto", fail_second_copy)
 
     try:
         with pytest.raises(error_type, match="injected packing failure") as raised:
@@ -528,16 +523,56 @@ def test_only_opted_in_host_tensors_borrow_shm_on_unpack(enable_registered_shm: 
         segment = shared_memory.SharedMemory(name=packed["name"])
         try:
             unpacked = _unpack_if_shm_handle(packed)
-            # Write through the unlinked segment: only a borrowed view sees it.
+            # Either way the receiver unlinks the name, even while a borrowed
+            # tensor still maps the segment.
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=packed["name"])
+            # Write through the unlinked segment: only a borrowed tensor sees it.
             np.ndarray(tensor.shape, dtype=np.float32, buffer=segment.buf)[0] = -1.0
             assert (unpacked[0].item() == -1.0) is enable_registered_shm
-            torch.testing.assert_close(unpacked[1:], tensor[1:])
-            del unpacked
         finally:
             segment.close()
-        # Either way the receiver unlinks the name.
-        with pytest.raises(FileNotFoundError):
-            shared_memory.SharedMemory(name=packed["name"])
+        # A view, like a per-request batch split, keeps the data valid alone.
+        tail = unpacked[1:]
+        del unpacked
+        gc.collect()
+        torch.testing.assert_close(tail, tensor[1:])
+    finally:
+        _cleanup_shm_handle(packed)
+
+
+class _UnusableStream:
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"host tensors must not use the D2H stream (accessed {name!r})")
+
+
+def test_host_tensor_with_d2h_stream_skips_staging_copy() -> None:
+    tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    output = DiffusionOutput(output=tensor)
+
+    pack_diffusion_output_shm(output, d2h_stream=_UnusableStream())
+    packed = output.output
+    try:
+        assert isinstance(packed, dict) and packed["__tensor_shm__"] is True
+        unpack_diffusion_output_shm(output)
+        torch.testing.assert_close(output.output, tensor)
+    finally:
+        _cleanup_shm_handle(packed)
+
+
+def test_bfloat16_nan_payloads_round_trip_bit_exact() -> None:
+    # Quiet and signalling NaNs with payloads and both signs, plus -inf and the
+    # smallest subnormal. An fp32 round trip would collapse every NaN to 0x7fc0.
+    special = torch.tensor([0x7FC1, 0xFFA5, 0x7F81, 0x7FC0, 0xFF80, 0x0001], dtype=torch.int32).to(torch.uint16)
+    bits = special.repeat(_large_numel(torch.bfloat16) // special.numel() + 1)
+    tensor = bits.view(torch.bfloat16)
+    packed = _pack_value_if_large(tensor)
+
+    try:
+        assert isinstance(packed, dict) and packed["numpy_dtype"] == "uint16"
+        unpacked = _unpack_if_shm_handle(packed)
+        assert unpacked.dtype == torch.bfloat16
+        assert torch.equal(unpacked.view(torch.uint16), bits)
     finally:
         _cleanup_shm_handle(packed)
 
