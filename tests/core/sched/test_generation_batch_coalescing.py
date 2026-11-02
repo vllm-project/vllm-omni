@@ -60,6 +60,20 @@ def notification(*ids, terminal=()):
     return OmniConnectorOutput(chunk_ready_req_ids=set(ids), chunk_finished_req_ids=set(terminal))
 
 
+@pytest.mark.parametrize("live,ready,release", [(8, 3, False), (8, 4, True), (3, 1, True), (4, 1, False)])
+def test_batch_release_preserves_threshold_and_low_concurrency(monkeypatch, live, ready, release):
+    s, _ = scheduler(monkeypatch)
+    s.requests = dict(list(s.requests.items())[:live])
+    assert s._generation_batch_ready({str(i) for i in range(ready)}) is release
+
+
+def test_runnable_streams_exclude_stale_finished_and_in_flight_requests(monkeypatch):
+    s, _ = scheduler(monkeypatch)
+    s.requests["1"].is_finished = lambda: True
+    s.requests["2"].num_in_flight_tokens = 1
+    assert s._generation_runnable_ids({"0", "1", "2", "gone"}) == {"0"}
+
+
 class Inbox:
     def __init__(self, clock, initial=(), delayed=()):
         self.clock = clock
