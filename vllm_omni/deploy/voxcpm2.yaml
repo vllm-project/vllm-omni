@@ -1,6 +1,7 @@
 # VoxCPM2 deploy: single-stage AR pipeline with per-request state batching.
 # MRV2 is opt-in: use a local deploy overlay with base_config: voxcpm2.yaml
 # and model_runner: v2. The same runtime_config works for both runners.
+# On Ascend the platform section below selects MRV2 by default.
 # Runs on large (H20 141GB) and small (24GB L4) cards alike: the KV cache is
 # pinned to a right-sized budget instead of ballooning to fill the card.
 #
@@ -60,3 +61,9 @@ stages:
       max_tokens: 4096
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  # Ascend runs the AR stage on Model Runner V2. Audio stays on the packed
+  # per-request path because incremental VAE decoding needs CUDA graphs.
+  npu:
+    model_runner: v2

@@ -1027,6 +1027,7 @@ class _RealtimeSession:
 
     async def __aenter__(self) -> _RealtimeSession:
         await self._client.__aenter__()
+        self._client.attach_event_collector(self.events)
         self._consume_task = asyncio.create_task(self.events.consume(self._client))
         # The handshake consumed session.created before the collector
         # subscribed; seed it so capability lookups and cursors still work.

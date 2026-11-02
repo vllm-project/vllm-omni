@@ -165,7 +165,7 @@ def test_forward_matches_reference_position_embedding() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cuda_position_ids_match_reference_for_processor_shapes(mocker) -> None:
     embeddings = SiglipVisionEmbeddings(_VisionConfig(image_size=140)).to(device="cuda")
@@ -193,7 +193,7 @@ def test_cuda_position_ids_match_reference_for_processor_shapes(mocker) -> None:
     assert all(call.args[2].device.type == "cpu" for call in grid_builder.call_args_list)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cuda_forward_matches_reference_for_processor_shape() -> None:
     torch.manual_seed(0)

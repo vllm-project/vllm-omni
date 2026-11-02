@@ -353,8 +353,8 @@ class TestWorkerWrapperBaseDelegation:
 
         allocator = FakeAllocator()
         mocker.patch(
-            "vllm_omni.diffusion.worker.diffusion_worker._get_cumem_allocator_class",
-            return_value=SimpleNamespace(get_instance=lambda: allocator),
+            "vllm_omni.diffusion.worker.diffusion_worker._get_mem_allocator_instance",
+            return_value=allocator,
         )
         mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector",
@@ -440,8 +440,8 @@ class TestWorkerWrapperBaseDelegation:
             release_pools=release_pools,
         )
         mocker.patch(
-            "vllm_omni.diffusion.worker.diffusion_worker._get_cumem_allocator_class",
-            return_value=SimpleNamespace(get_instance=lambda: allocator),
+            "vllm_omni.diffusion.worker.diffusion_worker._get_mem_allocator_instance",
+            return_value=allocator,
         )
         workers = []
         for _ in range(2):
@@ -516,11 +516,23 @@ class TestWorkerWrapperBaseDelegation:
 
     @pytest.mark.parametrize("owns_pool", [False, True])
     @pytest.mark.parametrize("cleanup_fails", [False, True])
-    def test_worker_shutdown_releases_only_owned_sleep_pool(self, mocker: MockerFixture, owns_pool, cleanup_fails):
+    @pytest.mark.parametrize("platform", ["cuda", "rocm", "xpu"])
+    def test_worker_shutdown_releases_only_owned_sleep_pool(
+        self, mocker: MockerFixture, owns_pool, cleanup_fails, platform
+    ):
         destroy = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
         shutdown_connector = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.shutdown_kv_connector")
-        allocator_class = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker._get_cumem_allocator_class")
-        release = allocator_class.return_value.get_instance.return_value.release_pools
+        allocator = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker._get_mem_allocator_instance").return_value
+        release = allocator.release_pools
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.is_cuda",
+            return_value=platform == "cuda",
+        )
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.is_rocm",
+            return_value=platform == "rocm",
+        )
+        retire = mocker.patch("vllm_omni.patch.release_cumem_allocations_for_shutdown", return_value=0)
         if cleanup_fails:
             release.side_effect = RuntimeError("pool release failed")
         worker = DiffusionWorker.__new__(DiffusionWorker)
@@ -530,6 +542,7 @@ class TestWorkerWrapperBaseDelegation:
         worker.shutdown()
 
         assert release.call_count == int(owns_pool)
+        assert retire.call_count == int(owns_pool and platform in ("cuda", "rocm"))
         shutdown_connector.assert_called_once_with()
         destroy.assert_called_once_with()
         if not cleanup_fails:

@@ -12,7 +12,7 @@ The combined Python metadata range for this checkout and vLLM is
 `>=3.11,<3.14`. The tested CUDA runtime uses Python 3.12, PyTorch 2.13.0 and
 CUDA 13.0 (`cu130`).
 The pre-built Omni wheel instructions below install
-the published 0.30.0 release with its matching vLLM dependency.
+the published 0.32.0 release with its matching vLLM dependency.
 
 !!! note
     PyTorch installed via `conda` will statically link `NCCL` library, which can cause issues when vLLM tries to use `NCCL`. See <gh-issue:8420> for more details.
@@ -25,22 +25,22 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 #### Installation of vLLM
 
-These pre-built wheel instructions install the published vLLM-Omni 0.30.0 release.
+These pre-built wheel instructions install the published vLLM-Omni 0.32.0 release.
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.30.0 --torch-backend=auto
+uv pip install vllm==0.32.0 --torch-backend=cu130
 ```
 
 #### Installation of vLLM-Omni
 
 ```bash
-uv pip install vllm-omni==0.30.0
+uv pip install vllm-omni==0.32.0
 ```
 
 To run Gradio demos, also install the optional extras:
 ```bash
-uv pip install 'vllm-omni[demo]==0.30.0'
+uv pip install 'vllm-omni[demo]==0.32.0'
 ```
 
 # --8<-- [end:pre-built-wheels]
@@ -62,8 +62,9 @@ CUDA variant or an existing incompatible PyTorch installation, build vLLM
 from source instead. The [vLLM 0.32.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.32.0)
 and its commit-index and PyPI wheels are available. The PyPI x86_64 wheel
 embeds the same release commit and CUDA/PyTorch requirements. The command
-above retains the exact tested artifact. A vLLM-Omni 0.32 wheel is not yet
-published; install Omni from this source checkout.
+above retains the exact tested artifact. The published vLLM-Omni 0.32.0
+wheel is available through the pre-built wheel instructions above; use the
+source checkout for development.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
@@ -120,14 +121,19 @@ Nightly CUDA images built from the latest `main` are also available:
 
 Use a commit-pinned tag when you need a reproducible nightly environment.
 
-Here's an example deployment command that has been verified on 2 x H100's:
+The [v0.32.0 release](https://github.com/vllm-project/vllm-omni/releases/tag/v0.32.0)
+provides CUDA images for `linux/amd64` and `linux/arm64`. Use the versioned
+tag for a reproducible release environment rather than the rolling `latest` tag.
+
+Example deployment on two GPUs (adjust hardware and memory capacity for your
+model):
 ```bash
 docker run --runtime nvidia --gpus 2 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.30.0 \
+    vllm/vllm-omni:v0.32.0 \
     vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 

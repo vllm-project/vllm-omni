@@ -1,0 +1,131 @@
+meta:
+  title: "Cosmos3-Super-Text2Image"
+  slug: "cosmos3-super-text2image"
+  provider: "NVIDIA"
+  description: "64B Cosmos3-Super specialization for high-fidelity text-to-image generation"
+  date_added: 2026-06-02
+  date_updated: 2026-06-02
+  tasks:
+    - omni
+  performance_headline: "High-fidelity text-to-image — 8×H100 with CFG-parallel + ulysses + HSDP"
+  related_recipes:
+    - nvidia/Cosmos3-Super
+    - nvidia/Cosmos3-Nano
+    - nvidia/Cosmos3-Super-Image2Video
+  hardware:
+    h200: verified
+    h100: verified
+    gb200: verified
+
+model:
+  model_id: "nvidia/Cosmos3-Super-Text2Image"
+  min_vllm_version: "0.21.0"
+  docker_image: "vllm/vllm-omni:cosmos3"
+  install:
+    docker:
+      note: "Release-tested vLLM-Omni image bundling the Cosmos3 omni handlers."
+    pip:
+  architecture: dense
+  parameter_count: "64B"
+  active_parameters: "64B"
+  context_length: 262144
+  base_args:
+    - "--host"
+    - "0.0.0.0"
+    - "--port"
+    - "8000"
+    - "--cfg-parallel-size"
+    - "2"
+    - "--ulysses-degree"
+    - "4"
+    - "--tensor-parallel-size"
+    - "1"
+    - "--use-hsdp"
+    - "--hsdp-shard-size"
+    - "8"
+    - "--init-timeout"
+    - "1800"
+  base_env: {}
+
+omni:
+  # Text-to-image specialization. Documented profile is an 8×H100 node with
+  # CFG-parallel + ulysses + HSDP (encoded in base_args). Images come back as
+  # base64 from /v1/images/generations.
+  tasks:
+    - id: t2i
+      description: "Text → high-fidelity image"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 154
+    description: "BF16 weights — 8×H100 node recommended"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  **Cosmos3-Super-Text2Image** is a 64B specialization of NVIDIA's Cosmos3-Super
+  omnimodal world model, tuned for **high-fidelity text-to-image generation**.
+  It is served via **vLLM-Omni**.
+
+  For best quality, text prompts should be JSON-upsampled — the model repo ships
+  an `agentic_upsampling/` package and an `AGENTIC_UPSAMPLING.md` guide.
+
+  ## Prerequisites
+
+  - 8× H100 for the documented full-node profile (4×H200 / 4×GB200 alternative below)
+  - The release-tested `vllm/vllm-omni:cosmos3` container, or vLLM-Omni installed
+    on top of `vllm==0.21.0`
+
+  ## Launch command (vLLM-Omni)
+
+  Recommended configuration on an 8×H100 node:
+
+  ```bash
+  docker pull vllm/vllm-omni:cosmos3
+
+  vllm serve nvidia/Cosmos3-Super-Text2Image \
+    --omni \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --cfg-parallel-size 2 \
+    --ulysses-degree 4 \
+    --tensor-parallel-size 1 \
+    --use-hsdp \
+    --hsdp-shard-size 8 \
+    --init-timeout 1800
+  ```
+
+  For **4×H200 or 4×GB200**, use
+  `--cfg-parallel-size 2 --ulysses-degree 2 --tensor-parallel-size 1`.
+  `--enable-layerwise-offload` can reduce VRAM usage on smaller GPUs, but for
+  text-to-image it incurs a significant performance penalty.
+
+  ### Example: text-to-image
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/images/generations \
+    -H "Content-Type: application/json" \
+    -d '{
+      "prompt": "a dragon flying over the Green Mountains at sunset",
+      "size": "1024x1024",
+      "seed": 42
+    }' | jq -r '.data[0].b64_json' | base64 -d > output.png
+  ```
+
+  ## References
+
+  - [Model card](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image)
+  - [Agentic prompt upsampling](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image/blob/main/AGENTIC_UPSAMPLING.md)
+  - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)
+  - [Cosmos](https://github.com/nvidia/cosmos)

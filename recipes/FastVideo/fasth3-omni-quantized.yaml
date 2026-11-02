@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+trust-remote-code: true
+enforce-eager: true
+num-gpus: 1
+task-type: ref2va
+vae-use-tiling: true
+diffusion-offload-config:
+  mode: layer
+  components: [dit, text_encoder]
+diffusion-attention-config:
+  default:
+    backend: FASTVIDEO_VSA
+additional-config:
+  video_vae_decoder:
+    model: FastVideo/FastH3-NVFP4-VAE-Decoder
+    revision: ddd17469cab7e490b1a04baaf26b247f0f0dcf0e
+    subfolder: fast-8L
+default-sampling-params:
+  "0":
+    num_inference_steps: 8
+    guidance_scale: 1
+init-timeout: 3600
+stage-init-timeout: 3600
