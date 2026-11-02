@@ -3,7 +3,7 @@
 """Ming-TTS (dense) serving adapter."""
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.inputs import tokens_input
@@ -12,7 +12,7 @@ from vllm.logger import init_logger
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import DEFAULT_PROMPT as MING_DEFAULT_PROMPT
-from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
+from vllm_omni.model_executor.models.ming_tts.constants import KEY_SPEAKER_AUDIO_KEYS, SPEAKER_EMBEDDING_DIM
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -94,6 +94,7 @@ class MingTTSAdapter(ARTTSAdapter):
         from vllm_omni.model_executor.models.ming_tts.prompt_assembly import build_ming_dense_prompt
 
         if self.ctx.server._tts_tokenizer is None:
+            assert self.ctx.engine_client is not None
             model_name = self.ctx.engine_client.model_config.model
             trust_remote_code = bool(getattr(self.ctx.engine_client.model_config, "trust_remote_code", False))
             self.ctx.server._tts_tokenizer = AutoTokenizer.from_pretrained(
@@ -199,11 +200,14 @@ class MingTTSAdapter(ARTTSAdapter):
                 uploaded_audio_voice = voice_lower
                 uploaded_audio_created_at = server._voice_created_at(voice_lower)
         ref_audio_data = None
+        speaker_audio_key = None
         if isinstance(ref_audio_source, list):
             ref_audio_data = await server._resolve_ref_audio_many(ref_audio_source)
         elif ref_audio_source is not None and isinstance(ref_audio_source, str):
-            wav_list, sr, _ = await server._resolve_ref_audio(ref_audio_source)
+            wav_list, sr, resolved_key = await server._resolve_ref_audio(ref_audio_source)
             ref_audio_data = (wav_list, sr)
+            if uploaded_audio_voice is None and request.speaker_embedding is None:
+                speaker_audio_key = server._get_resolved_ref_audio_artifact_key(resolved_key)
         prompt = self._build_ming_dense_prompt(
             request,
             ref_audio_data=ref_audio_data,
@@ -211,6 +215,8 @@ class MingTTSAdapter(ARTTSAdapter):
             voice_created_at=uploaded_audio_created_at,
         )
         tts_params = prompt.get("additional_information", {})
+        if speaker_audio_key is not None and speaker_audio_key.strip():
+            tts_params[KEY_SPEAKER_AUDIO_KEYS] = [speaker_audio_key]
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="ming_tts")
 
     def apply_sampling_overrides(
@@ -279,6 +285,7 @@ class MingTTSAdapter(ARTTSAdapter):
         return self._validate_max_new_tokens(request)
 
     def _validate_ming_tts_podcast_request(self, request: "OpenAICreateSpeechRequest") -> str | None:
+        assert isinstance(request.ref_audio, list)
         server = self.ctx.server
         if len(request.ref_audio) < 2:
             return "Podcast-style Ming requests require at least two 'ref_audio' clips"
@@ -300,7 +307,7 @@ class MingTTSAdapter(ARTTSAdapter):
                     f"got {embedding_count} embeddings for {len(request.ref_audio)} clips"
                 )
             if embeddings and isinstance(embeddings[0], list):
-                for item in embeddings:
+                for item in cast(list[list[float]], embeddings):
                     if len(item) != SPEAKER_EMBEDDING_DIM:
                         return (
                             f"Podcast-style Ming speaker embeddings must each have {SPEAKER_EMBEDDING_DIM} dimensions"
@@ -342,6 +349,7 @@ class MingTTSAdapter(ARTTSAdapter):
             return rate
         except Exception as e:
             logger.warning(f"Failed to derive Ming codec frame rate from hf_config: {e}")
+        return None
 
     def _load_supported_speakers(self) -> list[str]:
         return []
