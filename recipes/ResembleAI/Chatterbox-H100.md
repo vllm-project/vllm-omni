@@ -45,7 +45,7 @@ The request contract is the one in the
 
 | Profile on this hardware | Status |
 | --- | --- |
-| `chatterbox_turbo.yaml` (64 requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | measured through the nightly perf matrix at this head: 1, 8, 16 and 64 clients, built-in and cloned voices, and the 2-request/s stress case |
+| `chatterbox_turbo.yaml` (64 requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | measured through the nightly perf matrix at `feacefc03`, whose deploy files are the shipped ones: 1, 8, 16 and 64 clients, built-in and cloned voices, and the 2-request/s stress case |
 | `chatterbox.yaml` (64 guided requests, `conditioning_device: cuda:0`, BF16 flow, FP32 HiFT) | as Turbo's row |
 
 Real time here is the repository's measure: a median real-time factor
@@ -174,18 +174,19 @@ H100 baselines in that file, which are the nightly matrix below.
 
 ## Notes
 
-- Memory usage: the fractions in the deploy files are derived for a 24 GB
-  card (23.6 GiB) from this run's H100 stage-0 startup lines; no 24 GB card
-  was run, and the API process's GPU conditioning (the reference
-  conditioning batch below) is not in the fractions. Turbo: 1.12 GiB of
-  weights with vLLM's own, 0.08 GiB of activations, 0.06 GiB of graphs and
-  96 KiB of KV cache per token; 32 slots at 2048 tokens need 6.0 GiB, about
-  7.3 GiB in all, under the 35 % (8.3 GiB). Original: 1.32 GiB, 0.16 GiB,
-  0.08 GiB and 120 KiB per token; 16 sequences need 3.75 GiB, about 5.3 GiB
-  in all, under the 30 % (7.1 GiB). Stage 1 allocates no KV cache; its 15 %
-  bounds the flow's and HiFT's activations. The nightly matrix below ran
-  with these fractions: 159,248 KV-cache tokens for Turbo and 297,184 for
-  Original at startup.
+- Memory usage: the fractions in the deploy files size each stage for one
+  H100 (79.6 GiB) from its stage-0 startup lines; the API process's GPU
+  conditioning (the reference conditioning batch below) is not in the
+  fractions. Turbo: 1.12 GiB of weights with vLLM's own, 0.08 GiB of
+  activations, 0.06 GiB of graphs and 96 KiB of KV cache per token; 64
+  slots at 2048 tokens need 12.0 GiB, about 13.3 GiB in all, under the
+  20 % (15.9 GiB). Original: 1.32 GiB, 0.16 GiB, 0.08 GiB and 120 KiB per
+  token; 128 sequences need 30.0 GiB, about 31.6 GiB in all, under the
+  45 % (35.8 GiB). Stage 1 allocates no KV cache; its 15 % (11.9 GiB)
+  bounds the flow's and HiFT's activations for 64 utterances. The nightly
+  matrix below ran with these fractions: 159,248 KV-cache tokens for Turbo
+  and 297,184 for Original at startup. On a smaller card, lower
+  `max_num_seqs` and the fractions with it.
 - Key flags: `conditioning_device` under stage 0 `additional_config`
   places the reference encoders: on the stages' GPU (`cuda:0`) in every CUDA
   profile, and on the CPU on NPU, XPU and MUSA through each profile's
@@ -293,12 +294,12 @@ listening scores.
 
 ### Reference conditioning batch
 
-`benchmarks/tts/chatterbox_conditioning.py` on `cuda:0` at this head: 64
+`benchmarks/tts/chatterbox_conditioning.py` on `cuda:0` at `feacefc03`: 64
 references tiled from one 6.5 s Seed-TTS evaluation prompt
 (`common_voice_en_103675.wav`) to 6.1, 8.3, 10.1 and 16 s with distinct
 amplitude envelopes, encoded one at a time and then as one batch of 64 (the
-admission of both profiles), three cycles. The same run at the commit before the batched device extraction
-(same host, same clip) is the "before" column.
+admission of both profiles), three cycles. The same run at `e74733f8e`, the commit before the batched device extraction
+(same host, same clip), is the "before" column.
 
 | Model | Serial before (s) | Serial (s) | One batch before (s) | One batch (s) | Peak allocated / reserved (MiB) | Serial/batch parity |
 | --- | --- | --- | --- | --- | --- | --- |
