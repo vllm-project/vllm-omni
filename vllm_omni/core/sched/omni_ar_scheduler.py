@@ -204,11 +204,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def register_input_stream(self, request_id: str, stream: object) -> None:
         """Register a stream that was validated before scheduler admission."""
-        request = self.requests.get(request_id)
-        if request is None or request.is_finished():
-            raise ValueError(f"Cannot register input stream for inactive request {request_id}")
-        if request_id in self._model_input_streams:
-            raise ValueError(f"Input stream is already registered for request {request_id}")
         self._model_input_streams[request_id] = stream
 
     def append_text(self, update: TextInputUpdate) -> None:

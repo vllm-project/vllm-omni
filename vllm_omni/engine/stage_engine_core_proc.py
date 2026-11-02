@@ -166,8 +166,6 @@ class StageEngineCoreProc(EngineCoreProc):
                 return
             try:
                 stream = factory(request, self.vllm_config)
-                if stream is None:
-                    raise ValueError("Input stream factory did not create an input stream")
             except Exception as exc:
                 logger.exception("Rejecting request %s during input stream validation", request.request_id)
                 self._send_input_stream_error(request, str(exc))

@@ -309,7 +309,6 @@ class OmniStreamingSpeechHandler:
                         await self._send_error(
                             websocket,
                             "Previous utterance is still active; wait for session.done",
-                            utterance_index=incremental.index,
                         )
                         continue
                     if msg_type == "input.text" and not text:
@@ -531,7 +530,7 @@ class OmniStreamingSpeechHandler:
             return
         state.failure.set_result(error)
         state.text = ""
-        await self._send_error(websocket, str(error), partial_audio=state.total_bytes > 0, utterance_index=state.index)
+        await self._send_error(websocket, str(error), partial_audio=state.total_bytes > 0)
 
     async def _feed_incremental_text(
         self, websocket: WebSocket, state: _IncrementalUtterance, text: str, *, final: bool = False
@@ -540,7 +539,6 @@ class OmniStreamingSpeechHandler:
             await self._send_error(
                 websocket,
                 "input.text rejected: the current utterance has failed; send input.done",
-                utterance_index=state.index,
             )
             return
         if not state.failure.done():
@@ -1427,21 +1425,13 @@ class OmniStreamingSpeechHandler:
         return total_bytes
 
     @staticmethod
-    async def _send_error(
-        websocket: WebSocket,
-        message: str,
-        *,
-        partial_audio: bool = False,
-        utterance_index: int | None = None,
-    ) -> None:
+    async def _send_error(websocket: WebSocket, message: str, *, partial_audio: bool = False) -> None:
         """Send an error message to the client."""
         try:
             payload: dict[str, object] = {
                 "type": "error",
                 "message": message,
             }
-            if utterance_index is not None:
-                payload["utterance_index"] = utterance_index
             if partial_audio:
                 payload.update(partial_audio=True, action="discard")
             await websocket.send_json(payload)

@@ -147,22 +147,6 @@ def _has_tts_text_conditioning(info_dict: dict[str, Any], hidden_states: Any | N
     return False
 
 
-def _require_available_text_step(
-    info_dict: dict[str, Any],
-    trailing_text: torch.Tensor | None,
-    text_offset: int,
-) -> None:
-    """Reject unauthorized decode rather than substitute PAD for pending text.
-
-    The scheduler must park the request before reaching this guard. It does
-    not implement waiting or change the request's scheduling state.
-    """
-    if not text_input_is_complete(info_dict) and (
-        not isinstance(trailing_text, torch.Tensor) or trailing_text.ndim != 2 or text_offset >= trailing_text.shape[0]
-    ):
-        raise ValueError("Qwen3-TTS is waiting for text input; no decode step is authorized.")
-
-
 # ---------------------------------------------------------------------------
 # Components ported from the HuggingFace Qwen3-TTS reference implementation.
 # Only the classes actually needed by the vLLM AR Talker are kept here.
@@ -805,15 +789,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     # -------------------- preprocess / postprocess --------------------
 
     @staticmethod
-    def create_input_stream(request, vllm_config: VllmConfig) -> Qwen3TTSTextInput | None:
+    def create_input_stream(request, vllm_config: VllmConfig) -> Qwen3TTSTextInput:
         """Validate native text input before scheduler admission, without model weights."""
-        payload = request.additional_information
-        entries = payload if isinstance(payload, dict) else getattr(payload, "entries", {})
-        native = request.model_intermediate_buffer or {}
-        if "input_stream" not in native and not any(
-            key == "input_stream" or key.startswith("input_stream.") for key in entries
-        ):
-            return None
         info = unflatten_payload(deserialize_additional_information(request.additional_information))
         if request.model_intermediate_buffer:
             for key, value in request.model_intermediate_buffer.items():
@@ -822,10 +799,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 else:
                     info[key] = value
         stream = info.get("input_stream")
-        if not isinstance(stream, dict) or set(stream) - {"token_ids", "final", "timeout_s"}:
+        if not isinstance(stream, dict):
             raise ValueError("Qwen3-TTS input_stream requires token_ids and optional final / timeout_s")
         tokens = stream.get("token_ids")
-        if not isinstance(tokens, list) or not tokens:
+        if not tokens:
             raise ValueError("An input stream requires at least one initial token")
         timeout_s = stream.get("timeout_s", 10.0)
         if type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s <= 0:
@@ -889,8 +866,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 "qwen3_tts_text_projected": len(stream["token_ids"]),
                 "qwen3_tts_text_eos_projected": stream["final"],
             }
-        if updates:
-            meta.update(updates)
         return tail, offset, updates
 
     def preprocess(
@@ -1037,7 +1012,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         tail = hs.get("trailing_text")
         text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
         tail, text_offset, stream_updates = self._append_stream_text(info_dict, tail, text_offset)
-        _require_available_text_step(info_dict, tail, text_offset)
         trailing_text_update = tail if stream_updates else None
         if isinstance(tail, torch.Tensor) and tail.ndim == 2:
             tail_len = int(tail.shape[0])
@@ -1159,7 +1133,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             tail = hs.get("trailing_text")
             text_offset = max(0, int(meta.get("talker_text_offset", 0) or 0))
             tail, text_offset, stream_updates = self._append_stream_text(info_dict, tail, text_offset)
-            _require_available_text_step(info_dict, tail, text_offset)
             trailing_text_update = tail if stream_updates else None
             if isinstance(tail, torch.Tensor) and tail.ndim == 2:
                 tail_len = int(tail.shape[0])
