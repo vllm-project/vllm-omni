@@ -57,6 +57,18 @@ def test_v1_custom_readiness_enables_batch_waiting(construct_scheduler):
     assert scheduler._generation_max_wait_s == 0.012
 
 
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_v1_stage_zero_enables_batch_waiting_without_override(construct_scheduler, mocker, async_chunk):
+    adapter = mocker.patch("vllm_omni.core.sched.omni_scheduler_mixin.OmniChunkTransferAdapter")
+    adapter.return_value.receives_chunks = False
+    config = _config(native=False, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 12})
+    config.model_config.stage_id = 0
+    config.model_config.async_chunk = async_chunk
+    scheduler = construct_scheduler(config)
+    assert scheduler._generation_min_batch_size == 4
+    assert scheduler._generation_max_wait_s == 0.012
+
+
 @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
 def test_moss_profile_generation_constructor_after_platform_resolution(
     construct_scheduler, monkeypatch, mocker, platform
