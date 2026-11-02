@@ -835,7 +835,11 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     cache_config: Any = field(default_factory=dict)
     video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
-    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    # ``None`` means "not specified": ``__post_init__`` resolves it from the
+    # model's paged-KV capability and the stage configuration, exactly as
+    # ``OmniDiffusionConfig`` does, so the projection and the runtime config
+    # cannot disagree.
+    diffusion_kv_mode: DiffusionKVCacheMode | None = None
     enable_prefix_caching: bool = False
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
     enable_prompt_embed_cache: bool = False
@@ -983,7 +987,7 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             validate_host_weight_runtime_options,
             validate_kv_cache_dtype_vs_attention_specs,
         )
-        from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
+        from vllm_omni.diffusion.diffusion_kv.config import resolve_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
 
         kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
@@ -1057,17 +1061,35 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             )
         validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
 
-        self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
-        if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
+        from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+
+        metadata = get_diffusion_model_metadata(self.model_class_name or self.model_arch)
+        explicit_kv_mode = self.diffusion_kv_mode
+        kv_resolution = resolve_diffusion_kv_cache_mode(
+            explicit_kv_mode,
+            model_supports_paged_kv=metadata.supports_paged_kv,
+            max_rows_per_request=self.diffusion_kv_max_rows_per_request,
+            model_default_max_rows=metadata.paged_kv_max_rows_per_request,
+            step_execution=bool(self.step_execution),
+            offload_enabled=self._has_diffusion_offload_enabled(),
+            attention_backend=self._explicit_attention_backend(),
+        )
+        if explicit_kv_mode is not None:
+            self.diffusion_kv_mode = kv_resolution.mode
+            self.diffusion_kv_max_rows_per_request = kv_resolution.max_rows_per_request
+        # Otherwise keep the mode unset: this projection is serialized into the
+        # stage config, and baking a resolved default here would freeze it, so a
+        # later change to the default could not reach deploy-config stages. The
+        # runtime ``OmniDiffusionConfig`` resolves the unset value instead.
+        #
+        # Legacy imported AR KV (``omni_kv_config['need_recv_cache']``) is not a
+        # field of this projection, so that combination is only rejected when
+        # the runtime config is built. Everything else above is validated here.
+        if self.enable_prefix_caching and not kv_resolution.is_paged:
             raise ValueError(
                 "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
                 "set diffusion_kv_mode='paged_scheduler' or disable enable_prefix_caching"
             )
-        if (
-            self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
-            and self.diffusion_kv_max_rows_per_request is None
-        ):
-            raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -1092,6 +1114,36 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
                 "diffusers_load_kwargs and diffusers_call_kwargs are only "
                 "valid together with diffusion_load_format=diffusers"
             )
+
+    def _has_diffusion_offload_enabled(self) -> bool:
+        """Return whether any weight-offload path is configured.
+
+        Paged KV has not been validated with CPU, layerwise, or distributed
+        layerwise offload, so an implicit KV-mode resolution must stay on the
+        dense path for those stages.
+        """
+
+        return bool(
+            self.enable_cpu_offload
+            or self.enable_layerwise_offload
+            or self.enable_distributed_layerwise_offload
+            or self.diffusion_offload_config
+        )
+
+    def _explicit_attention_backend(self) -> str | None:
+        """Return the explicitly selected diffusion attention backend, if any."""
+
+        # Both config classes normalize ``diffusion_attention_config`` before
+        # resolving the KV mode, so the effective backend (including the
+        # DIFFUSION_ATTENTION_BACKEND fallback) is readable here.
+        default_spec = getattr(self.diffusion_attention_config, "default", None)
+        backend = getattr(default_spec, "backend", None)
+        if backend is None:
+            return None
+        if isinstance(backend, str):
+            return backend
+        # Accept the enum form (``DiffusionAttentionBackendEnum.FLASH_ATTN``).
+        return getattr(backend, "name", None)
 
     def _propagate_quantization_from_tf_config(self, tf_config: Any) -> None:
         quant_config = getattr(tf_config, "quant_config", None)

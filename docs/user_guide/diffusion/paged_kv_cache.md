@@ -66,8 +66,8 @@ stages:
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `diffusion_kv_mode` | Yes | `paged_scheduler` enables Scheduler-managed pages; `dense_legacy` is the default |
-| `diffusion_kv_max_rows_per_request` | Yes for paged | Positive Worker row limit, including all internal CFG branches; use `1` without CFG and `2` for standard CFG |
+| `diffusion_kv_mode` | Optional | `paged_scheduler` enables Scheduler-managed pages; `dense_legacy` stays the default while paged execution is validated, and an explicit `paged_scheduler` that cannot run fails at config time instead of falling back to dense |
+| `diffusion_kv_max_rows_per_request` | Optional for paged | Positive Worker row limit, including all internal CFG branches; use `1` without CFG and `2` for standard CFG. When omitted, a paged-capable model integration supplies its own capacity (2 for HunyuanImage-3.0 CFG); set it explicitly to override that value |
 | `kv_cache_memory_bytes` | Optional | Explicit physical KV-pool budget per Worker/rank; omit it to use automatic sizing |
 | `gpu_memory_utilization` | Optional | Automatic pool-sizing fraction when no explicit byte budget is set |
 | `max_num_seqs` | Recommended `1` | Public request capacity; it is separate from the internal CFG row limit |
