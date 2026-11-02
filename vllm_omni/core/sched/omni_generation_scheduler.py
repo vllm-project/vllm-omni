@@ -53,6 +53,7 @@ def _has_async_chunk_payload_to_run(request: Request) -> bool:
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     waiting: RequestQueue
     running: list[Request]
+    max_num_scheduled_tokens: int
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -757,8 +758,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # requests with empty prompt_token_ids.
                 self._restore_omni_wait_queues()
             else:
-                res = super().schedule(throttle_prefills)
-                self._restore_omni_wait_queues()
+                original_token_budget = self.max_num_scheduled_tokens
+                try:
+                    # Custom input readiness can defer stages without a
+                    # connector. The upstream fallback must honor that gate.
+                    if getattr(self, "_generation_defer_batch", False):
+                        self.max_num_scheduled_tokens = 0
+                    res = super().schedule(throttle_prefills)
+                finally:
+                    self.max_num_scheduled_tokens = original_token_budget
+                    self._restore_omni_wait_queues()
                 self._postprocess_omni_schedule_output(res)
                 return self._wrap_omni_scheduler_output(res)
 
