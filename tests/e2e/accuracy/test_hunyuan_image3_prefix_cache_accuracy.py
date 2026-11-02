@@ -95,7 +95,13 @@ def _generate_edit(client, *, model, images, prompt, output_path, capfd, **gener
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("tp_size,sp_size", [(4, 1), (2, 2)], ids=["tp4-sp1", "tp2-sp2"])
 def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
-    from tests.e2e.accuracy.helpers import CLIPScorer, compute_image_ssim_psnr, download_images, model_output_dir
+    from tests.e2e.accuracy.helpers import (
+        CLIPScorer,
+        compute_image_ssim_psnr,
+        download_images,
+        model_output_dir,
+        write_accuracy_result,
+    )
     from tests.helpers.runtime import OmniServer
 
     configs = json.loads(_BENCHMARK_CONFIG.read_text())
@@ -197,5 +203,13 @@ def test_hunyuan_image3_warm_prefix_accuracy(tmp_path, capfd, tp_size, sp_size):
             print(f"{label} {name}: {value:.6f}, required >= {threshold}")
             if not value >= threshold:
                 failures.append(f"{label}: {name}={value:.6f} < {threshold}")
-    (output_dir / "quality_metrics.json").write_text(json.dumps(metrics, indent=2))
+    metrics_path = output_dir / "quality_metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2))
+    write_accuracy_result(
+        model_id=model,
+        dataset="image_similarity",
+        metrics=metrics,
+        baseline=dict(_ACCURACY_THRESHOLDS),
+        extra={"tp_size": tp_size, "sp_size": sp_size, "metrics_json": str(metrics_path)},
+    )
     assert not failures, "\n".join(failures)

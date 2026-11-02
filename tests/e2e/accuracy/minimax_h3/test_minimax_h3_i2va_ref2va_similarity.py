@@ -17,9 +17,11 @@ from huggingface_hub import snapshot_download
 from tests.e2e.accuracy.helpers import (
     assert_video_metadata,
     assert_video_similarity_metrics,
+    measure_video_similarity_metrics,
     probe_binary,
     probe_video,
     reset_artifact_dir,
+    write_accuracy_result,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
@@ -235,12 +237,30 @@ def _assert_official_video(
     assert _probe_audio(reference_path) == expected_audio
     assert _probe_audio(generated_path) == expected_audio
 
+    ssim, psnr = measure_video_similarity_metrics(
+        label=label,
+        online_path=generated_path,
+        offline_path=reference_path,
+    )
+    write_accuracy_result(
+        model_id=MODEL_REPO_ID,
+        dataset="video_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": ssim_threshold, "psnr": psnr_threshold},
+        extra={
+            "label": label,
+            "online_video": str(generated_path),
+            "offline_video": str(reference_path),
+        },
+    )
     assert_video_similarity_metrics(
         label=label,
         online_path=generated_path,
         offline_path=reference_path,
         ssim_threshold=ssim_threshold,
         psnr_threshold=psnr_threshold,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
 
 

@@ -26,7 +26,9 @@ from tests.e2e.accuracy.helpers import (
     assert_similarity,
     compute_image_ssim_psnr,
     download_images,
+    measure_image_similarity,
     model_output_dir,
+    write_accuracy_result,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -352,7 +354,7 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         elapsed = time.perf_counter() - t0
 
     assert outputs, "Pipeline produced no outputs"
-    images = None
+    output_images = None
     cot_text = ""
     for out in outputs:
         ro = out
@@ -372,12 +374,12 @@ def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Imag
         if not imgs and ro and hasattr(ro, "images"):
             imgs = ro.images
         if imgs:
-            images = imgs
+            output_images = imgs
 
-    assert images, "Pipeline output had no images"
+    assert output_images, "Pipeline output had no images"
     cot_text = cot_text.lstrip("\n")
 
-    image = images[0].convert("RGB")
+    image = output_images[0].convert("RGB")
     image.save(output_path / "image_offline.png")
     (output_path / "cot_offline.txt").write_text(cot_text, encoding="utf-8")
     gc.collect()
@@ -643,14 +645,31 @@ def test_quantized_dit_matches_bf16_accuracy(
         reference=bf16_image,
     )
     quant_thresholds = _get_quant_thresholds()
+    model_label = f"{MODEL_NAME} {case.name} vs bf16"
+    ssim, psnr = measure_image_similarity(
+        model_name=model_label,
+        vllm_image=quant_image,
+        diffusers_image=bf16_image,
+        width=QUANT_WIDTH,
+        height=QUANT_HEIGHT,
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="image_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline={"ssim": quant_thresholds["ssim"], "psnr": quant_thresholds["psnr"]},
+        extra={"label": case.name},
+    )
     assert_similarity(
-        model_name=f"{MODEL_NAME} {case.name} vs bf16",
+        model_name=model_label,
         vllm_image=quant_image,
         diffusers_image=bf16_image,
         ssim_threshold=quant_thresholds["ssim"],
         psnr_threshold=quant_thresholds["psnr"],
         width=QUANT_WIDTH,
         height=QUANT_HEIGHT,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
 
     clip_scorer = CLIPScorer()
@@ -678,6 +697,16 @@ def test_quantized_dit_matches_bf16_accuracy(
     }
     metrics_path = output_dir / f"{case.name}_metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="quant_clip",
+        metrics=metrics,
+        baseline={
+            "clip_score": quant_thresholds["clip_score"],
+            "clip_score_drop": quant_thresholds["clip_score_drop"],
+        },
+        extra={"label": case.name, "metrics_json": str(metrics_path)},
+    )
 
     print(f"\nHunyuanImage3 quant accuracy ({case.name})")
     print(f"  bf16 model:       {bf16_model}")

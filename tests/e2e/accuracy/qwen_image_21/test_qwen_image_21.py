@@ -52,10 +52,12 @@ from PIL import Image
 from tests.e2e.accuracy.helpers import (
     SimilarityThresholds,
     assert_similarity_metrics,
+    baseline_from_similarity_thresholds,
     compute_image_ssim_psnr,
     model_output_dir,
     resolve_device_profile,
     resolve_similarity_thresholds,
+    write_accuracy_result,
     write_json_artifact,
 )
 from tests.e2e.accuracy.qwen_image_21.contract import (
@@ -344,6 +346,22 @@ def test_qwen_image_21_matches_reference(accuracy_artifact_root: Path, run_level
     if expected_xfail:
         pytest.xfail(f"{expected_xfail} Metrics: {output / 'metrics.json'}")
     assert selected is not None
+    write_accuracy_result(
+        model_id=MODEL_ID,
+        dataset="image_similarity",
+        metrics={
+            "ssim": candidate_scores["ssim"],
+            "psnr": candidate_scores["psnr"],
+            "alpha_mae": candidate_scores.get("alpha_mae"),
+        },
+        baseline=baseline_from_similarity_thresholds(table),
+        extra={
+            "case": case_name,
+            "device": device_name,
+            "profile": profile,
+            "artifacts": str(output),
+        },
+    )
     assert_similarity_metrics(
         model_name=f"Qwen-Image 2.1 {case_name}; artifacts: {output}",
         ssim_score=candidate_scores["ssim"],

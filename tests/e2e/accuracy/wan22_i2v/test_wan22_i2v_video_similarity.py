@@ -14,7 +14,9 @@ import torch
 from tests.e2e.accuracy.helpers import (
     assert_video_metadata,
     assert_video_similarity_metrics,
+    baseline_from_similarity_thresholds,
     build_online_image_reference,
+    measure_video_similarity_metrics,
     online_timeout_seconds,
     probe_binary,
     probe_video,
@@ -23,6 +25,7 @@ from tests.e2e.accuracy.helpers import (
     send_video_request_with_timeout,
     validate_image_source,
     video_artifact_dir,
+    write_accuracy_result,
     write_json_artifact,
 )
 from tests.e2e.accuracy.wan22_i2v.prerequisite import require_similarity_artifacts
@@ -279,12 +282,10 @@ def test_wan22_i2v_serving_matches_diffusers_video_similarity(
         f"wan22_i2v similarity thresholds: device_profile={device_profile}, "
         f"ssim>={thresholds.ssim:.6f}, psnr>={thresholds.psnr:.6f}"
     )
-    ssim, psnr = assert_video_similarity_metrics(
+    ssim, psnr = measure_video_similarity_metrics(
         label="wan22_i2v",
         online_path=online_path,
         offline_path=offline_path,
-        ssim_threshold=thresholds.ssim,
-        psnr_threshold=thresholds.psnr,
     )
     score_path = offline_path.with_name("similarity.json")
     write_json_artifact(
@@ -300,5 +301,28 @@ def test_wan22_i2v_serving_matches_diffusers_video_similarity(
             "offline_video": str(offline_path),
             "offline_metadata": str(offline_metadata_path),
         },
+    )
+    write_accuracy_result(
+        model_id=MODEL_NAME,
+        dataset="video_similarity",
+        metrics={"ssim": ssim, "psnr": psnr},
+        baseline=baseline_from_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE),
+        extra={
+            "label": "wan22_i2v",
+            "device_profile": device_profile,
+            "online_video": str(online_path),
+            "offline_video": str(offline_path),
+            "offline_metadata": str(offline_metadata_path),
+            "similarity_json": str(score_path),
+        },
+    )
+    assert_video_similarity_metrics(
+        label="wan22_i2v",
+        online_path=online_path,
+        offline_path=offline_path,
+        ssim_threshold=thresholds.ssim,
+        psnr_threshold=thresholds.psnr,
+        ssim_score=ssim,
+        psnr_score=psnr,
     )
     print(f"similarity_result={score_path}")

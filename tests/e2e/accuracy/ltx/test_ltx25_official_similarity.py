@@ -32,7 +32,7 @@ import torch
 from huggingface_hub import hf_hub_download, snapshot_download
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
-from tests.e2e.accuracy.helpers import reset_artifact_dir
+from tests.e2e.accuracy.helpers import reset_artifact_dir, write_accuracy_result
 from tests.helpers.mark import hardware_test
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
@@ -444,10 +444,12 @@ def _ltx25_t2a_request() -> dict[str, object]:
 
 def test_ltx25_t2a_request_is_audio_only() -> None:
     request = _ltx25_t2a_request()
+    num_frames = request["num_frames"]
+    assert isinstance(num_frames, int)
 
     assert not any(key.startswith("video_") for key in request)
     assert "audio_modality_scale" not in request
-    assert (request["num_frames"] - 1) % 8 == 0
+    assert (num_frames - 1) % 8 == 0
     assert request["sigmas"] == _ltx25_full_request()["sigmas"]
 
 
@@ -530,6 +532,46 @@ def _audio_metrics(reference: np.ndarray, prediction: np.ndarray) -> dict[str, f
 def _assert_strict_audio_similarity(audio_metrics: dict[str, float | bool]) -> None:
     assert audio_metrics["relative_l2"] <= STRICT_THRESHOLDS.audio_relative_l2
     assert audio_metrics["cosine_similarity"] >= STRICT_THRESHOLDS.audio_cosine_similarity
+
+
+def _write_ltx25_accuracy_result(
+    *,
+    model_id: str,
+    video_metrics: dict[str, float] | None,
+    audio_metrics: dict[str, float | bool],
+    metrics_json: Path,
+    extra: dict[str, object] | None = None,
+) -> None:
+    metrics: dict[str, object] = {
+        "audio_relative_l2": audio_metrics["relative_l2"],
+        "audio_cosine_similarity": audio_metrics["cosine_similarity"],
+    }
+    baseline: dict[str, float] = {
+        "audio_relative_l2": STRICT_THRESHOLDS.audio_relative_l2,
+        "audio_cosine_similarity": STRICT_THRESHOLDS.audio_cosine_similarity,
+    }
+    if video_metrics is not None:
+        metrics.update(
+            {
+                "video_ssim_mean": video_metrics["ssim_mean"],
+                "video_ssim_min": video_metrics["ssim_min"],
+                "video_psnr_mean_db": video_metrics["psnr_mean_db"],
+            }
+        )
+        baseline.update(
+            {
+                "video_ssim_mean": STRICT_THRESHOLDS.video_ssim_mean,
+                "video_ssim_min": STRICT_THRESHOLDS.video_ssim_min,
+                "video_psnr_mean_db": STRICT_THRESHOLDS.video_psnr_mean_db,
+            }
+        )
+    write_accuracy_result(
+        model_id=model_id,
+        dataset="video_audio_similarity",
+        metrics=metrics,
+        baseline=baseline,
+        extra={"metrics_json": str(metrics_json), **(extra or {})},
+    )
 
 
 def _assert_strict_similarity(
@@ -660,6 +702,13 @@ def test_ltx25_distilled_two_stage_matches_official(accuracy_artifact_root: Path
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    _write_ltx25_accuracy_result(
+        model_id=f"ltx25_distilled_{task}",
+        video_metrics=video_metrics,
+        audio_metrics=audio_metrics,
+        metrics_json=output_root / "metrics.json",
+        extra={"task": task, "pipeline_mode": "distilled_two_stage"},
+    )
     print(json.dumps(result, indent=2))
 
     _assert_strict_similarity(video_metrics, audio_metrics)
@@ -815,6 +864,13 @@ def test_ltx25_full_matches_official(accuracy_artifact_root: Path, task: str, pi
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    _write_ltx25_accuracy_result(
+        model_id=f"ltx25_{pipeline_mode}_{task}",
+        video_metrics=video_metrics,
+        audio_metrics=audio_metrics,
+        metrics_json=output_root / "metrics.json",
+        extra={"task": task, "pipeline_mode": pipeline_mode},
+    )
     print(json.dumps(result, indent=2))
 
     _assert_strict_similarity(video_metrics, audio_metrics)
@@ -932,6 +988,13 @@ def test_ltx25_t2a_matches_official(accuracy_artifact_root: Path) -> None:
         "audio": audio_metrics,
     }
     (output_root / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
+    _write_ltx25_accuracy_result(
+        model_id="ltx25_t2a",
+        video_metrics=None,
+        audio_metrics=audio_metrics,
+        metrics_json=output_root / "metrics.json",
+        extra={"task": "t2a"},
+    )
     print(json.dumps(result, indent=2))
 
     _assert_strict_audio_similarity(audio_metrics)
