@@ -344,7 +344,7 @@ def _expand_dot(m):
     return f"{match[0]} dot {match[2]}"
 
 
-def _expand_parantheses(m):
+def _expand_parentheses(m):
     match = m.group(0)
     match = re.sub(r"[\(\[\{]", ", ", match)
     match = re.sub(r"[\)\]\}][^$.!?,]", ", ", match)
@@ -368,7 +368,7 @@ def normalize_special(text):
     text = re.sub(_link_header_re, _expand_link_header, text)
     text = re.sub(_dash_re, _expand_dash, text)
     text = re.sub(_dot_re, _expand_dot, text)
-    text = re.sub(_parentheses_re, _expand_parantheses, text)
+    text = re.sub(_parentheses_re, _expand_parentheses, text)
     return text
 
 

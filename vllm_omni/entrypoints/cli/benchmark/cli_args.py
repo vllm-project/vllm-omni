@@ -251,6 +251,16 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
             "omitted; set <= 0 to restore the legacy 6 h cap."
         ),
     )
+    group.add_argument(
+        "--omni-fail-fast-on-timeout",
+        action="store_true",
+        default=False,
+        help=(
+            "After the first timed-out benchmark request, cancel all remaining queued or in-flight requests. "
+            "Completed outputs and partial result metrics are retained. Supported only with "
+            "--backend openai-chat-omni, --request-rate inf, and non-self-timed workloads."
+        ),
+    )
 
 
 def add_diffusion_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -537,6 +547,13 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
                 'stage metrics. "tpop" also requests text TPOT/TPOP globally and per stage, and internal '
                 'stream TPOP. "ttfc", "tpoc", and "icl" only affect internal stream stage metrics. '
                 'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun".'
+            )
+        if action.dest == "goodput":
+            action.help = (
+                'Specify service level objectives for goodput as "KEY:VALUE" pairs, where the key is a '
+                'request-level metric name and the value is in milliseconds. Multiple "KEY:VALUE" pairs '
+                "can be provided, separated by spaces, and a request must satisfy every SLO to count toward "
+                'goodput. Allowed metric names are "ttft", "tpot", "e2el", and "audio_ttfp".'
             )
         if action.dest == "random_mm_limit_mm_per_prompt":
             action.help = (

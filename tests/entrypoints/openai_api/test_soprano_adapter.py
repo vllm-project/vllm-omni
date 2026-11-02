@@ -10,6 +10,7 @@ import pytest
 import soundfile as sf
 import torch
 from vllm import SamplingParams
+from vllm.outputs import CompletionOutput
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -124,13 +125,21 @@ def test_prompt_matches_offline_preparation_and_rejects_multiple_units():
 
 
 def mock_output(failed=False):
-    completion = SimpleNamespace(index=0, text="", token_ids=[], finish_reason="stop", stop_reason=None, logprobs=None)
+    completion = CompletionOutput(
+        index=0,
+        text="",
+        token_ids=[],
+        cumulative_logprob=None,
+        finish_reason="stop",
+        stop_reason=None,
+        logprobs=None,
+    )
     wave = torch.empty(0) if failed else 0.1 * torch.sin(torch.arange(4096).float() / 20)
-    output = SimpleNamespace(
+    output = OmniRequestOutput(
         request_id="speech-test",
         outputs=[completion],
         finished=True,
-        multimodal_output={
+        _multimodal_output={
             "audio": wave,
             "sr": torch.tensor(32000),
             "audio_synthesis_error": torch.tensor([failed]),

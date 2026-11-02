@@ -77,6 +77,12 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
                     'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
                     '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
+- `--goodput`
+  Specify request-level service objectives as space-separated `KEY:VALUE` pairs, with values in milliseconds.
+  Supported metrics are `ttft`, `tpot`, `e2el`, and `audio_ttfp`. When multiple objectives are supplied, a
+  request contributes to goodput only when it satisfies every objective, for example
+  `--goodput ttft:500 audio_ttfp:1000`.
+
 - `--print-stage`
 Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.
 
@@ -348,6 +354,18 @@ sample metadata records the effective `unit_ms`. Audio pacing uses a cumulative
 monotonic deadline so sending and frame processing do not add a full extra sleep
 to every append. The standalone `generate` command rejects `server_vad` combined
 with `--pace as-fast-as-possible`, which compresses turn and playback timing.
+When audio ends before the video, the runner pads it with silence to cover the
+clip before applying its existing turn-ending behavior. Each sampled frame goes
+into its audio interval `[start, end)`; frames on a boundary belong to the next
+interval. Up to two frames fit in an append. A higher density fails explicitly;
+reduce `--duplex-eval-fps` (or standalone `--fps`) instead of dropping frames.
+To replace standalone responses generated before this correction, use
+`generate --overwrite` or a new response directory.
+With `server_vad`, the full video continues after speech ends: silent audio and
+later frames are still sent before the extra VAD tail silence. Speech can end a
+turn before the clip finishes; later image items update the session context but
+do not themselves trigger another response. Input coverage therefore does not
+guarantee that every post-speech frame contributes to an answer.
 Settling is not an acknowledgement
 that all final input has been processed. Frames use the transport advertised by
 the server: native video frames or bounded image conversation items for Qwen3.
@@ -382,6 +400,9 @@ or heard in the clip, such as the word-repetition prompts in
 instruction alone. The standalone `generate` command accepts the same choice as `--mix`.
 The MiniCPM-o Omni-DuplexEval nightly (`tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json`)
 runs with `soundtrack`; the Qwen3-Omni `server_vad` nightly keeps `question`.
+Its DFX config uses `duplex_eval_score_floor_hardware` to enforce calibrated
+quality floors on H100, B200 and A3 while ROCm burn-in still requires complete
+generation, publication and judging but records scores without a quality floor.
 
 Each session decodes its media in a
 worker thread after acquiring a concurrency slot, and releases the decoded input
@@ -407,6 +428,10 @@ response without failing the sample; its collected text remains available to the
 judge. The runner drains active responses before closing the session. Responses
 created during close are recorded in `unfinished_response_ids` in the metadata;
 server errors, failed responses, and drain/close timeouts still fail the sample.
+Failed measured sessions write a compact control-state trace under
+`failed_sessions/<split>/<id>.json`. These files record the committed event,
+response IDs and statuses, listen metadata, open responses, and quiet-window
+timing, but are never passed to the judge.
 
 `--duplex-eval-response-root` is a **parent directory** and may already exist.
 Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
@@ -445,6 +470,18 @@ sessions, and judge errors. Partial coverage is marked `partial`; no evaluated
 sessions is `failed`, not a zero-error accuracy result. Scores are conditional on
 the evaluated subset, not an accuracy score for all attempted sessions. Warmups
 are never scored. Judge failures do not discard completed performance measurements.
+Judge replies must finish with `finish_reason="stop"` and contain the required
+scores: `temporal_score` (integer 0–3) and `is_relevant` (0 or 1) for temporal
+judging, `content_score` (finite number 0–3) for content judging, or `success_score`
+(0 or 1) for PR. A missing or null `finish_reason` fails evaluation even when the
+score JSON is valid: a parseable score does not establish that generation finished.
+Missing or invalid scores also fail evaluation; a valid zero from a completed
+reply still counts as an evaluated sample. Raw judge replies are saved beside each score in
+`<sample>.judge.jsonl`. Retrying evaluation archives an existing score as
+`<sample>.json.<unique-id>.previous`, which summaries exclude, and resets the
+reply trace. A failed retry leaves no active score; a new score is published only
+after all required judge calls succeed.
+
 The saved `omni_duplex_eval.published_with_unfinished_responses` counts published
 samples with non-empty `unfinished_response_ids` in their metadata. A nonzero count
 also emits a warning. These samples remain eligible for scoring using their collected
@@ -494,9 +531,13 @@ that commit has finished. A reply already open when the clip ends does not
 decide the session: completing it normally is what starts the residual unit, and
 that unit can still open a response. A cancelled reply does not decide the
 session either: barge-in cancels that turn, and the residual response can still
-open afterwards. A failed reply does end the wait. The server does not promote
-another unit after a failure, and a failed response created after the commit is
-itself the residual. The listening outcome is
+open afterwards. If the full drain timeout expires with every created response
+finished, no completion activity during the same 2-second quiet window, and no
+later response open, the runner accepts the settled terminal silence after the
+in-flight reply completes or is cancelled instead of reporting a drain timeout.
+It never takes this fallback during the normal wait. A failed reply does end the
+wait. The server does not promote another unit after a failure, and a failed
+response created after the commit is itself the residual. The listening outcome is
 a session in which the model never spoke; it publishes empty judge input and
 scores 0 instead of failing on the drain timeout. The runner withholds the last
 PCM sample when the clip ends on a model-unit boundary, so the commit always
@@ -785,25 +826,6 @@ timestamp stays exact even when the clip length is not a multiple of 200 ms. `re
   streaming silence first would charge it for latency no real caller pays.
 - `vad` — the client streams the speech *and* the tail, and server VAD ends the turn on its own, without a client commit
   or `response.create`. Its 800 ms silence threshold must stay shorter than the one-second tail or the turn never ends.
-
-#### Run the matched nightly workload
-
-The [performance configuration](gh-file:tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json) runs both triggers using the
-first 32 English Seed-TTS entries in fixed order, concurrency 1, temperature 0, and a 256-token output limit. It asks
-the model to read the target text rather than answer or transcribe the accompanying audio. Each trigger runs two
-unmeasured warmup requests before its 32 measured requests. The CUDA nightly job runs this configuration on two H100/B200 GPUs.
-
-Run from the repository environment after reserving two GPUs according to your host's scheduling rules:
-
-```bash
-uv run --no-sync pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
-  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json \
-  --run-level full_model
-```
-
-`BENCHMARK_DIR` selects the result directory (default `tests/dfx/perf/results`). For cached local weights or data, copy the
-JSON and replace `server_params.model` and each `benchmark_params[].dataset_path` with local paths. Preserve sample
-count, order, system prompt, and generation settings across the two cases.
 
 #### Read the reported metrics
 
