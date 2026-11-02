@@ -2322,8 +2322,12 @@ async def generate_images(
         prompt = OmniTextPrompt(prompt=request.prompt, modalities=["image"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
-        gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
-        extra_args = dict(request.extra_params or {})
+        gen_params = OmniDiffusionSamplingParams()
+        app_state_args = getattr(raw_request.app.state, "args", None)
+        apply_stage_default_sampling_params(getattr(app_state_args, "default_sampling_params", None), gen_params, "0")
+        if "n" in request.model_fields_set:
+            gen_params.num_outputs_per_prompt = request.n
+        extra_args = {**gen_params.extra_args, **(request.extra_params or {})}
         if request.use_system_prompt is not None:
             extra_args["use_system_prompt"] = request.use_system_prompt
         if request.system_prompt is not None:
@@ -2368,13 +2372,10 @@ async def generate_images(
         _update_if_not_none(gen_params, "true_cfg_scale", request.true_cfg_scale)
         # Whitelisted per-request sampling grid (e.g. QwenImage21Pipeline's sigmas).
         _update_if_not_none(gen_params, "sigmas", (request.model_extra or {}).get("sigmas"))
-        # If seed is not provided, generate a random one to ensure
-        # a proper generator is initialized in the backend.
-        # This fixes issues where using the default global generator
-        # might produce blurry images in some environments.
-        _update_if_not_none(
-            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
-        )
+        if request.seed is not None:
+            gen_params.seed = request.seed
+        elif gen_params.seed is None:
+            gen_params.seed = random.randint(0, MAX_UINT32_SEED)
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
         _update_if_not_none(gen_params, "layers", request.layers)
 
