@@ -13,6 +13,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpecKind, get_kv_cache_spec_kind
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
 from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ARDiffusionKVCache,
@@ -24,7 +25,9 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import (
     build_kv_manager,
     compute_num_blocks,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache import manager as kv_manager
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import chunk_window_skipped_tokens
+from vllm_omni.experimental.ar_diffusion.runner import resolve_ar_diffusion_kv_config
 
 BLOCK = 16
 
@@ -184,7 +187,7 @@ def test_key_and_value_caches_do_not_share_storage():
         dtype=torch.float32,
         device=torch.device("cpu"),
     )
-    seen = set()
+    seen: set[int] = set()
     for layer, (key_cache, value_cache) in enumerate(kv_pools):
         k_storage = key_cache.untyped_storage().data_ptr()
         v_storage = value_cache.untyped_storage().data_ptr()
@@ -526,6 +529,8 @@ def _make_kv(
     num_frame_per_block=2,
     window_chunks=9,
     max_scratch_tokens_per_branch=0,
+    scratch_blocks_per_branch=None,
+    scratch_budget_blocks=None,
 ):
     kv_branches = (
         (ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 0))
@@ -534,7 +539,9 @@ def _make_kv(
     )
     page_bytes = 2 * BLOCK * 4 * 64 * torch.float32.itemsize
     declared_scratch_blocks = (max_scratch_tokens_per_branch + BLOCK - 1) // BLOCK
-    scratch_blocks = local_branches * (num_frame_per_block + declared_scratch_blocks)
+    scratch_blocks = local_branches * max(
+        num_frame_per_block + declared_scratch_blocks, scratch_budget_blocks or scratch_blocks_per_branch or 0
+    )
     managed_blocks = local_branches * (window_chunks + num_frame_per_block) + 2
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
@@ -542,6 +549,7 @@ def _make_kv(
             chunk_size=BLOCK,
             window_chunks=window_chunks,
             gpu_memory_fraction=1.0,
+            scratch_blocks_per_branch=scratch_blocks_per_branch,
         ),
         num_layers=1,
         num_kv_heads=4,
@@ -590,6 +598,78 @@ def test_scratch_env_override_cannot_reduce_declared_minimum(monkeypatch):
         max_scratch_tokens_per_branch=BLOCK + 1,
     )
     assert kv.scratch_blocks_per_kv_branch == 8
+
+
+def _capture_kv_warnings(monkeypatch):
+    warnings: list[str] = []
+    monkeypatch.setattr(kv_manager._log, "warning_once", lambda msg, *args, **kwargs: warnings.append(msg))
+    return warnings
+
+
+def test_scratch_config_override_raises_declared_minimum(monkeypatch):
+    monkeypatch.delenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", raising=False)
+    warnings = _capture_kv_warnings(monkeypatch)
+    kv = _make_kv(
+        local_branches=1,
+        num_frame_per_block=6,
+        max_scratch_tokens_per_branch=BLOCK + 1,
+        scratch_blocks_per_branch=12,
+    )
+    assert kv.scratch_blocks_per_kv_branch == 12
+    assert warnings == []
+
+
+def test_scratch_config_override_cannot_reduce_declared_minimum(monkeypatch):
+    monkeypatch.delenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", raising=False)
+    kv = _make_kv(
+        local_branches=1,
+        num_frame_per_block=6,
+        max_scratch_tokens_per_branch=BLOCK + 1,
+        scratch_blocks_per_branch=1,
+    )
+    assert kv.scratch_blocks_per_kv_branch == 8
+
+
+def test_scratch_config_override_wins_over_environment_without_warning(monkeypatch):
+    monkeypatch.setenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", "20")
+    warnings = _capture_kv_warnings(monkeypatch)
+    kv = _make_kv(
+        local_branches=1,
+        num_frame_per_block=6,
+        max_scratch_tokens_per_branch=BLOCK + 1,
+        scratch_blocks_per_branch=10,
+    )
+    assert kv.scratch_blocks_per_kv_branch == 10
+    assert warnings == []
+
+
+def test_scratch_environment_fallback_warns_deprecation(monkeypatch):
+    monkeypatch.setenv("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH", "10")
+    warnings = _capture_kv_warnings(monkeypatch)
+    kv = _make_kv(
+        local_branches=1,
+        num_frame_per_block=6,
+        max_scratch_tokens_per_branch=BLOCK + 1,
+        scratch_budget_blocks=10,
+    )
+    assert kv.scratch_blocks_per_kv_branch == 10
+    assert len(warnings) == 1
+    assert "AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH is deprecated" in warnings[0]
+    assert "ar_diffusion_kv_config.scratch_blocks_per_branch" in warnings[0]
+
+
+def test_scratch_config_override_rejects_negative_values():
+    with pytest.raises(ValueError, match="scratch_blocks_per_branch must be non-negative"):
+        ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=9, scratch_blocks_per_branch=-1)
+
+
+def test_scratch_config_override_is_read_from_deploy_model_config():
+    od_config = OmniDiffusionConfig(
+        model_config={"ar_diffusion_kv_config": {"chunk_size": BLOCK, "scratch_blocks_per_branch": 12}},
+    )
+    config = resolve_ar_diffusion_kv_config(od_config)
+    assert config.enable
+    assert config.scratch_blocks_per_branch == 12
 
 
 def test_scratch_maps_to_slot_zero_with_one_local_branch():

@@ -56,6 +56,14 @@ class ARDiffusionKVConfig:
     superpage_tokens: int = 0
     # Also capture the post-window-boundary (reset-cycle) forward during warm-up.
     warmup_capture_reset: bool = False
+    # Scratch KV blocks per local KV branch for non-committing forwards. ``None`` uses the minimum
+    # derived from the pipeline capability. A larger value raises it for deployment experiments; a
+    # smaller one is ignored, since the derived minimum is what one forward actually writes.
+    scratch_blocks_per_branch: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.scratch_blocks_per_branch is not None and self.scratch_blocks_per_branch < 0:
+            raise ValueError(f"scratch_blocks_per_branch must be non-negative, got {self.scratch_blocks_per_branch}")
 
     @property
     def sliding_window(self) -> int | None:
