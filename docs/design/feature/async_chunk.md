@@ -321,10 +321,13 @@ generation_max_wait_ms: 6
 ```
 
 Batch waiting is disabled by default. Ready streams execute when the target
-is reached or the wait bound expires. If the total live request count is below
-the target, ready inputs execute immediately. First and final chunks share the
-same bounded window. The target is a dispatch threshold, not a guarantee that
-the token or execution budget can accommodate the entire batch.
+is reached or the wait bound expires. If fewer requests are registered than the
+configured target, inputs execute immediately unless connector `extra` sets
+`generation_always_wait_target_batch: true` (default: `false`). On either runner,
+this option caps the target at the registered request count and retains the
+same wait bound. First and final chunks share
+the bounded window. The target is a dispatch threshold; token and execution
+budgets may limit the actual batch size.
 
 Native MRV2 retains its existing stateful TP1/PP1 support and notification-inbox
 waiting. V1 async-chunk receivers support TP1/PP1 for stateful and stateless

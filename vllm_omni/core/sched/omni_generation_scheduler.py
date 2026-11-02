@@ -52,6 +52,7 @@ def _has_async_chunk_payload_to_run(request: Request) -> bool:
 
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     waiting: RequestQueue
+    running: list[Request]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -70,6 +71,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         ) or {}
         self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
         self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
+        self._generation_always_wait_target_batch = extra.get("generation_always_wait_target_batch", False)
+        if not isinstance(self._generation_always_wait_target_batch, bool):
+            raise ValueError("generation_always_wait_target_batch must be a boolean")
         self._generation_coalescing_policy = extra.get("generation_coalescing_policy", "fixed")
         self._generation_max_regular_batch = int(extra.get("generation_max_regular_batch", 0) or 0)
         if self._generation_max_regular_batch < 0:
@@ -204,8 +208,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         }
 
     def _generation_batch_ready(self, runnable: set[str]) -> bool:
-        """Release at the configured target or immediately at low concurrency."""
+        """Optionally cap the target at the registered request population."""
         target = self._generation_min_batch_size
+        if getattr(self, "_generation_always_wait_target_batch", False):
+            target = min(target, len(self.requests))
+            return len(runnable) >= target
         return len(runnable) >= target or len(self.requests) < target
 
     def _process_pending_omni_inputs(self, model_mode: str) -> None:
