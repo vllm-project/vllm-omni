@@ -1010,8 +1010,11 @@ class StagePool:
     def _has_non_empty_output(self, request_output: Any) -> bool:
         # A pooling stage returns a single PoolingOutput whose payload is
         # ``data``; it has no text, token ids, or multimodal Mapping, so check
-        # it before the text-only shortcut below.
+        # it before the text-only shortcut below. A completion that also
+        # carries ``data`` is judged by its text and token ids instead.
         for output in iter_output_entries(request_output):
+            if getattr(output, "text", None) or getattr(output, "token_ids", None):
+                continue
             if self._is_non_empty_value(getattr(output, "data", None)):
                 return True
 

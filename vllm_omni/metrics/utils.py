@@ -304,6 +304,17 @@ def resolve_int_by_sequential_keys(
     return None
 
 
+def _is_pooled_output(candidate: object) -> bool:
+    """Whether ``candidate`` is one pooled output rather than a list of them.
+
+    A ``PoolingOutput`` carries the pooled ``data`` and no per-completion
+    fields. A sequence of completions is left to the generic iterable path, so
+    an output container that happens to expose ``data`` is still read as the
+    sequence of completions it is.
+    """
+    return hasattr(candidate, "data") and not isinstance(candidate, Sequence)
+
+
 def iter_output_entries(mm_source: object) -> list[Any]:
     """Return the output entries carried by ``mm_source.outputs`` as a list.
 
@@ -313,6 +324,8 @@ def iter_output_entries(mm_source: object) -> list[Any]:
     the one-element list before building it. Normalize both shapes so callers
     can iterate the entries without mistaking a ``PoolingOutput`` for a
     sequence of completions.
+
+    Any other iterable is read as a sequence of completions, as before.
 
     Args:
         mm_source: Duck-typed container with an optional ``outputs`` attribute
@@ -326,7 +339,13 @@ def iter_output_entries(mm_source: object) -> list[Any]:
         return []
     if isinstance(outs, (list, tuple)):
         return list(outs)
-    return [outs]
+    if _is_pooled_output(outs):
+        return [outs]
+    try:
+        return list(outs)
+    except TypeError:
+        # Neither a sequence of completions nor a pooled output.
+        return [outs]
 
 
 def extract_mm_output(mm_source: object) -> Mapping[str, Any]:
@@ -667,6 +686,8 @@ def count_tokens_from_outputs(engine_outputs: list[Any]) -> int:
                 # In DELTA mode token_ids only contains the latest chunk.
                 # Omni's output processor attaches the cumulative sequence
                 # for inter-stage routing and accurate metrics.
+                # A pooled output carries no token ids, so a pooling stage
+                # counts as zero tokens rather than raising.
                 tokens = getattr(output, "cumulative_token_ids", None)
                 if tokens is None:
                     tokens = getattr(output, "token_ids", None)

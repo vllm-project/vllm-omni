@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
+import torch
+from vllm.outputs import PoolingOutput, PoolingRequestOutput
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.metrics.utils import (
@@ -175,28 +178,47 @@ def test_extract_vae_decode_ms_without_stage_durations() -> None:
     assert extract_diffusion_vae_decode_ms(DiffusionOutput(stage_durations=None)) is None
 
 
-def _pooling_request_output(data: object) -> SimpleNamespace:
+def _pooling_request_output(data: torch.Tensor) -> PoolingRequestOutput:
     """A pooling stage's request output: ``outputs`` holds one PoolingOutput.
 
     vLLM's ``OutputProcessor._new_request_output`` unwraps the one-element
     list before building ``PoolingRequestOutput``, so ``outputs`` is a single
-    ``PoolingOutput`` and not a list of completions.
+    ``PoolingOutput`` and not a list of completions. The upstream classes are
+    used here so a change to their shape fails these tests instead of passing
+    them by accident.
     """
-    return SimpleNamespace(outputs=SimpleNamespace(data=data))
+    return PoolingRequestOutput(
+        request_id="req-1",
+        outputs=PoolingOutput(data=data),
+        prompt_token_ids=[1, 2],
+        num_cached_tokens=0,
+        finished=True,
+    )
 
 
 def test_iter_output_entries_wraps_single_pooling_output() -> None:
-    pooling_output = SimpleNamespace(data=SimpleNamespace(shape=(2, 2)))
+    source = _pooling_request_output(torch.zeros(2, 2))
 
-    entries = iter_output_entries(SimpleNamespace(outputs=pooling_output))
+    entries = iter_output_entries(source)
 
-    assert entries == [pooling_output]
+    assert len(entries) == 1
+    assert entries[0] is source.outputs
 
 
 def test_iter_output_entries_keeps_completion_list() -> None:
     completions = [SimpleNamespace(text="a"), SimpleNamespace(text="b")]
 
     entries = iter_output_entries(SimpleNamespace(outputs=completions))
+
+    assert entries == completions
+
+
+def test_iter_output_entries_reads_other_iterables_as_completions() -> None:
+    # Only list and tuple are unwrapped explicitly; any other iterable keeps
+    # being read as a sequence of completions.
+    completions = [SimpleNamespace(text="a"), SimpleNamespace(text="b")]
+
+    entries = iter_output_entries(SimpleNamespace(outputs=deque(completions)))
 
     assert entries == completions
 
@@ -208,12 +230,13 @@ def test_iter_output_entries_without_outputs() -> None:
 
 def test_iter_mm_outputs_ignores_single_pooling_output() -> None:
     # A PoolingOutput is not iterable and carries no multimodal_output.
-    assert iter_mm_outputs(_pooling_request_output(SimpleNamespace(shape=(2, 2)))) == []
+    assert iter_mm_outputs(_pooling_request_output(torch.zeros(2, 2))) == []
 
 
 def test_extract_mm_output_ignores_single_pooling_output() -> None:
-    assert extract_mm_output(_pooling_request_output(SimpleNamespace(shape=(2, 2)))) == {}
+    assert extract_mm_output(_pooling_request_output(torch.zeros(2, 2))) == {}
 
 
 def test_count_tokens_from_outputs_ignores_single_pooling_output() -> None:
-    assert count_tokens_from_outputs([_pooling_request_output(SimpleNamespace(shape=(2, 2)))]) == 0
+    # A pooling stage carries no token ids, so it counts as zero tokens.
+    assert count_tokens_from_outputs([_pooling_request_output(torch.zeros(2, 2))]) == 0
