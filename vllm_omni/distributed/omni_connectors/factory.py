@@ -59,6 +59,21 @@ class OmniConnectorFactory:
         return name in cls._registry and name in cls._deadline_aware_connectors
 
     @classmethod
+    def validate_deadline_receive(cls, name: object, *, context: str) -> None:
+        """Validate a payload connector without loading its native backend."""
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{context}: connector_config requires a non-empty string 'type'.")
+        if name not in cls._registry:
+            raise ValueError(f"{context}: Unknown connector: {name}. Available: {cls.list_registered_connectors()}")
+        if not cls.supports_deadline_receive(name):
+            raise ValueError(
+                f"{context}: connector {name!r} does not support get_with_deadline() required for "
+                "diffusion stage payload input. Use SharedMemoryConnector for processes sharing host memory, "
+                "or NixlConnector for network transfers. Custom backends must implement the deadline contract "
+                "and register with supports_deadline_receive=True."
+            )
+
+    @classmethod
     def create_connector(cls, spec: ConnectorSpec) -> OmniConnectorBase:
         """Create a connector from specification."""
         if spec.name not in cls._registry:
@@ -82,16 +97,16 @@ class OmniConnectorFactory:
 # Register built-in connectors with lazy imports
 def _create_mooncake_store_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .connectors import mooncake_store_connector as connector_module
+        from .connectors.mooncake_store_connector import MooncakeStoreConnector
     except ImportError:
         # Fallback import
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors import mooncake_store_connector as fallback_connector_module
+        from omni_connectors.connectors.mooncake_store_connector import MooncakeStoreConnector as FallbackConnector
 
-        connector_module = fallback_connector_module
-    return connector_module.MooncakeStoreConnector(config)
+        return FallbackConnector(config)
+    return MooncakeStoreConnector(config)
 
 
 def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
@@ -110,15 +125,15 @@ def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
 
 def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .connectors import yuanrong_connector as connector_module
+        from .connectors.yuanrong_connector import YuanrongConnector
     except ImportError:
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors import yuanrong_connector as fallback_connector_module
+        from omni_connectors.connectors.yuanrong_connector import YuanrongConnector as FallbackConnector
 
-        connector_module = fallback_connector_module
-    return connector_module.YuanrongConnector(config)
+        return FallbackConnector(config)
+    return YuanrongConnector(config)
 
 
 def _create_yuanrong_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
@@ -135,41 +150,45 @@ def _create_yuanrong_transfer_engine_connector(config: dict[str, Any]) -> OmniCo
 
 def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .connectors import mooncake_transfer_engine_connector as connector_module
+        from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
     except ImportError:
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors import mooncake_transfer_engine_connector as fallback_connector_module
+        from omni_connectors.connectors.mooncake_transfer_engine_connector import (
+            MooncakeTransferEngineConnector as FallbackConnector,
+        )
 
-        connector_module = fallback_connector_module
-    return connector_module.MooncakeTransferEngineConnector(config)
+        return FallbackConnector(config)
+    return MooncakeTransferEngineConnector(config)
 
 
 def _create_mori_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .connectors import mori_transfer_engine_connector as connector_module
+        from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
     except ImportError:
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors import mori_transfer_engine_connector as fallback_connector_module
+        from omni_connectors.connectors.mori_transfer_engine_connector import (
+            MoriTransferEngineConnector as FallbackConnector,
+        )
 
-        connector_module = fallback_connector_module
-    return connector_module.MoriTransferEngineConnector(config)
+        return FallbackConnector(config)
+    return MoriTransferEngineConnector(config)
 
 
 def _create_nixl_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .connectors import nixl_connector as connector_module
+        from .connectors.nixl_connector import NixlConnector
     except ImportError:
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors import nixl_connector as fallback_connector_module
+        from omni_connectors.connectors.nixl_connector import NixlConnector as FallbackConnector
 
-        connector_module = fallback_connector_module
-    return connector_module.NixlConnector(config)
+        return FallbackConnector(config)
+    return NixlConnector(config)
 
 
 # Register connectors
