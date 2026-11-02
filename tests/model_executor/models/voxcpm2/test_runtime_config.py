@@ -113,7 +113,7 @@ class _CountingEstimator(torch.nn.Module):
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_cfg_value_rejects_nonfinite(value: str) -> None:
-    with pytest.raises(ValueError, match="cfg_value must be finite"):
+    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value='nan'.* must be finite"):
         _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"cfg_value": value})))
 
 
@@ -261,5 +261,5 @@ def test_cfg_value_yaml_boolean_rejected(monkeypatch, bad):
     monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
     # yaml's cfg_value: true would float()-coerce to 1.0 (CFG effectively
     # off); the coercion entry must reject it before the helper sees it.
-    with pytest.raises(ValueError, match="not a boolean"):
+    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value=True.*not a boolean"):
         _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"cfg_value": bad})))

@@ -174,11 +174,10 @@ class _VoxCPM2RuntimeConfig:
                 # reject it before the coercion.
                 if isinstance(value, bool):
                     raise ValueError(
-                        "VoxCPM2 cfg_value must be a positive finite float, "
-                        f"not a boolean (got {value!r})"
+                        f"voxcpm2_runtime_config.cfg_value={value!r} must be a positive finite float, not a boolean"
                     )
                 if not math.isfinite(float(value)):
-                    raise ValueError("VoxCPM2 cfg_value must be finite.")
+                    raise ValueError(f"voxcpm2_runtime_config.cfg_value={value!r} must be finite.")
             if key == "cfg_cutoff_ratio":
                 return min(1.0, max(0.0, float(value)))
             return float(value)
