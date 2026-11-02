@@ -1024,7 +1024,7 @@ def destroy_model_parallel():
 
     # The optional fused transport owns collective symmetric allocations.
     # Release them while all process groups are still alive, without importing
-    # NPU/Triton dependencies for other backends.
+    # NPU build dependencies for other backends.
     a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
     if a2a_permute is not None:
         a2a_permute.clear_a2a_permute_workspaces()

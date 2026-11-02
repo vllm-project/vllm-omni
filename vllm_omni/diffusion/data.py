@@ -261,7 +261,7 @@ class DiffusionParallelConfig:
 
     Uses NCCL symmetric memory on CUDA and SHMEM on NPU. NPU currently requires
     eager inference and pure Ulysses over WORLD in one HCCS domain, with
-    TorchNPU's NPUSHMEM allocator, Triton-Ascend and libshmem.so installed.
+    TorchNPU's NPUSHMEM allocator, CANN SHMEM, AscendC and a C++ toolchain.
     """
 
     cfg_parallel_size: int = 1
