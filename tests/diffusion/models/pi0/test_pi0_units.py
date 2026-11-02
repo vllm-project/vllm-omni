@@ -282,6 +282,17 @@ def _tiny_pi0_model():
     return Pi0ForActionPrediction(cfg)
 
 
+@pytest.fixture(scope="module")
+def remap_model():
+    """One shared model for the weight-remap tests below.
+
+    The full-size PaliGemma backbone costs ~40s to construct on CPU, but each
+    remap test loads a single weight into its own parameter (distinct targets,
+    distinct payload constants) and asserts only that parameter, so the three
+    tests can share one construction between them."""
+    return _tiny_pi0_model()
+
+
 @pytest.fixture(autouse=True)
 def _silence_pi0_loader(caplog):
     # The remap tests feed a single synthetic weight; the loader's
@@ -291,8 +302,8 @@ def _silence_pi0_loader(caplog):
 
 
 @pytest.mark.slow
-def test_remap_paligemma_submodules_to_nested_layout():
-    model = _tiny_pi0_model()
+def test_remap_paligemma_submodules_to_nested_layout(remap_model):
+    model = remap_model
     params = dict(model.named_parameters())
     target = next(k for k in params if k.startswith("paligemma_with_expert.paligemma.model.vision_tower."))
     flat_key = "model." + target.replace(
@@ -308,8 +319,8 @@ def test_remap_paligemma_submodules_to_nested_layout():
 
 
 @pytest.mark.slow
-def test_lm_head_remap_to_embed_tokens():
-    model = _tiny_pi0_model()
+def test_lm_head_remap_to_embed_tokens(remap_model):
+    model = remap_model
     params = dict(model.named_parameters())
     target = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"
     assert target in params
@@ -322,12 +333,12 @@ def test_lm_head_remap_to_embed_tokens():
 
 
 @pytest.mark.slow
-def test_vision_tower_version_robust_remap():
+def test_vision_tower_version_robust_remap(remap_model):
     """transformers >=5.4 flattens SigLIP from vision_tower.vision_model.* to
     vision_tower.*; the lerobot/pi0_base checkpoint uses the vision_model infix.
     load_weights must adapt so vision weights aren't silently dropped (which
     would leave the vision encoder at random init)."""
-    model = _tiny_pi0_model()
+    model = remap_model
     params = dict(model.named_parameters())
     # A representative vision-tower param as it exists on the model.
     target = next(

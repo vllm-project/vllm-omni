@@ -34,6 +34,12 @@ classifiers = [
 
 [project.optional-dependencies]
 
+tracing = [
+    "opentelemetry-sdk>=1.28.0",
+    "opentelemetry-exporter-otlp>=1.28.0",
+    "opentelemetry-instrumentation-fastapi>=0.49b0",
+]
+
 ming-tn = [
     "pynini",
     "inflect",
@@ -44,6 +50,8 @@ watermarking = [
 ]
 
 dev = [
+    "opentelemetry-sdk>=1.28.0",
+    "opentelemetry-instrumentation-fastapi>=0.49b0",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "pytest-cov==7.1.0",
