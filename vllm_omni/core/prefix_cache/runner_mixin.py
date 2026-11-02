@@ -110,11 +110,8 @@ class PrefixCacheRunnerMixin:
         self._omni_prefix_cache_cfg = None
         if cfg is None or not get_pp_group().is_last_rank:
             return
-        view = get_prefix_cache_group_view(
-            self.input_batch,
-            cfg.block_size,
-            kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
-        )
+        adapter = self._new_prefix_cache_adapter()
+        view = self._build_prefix_cache_group_view(cfg, adapter)
         if view is None:
             raise OmniPrefixCacheUnmatchError(
                 "omni prefix caching requires a block table on the input batch; "
@@ -123,12 +120,23 @@ class PrefixCacheRunnerMixin:
         manager = OmniPrefixCacheManager(cfg)
         manager.register_policy(self._omni_cache_policy)
         self.omni_prefix_cache = manager
-        self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
+        self._prefix_cache_adapter = adapter
         self._prefix_cache_group_view = view
         policy = self._omni_cache_policy
         if self._prefix_cache_coalesce_decode and policy.needs_full_hidden_states and not policy.deferred_keys:
             self._prefix_cache_decode_cfg = cfg
             self._prefix_cache_decode_steps = []
+
+    def _new_prefix_cache_adapter(self) -> PrefixCacheSchedulerAdapter:
+        return PrefixCacheSchedulerAdapter()
+
+    def _build_prefix_cache_group_view(self, cfg: PrefixCacheConfig, adapter: PrefixCacheSchedulerAdapter) -> Any:
+        """Group view over this runner's block table; None when it has none."""
+        return get_prefix_cache_group_view(
+            self.input_batch,
+            cfg.block_size,
+            kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
+        )
 
     def _prefix_cache_step_begin(self, scheduler_output: SchedulerOutput) -> None:
         """Per-step lifecycle entry; must run before ``_update_states``
@@ -146,6 +154,7 @@ class PrefixCacheRunnerMixin:
                 and bool(step.scheduled_tokens)
                 and all(count == 1 for _, count in step.scheduled_tokens)
                 and not step.events
+                and not step.deliveries
                 and not getattr(scheduler_output, "scheduled_new_reqs", ())
                 and not getattr(scheduler_output, "preempted_req_ids", ())
             )
