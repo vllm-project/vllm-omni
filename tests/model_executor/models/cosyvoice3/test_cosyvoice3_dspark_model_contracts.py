@@ -81,6 +81,8 @@ def test_talker_draft_tuple_is_unwrapped_before_logits_and_omni_output(cg_mode, 
 
     runner = object.__new__(OmniGPUModelRunner)
     runner._staged_writes = staged_writes.StagedWrites()
+    # Contract inputs: model, use_aux_hidden_state_outputs and graph tuple output.
+    # The request/KV/EPLB state and step hooks below only bypass runner setup.
     runner.model = model
     runner.use_aux_hidden_state_outputs = True
     runner._configure_cudagraph_output_contract()

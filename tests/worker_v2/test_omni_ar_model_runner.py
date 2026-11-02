@@ -323,7 +323,15 @@ def test_sample_tokens_drafts_from_target_layers_after_postprocess(monkeypatch, 
 
 @pytest.mark.parametrize(
     "steps,last_rank,has_verifier",
-    [(0, True, False), (7, False, False), (7, True, True), (7, True, False), (0, True, None), (7, False, None)],
+    [
+        (0, True, False),
+        (7, False, False),
+        (7, True, True),
+        (7, True, False),
+        (0, True, None),
+        (7, False, None),
+        (7, True, None),
+    ],
 )
 def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier):
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
@@ -337,7 +345,11 @@ def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, step
             self.rejection_sampler = object() if has_verifier else None
 
     monkeypatch.setattr(omni_ar_model_runner.OmniGPUModelRunner, "load_model", load)
-    if steps and last_rank and not has_verifier:
+    if steps and last_rank and has_verifier is None:
+        # Missing base-runner state is an API-contract violation, not a disabled verifier.
+        with pytest.raises(AttributeError, match="rejection_sampler"):
+            runner.load_model(load_dummy_weights=True)
+    elif steps and last_rank and not has_verifier:
         with pytest.raises(ValueError, match="requires a rejection sampler"):
             runner.load_model(load_dummy_weights=True)
     else:
