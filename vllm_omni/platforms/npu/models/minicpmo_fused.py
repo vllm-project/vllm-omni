@@ -305,9 +305,7 @@ def attention_npu(attn, hidden, att_cache, attn_mask, kv, slots=None):
         # ``frames + cached`` keys are defined; slice to the live span so the
         # uninitialized tail cannot contribute.
         live = frames + cached
-        out = F.scaled_dot_product_attention(
-            query, keys[:, :, :live], values[:, :, :live], attn_mask=None
-        )
+        out = F.scaled_dot_product_attention(query, keys[:, :, :live], values[:, :, :live], attn_mask=None)
     else:
         out = F.scaled_dot_product_attention(query, keys, values, attn_mask=mask)
     out = out.transpose(1, 2).reshape(batch * frames, -1)
