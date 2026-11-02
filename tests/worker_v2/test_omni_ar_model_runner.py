@@ -233,6 +233,92 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     assert runner._resolve_global_request_id("unknown") == "unknown"  # fallback to the local id
 
 
+@pytest.mark.parametrize("num_spec_tokens", [3, 2])
+@pytest.mark.cpu
+def test_sample_tokens_drafts_from_target_layers_after_postprocess(monkeypatch, num_spec_tokens) -> None:
+    """MRv2 AR stages propose the next drafts from this step's target layers."""
+    runner = OmniARModelRunner.__new__(OmniARModelRunner)
+    input_batch = SimpleNamespace(req_ids=["a", "b"], num_reqs=2, seq_lens=torch.tensor([5, 9]))
+    input_batch.idx_mapping, input_batch.query_start_loc = torch.tensor([1, 0]), torch.tensor([0, 4, 8])
+    hidden, aux = torch.zeros(8, 2), [torch.ones(8, 2), torch.full((8, 2), 2.0)]
+    runner.execute_model_state = SimpleNamespace(
+        input_batch=input_batch,
+        hidden_states=hidden,
+        finished_req_ids=set(),
+        ec_connector_output=None,
+        attn_metadata="attn",
+        slot_mappings_by_layer="slots",
+        aux_hidden_states=aux,
+        dp_sync_state=None,
+        num_spec_tokens_to_schedule=num_spec_tokens,
+    )
+    runner._kv_extracted_req_ids = runner._last_aux_output = runner._last_multimodal_outputs = None
+    runner.is_last_pp_rank, runner.pp_handler, runner.check_ep_fault = True, None, False
+    runner.aux_output_connector = None
+    runner.model_config = SimpleNamespace(async_chunk=False)
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(engine_output_type="text"))
+    runner.model = SimpleNamespace(compute_logits=lambda h: h)
+    runner.model_state = SimpleNamespace(
+        postprocess_model_output=MagicMock(return_value=(hidden, None)), supports_mm_inputs=False
+    )
+    runner.req_states = SimpleNamespace(
+        all_token_ids=SimpleNamespace(gpu=torch.zeros(2, 9)),
+        num_computed_tokens=SimpleNamespace(gpu=torch.zeros(2)),
+        prompt_len=SimpleNamespace(np=np.array([2, 2]), gpu=torch.tensor([2, 2])),
+        draft_tokens=torch.zeros(2, 3, dtype=torch.long),
+        last_sampled_tokens="last",
+        next_prefill_tokens="next",
+    )
+    runner.main_stream = runner.output_copy_stream = MagicMock()
+    runner.eplb = runner._finalize_native_data_plane_output = runner._reserve_native_data_plane_outputs = MagicMock()
+    runner.sampler = SimpleNamespace(
+        sampling_states=SimpleNamespace(temperature=SimpleNamespace(gpu="temp"), seeds=SimpleNamespace(gpu="seeds"))
+    )
+    num_sampled, num_rejected = torch.tensor([3, 1]), torch.tensor([0, 2])
+    runner.sample = MagicMock(
+        return_value=(SimpleNamespace(sampled_token_ids=torch.zeros(2, 4, dtype=torch.long)), num_sampled, num_rejected)
+    )
+    runner.prompt_logprobs_worker = SimpleNamespace(
+        compute_prompt_logprobs=MagicMock(return_value={}),
+        compute_prompt_token_id_logprobs=MagicMock(return_value={}),
+    )
+    order = []
+    runner.postprocess_sampled = MagicMock(side_effect=lambda *_: order.append("postprocess"))
+    runner.kv_connector = SimpleNamespace(post_forward=MagicMock(side_effect=lambda _: order.append("kv")))
+    runner.num_speculative_steps = 3
+    runner._draft_workspace_lane = 1
+    runner.adaptive_verification = None
+    runner.draft_tokens_handler = MagicMock()
+    runner.speculator = MagicMock(spec=["propose", "supports_mm_inputs"])
+    runner.speculator.supports_mm_inputs = False
+
+    def propose(*_args, **_kwargs):
+        order.append("propose")
+        return torch.tensor([[7, 8, 9], [4, 5, 6]])
+
+    runner.speculator.propose.side_effect = propose
+    monkeypatch.setattr(
+        omni_ar_model_runner, "OmniAsyncOutput", MagicMock(return_value=SimpleNamespace(copy_event=None))
+    )
+
+    runner.sample_tokens(None)
+
+    assert order == ["postprocess", "propose", "kv"]
+    args, kwargs = runner.speculator.propose.call_args
+    assert args[:5] == (input_batch, "attn", "slots", hidden, aux)
+    assert args[5] is num_sampled and args[6] is num_rejected
+    assert args[7:] == ("last", "next", "temp", "seeds")
+    assert kwargs["num_speculative_tokens"] == num_spec_tokens
+    assert kwargs["mm_inputs"] is None
+    # Rows follow idx_mapping; drafts past this step's width are disabled.
+    expected = torch.tensor([[4, 5, 6], [7, 8, 9]])
+    expected[:, num_spec_tokens:] = -1
+    torch.testing.assert_close(runner.req_states.draft_tokens, expected)
+    batch, handed = runner.draft_tokens_handler.set_draft_tokens.call_args.args
+    assert batch is input_batch
+    torch.testing.assert_close(handed, expected[[1, 0], :num_spec_tokens])
+
+
 @pytest.mark.cpu
 def test_async_output_preserves_fixed_token_scores_on_host(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
@@ -424,6 +510,85 @@ def test_async_output_slices_request_payloads_with_graph_padding(
                 torch.testing.assert_close(payload["hidden"], hidden[offsets[i] : offsets[i + 1]])
             else:
                 assert "hidden" not in payload
+
+
+@pytest.mark.parametrize("async_chunk", [False, True])
+@pytest.mark.cpu
+def test_async_output_drops_rejected_draft_rows(monkeypatch, mocker, async_chunk):
+    """Only rows of accepted tokens reach the next stage after draft verification."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    # Each request verified three drafts: [last sampled, d1, d2, d3].
+    hidden = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4)
+    ids = torch.arange(8).reshape(8, 1)
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np = np.array([0, 4, 8])
+    batch.num_scheduled_tokens = np.array([4, 4])
+    batch.num_reqs = 2
+    batch.num_tokens_after_padding = 8
+    output = _async_output(
+        req_ids=["req-0", "req-1"],
+        sampler_output=SamplerOutput(
+            sampled_token_ids=torch.ones(2, 4, dtype=torch.long),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=torch.tensor([3, 1]),
+            num_rejected=torch.tensor([1, 3]),
+        ),
+        num_sampled_tokens=torch.tensor([3, 1]),
+        num_rejected_tokens=torch.tensor([1, 3]),
+        text_hidden=hidden,
+        multimodal_outputs={"latent_input_ids": ids},
+        input_batch=batch,
+        async_chunk=async_chunk,
+    ).get_output()
+
+    payloads = output.inter_stage_outputs
+    torch.testing.assert_close(payloads[0]["latent_input_ids"], ids[0:3])
+    torch.testing.assert_close(payloads[1]["latent_input_ids"], ids[4:5])
+    if not async_chunk:
+        torch.testing.assert_close(payloads[0]["hidden"], hidden[0:3])
+        torch.testing.assert_close(payloads[1]["hidden"], hidden[4:5])
+
+
+@pytest.mark.cpu
+def test_rejected_rows_trim_latent_and_ledger_together_and_spare_prefill(monkeypatch, mocker):
+    """A prefill request next to a verifying one keeps all its rows; the ledger stays row-aligned."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    # Request 0: 3 prefill rows. Request 1: last sampled token + 3 drafts, 2 rejected.
+    hidden = torch.arange(7 * 4, dtype=torch.float32).reshape(7, 4)
+    ids = torch.arange(100, 107).reshape(7, 1)
+    positions = torch.tensor([0, 1, 2, 20, 21, 22, 23]).reshape(7, 1)
+    batch = mocker.Mock(spec=InputBatch)
+    batch.query_start_loc_np = np.array([0, 3, 7])
+    batch.num_scheduled_tokens = np.array([3, 4])
+    batch.num_reqs = 2
+    batch.num_tokens_after_padding = 8
+    output = _async_output(
+        req_ids=["prefill", "verify"],
+        sampler_output=SamplerOutput(
+            sampled_token_ids=torch.ones(2, 4, dtype=torch.long),
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=torch.tensor([1, 2]),
+            num_rejected=torch.tensor([0, 2]),
+        ),
+        num_sampled_tokens=torch.tensor([1, 2]),
+        num_rejected_tokens=torch.tensor([0, 2]),
+        text_hidden=hidden,
+        multimodal_outputs={"latent": hidden, "latent_input_ids": ids, "latent_positions": positions},
+        input_batch=batch,
+        async_chunk=False,
+    ).get_output()
+
+    prefill, verify = output.inter_stage_outputs
+    for payload, rows in ((prefill, slice(0, 3)), (verify, slice(3, 5))):
+        torch.testing.assert_close(payload["latent"], hidden[rows])
+        torch.testing.assert_close(payload["latent_input_ids"], ids[rows])
+        torch.testing.assert_close(payload["latent_positions"], positions[rows])
 
 
 @pytest.mark.cpu
