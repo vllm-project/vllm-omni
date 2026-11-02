@@ -15,6 +15,8 @@ from vllm_omni.metrics.utils import (
     count_tokens_from_outputs,
     count_video_frames,
     extract_diffusion_vae_decode_ms,
+    iter_mm_outputs,
+    iter_request_outputs,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -170,3 +172,59 @@ def test_extract_vae_decode_ms_ignores_other_targets(durations: dict[str, float]
 def test_extract_vae_decode_ms_without_stage_durations() -> None:
     # Pipelines pass stage_durations=None when the profiler is off.
     assert extract_diffusion_vae_decode_ms(DiffusionOutput(stage_durations=None)) is None
+
+
+class _PoolingOutputLike:
+    """Stand-in for ``vllm.outputs.PoolingOutput``: a single output, not a list.
+
+    ``vllm`` is not importable in every test environment, but the shape that
+    breaks #9718 only needs "one object without ``__iter__``" under ``outputs``.
+    """
+
+    def __init__(self, *, multimodal_output: dict[str, object] | None = None) -> None:
+        self.data = object()
+        if multimodal_output is not None:
+            self.multimodal_output = multimodal_output
+
+
+def test_iter_request_outputs_normalizes_a_single_pooling_output() -> None:
+    """#9718: ``PoolingRequestOutput.outputs`` is one output, not a list."""
+    pooling_output = _PoolingOutputLike()
+    request_output = SimpleNamespace(request_id="req-0", outputs=pooling_output)
+
+    assert iter_request_outputs(request_output) == [pooling_output]
+
+
+@pytest.mark.parametrize("outputs", [None, []])
+def test_iter_request_outputs_returns_empty_without_outputs(outputs: object) -> None:
+    assert iter_request_outputs(SimpleNamespace(request_id="req-0", outputs=outputs)) == []
+
+
+def test_iter_request_outputs_keeps_completion_output_lists() -> None:
+    completions = [SimpleNamespace(text="a"), SimpleNamespace(text="b")]
+
+    assert iter_request_outputs(SimpleNamespace(outputs=completions)) == completions
+
+
+def test_iter_mm_outputs_accepts_a_single_pooling_output() -> None:
+    """#9718 crashed the orchestrator before any mm payload could be read."""
+    payload = {"audio": [SimpleNamespace(shape=(1, 160))]}
+    request_output = SimpleNamespace(request_id="req-0", outputs=_PoolingOutputLike(multimodal_output=payload))
+
+    assert iter_mm_outputs(request_output) == [payload]
+
+
+def test_iter_mm_outputs_reads_top_level_and_nested_payloads() -> None:
+    outer = {"image": [SimpleNamespace(shape=(64, 64))]}
+    inner = {"audio": [SimpleNamespace(shape=(1, 160))]}
+    completions = [SimpleNamespace(multimodal_output=inner)]
+    request_output = SimpleNamespace(multimodal_output=outer, outputs=completions)
+
+    assert iter_mm_outputs(request_output) == [outer, inner]
+
+
+def test_iter_mm_outputs_skips_empty_payloads() -> None:
+    completions = [SimpleNamespace(multimodal_output={}), SimpleNamespace(multimodal_output=None)]
+    request_output = SimpleNamespace(multimodal_output={}, outputs=completions)
+
+    assert iter_mm_outputs(request_output) == []
