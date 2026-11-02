@@ -612,6 +612,7 @@ class StageDeployConfig:
     sequence_parallel_size: int | None = None
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None
+    vae_encode_parallel_size: int | None = None
     vae_parallel_mode: str | None = None
     text_encoder_tp_size: int | None = None
     use_hsdp: bool | None = None

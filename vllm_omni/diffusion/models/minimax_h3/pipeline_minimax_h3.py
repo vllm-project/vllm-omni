@@ -598,6 +598,38 @@ def _minimax_h3_output_seeds(seed: int, num_outputs: int) -> list[int]:
     return [int(seed) + output_index for output_index in range(int(num_outputs))]
 
 
+def _assign_minimax_h3_images_to_ranks(
+    image_sizes: Sequence[tuple[int, int]],
+    workers: int,
+) -> list[list[int]]:
+    """Deterministically balance reference images across worker ranks.
+
+    The assignment is computed identically on every rank from the image
+    dimensions, so no metadata collective is needed before encoding. Images are
+    placed largest-first onto the least-loaded worker; ties fall back to the
+    lower rank index. Each worker's list is sorted back into request order so
+    reconstruction is stable.
+    """
+    if workers < 1:
+        raise ValueError(f"workers must be >= 1, got {workers}")
+    assigned: list[list[int]] = [[] for _ in range(workers)]
+    loads = [0] * workers
+    order = sorted(
+        range(len(image_sizes)),
+        key=lambda index: (
+            -(int(image_sizes[index][0]) * int(image_sizes[index][1])),
+            index,
+        ),
+    )
+    for index in order:
+        worker = min(range(workers), key=lambda candidate: (loads[candidate], candidate))
+        assigned[worker].append(index)
+        loads[worker] += max(1, int(image_sizes[index][0]) * int(image_sizes[index][1]))
+    for indices in assigned:
+        indices.sort()
+    return assigned
+
+
 def _dit_rank_world() -> tuple[Any, int, int]:
     if not dist.is_initialized():
         return None, 0, 1
@@ -957,6 +989,13 @@ class MiniMaxH3Pipeline(
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
         self.device = get_local_device()
+        self.vae_encode_parallel_size = int(
+            getattr(self.parallel_config, "vae_encode_parallel_size", 1) or 1
+        )
+        if self.vae_encode_parallel_size < 1:
+            raise ValueError(
+                f"vae_encode_parallel_size must be >= 1, got {self.vae_encode_parallel_size}"
+            )
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
         self.load_vae_encoder = od_config.model_loaded.get("vae_encoder", True)
         self.load_vae_decoder = od_config.model_loaded.get("vae_decoder", True)
@@ -1818,6 +1857,115 @@ class MiniMaxH3Pipeline(
         """Whether this rank's output is returned by the diffusion executor."""
         return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
+    def _encode_image_conditions(
+        self,
+        images: list[Image.Image],
+        *,
+        parallel: bool,
+        component_ready: bool,
+    ) -> tuple[torch.Tensor, list[tuple[int, int, int]]]:
+        """Encode reference images serially or image-level data-parallel.
+
+        ``parallel`` is decided by the caller from all-ranks-visible inputs
+        (configured degree, world size and image count), so every rank takes
+        the same branch. Non-participating ranks contribute an empty row set to
+        the same collectives rather than skipping them.
+        """
+        group, rank, world_size = _dit_rank_world()
+        shapes = [(1, image.height // 16, image.width // 16) for image in images]
+        configured_workers = int(getattr(self, "vae_encode_parallel_size", 1) or 1)
+        workers = min(configured_workers, int(world_size), len(images))
+        # Tile-parallel encoding already runs codec collectives on every VAE
+        # rank, so image-level DP must not be layered on top of it.
+        distributed_vae = self.video_vae.is_distributed_enabled()
+        if not parallel or workers <= 1 or distributed_vae:
+            image_rows = None
+            encode_images = bool(images) and (rank == 0 or distributed_vae)
+            if encode_images:
+                context = (
+                    nullcontext()
+                    if component_ready
+                    else self._component_on_device(self.video_vae.encoder_component)
+                )
+                with context:
+                    image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
+            return (
+                _broadcast_tensor(
+                    image_rows if rank == 0 else None,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                shapes,
+            )
+
+        if configured_workers > int(world_size):
+            logger.warning_once(
+                "MiniMax-H3 vae_encode_parallel_size=%d exceeds the DiT world size=%d; clamping to %d",
+                configured_workers,
+                int(world_size),
+                int(world_size),
+            )
+        assignment = _assign_minimax_h3_images_to_ranks(
+            [image.size for image in images],
+            workers,
+        )
+        local_indices = assignment[rank] if rank < workers else []
+        local_rows: list[torch.Tensor] = []
+        if local_indices:
+            context = (
+                nullcontext()
+                if component_ready
+                else self._component_on_device(self.video_vae.encoder_component)
+            )
+            with context:
+                local_rows = [self.video_vae.encode_image(images[index]) for index in local_indices]
+
+        local_flat = (
+            torch.cat(local_rows)
+            if local_rows
+            else torch.empty((0, 96), dtype=torch.float32, device=self.device)
+        )
+        local_flat = local_flat.to(device=self.device, dtype=torch.float32)
+
+        local_count = torch.tensor([local_flat.shape[0]], dtype=torch.long, device=self.device)
+        gathered_counts = [torch.empty_like(local_count) for _ in range(world_size)]
+        dist.all_gather(gathered_counts, local_count, group=group)
+        max_rows = max(int(count.item()) for count in gathered_counts)
+
+        per_image_rows = torch.zeros(len(images), dtype=torch.long, device=self.device)
+        for index, rows in zip(local_indices, local_rows, strict=True):
+            per_image_rows[index] = rows.shape[0]
+        dist.all_reduce(per_image_rows, op=dist.ReduceOp.SUM, group=group)
+
+        image_rows = None
+        if max_rows > 0:
+            padded = torch.zeros((max_rows, 96), dtype=torch.float32, device=self.device)
+            if local_flat.shape[0]:
+                padded[: local_flat.shape[0]] = local_flat
+            gathered_rows = [torch.empty_like(padded) for _ in range(world_size)]
+            dist.all_gather(gathered_rows, padded, group=group)
+            if rank == 0:
+                parts: list[tuple[int, torch.Tensor]] = []
+                for worker, indices in enumerate(assignment):
+                    offset = 0
+                    for index in indices:
+                        row_count = int(per_image_rows[index].item())
+                        parts.append((index, gathered_rows[worker][offset : offset + row_count]))
+                        offset += row_count
+                parts.sort(key=lambda item: item[0])
+                image_rows = torch.cat([part for _, part in parts], dim=0)
+        elif rank == 0:
+            image_rows = torch.empty((0, 96), dtype=torch.float32, device=self.device)
+
+        return (
+            _broadcast_tensor(
+                image_rows,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            shapes,
+        )
+
     def _encode_visual_conditions(
         self,
         images: list[Image.Image],
@@ -1827,42 +1975,49 @@ class MiniMaxH3Pipeline(
     ) -> tuple[torch.Tensor | None, list[tuple[int, int, int]]]:
         rows: list[torch.Tensor] = []
         shapes: list[tuple[int, int, int]] = []
-        _, rank, _ = _dit_rank_world()
-        # encode_image retains parallel tiling when there are enough tiles.
-        # Every VAE rank must finish its codec collectives before the latent
-        # broadcast, including when refinement enlarges the keyframe images.
-        encode_images = bool(images) and (rank == 0 or self.video_vae.is_distributed_enabled())
-        # Keep image and video references in one residency window when both
-        # appear in a request; otherwise the video branch would reload the VAE.
-        # Encoding touches only the CNN encoder half, so the 9GB ViT decoder
-        # stays off the device for the whole window.
-        needs_video_vae = video_count > 0 or encode_images
-        video_vae_context = (
-            self._component_on_device(self.video_vae.encoder_component) if needs_video_vae else nullcontext()
+        _, rank, world_size = _dit_rank_world()
+        distributed_vae = self.video_vae.is_distributed_enabled()
+        configured_workers = int(getattr(self, "vae_encode_parallel_size", 1) or 1)
+        parallel_images = (
+            configured_workers > 1
+            and int(world_size) > 1
+            and len(images) >= 2
+            and not distributed_vae
         )
-        with video_vae_context:
-            if images:
-                image_rows = None
-                if encode_images:
-                    image_rows = torch.cat([self.video_vae.encode_image(image) for image in images])
-                rows.append(
-                    _broadcast_tensor(
-                        image_rows if rank == 0 else None,
-                        dtype=torch.float32,
-                        device=self.device,
+        image_workers = min(configured_workers, int(world_size), len(images)) if parallel_images else 0
+        rank_loads_vae = video_count > 0 or (
+            bool(images) and (rank == 0 or distributed_vae or (parallel_images and rank < image_workers))
+        )
+        if video_count:
+            # Keep image and video references in one residency window. The
+            # video path already requires every rank to hold the VAE, so the
+            # image helper must not manage a second load/offload cycle here.
+            with self._component_on_device(self.video_vae.encoder_component):
+                if images:
+                    image_rows, image_shapes = self._encode_image_conditions(
+                        images,
+                        parallel=parallel_images,
+                        component_ready=True,
                     )
-                )
-                shapes.extend((1, image.height // 16, image.width // 16) for image in images)
-            if video_count:
+                    rows.append(image_rows)
+                    shapes.extend(image_shapes)
                 video_rows, video_shapes = self._encode_video_conditions_resident(
                     prepared_videos,
                     count=video_count,
                 )
                 rows.append(video_rows)
                 shapes.extend(video_shapes)
+        elif images:
+            image_rows, image_shapes = self._encode_image_conditions(
+                images,
+                parallel=parallel_images,
+                component_ready=False,
+            )
+            rows.append(image_rows)
+            shapes.extend(image_shapes)
         # The latents are extracted; the encode's input/staging pages are idle
         # and must not stay mapped through the denoise and decode peaks.
-        if needs_video_vae:
+        if rank_loads_vae:
             self._release_stage_cache()
         return (torch.cat(rows) if rows else None), shapes
 
