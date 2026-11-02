@@ -230,6 +230,23 @@ CUSTOM_DIT_ENABLERS.update(
 
 ---
 
+### MiniMax-H3 hit-priority reference refresh
+
+The optional `kv_offload_config.cache_dit_policy="hit"` coordinates a due
+reference refresh with the existing single MiniMax-H3 Cache-DiT wrapper.
+Before the maximum reference age, the compact prefix probe can keep a hit
+and postpone refresh. A miss requests one full-layout replay before the
+middle-block result and solver update are committed. A request/step-specific,
+single-use token prevents the replay from advancing the Cache-DiT clock again;
+calibrators are initialized after incompatible layout/version history is reset.
+The hard age limit takes precedence over hits. Pending copy-stream reads
+complete before the old Host reference data is overwritten.
+
+The default `refresh` policy is unchanged. Unsupported wrapper layouts or
+separate-CFG caching use the original fixed schedule. This policy does not
+isolate reference tokens or change the Host layout or sparse attention kernel.
+See the [configuration and tradeoffs](../../user_guide/diffusion_features.md#minimax-h3-reference-refresh-with-cache-dit).
+
 ## Testing
 
 After adding cache-dit support, test with:

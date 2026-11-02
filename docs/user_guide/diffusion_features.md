@@ -38,6 +38,35 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 MiniMax-H3 decode latency. It preserves the video encoder and audio VAE but
 can change generated pixels. Enable it with `additional_config.lightvae_decoder_path`.
 
+#### MiniMax-H3 Reference Refresh with Cache-DiT
+
+Reference-KV offload defaults to a fixed refresh schedule. Set
+`cache_dit_policy` to `hit` to defer a due refresh when Cache-DiT hits:
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va \
+  --cache-backend cache_dit \
+  --kv-offload-config '{"mode":"on","kv_refresh_interval":16,"cache_dit_policy":"hit","max_refresh_interval":32}'
+```
+
+The target age is measured from the last completed refresh. At a due step,
+Cache-DiT evaluates its normal prefix probe using the existing reference K/V.
+A hit defers refresh; a miss replays that step once in the full layout to
+refresh reference K/V before updating the solver. The replay does not advance
+the Cache-DiT step clock again. The maximum age forces a refresh regardless
+of hits and defaults to twice `kv_refresh_interval`.
+
+`cache_dit_policy="refresh"` keeps the original scheduling. Hit priority
+requires a positive refresh interval; an explicit maximum must be an integer
+at least as large as that interval and is accepted only with `hit`.
+Without the supported single Cache-DiT wrapper, or with separate-CFG caching,
+execution falls back to the original fixed schedule and logs the effective
+policy. Refresh/layout changes still invalidate incompatible residual and
+TaylorSeer history. No isolation mask or RainFusion kernel changes are involved.
+
+Longer reference reuse remains approximate. Evaluate quality and latency:
+prefix replay and history rebuilding can offset the saved block computation.
+
 #### Diffusion KV Prefix Caching
 
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
