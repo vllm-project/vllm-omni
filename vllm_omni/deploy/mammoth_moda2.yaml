@@ -9,7 +9,25 @@ stages:
     max_num_seqs: 100
     max_model_len: 8192
     gpu_memory_utilization: 0.5
-    enforce_eager: true
+    # torch.compile piecewise + CUDA graphs (vLLM's FULL_AND_PIECEWISE
+    # default, pinned explicitly). Measured on B300 (greedy, seed 42):
+    # eager 55.6s, PIECEWISE 109.1s (compiled kernels without full-graph
+    # launch amortization), FULL_AND_PIECEWISE 26.6s; the win comes from
+    # the FULL decode graphs. FULL capture is valid for this model only
+    # because the omni runner feeds the decoder inputs_embeds
+    # (input_ids=None), so the captured forward takes moe_forward's
+    # mask-is-None path — the same expert routing eager uses. moe_forward
+    # refuses capture with a live gen_token_mask (its host-side routing
+    # branches would be frozen into the graph; #7318 is the wrong-expert
+    # replay this caused under FULL without compilation).
+    enforce_eager: false
+    compilation_config:
+      cudagraph_mode: FULL_AND_PIECEWISE
+    # Async scheduling is unsafe for embed-early multimodal models: the input
+    # embedding runs during input prep, before the previous step's sampled
+    # token id is written back, and gathers the -1 sentinel (OOB crash at
+    # batch >= 8). Keep it off until embed-early is made async-safe.
+    async_scheduling: false
     trust_remote_code: true
     enable_prefix_caching: false
 

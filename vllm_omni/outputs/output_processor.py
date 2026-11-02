@@ -25,6 +25,7 @@ from vllm_omni.metrics import definitions as defs
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
 from vllm_omni.outputs.multimodal_accumulation import (
+    _payload_meta_value,
     drain_delta_payload,
     is_non_final_delta_audio_chunk,
     replace_nemotron_snapshot_keys,
@@ -86,6 +87,13 @@ def _accumulate_segment_tpot(record: dict[str, object], *, elapsed_ms: float, ne
     record[_TPOT_ELAPSED_MS] = total_elapsed_ms
     record[_TPOT_INTERVALS] = total_intervals
     record["vllm_tpot_ms"] = total_elapsed_ms / float(total_intervals)
+
+
+def _payload_is_full_snapshot(incoming) -> bool:
+    value = _payload_meta_value(incoming, "full_payload_snapshot")
+    if isinstance(value, torch.Tensor):
+        return value.numel() == 1 and bool(value.reshape(()).item())
+    return bool(value)
 
 
 def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
@@ -168,6 +176,15 @@ class OmniRequestState(RequestState):
             if incoming is not None:
                 replace_snapshot_keys(self.mm_accumulated, incoming)
                 replace_nemotron_snapshot_keys(self.mm_accumulated, incoming)
+                # Latent emissions are per-step chunks, except that a
+                # stop-token finish additionally delivers the full cumulative
+                # snapshot. The producer declares that explicitly
+                # (meta.full_payload_snapshot, set where the full payload is
+                # materialized); chunk and snapshot payloads are never told
+                # apart by their values, which cannot distinguish a snapshot
+                # from a legitimate identical next chunk.
+                if modality_key == "latent" and _payload_is_full_snapshot(incoming):
+                    self.mm_accumulated.tensors.pop("latent", None)
                 self.mm_accumulated = self.mm_accumulated.merged_with(incoming)
         except (ValueError, TypeError, RuntimeError):
             logger.exception("Error accumulating multimodal tensor")
