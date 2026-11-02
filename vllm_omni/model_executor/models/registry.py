@@ -345,6 +345,12 @@ _OMNI_MODELS = {
         "gepard_talker",
         "GepardTalkerForConditionalGeneration",
     ),
+    ## Kokoro-82M (hexgrad)
+    "KokoroForConditionalGeneration": (
+        "kokoro",
+        "modeling_kokoro",
+        "KokoroForConditionalGeneration",
+    ),
     ## audio8_tts (Audio8 TTS Preview 0.6B)
     "Audio8TTSSlowARForConditionalGeneration": (
         "audio8_tts",
