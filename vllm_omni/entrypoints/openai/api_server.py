@@ -2278,6 +2278,11 @@ async def generate_images(
                 extra_body["true_cfg_scale"] = request.true_cfg_scale
             if request.flow_shift is not None:
                 extra_body["flow_shift"] = request.flow_shift
+            if request.layers is not None:
+                # Layered models (e.g. Qwen-Image-Layered) read the requested
+                # layer count from ``extra_body``; the single-stage and
+                # multi-stage edit paths already forward it here.
+                extra_body["layers"] = request.layers
             if request.extra_params is not None:
                 extra_body["extra_params"] = request.extra_params
             if request.generator_device is not None:
