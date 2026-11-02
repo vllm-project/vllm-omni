@@ -116,13 +116,14 @@ def test_prepare_latents_rejects_generator_list_length_mismatch():
         )
 
 
-def test_prepare_latents_concatenates_multiple_condition_images():
+@pytest.mark.parametrize("num_images", [2, 4, 5, 10])
+def test_prepare_latents_concatenates_multiple_condition_images(num_images):
     pipeline = _toy_pipeline()
-    first = torch.full((2, 4, 1, 4, 4), 1.0)
-    second = torch.full((2, 4, 1, 2, 2), 3.0)
+    sizes = [4] + [2] * (num_images - 1)
+    images = [torch.full((2, 4, 1, size, size), float(i + 1)) for i, size in enumerate(sizes)]
 
     _, image_latents = pipeline.prepare_latents(
-        [first, second],
+        images,
         batch_size=2,
         num_channels_latents=4,
         height=32,
@@ -132,10 +133,12 @@ def test_prepare_latents_concatenates_multiple_condition_images():
         generator=torch.Generator().manual_seed(0),
     )
 
-    # Token dim concatenates the packed condition images: 16 + 4 per row.
-    assert image_latents.shape == (2, 20, 4)
-    torch.testing.assert_close(image_latents[:, :16].mean(), torch.tensor(1.0))
-    torch.testing.assert_close(image_latents[:, 16:].mean(), torch.tensor(3.0))
+    assert image_latents.shape == (2, sum(size * size for size in sizes), 4)
+    offset = 0
+    for i, size in enumerate(sizes):
+        tokens = image_latents[:, offset : offset + size * size]
+        torch.testing.assert_close(tokens, torch.full_like(tokens, float(i + 1)))
+        offset += size * size
 
 
 # ---------------------------------------------------------------------------
