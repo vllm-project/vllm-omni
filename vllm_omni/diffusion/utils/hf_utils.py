@@ -74,6 +74,10 @@ def _looks_like_magi2(model_name: str) -> bool:
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
 
+    from vllm_omni.model_extras.pika_h3 import is_pika_h3_model
+
+    if is_pika_h3_model(model_name):
+        return "PikaH3Pipeline"
     return "Magi2Pipeline" if _looks_like_magi2(model_name) else None
 
 

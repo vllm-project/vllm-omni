@@ -27,6 +27,9 @@ from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.lora.request import LoRARequest
 
+from .dmad import DmadSpec
+from .pika import PikaSpec, read_pika_spec, verify_pika_weights
+
 logger = init_logger(__name__)
 
 _TURBO_RANK = 128
@@ -164,44 +167,47 @@ def _select_turbo_file(artifact_path: str | Path) -> Path | None:
     return None
 
 
-def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
-    """Validate a Diffusers-layout Turbo tensor set and pack it for the manager."""
+def _validate_and_convert_tensors(
+    checkpoint,
+    *,
+    label: str = "MiniMax-H3 Turbo",
+    key_suffixes: tuple[tuple[str, str], ...] = ((_LORA_A_SUFFIX, "a"), (_LORA_B_SUFFIX, "b")),
+) -> dict[str, torch.Tensor]:
+    """Validate H3 adapter factors and pack them for the shared manager."""
 
     tensors: dict[str, torch.Tensor] = {}
     pairs: dict[str, set[str]] = {}
     raw_targets: set[str] = set()
     for name in checkpoint.keys():
-        if name.endswith(_LORA_A_SUFFIX):
-            raw_target = name[: -len(_LORA_A_SUFFIX)]
-            side = "a"
-        elif name.endswith(_LORA_B_SUFFIX):
-            raw_target = name[: -len(_LORA_B_SUFFIX)]
-            side = "b"
+        for suffix, side in key_suffixes:
+            if name.endswith(suffix):
+                raw_target = name[: -len(suffix)]
+                break
         else:
-            raise ValueError(f"Unconsumed MiniMax-H3 Turbo tensor: {name!r}")
+            raise ValueError(f"Unconsumed {label} tensor: {name!r}")
         raw_targets.add(raw_target)
 
-        mapped_name = _TURBO_WEIGHTS_MAPPER.apply_list([name])[0]
+        normalized_name = raw_target + (_LORA_A_SUFFIX if side == "a" else _LORA_B_SUFFIX)
+        mapped_name = _TURBO_WEIGHTS_MAPPER.apply_list([normalized_name])[0]
         mapped_target = mapped_name.rsplit(".lora_", 1)[0]
         if mapped_target.rsplit(".", 1)[-1] not in _TURBO_TARGETS:
-            raise ValueError(f"Unsupported MiniMax-H3 Turbo target: {raw_target!r}")
+            raise ValueError(f"Unsupported {label} target: {raw_target!r}")
         target_sides = pairs.setdefault(mapped_target, set())
         if side in target_sides:
-            raise ValueError(f"Duplicate MiniMax-H3 Turbo tensor for {mapped_target}.{side}")
+            raise ValueError(f"Duplicate {label} tensor for {mapped_target}.{side}")
         target_sides.add(side)
 
         tensor = checkpoint.get_tensor(name)
         if tensor.ndim != 2:
-            raise ValueError(f"MiniMax-H3 Turbo LoRA tensors must be matrices, got {name}={tuple(tensor.shape)}")
+            raise ValueError(f"{label} LoRA tensors must be matrices, got {name}={tuple(tensor.shape)}")
         suffix = next((suffix for suffix in _TURBO_RAW_TARGET_SUFFIXES if raw_target.endswith(suffix)), None)
         if suffix is None:
-            raise ValueError(f"MiniMax-H3 Turbo LoRA contains unsupported target: {raw_target}")
+            raise ValueError(f"{label} LoRA contains unsupported target: {raw_target}")
         input_dim, output_dim = _TURBO_TARGET_DIMS[suffix]
         expected_shape = (_TURBO_RANK, input_dim) if side == "a" else (output_dim, _TURBO_RANK)
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(
-                f"MiniMax-H3 Turbo tensor has invalid global shape: {name}={tuple(tensor.shape)}, "
-                f"expected={expected_shape}"
+                f"{label} tensor has invalid global shape: {name}={tuple(tensor.shape)}, expected={expected_shape}"
             )
         if side == "b" and ".ff.net.0.proj." in name:
             value, gate = tensor.chunk(2, dim=0)
@@ -213,12 +219,12 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
 
     incomplete = sorted(target for target, sides in pairs.items() if sides != {"a", "b"})
     if incomplete:
-        raise ValueError(f"Incomplete MiniMax-H3 Turbo LoRA pairs: {incomplete}")
+        raise ValueError(f"Incomplete {label} LoRA pairs: {incomplete}")
     missing = sorted(_TURBO_EXPECTED_RAW_TARGETS - raw_targets)
     unexpected = sorted(raw_targets - _TURBO_EXPECTED_RAW_TARGETS)
     if missing or unexpected:
         raise ValueError(
-            "MiniMax-H3 Turbo target set does not match the published artifact layout: "
+            f"{label} target set does not match the published artifact layout: "
             f"missing={len(missing)} {missing[:5]}, unexpected={len(unexpected)} {unexpected[:5]}"
         )
     return tensors
@@ -327,4 +333,130 @@ def load_minimax_h3_turbo_lora(
         spec.video_shift,
         spec.audio_shift,
     )
+    return lora_model, peft_helper, spec
+
+
+def load_pika_h3_lora(
+    *,
+    partition: str,
+    lora_request: LoRARequest,
+    lora_path: str | Path,
+    dtype: torch.dtype,
+    unsupported_offload_mode: str | None = None,
+) -> tuple[LoRAModel, PEFTHelper, PikaSpec] | None:
+    """Load the manifest-selected FL2VA or Ref2VA Pika release as a BF16 LoRA.
+
+    The 624 FP32 factors use the same Diffusers module names and shapes as
+    Turbo. Reuse its complete coverage check, QKV mapping and gate/up packing;
+    the Pika manifest supplies alpha=rank=128 and its own sampling contract.
+    """
+    resolved = read_pika_spec(lora_path)
+    if resolved is None:
+        return None
+    weights, spec = resolved
+    if partition != spec.task:
+        raise ValueError(f"Pika {spec.task} requires a dedicated --task-type {spec.task} server")
+    if unsupported_offload_mode is not None:
+        raise ValueError(f"Pika dynamic LoRA does not support {unsupported_offload_mode}")
+    if dtype != torch.bfloat16:
+        raise ValueError("Pika H3 Flex requires BF16 resident LoRA weights")
+    verify_pika_weights(weights, spec)
+    with safe_open(weights, framework="pt", device="cpu") as checkpoint:
+        tensors = _validate_and_convert_tensors(checkpoint, label="Pika H3 Flex")
+    peft_helper = PEFTHelper.from_dict({"r": 128, "lora_alpha": 128, "target_modules": _TURBO_TARGET_PATTERN})
+    lora_model = LoRAModel.from_lora_tensors(
+        lora_model_id=lora_request.lora_int_id,
+        tensors=tensors,
+        peft_helper=peft_helper,
+        device="cpu",
+        dtype=dtype,
+        weights_mapper=_TURBO_WEIGHTS_MAPPER,
+    )
+    _pack_h3_turbo_fc1(lora_model)
+    logger.info("Pika H3 Flex %s: 6 re-noising steps, rank=alpha=128, video/audio shifts=12/3", spec.task)
+    # Pika's public inference policy sets these before encoding/sampling.
+    # This loader requires a dedicated task partition and keeps that policy
+    # for its worker, including subsequent requests using the cached adapter.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = True
+    return lora_model, peft_helper, spec
+
+
+def load_dmad_h3_lora(
+    *,
+    partition: str,
+    lora_request: LoRARequest,
+    lora_path: str | Path,
+    dtype: torch.dtype,
+    unsupported_offload_mode: str | None = None,
+) -> tuple[LoRAModel, PEFTHelper, DmadSpec] | None:
+    """Load the official four/eight-step Diffusers-layout DMAD H3 students."""
+    path = Path(lora_path)
+    if path.is_dir():
+        candidates = sorted(path.glob("dmad_minimax_h3_*.safetensors"))
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise ValueError("Select one DMAD adapter file, not a directory containing multiple variants")
+        path = candidates[0]
+    if not path.is_file() or path.suffix != ".safetensors":
+        return None
+    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+        metadata = checkpoint.metadata() or {}
+        model = metadata.get("model", "")
+        if not model.startswith("DMAD "):
+            if path.name.startswith("dmad_minimax_h3_"):
+                raise ValueError("DMAD H3 adapter is missing its release metadata")
+            return None
+        supported = {
+            f"DMAD {steps}-step student of MiniMax-H3 (text-to-audio-video), LoRA on the T2VA transformer": steps
+            for steps in (4, 8)
+        }
+        if model not in supported:
+            raise ValueError(f"Unsupported DMAD H3 model metadata: {model!r}")
+        steps = supported[model]
+        expected = {
+            "lora_rank": "128",
+            "lora_alpha": "128",
+            "lora_scale": "1.0",
+            "sampling": (
+                f"{steps} steps, video shift 12, audio shift 2, re-noise step rule, "
+                "1344x768, 124 frames at 24 fps, no CFG"
+            ),
+        }
+        for key, value in expected.items():
+            if metadata.get(key) != value:
+                raise ValueError(f"Unsupported DMAD H3 {key}: expected {value!r}")
+        if metadata.get("steps", str(steps)) != str(steps):
+            raise ValueError("DMAD H3 step metadata disagrees with its model identity")
+        if partition != "fl2va":
+            raise ValueError("DMAD H3 requires the original FL2VA/T2VA partition; use --task-type fl2va")
+        if unsupported_offload_mode is not None:
+            raise ValueError(f"DMAD dynamic LoRA does not support {unsupported_offload_mode}")
+        if dtype != torch.bfloat16:
+            raise ValueError("DMAD H3 requires BF16 resident LoRA weights")
+        tensors = _validate_and_convert_tensors(
+            checkpoint,
+            label="DMAD H3",
+            key_suffixes=(
+                (".lora.down.weight", "a"),
+                (".lora.up.weight", "b"),
+                (".lora_A.weight", "a"),
+                (".lora_B.weight", "b"),
+                (_LORA_A_SUFFIX, "a"),
+                (_LORA_B_SUFFIX, "b"),
+            ),
+        )
+    spec = DmadSpec(steps)
+    peft_helper = PEFTHelper.from_dict({"r": 128, "lora_alpha": 128, "target_modules": _TURBO_TARGET_PATTERN})
+    lora_model = LoRAModel.from_lora_tensors(
+        lora_model_id=lora_request.lora_int_id,
+        tensors=tensors,
+        peft_helper=peft_helper,
+        device="cpu",
+        dtype=dtype,
+        weights_mapper=_TURBO_WEIGHTS_MAPPER,
+    )
+    _pack_h3_turbo_fc1(lora_model)
+    logger.info("DMAD H3: %d re-noising steps, rank=alpha=128, video/audio shifts=12/2", steps)
     return lora_model, peft_helper, spec

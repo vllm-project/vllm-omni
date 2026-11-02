@@ -962,9 +962,10 @@ def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
     }
 
 
-def test_i2v_minimax_h3_preserves_reference_geometry():
+@pytest.mark.parametrize("architecture", ["MiniMaxH3Pipeline", "PikaH3Pipeline"])
+def test_i2v_minimax_h3_preserves_reference_geometry(architecture):
     engine = FakeAsyncOmni()
-    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.model_class_name = architecture
     handler = OmniOpenAIServingVideo.for_diffusion(
         diffusion_engine=engine,
         model_name="MiniMaxAI/MiniMax-H3",
@@ -986,6 +987,9 @@ def test_i2v_minimax_h3_preserves_reference_geometry():
     assert input_image.size == (48, 32)
     sampling_params = engine.captured_sampling_params_list[0]
     assert (sampling_params.width, sampling_params.height) == (96, 64)
+    if architecture == "PikaH3Pipeline":
+        assert sampling_params.num_inference_steps == 6
+        assert sampling_params.lora_request is None
 
 
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):
@@ -1322,8 +1326,10 @@ def test_r5_mixed_image_video_audio_references_and_fanout(test_client, mocker: M
 
 
 @pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("architecture", ["MiniMaxH3Pipeline", "PikaH3Pipeline"])
 def test_multi_video_generation_preserves_uploaded_files_until_generation(
     endpoint,
+    architecture,
     test_client,
     mocker: MockerFixture,
 ):
@@ -1331,7 +1337,7 @@ def test_multi_video_generation_preserves_uploaded_files_until_generation(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
         return_value=b"fake-video",
     )
-    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = architecture
     response = test_client.post(
         endpoint,
         data={
@@ -3958,7 +3964,7 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
     engine = test_client.app.state.openai_serving_video._engine_client
     engine.model_class_name = "MiniMaxH3Pipeline"
     engine.controlnet_model_path = "/configured/control.safetensors"
-    captured = {}
+    captured: dict[str, str | float] = {}
     original = engine.generate
 
     async def generate(prompt, request_id, sampling_params_list):
@@ -3998,7 +4004,9 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
     assert not engine.captured_prompt.get("multi_modal_data", {}).get("video")
     for key in ("control_path", "source_path", "mask_path"):
         if key in captured:
-            assert not Path(captured[key]).exists()
+            path = captured[key]
+            assert isinstance(path, str)
+            assert not Path(path).exists()
 
 
 @pytest.mark.parametrize(("endpoint", "with_hint"), [("/v1/videos/sync", False), ("/v1/videos", True)])

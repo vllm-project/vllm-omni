@@ -344,6 +344,9 @@ def test_transformer_baseline_zero_strength_and_request_isolation(cpu_layers):
         tf_model_config=vars(arch),
         parallel_config=SimpleNamespace(ulysses_degree=1, ring_degree=1),
         controlnet_model_path=None,
+        # This fixture executes CPU tensors even on SM120 test hosts, where
+        # the deployment default otherwise opts into CUDA AdaLN offload.
+        cache_config={"minimax_h3_adaln_offload": False},
     )
     model = h3.MiniMaxH3DiTModel(config)
     with torch.no_grad():
