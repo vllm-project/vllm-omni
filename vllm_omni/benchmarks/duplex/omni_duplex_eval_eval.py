@@ -8,9 +8,12 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeVar
 from uuid import uuid4
+
+import requests
 
 from .omni_duplex_eval_clock import (
     has_response_chunks,
@@ -54,6 +57,70 @@ def _text(items: list[dict[str, Any]]) -> str:
     return " ".join(str(item.get("sentence", item.get("text", ""))).strip() for item in items).strip()
 
 
+_T = TypeVar("_T")
+
+
+def _uniform_subsample(values: list[_T], count: int) -> list[_T]:
+    if count >= len(values):
+        return list(values)
+    if count <= 1:
+        return [values[len(values) // 2]]
+    stride = (len(values) - 1) / (count - 1)
+    return [values[round(i * stride)] for i in range(count)]
+
+
+def _is_prompt_too_long_error(exc: requests.HTTPError) -> bool:
+    response = exc.response
+    if response is None or response.status_code not in (400, 500):
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        message = response.text
+    else:
+        error = payload.get("error") if isinstance(payload, dict) else None
+        if not isinstance(error, dict):
+            return False
+        if error.get("code") == "context_length_exceeded":
+            return True
+        message = error.get("message")
+        if not isinstance(message, str):
+            return False
+    normalized = message.lower()
+    return ("prompt" in normalized and "longer than the maximum model length" in normalized) or (
+        "input length" in normalized and "exceeds" in normalized and "maximum context length" in normalized
+    )
+
+
+def _judge_frames_with_overflow_retry(
+    call: Callable[[list[bytes]], str],
+    frames: list[bytes],
+    *,
+    allow_reduction: bool,
+) -> tuple[str, list[bytes], int]:
+    """Optionally retry an explicit context overflow with fewer original frames.
+
+    This is bounded failure recovery, not proactive token budgeting. A judge
+    rejection at one frame still propagates; no score or empty fallback is made.
+    """
+    original_frames = list(frames)
+    used_frames = original_frames
+    retries = 0
+    while True:
+        try:
+            return call(used_frames), used_frames, retries
+        except requests.HTTPError as exc:
+            if not allow_reduction or len(used_frames) <= 1 or not _is_prompt_too_long_error(exc):
+                raise
+            next_count = (len(used_frames) + 1) // 2
+            used_frames = _uniform_subsample(original_frames, next_count)
+            retries += 1
+            logger.warning(
+                "Judge context overflow; retrying with fewer uniformly selected frames",
+                extra={"initial_frame_count": len(original_frames), "frame_count": next_count, "retry": retries},
+            )
+
+
 def _gt_references(answers: list[object]) -> list[str]:
     """Mirror the official evaluator's reference handling.
 
@@ -80,9 +147,13 @@ def evaluate_sample(
     *,
     judge_fps: int = 2,
     judge_video_mode: str = "video_url",
+    judge_frame_overflow: Literal["error", "reduce"] = "error",
     window_size: float = 10.0,
     allow_invalid_clock: bool = False,
 ) -> dict[str, Any]:
+    if judge_frame_overflow not in ("error", "reduce"):
+        raise ValueError("judge_frame_overflow must be 'error' or 'reduce'")
+
     score_path.parent.mkdir(parents=True, exist_ok=True)
     if score_path.exists():
         # A failed retry must not leave an older score eligible for aggregation.
@@ -108,6 +179,27 @@ def evaluate_sample(
             trace.write(json.dumps({"raw_response": raw_response}, ensure_ascii=False) + "\n")
         return parse_judge_json(raw_response, required=required)
 
+    def judge_frames_result(
+        call: Callable[[list[bytes]], str], frames: list[bytes], required: tuple[str, ...]
+    ) -> dict[str, Any]:
+        used_frames = frames
+        retries = 0
+
+        def invoke() -> str:
+            nonlocal used_frames, retries
+            raw_response, used_frames, retries = _judge_frames_with_overflow_retry(
+                call, frames, allow_reduction=judge_frame_overflow == "reduce"
+            )
+            return raw_response
+
+        parsed = judge_result(invoke, required)
+        return {
+            **parsed,
+            "frame_count_initial": len(frames),
+            "frame_count": len(used_frames),
+            "frame_budget_retries": retries,
+        }
+
     raw = _read(response_path)
     meta = (
         _read(response_path.with_name(response_path.stem + ".meta.json"))
@@ -123,6 +215,7 @@ def evaluate_sample(
         "response_meta": meta,
         "judge_model": getattr(judge, "model", None),
         "judge_video_mode": judge_video_mode,
+        "judge_frame_overflow": judge_frame_overflow,
     }
     if sample.family == "rtd":
         items = normalize_response_items(raw)
@@ -145,8 +238,9 @@ def evaluate_sample(
                 )
                 continue
             frames = _extract_frames(video_path, _times(*window, fps=judge_fps))
-            parsed = judge_result(
-                lambda: judge.temporal(build_temporal_prompt(*window, item["sentence"], sample.question_text), frames),
+            parsed = judge_frames_result(
+                partial(judge.temporal, build_temporal_prompt(*window, item["sentence"], sample.question_text)),
+                frames,
                 ("temporal_score", "is_relevant"),
             )
             temporal_rows.append(
@@ -161,41 +255,41 @@ def evaluate_sample(
                     **parsed,
                 }
             )
-        content_frames = None
-        if judge_video_mode == "frame-sample":
-            content_frames = _extract_frames(video_path, _content_frame_times(duration))
         content_prompt = build_content_prompt(
             _text(items), sample.question_text, _gt_references([sample.answer1, sample.answer2])
         )
-        try:
-            content = judge_result(
-                lambda: judge.content(content_prompt, video_path, frames=content_frames, mode=judge_video_mode),
-                ("content_score",),
-            )
-        except Exception as exc:
-            # A long clip can overflow the judge model's context window when the
-            # whole video is passed through (video_url mode): the judge answers
-            # HTTP 400 "Input length (83158) exceeds model's maximum context
-            # length (65536)" (#9089).  Degrade that single content call to the
-            # bounded frame-sample path instead of failing the whole run.
-            if judge_video_mode != "video_url" or not _is_judge_context_length_error(exc):
-                raise
-            logger.warning(
-                "Judge rejected the full video for %s (context length exceeded); "
-                "retrying the content prompt in frame-sample mode",
-                sample.id,
-            )
+        if judge_video_mode == "frame-sample":
             content_frames = _extract_frames(video_path, _content_frame_times(duration))
-            if not content_frames:
-                # Nothing to fall back to: keep the original judge error.
-                raise
-            content = judge_result(
-                lambda: judge.content(content_prompt, video_path, frames=content_frames, mode="frame-sample"),
+            content = judge_frames_result(
+                lambda selected: judge.content(content_prompt, video_path, frames=selected, mode=judge_video_mode),
+                content_frames,
                 ("content_score",),
             )
-            content["judge_input_fallback"] = "frame-sample"
-        if content_frames is not None:
-            content["frame_count"] = len(content_frames)
+        else:
+            try:
+                content = judge_result(
+                    lambda: judge.content(content_prompt, video_path, frames=None, mode=judge_video_mode),
+                    ("content_score",),
+                )
+            except Exception as exc:
+                # Preserve upstream video_url recovery. Frame reduction remains
+                # separately opt-in, including frames chosen by this fallback.
+                if judge_video_mode != "video_url" or not _is_judge_context_length_error(exc):
+                    raise
+                logger.warning(
+                    "Judge rejected the full video for %s (context length exceeded); "
+                    "retrying the content prompt in frame-sample mode",
+                    sample.id,
+                )
+                content_frames = _extract_frames(video_path, _content_frame_times(duration))
+                if not content_frames:
+                    raise
+                content = judge_frames_result(
+                    lambda selected: judge.content(content_prompt, video_path, frames=selected, mode="frame-sample"),
+                    content_frames,
+                    ("content_score",),
+                )
+                content["judge_input_fallback"] = "frame-sample"
         result.update(
             {
                 "temporal": {"sentences": temporal_rows, "summary": summarize_temporal_results(temporal_rows)},
@@ -336,6 +430,15 @@ def summarize_scores(score_root: str | Path) -> dict[str, Any]:
         result["rtd"] = {
             "mean_content_score": sum(item["content_score"] for item in rtd_temporal) / len(rtd_temporal),
             "mean_avg_temporal_score": sum(item["avg_temporal_score"] for item in rtd_temporal) / len(rtd_temporal),
+            "judge_frame_overflow_policies": sorted(
+                {row.get("judge_frame_overflow", "error") for row in rows if "temporal" in row}
+            ),
+            "frame_reduction_samples": sum(
+                row.get("content", {}).get("frame_budget_retries", 0) > 0
+                or any(item.get("frame_budget_retries", 0) > 0 for item in row["temporal"].get("sentences", []))
+                for row in rows
+                if "temporal" in row
+            ),
             "by_task": {
                 task: {
                     "mean_content_score": sum(item["content"] for item in values) / len(values),
