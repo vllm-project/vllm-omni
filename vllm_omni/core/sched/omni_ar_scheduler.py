@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import replace
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -34,6 +34,13 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import talker_kstep_frames
 
 logger = init_logger(__name__)
+
+
+class _ChunkSaveKwargs(TypedDict, total=False):
+    new_token_ids: list[int]
+    confirmed_num_computed_tokens: int | None
+    duplex_perf_chunk: tuple[int, int]
+    segment_generation: int | None
 
 
 def _should_emit_engine_output(
@@ -123,6 +130,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     """
 
     max_num_active_reqs: int
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+    ) -> tuple[list[int], bool]:
+        status_before_update = request.status
+        has_output_placeholders = request.num_output_placeholders > 0
+        new_token_ids, stopped = super()._update_request_with_output(request, new_token_ids, is_stale=is_stale)
+        # vLLM 0.33 moved this publication into update_from_output, which
+        # Omni overrides. Keep both the plain-decode and general paths on
+        # the upstream frontier: materialized KV only, never in-flight KV.
+        if (
+            not is_stale
+            and status_before_update == RequestStatus.RUNNING
+            and (has_output_placeholders or self.num_spec_tokens > 0)
+        ):
+            self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens - request.num_in_flight_tokens)
+        return new_token_ids, stopped
 
     def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
         model_config = self.vllm_config.model_config
@@ -1402,7 +1426,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     or finished
                 )
             ):
-                save_kwargs = {
+                save_kwargs: _ChunkSaveKwargs = {
                     "new_token_ids": new_token_ids,
                     "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
                 }
