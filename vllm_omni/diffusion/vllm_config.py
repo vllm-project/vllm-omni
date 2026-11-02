@@ -218,9 +218,9 @@ def resolve_diffusion_moe_lora_token_capacity(
     return capacity
 
 
-def _is_cuda_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
+def _is_accelerator_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
     """Return whether the model uses vLLM's online MXFP4 MoE quantization."""
-    if not od_config.is_moe or not current_omni_platform.is_cuda():
+    if not od_config.is_moe or not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()):
         return False
 
     from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
@@ -265,14 +265,13 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     lora_backend = getattr(od_config, "lora_backend", "peft")
     lora_backend = getattr(lora_backend, "value", lora_backend)
     moe_lora_enabled = od_config.is_moe and lora_backend == "peft"
-    if moe_lora_enabled and not getattr(od_config, "lora_path", None) and _is_cuda_online_mxfp4_moe(od_config):
-        # vLLM rejects native W4A4 MXFP4 MoE kernels while LoRA is enabled.
-        # Keep the baseline path on those kernels; startup adapters retain the
-        # existing LoRA-capable W4A16 fallback because ``lora_config`` remains set.
+    if moe_lora_enabled and not getattr(od_config, "lora_path", None) and _is_accelerator_online_mxfp4_moe(od_config):
+        # vLLM rejects native MXFP4 MoE kernels while LoRA is enabled.
+        # Keep the baseline on those kernels. Startup adapters keep LoRA enabled;
+        # CUDA can fall back to W4A16 MARLIN, while XPU has no LoRA MXFP4 backend.
         logger.info(
-            "Disabling MoE LoRA for online MXFP4 on CUDA without a startup adapter; "
-            "this enables native W4A4 kernels. Pass lora_path to request a "
-            "LoRA-capable W4A16 backend."
+            "Disabling MoE LoRA for online MXFP4 on CUDA/XPU without a startup adapter; "
+            "this enables the native MXFP4 MoE backend."
         )
         moe_lora_enabled = False
     if moe_lora_enabled:
