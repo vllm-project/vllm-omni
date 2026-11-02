@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import time
 from dataclasses import dataclass, field
@@ -58,6 +59,8 @@ from .omni_duplex_eval_media import (
     read_soundtrack_pcm16,
     video_duration,
 )
+
+logger = logging.getLogger(__name__)
 
 #: MiniCPM-o's native duplex system prompt, the historical default.
 DEFAULT_INSTRUCTIONS = "Streaming Omni Conversation."
@@ -645,6 +648,14 @@ async def generate_sample(
             except asyncio.CancelledError:
                 pass
         await client.acknowledge_playback()
+        session_stats: dict[str, object] | None = None
+        if _session_capabilities(client).get("supports_session_stats") is True:
+            try:
+                fetched = await client.get_session_stats(timeout_s=5.0)
+            except (TimeoutError, ConnectionError) as exc:
+                logger.warning("Omni-DuplexEval session stats unavailable: %s", exc)
+                fetched = None
+            session_stats = fetched or None
         try:
             await client.close_session(timeout_s=20.0)
         except TimeoutError as exc:
@@ -683,6 +694,7 @@ async def generate_sample(
         collector,
         stream_start=stream_start if stream_start is not None else 0.0,
         session_id=sample.id,
+        session_stats=session_stats,
     )
     errors = []
     for event in client.events.errors():
