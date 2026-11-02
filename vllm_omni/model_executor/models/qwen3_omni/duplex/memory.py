@@ -95,6 +95,9 @@ def build_memory_messages(context: DuplexContextAuxiliaryInput) -> list[dict[str
     }
     try:
         encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        # JSON quoting alone leaves Qwen's added-token spellings active. Escape
+        # their delimiters as JSON data without changing decoded text or offsets.
+        encoded = encoded.replace("<", "\\u003c").replace(">", "\\u003e")
         if len(encoded.encode("utf-8")) > _MAX_PROMPT_DATA_BYTES:
             return None
     except (ValueError, UnicodeEncodeError):

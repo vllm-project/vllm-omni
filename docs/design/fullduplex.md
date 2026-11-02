@@ -462,9 +462,13 @@ proposals, explicit resolutions and a scoped reconciliation declaration;
 unknown or duplicate fields, invalid references and oversized output are refused.
 Decoding never changes session state. An empty valid result differs from invalid
 output, and only the owner can authorize mutations. Formatting preserves the
-entire captured scope; the eventual request policy must count the full rendered
-template before submission. This codec alone enables no model requests or stage
-consumption.
+entire captured scope, including literal media or template delimiters as data.
+A separate request adapter counts the complete template against an explicit
+caller allowance and the deployed context length. It defers oversized captures
+without trimming their scope and targets only Thinker stage 0. Only a single
+successfully stopped text completion is decoded against the retained capture;
+session admission still checks its current authority. These helpers allocate no
+shared compute allowance and enable no live policy or stage consumption.
 
 A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
 `context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:
