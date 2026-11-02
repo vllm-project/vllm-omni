@@ -12,14 +12,20 @@ Use the existing backend with an explicit codec on **both** peers:
 
 ```python
 from vllm_omni.distributed.weight_sharing import (
-    TorchCudaIpcBackend,
+    TorchIpcBackend,
+    TorchCudaIpcCodec,
     TorchNpuIpcCodec,
 )
 
-backend = TorchCudaIpcBackend(codec=TorchNpuIpcCodec())
+backend = TorchIpcBackend(codec=TorchNpuIpcCodec())
+
+# CUDA uses the same backend with its own codec:
+cuda_backend = TorchIpcBackend(codec=TorchCudaIpcCodec())
 ```
 
-`TorchCudaIpcBackend` retains its original name and defaults to CUDA. The NPU
+`TorchIpcBackend` manages the common session lifecycle and defaults to the CUDA
+codec when none is supplied. `TorchCudaIpcBackend` remains a compatibility alias
+for the same class, so existing calls continue to work. The NPU
 codec overrides every device operation and reuses only device-independent view
 reconstruction and storage leases. Importing the package does not load torch or
 torch_npu. The NPU codec uses torch_npu's reducer/rebuilder, with a distinct

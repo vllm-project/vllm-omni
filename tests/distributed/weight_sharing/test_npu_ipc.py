@@ -42,7 +42,7 @@ def _runtime(session="session"):
     api = importlib.import_module(f"{package.__name__}.contracts")
     codec_module = importlib.import_module(f"{package.__name__}.torch_npu_ipc_codec")
     context = make_context(api, device_uuid=codec_module._device_uuid(0), session_id=session)
-    return api, package.TorchCudaIpcBackend(codec=package.TorchNpuIpcCodec()), context
+    return api, package.TorchIpcBackend(codec=package.TorchNpuIpcCodec()), context
 
 
 def _bindings(device):

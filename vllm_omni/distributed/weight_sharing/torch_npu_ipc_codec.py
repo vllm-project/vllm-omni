@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ascend storage IPC adapter. Importing this module initializes no device.
 
-Use ``TorchCudaIpcBackend(codec=TorchNpuIpcCodec())`` on both peers. The backend
+Use ``TorchIpcBackend(codec=TorchNpuIpcCodec())`` on both peers. The backend
 owns synchronization, single-consumption receipts and uncertain-outcome retention.
 Only ordinary ND/NCHW storages in native, non-expandable allocations are supported;
 internal formats (including FRACTAL_NZ), private pools and imported allocations
