@@ -117,6 +117,8 @@ class TurnDetectionBatcher:
         # Owned by the worker thread:
         #: Appends whose next request is a frame, scored in the next iteration.
         self._active: list[_Append] = []
+        #: The iteration's appends being scored, until each is filed again.
+        self._scoring: list[_Append] = []
         #: Appends whose turn-scorer work is still on the executor.
         self._away = 0
 
@@ -167,23 +169,28 @@ class TurnDetectionBatcher:
                 self._iter(inbox, finished)
             except BaseException as exc:  # never strand a caller on its future
                 logger.exception("Duplex turn detection iteration failed")
-                self._abandon([*self._active, *inbox], exc, finished)
+                self._abandon([*self._active, *self._scoring, *inbox], exc, finished)
             if finished:
                 assert self._loop is not None  # bound by the first append
                 try:
                     self._loop.call_soon_threadsafe(_resolve, finished)
                 except RuntimeError:
                     pass  # the loop already closed; nobody is waiting
+            # Don't keep this iteration's appends (detectors, futures, segments) alive while idle.
+            del inbox, finished
 
     def _iter(self, inbox: list[_Append], finished: list[_Append]) -> None:
         for append in inbox:
             if append.pending is not _START:
                 # this append request is returned from SmartTurn detection
                 self._away -= 1
+                if append.error is not None:
+                    continue  # abandoned while away: its caller already has the error
             self._step(append, finished)
         if not self._active:
             return
-        waiting, self._active = self._active, []
+        waiting = self._scoring = self._active
+        self._active = []
         try:
             scores: list[float | BaseException] = score_frames(
                 [(append.detector.vad, cast(FrameScoreRequest, append.request).frame) for append in waiting]
@@ -193,6 +200,7 @@ class TurnDetectionBatcher:
         for append, score in zip(waiting, scores):
             append.pending = score
             self._step(append, finished)
+        self._scoring = []
 
     def _step(self, append: _Append, finished: list[_Append]) -> None:
         """Advance ``append`` with its pending value and file it by what it asks for next."""
@@ -239,6 +247,7 @@ class TurnDetectionBatcher:
     def _abandon(self, appends: list[_Append], exc: BaseException, finished: list[_Append]) -> None:
         """Fail ``appends`` that have not finished after an unexpected error."""
         self._active = []
+        self._scoring = []
         stranded = {id(append): append for append in appends if append.segments is None and append.error is None}
         for append in stranded.values():
             append.request = None
