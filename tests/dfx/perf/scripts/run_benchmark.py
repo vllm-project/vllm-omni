@@ -22,6 +22,7 @@ from tests.dfx.conftest import (
     load_benchmark_configs,
     run_benchmark,
 )
+from tests.helpers.duplex_artifacts import assert_duplex_artifact_publication
 from tests.helpers.runtime import OmniServer
 
 # Optional JSON field ``mark`` is applied as pytest marks via
@@ -331,13 +332,16 @@ def benchmark_params(request):
         yield {"test_name": test_name, "params": params}
 
 
-def _resolve_num_warmups(params: dict[str, Any], *, default: int) -> int:
+def _resolve_num_warmups(params: dict[str, Any], *, default: int, sweep_index: int = 0, sweep_size: int = 1) -> int:
     value = params.get("num_warmups")
     if value is None:
         return default
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError("num_warmups must be a non-negative integer")
-    return value
+    values = value if isinstance(value, list) else [value]
+    if isinstance(value, list) and len(values) != sweep_size:
+        raise ValueError("num_warmups must contain one value per sweep point")
+    if any(not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in values):
+        raise ValueError("num_warmups must be a non-negative integer or a list of them")
+    return values[sweep_index] if isinstance(value, list) else value
 
 
 def _assert_fixed_stage_workloads(result: dict[str, Any], params: dict[str, Any], num_prompts: int) -> None:
@@ -501,10 +505,7 @@ def _duplex_eval_score_floors_enforced(params: dict, hardware: object) -> bool:
 
 
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
-    summary = result.get("omni_duplex_eval")
-    assert isinstance(summary, dict), "Omni-DuplexEval summary is missing"
-    assert summary.get("published") == num_prompt, "Omni-DuplexEval artifacts are incomplete"
-    assert summary.get("artifact_errors") == [], "Omni-DuplexEval artifact publication failed"
+    summary = result["omni_duplex_eval"]
     sessions = result.get("duplex_session_metrics")
     assert isinstance(sessions, list) and len(sessions) == num_prompt, "Omni-DuplexEval session metrics are missing"
     if path := params.get("duplex_eval_accuracy_config"):
@@ -547,17 +548,21 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
+    assert_duplex_artifact_publication(result, params, num_prompt)
+    if params.get("duplex_performance_only"):
+        assert result.get("duplex_metric_aggregation") == "response", "Wrong duplex measurement unit"
+        for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+            assert result.get(f"num_{metric}_samples", 0) > 0, f"No measured {metric} samples"
+            suffix = "" if metric == "audio_rtf" else "_ms"
+            for percentile in (50, 95):
+                assert _is_finite_number(result.get(f"p{percentile}_{metric}{suffix}")), (
+                    f"Missing or invalid P{percentile} {metric}"
+                )
+        return
     if params.get("dataset_name") == "omni-duplex-eval":
         _assert_duplex_eval_result(result, params, num_prompt)
     if params.get("dataset_name") == "omniinteract":
-        summary = result.get("omniinteract")
-        assert isinstance(summary, dict), "OmniInteract summary is missing"
-        assert (summary.get("total"), summary.get("success"), summary.get("failed")) == (
-            num_prompt,
-            num_prompt,
-            0,
-        ), "OmniInteract requests did not all succeed"
-        assert summary.get("artifacts_complete") is True, "OmniInteract artifacts are incomplete"
+        summary = result["omniinteract"]
         if params.get("omniinteract_evaluate"):
             accuracy = summary.get("accuracy")
             assert isinstance(accuracy, dict), "OmniInteract accuracy is missing"
@@ -673,6 +678,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         "judge_server_params",
         "duplex_eval_accuracy_config",
         "duplex_eval_score_floor_hardware",
+        "duplex_performance_only",
         "name",
         "enable_negative_prompt",
         "random_request_config",
@@ -726,7 +732,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=2),
+            num_warmups=_resolve_num_warmups(params, default=2, sweep_index=sweep_index, sweep_size=len(qps_list)),
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
         )
@@ -746,7 +752,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
+            num_warmups=_resolve_num_warmups(
+                params,
+                default=max(2, int(concurrency)),
+                sweep_index=sweep_index,
+                sweep_size=len(max_concurrency_list),
+            ),
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
         )

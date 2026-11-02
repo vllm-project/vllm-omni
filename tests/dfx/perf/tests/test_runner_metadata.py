@@ -712,6 +712,50 @@ def test_num_warmups_preserves_explicit_zero():
     assert _resolve_num_warmups({"num_warmups": 0}, default=4) == 0
 
 
+@pytest.mark.parametrize("dataset", ["omniinteract", "omni_duplex_eval"])
+@pytest.mark.parametrize("sweep_key", ["max_concurrency", "request_rate"])
+def test_qwen3_duplex_sweep_warms_each_concurrency(monkeypatch, dataset, sweep_key):
+    from dataclasses import dataclass
+    from pathlib import Path
+
+    from tests.dfx.perf.scripts import run_benchmark
+
+    config_path = Path(__file__).with_name(f"test_qwen3_omni_duplex_{dataset}.json")
+    config = json.loads(config_path.read_text())[0]
+    params = dict(config["benchmark_params"][0])
+    if sweep_key == "request_rate":
+        params["request_rate"] = params.pop("max_concurrency")
+
+    @dataclass
+    class ServerEndpoint:
+        host: str = "localhost"
+        port: int = 8000
+        model: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append((kwargs["flow"], kwargs["num_prompt"], kwargs["num_warmups"]))
+        assert "--num-warmups" not in kwargs["args"]
+        assert "--name" not in kwargs["args"]
+        return {"completed": kwargs["num_prompt"]}
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
+    assert calls == [(1, 4, 1), (8, 16, 8), (16, 32, 16)]
+
+
+@pytest.mark.parametrize("warmups", [[], [1, 8], [1, 8, False], [1, 8, -1], [1, 8, 1.5]])
+def test_num_warmups_rejects_invalid_sweep(warmups):
+    from tests.dfx.perf.scripts.run_benchmark import _resolve_num_warmups
+
+    with pytest.raises(ValueError, match="num_warmups"):
+        _resolve_num_warmups({"num_warmups": warmups}, default=16, sweep_index=0, sweep_size=3)
+
+
 def test_omniinteract_result_accepts_complete_artifacts():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -1233,3 +1277,53 @@ def test_variable_stage_workload_does_not_require_stage_metrics(extra_body):
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
     assert_result({"completed": 2}, {"extra_body": extra_body}, 2)
+
+
+def _response_performance_result(dataset_name):
+    result = {"completed": 16, "duplex_metric_aggregation": "response"}
+    if dataset_name == "omni-duplex-eval":
+        result["omni_duplex_eval"] = {"published": 16, "artifact_errors": []}
+    else:
+        result["omniinteract"] = {"total": 16, "success": 16, "failed": 0, "artifacts_complete": True}
+    for metric in ("ttft", "audio_ttfp", "audio_rtf"):
+        result[f"num_{metric}_samples"] = 16
+        suffix = "" if metric == "audio_rtf" else "_ms"
+        for percentile in (50, 95):
+            result[f"p{percentile}_{metric}{suffix}"] = 1.0
+    return result
+
+
+@pytest.mark.parametrize("dataset_name", ["omni-duplex-eval", "omniinteract"])
+def test_response_performance_requires_measurements_not_accuracy(dataset_name):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    params = {"dataset_name": dataset_name, "duplex_performance_only": True}
+    result = _response_performance_result(dataset_name)
+    assert_result(result, params, 16)
+    result["num_audio_ttfp_samples"] = 0
+    with pytest.raises(AssertionError, match="No measured audio_ttfp"):
+        assert_result(result, params, 16)
+
+
+@pytest.mark.parametrize(
+    "dataset_name, field, value, message",
+    [
+        ("omni-duplex-eval", None, None, "summary is missing"),
+        ("omni-duplex-eval", "published", 15, "artifacts are incomplete"),
+        ("omni-duplex-eval", "artifact_errors", ["disk full"], "publication failed"),
+        ("omniinteract", None, None, "summary is missing"),
+        ("omniinteract", "artifacts_complete", False, "artifacts are incomplete"),
+        ("omniinteract", "success", 15, "requests did not all succeed"),
+    ],
+)
+def test_response_performance_rejects_missing_artifacts(dataset_name, field, value, message):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _response_performance_result(dataset_name)
+    summary_key = dataset_name.replace("-", "_")
+    if field is None:
+        del result[summary_key]
+    else:
+        result[summary_key][field] = value
+    with pytest.raises(AssertionError, match=message):
+        assert_result(result, {"dataset_name": dataset_name, "duplex_performance_only": True}, 16)

@@ -128,6 +128,7 @@ _IMAGE_STAGE_METRICS_BACKENDS = frozenset(
     }
 )
 _PRINT_STAGE = False
+_DUPLEX_METRIC_AGGREGATION = "session"
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -162,6 +163,14 @@ def should_request_stage_metrics(args: Any) -> bool:
     extra_body = getattr(args, "extra_body", None) or {}
     modalities = extra_body.get("modalities") if isinstance(extra_body, dict) else None
     return backend == "openai-chat-omni" and "image" in (modalities or [])
+
+
+def set_duplex_metric_aggregation(aggregation: str) -> None:
+    """Select the observation unit for duplex latency distributions."""
+    if aggregation not in {"session", "response"}:
+        raise ValueError(f"Unknown duplex metric aggregation: {aggregation}")
+    global _DUPLEX_METRIC_AGGREGATION
+    _DUPLEX_METRIC_AGGREGATION = aggregation
 
 
 def set_print_stage(enabled: bool) -> None:
@@ -595,6 +604,55 @@ def get_samples(args, tokenizer, **kwargs):
     any upstream caller reaching this patched replacement keeps working; they are
     forwarded to the original implementation on every delegate path.
     """
+    pool_size = getattr(args, "duplex_sample_pool_size", None)
+    if pool_size is not None:
+        if args.dataset_name not in {"omniinteract", "omni-duplex-eval"}:
+            raise ValueError("--duplex-sample-pool-size requires OmniInteract or Omni-DuplexEval")
+        if getattr(args, "omniinteract_evaluate", False) or getattr(args, "duplex_eval_evaluate", False):
+            raise ValueError("--duplex-sample-pool-size is for performance runs without answer evaluation")
+        count = args.num_prompts or pool_size
+        if count > pool_size and getattr(args, "no_oversample", False):
+            raise ValueError("Repeating the duplex sample pool conflicts with --no-oversample")
+        pool_count = min(count, pool_size)
+        pool_args = argparse.Namespace(**vars(args))
+        pool_args.duplex_sample_pool_size = None
+        pool_args.num_prompts = pool_count
+        # Load the source pool once, including OmniInteract's predecoded media.
+        # Clear the option so this call cannot recurse again.
+        pool = get_samples(pool_args, tokenizer, **kwargs)
+        if len(pool) != pool_count:
+            raise ValueError(f"Requested {pool_count} distinct duplex samples, but selected {len(pool)}")
+        requests = []
+        identities = set()
+        for index in range(count):
+            cycle, offset = divmod(index, len(pool))
+            # Repeats can overlap: shared media/options must stay read-only.
+            # Prepared media is frozen bytes/tuples; stream cursors and playback
+            # state are created separately by each run_omniinteract_case call.
+            request = replace(pool[offset], request_id=f"{args.request_id_prefix or ''}{index}")
+            if isinstance(request, OmniInteractSampleRequest) and request.omniinteract_case is not None:
+                case = request.omniinteract_case
+                if cycle:
+                    relative = Path(case.video_rel)
+                    request.omniinteract_case = replace(
+                        case, video_rel=str(relative.with_name(f"{relative.stem}__repeat_{cycle}{relative.suffix}"))
+                    )
+                output_keys = [(request.omniinteract_case.subset, request.omniinteract_case.video_rel)]
+            elif isinstance(request, OmniDuplexEvalSampleRequest) and request.sample is not None:
+                if cycle:
+                    request.sample = replace(request.sample, id=f"{request.sample.id}__repeat_{cycle}")
+                output_keys = [
+                    (request.sample.split, f"{request.sample.id}{suffix}") for suffix in (".json", ".meta.json")
+                ]
+            else:
+                raise TypeError("Duplex sample pool lost its dataset identity")
+            if any(key in identities for key in output_keys):
+                raise ValueError(f"Repeated duplex output identity would collide: {output_keys}")
+            identities.update(output_keys)
+            requests.append(request)
+        args.num_prompts = len(requests)
+        return requests
+
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
@@ -3445,7 +3503,9 @@ async def async_request_openai_realtime_duplex(
         output.latency = request_finished_at - output.start_time
         output.tts_turn_pcm_bytes = turn_pcm_bytes
         output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
-        if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
+        if _DUPLEX_METRIC_AGGREGATION == "response" or bool(
+            (request_func_input.extra_body or {}).get("save_duplex_request_metrics")
+        ):
             output.duplex_request_metrics = turn_metrics
             output.duplex_session_metrics = session_metrics
         output.output_tokens = sum(
@@ -3944,6 +4004,7 @@ async def benchmark(
             request_rate=request_rate,
             benchmark_duration=benchmark_duration,
             print_stage=_PRINT_STAGE,
+            duplex_metric_aggregation=_DUPLEX_METRIC_AGGREGATION,
         )
     else:
         metrics = calculate_metrics_for_embeddings(
@@ -4188,6 +4249,9 @@ async def benchmark(
         for p, value in getattr(metrics, f"percentiles_{metric_attribute_name}{suffix}", None) or []:
             p_word = str(int(p)) if int(p) == p else str(p)
             result[f"p{p_word}_{metric_attribute_name}{suffix}"] = value
+
+    if any(isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs):
+        result["duplex_metric_aggregation"] = _DUPLEX_METRIC_AGGREGATION
 
     if task_type == TaskType.GENERATION:
         for metric in result_percentile_metrics:

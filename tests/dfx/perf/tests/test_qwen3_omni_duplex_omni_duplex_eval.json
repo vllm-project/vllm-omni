@@ -2,56 +2,75 @@
   {
     "test_name": "test_qwen3_omni_duplex_omni_duplex_eval",
     "mark": [
-      {"hardware_marks": {"res": {"cuda": ["H100", "B200"]}, "num_cards": 3}},
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": [
+              "H100",
+              "B200"
+            ]
+          },
+          "num_cards": 2
+        }
+      },
       "full_model",
       "omni"
     ],
     "server_params": {
       "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-      "extra_cli_args": ["--deploy-config", "vllm_omni/deploy/qwen3_omni_duplex.yaml"]
-    },
-    "judge_server_params": {
-      "model": "Qwen/Qwen2.5-7B-Instruct",
-      "use_omni": false,
-      "cuda_visible_devices": "2",
-      "extra_cli_args": ["--served-model-name", "Qwen2.5-7B-Instruct"]
+      "extra_cli_args": [
+        "--deploy-config",
+        "tests/dfx/perf/configs/qwen3_omni_duplex_perf.yaml"
+      ]
     },
     "benchmark_params": [
       {
-        "name": "pr_correction",
+        "name": "c1_c8_c16_response_v2",
         "dataset_name": "omni-duplex-eval",
-        "dataset_path": "Hothan/Omni-DuplexEval",
+        "dataset_path": "Hothan/Omni-DuplexEval@de63329f76daa5e0c604363ef6a2c383dfba45f6",
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
-        "num_prompts": [3],
-        "max_concurrency": [1],
-        "num_warmups": 1,
+        "num_prompts": [
+          4,
+          16,
+          32
+        ],
+        "max_concurrency": [
+          1,
+          8,
+          16
+        ],
         "disable_shuffle": true,
         "trust_remote_code": true,
         "duplex_eval_split": "PR_correction",
         "duplex_eval_turn_detection": "server_vad",
         "duplex_eval_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
         "duplex_eval_response_root": "tests/dfx/perf/results/omni_duplex_eval_qwen3_omni/PR_correction",
-        "duplex_eval_evaluate": true,
-        "duplex_eval_judge_model": "Qwen2.5-7B-Instruct",
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
-      },
-      {
-        "name": "rtd_counting",
-        "dataset_name": "omni-duplex-eval",
-        "dataset_path": "Hothan/Omni-DuplexEval",
-        "backend": "openai-realtime-duplex",
-        "endpoint": "/v1/realtime",
-        "num_prompts": [2],
-        "max_concurrency": [1],
-        "num_warmups": 0,
-        "disable_shuffle": true,
-        "trust_remote_code": true,
-        "duplex_eval_split": "RTD_counting",
-        "duplex_eval_turn_detection": "server_vad",
-        "duplex_eval_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
-        "duplex_eval_response_root": "tests/dfx/perf/results/omni_duplex_eval_qwen3_omni/RTD_counting",
-        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,audio_ttfp,audio_rtf",
+        "duplex_metric_aggregation": "response",
+        "metric-percentiles": "50,95",
+        "duplex_eval_ids": [
+          "0",
+          "2",
+          "3",
+          "4",
+          "5",
+          "7",
+          "8",
+          "13",
+          "27",
+          "28",
+          "32",
+          "35",
+          "38",
+          "41",
+          "53",
+          "59"
+        ],
+        "duplex_performance_only": true,
+        "ready_check_timeout_sec": 0,
+        "duplex_sample_pool_size": 16,
+        "num_warmups": [1, 8, 16]
       }
     ]
   }

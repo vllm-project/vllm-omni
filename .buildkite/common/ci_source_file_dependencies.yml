@@ -350,6 +350,7 @@ source_file_dependencies:
     - tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json
 
   omni_qwen3_omni_duplex_perf:
+    - tests/dfx/perf/configs/qwen3_omni_duplex_perf.yaml
     - *qwen3_omni
     - *duplex
     - vllm_omni/deploy/qwen3_omni_duplex.yaml
