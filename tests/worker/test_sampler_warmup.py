@@ -84,7 +84,24 @@ def test_missing_upstream_helper_skips_warmup_instead_of_failing(fake_kernels, m
     assert len(worker.model_runner.jit_warmup_registry) == 0
 
 
+def test_changed_upstream_helper_signature_skips_warmup_instead_of_failing(fake_kernels, monkeypatch):
+    def register_top_k_top_p_warmups(max_num_seqs):
+        raise AssertionError("unreachable")
+
+    module = ModuleType(_SAMPLER_MODULE)
+    module.register_top_k_top_p_warmups = register_top_k_top_p_warmups  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, _SAMPLER_MODULE, module)
+    worker = _worker()
+
+    assert register_top_k_top_p_warmup(worker) is False
+    assert len(worker.model_runner.jit_warmup_registry) == 0
+
+
 def test_ar_worker_registers_sampler_warmup_before_upstream_kernel_warmup(monkeypatch):
+    # The patch below only intercepts super() if no class between GPUARWorker
+    # and OmniGPUWorkerBase in the MRO overrides compile_or_warm_up_model.
+    next_impl = next(cls for cls in GPUARWorker.__mro__[1:] if "compile_or_warm_up_model" in vars(cls))
+    assert next_impl is OmniGPUWorkerBase
     calls = []
     monkeypatch.setattr(gpu_ar_worker, "warm_up_moe_prefill_kernels", lambda worker: calls.append("moe_prefill"))
     monkeypatch.setattr(gpu_ar_worker, "register_top_k_top_p_warmup", lambda worker: calls.append("sampler"))

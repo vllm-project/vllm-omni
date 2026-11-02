@@ -30,11 +30,14 @@ def register_top_k_top_p_warmup(worker: Any) -> bool:
     """Register vLLM's native top-k/top-p kernels with the v2 runner's JIT warmup registry.
 
     Must run before ``compile_or_warm_up_model`` reaches ``kernel_warmup``.
+    Assumes the zero-argument ``register_top_k_top_p_warmups()`` of vLLM 0.32.0.
     Returns whether the kernels were registered.
     """
     if not getattr(worker, "use_v2_model_runner", False) or not current_platform.is_cuda():
         return False
     model_runner = worker.model_runner
+    # Every sampling stage registers, not only stages whose deploy config sets a
+    # seed: any request can carry its own ``seed`` with ``top_k``/``top_p``.
     if not getattr(model_runner, "is_last_pp_rank", True) or getattr(model_runner, "is_pooling_model", False):
         return False
     registry = getattr(model_runner, "jit_warmup_registry", None)
@@ -48,14 +51,23 @@ def register_top_k_top_p_warmup(worker: Any) -> bool:
     try:
         from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
     except ImportError:
-        logger.warning(
+        logger.warning_once(
             "Skipping top-k/top-p sampler warmup: "
             "vllm.v1.sample.ops.topk_topp_sampler.register_top_k_top_p_warmups is not importable. "
             "Seeded top-k/top-p requests may JIT-compile sampling kernels on the first requests."
         )
         return False
 
-    with registry.activate():
-        register_top_k_top_p_warmups()
+    try:
+        with registry.activate():
+            register_top_k_top_p_warmups()
+    except TypeError as e:
+        logger.warning_once(
+            "Skipping top-k/top-p sampler warmup: register_top_k_top_p_warmups() no longer "
+            "matches the expected zero-argument signature (%s). Seeded top-k/top-p requests "
+            "may JIT-compile sampling kernels on the first requests.",
+            str(e),
+        )
+        return False
     logger.debug("Registered the Triton top-k/top-p sampling kernels for JIT warmup.")
     return True
