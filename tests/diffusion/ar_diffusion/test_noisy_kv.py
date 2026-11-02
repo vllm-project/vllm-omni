@@ -15,6 +15,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     build_cell_plan,
     union_wait_ready,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
@@ -98,6 +99,138 @@ def test_reset_all_releases_versions():
     assert not cache.pool.has(key)
     assert cache.pool.has_free
     assert all(len(stack) == cache.capacity for stack in cache.pool.free)
+
+
+def _history_plan() -> CellPlan:
+    return build_cell_plan(
+        CellSchedule(
+            chunks=2,
+            num_denoise_steps=2,
+            step_replicas=3,
+            layer_groups=2,
+            ordering=Ordering.LATEST_KV,
+            kv_history_chunks=6,
+        )
+    )
+
+
+def test_finish_request_preserves_only_retained_history():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    lifecycle: KVCacheLifecycle[str] = state
+    plan = _history_plan()
+    state.begin_request("A", plan, chunk_tokens=4)
+    history = ("A", 0, 0, 0)
+    temporary = ("A", 1, 0, 0)
+    other = ("B", 0, 0, 0)
+    for key in (history, temporary, other):
+        cache.pool.alloc(key)
+    state.retain_history("A", [(0, 0, 0)])
+    lifecycle.finish_request("A")
+    lifecycle.finish_request("A")
+    assert cache.pool.has(history)
+    assert not cache.pool.has(temporary)
+    assert cache.pool.has(other)
+    with pytest.raises(ValueError, match="retains history"):
+        state.begin_request("A", plan, chunk_tokens=4)
+    lifecycle.release_history("A")
+    lifecycle.release_history("A")
+    assert not cache.pool.has(history)
+    assert cache.pool.has(other)
+    state.begin_request("A", plan, chunk_tokens=4)
+
+
+def test_retained_history_survives_last_use_eviction():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    plan = _history_plan()
+    state.begin_request("A", plan, chunk_tokens=4)
+    version, last = next(iter(plan.last_use(0).items()))
+    key = ("A", *version)
+    cache.pool.alloc(key)
+    state.retain_history("A", [version])
+    state.evict(last)
+    assert cache.pool.has(key)
+    with pytest.raises(RuntimeError, match="Finish"):
+        state.release_history("A")
+    state.end_request("A")
+    assert not cache.pool.has(key)
+
+
+def test_retain_history_validation_is_atomic():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    plan = _history_plan()
+    with pytest.raises(ValueError, match="no active request"):
+        state.retain_history("A", [])
+    state.begin_request("A", plan, chunk_tokens=4)
+    key = ("A", 0, 0, 0)
+    cache.pool.alloc(key)
+    with pytest.raises(ValueError, match="nonresident"):
+        state.retain_history("A", [(0, 0, 0), (1, 0, 0)])
+    state.finish_request("A")
+    assert not cache.pool.has(key)
+
+
+def test_reset_all_releases_finished_request_history():
+    cache = _cache()
+    state = NoisyKVState(cache)
+    plan = _history_plan()
+    state.begin_request("A", plan, chunk_tokens=4)
+    key = ("A", 0, 0, 0)
+    cache.pool.alloc(key)
+    state.retain_history("A", [(0, 0, 0)])
+    state.finish_request("A")
+    state.reset_all()
+    assert not cache.pool.has(key)
+    state.begin_request("A", plan, chunk_tokens=4)
+
+
+def test_history_release_waits_for_transport_before_pool_reuse(monkeypatch):
+    cache = _cache()
+    state = NoisyKVState(cache)
+    state.begin_request("A", _history_plan(), chunk_tokens=4)
+    key = ("A", 0, 0, 0)
+    cache.pool.alloc(key)
+    state.retain_history("A", [(0, 0, 0)])
+    state.finish_request("A")
+    events = []
+
+    def wait_sends():
+        assert cache.pool.has(key)
+        events.append("send complete")
+
+    def discard(version):
+        assert version == key
+        assert cache.pool.has(key)
+        events.append("receive complete")
+
+    monkeypatch.setattr(cache.transport, "wait_sends", wait_sends)
+    monkeypatch.setattr(cache.transport, "discard", discard)
+    state.release_history("A")
+    assert events == ["send complete", "receive complete"]
+    assert not cache.pool.has(key)
+
+
+def test_history_release_failure_keeps_storage_for_retry(monkeypatch):
+    cache = _cache()
+    state = NoisyKVState(cache)
+    state.begin_request("A", _history_plan(), chunk_tokens=4)
+    key = ("A", 0, 0, 0)
+    cache.pool.alloc(key)
+    state.retain_history("A", [(0, 0, 0)])
+    state.finish_request("A")
+
+    def failed_wait():
+        raise RuntimeError("transport failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cache.transport, "wait_sends", failed_wait)
+        with pytest.raises(RuntimeError, match="transport failure"):
+            state.release_history("A")
+    assert cache.pool.has(key)
+    state.release_history("A")
+    assert not cache.pool.has(key)
 
 
 def test_per_layer_free_stacks_do_not_share_slots():

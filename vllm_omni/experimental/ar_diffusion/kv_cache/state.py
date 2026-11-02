@@ -253,6 +253,11 @@ class ARDiffusionKVState:
         self.conditioning_kv.invalidate()
         self.kv_cache.release_cross_attention(self.session_id)
 
+    def finish_request(self) -> None:
+        """Finish a compute call while keeping all branches' session history."""
+        for kv_branch in self.adapters:
+            self.kv_cache.finish_request(self.adapter(kv_branch))
+
     def close(self) -> None:
         """Release all self- and cross-attention storage owned by this session."""
         if self._closed:
@@ -263,7 +268,7 @@ class ARDiffusionKVState:
         errors: list[Exception] = []
         for adapter in self.adapters.values():
             try:
-                self.kv_cache.end_request(adapter)
+                self.kv_cache.release_history(adapter)
             except Exception as exc:  # noqa: BLE001 - release all owned storage even on failure
                 errors.append(exc)
         self.kv_cache.release_cross_attention(self.session_id)
@@ -289,7 +294,7 @@ class ARDiffusionKVState:
                 segments.close()
             self._segments.clear()
             for adapter in self.adapters.values():
-                self.kv_cache.end_request(adapter)
+                self.kv_cache.release_history(adapter)
             self.kv_cache.retain_cross_attention(self.session_id, keep_cross_attention)
             self.conditioning_kv.retain(keep_cross_attention)
         else:

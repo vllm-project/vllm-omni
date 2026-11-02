@@ -110,6 +110,17 @@ path.
 
 ## KV ownership and capacity
 
+The storage boundary `KVCacheLifecycle[OwnerT]` separates finishing a compute
+request from releasing retained history. Legacy owners are session/branch
+adapters, not individual service request IDs. `ARDiffusionKVCache.finish_request`
+validates the owner and preserves its window/segment history; the successful
+request or emitted-chunk boundary in the runner calls it through
+`ARDiffusionKVState.finish_request`. Session close/reset and segment eviction
+use `release_history` to return pages to the existing pool. The old
+`end_request` method remains a compatibility entry point for full release.
+These operations do not add per-step synchronization or change history policy,
+layout, capacity, or model sampling.
+
 `ARDiffusionKVCacheSpec` is the pipeline-owned immutable geometry contract. It
 declares:
 

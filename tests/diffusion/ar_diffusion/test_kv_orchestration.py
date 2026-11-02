@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for ARDiffusionKVCache — the engine-level KV orchestration body (Phase 1)."""
 
 import pytest
 import torch
 
 from vllm_omni.experimental.ar_diffusion.capability import ARDiffusionKVBranchSpec
-from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVCache, ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVCache, ARDiffusionKVConfig, KVCacheLifecycle
+from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionRequestAdapter
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -77,6 +79,46 @@ def test_num_computed_advances_per_chunk():
     kv.commit_chunk(a)
     assert a.num_computed_tokens == 16
     kv.end_request(a)
+
+
+def test_lifecycle_completion_preserves_legacy_history_and_allows_continuation():
+    kv = make_cache()
+    lifecycle: KVCacheLifecycle[ARDiffusionRequestAdapter] = kv
+    free = kv.manager.block_pool.get_num_free_blocks()
+    adapter = kv.begin_request("session-branch")
+    kv.allocate_chunk(adapter)
+    kv.commit_chunk(adapter)
+    blocks = kv.window_block_ids(adapter)
+    occupied = kv.manager.block_pool.get_num_free_blocks()
+
+    lifecycle.finish_request(adapter)
+    lifecycle.finish_request(adapter)
+    assert kv.window_block_ids(adapter) == blocks
+    assert adapter.completed_chunks == 1
+    assert kv.manager.block_pool.get_num_free_blocks() == occupied
+
+    kv.allocate_chunk(adapter)
+    kv.commit_chunk(adapter)
+    assert adapter.completed_chunks == 2
+    lifecycle.finish_request(adapter)
+    lifecycle.release_history(adapter)
+    assert kv.manager.block_pool.get_num_free_blocks() == free
+
+
+def test_lifecycle_rejects_stale_legacy_owner_without_releasing_replacement():
+    kv = make_cache()
+    old = kv.begin_request("session-branch")
+    kv.end_request(old)
+    current = kv.begin_request("session-branch")
+    kv.allocate_chunk(current)
+    kv.commit_chunk(current)
+    blocks = kv.window_block_ids(current)
+    with pytest.raises(RuntimeError, match="no matching active adapter"):
+        kv.finish_request(old)
+    with pytest.raises(RuntimeError, match="no matching active adapter"):
+        kv.release_history(old)
+    assert kv.window_block_ids(current) == blocks
+    kv.release_history(current)
 
 
 def test_state_close_frees_both_branch_blocks():

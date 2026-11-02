@@ -36,6 +36,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.config import (
     ARDiffusionKVConfig,
     contiguous_kv_gather_enabled,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     ChunkWindowManager,
     ChunkWindowSpec,
@@ -178,7 +179,7 @@ class HistoryStagingState:
     signature: tuple[Any, ...] | None = None
 
 
-class ARDiffusionKVCache:
+class ARDiffusionKVCache(KVCacheLifecycle[ARDiffusionRequestAdapter]):
     """Own the paged KV pool and KV-branch-local storage for one model.
 
     Build once per loaded model (dimensions known); then per request:
@@ -777,7 +778,18 @@ class ARDiffusionKVCache:
         _log.debug("AR-Diffusion begin_request: req=%s prefill=%d", request_id, prefill_prefix_tokens)
         return adapter
 
-    def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
+    def finish_request(self, owner: ARDiffusionRequestAdapter) -> None:
+        """Finish a call without releasing the session branch's history.
+
+        Window/segment commit already applies the history policy. This backend
+        has no additional per-call allocation to retire; the adapter remains
+        installed until explicit history release, reset or close.
+        """
+        self._require_current_adapter(owner)
+
+    def release_history(self, owner: ARDiffusionRequestAdapter) -> None:
+        """Release one branch/segment allocation after computation stops."""
+        adapter = owner
         self._require_current_adapter(adapter)
         _log.debug(
             "AR-Diffusion end_request: req=%s chunks=%d free=%d",
@@ -787,6 +799,10 @@ class ARDiffusionKVCache:
         )
         self.manager.free(adapter)
         self._adapters.pop(adapter.request_id, None)
+
+    def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
+        """Compatibility entry point for releasing an owner's entire history."""
+        self.release_history(adapter)
 
     # -- per-chunk operations ------------------------------------------------
 

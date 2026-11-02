@@ -436,7 +436,7 @@ def run_cell_pipeline(
                 if local + 1 < item.plan.num_slots:
                     still.append(item)
                 else:
-                    kv.end_request(item.req)
+                    kv.finish_request(item.req)
             ctx.inflight = still
             kv.set_inflight(tuple(ctx.inflight))
             # End-of-slot wait for remotes first consumed at slot+1 (plan wait_ready).

@@ -81,7 +81,7 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
     for handle in handles:
         handle.wait()
     expected_bytes = 2 * chunk_tokens * spec.num_kv_heads * spec.head_size * 4
-    if mode != "immediate":
+    if mode not in ("immediate", "retain"):
         assert cache.transport.await_ready(frozenset()) == (1 if rank == xfer.dst else 0)
         torch.distributed.barrier()
         cache.transport.exchange((), rank=rank, pp_group=pp_group, chunk_tokens_by_request={"A": chunk_tokens})
@@ -120,7 +120,15 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
         flush=True,
     )
     torch.distributed.barrier()
-    state.end_request("A")
+    if mode == "retain":
+        state.retain_history("A", [xfer.version])
+        state.evict(plan.last_use(rank)[xfer.version])
+        state.finish_request("A")
+        assert pool.has(key)
+        state.release_history("A")
+        assert not pool.has(key)
+    else:
+        state.end_request("A")
     pp_group.destroy()
     torch.distributed.destroy_process_group()
 
@@ -139,6 +147,14 @@ def test_unused_inbound_kv_finishes_before_page_reuse() -> None:
     torch.multiprocessing.spawn(
         _transfer_worker,
         args=(4, f"tcp://127.0.0.1:{get_open_port()}", "cpu", "discard"),
+        nprocs=2,
+    )
+
+
+def test_noisy_kv_transfer_retains_history_after_completion() -> None:
+    torch.multiprocessing.spawn(
+        _transfer_worker,
+        args=(4, f"tcp://127.0.0.1:{get_open_port()}", "cpu", "retain"),
         nprocs=2,
     )
 

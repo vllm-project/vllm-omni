@@ -424,6 +424,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 yield
             if synchronize:
                 current_omni_platform.synchronize()
+                state.finish_request()
         except Exception:
             self._release_session(
                 session_id,
@@ -719,6 +720,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 # it must sit inside the same fail-closed scope as the step
                 # itself rather than leave cleanup to the scheduler's next cycle.
                 current_omni_platform.synchronize()
+                if not errored:
+                    self._sessions[session_id].finish_request()
         except Exception:
             self._fail_closed_stepwise(request_id)
             raise

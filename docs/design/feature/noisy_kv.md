@@ -179,6 +179,38 @@ exception does not leak `VersionPool` slots. Rank topology is described by
 
 ## NoisyKV
 
+### KV lifecycle boundary
+
+`KVCacheLifecycle[OwnerT]` defines the common `finish_request(owner)` and
+`release_history(owner)` operations. Owners remain backend-local: a legacy
+session/branch adapter or a Noisy version namespace. The protocol does not
+require shared token, layer or Cell coordinates.
+
+`NoisyKVState` separates request completion from history release:
+
+- `retain_history(req, versions)` pins resident versions before their planned
+  last use. The caller chooses versions according to the model's history policy.
+- `finish_request(req)` releases temporary versions and execution metadata while
+  keeping pinned history. The Cell executor uses this on successful completion.
+- `release_history(req)` releases pinned history after the request has finished.
+- `end_request(req)` remains the full-cleanup compatibility entry point, used
+  for cancellation; `reset_all()` also clears retained history.
+
+Completion and cleanup require model computation to have stopped. Before
+returning a slot to the pool, cleanup waits for outbound sends and discards any
+pending receive through the transport's completion mechanism. Logical release
+returns slots to the existing pool; it does not free its GPU tensors.
+
+Existing callers do not pin history, so their retention behavior is unchanged.
+The legacy path already retains history in runner-owned `ARDiffusionKVState`
+across calls and releases it through `close()` / `reset()`. These paths retain
+their different KV layouts and allocation granularity. The Noisy operations
+establish the common lifecycle boundary, without implementing Session
+continuation or a shared allocation/read/write interface yet. A retained Noisy
+owner cannot be reused until its history is released; future continuation must
+explicitly bind history and generation positions instead of reusing local Cell
+coordinates implicitly.
+
 Implemented in `experimental/ar_diffusion/kv_cache/noisy.py`.
 
 | | |

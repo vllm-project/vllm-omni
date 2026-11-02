@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """AR-Diffusion engine-level KV cache helpers.
 
 Thin glue over vLLM's paged KV stack (``KVCacheManager`` / ``BlockPool`` /
@@ -11,6 +12,7 @@ request adapter / pool builders) · ``state`` (the model-facing ARDiffusionKVSta
 """
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.lifecycle import KVCacheLifecycle
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import (
     ARDiffusionKVCache,
     ARDiffusionRequestAdapter,
@@ -43,6 +45,7 @@ __all__ = [
     "ARDiffusionRequestAdapter",
     "ChunkWindowManager",
     "ChunkWindowSpec",
+    "KVCacheLifecycle",
     "allocate_kv_pool_with_views",
     "ar_diffusion_paged_attention",
     "build_kv_manager",
