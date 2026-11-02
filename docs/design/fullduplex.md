@@ -429,6 +429,21 @@ The existing private request slot, preemption and mailbox own its execution.
 After successful resource cleanup, the owner binds those handles and validates
 epoch, settings, source, catalogue and suppression fences before admission.
 
+Qwen3-Omni text-card extraction is experimental and opt-in through the server's
+`duplex_session.context_memory` deployment mapping. An absent or null mapping
+disables extraction before history capture; clients cannot enable it through
+`session.update`. Other plugins reject this deployment setting. The mapping
+bounds captured sources and characters, request input/output tokens, deadlines
+and the session's rolling auxiliary compute allowance. Token counts include the
+real Thinker template and are checked against the deployed model context limit.
+Extraction uses only private stage-0 requests; cards are not yet inserted into
+ordinary conversation prompts.
+
+If captured work cannot fit, the plugin asks the owner to recapture a smaller
+range. Resizing neither admits nodes nor advances coverage. Every new range
+receives a fresh descriptor and the usual admission fences. If even the minimum
+range cannot fit, that work parks without a model forward or a repeating retry.
+
 Progress covers text fragments and bounded catalogue pages. A successful empty
 result advances only its coverage unit. Own card admissions retain the current
 page pass; external catalogue changes discard it. New keys require extension

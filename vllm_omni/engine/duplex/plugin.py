@@ -32,6 +32,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.memory_types import (
     DuplexContextAuxiliaryInput,
     DuplexContextAuxiliaryPolicy,
+    DuplexContextAuxiliaryRechunk,
     DuplexContextAuxiliaryWork,
     DuplexMemoryProposalBatch,
 )
@@ -463,6 +464,11 @@ class DuplexModelPlugin(ABC):
     def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
         """Bind model policy to the resolved deployment topology before admission."""
 
+    def configure_session_runtime(self, runtime_config: DuplexSessionRuntimeConfig) -> None:
+        """Bind deployment-owned policy before sessions can be admitted."""
+        if runtime_config.context_memory is not None:
+            raise ValueError("context_memory is unsupported by this duplex plugin")
+
     def input_stage_id(self, payload: object) -> int:
         """Select the entry stage for one append before reserving its request."""
         return 0
@@ -512,7 +518,7 @@ class DuplexModelPlugin(ABC):
 
     async def prepare_context_auxiliary_request(
         self, *, context: DuplexContextAuxiliaryInput, runtime_config: Mapping[str, object]
-    ) -> DuplexAuxiliaryRequest | None:
+    ) -> DuplexAuxiliaryRequest | DuplexContextAuxiliaryRechunk | None:
         """Prepare private work from detached evidence, without live session state."""
         return None
 

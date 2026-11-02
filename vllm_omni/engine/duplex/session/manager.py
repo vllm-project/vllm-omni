@@ -121,6 +121,7 @@ class DuplexSessionManager:
         executor: concurrent.futures.ThreadPoolExecutor | None = None,
     ) -> None:
         validate_duplex_plugin_sampling(plugin, sampling_defaults=tuple(stage_port.sampling_defaults()))
+        plugin.configure_session_runtime(runtime_config)
         self.plugin = plugin
         self.stage_port = stage_port
         self.model_config = model_config

@@ -101,6 +101,8 @@ class DuplexMemoryContextState:
         self._recovery: _ReconciliationPass | None = None
         self._next_recovery_id = 1
         self._force_recovery = False
+        self._catalog_width = 16
+        self._adaptive_chars = 8192
 
     def note_change(self, slot_order: int) -> None:
         if self._recovery is not None and slot_order < self._recovery.target:
@@ -171,6 +173,7 @@ class DuplexMemoryContextState:
             raise ValueError("invalid_memory_text_limit")
         if session.state is not DuplexSessionState.OPEN:
             return None
+        max_chars = min(max_chars, self._adaptive_chars)
         limits = (max_sources, max_chars, excluded_item_ids)
         if (
             self._pending is not None
@@ -253,7 +256,8 @@ class DuplexMemoryContextState:
             start=self._cursor,
             end=end,
             evidence=tuple(evidence),
-            pages=[keys[index : index + 16] for index in range(0, len(keys), 16)] or [()],
+            pages=[keys[index : index + self._catalog_width] for index in range(0, len(keys), self._catalog_width)]
+            or [()],
             catalog_revision=session.context_ledger.card_catalog_revision,
         )
         self._next_pass_id += 1
@@ -326,6 +330,27 @@ class DuplexMemoryContextState:
         ):
             return False
         return self._evidence_matches(session, context.evidence)
+
+    def rechunk(self, session: DuplexEngineSession, context: DuplexContextAuxiliaryInput) -> bool:
+        """Replace retained work with a smaller capture without acknowledging it.
+
+        Ceilings only shrink during a session, so an unfit minimum parks rather
+        than repeatedly re-tokenizing. Restarting the current catalogue pass may
+        replay pages, but cannot advance past an unexamined text range.
+        """
+        if not self.matches(session, context):
+            return False
+        if len(context.catalog) > 1:
+            self._catalog_width = min(self._catalog_width, len(context.catalog) // 2)
+        else:
+            chars = sum(len(item.text) for item in context.evidence)
+            if chars <= 1:
+                return False
+            self._adaptive_chars = min(self._adaptive_chars, chars // 2)
+        self._pending = None
+        self._pass = None
+        self._generation += 1
+        return True
 
     def _evidence_matches(self, session: DuplexEngineSession, evidence: tuple[DuplexContextEvidence, ...]) -> bool:
         sources = {source.source_id: source for source in session._conversation.sources.values()}
@@ -463,7 +488,9 @@ class DuplexMemoryContextState:
                 new_keys = tuple(sorted(discovered))
                 recovery.replay_keys.update(discovered)
                 recovery.known_keys.update(discovered)
-            current_pass.pages.extend(new_keys[index : index + 16] for index in range(0, len(new_keys), 16))
+            current_pass.pages.extend(
+                new_keys[index : index + self._catalog_width] for index in range(0, len(new_keys), self._catalog_width)
+            )
             current_pass.catalog_revision = session.context_ledger.card_catalog_revision
             current_pass.page += 1
             if current_pass.page == len(current_pass.pages):

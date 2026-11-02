@@ -19,6 +19,7 @@ from vllm.config import KernelConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
+from vllm_omni.config.context_memory import DuplexContextMemoryConfig
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
@@ -744,12 +745,22 @@ class DuplexSessionRuntimeConfig:
     # (Qwen3-Omni): user turns before the N most recent user runs drop their
     # audio and image parts there. ``None`` leaves every prompt unchanged.
     context_keep_media_turns: int | None = None
+    # Experimental text-only extraction; configured only by the deployment.
+    context_memory: DuplexContextMemoryConfig | None = None
     # Record per-turn stage work and emitted audio and answer the client's
     # ``session.stats.get`` (RFC #8325). Off: nothing is recorded or attached.
     # Single-host only: stage and API timestamps share one CLOCK_MONOTONIC.
     collect_stats: bool = False
 
     def __post_init__(self) -> None:
+        if isinstance(self.context_memory, Mapping):
+            try:
+                memory = DuplexContextMemoryConfig(**self.context_memory)
+            except TypeError as exc:
+                raise ValueError("invalid duplex_session.context_memory fields") from exc
+            object.__setattr__(self, "context_memory", memory)
+        elif self.context_memory is not None and not isinstance(self.context_memory, DuplexContextMemoryConfig):
+            raise ValueError("duplex_session.context_memory must be a mapping or null")
         if not isinstance(self.collect_stats, bool):
             raise ValueError("duplex_session.collect_stats must be a boolean")
         if self.replica_policy not in ("legacy", "least_sessions"):

@@ -26,7 +26,11 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_is_auxiliary_request,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex.memory_types import DuplexContextAuxiliaryInput, DuplexContextAuxiliaryPolicy
+from vllm_omni.engine.duplex.memory_types import (
+    DuplexContextAuxiliaryInput,
+    DuplexContextAuxiliaryPolicy,
+    DuplexContextAuxiliaryRechunk,
+)
 from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryPolicy, DuplexAuxiliaryRequest, duplex_text_history
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudget, DuplexAuxiliaryReservation
@@ -483,7 +487,18 @@ class SessionMemoryRuntime:
                     state=self._ctx.model_state,
                 )
             )
-            request = await asyncio.wait_for(preparation, timeout=30.0)
+            prepared = await asyncio.wait_for(preparation, timeout=30.0)
+            if isinstance(prepared, DuplexContextAuxiliaryRechunk):
+                if (
+                    context is not None
+                    and not self._closing
+                    and session.epoch == epoch
+                    and session.config_revision == config_revision
+                    and session.rechunk_memory_context(context)
+                ):
+                    self._source = None
+                return
+            request = prepared
             if request is not None and context is not None:
                 if request.context_work is not None and request.context_work != context.work:
                     return

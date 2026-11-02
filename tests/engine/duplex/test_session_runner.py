@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
+from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
@@ -55,7 +56,6 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
-from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 
@@ -240,6 +240,7 @@ async def open_harness(
     log_stats: bool = False,
     plugin: DuplexModelPlugin | None = None,
     model: str = "openbmb/MiniCPM-o-4_5",
+    model_config: Any = None,
 ) -> Harness:
     if plugin is None:
         plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
@@ -257,7 +258,7 @@ async def open_harness(
         output_sink=output,
         result_sink=results,
         runtime_config=limits,
-        model_config=None,
+        model_config=model_config,
         log_stats=log_stats,
         clock=clock,
     )

@@ -84,6 +84,11 @@ class DuplexMemoryCursor:
 
 
 @dataclass(frozen=True)
+class DuplexContextAuxiliaryRechunk:
+    """A plugin asks the owner for smaller work; it conveys no coverage."""
+
+
+@dataclass(frozen=True)
 class DuplexContextEvidence:
     handle: int
     source_id: int

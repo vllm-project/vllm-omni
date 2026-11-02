@@ -15,6 +15,7 @@ import io
 import json
 import os
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -23,9 +24,12 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_omni.config.context_memory import DuplexContextMemoryConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
+from vllm_omni.engine.duplex.memory_types import DuplexContextAuxiliaryPolicy, DuplexContextAuxiliaryRechunk
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudgetLimits
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
 from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
@@ -335,16 +339,69 @@ class QwenDataPlane(DuplexDataPlane):
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
+    private_runtime_config_keys = frozenset({"context_memory", "duplex_session", "memory_compute_budget"})
 
     def __init__(self, encode_audio):
         self.data_plane = QwenDataPlane(encode_audio)
         self.processor = None
         self._processor_lock = asyncio.Lock()
         self._history_calibrator = None
+        self._memory_config: DuplexContextMemoryConfig | None = None
+        self._memory_compute_limits: DuplexAuxiliaryBudgetLimits | None = None
+        self._memory_max_model_len: int | None = None
         # Checkpoint speaker names, loaded once from the stage-0 model config.
         # ``None`` means "not attempted" (no validation); an empty set means the
         # checkpoint declares no speaker_id mapping (names pass through unvalidated).
         self._supported_speakers: set[str] | None = None
+
+    def configure_session_runtime(self, runtime_config):
+        self._memory_config = runtime_config.context_memory
+        self.supports_context_auxiliary_requests = self._memory_config is not None
+        self._memory_compute_limits = None
+        if self._memory_config is not None:
+            config = self._memory_config
+            self._memory_compute_limits = DuplexAuxiliaryBudgetLimits(
+                max_input_tokens=config.compute_input_tokens,
+                max_output_tokens=config.compute_output_tokens,
+                window_s=config.compute_window_s,
+                cooldown_s=config.cooldown_s,
+                idle_s=config.idle_s,
+            )
+
+    def context_auxiliary_policy(self, *, runtime_config):
+        config = self._memory_config
+        if config is None:
+            return None
+        return DuplexContextAuxiliaryPolicy(
+            max_sources=config.max_sources, max_chars=config.max_chars, compute_budget=self._memory_compute_limits
+        )
+
+    async def prepare_context_auxiliary_request(self, *, context, runtime_config):
+        config = self._memory_config
+        if config is None:
+            return None
+        if self._memory_max_model_len is None:
+            raise DuplexRuntimeConfigError("Qwen memory requires deployed max_model_len")
+        from vllm_omni.model_executor.models.qwen3_omni.duplex.memory_request import build_memory_request
+
+        # Tokenization uses a detached bounded capture; cancellation cannot
+        # mutate history or acknowledge coverage in the owner.
+        request = await asyncio.to_thread(
+            build_memory_request,
+            context,
+            processor=self.processor,
+            input_token_limit=min(config.input_token_limit, config.compute_input_tokens),
+            output_token_limit=config.output_token_limit,
+            max_model_len=self._memory_max_model_len,
+        )
+        if request is None:
+            return DuplexContextAuxiliaryRechunk()
+        return replace(request, timeout_s=config.timeout_s, retry_delays_s=(0,))
+
+    def decode_context_auxiliary_result(self, *, request, output):
+        from vllm_omni.model_executor.models.qwen3_omni.duplex.memory_request import decode_memory_result
+
+        return decode_memory_result(request=request, output=output)
 
     def history_calibrator(self, runtime_config):
         if runtime_config.history_asr_url is None and runtime_config.history_ms_per_token is None:
@@ -412,6 +469,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         return QwenDuplexSessionState()
 
     def validate_client_extra_body(self, extra_body):
+        super().validate_client_extra_body(extra_body)
         if not isinstance(extra_body, Mapping):
             return
         if extra_body.get("auto_response"):
@@ -439,6 +497,11 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.validate_client_extra_body(config.extra_body)
         if config.ref_audio:
             raise DuplexRuntimeConfigError("Qwen duplex does not support reference voice audio")
+        if self._memory_config is not None:
+            max_model_len = getattr(model_config, "max_model_len", None)
+            if type(max_model_len) is not int or max_model_len < 1:
+                raise DuplexRuntimeConfigError("Qwen memory requires deployed max_model_len")
+            self._memory_max_model_len = max_model_len
         self._load_supported_speakers(model_config)
         if model_config is None and self.processor is None:
             raise DuplexRuntimeConfigError("Qwen duplex requires the stage-0 model configuration")
