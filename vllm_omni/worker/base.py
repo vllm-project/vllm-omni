@@ -94,6 +94,23 @@ class OmniGPUWorkerBase(GPUWorker):
             gc.collect()
             return res
 
+    def get_stage_post_warmup_memory_stats(self) -> dict[str, int] | None:
+        if self.rank != 0:
+            return None
+        model = self.model_runner.get_model()
+        get_stats = getattr(model, "get_stage_post_warmup_memory_stats", None)
+        if get_stats is None:
+            return None
+
+        stats = get_stats()
+        if stats is None:
+            return None
+
+        return {
+            "allocated_bytes": stats.allocated_bytes,
+            "reserved_bytes": stats.reserved_bytes,
+        }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -167,10 +184,17 @@ class OmniGPUWorkerBase(GPUWorker):
             1. requested_memory = total_gpu_memory * gpu_memory_utilization
                (computed in init_device from cache_config)
 
-            2. Measure weights + peak_activation + non_torch_increase with
-               ``memory_profiling`` around ``profile_run()``.
-               ``non_torch_increase`` is device-level, so it reflects whatever
-               else is resident on the GPU at profiling time.
+            2. Measure weights + pre-profiling runner buffers +
+               peak_activation + non_torch_increase with ``memory_profiling``
+               around ``profile_run()``. Runner buffers allocated before
+               profiling are the torch allocations beyond the weights when
+               profiling starts; they are part of neither the weights nor the
+               profiling-window peak increase. ``non_torch_increase`` is
+               device-level, so it reflects whatever else is resident on the
+               GPU at profiling time. Upstream's ``non_kv_cache_memory`` is not
+               used: it also counts memory the caching allocator reserves but
+               does not allocate, e.g. graph pools captured at model load,
+               which co-located stage budgets are tuned without.
 
             3. Profile the CUDA graphs the runner captures through
                ``cudagraph_dispatcher``, the encoder graph manager and the
@@ -239,7 +263,7 @@ class OmniGPUWorkerBase(GPUWorker):
         # graph size again when it suggests --kv-cache-memory in
         # compile_or_warm_up_model. Keep the activation peak alone so that
         # suggestion counts the graph pool once.
-        self.peak_activation_memory = profile_result.torch_peak_increase
+        self.peak_activation_memory = profile_result.transient_peak_headroom
         # Upstream 58b2012aa2 added `total_consumed` to the profiling result
         # and reads it in GPUWorker.compile_or_warm_up_model() (when
         # kv_cache_memory_bytes is None and peak_activation_memory is set, both
@@ -248,8 +272,11 @@ class OmniGPUWorkerBase(GPUWorker):
         # --kv-cache-memory suggestion counts them here.
         self.total_consumed = profile_result.total_consumed + auxiliary_graph_memory
 
+        weights_memory = int(self.model_runner.model_memory_usage)
+        preprofile_buffers = max(0, profile_result.before_profile.torch_allocated - weights_memory)
         profiled_usage = (
-            int(self.model_runner.model_memory_usage)
+            weights_memory
+            + preprofile_buffers
             + profile_result.torch_peak_increase
             + profile_result.non_torch_increase
             + cudagraph_memory_estimate
@@ -329,9 +356,9 @@ class OmniGPUWorkerBase(GPUWorker):
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            from vllm.device_allocator.cumem import CuMemAllocator
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            allocator = CuMemAllocator.get_instance()
+            allocator = get_mem_allocator_instance()
             logger.info(f"[LLM Worker {self.rank}] Sleep Mode ENABLED. Activating CuMem pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         else:
@@ -344,7 +371,7 @@ class OmniGPUWorkerBase(GPUWorker):
         Args:
             level: 1 (Offload weights to CPU), level: 2 (Total Discard).
         """
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
         # Drain in-flight kernels before CuMem unmap. Abort/decode can still
         # have GPU work after the scheduler reports idle; unmapping then
@@ -354,7 +381,7 @@ class OmniGPUWorkerBase(GPUWorker):
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
         offload_tags = ("weights",) if level == 1 else tuple()
-        allocator = CuMemAllocator.get_instance()
+        allocator = get_mem_allocator_instance()
         allocator.sleep(offload_tags=offload_tags)
         # allocator.sleep already gc.collects and empty_cache()s. A second
         # empty_cache on the pluggable allocator is a known CUDA invalid
@@ -372,9 +399,9 @@ class OmniGPUWorkerBase(GPUWorker):
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
         "Physical video memory reloading logic"
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
-        allocator = CuMemAllocator.get_instance()
+        allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")

@@ -257,6 +257,24 @@ class SessionHeartbeatAck(RealtimeEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class SessionStats(RealtimeEvent):
+    """Server-side per-chunk stage work and audio of this session (reply to ``session.stats.get``)."""
+
+    wire_type = "session.stats"
+
+    #: The ``event_id`` of the ``session.stats.get`` this answers.
+    request_event_id: str | None = None
+    #: The stats document (RFC #8325 §3.3), built by the engine and rendered as-is.
+    stats: Mapping[str, object] = field(default_factory=dict)
+
+    def _wire_fields(self) -> dict[str, object]:
+        data: dict[str, object] = {"session_id": self.session_id, "stats": wire_value(self.stats)}
+        if self.request_event_id is not None:
+            data["request_event_id"] = self.request_event_id
+        return data
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class TurnEvent(RealtimeEvent):
     """Turn-state transition (``turn.event``)."""
 
@@ -366,7 +384,7 @@ def error_event(
 
 
 #: The complete event vocabulary a duplex client may receive: 21 Tier 1
-#: classes re-exported unchanged, the 9 Tier 2 ones defined above, and 12
+#: classes re-exported unchanged, the 9 Tier 2 ones defined above, and 13
 #: Tier 3 ones. A duplex consumer imports from here and never reaches past
 #: this module into ``vllm_omni.protocol.realtime``.
 __all__ = [
@@ -413,6 +431,7 @@ __all__ = [
     "SessionReplaced",
     "SessionResumed",
     "SessionResyncRequired",
+    "SessionStats",
     "Speak",
     "TurnEvent",
     # Bases and helpers shared with the Tier 1 surface.

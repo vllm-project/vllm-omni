@@ -12,7 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 
+from vllm_omni.worker import sampling_utils
 from vllm_omni.worker.sampling_utils import build_model_sampler_extra_args, call_model_sampler
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -93,8 +95,6 @@ def test_non_opted_in_sampler_keeps_two_argument_contract(mocker):
 
 @pytest.mark.parametrize("with_extra_args", [False, True])
 def test_opted_in_sampler_receives_host_sampling_params_in_row_order(mocker, with_extra_args):
-    from vllm.sampling_params import SamplingParams
-
     params = SamplingParams(repetition_penalty=1.05, extra_args={"ar_task_mode": "generation"})
     model = SimpleNamespace(model_sampler_wants_sampling_params=True, model_sampler_wants_extra_args=with_extra_args)
     model_sample = mocker.Mock(return_value="sampled")
@@ -113,4 +113,34 @@ def test_opted_in_sampler_receives_host_sampling_params_in_row_order(mocker, wit
     if with_extra_args:
         kwargs["per_req_extra_args"] = [None, None, params.extra_args]
     model_sample.assert_called_once_with(logits, metadata, **kwargs)
+    assert result == "sampled"
+
+
+@pytest.mark.parametrize("opted_in", [False, True])
+def test_unsupported_deferred_rng_is_logged_without_changing_contract(mocker, opted_in):
+    model = SimpleNamespace(model_sampler_wants_sampling_params=opted_in)
+    model_sample = mocker.Mock(return_value="sampled")
+    debug = mocker.patch.object(sampling_utils.logger, "debug_once")
+    logits = torch.empty(0)
+    metadata = SimpleNamespace()
+    result = call_model_sampler(
+        model, model_sample, logits, metadata, input_batch=SimpleNamespace(req_ids=[]), requests={}, defer_rng=True
+    )
+    kwargs = {"per_req_sampling_params": []} if opted_in else {}
+    model_sample.assert_called_once_with(logits, metadata, **kwargs)
+    debug.assert_called_once()
+    assert result == "sampled"
+
+
+def test_supported_deferred_rng_is_forwarded(mocker):
+    model = SimpleNamespace(model_sampler_wants_sampling_params=True, model_sampler_can_defer_rng=True)
+    model_sample = mocker.Mock(return_value="sampled")
+    debug = mocker.patch.object(sampling_utils.logger, "debug_once")
+    logits = torch.empty(0)
+    metadata = SimpleNamespace()
+    result = call_model_sampler(
+        model, model_sample, logits, metadata, input_batch=SimpleNamespace(req_ids=[]), requests={}, defer_rng=True
+    )
+    model_sample.assert_called_once_with(logits, metadata, per_req_sampling_params=[], defer_rng=True)
+    debug.assert_not_called()
     assert result == "sampled"
