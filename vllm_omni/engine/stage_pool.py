@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.pooling_params import PoolingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.output_processor import RequestState
@@ -146,6 +145,12 @@ class StagePool:
             "reset_prefix_cache",
             "reset_encoder_cache",
             "reset_mm_cache",
+            # add_lora carries a LoRARequest, which the generic collective path
+            # nests in an untyped args tuple. The worker's generic decoder only
+            # converts top-level msgspec-annotated arguments, so the adapter
+            # would arrive as a plain list with no lora_int_id (#9242). Routing
+            # it through the typed helper keeps the request a struct.
+            "add_lora",
         }
     )
 
@@ -1647,24 +1652,8 @@ class StagePool:
                     if timeout is not None:
                         return await asyncio.wait_for(result, timeout=timeout)
                     return await result
-                if method in self._CACHE_RESET_METHODS or method == "release_kv_cache_memory":
+                if method in self._CACHE_RESET_METHODS or method == "release_kv_cache_memory" or method == "add_lora":
                     return {"supported": False, "error": f"EngineCore helper {method}_async is unavailable"}
-
-            # add_lora must reach the worker through the typed utility call, not
-            # the generic collective_rpc: the latter nests the LoRARequest in an
-            # untyped args tuple, and the worker's generic decoder only converts
-            # top-level msgspec-annotated arguments, so the adapter would arrive
-            # as a plain list with no lora_int_id (#9242). Diffusion stages keep
-            # the generic path so their "not implemented" shape is unchanged.
-            lora_request = args[0] if args else kwargs.get("lora_request")
-            if method == "add_lora" and self.stage_type != "diffusion" and isinstance(lora_request, LoRARequest):
-                add_lora_async = getattr(client, "add_lora_async", None)
-                if callable(add_lora_async):
-                    result = add_lora_async(lora_request)
-                    if timeout is not None:
-                        return await asyncio.wait_for(result, timeout=timeout)
-                    return await result
-                return {"supported": False, "error": "EngineCore helper add_lora_async is unavailable"}
 
             return await client.collective_rpc_async(
                 method=method,
