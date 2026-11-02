@@ -431,6 +431,7 @@ class LingBotSelfAttention(nn.Module):
                 update_cache=update_cache,
             )
             if (query.is_cuda or query.device.type == "npu") and query.shape[0] == 1:
+                # ``key`` is still the current chunk alone; the history is only in ``visible_key``.
                 output = _paged_direct_attention(
                     query, visible_key, visible_value, chunk_tokens=key.shape[1], softmax_scale=self.head_dim**-0.5
                 )
