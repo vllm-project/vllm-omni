@@ -60,9 +60,47 @@ def test_lone_leading_zero_is_comma_broken():
     assert shape_voxcpm2_edge_digits("0今天天气真好") == "0，今天天气真好"
 
 
+def test_leading_digit_bound_to_unit_or_date_keeps_no_comma():
+    # [important regression, linyueqian]: the leading rule must only fire for
+    # STANDALONE edge numbers. A digit bound to a unit/date/time/measure char
+    # is a normal numeric expression; the inserted comma garbles or does not
+    # help (measured: "3点到" reads worse with the comma, n=5; the dates and
+    # magnitudes below read perfectly without it, n=3 each).
+    assert shape_voxcpm2_edge_digits("1月1日开会") == "1月1日开会"
+    assert shape_voxcpm2_edge_digits("3点到") == "3点到"
+    assert shape_voxcpm2_edge_digits("10月份见") == "10月份见"
+    assert shape_voxcpm2_edge_digits("2万元已到账") == "2万元已到账"
+    assert shape_voxcpm2_edge_digits("5个苹果") == "5个苹果"
+    assert shape_voxcpm2_edge_digits("3斤苹果") == "3斤苹果"
+
+
+def test_leading_standalone_digit_run_still_gets_comma():
+    # the designed shapes (digit followed by a non-bound Han char) keep the pad
+    assert shape_voxcpm2_edge_digits("10今天天气真好") == "10，今天天气真好"
+    assert shape_voxcpm2_edge_digits("1今天天气真好") == "1，今天天气真好"
+    assert shape_voxcpm2_edge_digits("48今天天气真好") == "48，今天天气真好"
+    assert shape_voxcpm2_edge_digits("0今天天气真好") == "0，今天天气真好"
+
+
 def test_lone_trailing_zero_is_sentinel_held():
     out = shape_voxcpm2_edge_digits("今天天气真好，一起去吃饭。0。")
     assert out.endswith("\uee00。")
+
+
+def test_lone_trailing_zero_before_final_newline_keeps_the_zero():
+    # "$" also matches before a final newline: the matched "0。" here is NOT
+    # the last two characters ("。\n" is), so a text[:-2] slice dropped the
+    # wrong span and re-appended the stop -> "今天00。" with TN off.
+    out = shape_voxcpm2_edge_digits("今天天气真好，一起去吃饭。0。\n")
+    assert out == "今天天气真好，一起去吃饭。\uee00。\n"
+    # and the restore path (TN off) puts back exactly one 0
+    from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import normalize_voxcpm2_text
+
+    monkey_text = out
+    import os
+
+    os.environ["VLLM_OMNI_SPEECH_TEXT_NORMALIZE"] = "0"
+    assert normalize_voxcpm2_text(monkey_text, None) == "今天天气真好，一起去吃饭。0。\n"
 
 
 def test_zero_inside_multi_digit_run_is_not_sentinel_split():
@@ -135,14 +173,24 @@ def test_normalize_calls_normalizer_when_on(monkeypatch):
 def test_normalize_sentinel_survives_normalizer_roundtrip(monkeypatch):
     from vllm_omni.entrypoints.openai.tts_adapters.voxcpm2_digits import normalize_voxcpm2_text
 
-    # a lone leading zero is sentinel-held into TN and restored after
+    # a lone leading zero is sentinel-held into TN and restored after.
+    # The extra "3+5" keeps a TN trigger alive after the sentinel removes
+    # the leading zero - the original single-number input made this a
+    # no-op (the sentinel removed the only TN trigger, so _Stub.normalize
+    # was never called and the test passed vacuously).
     class _Stub:
+        def __init__(self):
+            self.calls = []
+
         def normalize(self, t):
-            return t.replace("0", "零")  # would eat a bare leading 0
+            self.calls.append(t)
+            return t.replace("0", "零").replace("3+5", "三加五")  # would eat a bare leading 0
 
     monkeypatch.setenv("VLLM_OMNI_SPEECH_TEXT_NORMALIZE", "1")
-    shaped = shape_voxcpm2_edge_digits("0今天天气真好")
-    out = normalize_voxcpm2_text(shaped, _Stub())
+    shaped = shape_voxcpm2_edge_digits("0今天天气真好，3+5=8")
+    stub = _Stub()
+    out = normalize_voxcpm2_text(shaped, stub)
+    assert stub.calls, "the normalizer must actually run (a TN trigger must survive the sentinel)"
     assert out.startswith("0，"), f"sentinel must protect the leading 0 through TN, got {out!r}"
 
 
