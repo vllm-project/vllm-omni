@@ -24,6 +24,7 @@ from vllm.v1.worker import gpu_input_batch
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_omni.core.prefix_cache import ModelCachePolicy, StageCacheOutputs
+from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
@@ -39,6 +40,62 @@ from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentio
 from vllm_omni.worker.sampling_utils import clamp_prompt_ids_to_penalty_padding
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_model_sampling_progress_does_not_copy_lifecycle_history(mocker, opt_in):
+    class NoIteration(list):
+        def __iter__(self):
+            raise AssertionError("Per-step lifecycle history must not be copied")
+
+    runner = object.__new__(GPUARModelRunner)
+    mocker.patch("vllm_omni.worker.gpu_model_runner.get_pp_group", return_value=mocker.Mock(is_first_rank=True))
+    runner.model_config = mocker.Mock(is_encoder_decoder=False)
+    runner.vllm_config = mocker.Mock(model_config=mocker.Mock(async_chunk=True))
+    runner.supports_mm_inputs = runner.enable_prompt_embeds = runner.uses_mrope = runner.has_talker_mtp = False
+    runner.model = mocker.Mock(spec=torch.nn.Module)
+    runner.model.has_preprocess = True
+    runner.model.requires_request_sampling_params = opt_in
+    seen = {}
+
+    def preprocess(input_ids, input_embeds, **info):
+        seen.update(info)
+        return input_ids, input_embeds, {}
+
+    runner.model.preprocess = preprocess
+    params = SamplingParams(max_tokens=128, seed=42)
+    runner.requests = {"r": CachedRequestState("r", [0], [], params, None, ([],), 64, NoIteration([0] * 63 + [1]))}
+    runner.input_batch = mocker.Mock(spec=InputBatch)
+    runner.input_batch.req_ids = ["r"]
+    runner.input_batch.num_computed_tokens_cpu = np.array([64])
+    runner.input_ids = CpuGpuBuffer(1, dtype=torch.int64, device=torch.device("cpu"), pin_memory=False)
+    runner.inputs_embeds = CpuGpuBuffer((1, 2), dtype=torch.float32, device=torch.device("cpu"), pin_memory=False)
+    runner.query_start_loc = CpuGpuBuffer(2, dtype=torch.int32, device=torch.device("cpu"), pin_memory=False)
+    runner.query_start_loc.cpu[:] = torch.tensor([0, 1])
+    runner.positions = torch.tensor([64])
+    runner.model_intermediate_buffer = {}
+    for method in (
+        "_collect_additional_information_for_prefill",
+        "_update_additional_information",
+        "_update_intermediate_buffer",
+    ):
+        setattr(runner, method, mocker.Mock())
+    runner._init_model_kwargs = lambda: {}
+    runner._maybe_run_batch_preprocess = lambda *args: set()
+    runner._maybe_attach_mimo_audio_req_infos = lambda request, info, rid: info
+    scheduler = SchedulerOutput.make_empty()
+    scheduler.total_num_scheduled_tokens = 1
+    scheduler.num_scheduled_tokens = {"r": 1}
+    runner._preprocess(scheduler, 1)
+    assert "_omni_output_token_ids" not in seen
+    if opt_in:
+        assert seen[OUTPUT_TOKEN_COUNT_KEY] == 64
+        assert seen[LAST_OUTPUT_TOKEN_KEY] == 1
+        assert seen["_omni_sampling_params"]["seed"] == 42
+        runner.requests["r"].output_token_ids.append(0)
+        assert seen[OUTPUT_TOKEN_COUNT_KEY] == 64 and seen[LAST_OUTPUT_TOKEN_KEY] == 1
+    else:
+        assert OUTPUT_TOKEN_COUNT_KEY not in seen and LAST_OUTPUT_TOKEN_KEY not in seen
 
 
 def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -> GPUARModelRunner:
@@ -2029,6 +2086,7 @@ class TestPreferModelSamplerNoneFallback:
             "minimax_music3",
             "nemotron_voicechat",
             "yue2",  # Always supplies SamplerOutput, including empty/prefill steps.
+            "zonos2",
         }
         assert declarers == expected, (
             "The set of models declaring `prefer_model_sampler` changed:\n"

@@ -35,7 +35,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import stage_prefix_cache_config
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
-from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.data_entry_keys import LAST_OUTPUT_TOKEN_KEY, OUTPUT_TOKEN_COUNT_KEY, OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
@@ -2089,6 +2089,27 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # Seed, so a model that samples inside forward() can be
                 # reproducible: vLLM's own sampler seeding does not reach it.
                 req_infos["_omni_seed"] = getattr(sampling_params, "seed", None)
+                if getattr(self.model, "requires_request_sampling_params", False):
+                    req_infos["_omni_req_id"] = req_id
+                    # The model needs committed progress, not an O(T) copy of
+                    # lifecycle IDs. Nine-codebook replay stays request-owned.
+                    output_token_ids = getattr(req_state, "output_token_ids", ())
+                    req_infos[OUTPUT_TOKEN_COUNT_KEY] = len(output_token_ids)
+                    req_infos[LAST_OUTPUT_TOKEN_KEY] = output_token_ids[-1] if output_token_ids else None
+                    req_infos["_omni_sampling_params"] = {
+                        key: getattr(sampling_params, key, None)
+                        for key in (
+                            "temperature",
+                            "top_k",
+                            "top_p",
+                            "min_p",
+                            "seed",
+                            "max_tokens",
+                            "ignore_eos",
+                            "repetition_penalty",
+                            "extra_args",
+                        )
+                    }
                 if callable(batch_decode_preprocess) and span_len == 1 and not is_prefill:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue

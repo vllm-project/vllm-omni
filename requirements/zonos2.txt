@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Optional ZONOS2-only dependencies; install torchaudio matching your torch separately.
+descript-audio-codec==1.0.0
+descript-audiotools==0.7.2
+nemo_text_processing==1.2.0
+pynini==2.1.6.post1
+sacremoses==0.2.0
+editdistance
+cdifflib
