@@ -189,6 +189,21 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             )
             self._pending_chunk_error_outputs.append((finished_request.client_index, error_output))
 
+    def _generation_runnable_ids(self, ready_ids: set[str]) -> set[str]:
+        """Count streams, excluding stale notifications and outstanding runs."""
+        return {
+            req_id
+            for req_id in ready_ids
+            if (request := self.requests.get(req_id)) is not None
+            and not request.is_finished()
+            and request.num_in_flight_tokens == 0
+        }
+
+    def _generation_batch_ready(self, runnable: set[str]) -> bool:
+        """Release at the configured target or immediately at low concurrency."""
+        target = self._generation_min_batch_size
+        return len(runnable) >= target or len(self.requests) < target
+
     def _drain_omni_connector_outputs(self):
         self._generation_defer_batch = False
         outputs = super()._drain_omni_connector_outputs()
@@ -217,13 +232,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 ready.update(output.chunk_ready_req_ids)
                 terminal.update(output.chunk_finished_req_ids)
                 terminal.update(req_id for req_id, update in output.request_metadata.items() if update.input_terminal)
-            runnable = {
-                req_id
-                for req_id in ready | terminal
-                if (request := self.requests.get(req_id)) is not None
-                and not request.is_finished()
-                and request.num_in_flight_tokens == 0
-            }
+            runnable = self._generation_runnable_ids(ready | terminal)
             if runnable and waited_without_input:
                 # Idle waiting must not eat the ready batch's coalescing budget.
                 # Start that budget at its first arrival, once only. The two
@@ -251,7 +260,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if not can_wait_idle:
                     break
                 waited_without_input = True
-            elif len(runnable) >= target or len(self.requests) < target:
+            elif self._generation_batch_ready(runnable):
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
