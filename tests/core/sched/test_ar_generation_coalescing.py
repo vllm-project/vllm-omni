@@ -43,6 +43,7 @@ def scheduler(*, native=False, extras=None, population=4, async_scheduling=False
     s.use_v2_model_runner = native
     s.max_num_active_reqs = 128
     s.max_num_scheduled_tokens = 128
+    s.prev_step_scheduled_req_ids = set()
     _init_policies(s)
     return s
 
@@ -354,19 +355,20 @@ def test_orchestrator_readiness_override_enables_ar_gate(monkeypatch):
 
 @pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("prompt_length", [8, 128])
 def test_real_upstream_empty_step_preserves_tokens_and_emits_finished_ids(
-    monkeypatch, mocker, native, async_scheduling
+    monkeypatch, mocker, native, async_scheduling, prompt_length
 ):
     clock = [10.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
     s = scheduler(native=native, extras=knobs(), async_scheduling=async_scheduling)
+    s.requests["0"] = _make_request("0", prompt_length)
     s.waiting.add_request(s.requests["0"])
-    # Isolate input transport and output packaging, retaining upstream schedule
+    # Isolate input transport and payload packaging, retaining upstream schedule
     # and accounting. Cache allocations must never run on a deferred step.
     monkeypatch.setattr(s, "_process_pending_omni_inputs", lambda model_mode: None)
     monkeypatch.setattr(s, "_postprocess_omni_schedule_output", lambda *args, **kwargs: None)
     monkeypatch.setattr(s, "get_finished_requests_needing_kv_transfer", lambda: {})
-    monkeypatch.setattr(s, "_wrap_omni_scheduler_output", lambda output, **kwargs: output)
     s.current_step = 0
     s.vllm_config.speculative_config = None
     s.scheduler_config = s.vllm_config.scheduler_config
@@ -377,7 +379,7 @@ def test_real_upstream_empty_step_preserves_tokens_and_emits_finished_ids(
     s.max_num_encoder_input_tokens = 0
     s.num_waiting_for_streaming_input = 0
     s.lora_config = None
-    s.prev_step_scheduled_req_ids = set()
+    s.prev_step_scheduled_req_ids = {"0", "finished"}
     s.finished_req_ids = {"finished"}
     s.reset_preempted_req_ids = set()
     s.num_spec_tokens = 0
@@ -398,10 +400,15 @@ def test_real_upstream_empty_step_preserves_tokens_and_emits_finished_ids(
     output = s.schedule()
     assert output.num_scheduled_tokens == {}
     assert output.finished_req_ids == {"finished"}
+    assert output.preserve_v1_batch is (not native)
+    assert s.prev_step_scheduled_req_ids == ({"0"} if not native else {"0", "finished"})
     assert s.finished_req_ids == set()
     cache.allocate_slots.assert_not_called()
     assert s.requests["0"].num_computed_tokens == s.requests["0"].num_in_flight_tokens == 0
     assert s.max_num_scheduled_tokens == 128
+    clock[0] += 0.006
+    assert not s.schedule().num_scheduled_tokens
+    assert s.prev_step_scheduled_req_ids == ({"0"} if not native else {"0", "finished"})
     # On expiry the real upstream scheduler resumes allocation/accounting.
     request = s.requests["0"]
     s.waiting.remove_requests([request])
@@ -418,9 +425,11 @@ def test_real_upstream_empty_step_preserves_tokens_and_emits_finished_ids(
     s.decode_stagger = 1
     s._inflight_prefills = set()
     cache.allocate_slots.return_value = KVCacheBlocks(blocks=())
-    clock[0] += 0.012
+    clock[0] += 0.006
     output = s.schedule()
     assert output.num_scheduled_tokens == {"0": 1}
+    assert not output.preserve_v1_batch
+    assert output.scheduled_cached_reqs.all_token_ids == {}
     assert request.num_computed_tokens == request.num_prompt_tokens + 1
     assert request.num_in_flight_tokens == 1
     assert request.num_output_placeholders == int(async_scheduling)

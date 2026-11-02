@@ -350,6 +350,9 @@ so dispatch includes tick granularity; neither blocks the scheduler thread.
 Input/control processing continues during the wait, and deferred steps schedule
 zero tokens before any allocation. AR does not support the generation
 scheduler's `idle_wait`, regular-batch cap or express scheduling features.
+V1 retains persistent batch rows across coalescing-only deferred steps while
+still cleaning up finished requests, avoiding full token-history resends caused
+solely by the batch wait. Ordinary empty steps retain their existing behavior.
 
 The default readiness hook supports legacy async-chunk receivers and native
 async-chunk coordinators. Unsupported input sources disable AR batch waiting
