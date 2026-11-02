@@ -78,11 +78,11 @@ class _RecurrentFakeSilero:
     def new_state(self) -> np.ndarray:
         return np.zeros(2)
 
-    def infer(self, frame: np.ndarray, state: object) -> tuple[float, np.ndarray]:
+    def infer(self, frame: np.ndarray, state: np.ndarray) -> tuple[float, np.ndarray]:
         energy = min(1.0, 30.0 * float(np.sqrt(np.mean(np.square(frame, dtype=np.float64)))))
         fast, slow = state
-        state = np.array([0.5 * fast + 0.5 * energy, 0.95 * slow + 0.05 * energy])
-        return min(1.0, 0.8 * state[0] + 0.4 * state[1]), state
+        next_state = np.array([0.5 * fast + 0.5 * energy, 0.95 * slow + 0.05 * energy])
+        return min(1.0, 0.8 * next_state[0] + 0.4 * next_state[1]), next_state
 
     def infer_batch(self, frames, states):
         scored = [self.infer(frame, state) for frame, state in zip(frames, states)]
@@ -338,6 +338,7 @@ def _assert_close(got: object, want: object, where: str) -> None:
     elif isinstance(want, np.ndarray):
         np.testing.assert_allclose(got, want, atol=ATOL, rtol=0, err_msg=where)
     elif isinstance(want, _SileroVADState):
+        assert isinstance(got, _SileroVADState), where
         _assert_close(got.model_state, want.model_state, f"{where}.model_state")
         _assert_close(got.context, want.context, f"{where}.context")
     elif dataclasses.is_dataclass(want):
@@ -345,7 +346,8 @@ def _assert_close(got: object, want: object, where: str) -> None:
         for field in dataclasses.fields(want):
             _assert_close(getattr(got, field.name), getattr(want, field.name), f"{where}.{field.name}")
     elif isinstance(want, list):
-        assert isinstance(got, list) and len(got) == len(want), f"{where}: {len(got)} vs {len(want)} items"
+        assert isinstance(got, list), where
+        assert len(got) == len(want), f"{where}: {len(got)} vs {len(want)} items"
         for i, (g, w) in enumerate(zip(got, want)):
             _assert_close(g, w, f"{where}[{i}]")
     else:
@@ -391,7 +393,7 @@ async def test_batched_turn_detection_matches_each_session_alone(variant: _Varia
         _assert_same_trace(trace, reference, f"session {i} ({'semantic' if sessions[i].semantic else 'server'}_vad)")
     # The comparison covered what it is meant to cover.
     assert len(set(backend.batch_sizes)) >= 3 and max(backend.batch_sizes) >= 4, backend.batch_sizes
-    results = [s.result for r in references for append in r.segments if append != "reset" for s in append]
+    results = [s.result for r in references for append in r.segments if isinstance(append, list) for s in append]
     assert sum(r.speech_started for r in results) >= len(sessions)
     assert any(r.commit_reason == "semantic_complete" for r in results)
     assert any(r.should_commit and r.backend == "silero" for r in results)
@@ -479,7 +481,9 @@ async def test_a_slow_smart_turn_does_not_stall_server_vad_sessions(variant: _Va
     await asyncio.wait_for(semantic_task, timeout=10)
     batcher.close()
     executor.shutdown()
-    committed = [s.result for s in semantic_trace.segments[0] if s.result.should_commit]
+    segments = semantic_trace.segments[0]
+    assert isinstance(segments, list)
+    committed = [s.result for s in segments if s.result.should_commit]
     assert [(r.commit_reason, r.turn_complete_probability) for r in committed] == [("semantic_complete", 0.9)]
 
 

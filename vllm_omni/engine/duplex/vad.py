@@ -30,7 +30,7 @@ import threading
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, cast
 
 import numpy as np
 import pybase64 as base64
@@ -126,8 +126,14 @@ def run_frame_steps(
                 continue
             if not isinstance(request, TurnScoreRequest):
                 raise TypeError(f"turn detection yielded an unknown request: {type(request).__name__}")
+            if load_turn_scorer is None or score_turn is None:
+                raise TypeError("turn detection asked for Smart Turn work, but no Smart Turn callables were given")
             try:
-                result = load_turn_scorer() if request.is_loading else score_turn(request.window)
+                if request.is_loading:
+                    result = load_turn_scorer()
+                else:
+                    assert request.window is not None
+                    result = score_turn(request.window)
             except Exception as exc:
                 request = steps.throw(exc)
             else:
@@ -547,7 +553,7 @@ class SileroStreamingVAD:
             offset += self._WINDOW_SAMPLES
             frame_start = self._processed_samples
             self._processed_samples += self._WINDOW_SAMPLES
-            probability = min(1.0, max(0.0, float((yield FrameScoreRequest(frame)))))
+            probability = min(1.0, max(0.0, float(cast("float", (yield FrameScoreRequest(frame))))))
             max_probability = max(max_probability, probability)
 
             if self._speech_active:

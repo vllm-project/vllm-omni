@@ -245,7 +245,7 @@ def decode_audio_append(
         raise RealtimeProtocolError(str(exc), code="bad_event", event_id=event_id) from exc
     if audio_bytes is None:  # not converted (already pcm_f32le, or undecodable): take the wire bytes as they are
         try:
-            audio_bytes = base64.b64decode(audio, validate=True)
+            audio_bytes = base64.b64decode(cast("str", audio), validate=True)
         except (binascii.Error, ValueError) as exc:
             raise RealtimeProtocolError("input audio is not valid base64", code="bad_audio", event_id=event_id) from exc
     hints: dict[str, object] = {}

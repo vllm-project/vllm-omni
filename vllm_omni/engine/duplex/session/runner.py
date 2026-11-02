@@ -28,7 +28,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, TypeVar, cast
 
 import pybase64 as base64
 from vllm.logger import init_logger
@@ -1305,7 +1305,8 @@ class DuplexSessionRunner:
                 value = event.get(key)
                 if isinstance(value, str) and value.strip().lower() in {"barge_in", "interrupt", "cancel"}:
                     event.pop(key, None)
-        fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
+        fmt_raw = event.get("format")
+        fmt = fmt_raw if isinstance(fmt_raw, str) else "pcm16"
         sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
         sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else 16000
         client_force_listen = bool(event.get("force_listen", False))
@@ -1337,7 +1338,8 @@ class DuplexSessionRunner:
                 except ValueError as exc:
                     self._emit_error("bad_event", str(exc))
                     return
-                audio, fmt, converted_rate = converted
+                audio, converted_fmt, converted_rate = converted
+                fmt = cast("str", converted_fmt)  # a str format comes back as a str
                 if converted_rate is not None:
                     sample_rate_hz = converted_rate
                 if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:

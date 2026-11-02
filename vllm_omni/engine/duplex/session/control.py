@@ -122,7 +122,8 @@ class SessionControl:
         audio = event.get("audio")
         if not isinstance(audio, str | bytes) or not audio:
             return [(event, None)]
-        fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm_f32le"
+        fmt_raw = event.get("format")
+        fmt = fmt_raw if isinstance(fmt_raw, str) else "pcm_f32le"
         sample_rate_hz = event.get("sample_rate_hz")
         try:
             # The manager's batcher scores this session's Silero frames together

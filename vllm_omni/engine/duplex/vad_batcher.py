@@ -31,10 +31,11 @@ from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass
+from typing import cast
 
 from vllm.logger import init_logger
 
-from vllm_omni.engine.duplex.turn_detection import TurnDetectionSegment, TurnDetector
+from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionSegment, TurnDetector
 from vllm_omni.engine.duplex.vad import (
     FrameScoreRequest,
     FrameSteps,
@@ -168,6 +169,7 @@ class TurnDetectionBatcher:
                 logger.exception("Duplex turn detection iteration failed")
                 self._abandon([*self._active, *inbox], exc, finished)
             if finished:
+                assert self._loop is not None  # bound by the first append
                 try:
                     self._loop.call_soon_threadsafe(_resolve, finished)
                 except RuntimeError:
@@ -184,7 +186,7 @@ class TurnDetectionBatcher:
         waiting, self._active = self._active, []
         try:
             scores: list[float | BaseException] = score_frames(
-                [(append.detector.vad, append.request.frame) for append in waiting]
+                [(append.detector.vad, cast(FrameScoreRequest, append.request).frame) for append in waiting]
             )
         except Exception as exc:
             scores = [exc] * len(waiting)
@@ -201,10 +203,11 @@ class TurnDetectionBatcher:
             self._active.append(append)
         elif isinstance(request, TurnScoreRequest):
             # Smart Turn loading or inference, offloaded to the session executor
+            detector = cast(SemanticTurnDetector, append.detector)  # only semantic_vad asks for Smart Turn
             if request.is_loading:
-                self._offload(append, append.detector.load_turn_scorer)
+                self._offload(append, detector.load_turn_scorer)
             else:
-                self._offload(append, append.detector.score_turn, request.window)
+                self._offload(append, detector.score_turn, request.window)
         else:
             if request is not None:
                 append.request = None

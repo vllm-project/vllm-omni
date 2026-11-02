@@ -350,8 +350,8 @@ def _segment_steps(
             )
         accumulated = result
         if result.should_commit or offset == samples.size:
-            audio = base64.b64encode(samples[start:offset].astype("<f4", copy=False).tobytes()).decode("ascii")
-            segments.append(TurnDetectionSegment(audio, result))
+            pcm = base64.b64encode(samples[start:offset].astype("<f4", copy=False).tobytes()).decode("ascii")
+            segments.append(TurnDetectionSegment(pcm, result))
             start = offset
             accumulated = None
     return segments
@@ -723,6 +723,7 @@ class SemanticTurnDetector:
 
     def score_turn(self, window: np.ndarray) -> float:
         """Smart Turn's completion probability for ``window`` (slow); serves :class:`TurnScoreRequest`."""
+        assert self._turn_scorer is not None, "load_turn_scorer() runs before score_turn()"
         return self._turn_scorer(window)
 
     def _run_steps(self, steps: FrameSteps[_T]) -> _T:
