@@ -1147,12 +1147,28 @@ def _pack_att_cache(att: object) -> object:
 
     The fused/ragged bodies keep K and V in a leading ``2`` so a layer slice is
     one contiguous pair; upstream ``blocks_forward_chunk`` (and the NPU attention
-    patch) instead expects the ``[K | V]`` packed slice per layer. Anything that
-    is not a split tensor is returned untouched (the ``[None] * depth``
-    placeholder of a cold start).
+    patch) instead expects the ``[K | V]`` packed slice per layer. ``None`` and
+    the ``[None] * depth`` placeholder of a cold start pass through untouched;
+    every other shape is a layout mismatch and fails loudly here instead of
+    reaching the upstream ``cat`` and failing there.
     """
-    if not isinstance(att, torch.Tensor) or att.ndim != 6:
-        return att
+    if att is None:
+        return None
+    if isinstance(att, (list, tuple)):
+        if all(row is None for row in att):
+            return att
+        raise TypeError(
+            "_pack_att_cache expects one split K/V tensor per step or a list of "
+            f"None placeholders, got a {type(att).__name__} of "
+            f"{type(att[0]).__name__ if len(att) else 'nothing'}"
+        )
+    if not isinstance(att, torch.Tensor):
+        raise TypeError(f"_pack_att_cache expects a tensor or None, got {type(att).__name__}")
+    if att.ndim != 6:
+        raise ValueError(
+            "_pack_att_cache expects a (depth, 2, batch, heads, frames, head_dim) "
+            f"split K/V cache, got shape {tuple(att.shape)}"
+        )
     return torch.cat((att[:, 0], att[:, 1]), dim=-1)
 
 
