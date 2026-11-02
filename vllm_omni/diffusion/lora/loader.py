@@ -12,6 +12,12 @@ from diffusers.loaders.lora_conversion_utils import (
 )
 from safetensors.torch import load_file
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
@@ -124,6 +130,47 @@ def _prepare_lora_delta(
     used_keys.add(lora_a_key)
     used_keys.add(lora_b_key)
     return delta, used_keys
+
+
+def _shard_lora_delta(delta: torch.Tensor, layer: torch.nn.Module, is_bias: bool) -> torch.Tensor:
+    """Match an adapter's full delta to the linear layer's local TP partition."""
+    if not isinstance(layer, (ColumnParallelLinear, RowParallelLinear)) or layer.tp_size == 1:
+        return delta
+
+    if isinstance(layer, RowParallelLinear):
+        # Row-parallel biases are replicated; only the weight's input is split.
+        if is_bias:
+            return delta
+        if delta.shape[1] != layer.input_size:
+            raise ValueError(f"LoRA input size {delta.shape[1]} does not match layer input size {layer.input_size}.")
+        size = layer.input_size_per_partition
+        return delta.narrow(1, layer.tp_rank * size, size)
+
+    if isinstance(layer, QKVParallelLinear):
+        output_sizes = [
+            layer.total_num_heads * layer.head_size,
+            layer.total_num_kv_heads * layer.head_size,
+            layer.total_num_kv_heads * layer.v_head_size,
+        ]
+        shard_sizes = [
+            layer.num_heads * layer.head_size,
+            layer.num_kv_heads * layer.head_size,
+            layer.num_kv_heads * layer.v_head_size,
+        ]
+        kv_rank = layer.tp_rank // layer.num_kv_head_replicas
+        shard_ranks = [layer.tp_rank, kv_rank, kv_rank]
+    else:
+        output_sizes = layer.output_sizes if isinstance(layer, MergedColumnParallelLinear) else [layer.output_size]
+        shard_sizes = [size // layer.tp_size for size in output_sizes]
+        shard_ranks = [layer.tp_rank] * len(output_sizes)
+
+    # Packed projections must be sharded separately, then repacked locally.
+    # split() also rejects incompatible full output sizes instead of cropping.
+    shards = [
+        part.narrow(0, rank * size, size)
+        for part, rank, size in zip(delta.split(output_sizes, dim=0), shard_ranks, shard_sizes, strict=True)
+    ]
+    return shards[0] if len(shards) == 1 else torch.cat(shards, dim=0)
 
 
 def _resolve_lora_compute_device() -> torch.device | None:
@@ -294,6 +341,7 @@ class LoraLoaderMixin:
 
         # Resolve the accelerator fallback once, outside the parameter loop.
         accel_dev = _resolve_lora_compute_device()
+        layers = dict(module.named_modules(prefix=prefix))
 
         for name, params in module.named_parameters(prefix):
             is_bias = False
@@ -318,6 +366,7 @@ class LoraLoaderMixin:
             )
             if delta is None:
                 continue
+            delta = _shard_lora_delta(delta, layers[base_key], is_bias)
             lora_loaded_keys.update(used_keys)
 
             delta = delta.to(device=params.device, dtype=params.dtype)
@@ -351,6 +400,7 @@ class LoraLoaderMixin:
 
         # Resolve the accelerator fallback once, outside the parameter loop.
         accel_dev = _resolve_lora_compute_device()
+        layers = dict(module.named_modules(prefix=prefix))
 
         for name, param in module.named_parameters(prefix):
             is_bias = False
@@ -375,6 +425,7 @@ class LoraLoaderMixin:
             )
             if delta is None:
                 continue
+            delta = _shard_lora_delta(delta, layers[base_key], is_bias)
             lora_unloaded_keys.update(used_keys)
 
             delta = delta.to(device=param.device, dtype=param.dtype)
