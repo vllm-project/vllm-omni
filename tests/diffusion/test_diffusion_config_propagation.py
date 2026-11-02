@@ -313,3 +313,26 @@ def test_additional_config_roundtrip():
     additional_config = {"torchair_graph_config": {"enabled": True}}
     od = _roundtrip_diffusion_config(model="x", additional_config=additional_config)
     assert od.additional_config == additional_config
+
+
+def test_completion_boundary_config_roundtrip():
+    config = _roundtrip_diffusion_config(step_execution=True, completion_boundary_batching=True)
+    assert config.step_execution is True
+    assert config.completion_boundary_batching is True
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"step_execution": False},
+        {"step_execution": True, "streaming_output": True},
+        {"step_execution": True, "num_gpus": 2},
+    ],
+)
+def test_completion_boundary_config_rejects_unsupported_modes(kwargs):
+    with pytest.raises(ValueError, match="completion_boundary_batching"):
+        OmniDiffusionConfig(model="test-model", completion_boundary_batching=True, **kwargs)
+
+
+def test_completion_boundary_config_is_disabled_by_default():
+    assert OmniDiffusionConfig(model="test-model").completion_boundary_batching is False
