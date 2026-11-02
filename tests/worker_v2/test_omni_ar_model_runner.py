@@ -21,7 +21,7 @@ from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
 from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner, OmniAsyncOutput
 from vllm_omni.worker_v2.output_snapshot import pack_output_snapshot
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 
 class _FakeStream:
@@ -51,6 +51,7 @@ def _async_output(req_ids=("req-0",), **overrides) -> OmniAsyncOutput:
 
 
 @pytest.mark.parametrize("compact_width", [1, 2])
+@pytest.mark.cpu
 def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch, compact_width) -> None:
     event_kwargs = []
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
@@ -104,6 +105,7 @@ def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch,
 
 @pytest.mark.parametrize("has_audio", [False, True])
 @pytest.mark.parametrize("include_hidden", [False, True])
+@pytest.mark.cpu
 def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, has_audio, include_hidden) -> None:
     from vllm_omni.model_executor.models.voxcpm2.model_state import VoxCPM2AudioOutput
 
@@ -150,6 +152,7 @@ def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, 
 @pytest.mark.parametrize("needs_history", [False, True])
 @pytest.mark.parametrize("include_hidden", [None, False, True])
 @pytest.mark.parametrize("engine_output_type", ["text", "latent"])
+@pytest.mark.cpu
 def test_last_pp_rank_orchestration_and_kv_resolver(
     monkeypatch, needs_history, include_hidden, engine_output_type
 ) -> None:
@@ -230,6 +233,7 @@ def test_last_pp_rank_orchestration_and_kv_resolver(
     assert runner._resolve_global_request_id("unknown") == "unknown"  # fallback to the local id
 
 
+@pytest.mark.cpu
 def test_async_output_preserves_fixed_token_scores_on_host(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
     scores = torch.tensor([[-0.5, -1.5], [-0.2, -2.2]])
@@ -245,6 +249,7 @@ def test_async_output_preserves_fixed_token_scores_on_host(monkeypatch) -> None:
     torch.testing.assert_close(output.prompt_token_id_logprobs_dict["req-0"], scores)
 
 
+@pytest.mark.cpu
 def test_async_mm_snapshot_owns_output_until_copy_finishes() -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.model_config = SimpleNamespace(async_chunk=True)
@@ -269,6 +274,7 @@ def test_async_mm_snapshot_owns_output_until_copy_finishes() -> None:
     assert waited == [copy_event]
 
 
+@pytest.mark.cpu
 def test_producer_snapshot_is_not_repacked() -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.model_config = SimpleNamespace(async_chunk=True)
@@ -287,6 +293,7 @@ def test_producer_snapshot_is_not_repacked() -> None:
     assert runner._async_mm_snapshot_pending == [False]
 
 
+@pytest.mark.cpu
 def test_fresh_per_step_outputs_are_not_repacked() -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
     runner.model_config = SimpleNamespace(async_chunk=True)
@@ -298,6 +305,7 @@ def test_fresh_per_step_outputs_are_not_repacked() -> None:
     assert runner._last_multimodal_snapshot_slot is None
 
 
+@pytest.mark.cpu
 def test_snapshot_slots_bounded_by_shape_and_packed_grouping_isolation(monkeypatch) -> None:
     slot: dict[tuple[Any, ...], torch.Tensor] = {}
     omni_ar_model_runner._copy_mm_to_snapshot_slot(torch.ones(1, 2), slot)
@@ -329,6 +337,7 @@ def test_snapshot_slots_bounded_by_shape_and_packed_grouping_isolation(monkeypat
 
 
 @pytest.mark.parametrize("need_pooler,async_chunk", [(False, False), (False, True), (True, False), (True, True)])
+@pytest.mark.cpu
 def test_guard_graph_replay_for_pooler_copy(need_pooler, async_chunk) -> None:
     main_stream = MagicMock()
     omni_ar_model_runner._guard_graph_replay_for_pooler_copy(
@@ -338,6 +347,7 @@ def test_guard_graph_replay_for_pooler_copy(need_pooler, async_chunk) -> None:
     assert main_stream.wait_event.call_count == (1 if need_pooler and not async_chunk else 0)
 
 
+@pytest.mark.cpu
 def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> None:
     # Graph-padded batch: padded_total_tokens > total_tokens; slice by the real token axis.
     padded_codes = torch.arange(16, dtype=torch.long).reshape(8, 2)
@@ -367,6 +377,7 @@ def test_build_async_chunk_outputs_slices_padded_axis_and_splits_channels() -> N
     ids=["unpadded", "hidden_padded", "codes_padded", "both_padded"],
 )
 @pytest.mark.parametrize("lengths", [(1, 1, 1), (3, 1, 1)], ids=["decode", "mixed_prefill_decode"])
+@pytest.mark.cpu
 def test_async_output_slices_request_payloads_with_graph_padding(
     monkeypatch, mocker, async_chunk, hidden_padded, codes_padded, lengths, include_hidden
 ):
@@ -415,6 +426,7 @@ def test_async_output_slices_request_payloads_with_graph_padding(
                 assert "hidden" not in payload
 
 
+@pytest.mark.cpu
 def test_finalized_full_payload_latent_ledger_is_accumulated_once(monkeypatch):
     from tests.engine.test_output_processor_mrv2_text import (
         _Detokenizer,
@@ -454,6 +466,7 @@ def test_finalized_full_payload_latent_ledger_is_accumulated_once(monkeypatch):
     torch.testing.assert_close(payload["latent"], hidden)
 
 
+@pytest.mark.cpu
 def test_async_chunk_output_stages_mm_on_copy_stream_before_get_output(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
     calls = []
@@ -481,6 +494,7 @@ def test_async_chunk_output_stages_mm_on_copy_stream_before_get_output(monkeypat
 
 @pytest.mark.parametrize("prefill_first", [False, True])
 @pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.cpu
 def test_request_reference_codes_preserve_local_axis(prefill_first, padded):
     lengths = np.array([255, 1] if prefill_first else [1, 255])
     offsets = np.array([0, lengths[0], 256])
@@ -498,6 +512,7 @@ def test_request_reference_codes_preserve_local_axis(prefill_first, padded):
         assert torch.equal(outputs[i]["codes.audio"], codes[offsets[i] : offsets[i + 1]])
 
 
+@pytest.mark.cpu
 def test_stream_audio_cancel_rejects_inflight_output_and_id_reuse() -> None:
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
 
@@ -512,6 +527,7 @@ def test_stream_audio_cancel_rejects_inflight_output_and_id_reuse() -> None:
     assert not buffer.requests
 
 
+@pytest.mark.cpu
 def test_stream_audio_length_end_flushes_first_and_partial_chunks() -> None:
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
 
@@ -535,6 +551,7 @@ def test_stream_audio_length_end_flushes_first_and_partial_chunks() -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float64, torch.bfloat16])
+@pytest.mark.cpu
 def test_stream_audio_batch_views_retain_pcm_after_output_release(dtype):
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
 
@@ -568,6 +585,7 @@ def test_stream_audio_batch_views_retain_pcm_after_output_release(dtype):
         assert states[i].pending_samples == 0
 
 
+@pytest.mark.cpu
 def test_stream_audio_numpy_direct_first_cancel_and_mixed_fallback():
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
 
@@ -590,6 +608,7 @@ def test_stream_audio_numpy_direct_first_cancel_and_mixed_fallback():
     assert replacement.pending_samples == 0 and not replacement.pending
 
 
+@pytest.mark.cpu
 def test_stream_audio_prefill_length_end_reaches_output(mocker) -> None:
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.states import RequestState
@@ -626,6 +645,7 @@ def test_stream_audio_prefill_length_end_reaches_output(mocker) -> None:
     assert "model_outputs" not in mm
 
 
+@pytest.mark.cpu
 def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) -> None:
     from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState, TalkerInputs
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
@@ -666,6 +686,7 @@ def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) 
     assert not eager._audio_buffer.requests and not request.active
 
 
+@pytest.mark.cpu
 def test_stream_audio_replay_uses_exact_inputs_and_consumes_last_frame_once(mocker):
     from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState, TalkerInputs
 
@@ -692,6 +713,7 @@ def test_stream_audio_replay_uses_exact_inputs_and_consumes_last_frame_once(mock
         eager.replay_inputs("request", 0, 4, torch.ones(2), torch.empty(2, 2))
 
 
+@pytest.mark.cpu
 def test_stream_reference_priming_groups_lengths_without_padding_or_slot_aliasing(mocker):
     from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
 
@@ -720,6 +742,7 @@ def test_stream_reference_priming_groups_lengths_without_padding_or_slot_aliasin
 
 
 @pytest.mark.parametrize("context_frames", [25, 72])
+@pytest.mark.cpu
 def test_model_owned_reference_context_respects_configured_boundary(mocker, context_frames):
     from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import Qwen3TTSTalkerForConditionalGeneration
 
@@ -736,6 +759,7 @@ def test_model_owned_reference_context_respects_configured_boundary(mocker, cont
 
 
 @pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.cpu
 def test_model_owned_audio_finalizer_runs_after_copy_without_hidden(monkeypatch, streaming):
     monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
     batch = SimpleNamespace(
@@ -770,6 +794,7 @@ def test_model_owned_audio_finalizer_runs_after_copy_without_hidden(monkeypatch,
     assert (result.pooler_output is None) == streaming
 
 
+@pytest.mark.cpu
 def test_stream_audio_history_replays_exact_inputs_after_batch_reordering(mocker):
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -807,6 +832,7 @@ def test_stream_audio_history_replays_exact_inputs_after_batch_reordering(mocker
 
 
 @pytest.mark.parametrize("valid", [False, True])
+@pytest.mark.cpu
 def test_stream_audio_direct_first_requires_only_real_pcm_on_terminal(valid):
     from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer, StreamingAudioOutput
@@ -834,6 +860,7 @@ def test_stream_audio_direct_first_requires_only_real_pcm_on_terminal(valid):
     assert replacement.push(torch.full((4,), 99), False).tolist() == [99] * 4
 
 
+@pytest.mark.cpu
 def test_stream_audio_direct_first_drops_one_frame_and_retains_partial_suffix():
     from vllm_omni.worker_v2.streaming_audio import AudioRequest
 
@@ -848,6 +875,7 @@ def test_stream_audio_direct_first_drops_one_frame_and_retains_partial_suffix():
 
 
 @pytest.mark.parametrize("consumer", ["pcm_only", "finalizer", "extra"])
+@pytest.mark.cpu
 def test_stream_audio_snapshot_skips_discarded_code_partition(monkeypatch, mocker, consumer):
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -908,6 +936,7 @@ def test_stream_audio_snapshot_skips_discarded_code_partition(monkeypatch, mocke
 
 
 @pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.cpu
 def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     from vllm_omni.worker_v2.output_snapshot import RequestOutputSnapshot
 
@@ -945,6 +974,7 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert (result.pooler_output is None) == streaming
 
 
+@pytest.mark.cpu
 def test_stream_history_allocates_only_for_scheduled_requests():
     from vllm_omni.worker_v2.model_states.mtp_model_state import MTPState
 

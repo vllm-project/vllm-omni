@@ -5,7 +5,7 @@
 Engine components for vLLM-Omni.
 """
 
-from typing import Any
+from typing import Any, TypeAlias
 
 import msgspec
 import torch
@@ -14,6 +14,10 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
 )
+
+# Where a receiver gets a request's stage payload: the sender's connector address, or the
+# serialized payload itself for a run request.
+PayloadSenderInfo: TypeAlias = dict[str, Any] | bytes
 
 
 class PromptEmbedsPayload(msgspec.Struct):
@@ -82,7 +86,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # GPUModelRunner.model_intermediate_buffer instead of using the deprecated
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
-    payload_sender_info: dict[str, Any] | None = None
+    payload_sender_info: PayloadSenderInfo | None = None
 
     @classmethod
     def from_request(
@@ -92,7 +96,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         prompt_embeds: torch.Tensor | None = None,
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict[str, Any] | None = None,
-        payload_sender_info: dict[str, Any] | None = None,
+        payload_sender_info: PayloadSenderInfo | None = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 
@@ -154,6 +158,8 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     num_generation_tokens: int | None = None
     # Coalesced decode steps have no recoverable per-step ITL samples.
     is_coalesced: bool = False
+    # A request's serialized stage payload; this is only used for run requests
+    stage_payload: bytes | None = None
     # Duplex session stats (RFC #8325): [epoch, seq, start_ns, duration_ns] step
     # spans of measured duplex chunks, the producing step's chunk last.
     stage_work: list[list[int]] | None = None

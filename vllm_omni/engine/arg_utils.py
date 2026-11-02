@@ -40,6 +40,8 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "IndexTTS2TalkerForConditionalGeneration": "indextts2",
     "IndexTTS25S2MelDecoder": "indextts2_5",
     "IndexTTS25TalkerForConditionalGeneration": "indextts2_5",
+    # Kokoro's config.json names neither model_type nor architectures.
+    "KokoroForConditionalGeneration": "kokoro",
     "OmniVoiceModel": "omnivoice",
     # PersonaPlex ships an empty config.json, so create_model_config() must patch
     # model_type=personaplex from the arch name or the staged pipeline can't load
@@ -70,6 +72,7 @@ def _register_omni_hf_configs() -> None:
             IndexTTS2Config,
             IndexTTS25Config,
         )
+        from vllm_omni.model_executor.models.kokoro.configuration_kokoro import KokoroConfig
         from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
             LingV3TTSConfig,
             Ming3TTSConfig,
@@ -121,6 +124,7 @@ def _register_omni_hf_configs() -> None:
         ("lingv3_tts", LingV3TTSConfig),
         ("indextts2", IndexTTS2Config),
         ("indextts2_5", IndexTTS25Config),
+        ("kokoro", KokoroConfig),
         ("moss_tts_local", MossTTSLocalConfig),
         ("moss_tts_realtime", MossTTSRealtimeConfig),
         ("qwen3_tts", Qwen3TTSConfig),
@@ -750,6 +754,7 @@ class OrchestratorArgs:
     forced_aligner_device: str | None = None
 
     # === Observability ===
+    otlp_traces_endpoint: str | None = None
     log_stats: bool = False
     collect_stage_metrics: bool = True
     enable_orch_monitor: bool = False

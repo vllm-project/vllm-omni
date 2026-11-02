@@ -68,6 +68,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
+| [`hexgrad/Kokoro-82M-A6000.md`](./hexgrad/Kokoro-82M-A6000.md) | Online + offline TTS with 54 built-in voices (streaming PCM/WAV, SSE) | 1x RTX A6000 48GB |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
 | [`inclusionAI/Ming-3.0-audio-flash.md`](./inclusionAI/Ming-3.0-audio-flash.md) | Online multilingual ASR and speech QA with optional 44.1 kHz speech output | 4x 80GB GPU / 2x H200 141GB |
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |

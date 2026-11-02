@@ -116,12 +116,14 @@ def _make_orchestrator(num_stages: int = 2) -> Orchestrator:
 def _req_state(final_stage_id: int = 1) -> SimpleNamespace:
     return SimpleNamespace(
         final_stage_id=final_stage_id,
+        yield_stage_id=None,
         stage_submit_ts={},
         sampling_params_list=[SimpleNamespace(output_kind=None)] * (final_stage_id + 1),
         streaming=SimpleNamespace(enabled=False, segment_finished=False),
         running_counter_registered=False,
         prompt={"prompt": "x"},
         pipeline_timings={},
+        trace=None,
     )
 
 
