@@ -171,6 +171,7 @@ nav:
           - Backend Selection: design/feature/attention_backend_selection.md
           - Skip-Softmax: design/feature/skip_softmax.md
           - Scheduler-Managed Paged KV Cache: design/feature/diffusion_paged_kv_cache.md
+          - Paged Independent-Request Batching: design/feature/diffusion_paged_kv_independent_batching.md
         - CPU Offloading:
           - Overview: design/feature/offloader/README.md
           - Model-Level: design/feature/offloader/module_offload.md
