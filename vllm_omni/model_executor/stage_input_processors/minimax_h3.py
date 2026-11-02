@@ -39,6 +39,27 @@ def prepare_encoder_prompt(
     prompt: Any,
     sampling_params_list: Sequence[Any],
 ) -> Any:
+    """Prepare the H3 encoder request.
+
+    TODO(encoder-stage, keep_steps): CodeVideoModel early-only video
+    conditioning needs a SECOND Qwen pass over the same prompt with the video
+    reference removed from the presentation (``qwen_videos=[]`` and
+    ``condition_labels`` without the ``("video", i)`` entries; prompt text
+    unchanged). The result must reach the diffusion stage as
+    ``MiniMaxH3EncoderConditioning.base_hidden_states`` /
+    ``base_token_tags`` -- the wire fields already exist in
+    ``conditioning.py`` and the diffusion stage already consumes them.
+
+    Implementation route: when ``sampling.extra_args["keep_steps"]`` is set
+    and the request is task ref2va with image + video references, issue one
+    additional encoder-stage request whose ``prepare_encoder_prompt`` output
+    omits the video from ``qwen_mm_data`` and ``condition_labels``, then merge
+    its hidden states/tags into the encoder output payload under the two
+    ``base_*`` keys before the payload is handed to the DiT stage.
+    Until this is wired, serving deployments reject keep_steps requests with
+    a clear error; the local-text-encoder path (tests/offline) already works
+    end to end via ``_prepare_local_conditioning``.
+    """
     multi_modal_data = prompt.get("multi_modal_data") if isinstance(prompt, Mapping) else None
     if isinstance(multi_modal_data, Mapping) and multi_modal_data.get(MINIMAX_H3_TIMELINE_GUIDES_KEY) is not None:
         raise OmniClientError("MiniMax H3 timeline guides require the media encoder in the diffusion stage")

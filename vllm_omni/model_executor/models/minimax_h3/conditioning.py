@@ -793,12 +793,22 @@ class MiniMaxH3EncoderConditioning:
     guide_blocks: tuple[dict[str, Any], ...] = ()
     guide_visual_condition: torch.Tensor | None = None
     guide_audio_condition: torch.Tensor | None = None
+    # CodeVideoModel keep_steps support: the encoder side may additionally
+    # return the image-only presentation (same prompt text, video reference
+    # removed) so the diffusion stage can drop the video condition after the
+    # leading denoise steps. Both fields stay None for requests without
+    # keep_steps and for every legacy wire payload.
+    base_hidden_states: torch.Tensor | None = None
+    base_token_tags: torch.Tensor | None = None
 
     @classmethod
     def from_components(
         cls,
         text: MiniMaxH3TextConditioning,
         media: MiniMaxH3EncoderMediaConditioning,
+        *,
+        base_hidden_states: torch.Tensor | None = None,
+        base_token_tags: torch.Tensor | None = None,
     ) -> MiniMaxH3EncoderConditioning:
         """Combine local encoder results without a stage-wire round trip."""
         text = MiniMaxH3TextConditioning.from_payload(text.to_payload())
@@ -813,6 +823,8 @@ class MiniMaxH3EncoderConditioning:
             hidden_states=text.hidden_states,
             token_tags=text.token_tags,
             **{item.name: getattr(media, item.name) for item in fields(media)},
+            base_hidden_states=base_hidden_states,
+            base_token_tags=base_token_tags,
         )
 
     @classmethod
@@ -958,6 +970,16 @@ class MiniMaxH3EncoderConditioning:
             audio_edit_clean_rows=audio_edit_clean_rows,
             audio_edit_mask=audio_edit_mask,
             audio_edit_source_t=audio_edit_source_t,
+            base_hidden_states=(
+                payload["base_hidden_states"]
+                if isinstance(payload.get("base_hidden_states"), torch.Tensor)
+                else None
+            ),
+            base_token_tags=(
+                payload["base_token_tags"]
+                if isinstance(payload.get("base_token_tags"), torch.Tensor)
+                else None
+            ),
         )
 
     def to_omni_payload(self) -> dict[str, Any]:
@@ -989,7 +1011,7 @@ class MiniMaxH3EncoderConditioning:
             guide_visual_condition=self.guide_visual_condition,
             guide_audio_condition=self.guide_audio_condition,
         ).to_omni_components()
-        return {
+        payload = {
             "hidden_states": {"output": text.hidden_states},
             "embed": {
                 "embedding": visual,
@@ -998,6 +1020,15 @@ class MiniMaxH3EncoderConditioning:
             "meta": {"token_role_ids": text.token_tags},
             "kv_metadata": {MINIMAX_H3_ENCODER_LAYOUT_KEY: layout},
         }
+        # Optional image-only presentation for keep_steps (CodeVideoModel
+        # early-only video conditioning). TODO(encoder-stage): produce these
+        # two tensors by running the Qwen encoder a second time over the same
+        # prompt with the video reference removed from the presentation; see
+        # the skeleton notes in stage_input_processors/minimax_h3.py.
+        if self.base_hidden_states is not None and self.base_token_tags is not None:
+            payload["base_hidden_states"] = self.base_hidden_states
+            payload["base_token_tags"] = self.base_token_tags
+        return payload
 
 
 __all__ = [
