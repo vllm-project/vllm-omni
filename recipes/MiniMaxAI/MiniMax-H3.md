@@ -641,8 +641,8 @@ vllm-omni serve /models/10eros-max/10Eros_Max_h3_TURBO-hybrid_beta5.safetensors 
   some first/last-frame inputs with a quiet prompt, beta5 FL2VA audio is
   near-silent while official H3 is not; the DiT predicts the audio VAE's
   silence latent from the first step, so this is checkpoint behaviour, not a
-  loader defect. Run manifests, per-seed metrics and the reproduction scripts:
-  <https://github.com/abinzzz/vllm-omni/tree/feat/h3-single-file-bf16/tools/minimax_h3/reproduce_a1>.
+  loader defect. Run manifests, per-seed metrics and the reproduction scripts
+  are in the [validation Gist](https://gist.github.com/abinzzz/c9dc1dc188a3085e16ff496fc9078bfc).
 
 ## AMD ROCm (gfx942 / gfx950)
 
