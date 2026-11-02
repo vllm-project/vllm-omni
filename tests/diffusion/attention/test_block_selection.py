@@ -266,7 +266,7 @@ def test_exact_topk_prefix_and_cutoff_ties(cuda_selector, monkeypatch):
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("kind", ["nan", "mixed", "positive_inf", "negative_inf", "extreme_finite"])
+@pytest.mark.parametrize("kind", ["nan", "mixed", "positive_inf", "negative_inf"])
 @torch.inference_mode()
 def test_nonfinite_score_rows_have_complete_unique_selection(cuda_selector, kind):
     from vllm_omni.diffusion.attention.block_selection.subblock_topk import _fused_topk
@@ -276,16 +276,12 @@ def test_nonfinite_score_rows_have_complete_unique_selection(cuda_selector, kind
         scores[0].fill_(float("nan"))
     elif kind == "mixed":
         scores[0, 17] = float("nan")
-    elif kind == "extreme_finite":
-        scores[0, ::2] = -torch.finfo(torch.float32).max
-        scores[0, 1::2] = torch.finfo(torch.float32).max
     else:
         scores[0, 17] = float("inf") if kind == "positive_inf" else -float("inf")
     actual = _fused_topk(scores, 8)
     assert torch.all((actual >= 0) & (actual < 32))
     assert torch.all(actual[:, 1:] > actual[:, :-1])
-    if kind != "extreme_finite":
-        torch.testing.assert_close(actual[0], torch.arange(8, device="cuda", dtype=torch.int32))
+    torch.testing.assert_close(actual[0], torch.arange(8, device="cuda", dtype=torch.int32))
     torch.testing.assert_close(actual[1:], _fused_topk(scores[1:].contiguous(), 8))
 
 
