@@ -103,8 +103,9 @@ def rope_apply(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     multiply-adds becomes its own pass over a temporary while the complex
     multiply is a single elementwise kernel.
 
-    Both branches evaluate the same products in the same order and agree bitwise
-    once the caller casts back to bfloat16.
+    Both branches evaluate the same products in the same order. In float32 an FMA
+    contraction in either one can still move the bfloat16 the caller casts back to
+    by one ulp, on about one element in 1e5.
 
     The rotation runs in float32. Only the angles need anything wider, and they
     are already spent by the time ``rope_params`` hands over cos and sin: those
