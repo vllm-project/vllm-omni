@@ -161,7 +161,7 @@ def _shard_lora_delta(delta: torch.Tensor, layer: torch.nn.Module, is_bias: bool
         shard_ranks = [layer.tp_rank, kv_rank, kv_rank]
     else:
         output_sizes = layer.output_sizes if isinstance(layer, MergedColumnParallelLinear) else [layer.output_size]
-        shard_sizes = [size // layer.tp_size for size in output_sizes]
+        shard_sizes = layer.output_partition_sizes
         shard_ranks = [layer.tp_rank] * len(output_sizes)
 
     # Packed projections must be sharded separately, then repacked locally.
