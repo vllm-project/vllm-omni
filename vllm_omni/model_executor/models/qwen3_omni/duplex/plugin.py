@@ -23,7 +23,7 @@ from vllm.logger import init_logger
 from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind
 
-from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexContextViewPolicy, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DuplexDataPlane, DuplexModelPlugin, DuplexRuntimeConfigError
 from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
@@ -372,6 +372,12 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 )
                 self.data_plane.retain_history_audio = True
         return self._history_calibrator
+
+    def context_view_policy(self, *, stage_id, runtime_config):
+        # Only the Thinker (stage 0) formats conversation history.
+        if stage_id != 0 or runtime_config.context_keep_media_turns is None:
+            return None
+        return DuplexContextViewPolicy(keep_media_user_turns=runtime_config.context_keep_media_turns)
 
     def capabilities(self, *, max_sessions):
         return DuplexCapabilities(
@@ -867,6 +873,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
 
     def prepare_prompt_config(self, config, *, state, payload):
         history = config.get("conversation", [])
+        # Formatting may read the L1 view; audio binding stays on ``history``.
+        view = config.get("conversation_view")
+        if not isinstance(view, list) or len(view) != len(history):
+            view = None
         bind_from = 0
         lengths = []
         for key in ("qwen_tool_turns", "qwen_tool_turns_inflight"):
@@ -889,7 +899,19 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         # before response.create. Search only the unanswered user turn so a new
         # payload can never overwrite an earlier, already answered utterance.
         current_contents = []
+        current_turn_start = len(history)
+        if view is not None:
+            # System instructions do not answer a pending user question.
+            # Protect its media even when they follow the user item.
+            for index in range(len(history) - 1, -1, -1):
+                role = history[index].get("role")
+                if role == "assistant":
+                    break
+                if role == "user":
+                    current_turn_start = index
         if has_audio:
+            # Keep payload binding on its existing trailing-user boundary;
+            # formatting protection above has a separate responsibility.
             for index, message in reversed(list(enumerate(history))):
                 if index < bind_from or message.get("role") != "user":
                     break
@@ -935,12 +957,25 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             included_audio = set()
             for offset, message in enumerate(turn):
                 src = index + offset
+                source_content = message.get("content")
+                # The view formats older context. The unanswered user run is
+                # request input even when the policy keeps zero media turns.
+                if view is not None and src < current_turn_start and message.get("role") == "user":
+                    message = view[src]
                 content = message.get("content")
                 if message.get("role") == "user" and isinstance(content, list):
                     if any(part.get("type") == "audio_url" for part in content):
-                        audio = next((value for keys, value in retained if any(key is content for key in keys)), None)
+                        audio = next(
+                            (value for keys, value in retained if any(key is source_content for key in keys)), None
+                        )
                         if audio is None:
-                            break
+                            # The clip left the audio slots. Keep the turn as
+                            # the view's text instead of dropping it.
+                            text = [] if view is None else self._view_text_parts(view[src])
+                            if not text:
+                                break
+                            resolved.append({"role": "user", "content": text, "_src": src})
+                            continue
                         if id(audio) not in included_audio:
                             resolved.append({"role": "user", "audio_payload": audio, "_src": src})
                             included_audio.add(id(audio))
@@ -948,6 +983,9 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                         other_parts = [part for part in content if part.get("type") != "audio_url"]
                         if other_parts:
                             resolved.append({"role": "user", "content": other_parts, "_src": src})
+                        continue
+                    if view is not None and content == []:
+                        # An older media-only item the view dropped; never decode it.
                         continue
                 copied = dict(message)
                 copied["_src"] = src
@@ -959,6 +997,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             # Re-encoding only history here makes Qwen answer an old question.
             messages.append({"role": "user", "audio_payload": payload, "_src": len(history)})
         return {**config, "qwen_messages": messages}
+
+    @staticmethod
+    def _view_text_parts(message):
+        content = message.get("content")
+        parts = [part for part in content if part.get("type") == "text"] if isinstance(content, list) else []
+        transcript = message.get("transcript")
+        if not parts and isinstance(transcript, str) and transcript:
+            parts = [{"type": "text", "text": transcript}]
+        return parts
 
     @staticmethod
     def format_history(messages):

@@ -731,9 +731,9 @@ async def test_visual_response_reference_uses_only_current_playback_committed_te
         assert h.runner.model_state.observations[0].response_item_id == f"item_{response_id}"
 
         def render():
-            conversation, item_ids = h.session.history_snapshot()
+            snapshot = h.session.history_snapshot()
             config = plugin.prepare_prompt_config(
-                {"conversation": conversation, "conversation_item_ids": item_ids},
+                {"conversation": snapshot.messages, "conversation_item_ids": snapshot.item_ids},
                 state=h.runner.model_state,
                 payload={},
             )
@@ -808,9 +808,9 @@ async def test_omitted_visual_summaries_rebudget_answered_open_chunk(text_summar
             segment_finished=True,
         )
         plugin, state = h.runner.plugin, h.runner.model_state
-        conversation, item_ids = h.session.history_snapshot()
+        snapshot = h.session.history_snapshot()
         config = plugin.prepare_prompt_config(
-            {"conversation": conversation, "conversation_item_ids": item_ids},
+            {"conversation": snapshot.messages, "conversation_item_ids": snapshot.item_ids},
             state=state,
             payload={"video_frames": [frame("blue")]},
         )
