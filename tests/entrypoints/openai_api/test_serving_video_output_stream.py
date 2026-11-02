@@ -387,6 +387,37 @@ class TestStreamingVideoOutputWebSocket:
 
         engine_client.abort.assert_not_called()
 
+    def test_streaming_session_rejects_invalid_generator_device(self, mocker: MockerFixture):
+        async def mock_generate(*_args, **_kwargs):
+            if False:
+                yield None
+
+        # _build_test_app assigns generate verbatim, so wrap it in a spy to
+        # keep the not-called assertion below usable.
+        generate_spy = mocker.Mock(wraps=mock_generate)
+
+        app, _handler, engine_client = _build_test_app(
+            mocker=mocker,
+            streaming_chunks=[],
+            mock_generate=generate_spy,
+        )
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime/video") as ws:
+                ws.send_json(
+                    {
+                        "type": "session.start",
+                        "prompt": "hello",
+                        "generator_device": "cuda",
+                    }
+                )
+                err = ws.receive_json()
+                assert err["type"] == "error"
+                assert "generator_device must be 'cpu'" in err["message"]
+
+        engine_client.generate.assert_not_called()
+        engine_client.abort.assert_not_called()
+
     def test_first_message_must_be_session_start(self, mocker: MockerFixture):
         """Control messages sent before session.start are rejected at the handshake.
 
