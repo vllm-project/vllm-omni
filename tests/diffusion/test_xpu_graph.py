@@ -114,14 +114,41 @@ def test_capture_context_wraps_the_capture_forwards(platform) -> None:
     assert entered == [True] and platform.captures == 1
 
 
-def test_runs_eager_inside_an_outer_capture(platform) -> None:
-    graph = _forced_on()
+@pytest.mark.parametrize("enabled", [True, False])
+def test_runs_eager_inside_an_outer_capture_under_capture_context(platform, enabled) -> None:
+    entered = []
+
+    @contextmanager
+    def context():
+        entered.append(True)
+        yield
+
+    graph = _forced_on(capture_context=context)
+    graph.enabled = enabled
     platform.outer_capture = True
 
     torch.testing.assert_close(graph(x=torch.ones(2)), torch.full((2,), 2.0))
 
-    assert graph.enabled and graph.num_graphs == 0 and graph.stats()["eager_calls"] == 1
+    assert graph.enabled is enabled and graph.num_graphs == 0 and graph.stats()["eager_calls"] == 1
     assert platform.captures == 0
+    # The outer capture forbids host syncs, so the caller's cache bypass must apply.
+    assert entered == [True]
+
+
+def test_disabled_eager_outside_a_capture_skips_capture_context(platform) -> None:
+    entered = []
+
+    @contextmanager
+    def context():
+        entered.append(True)
+        yield
+
+    graph = _forced_on(capture_context=context)
+    graph.enabled = False
+
+    torch.testing.assert_close(graph(x=torch.ones(2)), torch.full((2,), 2.0))
+
+    assert entered == [] and graph.stats()["eager_calls"] == 1
 
 
 @pytest.mark.parametrize(("cuda_alike", "stream_capturing", "expected"), [(False, True, False), (True, True, True)])

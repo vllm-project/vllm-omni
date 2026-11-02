@@ -19,7 +19,8 @@ request's longer audio, a reference tail present or not).
 
 Graph capture forbids host synchronization inside the captured region, so the
 wrapper (a) enters the caller's ``capture_context`` around the capture
-forwards (TaoMate uses it to bypass its host-keyed AdaLN projection cache),
+forwards and around eager forwards inside an outer capture (TaoMate uses it
+to bypass its host-keyed AdaLN projection cache),
 and (b) validates the very first capture with
 ``torch.cuda.set_sync_debug_mode("error")`` before capturing, so a
 synchronizing operator fails loudly on every rank at the same program point
@@ -212,8 +213,13 @@ class GraphedForward:
         ``pin`` exempts a newly captured graph from LRU eviction. Returned
         tensors are clones, so the caller may hold them across the next call.
         """
-        if not self.enabled or current_omni_platform.is_graph_capturing():
-            # Inside an outer capture, which records these kernels anyway.
+        if current_omni_platform.is_graph_capturing():
+            # An outer capture records these kernels anyway; it forbids host
+            # syncs just like our own capture does.
+            self.eager_calls += 1
+            with self.capture_context():
+                return self.module(**kwargs)
+        if not self.enabled:
             self.eager_calls += 1
             return self.module(**kwargs)
         key = (kwargs_signature(variant), kwargs_signature(kwargs))
