@@ -1,0 +1,256 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""MRv2 ordinary-turn Thinker length stop through the real async update path.
+
+``update_from_output`` and the upstream AsyncScheduler request update run for
+real. schedule() increments, sampled tokens and target rows are inputs; KV
+cache calls are recorded, not physical blocks. Each step ends at the first
+publication or grammar hook, after the stop decision.
+"""
+
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+
+import pytest
+import torch
+from vllm.v1.request import RequestStatus
+
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+_EOS = 151645
+_TTS_EOS = 151704
+
+
+class _StepCompleteError(Exception):
+    pass
+
+
+@dataclass
+class _Request:
+    request_id: str = "turn-0"
+    client_index: int = 0
+    prompt_token_ids: list[int] = field(default_factory=lambda: [1, 2])
+    output_token_ids: list[int] = field(default_factory=lambda: [11])
+    num_computed_tokens: int = 2
+    num_in_flight_tokens: int = 0
+    num_output_placeholders: int = 0
+    num_stale_output_tokens: int = 0
+    status: RequestStatus = RequestStatus.RUNNING
+    drop_stale_output: bool = False
+    has_encoder_inputs: bool = False
+    use_structured_output: bool = False
+    pooling_params: object = None
+    stop_reason: object = None
+    resumable: bool = False
+    max_tokens: int = 128
+    spec_token_ids: list[int] = field(default_factory=list)
+    sampling_params: object = field(
+        default_factory=lambda: SimpleNamespace(
+            num_logprobs=None, eos_token_id=_EOS, stop_token_ids=[_TTS_EOS], min_tokens=0, repetition_detection=None
+        )
+    )
+
+    @property
+    def num_prompt_tokens(self):
+        return len(self.prompt_token_ids)
+
+    @property
+    def num_tokens(self):
+        return len(self.prompt_token_ids) + self.num_output_tokens
+
+    @property
+    def num_output_tokens(self):
+        return len(self.output_token_ids)
+
+    def append_output_token_ids(self, token):
+        self.output_token_ids.append(token)
+
+    def take_prefill_stats(self):
+        return None
+
+    def is_finished(self):
+        return RequestStatus.is_finished(self.status)
+
+
+def _vllm_config(*, model_arch, session_mode, speculative):
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            model_arch=model_arch,
+            model_stage="llm",
+            session_mode=session_mode,
+            use_v2_model_runner=True,
+            async_chunk=False,
+            stage_id=0,
+            engine_output_type="latent",
+        ),
+        speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=3) if speculative else None,
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+    )
+
+
+def _scheduler(
+    monkeypatch, *, model_arch="MiniCPMO45OmniForConditionalGeneration", session_mode="turn", speculative=False
+):
+    scheduler = object.__new__(OmniARAsyncScheduler)
+    request = _Request()
+    cache_calls = []
+    scheduler.requests = {request.request_id: request}
+    scheduler.vllm_config = _vllm_config(model_arch=model_arch, session_mode=session_mode, speculative=speculative)
+    scheduler.use_v2_model_runner = True
+    scheduler.num_spec_tokens = 3 if speculative else 0
+    scheduler.num_sampled_tokens_per_step = 1
+    scheduler.perf_metrics = None
+    scheduler.chunk_transfer_adapter = None
+    scheduler.aux_output_connector = None
+    scheduler._new_prompt_len_snapshot = {}
+    scheduler._hold_payloadless_outputs = False
+    scheduler._native_data_plane = False
+    scheduler.max_model_len = 4096
+    scheduler._talker_kstep_armed = lambda: False
+    scheduler.make_spec_decoding_stats = lambda stats, **kwargs: stats
+    scheduler._maybe_decode_pooling_output = lambda *args: None
+    scheduler._process_kv_transfer_trigger = lambda *args: False
+    scheduler.kv_cache_manager = SimpleNamespace(
+        cache_blocks=lambda req, boundary: cache_calls.append(boundary),
+        estimate_cached_tokens=lambda req: 0,
+    )
+
+    def complete(*args, **kwargs):
+        raise _StepCompleteError
+
+    # Both are reached only after this step's stop decision.
+    monkeypatch.setattr(OmniSchedulerMixin, "_reject_invalid_grammar_tokens", complete)
+    monkeypatch.setattr(OmniSchedulerMixin, "_append_request_output", complete)
+    return scheduler, request
+
+
+def _payload(token, position):
+    return {
+        "latent": torch.tensor([[float(token), float(position)]]),
+        "latent_input_ids": torch.tensor([[token]]),
+        "latent_positions": torch.tensor([[position]]),
+    }
+
+
+def _step(scheduler, request, drafts, sampled, payload=None):
+    # schedule()'s optimistic async increments for one decode step.
+    scheduled = len(drafts) + 1
+    request.num_computed_tokens += scheduled
+    request.num_in_flight_tokens += scheduled
+    request.num_output_placeholders += scheduled
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={request.request_id: scheduled},
+        scheduled_spec_decode_tokens={request.request_id: list(drafts)} if drafts else {},
+        num_invalid_spec_tokens=0,
+        finished_req_ids=set(),
+    )
+    runner_output = SimpleNamespace(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[list(sampled)],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        # MRv2 full-payload outputs carry the rows on both channels.
+        multimodal_outputs=[payload] if payload is not None else None,
+        inter_stage_outputs=[payload] if payload is not None else None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        ec_connector_output=None,
+        cudagraph_stats=None,
+    )
+    with pytest.raises(_StepCompleteError):
+        scheduler.update_from_output(scheduler_output, runner_output)
+
+
+def _unconsumed(request):
+    # Tokens appended to the request that no target forward has taken as input
+    # (nothing else is in flight in these tests).
+    return request.num_tokens - request.num_computed_tokens
+
+
+@pytest.mark.parametrize(
+    "speculative,drafts,sampled",
+    [(False, [], [12]), (True, [12, 99, 98], [12, 13])],
+    ids=["ordinary", "correction"],
+)
+def test_length_stop_leaves_the_final_token_unconsumed(monkeypatch, speculative, drafts, sampled):
+    """The gap: at the length limit no target forward has the final token as input."""
+    scheduler, request = _scheduler(monkeypatch, speculative=speculative)
+    request.max_tokens = 1 + len(sampled)
+    _step(scheduler, request, drafts, sampled)
+    assert request.output_token_ids == [11, *sampled]
+    assert _unconsumed(request) == 1
+
+
+@pytest.mark.parametrize(
+    "speculative,drafts,sampled",
+    [(False, [], [12]), (True, [12, 99, 98], [12, 13])],
+    ids=["ordinary", "correction"],
+)
+def test_length_stop_consumes_the_final_token_before_finishing(monkeypatch, speculative, drafts, sampled):
+    """Contract: one draft-free target forward takes the final token; its sample is dropped."""
+    scheduler, request = _scheduler(monkeypatch, speculative=speculative)
+    request.max_tokens = 1 + len(sampled)
+    _step(scheduler, request, drafts, sampled)
+    committed = [11, *sampled]
+    assert not request.is_finished()
+    assert request.spec_token_ids in ([], None)
+    position = request.num_tokens - 1
+    _step(scheduler, request, [], [999], _payload(committed[-1], position))
+    assert request.output_token_ids == committed
+    assert _unconsumed(request) == 0
+    assert request.num_output_placeholders == 0
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
+
+@pytest.mark.parametrize("change", ["id", "position", "absent", "extra-row"])
+def test_terminal_forward_must_return_the_committed_own_row(monkeypatch, change):
+    """A wrong or missing terminal row fails the request instead of a silent shorter reply."""
+    scheduler, request = _scheduler(monkeypatch)
+    request.max_tokens = 2
+    _step(scheduler, request, [], [12])
+    assert not request.is_finished()
+    payload = _payload(12, 3)
+    if change == "id":
+        payload["latent_input_ids"] += 1
+    elif change == "position":
+        payload["latent_positions"] -= 1
+    elif change == "absent":
+        payload = None
+    else:
+        payload = {k: torch.cat([v, v]) for k, v in payload.items()}
+    _step(scheduler, request, [], [999], payload)
+    assert request.output_token_ids == [11, 12]
+    assert request.status == RequestStatus.FINISHED_ERROR
+
+
+@pytest.mark.parametrize("eos", [_EOS, _TTS_EOS])
+def test_eos_stop_finishes_without_a_terminal_forward(monkeypatch, eos):
+    scheduler, request = _scheduler(monkeypatch)
+    _step(scheduler, request, [], [eos])
+    assert request.status == RequestStatus.FINISHED_STOPPED
+
+
+def test_length_limit_inside_accepted_drafts_finishes_without_a_terminal_forward(monkeypatch):
+    # Drafts 12, 13 accepted, bonus 14 trimmed by the limit: 13 was an input.
+    scheduler, request = _scheduler(monkeypatch, speculative=True)
+    request.max_tokens = 3
+    _step(scheduler, request, [12, 13, 98], [12, 13, 14])
+    assert request.output_token_ids == [11, 12, 13]
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [{"model_arch": "Qwen3OmniMoeForConditionalGeneration"}, {"session_mode": "duplex"}],
+    ids=["other-model", "duplex"],
+)
+def test_length_stop_is_unchanged_outside_ordinary_turn_minicpmo(monkeypatch, setting):
+    scheduler, request = _scheduler(monkeypatch, **setting)
+    request.max_tokens = 2
+    _step(scheduler, request, [], [12])
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
