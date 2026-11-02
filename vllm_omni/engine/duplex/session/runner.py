@@ -770,9 +770,7 @@ class DuplexSessionRunner:
             admission = len(command.audio) + sum(len(frame) for frame in command.video_frames)
             with ExitStack() as reservation:
                 reservation.callback(session.release_input_bytes, admission, queued=True)
-                await self._on_append_audio(
-                    command.payload(encode_audio=False), release_queued_input=reservation.close
-                )
+                await self._on_append_audio(command.payload(encode_audio=False), release_queued_input=reservation.close)
         elif isinstance(command, AppendText):
             session.mark_user_input_activity()
             self._emit_error(
