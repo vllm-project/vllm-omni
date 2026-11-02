@@ -19,7 +19,6 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
-from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -310,9 +309,7 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
             wire_params = StageDiffusionClient._sampling_params_to_dict(sampling_params)
             self.request = OmniDiffusionRequest(
                 prompt=prompt,
-                sampling_params=StageDiffusionProc._reconstruct_sampling_params(
-                    object.__new__(StageDiffusionProc), wire_params
-                ),
+                sampling_params=OmniDiffusionSamplingParams.from_dict(wire_params),
                 request_id=request_id,
             )
 
@@ -340,6 +337,7 @@ def test_auk_sampling_overrides_reach_stage1_pipeline(auk_adapter, mocker):
         stage_type="llm",
         final_output=False,
         get_kv_sender_info=lambda: None,
+        get_payload_sender_info=lambda: None,
     )
     diffusion_stage = RecordingDiffusionStage()
     orchestrator = object.__new__(Orchestrator)
