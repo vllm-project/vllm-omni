@@ -296,3 +296,71 @@ def test_extra_config_reaches_the_switch_from_the_connector_dict():
     extra = tts_mod.MiniCPMO45OmniTTSForConditionalGeneration._extra_config(holder)
     assert extra["talker_codec_fused_prelude"] == "false"
     assert tts_mod._bool_flag(extra["talker_codec_fused_prelude"], "talker_codec_fused_prelude") is False
+
+
+def _eager_top_k_top_p(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
+    """The eager chain ``_topk_topp_fused`` replaces (talker_codec_sample.py)."""
+    out = logits.clone()
+    if top_k > 0:
+        keep = min(tcs.VOCAB_SIZE, int(top_k))
+        threshold = torch.topk(out, keep, dim=-1).values[..., -1, None]
+        out.masked_fill_(out < threshold, float("-inf"))
+    if 0.0 < float(top_p) < 1.0:
+        sorted_logits, sorted_indices = torch.sort(out, descending=False, dim=-1)
+        cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        remove = cumulative_probs <= (1.0 - float(top_p))
+        remove[..., -1:] = False
+        remove = remove.scatter(-1, sorted_indices, remove)
+        out.masked_fill_(remove, float("-inf"))
+    return out
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_fused_tail_matches_eager_top_k_top_p(seed):
+    """The fused tail must keep exactly the eager chain's candidates and logits."""
+    torch.manual_seed(seed)
+    logits = torch.randn(1, tcs.VOCAB_SIZE, device=_device())
+    fused = tcs._topk_topp_fused(logits.clone(), 25, 0.85)
+    assert fused is not None
+    eager = _eager_top_k_top_p(logits, 25, 0.85)
+    kept_fused = torch.isfinite(fused)
+    kept_eager = torch.isfinite(eager)
+    assert torch.equal(kept_fused, kept_eager)
+    assert torch.equal(fused[kept_fused], eager[kept_eager])
+
+
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_fused_tail_falls_back_for_batched_logits():
+    """The kernel masks one row; batched logits must fall back to the eager chain."""
+    logits = torch.randn(2, tcs.VOCAB_SIZE, device=_device())
+    assert tcs._topk_topp_fused(logits, 25, 0.85) is None
+
+
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_fused_tail_falls_back_above_the_candidate_cap():
+    """A candidate set the kernel cannot hold must fall back, not get truncated."""
+    logits = torch.randn(1, tcs.VOCAB_SIZE, device=_device())
+    assert tcs._topk_topp_fused(logits, tcs._TAIL_MAX_CANDIDATES + 1, 0.85) is None
+
+
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_fused_tail_defers_a_single_candidate_to_eager():
+    """top_k == 1 must never reach the kernel: KP == 1 aborts the Ascend compiler."""
+    logits = torch.randn(1, tcs.VOCAB_SIZE, device=_device())
+    assert tcs._topk_topp_fused(logits, 1, 0.85) is None
+
+
+@pytest.mark.parametrize("top_k,top_p", [(25, 1.0), (tcs._TAIL_MAX_CANDIDATES, 0.85)])
+@pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
+def test_fused_tail_matches_eager_at_the_parameter_edges(top_k, top_p):
+    """top_p == 1.0 and top_k == 1 / the cap must keep exactly the eager set."""
+    torch.manual_seed(7)
+    logits = torch.randn(1, tcs.VOCAB_SIZE, device=_device())
+    fused = tcs._topk_topp_fused(logits.clone(), top_k, top_p)
+    assert fused is not None
+    eager = _eager_top_k_top_p(logits, top_k, top_p)
+    kept_fused = torch.isfinite(fused)
+    kept_eager = torch.isfinite(eager)
+    assert torch.equal(kept_fused, kept_eager)
+    assert torch.equal(fused[kept_fused], eager[kept_eager])

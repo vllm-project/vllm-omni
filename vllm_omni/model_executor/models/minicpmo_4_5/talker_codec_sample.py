@@ -718,6 +718,11 @@ def _topk_topp_fused(
     keep = min(int(logits.shape[-1]), int(top_k))
     if keep > _TAIL_MAX_CANDIDATES:
         return None
+    # One candidate means the kernel is instantiated at KP == 1, and the Ascend
+    # Triton compiler aborts (ttir_to_linalg) on those degenerate reduction
+    # shapes. An abort cannot be caught below, so defer that case to eager.
+    if keep < 2:
+        return None
     vals, idx = torch.topk(logits, keep, dim=-1)
     out = torch.empty_like(logits)
     kp = 1 << (keep - 1).bit_length()
