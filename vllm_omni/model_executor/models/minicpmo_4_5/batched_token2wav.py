@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.utils.device_copy import index_to_device
 
+from .code2wav_stats import Code2WavSolveStats
 from .code2wav_watchdog import Code2WavWatchdog
 from .cuda_graph_wrapper import (
     CFMGraphWrapper,
@@ -370,6 +371,9 @@ class BatchedToken2Wav(nn.Module):
             raise ValueError("setup_cache_size must be >= 0")
         self._token2wav = token2wav
         self._watchdog = watchdog or Code2WavWatchdog()
+        # Off unless VLLM_OMNI_CODE2WAV_STATS is set: counts what each CFM /
+        # HiFT solve covers, which is what decides stage-2 cost per frame.
+        self._solve_stats = Code2WavSolveStats()
         self._cfm_tf32 = bool(cfm_tf32)
         cfm_graph_cfg = dict(cfm_graph_config or {})
         # Ragged solves of rows whose caches differ in length (a stream's second chunk next to steady
@@ -645,6 +649,7 @@ class BatchedToken2Wav(nn.Module):
         if int(mel.shape[2]) == 0:
             # No frames, no samples: HiFT itself cannot run on an empty mel.
             return empty_hift_outputs(mel)
+        self._solve_stats.record("hift", batch=int(mel.shape[0]), frames=int(mel.shape[2]))
         if self.hift_graph_wrapper is None:
             return self.hift.inference(mel, source_cache)
         return self.hift_graph_wrapper.replay(mel, source_cache)
@@ -1405,6 +1410,7 @@ class BatchedToken2Wav(nn.Module):
             )
             or (self._cfm_graph_wrapper is None and self._cfm_graph_enabled)
         )
+        self._solve_stats.record("cfm", batch=batch_size, frames=mel_frames, ragged=valid_lengths is not None)
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,
             offset=offset,
