@@ -315,6 +315,46 @@ class TestMammothModa2Extractor(BaseExtractorTest):
         output = context.postprocess(context.hidden_states)
         assert output.shape == sample_inputs["hidden_states"].shape
 
+    @pytest.mark.parametrize(
+        ("with_padding", "expected_modes"),
+        [
+            (False, ["none", "none", "none", "none"]),
+            (True, ["padding", "none", "padding", "padding"]),
+        ],
+        ids=["all_valid", "right_padded"],
+    )
+    def test_forward_publishes_attention_mask_modes(
+        self,
+        mammoth_module,
+        sample_inputs,
+        monkeypatch,
+        with_padding,
+        expected_modes,
+    ):
+        modes = []
+        blocks = [*mammoth_module.context_refiner, *mammoth_module.noise_refiner, *mammoth_module.layers]
+        for block in blocks:
+            original = block.attn.omni_attn.forward
+
+            def spy(query, key, value, attn_metadata=None, *, _original=original):
+                modes.append(attn_metadata.extra.get("attention_mask_mode"))
+                return _original(query, key, value, attn_metadata)
+
+            monkeypatch.setattr(block.attn.omni_attn, "forward", spy)
+
+        inputs = dict(sample_inputs)
+        if with_padding:
+            inputs["hidden_states"] = sample_inputs["hidden_states"].repeat(2, 1, 1, 1)
+            inputs["timestep"] = sample_inputs["timestep"].repeat(2)
+            inputs["text_hidden_states"] = sample_inputs["text_hidden_states"].repeat(2, 1, 1)
+            inputs["text_attention_mask"] = sample_inputs["text_attention_mask"].repeat(2, 1)
+            inputs["text_attention_mask"][1, -1] = False
+
+        with torch.no_grad():
+            mammoth_module(**inputs)
+
+        assert modes == expected_modes
+
     def test_branch_hint_is_preserved(self, mammoth_module, sample_inputs):
         context = extract_mammoth_moda2_context(
             mammoth_module,

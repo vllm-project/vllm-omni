@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,7 +18,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-pytestmark = [pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_mammoth_moda2_calibrated_teacache_defaults():
@@ -269,6 +272,7 @@ def test_mammoth_moda2_teacache_forwards_ar_image_conditioning():
         img_mask,
         noise_rotary_emb,
         temb,
+        context_attention_mask_mode="none",
     )
     assert ctx.hidden_states.shape == (1, 4, hidden_size)
     assert ctx.extra_states["teacache_branch"] == "positive"
