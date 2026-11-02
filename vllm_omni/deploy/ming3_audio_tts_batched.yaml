@@ -1,17 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# Opt-in cross-request batching for standalone Ming3 TTS. With max_num_seqs
-# above one, every scheduled request joins one Talker AR batch: Qwen2 decode,
-# CFM, aggregator and stop head run as one CUDA graph per batch bucket.
+# Compatibility name: batching is enabled in the default Ming3 TTS profile.
 base_config: ming3_audio_tts.yaml
-
-stages:
-  - stage_id: 0
-    max_num_seqs: 64
-    enforce_eager: false
-    compilation_config:
-      mode: 0
-      cudagraph_mode: NONE
-    engine_extras:
-      hf_overrides:
-        low_latency_streaming: true

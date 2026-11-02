@@ -281,11 +281,262 @@ def test_moe_punica_initializes_public_mapping_metadata(monkeypatch):
     assert manager._get_moe_punica_wrapper() is punica
     assert len(punica.update_calls) == 1
     mapping, lora_index_to_id, max_loras, vocab_size = punica.update_calls[0]
-    assert mapping.index_mapping == (1,) * 8
-    assert mapping.prompt_mapping == (1,)
-    assert lora_index_to_id == [1]
+    assert mapping.index_mapping == (0,) * 8
+    assert mapping.prompt_mapping == (0,)
+    assert lora_index_to_id == [None]
     assert max_loras == 1
     assert vocab_size == 0
+
+
+def test_moe_lora_context_is_prepared_at_init_when_capacity_is_set(monkeypatch):
+    calls: list[str] = []
+
+    def _ensure(self):
+        calls.append("ensure")
+
+    monkeypatch.setattr(DiffusionLoRAManager, "_ensure_moe_lora_context", _ensure)
+    DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_num_batched_tokens=8,
+    )
+    assert calls == ["ensure"]
+
+
+def test_moe_lora_context_is_skipped_without_token_capacity(monkeypatch):
+    calls: list[str] = []
+
+    def _replace(self):
+        calls.append("replace")
+
+    monkeypatch.setattr(DiffusionLoRAManager, "_replace_moe_runners_with_lora", _replace)
+    DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    assert calls == []
+
+
+def test_moe_runners_are_wrapped_at_init_when_capacity_is_set(monkeypatch):
+    import vllm.model_executor.layers.fused_moe as upstream_moe
+
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _TargetMoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = SimpleNamespace(is_act_and_mul=True, num_experts=2)
+            self.global_num_experts = 2
+
+    monkeypatch.setattr(upstream_moe, "MoERunner", _TargetMoERunner)
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _DummyBaseLayerWithLoRA(layer),
+    )
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub),
+    )
+    monkeypatch.setattr(manager_mod.DiffusionLoRAManager, "_publish_moe_lora_context", lambda self: None)
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.experts = _TargetMoERunner()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_num_batched_tokens=8,
+    )
+
+    assert "transformer.experts" in manager._lora_modules
+    assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA)
+
+
+def test_publish_moe_lora_context_uses_no_lora_mapping_until_adapter_is_active(monkeypatch):
+    import vllm.lora.layers.fused_moe as fused_moe
+    import vllm.lora.punica_wrapper as punica_module
+
+    class _FakePunica:
+        def __init__(self):
+            self.update_calls = []
+
+        def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size):
+            self.update_calls.append((mapping, lora_index_to_id, max_loras, vocab_size))
+
+    class _FakeMoELoRA(fused_moe.FusedMoEWithLoRA):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.mappings = []
+            self.base_layer = torch.nn.Module()
+
+        def set_mapping(self, punica_wrapper):
+            self.mappings.append(punica_wrapper)
+
+        def set_lora(self, index, lora_a, lora_b):
+            raise AssertionError("MoE layer has no adapter weights in this test")
+
+        def reset_lora(self, index):
+            pass
+
+    punica = _FakePunica()
+    monkeypatch.setattr(punica_module, "get_punica_wrapper", lambda *args, **kwargs: punica)
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager._moe_punica_wrapper = None
+    manager._max_lora_rank = 8
+    manager.max_cached_adapters = 1
+    manager.dtype = torch.bfloat16
+    manager.device = torch.device("cpu")
+    manager._max_num_batched_tokens = 4
+    manager._active_adapter_id = None
+    wrapper = _FakeMoELoRA()
+    manager._lora_modules = {"transformer.experts": wrapper}
+
+    manager._publish_moe_lora_context()
+    mapping, lora_index_to_id, _, _ = punica.update_calls[-1]
+    assert mapping.index_mapping == (0,) * 4
+    assert lora_index_to_id == [None]
+    assert wrapper.mappings == [punica]
+
+
+def test_activation_republishes_moe_mapping_after_committing_the_adapter(monkeypatch):
+    """The mapping is derived from ``_active_adapter_id``; activating an
+    adapter must republish it, otherwise the MoE kernels keep taking the
+    no-LoRA fast path and silently drop the expert contribution."""
+    import vllm.lora.layers.fused_moe as fused_moe
+    import vllm.lora.punica_wrapper as punica_module
+
+    class _FakePunica:
+        def __init__(self):
+            self.update_calls = []
+
+        def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size):
+            self.update_calls.append((mapping, lora_index_to_id, max_loras, vocab_size))
+
+    class _FakeMoELoRA(fused_moe.FusedMoEWithLoRA):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.mappings = []
+            # Not a MoERunner, so the dense binding path treats this layer as
+            # carrying no weights for the adapter below.
+            self.base_layer = torch.nn.Module()
+
+        def set_mapping(self, punica_wrapper):
+            self.mappings.append(punica_wrapper)
+
+        def set_lora(self, index, lora_a, lora_b):
+            raise AssertionError("MoE layer has no adapter weights in this test")
+
+        def reset_lora(self, index):
+            pass
+
+    punica = _FakePunica()
+    monkeypatch.setattr(punica_module, "get_punica_wrapper", lambda *args, **kwargs: punica)
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    manager._max_num_batched_tokens = 4
+    manager._max_lora_rank = 8
+    manager._lora_modules = {"transformer.experts": _FakeMoELoRA()}
+
+    dense_layer = _DummyLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules["transformer.foo"] = dense_layer
+    manager._registered_adapters = {
+        1: type(
+            "LM",
+            (),
+            {
+                "id": 1,
+                "loras": {
+                    "transformer.foo": LoRALayerWeights(
+                        module_name="transformer.foo",
+                        rank=2,
+                        lora_alpha=2,
+                        lora_a=torch.ones((2, 4)),
+                        lora_b=torch.ones((2, 2)),
+                    )
+                },
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    manager._activate_adapter(1, 0.5)
+
+    assert manager._active_adapter_id == 1
+    assert len(dense_layer.set_calls) == 1
+    # The binding-time publish still sees no active adapter; the post-commit
+    # publish is what switches the mapping to the adapter slot.
+    published = [(m.index_mapping, ids) for m, ids, _, _ in punica.update_calls]
+    assert published[0] == ((0,) * 4, [None])
+    assert published[-1] == ((1,) * 4, [1])
+
+
+def test_failed_activation_republishes_no_adapter_moe_mapping(monkeypatch):
+    class _FailingLoRALayer(_DummyLoRALayer):
+        def set_lora(self, index: int, lora_a, lora_b):
+            raise RuntimeError("bind failed")
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+    manager._max_num_batched_tokens = 4
+    failing = _FailingLoRALayer(n_slices=1, output_slices=(2,))
+    manager._lora_modules = {"transformer.foo": failing}
+    manager._registered_adapters = {
+        1: type(
+            "LM",
+            (),
+            {
+                "id": 1,
+                "loras": {
+                    "transformer.foo": LoRALayerWeights(
+                        module_name="transformer.foo",
+                        rank=2,
+                        lora_alpha=2,
+                        lora_a=torch.ones((2, 4)),
+                        lora_b=torch.ones((2, 2)),
+                    )
+                },
+                "get_lora": lambda self, k: self.loras.get(k),
+            },
+        )()
+    }
+
+    seen_adapter_ids: list[int | None] = []
+    publish = manager._publish_moe_lora_context
+
+    def _recording_publish() -> None:
+        seen_adapter_ids.append(manager._active_adapter_id)
+        publish()
+
+    monkeypatch.setattr(manager, "_publish_moe_lora_context", _recording_publish)
+
+    # Start with another adapter active so the mapping currently points at the
+    # adapter slot; a failed switch has to republish the no-adapter mapping.
+    manager._active_adapter_id = 7
+    manager._adapter_scales = {7: 0.5}
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        manager._activate_adapter(1, 0.5)
+
+    assert manager._active_adapter_id is None
+    assert failing.reset_calls == 1
+    # A failed activation rolls back to the no-adapter mapping.
+    assert seen_adapter_ids == [None]
 
 
 def test_moe_lora_token_capacity_is_validated_before_forward(monkeypatch):
@@ -364,6 +615,46 @@ def test_move_moe_lora_buffers_keeps_all_stacks_and_views_on_device():
         (3, 5),
         (3, 4),
     ]
+
+
+def test_lora_manager_homes_lora_buffers_to_compute_device_without_dlo(monkeypatch):
+    # Non-DLO deployments used to leave `_resident_lora_device` unset, so
+    # buffers created while the base weights were offloaded stayed on CPU
+    # after wake, and rank-growth reinit re-stranded them (#8817).
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _LoRALayer(DummyBaseLayerWithLoRA):
+        lora_buffer_device = None
+
+        def _set_diffusion_lora_buffer_device(self, device):
+            self.lora_buffer_device = device
+            self._diffusion_lora_buffer_device = device
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _LoRALayer)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _LoRALayer(layer),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    compute = torch.device("meta")
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=compute,
+        dtype=torch.bfloat16,
+    )
+
+    manager._replace_layers_with_lora(type("_PH", (), {"r": 1})())
+
+    layer = pipeline.transformer.foo
+    assert layer.lora_buffer_device == compute
+    # The recorded device is what create_lora_weights consults when a later
+    # rank increase re-allocates the buffers, so the second exposure from
+    # #8817 is pinned by this attribute as well.
+    assert layer._diffusion_lora_buffer_device == compute
 
 
 def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch):
@@ -1083,7 +1374,9 @@ def test_rank_growth_invalidates_moe_punica_before_republish(monkeypatch):
 
     manager._ensure_max_lora_rank(128)
 
-    assert published_cache_values == [None]
+    # The rank bump clears the punica cache before the first republish, and
+    # the reactivation publishes again once the adapter state is committed.
+    assert published_cache_values[0] is None
     assert manager._moe_punica_wrapper.max_lora_rank == 128
 
 

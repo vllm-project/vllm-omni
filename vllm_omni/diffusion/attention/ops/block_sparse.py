@@ -127,10 +127,12 @@ if not hasattr(torch.ops.vllm_omni, "fastvideo_block_sparse_attn_bshd"):
             except (ImportError, RuntimeError) as exc:
                 if block_size == 128:
                     raise RuntimeError("FastH3 Omni requires a supported Blackwell sparse attention kernel") from exc
+                # warning_once caches its arguments. An exception retains traceback
+                # frames, including this forward's query/key/value tensors.
                 logger.warning_once(
                     "FASTVIDEO_VSA_SM100A=1 requested but the native Blackwell forward is "
                     "unavailable (%s); using the Triton block-sparse route instead.",
-                    exc,
+                    str(exc),
                 )
 
         from fastvideo_kernel.block_sparse_attn import block_sparse_attn

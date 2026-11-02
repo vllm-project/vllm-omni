@@ -53,6 +53,14 @@ def test_custom_sampler_falls_back_to_parent(monkeypatch):
     assert state.custom_sampler(sampler) == (sampler, marker)
 
 
+def test_model_sampler_hook_returning_none_keeps_runner_samplers():
+    # Upstream load_model builds its own sampler and rejection sampler when
+    # custom_sampler returns a falsy value.
+    state = object.__new__(OmniModelState)
+    state.model = SimpleNamespace(mrv2_custom_sampler=lambda sampler: None)
+    assert state.custom_sampler(object()) is None
+
+
 def test_logits_vocab_is_adopted_before_parent_sampler_initialization(monkeypatch):
     import vllm.v1.worker.gpu.model_runner as upstream
 

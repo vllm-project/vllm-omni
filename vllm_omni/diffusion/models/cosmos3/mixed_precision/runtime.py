@@ -9,6 +9,7 @@ from typing import Literal
 
 import torch
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+from vllm.model_executor.models.utils import PPMissingLayer
 
 from .config import Cosmos3MixedPrecisionConfig
 from .strategy import (
@@ -85,7 +86,9 @@ class Cosmos3MixedPrecisionRuntime:
         components: dict[PrecisionPath, torch.nn.Module] = {
             "generation": transformer.gen_layers,
         }
-        if self.config.reasoner == "a16":
+        # Under pipeline parallelism the UND reasoner lives only on the first
+        # stage; later stages hold a PPMissingLayer placeholder without layers.
+        if self.config.reasoner == "a16" and not isinstance(transformer.language_model, PPMissingLayer):
             components["reasoner"] = transformer.language_model.layers
 
         wrapped_count = 0

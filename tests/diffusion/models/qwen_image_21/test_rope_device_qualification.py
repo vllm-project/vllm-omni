@@ -87,7 +87,7 @@ def test_validated_pointwise_declines_kernels_while_compiling(monkeypatch):
     )
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.no_grad()
 def test_validated_pointwise_compiles_with_inductor():
     """Eager callers may validate once and pass the flag into regionally compiled blocks."""
@@ -105,7 +105,7 @@ def test_validated_pointwise_compiles_with_inductor():
     torch.testing.assert_close(compiled(x, y, gate), expected, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @torch.no_grad()
 def test_unqualified_attention_uses_reference_norm_and_rope(monkeypatch):
     sequence = 17

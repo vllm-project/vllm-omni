@@ -15,7 +15,7 @@ from tests.model_executor.models.minicpmo_4_5.test_talker_mrv2 import _talker
 pytestmark = [pytest.mark.core_model]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_mrv2_sampler_applies_codec_window_penalty_instead_of_stock_penalty():
     """The real MRv2 sampler pipeline scores the V1 16-frame codec penalty.
 

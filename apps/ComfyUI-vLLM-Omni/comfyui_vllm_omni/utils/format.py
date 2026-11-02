@@ -129,10 +129,18 @@ def image_tensor_to_base64(tensor: torch.Tensor, filename: str = "image.png") ->
     return f"data:{mime_type};base64,{base64_str}"
 
 
-def video_to_bytes(video: VideoInput, filename: str = "video.mp4", *, format: str = "auto") -> BytesIO:
+def video_to_bytes(video: VideoInput, filename: str = "video.mp4", *, format: str | None = None) -> BytesIO:
+    """Write ``video`` into a named buffer.
+
+    Without ``format``, ComfyUI keeps a loaded file's own container (MKV/WebM
+    stay Matroska); pass ``format="mp4"`` when the upload must be an MP4.
+    """
     output_buffer = BytesIO()
     output_buffer.name = filename
-    video.save_to(output_buffer, format=format)
+    if format is None:
+        video.save_to(output_buffer)
+    else:
+        video.save_to(output_buffer, format=format)
     output_buffer.seek(0)
     return output_buffer
 
