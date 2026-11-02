@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU regressions for MammothModa2 AR MoE graph-safe routing.
+"""CPU regressions for MammothModa2 AR MoE routing under graph capture.
 
-Covers the cudagraph_mode FULL fix from #7318: the graph-safe `torch.where`
-routing must be numerically identical to the eager dispatch path, and the
-graph-safe embedding blend must produce the same result as eager lookup.
+Host-side routing baked into a graph cannot be reused for real inputs: during
+capture the masks are all zeros, so any `.any()` / `.all()` branch recorded
+there replays the wrong expert. These tests pin the graph-safe `torch.where`
+routing to the eager result, keep both experts in the captured graph, and make
+capture without a mask fail closed instead of silently routing to the
+understanding expert.
 """
 
 import pytest
@@ -65,6 +68,74 @@ def test_moe_forward_dispatch_to_blend_when_capturing(monkeypatch: pytest.Monkey
     reference = m._moe_blend(hidden, _und, _gen, mask)
 
     torch.testing.assert_close(blended, reference)
+
+
+def test_moe_forward_capturing_none_mask_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Capture with no mask must raise, not silently bake the understanding expert."""
+    monkeypatch.setattr(m, "_is_graph_capturing", lambda device: True)
+    hidden = torch.randn(2, 3, 4)
+
+    with pytest.raises(RuntimeError, match="requires gen_token_mask"):
+        m.moe_forward(hidden, _und, _gen, None)
+
+    with pytest.raises(RuntimeError, match="requires gen_token_mask"):
+        m.moe_forward(hidden, _und, _gen, torch.zeros(0, dtype=torch.bool))
+
+
+def test_moe_forward_capturing_all_false_mask_still_runs_both_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dummy capture uses an all-false mask; both experts must still be graphed."""
+    monkeypatch.setattr(m, "_is_graph_capturing", lambda device: True)
+    hidden = torch.randn(4, 2)
+    calls: list[str] = []
+
+    def und(x: torch.Tensor) -> torch.Tensor:
+        calls.append("und")
+        return x * 2.0
+
+    def gen(x: torch.Tensor) -> torch.Tensor:
+        calls.append("gen")
+        return x * 3.0
+
+    out = m.moe_forward(hidden, und, gen, torch.zeros(4, dtype=torch.bool))
+
+    assert calls == ["und", "gen"]
+    torch.testing.assert_close(out, hidden * 2.0)
+
+
+def test_ar_wrappers_keep_raw_input_tokens() -> None:
+    """The runner decides whether to drop input_ids from the top-level module."""
+    assert m.MammothModa2ARForConditionalGeneration.requires_raw_input_tokens is True
+    assert m.MammothModa2Qwen3ARForConditionalGeneration.requires_raw_input_tokens is True
+
+
+def test_is_graph_capturing_warns_once_without_backend_probe(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A backend with no capture probe must surface once, not fail silently."""
+    monkeypatch.delattr(torch, "npu", raising=False)
+    monkeypatch.setattr(m, "_WARNED_CAPTURE_PROBES", set())
+
+    from types import SimpleNamespace
+
+    fake_npu = SimpleNamespace(type="npu")
+    assert m._is_graph_capturing(fake_npu) is False
+    assert m._is_graph_capturing(fake_npu) is False
+
+    hits = [r for r in caplog.records if "no is_current_stream_capturing" in r.getMessage()]
+    assert len(hits) == 1
+
+
+def test_get_input_embeddings_graph_safe_clamps_oob_gen_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The discarded side of the blend must not index out of range."""
+    lm = _make_lm()
+    monkeypatch.setattr(m, "_is_graph_capturing", lambda device: True)
+
+    # 100 is far past both tables; the gen lookup must clamp instead of raising.
+    out = lm.get_input_embeddings(torch.tensor([0, 100]))
+    torch.testing.assert_close(out[0], torch.full((3,), 1.0))
+    torch.testing.assert_close(out[1], torch.full((3,), 2.0))
 
 
 def test_moe_forward_eager_path_unchanged_when_not_capturing() -> None:
