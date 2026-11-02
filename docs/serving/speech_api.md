@@ -154,6 +154,7 @@ Content-Type: application/json
 | `extra_params` | object | null | Model-specific generation controls. See the model sections for supported fields. |
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
 | `stream_format` | string | null | Streaming output format. `"audio"` streams raw audio bytes as they are decoded; `"sse"` streams OpenAI `speech.audio.*` Server-Sent Events. If omitted, `stream=true` selects SSE and `stream=false` remains non-streaming. See [Response Format](#response-format). |
+| `cache_salt` | string | null | Caller-supplied prefix-cache salt namespace. Composed with the server-derived conditioning identity (adapter-computed or the derived default), so callers narrow sharing (tenants, sessions) without dropping voice/input isolation. |
 
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 

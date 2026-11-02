@@ -22,6 +22,23 @@ _LONG_CONTEXT_PROFILES = [
 ]
 
 
+@pytest.mark.parametrize("model_type", ["ming3_tts", "lingv3_tts"])
+def test_ming3_tts_default_serves_audio_with_one_mrv2_stage(model_type):
+    pipeline = resolve_pipeline_config(model_type)
+    assert pipeline is not None
+    # Exercise default loading, as used by `vllm serve MODEL --omni`.
+    config = VllmOmniConfig.from_pipeline_config(pipeline)
+    (stage,) = config.stage_configs
+    assert stage.model_stage == "llm"
+    assert stage.engine_output_type == "audio"
+    assert stage.final_output is True
+    assert stage.model_config.use_v2_model_runner is True
+    assert stage.scheduler_config.async_scheduling is True
+    assert stage.scheduler_config.max_num_seqs == 64
+    assert stage.scheduler_config.max_model_len == 4096
+    assert stage.model_config.default_sampling_params["max_tokens"] == 801
+
+
 @pytest.mark.parametrize("profile", _LONG_CONTEXT_PROFILES)
 def test_ming_profile_context_and_topology_reach_both_config_builders(profile):
     deploy = load_deploy_config(_DEPLOY / profile)

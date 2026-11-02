@@ -56,6 +56,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from fastapi.testclient import TestClient
 from starlette.datastructures import State
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
 from vllm.entrypoints.serve.tokenize import api_router as tokenization_api_router
@@ -63,6 +64,7 @@ from vllm.entrypoints.serve.tokenize.protocol import DetokenizeResponse, Tokeniz
 from vllm.exceptions import RetryableRequestError
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.engine.omni_engine_base import OmniEngineBase
 from vllm_omni.entrypoints.openai import api_server
 from vllm_omni.entrypoints.serve.utils import errors as serve_errors
 
@@ -95,16 +97,46 @@ def test_omni_api_worker_sets_parent_death_signal_before_validation(mocker):
 
 
 @pytest.mark.asyncio
-async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
+@pytest.mark.parametrize("tracing_mode", ["enabled", "disabled", "no-engine", "no-provider"])
+async def test_omni_run_server_worker_forwards_client_config(monkeypatch, tracing_mode):
+    import httpx
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from vllm_omni.tracing import capture_trace_headers
+
+    tracing_enabled = tracing_mode == "enabled"
+    if tracing_enabled:
+        pytest.importorskip("opentelemetry.instrumentation.fastapi")
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    app = FastAPI()
+    app.add_middleware(CORSMiddleware, allow_origins=["http://client"])
+
+    @app.get("/trace")
+    async def trace_context():
+        return capture_trace_headers()
+
+    app.middleware_stack = app.build_middleware_stack()
+
     captured: dict[str, object] = {}
 
     @asynccontextmanager
     async def fake_build_async_omni(*_args, **kwargs):
         captured.update(kwargs)
-        yield _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        engine = _FakeEngineClient(vllm_config=_FakeVllmConfig(_FakeParallelConfig(_api_process_rank=1)))
+        if tracing_mode == "no-engine":
+            del engine.engine
+        elif tracing_mode == "no-provider":
+            del engine.engine.tracer_provider
+        else:
+            engine.engine.tracer_provider = provider if tracing_enabled else None
+        yield engine
 
     monkeypatch.setattr(api_server, "build_async_omni", fake_build_async_omni)
-    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: FastAPI())
+    monkeypatch.setattr(api_server, "build_openai_app", lambda *_args: app)
     monkeypatch.setattr(api_server, "omni_init_app_state", lambda *_args: asyncio.sleep(0))
     monkeypatch.setattr(api_server, "shutdown_unsupported_routes", lambda *_args: None)
 
@@ -115,6 +147,22 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     async def fake_serve_http(app, **_kwargs):
         assert app.state.api_server_count == 2
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            for sampled in ("01", "00"):
+                parent = f"00-12345678901234567890123456789012-1234567890123456-{sampled}"
+                response = await client.get(
+                    "/trace",
+                    headers={"traceparent": parent, "tracestate": "vendor=state", "origin": "http://client"},
+                )
+                assert response.status_code == 200
+                assert response.headers["access-control-allow-origin"] == "http://client"
+                carrier = response.json()
+                if tracing_enabled:
+                    assert carrier["traceparent"].split("-")[1] == parent.split("-")[1]
+                    assert int(carrier["traceparent"].split("-")[3], 16) & 1 == int(sampled, 16)
+                    assert carrier["tracestate"] == "vendor=state"
+                else:
+                    assert carrier == {}
         task = asyncio.create_task(asyncio.sleep(0))
         await asyncio.sleep(0)
         return task
@@ -126,6 +174,11 @@ async def test_omni_run_server_worker_forwards_client_config(monkeypatch):
 
     await api_server.omni_run_server_worker("127.0.0.1:8000", _FakeSocket(), args, config)
     assert captured["client_config"] is config
+    spans = exporter.get_finished_spans()
+    assert len(spans) == int(tracing_enabled)
+    if tracing_enabled:
+        assert spans[0].parent.span_id == int("1234567890123456", 16)
+    provider.shutdown()
 
 
 # FastAPI/Starlette auto-adds HEAD on every GET route. Including HEAD here
@@ -156,6 +209,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("WEBSOCKET", "/v1/realtime"),
     ("WEBSOCKET", "/v1/realtime/robot/openpi"),
     ("WEBSOCKET", "/v1/duplex"),
+    ("POST", "/v1/run"),
     ("POST", "/v1/realtime/sessions"),
     ("POST", "/v1/realtime/sessions/{session_id}/step"),
     ("POST", "/v1/realtime/sessions/{session_id}/reset"),
@@ -165,6 +219,8 @@ _EXPECTED_ROUTER_ROUTES = {
     ("GET", "/v1/models"),
     ("POST", "/v1/images/generations"),
     ("POST", "/v1/images/edits"),
+    ("POST", "/v1/images/segmentations"),
+    ("POST", "/v1/videos/segmentations"),
     ("POST", "/v1/videos"),
     ("POST", "/v1/videos/sync"),
     ("GET", "/v1/videos"),
@@ -202,6 +258,7 @@ _DIFFUSION_APP_STATE_KEYS = {
     "openai_streaming_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -233,6 +290,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "openai_serving_video",
     "openai_serving_realtime_robot",
     "rl_rollout_serving",
+    "run_serving",
     "enable_server_load_tracking",
     "server_load_metrics",
 }
@@ -374,6 +432,8 @@ class _FakeEngineClient:
     config_path: str | None = None
 
     def __init__(self, *, stage_configs=None, endpoint_restrictions=None, vllm_config=None) -> None:
+        self.engine = object.__new__(OmniEngineBase)
+        self.engine.tracer_provider = None
         self.stage_configs = stage_configs if stage_configs is not None else []
         self.endpoint_restrictions = endpoint_restrictions if endpoint_restrictions is not None else {}
         self.model_config = SimpleNamespace()
@@ -790,7 +850,7 @@ async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch
     async def inner(scope, receive, send):
         called[scope["type"]] = True
 
-    middleware._inner = inner
+    middleware._asgi = inner
     await middleware(http_scope, _receive, _send)
     await middleware(ws_scope, _receive, _send)
 
