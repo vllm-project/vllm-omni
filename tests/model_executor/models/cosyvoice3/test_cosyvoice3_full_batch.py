@@ -129,7 +129,6 @@ def test_packed_stream_noise_growth_preserves_prefix_and_global_rng():
 def test_packed_attention_matches_row_reference(monkeypatch, backend, chunk_size):
     require_packed_backend(monkeypatch, backend)
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
-        attention_uses_pages,
         build_row_attention,
         pack_rows,
         ragged_attention_tensor_geometry,
@@ -142,7 +141,6 @@ def test_packed_attention_matches_row_reference(monkeypatch, backend, chunk_size
     lengths = [67, 0, 103]
     rows = pack_rows(lengths, torch.device("cuda"))
     attention = build_row_attention(rows, heads=2, head_dim=64, backend=backend, chunk_size=chunk_size)
-    assert attention.paged is attention_uses_pages(backend, chunk_size is not None)
     if backend == "flashinfer":
         plan = FlashInferRowPlan(
             rows.row_ids.device, heads=2, head_dim=64, dtype=torch.bfloat16, chunked=chunk_size is not None

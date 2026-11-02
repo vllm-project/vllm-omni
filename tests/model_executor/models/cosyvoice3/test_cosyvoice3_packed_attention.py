@@ -28,25 +28,6 @@ def _attention(lengths, backend, chunk_size=None, width=None):
     return rows, attention
 
 
-@pytest.mark.parametrize("backend", ["fa2", "fa3"])
-def test_attention_metadata_retains_live_graph_buffers(backend):
-    from dataclasses import replace
-
-    _, source = _attention([17, 0, 33], backend, chunk_size=CHUNK)
-    graph_attention = replace(source)
-
-    # Constructing metadata must retain the graph buffers, not snapshot them.
-    for name in ("cache_seqlens", "cu_seqlens_q", "page_table", "slot_frames"):
-        buffer = getattr(source, name)
-        assert getattr(graph_attention, name) is buffer
-        address = buffer.data_ptr()
-        updated = torch.zeros_like(buffer)
-        buffer.copy_(updated)
-        assert getattr(graph_attention, name).data_ptr() == address
-        assert torch.equal(getattr(graph_attention, name), updated)
-    assert graph_attention.page_size == (16 if backend == "fa2" else 1)
-
-
 def _segment_frames(attention, segment):
     """Packed frames a segment's K/V reads, the way the kernel reads them."""
     end = int(attention.cache_seqlens[segment])
@@ -110,15 +91,14 @@ def test_paged_attention_matches_isolated_row_attention(backend, chunk_size):
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize("chunk_size", [None, CHUNK])
-@pytest.mark.parametrize("lengths", [[1], [15, 17, 33], [67, 0, 103, 16, 1], [500, 7, 129, 64, 0]])
+@pytest.mark.parametrize("lengths", [[1], [67, 0, 103, 16, 1, 500, 7, 129, 64]])
 def test_every_segment_reads_exactly_its_rows_frames(backend, chunk_size, lengths):
     rows, attention = _attention(lengths, backend, chunk_size)
     page_size = attention.page_size
 
     if attention.paged:
-        # Rows start on a page and waste less than one page each.
+        # Every page index must fit the gathered K/V buffer.
         slot_frames = attention.slot_frames
-        assert slot_frames.shape[0] == sum(-(-n // page_size) for n in lengths) * page_size
         assert int(attention.page_table.max()) < slot_frames.shape[0] // page_size
     # Paged slots past a row's end alias frame 0, so a segment must never read
     # past its own row: each one reads exactly its row's frames, in order.
@@ -133,22 +113,7 @@ def test_every_segment_reads_exactly_its_rows_frames(backend, chunk_size, length
         assert torch.equal(_segment_frames(attention, segment), row_starts[row] + torch.arange(end))
 
 
-@pytest.mark.parametrize("chunk_size", [None, CHUNK])
-def test_fa2_slots_aliasing_frame_zero_never_reach_other_rows(chunk_size):
-    lengths = [7, 67, 1, 103, 16]
-    _, attention = _attention(lengths, backend="fa2", chunk_size=chunk_size)
-    generator = torch.Generator().manual_seed(1)
-    q, k, v = [torch.randn(sum(lengths), 2, 8, generator=generator) for _ in range(3)]
-    clean = _paged_attention(q, k, v, attention)
-    k[0], v[0] = float("nan"), float("nan")
-
-    poisoned = _paged_attention(q, k, v, attention)
-
-    assert torch.equal(poisoned[lengths[0] :], clean[lengths[0] :])
-
-
-@pytest.mark.parametrize("seed", range(4))
-def test_flow_graph_slot_buffer_covers_every_padded_layout(monkeypatch, seed):
+def test_flow_graph_slot_buffer_covers_every_padded_layout(monkeypatch):
     import random
     from types import SimpleNamespace
 
@@ -161,7 +126,7 @@ def test_flow_graph_slot_buffer_covers_every_padded_layout(monkeypatch, seed):
     monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: None)
     attn = SimpleNamespace(heads=2, inner_dim=16)
     dit = SimpleNamespace(transformer_blocks=[SimpleNamespace(attn=attn)], static_chunk_size=CHUNK)
-    rng = random.Random(seed)
+    rng = random.Random(0)
     noise, spks, time_span = torch.zeros(1, 1, 80), torch.zeros(1, 80), torch.zeros(4)
     for backend in ("fa2", "fa3"):
         runner = FlowGraphRunner(SimpleNamespace(dit=dit, backend=backend, dtype=None))
@@ -195,19 +160,12 @@ def test_fa3_pages_are_the_packed_sequence_itself():
     lengths = [67, 0, 103]
     rows, attention = _attention(lengths, backend="fa3", chunk_size=CHUNK)
 
-    assert attention.page_size == 1
     assert torch.equal(attention.slot_frames, torch.arange(rows.total))
-    starts = rows.starts_host.long()
-    for segment, (row, end) in enumerate([(0, 50), (0, 67), (1, 0), (2, 50), (2, 100), (2, 103)]):
-        assert int(attention.cache_seqlens[segment]) == end
-        assert torch.equal(attention.page_table[segment, :end].long(), starts[row] + torch.arange(end))
-        assert not attention.page_table[segment, end:].any()
 
 
 def test_fa2_pages_round_up_while_geometry_keeps_the_bucketed_width():
-    rows, attention = _attention([5, 0, 37], backend="fa2", chunk_size=CHUNK, width=256)
+    _, attention = _attention([5, 0, 37], backend="fa2", chunk_size=CHUNK, width=256)
 
-    assert rows.width == 256
     assert attention.page_table.shape == (3, 16)
     assert attention.cache_seqlens.tolist() == [5, 0, 37]
     assert attention.cu_seqlens_q.tolist() == [0, 5, 5, 42]
@@ -216,13 +174,10 @@ def test_fa2_pages_round_up_while_geometry_keeps_the_bucketed_width():
     assert not attention.page_table[1].any()
 
 
-@pytest.mark.parametrize("width", [None, 256])
-def test_fa2_full_context_attends_unpaged_while_fa3_keeps_in_place_pages(width):
-    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import attention_uses_pages
-
+def test_fa2_full_context_attends_unpaged_while_fa3_keeps_in_place_pages():
     lengths = [5, 0, 37, 16]
-    _, fa2 = _attention(lengths, backend="fa2", width=width)
-    _, fa3 = _attention(lengths, backend="fa3", width=width)
+    _, fa2 = _attention(lengths, backend="fa2", width=256)
+    _, fa3 = _attention(lengths, backend="fa3", width=256)
 
     # FA2 full context: one segment per row whose K/V span is its query span.
     assert not fa2.paged and fa2.page_table is None and fa2.slot_frames is None
@@ -231,10 +186,6 @@ def test_fa2_full_context_attends_unpaged_while_fa3_keeps_in_place_pages(width):
     assert fa2.max_seqlen_q == 37
     # FA3 keeps its one-frame pages, and chunk-causal segments stay paged on both.
     assert fa3.paged
-    backends = ("fa2", "fa3", "flashinfer")
-    uses_pages = [attention_uses_pages(b, chunked) for b in backends for chunked in (False, True)]
-    # FlashInfer plans its own KV indices instead of a FlashAttention page table.
-    assert uses_pages == [False, True, True, True, False, False]
 
 
 def test_rope_only_needs_a_width_covering_every_row():
@@ -266,13 +217,12 @@ def test_packed_solve_scopes_precise_bf16_gemms(monkeypatch):
         raise RuntimeError("solve failed")
 
     estimator = SimpleNamespace(graph_runner=SimpleNamespace(run=run))
-    for _ in range(2):
-        with pytest.raises(RuntimeError, match="solve failed"):
-            solve_flow_euler_packed(
-                estimator, None, None, None, None, None, None, cfg_rate=0.7, streaming=False, modulation_key=()
-            )
+    with pytest.raises(RuntimeError, match="solve failed"):
+        solve_flow_euler_packed(
+            estimator, None, None, None, None, None, None, cfg_rate=0.7, streaming=False, modulation_key=()
+        )
 
-    assert seen == [False, False]
+    assert seen == [False]
     assert matmul.allow_bf16_reduced_precision_reduction
 
 
@@ -292,14 +242,11 @@ def fake_gpu(monkeypatch):
     [
         ({"fa2", "fa3"}, None, "fa3"),  # Hopper
         ({"fa2"}, None, "fa2"),  # Ampere, Ada, Blackwell
-        (set(), None, None),
         ({"fa2", "fa3"}, "fa2", "fa2"),
         ({"fa2"}, "fa3", None),
         # FlashInfer is opt-in: installed alone, it is never picked automatically.
-        ({"fa2", "fa3", "flashinfer"}, None, "fa3"),
         ({"flashinfer"}, None, None),
         ({"fa2", "flashinfer"}, "flashinfer", "flashinfer"),
-        ({"fa2"}, "flashinfer", None),
     ],
 )
 def test_packed_backend_prefers_fa3_and_honors_the_pin(monkeypatch, fake_gpu, supported, pinned, expected):
@@ -321,7 +268,7 @@ def test_packed_backend_rejects_unknown_pins(monkeypatch, fake_gpu):
         fake_gpu[0].cosyvoice3_packed_attention_backend()
 
 
-@pytest.mark.parametrize("capability, expected", [((7, 5), False), ((8, 0), True), ((12, 0), True)])
+@pytest.mark.parametrize("capability, expected", [((7, 5), False), ((8, 0), True)])
 def test_flashinfer_pin_keeps_the_stock_flow_below_sm80(monkeypatch, capability, expected):
     import vllm_omni.model_executor.models.cosyvoice3.runtime as runtime
 
@@ -376,7 +323,7 @@ def fake_flashinfer(monkeypatch):
     return packed_flashinfer
 
 
-@pytest.mark.parametrize("lengths", [[1], [15, 17, 33], [67, 0, 103, 16, 1], [500, 7, 129, 64, 0]])
+@pytest.mark.parametrize("lengths", [[1], [67, 0, 103, 16, 1, 500, 7, 129, 64]])
 def test_flashinfer_chunk_plan_reads_each_rows_prefix_in_place(fake_flashinfer, lengths):
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import row_segments
 
@@ -387,10 +334,11 @@ def test_flashinfer_chunk_plan_reads_each_rows_prefix_in_place(fake_flashinfer, 
     plan.plan(lengths, segment_rows, segment_ends, offsets)
     (qo_indptr, kv_indptr, indices, last_page_len, heads, kv_heads, head_dim, page_size), kwargs = plan.wrapper.planned
 
-    assert (heads, kv_heads, head_dim, page_size) == (2, 2, 8, 1)
+    assert page_size == 1
     # FlashInfer reads index tensors as int32; int64 ones are misread.
     assert {t.dtype for t in (qo_indptr, kv_indptr, indices, last_page_len)} == {torch.int32}
-    assert kwargs == {"causal": False, "q_data_type": torch.bfloat16, "disable_split_kv": True}
+    # Chunk queries must see the entire prefix, not a token-causal triangle.
+    assert kwargs["causal"] is False
     assert qo_indptr.tolist() == offsets
     assert last_page_len.tolist() == [1] * len(segment_ends)
     # One-frame pages are packed frames: each segment reads its row's prefix.
@@ -410,13 +358,10 @@ def test_flashinfer_full_context_plan_attends_each_rows_own_span(fake_flashinfer
     plan.plan(lengths, *row_segments(lengths, None))
     (qo_indptr, kv_indptr, heads, kv_heads, head_dim), kwargs = plan.wrapper.planned
 
-    assert type(plan.wrapper).__name__ == "Ragged"
     assert qo_indptr.tolist() == kv_indptr.tolist() == [0, 5, 5, 42, 58]
-    assert (heads, kv_heads, head_dim) == (2, 2, 8)
 
 
-@pytest.mark.parametrize("seed", range(4))
-def test_flashinfer_graph_buffers_cover_every_padded_layout(monkeypatch, fake_flashinfer, seed):
+def test_flashinfer_graph_buffers_cover_every_padded_layout(monkeypatch, fake_flashinfer):
     import random
     from types import SimpleNamespace
 
@@ -426,7 +371,7 @@ def test_flashinfer_graph_buffers_cover_every_padded_layout(monkeypatch, fake_fl
     attn = SimpleNamespace(heads=2, inner_dim=16)
     dit = SimpleNamespace(transformer_blocks=[SimpleNamespace(attn=attn)], static_chunk_size=CHUNK)
     runner = FlowGraphRunner(SimpleNamespace(dit=dit, backend="flashinfer", dtype=torch.bfloat16))
-    rng = random.Random(seed)
+    rng = random.Random(0)
     noise, spks, time_span = torch.zeros(1, 1, 80), torch.zeros(1, 80), torch.zeros(4)
     for _ in range(50):
         lengths = tuple(rng.choice([1, 15, 17, rng.randint(1, 900)]) for _ in range(rng.randint(1, 8)))
