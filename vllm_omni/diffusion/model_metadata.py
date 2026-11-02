@@ -52,6 +52,16 @@ HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
 # Boogu-Image editing (TI2I) supports a single reference image for now.
 BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
+# SenseNova-U1.5 MoT editing accepts multiple reference images: the pipeline
+# expands per-image ``<image>`` placeholders (Image-N prefixes) and folds every
+# grid row into the vision embedding / MoT routing. The pipeline splits a global
+# 4096x4096 px budget across the references (``max_pixels_per_image =
+# min(2048*2048, 4096*4096 // num_images)``) against a per-image upscale floor
+# of 512x512, so the cap is the largest count keeping the two reconciled
+# (4096*4096 // 512*512 = 64): beyond it the floor would exceed the per-image
+# share and the resize upscale branch would blow the documented budget. E2E
+# verified with 8/16/32/64 references at 2560x2048; 65 rejected by admission.
+SENSENOVA_U1_MAX_INPUT_IMAGES = 64
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
@@ -90,6 +100,10 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "JoyImageEditPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=JOY_IMAGE_EDIT_MAX_INPUT_IMAGES,
+    ),
+    "SenseNovaU1Pipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=SENSENOVA_U1_MAX_INPUT_IMAGES,
     ),
     "MiniMaxH3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
