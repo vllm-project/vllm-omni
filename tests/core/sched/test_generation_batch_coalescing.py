@@ -100,6 +100,7 @@ def scheduler(monkeypatch, initial=(), delayed=()):
     clock = [10.0]
     monkeypatch.setattr("vllm_omni.core.sched.omni_generation_scheduler.time.monotonic", lambda: clock[0])
     s = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
+    s._native_data_plane = True
     s._generation_max_wait_s = 0.012
     s._generation_min_batch_size = 4
     s._pause_state = PauseState.UNPAUSED
