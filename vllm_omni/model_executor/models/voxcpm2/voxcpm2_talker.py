@@ -15,6 +15,7 @@ import dataclasses
 import hashlib
 import logging
 import math
+import os
 import time
 from collections.abc import Callable, Iterable, Sequence
 from functools import lru_cache
@@ -1020,6 +1021,36 @@ def _optimized_solve_euler_with_noise(
 # ===================================================================
 
 
+def _resolve_cfg_value(config_value: float) -> float:
+    """cfg_value precedence: env (VLLM_OMNI_SPEECH_CFG_VALUE) > the deploy
+    yaml's ``voxcpm2_runtime_config.cfg_value`` > the dataclass default.
+
+    An unset or empty env value falls back to the config value; a non-numeric
+    env value names the variable in the error; the resolved value must be a
+    positive finite float, and the error names the source it came from.
+    """
+    cfg_from_env = os.environ.get("VLLM_OMNI_SPEECH_CFG_VALUE")
+    if cfg_from_env and cfg_from_env.strip():
+        try:
+            value = float(cfg_from_env)
+        except ValueError as exc:
+            raise ValueError(f"VLLM_OMNI_SPEECH_CFG_VALUE={cfg_from_env!r} is not a valid float") from exc
+        source = f"VLLM_OMNI_SPEECH_CFG_VALUE={cfg_from_env!r}"
+    else:
+        # yaml booleans are rejected upstream in _coerce_value, so this
+        # helper only ever sees the already-coerced config value.
+        try:
+            value = float(config_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"voxcpm2_runtime_config.cfg_value={config_value!r} is not a valid float") from exc
+        source = f"voxcpm2_runtime_config.cfg_value={value!r}"
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(
+            f"{source} must be a positive finite float (env VLLM_OMNI_SPEECH_CFG_VALUE overrides the deploy yaml)"
+        )
+    return value
+
+
 class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1094,7 +1125,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         torch.accelerator.empty_cache()
 
         self._inference_timesteps = self._runtime_config.inference_timesteps
-        self._cfg_value = self._runtime_config.cfg_value
+        self._cfg_value = _resolve_cfg_value(self._runtime_config.cfg_value)
         self._cfg_cutoff_ratio = self._runtime_config.cfg_cutoff_ratio
         # Number of trailing latent frames to keep as VAE receptive-field context
         # for sliding-window streaming decode. 12 matches the nanovllm reference

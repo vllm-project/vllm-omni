@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -113,7 +114,13 @@ class _CountingEstimator(torch.nn.Module):
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_cfg_value_rejects_nonfinite(value: str) -> None:
-    with pytest.raises(ValueError, match="cfg_value must be finite"):
+    # Pin the yaml key AND the raw value (the way the env-var test at the
+    # bottom of this file does): a bare "must be finite" match would pass
+    # even if the message stopped naming the key or echoed a wrong value.
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"voxcpm2_runtime_config.cfg_value={value!r}") + ".*must be finite",
+    ):
         _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"cfg_value": value})))
 
 
@@ -193,3 +200,77 @@ def test_mrv1_rejects_outer_full_cudagraph(mode_name):
 )
 def test_supported_graph_modes_pass(mode_name, uses_v2):
     reject_outer_full_cudagraph(_graph_config(CUDAGraphMode[mode_name], uses_v2=uses_v2))
+
+
+def test_cfg_value_env_overrides_yaml(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", "3.0")
+    assert talker_mod._resolve_cfg_value(2.0) == 3.0
+
+
+def test_cfg_value_unset_falls_back_to_config(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    assert talker_mod._resolve_cfg_value(2.0) == 2.0
+    assert talker_mod._resolve_cfg_value(3.5) == 3.5
+
+
+def test_cfg_value_empty_is_unset(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", "  ")
+    assert talker_mod._resolve_cfg_value(2.5) == 2.5
+
+
+def test_cfg_value_non_numeric_names_the_variable(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", "abc")
+    with pytest.raises(ValueError, match="VLLM_OMNI_SPEECH_CFG_VALUE='abc' is not a valid float"):
+        talker_mod._resolve_cfg_value(2.0)
+
+
+@pytest.mark.parametrize("bad", ["-1", "0", "nan", "inf"])
+def test_cfg_value_non_positive_names_the_source(monkeypatch, bad):
+    import re
+
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_CFG_VALUE", bad)
+    # Match the full source attribution — the raw env-string repr, not just
+    # the variable name: the message always carries the "(env ... overrides
+    # ...)" tail, so a bare name match would pass even if the error blamed
+    # the yaml instead of this env var.
+    with pytest.raises(ValueError, match=re.escape(f"VLLM_OMNI_SPEECH_CFG_VALUE={bad!r}")):
+        talker_mod._resolve_cfg_value(2.0)
+
+
+def test_cfg_value_invalid_yaml_value_blames_the_yaml_source(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value=0"):
+        talker_mod._resolve_cfg_value(0)
+
+
+def test_cfg_value_non_float_yaml_value_names_the_yaml_source(monkeypatch):
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_mod
+
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value='fast' is not a valid float"):
+        talker_mod._resolve_cfg_value("fast")
+
+
+@pytest.mark.parametrize("bad", [True, False])
+def test_cfg_value_yaml_boolean_rejected(monkeypatch, bad):
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
+    # yaml's cfg_value: true would float()-coerce to 1.0 (CFG effectively
+    # off); the coercion entry must reject it before the helper sees it.
+    # Pattern built from the parameter so both arms pin their own value.
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"voxcpm2_runtime_config.cfg_value={bad!r}") + ".*not a boolean",
+    ):
+        _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"cfg_value": bad})))
