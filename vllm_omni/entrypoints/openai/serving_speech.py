@@ -2818,7 +2818,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         else:
             err_type = "BadRequestError" if 400 <= status_code < 500 else "server_error"
         error_body = json.dumps({"error": {"message": message, "type": err_type, "param": None, "code": status_code}})
-        # codeql[py/stack-trace-exposure]: callers use static messages
+        # codeql[py/stack-trace-exposure]
         return Response(content=error_body, media_type="application/json", status_code=status_code)
 
     def _validate_speech_streaming_request(

@@ -51,7 +51,7 @@ async def _validate_url(base_url: str) -> None:
 async def fetch_served_models(base_url: str) -> list[str]:
     """GET ``{base_url}/models`` and return the served model ids."""
     url = base_url.rstrip("/") + "/models"
-    # codeql[py/server-side-request-forgery]: validated upstream
+    # codeql[py/server-side-request-forgery]
     async with aiohttp.ClientSession(timeout=_TIMEOUT) as session, session.get(url) as response:
         if not response.ok:
             raise RuntimeError(f"GET {url} -> {response.status}: {await response.text()}")
