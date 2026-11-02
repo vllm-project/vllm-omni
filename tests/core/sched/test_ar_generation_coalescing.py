@@ -336,17 +336,24 @@ def test_native_notifications_update_readiness_before_gate(monkeypatch):
     assert s._generation_batch_deadline is None
 
 
-def test_orchestrator_readiness_override_enables_ar_gate(monkeypatch):
+@pytest.mark.parametrize("source", ["override", "stage_zero"])
+def test_orchestrator_readiness_enables_ar_gate(monkeypatch, source):
     s = scheduler()
     ready: set[str] = set()
-    monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready.copy())
+    if source == "override":
+        monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready.copy())
+    else:
+        s.vllm_config.model_config.stage_id = 0
     s.chunk_transfer_adapter = None
     s.vllm_config.additional_config = knobs()
     _init_policies(s)
     assert s._generation_max_wait_s == 0.012
-    s.requests["0"].status = RequestStatus.RUNNING
-    s.requests["0"].num_computed_tokens = s.requests["0"].num_prompt_tokens
-    s.running.append(s.requests["0"])
+    if source == "override":
+        s.requests["0"].status = RequestStatus.RUNNING
+        s.requests["0"].num_computed_tokens = s.requests["0"].num_prompt_tokens
+        s.running.append(s.requests["0"])
+    else:
+        s.waiting.add_request(s.requests["0"])
     budgets = prepare_schedule_boundary(monkeypatch, s)
     ready.add("0")
     s.schedule()
