@@ -205,6 +205,9 @@ CUDA sources until the transfer event completes.
 Small lists of multiple compatible CUDA tensors are packed for one snapshot
 copy. A singleton list or tuple uses the ordinary tensor clone/copy path,
 preserving the container without an unnecessary pack and unpack.
+Equal-shaped rows are restored with one batch view and unbind, avoiding
+per-request slice/view dispatches. Ragged rows retain their individual shapes;
+both paths expose views of the owned CPU snapshot after its copy event.
 
 MiniCPM-o 4.5's Talker opts out of hidden-state payloads: Code2Wav consumes
 codec codes and metadata only. Its hidden states remain available for logits

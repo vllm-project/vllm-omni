@@ -133,3 +133,78 @@ def test_batched_decode_matches_scalar_preprocess(mocker) -> None:
         assert [t.item() for t in output["meta"]["finished"]] == [False, True, True, True]
     assert talkers[True]._request_audio_states == talkers[False]._request_audio_states
     assert talkers[True]._decode_codec_ids == {}
+
+
+def _decode_wrapper():
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import MiniCPMO45OmniForConditionalGeneration
+
+    wrapper = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    nn.Module.__init__(wrapper)
+    wrapper.model_stage = "tts"
+    wrapper.talker = _make_talker()
+    return wrapper
+
+
+@pytest.mark.parametrize("order", [["a", "b"], ["b", "a"], ["a", "c"]])
+def test_pure_decode_batch_uses_live_request_order(order):
+    wrapper = _decode_wrapper()
+    buffers: dict[str, dict[str, Any]] = {
+        rid: {"audio_state": {"finished": False, "step": 1}, "marker": rid} for rid in ["a", "b", "c"]
+    }
+    ids = torch.tensor([2, 3, 0])
+    embeds = torch.full((3, 4), -123.0)
+    handled = wrapper.preprocess_batch(
+        req_ids=order,
+        model_intermediate_buffer=buffers,
+        device=ids.device,
+        input_ids=ids,
+        inputs_embeds=embeds,
+        token_offsets=[0, 1],
+        num_scheduled_tokens=[1, 1],
+        num_computed_tokens=[5, 9],
+        prompt_lens=[4, 7],
+    )
+    assert handled == order
+    torch.testing.assert_close(embeds[:2], wrapper.talker.emb_code[0](ids[:2]))
+    assert (embeds[2] == -123).all()
+    for rid, offset in zip(order, [5, 9]):
+        assert buffers[rid]["request_id"] == rid
+        assert buffers[rid]["_omni_num_computed_tokens"] == offset
+        assert buffers[rid]["marker"] == rid
+        assert buffers[rid]["codes"]["audio"].numel() == 0
+
+
+@pytest.mark.parametrize("case", ["prefill", "mixed", "offset", "missing_state", "kstep"])
+def test_pure_decode_batch_falls_back_without_mutation(case):
+    wrapper = _decode_wrapper()
+    buffers: dict[str, dict[str, Any]] = {rid: {"audio_state": {"finished": False}} for rid in ["a", "b"]}
+    scheduled, computed, offsets = [1, 1], [5, 9], [0, 1]
+    if case == "prefill":
+        computed[1] = 0
+    elif case == "mixed":
+        scheduled[1] = 2
+    elif case == "offset":
+        offsets[1] = 2
+    elif case == "missing_state":
+        buffers["b"].clear()
+    else:
+        wrapper.talker._k_step_frames = 2
+    before = copy.deepcopy(buffers)
+    ids = torch.tensor([2, 3, 0])
+    embeds = torch.full((3, 4), -123.0)
+    assert (
+        wrapper.preprocess_batch(
+            req_ids=["a", "b"],
+            model_intermediate_buffer=buffers,
+            device=ids.device,
+            input_ids=ids,
+            inputs_embeds=embeds,
+            token_offsets=offsets,
+            num_scheduled_tokens=scheduled,
+            num_computed_tokens=computed,
+            prompt_lens=[4, 7],
+        )
+        is None
+    )
+    assert buffers == before
+    assert (embeds == -123).all()

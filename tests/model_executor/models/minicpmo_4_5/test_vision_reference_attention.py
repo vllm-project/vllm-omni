@@ -26,6 +26,30 @@ def test_scaled_softmax_preserves_bf16_rounding(tokens: int) -> None:
 
 @pytest.mark.core_model
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+def test_scaled_softmax_reuses_kernel_across_video_shapes() -> None:
+    from vllm_omni.model_executor.models.minicpmo_4_5.ops.scaled_softmax import (
+        _scaled_softmax_kernel,
+        scaled_softmax,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(9583)
+    scale = 72**-0.5
+    compiled = []
+    # Different resolutions, batch sizes, alignments and a partial four-row
+    # tile must share one reduction bucket without changing BF16 arithmetic.
+    for rows, tokens in [(1, 1025), (3, 1032), (64, 1056), (65, 1032)]:
+        scores = torch.randn((rows, tokens), device="cuda", dtype=torch.bfloat16, generator=generator) * 8
+        expected = (scores * scale).softmax(-1, dtype=torch.float32).to(scores.dtype)
+        actual = scaled_softmax(scores, scale)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        compiled.append(
+            _scaled_softmax_kernel.warmup(scores, actual, tokens, rows, scale, 1056, grid=(1,), enable_fp_fusion=False)
+        )
+    assert all(kernel is compiled[0] for kernel in compiled)
+
+
+@pytest.mark.core_model
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 @pytest.mark.parametrize("layout", ["transposed", "strided"])
 def test_noncontiguous_scores_use_reference_attention(layout: str) -> None:
     attention = SiglipAttention(SiglipVisionConfig(hidden_size=32, num_attention_heads=4)).eval()

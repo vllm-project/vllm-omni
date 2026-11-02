@@ -54,6 +54,8 @@ platforms:
         kv_cache_memory_bytes: 2147483648  # 2 GiB
 
   npu:
+    duplex_session:
+      max_sessions: 4
     stages:
       - stage_id: 0
         # Two-replica sizing, restated for the NPU render (see the note on the

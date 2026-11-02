@@ -108,3 +108,12 @@ this placeholder page.
   are captured.
 - Allocate an invariant namespace only after those behaviors are enforced and
   owner-approved.
+
+## Platform session limits
+
+`platforms.<platform>.duplex_session` overrides individual fields of the
+shared `duplex_session` configuration before runtime projection. Unspecified
+fields retain their shared values; the merged dataclass applies the same
+validation as top-level session settings. This lets a deployment align session
+admission and worker state capacity with its platform-specific stage limits.
+MiniCPM-o's default profile uses 32 sessions on CUDA and 16 on NPU.

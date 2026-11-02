@@ -131,3 +131,36 @@ def test_v1_batched_decode_and_async_snapshot_match_scalar(mocker):
                 torch.testing.assert_close(left.cpu(), right, rtol=0, atol=0)
     hidden.fill_(-1)
     torch.testing.assert_close(snapshot.payload["hidden_states"], expected_hidden, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_pure_decode_batch_snapshot_keeps_row_shapes_and_owned_values():
+    from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
+
+    talker = _make_talker("cuda")
+    states = {
+        "a": {"finished": False, "step": 2, "max_tokens": 100, "recent_codes": [1, 2]},
+        "b": {"finished": False, "step": 2, "max_tokens": 100, "recent_codes": [2, 3]},
+    }
+    talker._request_audio_states = states
+    infos = _infos(states)
+    ids = torch.tensor([3, _EOS], dtype=torch.long, device="cuda")
+    talker.preprocess_decode_batch(input_ids=ids, req_infos=infos)
+    out = talker._make_omni_output_single_frame(torch.zeros(2, 4, device="cuda"), infos, [(0, 1), (1, 2)])
+    mm = out.multimodal_outputs
+    assert isinstance(mm["codes"]["audio"], torch.Tensor)
+    assert mm["codes"]["audio"].shape == (2, 1, 1)
+    snapshot = _snapshot_tensor_payload_to_cpu_async(mm, copy_stream=torch.cuda.Stream(), pin_memory=True)
+    # Source reuse is allowed immediately after snapshot construction: the
+    # copy stream must read owned clones, not these producer buffers.
+    mm["codes"]["audio"].fill_(-123)
+    mm["meta"]["finished"].fill_(False)
+    snapshot.wait()
+    restored = talker.finalize_multimodal_outputs_from_cpu_snapshot(snapshot.payload)
+    assert [x.tolist() for x in restored["codes"]["audio"]] == [[[3]], [[_EOS]]]
+    assert [x.shape for x in restored["codes"]["audio"]] == [torch.Size([1, 1])] * 2
+    assert [x.shape for x in restored["meta"]["finished"]] == [torch.Size([])] * 2
+    assert [x.item() for x in restored["meta"]["finished"]] == [False, True]
+    assert [x.tolist() for x in restored["meta"]["codec_frame_valid"]] == [[True], [False]]
+    assert _extract_codec_delta(to_payload_element(restored, 0, 0, 1, seq_len=2), "a") == [3]
+    assert _extract_codec_delta(to_payload_element(restored, 1, 1, 2, seq_len=2), "b") == []

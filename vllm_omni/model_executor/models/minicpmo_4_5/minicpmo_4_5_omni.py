@@ -166,12 +166,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         self.model_stage = vllm_config.model_config.model_stage
         self.model_sampler_wants_sampling_params = self.model_stage == "tts"
         self._use_v2_model_runner = bool(getattr(vllm_config.model_config, "use_v2_model_runner", False))
-        if (
-            self.model_stage == "llm"
-            and self._use_v2_model_runner
-            and getattr(vllm_config.model_config, "async_chunk", False)
-        ):
-            raise ValueError("MiniCPM-o MRv2 Thinker requires async_chunk: false for its full llm2tts payload")
         # The Thinker's row ledger needs real token identities even when
         # embeddings are supplied, including during CUDA graph capture/replay.
         self.requires_raw_input_tokens = self.model_stage == "llm"
@@ -241,7 +235,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 self.preprocess_decode_batch = batch_decode
             # Model Runner V2 hooks: device-side codec output, EOS control and
             # codec penalty (see MiniCPMO45OmniTTSForConditionalGeneration).
-            for hook_name in ("preprocess_decode_batch_mrv2", "make_omni_output_mrv2", "mrv2_custom_sampler"):
+            for hook_name in (
+                "preprocess_decode_batch_mrv2",
+                "make_omni_output_mrv2",
+                "mrv2_custom_sampler",
+                "finalize_multimodal_outputs_from_cpu_snapshot",
+            ):
                 hook = getattr(self.talker, hook_name, None)
                 if callable(hook):
                     setattr(self, hook_name, hook)
@@ -619,13 +618,79 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             req_input_ids = torch.full_like(input_ids, helper._required_token_id("unit_token_id"))
         return req_input_ids, req_embeds, {"duplex": update_result}
 
+    preprocess_batch_requires_stable_decode = True
+
+    @property
+    def preprocess_batch_fills_rows(self) -> bool:
+        return self.model_stage == "tts" and self.talker.emb_code[0].weight.device.type == "cuda"
+
+    def _preprocess_talker_decode_rows(
+        self,
+        req_ids: list[str],
+        buffers: dict[str, dict[str, Any]],
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        token_offsets: list[int] | None,
+        num_scheduled_tokens: list[int] | None,
+        num_computed_tokens: list[int] | None,
+        prompt_lens: list[int] | None,
+    ) -> list[str] | None:
+        # Inspect the live request order and layout on every call. Never cache
+        # by batch size: admission, preemption and duplex conditions can change
+        # while the batch size stays fixed.
+        count = len(req_ids)
+        if (
+            not count
+            or input_ids is None
+            or inputs_embeds is None
+            or self.talker._k_step_frames != 0
+            or token_offsets != list(range(count))
+            or num_scheduled_tokens != [1] * count
+            or num_computed_tokens is None
+            or prompt_lens is None
+            or len(num_computed_tokens) != count
+            or len(prompt_lens) != count
+            or any(done < length for done, length in zip(num_computed_tokens, prompt_lens))
+        ):
+            return None
+        infos: list[dict[str, Any]] = []
+        for rid in req_ids:
+            info = buffers.get(rid)
+            if not isinstance(info, dict) or not isinstance(info.get("audio_state"), dict):
+                return None
+            infos.append(info)
+        for rid, info, done, length in zip(req_ids, infos, num_computed_tokens, prompt_lens):
+            info["request_id"] = rid
+            info["duplex_token_offset"] = done
+            info["duplex_prompt_len"] = length
+            info["_omni_prompt_len"] = length
+            info["_omni_num_computed_tokens"] = done
+            info["_omni_is_prefill"] = False
+        decode_ids = input_ids[:count]
+        ids, embeds, updates = self.talker.preprocess_decode_batch(input_ids=decode_ids, req_infos=infos)
+        inputs_embeds[:count].copy_(embeds)
+        if ids is not decode_ids:
+            decode_ids.copy_(ids)
+        # This hook emits only empty CPU codec deltas; pending device ids are
+        # owned by Talker. Update the existing buffer in place, preserving its
+        # alias in the runner's request state and all condition metadata.
+        for info, update in zip(infos, updates):
+            info.setdefault("codes", {}).update(update["codes"])
+        return req_ids
+
     def preprocess_batch(
         self,
         *,
         req_ids: list[str],
         model_intermediate_buffer: dict[str, dict[str, Any]],
         device: torch.device,
-    ) -> None:
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        token_offsets: list[int] | None = None,
+        num_scheduled_tokens: list[int] | None = None,
+        num_computed_tokens: list[int] | None = None,
+        prompt_lens: list[int] | None = None,
+    ) -> list[str] | None:
         """Runner hook before ``preprocess``: batch this step's duplex appends across sessions.
 
         With two or more appends, camera frames share vision-tower calls (``prefetch_vision``) and
@@ -637,7 +702,18 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             # Full device-graph replay skips Talker.forward's Python cleanup.
             # Release finished requests before preprocessing can reuse slots.
             self.talker._flush_deferred_cleanup()
-            return
+            if inputs_embeds is not None:
+                return self._preprocess_talker_decode_rows(
+                    req_ids,
+                    model_intermediate_buffer,
+                    input_ids,
+                    inputs_embeds,
+                    token_offsets,
+                    num_scheduled_tokens,
+                    num_computed_tokens,
+                    prompt_lens,
+                )
+            return None
         if self.model_stage != "llm":
             return
         infos = [model_intermediate_buffer.get(req_id) for req_id in req_ids]
