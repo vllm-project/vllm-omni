@@ -394,6 +394,31 @@ L1 nodes for the same source revision are rejected through either admission
 API. Callers refresh against a current authoritative snapshot before reading
 valid nodes.
 
+Memory cards use the same ledger, with one active head per fact key. The
+session admits a complete candidate batch against a fresh snapshot and its
+private history-slot order. Slot order is allocated when a history position is
+reserved, including an assistant placeholder; filling or editing that position
+does not make it a newer fact. A batch with stale sources, stale head generations,
+invalid parents or conflicting operations creates no nodes and consumes no IDs.
+
+A correction replaces the active card and retires its dependent nodes.
+Supersession is separate from parent dependencies: a replacement supported by new
+evidence does not inherit the old card's sources. Empty heads retain a generation
+and evidence-order floor, so deleting a replacement cannot restore its predecessor,
+and freshly re-extracting older evidence cannot overwrite a later fact.
+
+Lexical retrieval refreshes source validity before selecting bounded candidates.
+Pending corrections are session-owned barriers, scoped to known keys or all cards
+when the affected key is unknown. Explicit reconciliation must cover the captured
+trigger text and every required key; an empty extraction does not clear a barrier.
+Partial reconciliation is discarded for keys whose head generation changes.
+Recognizing a natural-language correction is a model-policy responsibility,
+separate from these deterministic validity rules.
+
+These card APIs are internal foundations. Extraction scheduling, shared auxiliary
+budgets and a stage's final prompt consumption are separate integrations; the
+existing L1 view policy below does not enable them.
+
 A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
 `context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:
 the prompt config is built exactly as before and no L1 view is rendered. With a

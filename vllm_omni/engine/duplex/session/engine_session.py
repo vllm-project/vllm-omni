@@ -49,6 +49,7 @@ from vllm_omni.engine.duplex.session.lease import (
     DuplexLeaseConfig,
     DuplexLeaseState,
 )
+from vllm_omni.engine.duplex.session.memory_retrieval import DuplexMemorySuppression
 from vllm_omni.engine.duplex.session.perf_ledger import SessionPerfLedger
 from vllm_omni.metrics.stats import (
     DUPLEX_STAGE_TABLE_EXCLUDE,
@@ -249,6 +250,7 @@ class DuplexEngineSession:
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
     _context_ledger: DuplexContextLedger = field(default_factory=DuplexContextLedger, repr=False)
+    _memory_suppression: DuplexMemorySuppression = field(default_factory=DuplexMemorySuppression, repr=False)
     model_state: DuplexModelSessionState | None = field(default=None, repr=False)
     projector: RealtimeProjectionState | None = field(default=None, repr=False)
     created_monotonic: float = field(default_factory=time.monotonic)
@@ -528,6 +530,11 @@ class DuplexEngineSession:
         self._context_ledger.refresh(snapshot)
         orders = {source.source_id: source.slot_order for source in self._conversation.sources.values()}
         return self._context_ledger.admit_card_batch(snapshot, source_orders=orders, batch=batch)
+
+    @property
+    def memory_suppression(self) -> DuplexMemorySuppression:
+        """Pending-correction eligibility, preserved with this live session."""
+        return self._memory_suppression
 
     def render_history_view(
         self, policy: DuplexContextViewPolicy, *, snapshot: DuplexHistorySnapshot | None = None
