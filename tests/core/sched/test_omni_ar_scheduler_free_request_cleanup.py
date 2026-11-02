@@ -176,3 +176,62 @@ def test_native_mooncake_deferred_ar_pages_drain_in_physical_order() -> None:
     sched._drain_deferred_frees()
     freed = list(sched.kv_cache_manager.block_pool.free_blocks.call_args.args[0])
     assert [block.block_id for block in freed] == [2, 4, 7]
+
+
+def _tagged_finished_request(request_id: str, final_stage_id: int) -> _FakeFinishedRequest:
+    from vllm import SamplingParams
+    from vllm.v1.engine import EngineCoreRequest
+
+    from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata
+
+    engine_request = EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=[1],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    request = _make_finished_request(request_id)
+    request.additional_information = apply_omni_final_stage_metadata(
+        engine_request, final_stage_id=final_stage_id
+    ).additional_information
+    request.client_index = 0
+    return request
+
+
+@pytest.mark.parametrize("final_stage_id", [0, 1], ids=["stage0-final", "kv-transfer"])
+def test_free_request_leaves_no_omits_kv_transfer_cache_entry(final_stage_id):
+    """_free_request() reads the final-stage flags through the real
+    _should_transfer_kv_for_request(), which re-caches them; the entry must
+    still be gone once the request is freed, or a KV-sending AR stage keeps
+    one entry per finished request."""
+    sched = _make_scheduler()
+    del sched._should_transfer_kv_for_request  # use the real method
+    sched._omni_kv_config = {"need_send_cache": True}
+    sched.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    sched.transfer_triggered_requests = set()
+    sched.active_kv_transfers = set()
+    sched.waiting_for_transfer_free = set()
+    sched._kv_wait_start_ts = {}
+    sched.requests_needing_kv_transfer = {}
+    sched.kv_cache_manager = SimpleNamespace(get_block_ids=lambda req_id: ([3, 5],))
+    sched._get_confirmed_num_computed_tokens = lambda request: 4
+    sched.requests = {}
+    sched._free_blocks = MagicMock(side_effect=lambda request: sched.requests.pop(request.request_id))
+
+    for i in range(8):
+        request = _tagged_finished_request(f"req-{i}", final_stage_id)
+        sched.requests[request.request_id] = request
+        sched._free_request(request)
+
+    if final_stage_id == 1:
+        # Blocks are held for KV extraction; the extraction ack frees them later.
+        assert sched.waiting_for_transfer_free == {f"req-{i}" for i in range(8)}
+        for req_id in sorted(sched.waiting_for_transfer_free):
+            sched._free_blocks(sched.requests[req_id])
+    assert sched.requests == {}
+    assert sched._omits_kv_transfer_cache == {}
