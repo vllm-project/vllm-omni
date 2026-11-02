@@ -1473,6 +1473,24 @@ def _make_lora_model(adapter_id: int, modules: dict[str, tuple[torch.Tensor, tor
     return LoRAModel(lora_model_id=adapter_id, rank=rank, loras=loras)
 
 
+def _make_unoptimized_lora_model(
+    adapter_id: int, modules: dict[str, tuple[int, torch.Tensor, torch.Tensor]]
+) -> LoRAModel:
+    """Build a LoRAModel without optimize(): per-module scaling (lora_alpha /
+    rank) stays unfolded, as in the epilogue-scaled load path."""
+    loras = {}
+    for name, (lora_alpha, lora_a, lora_b) in modules.items():
+        loras[name] = LoRALayerWeights(
+            module_name=name,
+            rank=lora_a.shape[0],
+            lora_alpha=lora_alpha,
+            lora_a=lora_a,
+            lora_b=lora_b,
+        )
+    rank = max((lora.rank for lora in loras.values()), default=1)
+    return LoRAModel(lora_model_id=adapter_id, rank=rank, loras=loras)
+
+
 def test_compose_lora_models_concatenates_rank_dim():
     manager = DiffusionLoRAManager(
         pipeline=torch.nn.Module(),
@@ -1502,6 +1520,40 @@ def test_compose_lora_models_concatenates_rank_dim():
     # The composed delta must equal the manual per-adapter sum.
     x = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 8
     expected = 0.5 * (x @ a1.t()) @ b1.t() + 2.0 * (x @ a2.t()) @ b2.t()
+    actual = (x @ composed_lora.lora_a.t()) @ composed_lora.lora_b.t()
+    torch.testing.assert_close(actual, expected)
+
+
+def test_compose_lora_models_folds_unoptimized_source_scaling():
+    """Epilogue-scaled pipelines skip optimize(), so sources keep scaling != 1;
+    composition must fold each source's scaling * request-scale into B."""
+    pipeline = torch.nn.Module()
+    pipeline.diffusion_lora_scale_in_epilogue = True
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        max_cached_adapters=3,
+    )
+    a1 = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 8
+    b1 = torch.arange(12, dtype=torch.float32).reshape(6, 2) / 12
+    a2 = torch.arange(12, dtype=torch.float32).reshape(3, 4) / 12
+    b2 = torch.arange(18, dtype=torch.float32).reshape(6, 3) / 18
+    model1 = _make_unoptimized_lora_model(1, {"transformer.to_q": (8, a1, b1)})
+    model2 = _make_unoptimized_lora_model(2, {"transformer.to_q": (6, a2, b2)})
+    assert model1.loras["transformer.to_q"].scaling == 4.0
+    assert model2.loras["transformer.to_q"].scaling == 2.0
+
+    composed, _ = manager._compose_lora_models(99, [(model1, 0.5), (model2, 2.0)])
+
+    composed_lora = composed.loras["transformer.to_q"]
+    assert composed_lora.scaling == 1.0
+    torch.testing.assert_close(composed_lora.lora_a, torch.cat([a1, a2], dim=0))
+    torch.testing.assert_close(composed_lora.lora_b, torch.cat([b1 * (4.0 * 0.5), b2 * (2.0 * 2.0)], dim=1))
+
+    # The composed delta must equal the per-adapter scaling-weighted sum.
+    x = torch.arange(8, dtype=torch.float32).reshape(2, 4) / 8
+    expected = 4.0 * 0.5 * (x @ a1.t()) @ b1.t() + 2.0 * 2.0 * (x @ a2.t()) @ b2.t()
     actual = (x @ composed_lora.lora_a.t()) @ composed_lora.lora_b.t()
     torch.testing.assert_close(actual, expected)
 
@@ -1706,6 +1758,46 @@ def test_set_active_adapters_composed_eviction_with_transient_sources(monkeypatc
     manager.remove_adapter(second_composed_id)
     assert second_composed_id not in manager._registered_adapters
     assert manager._composed_adapters == {}
+
+
+def test_remove_source_adapter_purges_dependent_composed(monkeypatch):
+    """Removing a source adapter must purge every composed cache entry that
+    references it (and the composed adapter itself), so re-registering the
+    source id with new weights cannot resurrect the stale composition."""
+    manager, models, load_calls, activations = _composed_harness(monkeypatch)
+    req1, req2 = _dummy_lora_request(1), _dummy_lora_request(2)
+
+    manager.set_active_adapter(req1, 1.0)
+    manager.set_active_adapters([req1, req2], [1.0, 1.0])
+    composed_id = activations[-1][0]
+    assert len(manager._composed_adapters) == 1
+    assert composed_id in manager._registered_adapters
+
+    manager.remove_adapter(1)
+    assert 1 not in manager._registered_adapters
+    assert manager._composed_adapters == {}
+    assert composed_id not in manager._registered_adapters
+
+    # Re-registering the same source id with new weights must compose fresh.
+    models[1] = _make_lora_model(1, {"transformer.foo": (torch.ones(2, 4), torch.full((4, 2), 7.0))})
+    load_calls.clear()
+    manager.set_active_adapters([req1, req2], [1.0, 1.0])
+    assert sorted(load_calls) == [1, 2], "a stale composed-cache hit would skip the reload"
+    new_composed_id = activations[-1][0]
+    assert new_composed_id == composed_id, "the same stack key keeps its stable id"
+    new_composed = manager._registered_adapters[new_composed_id]
+    torch.testing.assert_close(
+        new_composed.loras["transformer.foo"].lora_b,
+        torch.cat([torch.full((4, 2), 7.0), models[2].loras["transformer.foo"].lora_b], dim=1),
+    )
+
+
+def test_set_active_adapters_rejects_duplicate_adapter_ids(monkeypatch):
+    manager, _, load_calls, _ = _composed_harness(monkeypatch)
+
+    with pytest.raises(ValueError, match="Duplicate LoRA adapter in stack"):
+        manager.set_active_adapters([_dummy_lora_request(1), _dummy_lora_request(1)], [0.5, 1.0])
+    assert load_calls == []
 
 
 def test_stacked_scale_keys_match_scheduler_batch_key():

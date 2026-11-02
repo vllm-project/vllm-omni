@@ -134,7 +134,8 @@ def parse_lora_requests(
     produces lists. Per-adapter scales default to 1.0 when omitted.
 
     Raises:
-        ValueError: If any object shape is invalid or required fields are missing.
+        ValueError: If any object shape is invalid, required fields are missing,
+            or the same adapter appears more than once in a stack.
     """
     if lora_body is None:
         return None, None
@@ -145,10 +146,16 @@ def parse_lora_requests(
 
     lora_requests: list[LoRARequest] = []
     lora_scales: list[float] = []
+    seen: set[int] = set()
     for item in items:
         lora_request, lora_scale = parse_lora_request(item)
         if lora_request is None:
             raise ValueError("Invalid lora field: array items must be objects.")
+        if lora_request.lora_int_id in seen:
+            raise ValueError(
+                f"Duplicate LoRA adapter in stack: id={lora_request.lora_int_id}, name={lora_request.lora_name}"
+            )
+        seen.add(lora_request.lora_int_id)
         lora_requests.append(lora_request)
         lora_scales.append(lora_scale if lora_scale is not None else 1.0)
     if len(lora_requests) == 1:

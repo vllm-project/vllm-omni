@@ -453,6 +453,11 @@ class DiffusionLoRAManager:
         pairs = [
             (req, scale) for req, scale in zip(requests, scales) if req is not None and not math.isclose(0.0, scale)
         ]
+        seen_ids: set[int] = set()
+        for req, _ in pairs:
+            if req.lora_int_id in seen_ids:
+                raise ValueError(f"Duplicate LoRA adapter in stack: id={req.lora_int_id}")
+            seen_ids.add(req.lora_int_id)
         if not pairs:
             self.set_active_adapter(None)
             return
@@ -552,7 +557,7 @@ class DiffusionLoRAManager:
                         "stacking adapters on packed layers is not supported."
                     )
                 lora_a_parts.append(weights.lora_a)
-                lora_b_parts.append(weights.lora_b * scale)
+                lora_b_parts.append(weights.lora_b * (weights.scaling * scale))
             if not lora_a_parts:
                 continue
             composed_rank = sum(part.shape[0] for part in lora_a_parts)
@@ -1419,9 +1424,15 @@ class DiffusionLoRAManager:
         self._adapter_scales.pop(adapter_id, None)
         self._adapter_access_order.pop(adapter_id, None)
         self._pinned_adapters.discard(adapter_id)
-        stale_composed_keys = [key for key, cid in getattr(self, "_composed_adapters", {}).items() if cid == adapter_id]
+        stale_composed_keys = [
+            key
+            for key, cid in self._composed_adapters.items()
+            if cid == adapter_id or any(src_id == adapter_id for src_id, _ in key)
+        ]
         for key in stale_composed_keys:
-            del self._composed_adapters[key]
+            composed_id = self._composed_adapters.pop(key)
+            if composed_id != adapter_id and composed_id in self._registered_adapters:
+                self.remove_adapter(composed_id)
         logger.debug(
             "Adapter %d removed, cache size: %d/%d",
             adapter_id,

@@ -88,6 +88,15 @@ class TestParseLoraRequests:
         with pytest.raises(ValueError, match="name and path are required"):
             parse_lora_requests([{"name": "a"}])
 
+    def test_rejects_duplicate_adapter(self) -> None:
+        with pytest.raises(ValueError, match="Duplicate LoRA adapter"):
+            parse_lora_requests(
+                [
+                    {"name": "a", "path": "/tmp/a", "scale": 0.5},
+                    {"name": "a", "path": "/tmp/a", "scale": 0.5},
+                ]
+            )
+
 
 class TestGetLoraFromJsonStr:
     def test_none_returns_none(self) -> None:
