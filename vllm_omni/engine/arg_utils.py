@@ -798,6 +798,7 @@ class OrchestratorArgs:
     step_execution: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    light_vae_path: str | None = None
     vae_fast_path: str = "lossless"
     vae_encode_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
