@@ -8,10 +8,11 @@ import pytest
 from vllm_omni.diffusion.cache.teacache.coefficient_estimator import (
     _MODEL_ADAPTERS,
     DataCollectionHook,
+    GlmImageAdapter,
     ZImageAdapter,
 )
 from vllm_omni.diffusion.cache.teacache.config import _MODEL_COEFFICIENTS, TeaCacheConfig
-from vllm_omni.diffusion.cache.teacache.extractors import extract_zimage_context
+from vllm_omni.diffusion.cache.teacache.extractors import extract_glm_image_context, extract_zimage_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -34,11 +35,22 @@ def test_zimage_estimator_adapter_registered():
     assert ZImageAdapter.uses_tf_config is True
 
 
+def test_glm_image_teacache_defaults_registered():
+    glm = _MODEL_COEFFICIENTS["GlmImageTransformer2DModel"]
+    config = TeaCacheConfig(transformer_type="GlmImageTransformer2DModel")
+    assert config.coefficients == glm
+    assert config.rel_l1_thresh == 0.2
+    assert _MODEL_ADAPTERS["GlmImage"] is GlmImageAdapter
+    assert GlmImageAdapter.model_class_name == "GlmImagePipeline"
+    assert DataCollectionHook("GlmImageTransformer2DModel").extractor_fn is extract_glm_image_context
+
+
 def test_data_collection_hook_resolves_extractor_at_init():
     """The estimator hook binds its extractor in __init__, so an unknown type fails before any forward."""
     hook = DataCollectionHook("ZImageTransformer2DModel")
     assert hook.extractor_fn is extract_zimage_context
     assert hook.current_trajectory == []
+    assert hook.current_trajectories == {"positive": [], "negative": []}
 
     with pytest.raises(ValueError, match="Unknown model type"):
         DataCollectionHook("NotARegisteredTransformer")

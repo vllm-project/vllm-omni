@@ -140,6 +140,22 @@ _MODEL_COEFFICIENTS = {
         -4.232669906169421e00,
         2.173782527946167e-01,
     ],
+    # GLM-Image DiT (GlmImageTransformer2DModel) TeaCache coefficients.
+    # PROVISIONAL: borrowed from Qwen-Image (shared dual-stream AdaLN /
+    # joint-attn pattern). Not yet GLM-specific evidence — do not treat skips
+    # as quality-neutral until replaced by a same-branch Parti calibration:
+    #   python tools/teacache/calibrate_glm_image.py --model <path> \
+    #       --prior-tokens <pt> --prompts <txt>
+    # Attach fit SHA, R^2, input rel_l1 range, and matched cache-off/on
+    # benchmark numbers (tools/teacache/benchmark_glm_image.py) before
+    # promoting the default. Default rel_l1_thresh=0.2 is likewise provisional.
+    "GlmImageTransformer2DModel": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
 }
 
 _DEFAULT_REL_L1_THRESH = 0.2
@@ -147,6 +163,7 @@ _MODEL_DEFAULT_REL_L1_THRESH = {
     "MingImageTransformer2DModel": 0.3,
     "MammothModa2Transformer2DModel": 0.075,
     "MiniMaxH3DiTModel": 0.17,
+    "GlmImageTransformer2DModel": 0.2,
 }
 
 
