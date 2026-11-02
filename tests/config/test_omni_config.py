@@ -1251,6 +1251,7 @@ def test_sub_config_fields_match_structured_scopes():
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
     assert {f.name for f in fields(OmniStageLoadConfig)} == vllm_load_fields | {
+        "cpu_offload_gb",
         "tokenizer",
         "skip_tokenizer_init",
         "tokenizer_mode",

@@ -68,6 +68,12 @@ def test_get_supported_speakers_caches_normalized_keys(mocker: MockerFixture, se
     assert serving_chat._get_supported_speakers() == {"vivian", "ethan"}
 
 
+def test_resolve_chat_speaker_falls_back_to_nested_audio_voice(serving_chat):
+    request = SimpleNamespace(audio={"voice": "Vivian"})
+
+    assert serving_chat._resolve_chat_speaker(request) == "Vivian"
+
+
 def test_create_chat_completion_converts_value_error_to_error_response(mocker: MockerFixture, serving_chat):
     serving_chat._diffusion_mode = False
     serving_chat._check_model = mocker.AsyncMock(return_value=None)

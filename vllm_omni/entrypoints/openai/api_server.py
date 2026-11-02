@@ -22,6 +22,7 @@ from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
+from inspect import isawaitable
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -246,6 +247,20 @@ router = APIRouter()
 VIDEO_ABORT_TIMEOUT_S = ABORT_TIMEOUT_S
 
 profiler_router = APIRouter()
+
+
+async def _close_duplex_handler(state: object) -> None:
+    """Close the API-owned duplex handler without assuming a duplex deployment."""
+    handler = getattr(state, "openai_serving_duplex", None)
+    close = getattr(handler, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if isawaitable(result):
+            await result
+    except Exception:
+        logger.exception("Failed to close the duplex session handler")
 
 
 # Server entry points
@@ -595,6 +610,7 @@ async def omni_run_server_worker(
             if warmup_task is not None:
                 warmup_task.cancel()
             state = getattr(app, "state", None)
+            await _close_duplex_handler(state)
             serving_video = getattr(state, "openai_serving_video", None) if state is not None else None
             if serving_video is not None:
                 serving_video.shutdown()
@@ -646,7 +662,12 @@ async def build_async_omni(
 
 
 def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
-    """Select the serving engine without changing the model's duplex capability."""
+    """Whether the model has a plugin and its effective deploy mode is duplex.
+
+    Resolution errors propagate: a duplex model whose pipeline or deploy
+    config cannot be resolved must fail startup rather than silently start a
+    turn-based server.
+    """
     from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.config.stage_config import _DEPLOY_DIR, resolve_deploy_yaml
 
@@ -657,22 +678,20 @@ def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
     )
     if pipeline_config is None or not getattr(pipeline_config, "duplex_plugin", None):
         return False
-
     deploy_path = kwargs.get("deploy_config")
     if deploy_path is None:
-        if pipeline_config.default_deploy_config_name is None:
-            raise ValueError("A duplex-capable model requires a deploy config with session_mode: turn or duplex")
-        deploy_path = _DEPLOY_DIR / pipeline_config.default_deploy_config_name
+        default_name = pipeline_config.default_deploy_config_name
+        if default_name is None:
+            return getattr(pipeline_config, "default_session_mode", None) == "duplex"
+        deploy_path = _DEPLOY_DIR / default_name
     else:
         deploy_path = Path(deploy_path)
         if not deploy_path.exists() and deploy_path.parent == Path("."):
             deploy_path = _DEPLOY_DIR / deploy_path
-
-    # Resolve base_config too, so the API and stage workers use the same mode.
     session_mode = resolve_deploy_yaml(deploy_path).get(
-        "session_mode", getattr(pipeline_config, "default_session_mode", None)
+        "session_mode", getattr(pipeline_config, "default_session_mode", None) or "turn"
     )
-    if session_mode not in ("turn", "duplex"):
+    if session_mode not in {"turn", "duplex"}:
         raise ValueError("A duplex-capable model requires session_mode: turn or duplex in its deploy config")
     return session_mode == "duplex"
 
@@ -799,11 +818,14 @@ async def _init_duplex_app_state(
         "run_serving",
     ):
         setattr(state, attribute, None)
-    state.openai_serving_duplex = OmniDuplexSessionHandler(duplex_omni=engine_client)
     # One engine, both surfaces. ``DuplexOmni`` extends ``AsyncOmni``, so the
     # ordinary chat service runs on it unchanged: a chat request is a turn-based
     # request on the same pipeline, not a session, and costs no admission slot.
     state.openai_serving_chat = await _init_duplex_chat(engine_client, state, args, request_logger)
+    state.openai_serving_duplex = OmniDuplexSessionHandler(
+        duplex_omni=engine_client,
+        chat_service=state.openai_serving_chat,
+    )
     state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
     state.server_load_metrics = 0
     if state.openai_serving_chat is not None:

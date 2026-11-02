@@ -151,11 +151,13 @@ def commit_audio_input(
     realtime_item_id: object | None = None,
     transcript: object | None = None,
     turn_id: int | None = None,
+    fallback_audio_payload: Mapping[str, object] | None = None,
 ) -> DuplexCommittedInput:
     clean_transcript = transcript.strip() if isinstance(transcript, str) else None
     committed = session.commit_audio_input(
         transcript=clean_transcript or None,
         turn_id=turn_id,
+        fallback_audio_payload=fallback_audio_payload,
     )
     if isinstance(realtime_item_id, str) and realtime_item_id:
         session.register_history_item(realtime_item_id, committed.message)

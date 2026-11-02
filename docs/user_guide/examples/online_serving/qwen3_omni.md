@@ -34,6 +34,28 @@ both stages on vLLM's Triton unquantized MoE path and avoids the unstable FlashI
 some GPUs.
 Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
 
+The standard launch above is turn-based. To expose the Realtime duplex route
+using Qwen3's opt-in chat-fallback bridge, select its dedicated overlay:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/qwen3_omni_chat_fallback.yaml
+```
+
+Then run the model-neutral barge-in client:
+
+```bash
+python examples/online_serving/barge_in_client.py --preset none \
+    --url ws://localhost:8091/v1/duplex \
+    --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --question-wav input_16k_mono.wav \
+    --interrupt-wav follow_up_16k_mono.wav \
+    --output-dir ./duplex_out
+```
+
+The default fallback overlay disables asynchronous chunk streaming. The separate
+`qwen3_omni_chat_fallback_streaming.yaml` enables incremental output; both
+profiles start the fallback request after the input turn is committed.
 On B200/B300-class GPUs (SM100/SM103) with cuDNN 9.20.0, Qwen3-Omni
 automatically runs Code2Wav in FP32 when its configured precision resolves to
 BF16 or FP16. This avoids incorrect low-precision convolutions that can make
