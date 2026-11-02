@@ -165,7 +165,11 @@ include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
 "vllm_omni" = ["_version.py", "py.typed", "transformers_utils/chat_templates/*.jinja"]
-"vllm_omni.diffusion.distributed" = ["csrc/*.cpp"]
+"vllm_omni.diffusion.distributed" = [
+    "csrc/ulysses_shmem_fused/*.cpp",
+    "csrc/ulysses_shmem_fused/*.h",
+    "csrc/ulysses_shmem_fused/CMakeLists.txt",
+]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

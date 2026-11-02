@@ -1,26 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Eager NPU Ulysses transport using SHMEM remote reads fused with relayout.
+"""Eager NPU Ulysses transport using CANN SHMEM and a fused AscendC kernel.
 
-Loaded only when ``ulysses_a2a_permute`` is enabled on NPU. Requires TorchNPU's NPUSHMEM
-allocator, libshmem.so on LD_LIBRARY_PATH, Triton-Ascend and a C++ toolchain for
-the queue-aware stream barrier launcher. All WORLD ranks must participate in
-the same order on one stream in one HCCS domain. Independent SP groups, graph
-capture and autograd are unsupported. Head-shard rows must be 32-byte aligned.
+The existing ``--ulysses-a2a-permute`` path uses one kernel per exchange to
+synchronize ranks, pull peer data and relayout it for attention. All WORLD
+ranks must participate in the same order and stream in one HCCS domain.
+Requires TorchNPU NPUSHMEM, CANN AscendC/SHMEM headers, a C++ toolchain
+and libshmem.so on LD_LIBRARY_PATH.
 """
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import os
+import shutil
+import subprocess
 from functools import cache
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from filelock import FileLock
 from torch.distributed.distributed_c10d import _resolve_process_group
 from vllm.logger import init_logger
-from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 _WORKSPACE = None
@@ -28,21 +32,77 @@ _WORKSPACE_GROUP = None
 
 
 @cache
-def _load_barrier() -> None:
+def ensure_a2a_permute_available() -> None:
+    """Compile/load once per process; serialize builds across worker ranks."""
     import torch_npu
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import get_default_build_root, load
 
-    npu_root = Path(torch_npu.__file__).parent
-    cann_root = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
+    source = Path(__file__).parent / "csrc/ulysses_shmem_fused"
+    cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")).resolve()
+    shmem_spec = importlib.util.find_spec("shmem")
+    shmem_path = os.environ.get("SHMEM_ROOT")
+    if shmem_path:
+        shmem = Path(shmem_path).resolve()
+    elif shmem_spec is not None and shmem_spec.submodule_search_locations:
+        shmem = Path(next(iter(shmem_spec.submodule_search_locations))).resolve()
+    else:
+        raise RuntimeError("Install the CANN SHMEM package or set SHMEM_ROOT to its source/include root")
+    if not (shmem / "include/device/gm2gm/shmem_device_cc.h").is_file():
+        raise RuntimeError(f"CANN SHMEM device headers not found under {shmem}")
+    fingerprint = hashlib.sha256()
+    for name in ("CMakeLists.txt", "kernel.cpp", "compat_signals.h"):
+        fingerprint.update((source / name).read_bytes())
+    fingerprint.update(str(cann).encode())
+    fingerprint.update(str(shmem).encode())
+    build_fingerprint = fingerprint.hexdigest()[:16]
+    cache_dir = Path(get_default_build_root()) / "omni_ulysses_shmem_fused" / build_fingerprint
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    build = cache_dir / "ascendc"
+    library = build / "lib/libulysses_shmem_fused.so"
+    with FileLock(str(cache_dir / "build.lock")):
+        if not library.is_file():
+            # Legacy CANN links device objects in place. Retry failed builds
+            # from a fresh, private directory rather than incrementally.
+            if build.exists():
+                shutil.rmtree(build)
+            env = dict(os.environ, ASCEND_HOME_PATH=str(cann))
+            log_path = cache_dir / "build.log"
+            try:
+                with log_path.open("w") as log:
+                    subprocess.run(
+                        [
+                            "cmake",
+                            "-S",
+                            str(source),
+                            "-B",
+                            str(build),
+                            "-DCMAKE_BUILD_TYPE=Release",
+                            f"-DSHMEM_ROOT={shmem}",
+                        ],
+                        env=env,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["cmake", "--build", str(build), "-j", os.environ.get("MAX_JOBS", "2")],
+                        env=env,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        check=True,
+                    )
+            except subprocess.CalledProcessError as exc:
+                # An unsuccessful CMake link must never become a cache hit.
+                library.unlink(missing_ok=True)
+                raise RuntimeError(f"AscendC Ulysses build failed; see {log_path}") from exc
+            if not library.is_file():
+                raise RuntimeError(f"AscendC build produced no library; see {log_path}")
+    npu = Path(torch_npu.__file__).parent
     load(
-        name="omni_ulysses_shmem_barrier",
-        sources=[str(Path(__file__).parent / "csrc/ulysses_shmem_barrier.cpp")],
-        extra_include_paths=[
-            str(npu_root / "include"),
-            str(npu_root / "include/third_party/acl/inc"),
-            str(cann_root / "include"),
-        ],
-        extra_ldflags=[f"-L{npu_root / 'lib'}", "-ltorch_npu", "-ldl"],
+        name=f"omni_ulysses_shmem_fused_bridge_{build_fingerprint}",
+        sources=[str(source / "bridge.cpp")],
+        extra_include_paths=[str(npu / "include"), str(npu / "include/third_party/acl/inc"), str(cann / "include")],
+        extra_ldflags=[str(library), f"-Wl,-rpath,{library.parent}", f"-L{npu / 'lib'}", "-ltorch_npu", "-ldl"],
         extra_cflags=["-O2"],
         with_cuda=False,
         is_python_module=False,
@@ -50,153 +110,19 @@ def _load_barrier() -> None:
     )
 
 
-def ensure_a2a_permute_available() -> None:
-    """Prepare the NPU extension without building the CUDA implementation."""
-    _load_barrier()
-
-
-@triton.jit
-def _pull_tile(
-    peer_ptrs,
-    output,
-    rank: tl.constexpr,
-    world: tl.constexpr,
-    seq_local: tl.constexpr,
-    channels: tl.constexpr,
-    reverse: tl.constexpr,
-    block_rows: tl.constexpr,
-    block_channels: tl.constexpr,
-    batch,
-    source_offset: tl.constexpr,
-):
-    peer = tl.program_id(1)
-    row_index = tl.program_id(0) * block_rows + tl.arange(0, block_rows)
-    row = row_index[:, None]
-    column = tl.arange(0, block_channels)[None, :]
-    source = tl.load(peer_ptrs + peer).to(tl.pointer_type(output.dtype.element_ty))
-    source += source_offset
-    if reverse:
-        # Each peer owns all sequences and its own head shard.
-        src_offset = ((batch * world + rank) * seq_local + row) * channels + column
-        dst_offset = ((batch * seq_local + row) * world + peer) * channels + column
-    else:
-        # Each peer owns its sequence shard and all heads.
-        src_offset = ((batch * seq_local + row) * world + rank) * channels + column
-        dst_offset = ((batch * world + peer) * seq_local + row) * channels + column
-    mask = (row_index[:, None] < seq_local) & (column < channels)
-    value = tl.load(source + src_offset, mask, other=0)
-    tl.store(output + dst_offset, value, mask)
-
-
-@triton.jit
-def _pull_and_relayout(
-    peer_ptrs,
-    output,
-    rank: tl.constexpr,
-    world: tl.constexpr,
-    seq_local: tl.constexpr,
-    channels: tl.constexpr,
-    reverse: tl.constexpr,
-    block_rows: tl.constexpr,
-    block_channels: tl.constexpr,
-):
-    _pull_tile(
-        peer_ptrs,
-        output,
-        rank,
-        world,
-        seq_local,
-        channels,
-        reverse,
-        block_rows,
-        block_channels,
-        tl.program_id(2),
-        0,
-    )
-
-
-@triton.jit
-def _pull_qkv_and_relayout(
-    peer_ptrs,
-    query_out,
-    key_out,
-    value_out,
-    rank: tl.constexpr,
-    world: tl.constexpr,
-    seq_local: tl.constexpr,
-    query_channels: tl.constexpr,
-    key_channels: tl.constexpr,
-    value_channels: tl.constexpr,
-    key_offset: tl.constexpr,
-    value_offset: tl.constexpr,
-    block_rows: tl.constexpr,
-    query_block_channels: tl.constexpr,
-    key_block_channels: tl.constexpr,
-    value_block_channels: tl.constexpr,
-):
-    batch = tl.program_id(2) // 3
-    item = tl.program_id(2) % 3
-    if item == 0:
-        _pull_tile(
-            peer_ptrs,
-            query_out,
-            rank,
-            world,
-            seq_local,
-            query_channels,
-            False,
-            block_rows,
-            query_block_channels,
-            batch,
-            0,
-        )
-    elif item == 1:
-        _pull_tile(
-            peer_ptrs,
-            key_out,
-            rank,
-            world,
-            seq_local,
-            key_channels,
-            False,
-            block_rows,
-            key_block_channels,
-            batch,
-            key_offset,
-        )
-    else:
-        _pull_tile(
-            peer_ptrs,
-            value_out,
-            rank,
-            world,
-            seq_local,
-            value_channels,
-            False,
-            block_rows,
-            value_block_channels,
-            batch,
-            value_offset,
-        )
-
-
 class NPUUlyssesSHMEM:
-    """A fixed-capacity, single-stream workspace with out-of-place outputs.
+    """Single-stream symmetric workspace using fused AscendC exchanges.
 
-    Construction and close are collective over WORLD. The capacity must be
-    identical on every rank; dtype and shapes may vary below that capacity.
-    The two stream barriers publish staging writes and protect reuse after all
-    peers have finished reading. A CPU barrier alone would not provide this
-    ordering for queued kernels.
+    Inference-only, one stream, WORLD group, in one HCCS domain. Head-shard
+    rows must fit the 32 KiB UB tile. Every group size uses the same
+    tile-major peer-interleaved MIX kernel with two AIV workers per peer.
     """
 
-    def __init__(self, capacity_bytes: int, *, block_size: int = 4096) -> None:
+    def __init__(self, capacity_bytes: int) -> None:
         if not dist.is_initialized() or dist.get_world_size() < 2:
             raise RuntimeError("SHMEM exchange requires an initialized WORLD with at least two ranks")
         if capacity_bytes <= 0:
             raise ValueError("capacity_bytes must be positive")
-        if block_size <= 0 or block_size & (block_size - 1):
-            raise ValueError("block_size must be a positive power of two")
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("NPU SHMEM Ulysses requires eager execution; graph capture is unsupported")
         self.device = torch.device("npu", torch.npu.current_device())
@@ -205,10 +131,8 @@ class NPUUlyssesSHMEM:
         self.world = dist.get_world_size()
         self.rank = dist.get_rank()
         self.capacity_bytes = capacity_bytes
-        self.block_size = block_size
         self.stream = torch.npu.current_stream(self.device)
-        _load_barrier()
-        self._barrier = torch.ops.omni_ulysses_shmem.barrier
+        ensure_a2a_permute_available()
         symm_mem.enable_symm_mem_for_group(dist.group.WORLD.group_name)
         self.allocation = symm_mem.empty(capacity_bytes, dtype=torch.uint8, device=self.device)
         self.handle = symm_mem.rendezvous(self.allocation, dist.group.WORLD.group_name)
@@ -229,51 +153,54 @@ class NPUUlyssesSHMEM:
         if torch.npu.is_current_stream_capturing():
             raise RuntimeError("NPU SHMEM Ulysses requires eager execution; graph capture is unsupported")
 
-    def __call__(self, tensor: torch.Tensor, *, reverse: bool = False) -> torch.Tensor:
-        self._check_stream()
+    def _row_bytes(self, tensor: torch.Tensor, reverse: bool = False) -> int:
+        """Validate inputs and return the bytes copied per head-shard row."""
         if tensor.device != self.device:
             raise ValueError("Input must be on the workspace NPU device")
         if tensor.requires_grad:
             raise ValueError("NPU SHMEM Ulysses is inference-only")
-        if tensor.ndim != 4 or any(dim <= 0 for dim in tensor.shape):
-            raise ValueError("Input must be a nonempty [B, S, H, D] tensor")
+        if tensor.ndim != 4 or any(tensor.shape[i] <= 0 for i in (0, 2, 3)):
+            raise ValueError("Input must be [B, S, H, D] with positive batch, heads and head size")
         if tensor.dtype not in (torch.bfloat16, torch.float16, torch.float32):
             raise ValueError("Supported dtypes: bfloat16, float16, float32")
-        batch, seq, heads, dim = tensor.shape
         if reverse:
-            if seq % self.world:
+            if tensor.shape[1] % self.world:
                 raise ValueError("Global sequence length must be divisible by WORLD size")
-            seq_local, channels = seq // self.world, heads * dim
-            shape = (batch, seq_local, heads * self.world, dim)
-        else:
-            if heads % self.world:
-                raise ValueError("Head count must be divisible by WORLD size; pad/repeat GQA heads upstream")
-            seq_local, channels = seq, heads // self.world * dim
-            shape = (batch, seq * self.world, heads // self.world, dim)
-        required_bytes = tensor.numel() * tensor.element_size()
-        if channels * tensor.element_size() % 32:
+        elif tensor.shape[2] % self.world:
+            raise ValueError("Head count must be divisible by WORLD size; pad/repeat GQA heads upstream")
+        row_bytes = tensor.shape[2] * tensor.shape[3] * tensor.element_size()
+        if not reverse:
+            row_bytes //= self.world
+        if row_bytes % 32:
             raise ValueError("Head shard rows must be 32-byte aligned for the tiled NPU copy")
+        if row_bytes > 32768:
+            raise ValueError("Fused NPU exchange supports at most 32 KiB per head shard row")
+        return row_bytes
+
+    def __call__(self, tensor: torch.Tensor, *, reverse: bool = False) -> torch.Tensor:
+        self._check_stream()
+        row_bytes = self._row_bytes(tensor, reverse)
+        batch, seq, heads, dim = tensor.shape
+        seq_local = seq // self.world if reverse else seq
+        shape = (
+            (batch, seq_local, heads * self.world, dim)
+            if reverse
+            else (batch, seq * self.world, heads // self.world, dim)
+        )
+        required_bytes = tensor.numel() * tensor.element_size()
         if required_bytes > self.capacity_bytes:
             raise ValueError(f"Input requires {required_bytes} bytes; capacity is {self.capacity_bytes}")
+        output = tensor.new_empty(shape)
+        # Strict Ulysses requires matching shapes on every rank. Joint-only
+        # CFG prefill therefore has no sequence payload to exchange anywhere.
+        if seq_local == 0:
+            return output
         staging = self.allocation[:required_bytes].view(tensor.dtype).view(tensor.shape)
         # copy_ also accepts row-strided Q/K/V views from packed projections.
         staging.copy_(tensor)
-        output = torch.empty(shape, dtype=tensor.dtype, device=self.device)
-        self._barrier(self.allocation)
-        block_channels = triton.next_power_of_2(channels)
-        block_rows = max(1, self.block_size // block_channels)
-        _pull_and_relayout[(triton.cdiv(seq_local, block_rows), self.world, batch)](
-            self.peer_ptrs,
-            output,
-            self.rank,
-            self.world,
-            seq_local,
-            channels,
-            reverse,
-            block_rows,
-            block_channels,
+        torch.ops.omni_ulysses_shmem_fused.pull(
+            self.peer_ptrs, output, self.rank, self.world, batch, seq_local, row_bytes, reverse
         )
-        self._barrier(self.allocation)
         return output
 
     def qkv(
@@ -281,37 +208,32 @@ class NPUUlyssesSHMEM:
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        *,
-        reuse_staging_views: bool = True,
     ) -> tuple[torch.Tensor, ...]:
         """Exchange Q/K/V together, including unequal Q and KV head counts.
 
-        All three inputs use disjoint symmetric regions. Both stream barriers
+        All three inputs use disjoint symmetric regions. Both device barriers
         surround the entire group, so no peer can reuse a region prematurely.
         """
         self._check_stream()
         tensors = (query, key, value)
+        rows = [self._row_bytes(tensor) for tensor in tensors]
         for tensor in tensors:
-            if tensor.device != self.device or tensor.dtype != query.dtype:
-                raise ValueError("Q/K/V must share the workspace device and dtype")
-            if tensor.requires_grad:
-                raise ValueError("NPU SHMEM Ulysses is inference-only")
-            if tensor.ndim != 4 or any(dim <= 0 for dim in tensor.shape):
-                raise ValueError("Q/K/V must be nonempty [B, S, H, D] tensors")
-            if tensor.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-                raise ValueError("Supported dtypes: bfloat16, float16, float32")
-            if tensor.shape[:2] != query.shape[:2] or tensor.shape[2] % self.world:
-                raise ValueError("Q/K/V must share batch/sequence dimensions and have divisible head counts")
-            if tensor.shape[2] // self.world * tensor.shape[3] * tensor.element_size() % 32:
-                raise ValueError("Head shard rows must be 32-byte aligned for the tiled NPU copy")
+            if tensor.dtype != query.dtype or tensor.shape[:2] != query.shape[:2]:
+                raise ValueError("Q/K/V must share dtype and batch/sequence dimensions")
         sizes = [tensor.numel() for tensor in tensors]
         required_bytes = sum(sizes) * query.element_size()
         if required_bytes > self.capacity_bytes:
             raise ValueError(f"Q/K/V require {required_bytes} bytes; capacity is {self.capacity_bytes}")
         batch, seq = query.shape[:2]
+        outputs = tuple(
+            tensor.new_empty((batch, seq * self.world, tensor.shape[2] // self.world, tensor.shape[3]))
+            for tensor in tensors
+        )
+        if seq == 0:
+            return outputs
         offsets = (0, sizes[0], sizes[0] + sizes[1])
         staging_key = (query.dtype, tuple(tensor.shape for tensor in tensors))
-        if reuse_staging_views and staging_key == self._qkv_staging_key:
+        if staging_key == self._qkv_staging_key:
             staging_views = self._qkv_staging_views
         else:
             staging = self.allocation[:required_bytes].view(query.dtype)
@@ -319,44 +241,20 @@ class NPUUlyssesSHMEM:
                 staging[offset : offset + size].view(tensor.shape)
                 for tensor, offset, size in zip(tensors, offsets, sizes)
             )
-            if reuse_staging_views:
-                # Retain only the last configuration; views alias the fixed
-                # allocation, while every call still copies fresh input data.
-                self._qkv_staging_key = staging_key
-                self._qkv_staging_views = staging_views
+            # Retain only the last configuration; views alias the fixed
+            # allocation, while every call still copies fresh input data.
+            self._qkv_staging_key = staging_key
+            self._qkv_staging_views = staging_views
         for tensor, staging_view in zip(tensors, staging_views):
             staging_view.copy_(tensor)
-        outputs = tuple(
-            torch.empty(
-                (batch, seq * self.world, tensor.shape[2] // self.world, tensor.shape[3]),
-                dtype=tensor.dtype,
-                device=self.device,
-            )
-            for tensor in tensors
-        )
-        channels = [tensor.shape[2] // self.world * tensor.shape[3] for tensor in tensors]
-        block_channels = [triton.next_power_of_2(channel) for channel in channels]
-        block_rows = max(1, self.block_size // max(block_channels))
-        self._barrier(self.allocation)
-        _pull_qkv_and_relayout[(triton.cdiv(seq, block_rows), self.world, batch * 3)](
-            self.peer_ptrs,
-            *outputs,
-            self.rank,
-            self.world,
-            seq,
-            *channels,
-            offsets[1],
-            offsets[2],
-            block_rows,
-            *block_channels,
-        )
-        self._barrier(self.allocation)
+        torch.ops.omni_ulysses_shmem_fused.qkv(self.peer_ptrs, *outputs, self.rank, self.world, batch, seq, *rows)
         return outputs
 
     def close(self) -> None:
-        """Finish remote reads before collectively releasing the workspace."""
+        """Finish queued exchanges before releasing symmetric memory."""
         self._check_stream()
-        self._barrier(self.allocation)
+        # Every fused exchange ends with a device-side SHMEM barrier, which
+        # guarantees peers have finished reading the staging workspace.
         torch.npu.synchronize(self.device)
         self._qkv_staging_views = None
         self._qkv_staging_key = None
@@ -366,15 +264,16 @@ class NPUUlyssesSHMEM:
         self._closed = True
 
 
-def get_ulysses_shmem_workspace(group: dist.ProcessGroup, tensors: tuple[torch.Tensor, ...]) -> NPUUlyssesSHMEM:
+def _get_workspace(tensors: tuple[torch.Tensor, ...], group_name: str, world_size: int) -> NPUUlyssesSHMEM:
     """Share one workspace across layers; grow collectively for larger requests.
 
     Strict Ulysses already requires matching tensor shapes across ranks. The
     resulting byte capacity and growth decisions must consequently match too.
     The group must contain every WORLD rank in the same order, since SHMEM's
-    stream barrier is collective over WORLD.
+    device barrier is collective over WORLD.
     """
     global _WORKSPACE, _WORKSPACE_GROUP
+    group = _resolve_group(group_name, world_size)
     if tensors[0].device.type != "npu":
         raise ValueError("NPU ulysses_a2a_permute requires NPU tensors")
     if _WORKSPACE_GROUP is not None and group is not _WORKSPACE_GROUP:
@@ -384,12 +283,13 @@ def get_ulysses_shmem_workspace(group: dist.ProcessGroup, tensors: tuple[torch.T
             raise ValueError("NPU SHMEM Ulysses requires the Ulysses group to match WORLD rank order")
     required = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
     if _WORKSPACE is not None:
-        _WORKSPACE._check_stream()
         if required <= _WORKSPACE.capacity_bytes:
             return _WORKSPACE
         _WORKSPACE.close()
         _WORKSPACE = None
-    capacity = ((required + (64 << 20) - 1) // (64 << 20)) * (64 << 20)
+    # The first exchange may be a joint-only CFG prefill with zero image
+    # tokens. Rendezvous still needs a positive symmetric allocation.
+    capacity = max(64 << 20, ((required + (64 << 20) - 1) // (64 << 20)) * (64 << 20))
     _WORKSPACE = NPUUlyssesSHMEM(capacity)
     _WORKSPACE_GROUP = group
     logger.info(
@@ -401,6 +301,13 @@ def get_ulysses_shmem_workspace(group: dist.ProcessGroup, tensors: tuple[torch.T
     return _WORKSPACE
 
 
+def _resolve_group(group_name: str, world_size: int):
+    group = _resolve_process_group(group_name)
+    if dist.get_world_size(group) != world_size:
+        raise ValueError("world_size must match the Ulysses process group")
+    return group
+
+
 def clear_ulysses_shmem_workspace() -> None:
     """Collectively release the workspace before destroying process groups."""
     global _WORKSPACE, _WORKSPACE_GROUP
@@ -410,15 +317,8 @@ def clear_ulysses_shmem_workspace() -> None:
     _WORKSPACE_GROUP = None
 
 
-def _get_op_workspace(tensors: tuple[torch.Tensor, ...], group_name: str, world_size: int) -> NPUUlyssesSHMEM:
-    group = _resolve_process_group(group_name)
-    if dist.get_world_size(group) != world_size:
-        raise ValueError("world_size must match the Ulysses process group")
-    return get_ulysses_shmem_workspace(group, tensors)
-
-
 def ulysses_qkv_fwd(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
-    return _get_op_workspace((x,), group_name, world_size)(x)
+    return _get_workspace((x,), group_name, world_size)(x)
 
 
 def ulysses_qkv_fwd_group(
@@ -428,8 +328,8 @@ def ulysses_qkv_fwd_group(
     group_name: str,
     world_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _get_op_workspace((query, key, value), group_name, world_size).qkv(query, key, value)
+    return _get_workspace((query, key, value), group_name, world_size).qkv(query, key, value)
 
 
 def ulysses_o_rev(y: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
-    return _get_op_workspace((y,), group_name, world_size)(y, reverse=True)
+    return _get_workspace((y,), group_name, world_size)(y, reverse=True)
