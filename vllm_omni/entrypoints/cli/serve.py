@@ -986,6 +986,8 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="MiniMax-H3 reference-KV cache as JSON: mode=on, "
             "kv_refresh_interval (default 2), kv_host_quantization=none|fp8|int8. "
+            "Optional cache_dit_policy=refresh|hit (default refresh); hit priority uses "
+            "max_refresh_interval (default twice kv_refresh_interval). "
             "Reference projections are skipped on reuse steps. "
             "Omit to keep the existing attention path.",
         )

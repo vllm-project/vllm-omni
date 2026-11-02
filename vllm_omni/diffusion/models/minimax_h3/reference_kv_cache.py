@@ -17,6 +17,10 @@ from vllm_omni.platforms import current_omni_platform
 _log = init_logger(__name__)
 
 
+class ReferenceKVRefreshRequiredError(RuntimeError):
+    """Request a full-layout replay before committing a due compact probe."""
+
+
 @dataclass
 class MiniMaxH3ReferenceKVStats:
     block_cached_layers: int = 0
@@ -78,6 +82,12 @@ class _MiniMaxH3ReferenceKVBase:
         self._refresh = False
         self._global_refresh = False
         self._layers_seen: set[int] = set()
+        self.cache_dit_policy = "refresh"
+        self.max_refresh_interval: int | None = None
+        self.cache_dit_schedule_active = False
+        self._last_refresh_step: int | None = None
+        self._reference_version = -1
+        self.refresh_reason = "unstarted"
 
     @property
     def host_bytes(self) -> int:
@@ -96,7 +106,66 @@ class _MiniMaxH3ReferenceKVBase:
     def reference_epoch(self) -> int:
         if self._step is None:
             raise RuntimeError("no active reference-KV step")
+        if self.cache_dit_schedule_active:
+            return self._reference_version + int(self._global_refresh)
         return self._step // self.refresh_interval if self.refresh_interval > 0 else 0
+
+    @property
+    def reference_age(self) -> int | None:
+        if self._step is None or self._last_refresh_step is None:
+            return None
+        return self._step - self._last_refresh_step
+
+    @property
+    def refresh_due(self) -> bool:
+        return (
+            self.cache_dit_schedule_active
+            and not self._global_refresh
+            and self.reference_age is not None
+            and self.reference_age >= self.refresh_interval
+        )
+
+    def _start_step(self, step: int) -> None:
+        self._step = int(step)
+        self._layers_seen.clear()
+        if self.cache_dit_schedule_active:
+            if self._last_refresh_step is None:
+                self._global_refresh = True
+                self.refresh_reason = "initial"
+            else:
+                assert self.max_refresh_interval is not None
+                self._global_refresh = self.reference_age >= self.max_refresh_interval
+                self.refresh_reason = "maximum_age" if self._global_refresh else "reuse"
+        else:
+            self._global_refresh = step == 0 or (self.refresh_interval > 0 and step % self.refresh_interval == 0)
+            self.refresh_reason = "periodic" if self._global_refresh else "reuse"
+        self._refresh = self._is_refresh_step(step)
+
+    def promote_step_to_refresh(self) -> None:
+        """Discard only a compact Fn probe, before any cache hit or middle span.
+
+        Host values cannot be overwritten while the copy stream still reads
+        the previous version. This synchronization occurs only at the actual
+        refresh boundary, never on ordinary reuse steps.
+        """
+        if not self.refresh_due:
+            raise RuntimeError("only a due active Cache-DiT probe can request refresh")
+        copy_stream = getattr(self, "_copy_stream", None)
+        if copy_stream is not None:
+            copy_stream.synchronize()
+        self._layers_seen.clear()
+        self._global_refresh = self._refresh = True
+        self.refresh_reason = "cache_dit_miss"
+        self.stats.refresh_steps += 1
+        if hasattr(self, "_slot_layers"):
+            self._slot_layers = [None] * self.ring_size
+            self._ready_events = [None] * self.ring_size
+            self._consumed_events = [None] * self.ring_size
+
+    def _commit_reference_refresh(self) -> None:
+        if self._global_refresh:
+            self._last_refresh_step = self._step
+            self._reference_version += 1
 
     @property
     def is_reference_refresh_step(self) -> bool:
@@ -208,7 +277,7 @@ class _MiniMaxH3ReferenceKVBase:
     def _is_refresh_step(self, step: int) -> bool:
         if self._host_pool is None:
             return True
-        return self.refresh_interval > 0 and step % self.refresh_interval == 0
+        return self._global_refresh
 
 
 class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
@@ -259,6 +328,8 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
             state.ring_size,
             state.host_quantization,
         )
+        state.cache_dit_policy = config.cache_dit_policy
+        state.max_refresh_interval = config.max_refresh_interval
         return state
 
     def __init__(
@@ -627,10 +698,7 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
         del sigma
         if self._step is not None:
             raise RuntimeError(f"reference-KV Tier2 step {self._step} is still active")
-        self._step = int(step)
-        self._layers_seen.clear()
-        self._global_refresh = step == 0 or (self.refresh_interval > 0 and step % self.refresh_interval == 0)
-        self._refresh = self._is_refresh_step(step)
+        self._start_step(step)
         if self._refresh:
             self.stats.refresh_steps += 1
             return
@@ -723,6 +791,7 @@ class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
                 "MiniMax-H3 reference-KV Tier2 saw "
                 f"{len(self._layers_seen)}/{self.num_layers} layers in step {self._step}"
             )
+        self._commit_reference_refresh()
         self._step = None
         self._layers_seen.clear()
 
