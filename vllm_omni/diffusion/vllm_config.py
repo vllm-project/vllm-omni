@@ -11,6 +11,7 @@ from typing import Any, cast
 import torch
 from vllm.config import CompilationConfig, DeviceConfig, KernelConfig, KVTransferConfig, VllmConfig
 from vllm.config.lora import LoRAConfig
+from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -19,6 +20,8 @@ from vllm_omni.platforms import current_omni_platform
 
 # Dense diffusion has no native scheduler token budget to inherit.
 DEFAULT_DIFFUSION_MOE_LORA_MAX_TOKENS = 65536
+
+logger = init_logger(__name__)
 
 
 def resolve_diffusion_max_model_len(od_config: OmniDiffusionConfig) -> int:
@@ -215,6 +218,21 @@ def resolve_diffusion_moe_lora_token_capacity(
     return capacity
 
 
+def _is_cuda_online_mxfp4_moe(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether the model uses vLLM's online MXFP4 MoE quantization."""
+    if not od_config.is_moe or not current_omni_platform.is_cuda():
+        return False
+
+    from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+    from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Static
+
+    quant_config = getattr(od_config, "quantization_config", None)
+    if not isinstance(quant_config, OnlineQuantizationConfig):
+        return False
+    moe_spec = getattr(getattr(quant_config, "args", None), "moe", None)
+    return moe_spec is not None and moe_spec.weight == kMxfp4Static
+
+
 def create_base_diffusion_vllm_config(
     device: torch.device,
     od_config: OmniDiffusionConfig,
@@ -246,7 +264,18 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     vllm_config.model_config = _make_diffusion_vllm_model_config(od_config)  # type: ignore[assignment]
     lora_backend = getattr(od_config, "lora_backend", "peft")
     lora_backend = getattr(lora_backend, "value", lora_backend)
-    if od_config.is_moe and lora_backend == "peft":
+    moe_lora_enabled = od_config.is_moe and lora_backend == "peft"
+    if moe_lora_enabled and not getattr(od_config, "lora_path", None) and _is_cuda_online_mxfp4_moe(od_config):
+        # vLLM rejects native W4A4 MXFP4 MoE kernels while LoRA is enabled.
+        # Keep the baseline path on those kernels; startup adapters retain the
+        # existing LoRA-capable W4A16 fallback because ``lora_config`` remains set.
+        logger.info(
+            "Disabling MoE LoRA for online MXFP4 on CUDA without a startup adapter; "
+            "this enables native W4A4 kernels. Pass lora_path to request a "
+            "LoRA-capable W4A16 backend."
+        )
+        moe_lora_enabled = False
+    if moe_lora_enabled:
         vllm_config.lora_config = LoRAConfig(
             max_lora_rank=512,
             max_loras=1,
