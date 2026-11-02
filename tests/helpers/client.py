@@ -112,6 +112,7 @@ class OmniResponse:
     cached_tokens: int | None = None
     multimodal_tokens: dict[str, int] | None = None
     logprobs: list | None = None
+    tool_calls: list[dict[str, str]] | None = None
 
 
 @dataclass
@@ -443,16 +444,24 @@ class OnlineOmniClient:
         try:
             text_content = ""
             audio_data = []
+            tool_calls_by_idx: dict[int, dict[str, str]] = {}
             for chunk in chat_completion:
                 if result.request_id is None:
                     result.request_id = getattr(chunk, "id", None)
                 for choice in chunk.choices:
-                    content = getattr(getattr(choice, "delta", None), "content", None)
+                    delta = getattr(choice, "delta", None)
+                    content = getattr(delta, "content", None)
                     modality = getattr(chunk, "modality", None)
                     if modality == "audio" and content:
                         audio_data.append(content)
                     elif modality == "text" and content:
                         text_content += content
+                    for tool_call in getattr(delta, "tool_calls", None) or []:
+                        entry = tool_calls_by_idx.setdefault(tool_call.index, {"name": "", "arguments": ""})
+                        if tool_call.function and tool_call.function.name:
+                            entry["name"] = tool_call.function.name
+                        if tool_call.function and tool_call.function.arguments:
+                            entry["arguments"] += tool_call.function.arguments
                 # Usage is yielded after the last token
                 if chunk.usage:
                     result.prompt_tokens = chunk.usage.prompt_tokens
@@ -467,6 +476,7 @@ class OnlineOmniClient:
                 result.audio_bytes = wav_buf.getvalue()
             result.text_content = text_content
             result.audio_data = audio_data
+            result.tool_calls = list(tool_calls_by_idx.values()) or None
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
         except Exception as e:
@@ -1357,6 +1367,10 @@ class OnlineOmniClient:
             "stream": stream,
             "modalities": modalities,
         }
+        if "tools" in request_config:
+            create_kwargs["tools"] = request_config["tools"]
+        if "tool_choice" in request_config:
+            create_kwargs["tool_choice"] = request_config["tool_choice"]
         if "logprobs" in request_config:
             create_kwargs["logprobs"] = request_config["logprobs"]
         if "top_logprobs" in request_config:
