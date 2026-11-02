@@ -118,7 +118,10 @@ normalization and produces the prompt updates; runner transport adds the
 terminal-input signal. Configured adapters apply to non-async full-payload
 receive. Native MRV2 async receive uses the built-in adapter and the same
 typed updates; other async-chunk paths remain owned by
-`OmniChunkTransferAdapter`.
+`OmniChunkTransferAdapter`. On the native path, a `codes.audio` window sent as
+a tensor with two or more dimensions is one placeholder token, as in
+`OmniChunkTransferAdapter`, and the consumer reads the codes from runtime
+information. Flat codes stay one prompt token per code.
 
 ## Candidate invariants
 
