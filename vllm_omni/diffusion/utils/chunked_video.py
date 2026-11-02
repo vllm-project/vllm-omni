@@ -367,6 +367,7 @@ class ChunkedVideoMP4Session:
         max_pending: int = 2,
         video_codec_options: dict[str, str] | None = None,
         crop: tuple[int, int] | None = None,
+        crop_offset: tuple[int, int] = (0, 0),
         transfer_slots: int = 2,
         max_pending_bytes: int | None = _DEFAULT_MAX_PENDING_BYTES,
         skip_frames: int = 0,
@@ -385,6 +386,11 @@ class ChunkedVideoMP4Session:
         self._max_pending = max_pending
         self._video_codec_options = video_codec_options
         self._crop = crop
+        if len(crop_offset) != 2 or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in crop_offset):
+            raise ValueError("crop_offset must contain two non-negative integers")
+        if crop is None and crop_offset != (0, 0):
+            raise ValueError("crop_offset requires crop dimensions")
+        self._crop_offset = crop_offset
         self._skip_frames = skip_frames
         self._transfer_slots = transfer_slots
         self._max_pending_bytes = max_pending_bytes
@@ -427,7 +433,10 @@ class ChunkedVideoMP4Session:
         """Queue one committed ``BCTHW`` chunk."""
         if self._crop is not None:
             height, width = self._crop
-            chunk = chunk[..., :height, :width]
+            top, left = self._crop_offset
+            if top + height > chunk.shape[-2] or left + width > chunk.shape[-1]:
+                raise ValueError("crop rectangle exceeds the decoded chunk")
+            chunk = chunk[..., top : top + height, left : left + width]
         if self._skip_frames:
             skipped = min(self._skip_frames, int(chunk.shape[2]))
             self._skip_frames -= skipped
