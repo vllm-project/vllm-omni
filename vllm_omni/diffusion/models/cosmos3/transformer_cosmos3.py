@@ -2141,7 +2141,8 @@ class Cosmos3VFMTransformer(nn.Module):
         extra = values.pop("kwargs")
         if extra:
             raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(extra)}")
-        context = self._prepare_gen_request(**values)
+        request_values = {key: value for key, value in values.items() if key != "intermediate_tensors"}
+        context = self._prepare_gen_request(**request_values)
         return (), {**values, "attention_context": context}
 
     # -- Forward -------------------------------------------------------------
