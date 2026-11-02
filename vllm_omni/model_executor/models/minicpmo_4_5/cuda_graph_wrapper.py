@@ -147,6 +147,14 @@ class HiFTGraphWrapper:
         self.mel_frames = int(token2wav.hift.conv_pre.in_channels)
         self.flow_upsample_rate = int(getattr(token2wav.flow, "token_mel_ratio", 2))
         self.extra_codec_chunk_frames = [int(c) for c in connector_config.get("hift_graph_codec_chunk_frames") or ()]
+        # Mel-width grid for tail chunks (0 disables). The K-step flow hands
+        # stage 2 eight-frame quanta, so tail chunks arrive at widths such as
+        # 24/44 that no steady-state bucket covers; padding their mel width up
+        # to this grid replays them on a nearby bucket instead of the eager
+        # vocoder. See ``_width_pad_target``.
+        self.width_pad_bucket = int(connector_config.get("hift_graph_width_bucket", 16))
+        if self.width_pad_bucket < 0:
+            raise ValueError("MiniCPM-o hift_graph_width_bucket must be >= 0")
         self.capture_bucket_size, self.capture_source_cache_len = self.derive_capture_bucket_size()
         # The only (mel_frames, cache_source_len) shapes ever lazily captured: a duplex first chunk's
         # arbitrary width is seen once, and capturing it would stall every stream for one replay.
@@ -198,6 +206,16 @@ class HiFTGraphWrapper:
             if mel_frames <= self.mel_cache_len:
                 raise ValueError("MiniCPM-o hift_graph_codec_chunk_frames must emit audio beyond the HiFT mel cache")
             shapes += [(mel_frames, 0), (mel_frames + self.mel_cache_len, self.source_cache_len)]
+        widest = max(shape[0] for shape in shapes)
+        if self.width_pad_bucket > 1:
+            # Width-aligned buckets so a tail chunk pads up to the next grid
+            # point instead of the single widest steady bucket (up to 2.4x less
+            # vocoder work per replay). Both the first-chunk (cache 0) and the
+            # continuation (cache 3840) forms are needed: tails arrive in both.
+            for mel_frames in range(self.width_pad_bucket, widest, self.width_pad_bucket):
+                if mel_frames <= self.mel_cache_len:
+                    continue
+                shapes += [(mel_frames, 0), (mel_frames + self.mel_cache_len, self.source_cache_len)]
         shapes = list(dict.fromkeys(shapes))
         return [shape[0] for shape in shapes], [shape[1] for shape in shapes]
 
@@ -305,6 +323,36 @@ class HiFTGraphWrapper:
         num_frames = speech_feat.shape[2]
         cache_source_len = cache_source.shape[2]
 
+        # Tail chunks off the bucket grid pad up to the next width bucket and
+        # crop the waveform back afterwards; replays stay on captured graphs.
+        padded_frames = None
+        if (num_frames, cache_source_len) not in self._legit_shapes:
+            pad_target = self._width_pad_target(num_frames, cache_source_len)
+            if pad_target is not None:
+                padded_frames = num_frames
+                pad = pad_target - num_frames
+                speech_feat = torch.cat(
+                    [speech_feat, speech_feat[:, :, -1:].expand(-1, -1, pad)],
+                    dim=2,
+                ).contiguous()
+                num_frames = pad_target
+        if padded_frames is not None:
+            speech, next_cache_source = self._replay_frames(
+                speech_feat, cache_source, num_frames, cache_source_len, batch_size
+            )
+            hop = int(speech.shape[-1]) // int(num_frames)
+            return speech[..., : padded_frames * hop].contiguous(), next_cache_source
+
+        return self._replay_frames(speech_feat, cache_source, num_frames, cache_source_len, batch_size)
+
+    def _width_pad_target(self, num_frames: int, cache_source_len: int) -> int | None:
+        """Narrowest capture bucket at or above ``num_frames`` for this cache length."""
+        candidates = [
+            frames for frames, cache_len in self._legit_shapes if cache_len == cache_source_len and frames >= num_frames
+        ]
+        return min(candidates) if candidates else None
+
+    def _replay_frames(self, speech_feat, cache_source, num_frames, cache_source_len, batch_size):
         exact_key = (batch_size, num_frames, cache_source_len)
         if exact_key in getattr(self, "_exact_keys", ()) and exact_key in self.graph:
             # An exact-shape graph: same shape as the eager call, no padding.

@@ -46,6 +46,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     HISTORY_WINDOW,
     TalkerCodecDeviceState,
     TalkerCodecSampleResult,
+    TalkerCudaKStepState,
     codec_sample_result,
     greedy_codec_sample,
     make_device_state,
@@ -61,6 +62,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
+from vllm_omni.utils.seeded_exponential import fill_exponential_rows
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 
 logger = init_logger(__name__)
@@ -222,6 +224,17 @@ def blank_scheduler_prompt_for_penalties(
     them would tax unrelated codec tokens.
     """
     return torch.full_like(prompt_token_ids, int(vocab_size))
+
+
+def kstep_frame_rows(spans: list[tuple[int, int]], device: torch.device) -> torch.Tensor:
+    """Rows a K-frame step samples for each request: the last row of its span.
+
+    The loop reads ``hidden[end - 1 : end]`` for a request, so that is the row
+    whose codec logits matter. For a one-row span (what the per-frame loop
+    passes) this is ``start``; for a wider span it is the span's tail -- which
+    is exactly where vLLM put this frame's scheduled position.
+    """
+    return torch.tensor([int(end) - 1 for _, end in spans], device=device, dtype=torch.long)
 
 
 def _native_duplex_row_meta(info_dict: Mapping[str, Any]) -> tuple[bool, int, int, str, bool]:
@@ -477,6 +490,128 @@ def _codec_int_param(state: Any, key: str, fallback: int) -> int:
     """
     value = state.get(key) if isinstance(state, Mapping) else None
     return int(fallback if value is None else value)
+
+
+_CUDA_KSTEP_STATE_FIELDS = ("history", "steps", "finished", "last_tokens")
+
+
+def _cuda_kstep_host_signature(model: Any, request_id: str, state: dict) -> tuple:
+    return (
+        _codec_int_param(state, "step", 0),
+        bool(state.get("finished", False)),
+        tuple(getattr(model, "_request_codec_history", {}).get(request_id, ())[-HISTORY_WINDOW:]),
+    )
+
+
+def _cuda_kstep_upload(model: Any, workspace: Any, name: str, row: int, values: Any) -> None:
+    """Reuse a host staging row; a blocking copy completes before its next write."""
+    staging = getattr(model, "_cuda_kstep_host_staging", None)
+    if staging is None:
+        staging = model._cuda_kstep_host_staging = {}
+    target = getattr(workspace, name)[row : row + 1]
+    key = (id(workspace), name)
+    host = staging.get(key)
+    if host is None:
+        host = torch.empty(target.shape, dtype=target.dtype, pin_memory=target.is_cuda)
+        staging[key] = host
+    if isinstance(values, (list, tuple)):
+        for index, value in enumerate(values):
+            host.view(-1)[index] = value
+    else:
+        host.fill_(values)
+    target.copy_(host, non_blocking=False)
+
+
+def _cuda_kstep_pinned_buffer(model: Any, frames: int, rows: int) -> torch.Tensor:
+    """Pinned landing buffer per (frames, rows); the shapes recur each step."""
+    cache = getattr(model, "_cuda_kstep_pinned", None)
+    if cache is None:
+        cache = model._cuda_kstep_pinned = {}
+    key = (frames, rows)
+    pinned = cache.get(key)
+    if pinned is None:
+        pinned = torch.empty(frames, rows, 3, dtype=torch.long, pin_memory=True)
+        cache[key] = pinned
+    return pinned
+
+
+def _apply_cuda_kstep_host_frames(
+    model: Any,
+    host: list,
+    frames: int,
+    states: list,
+    request_ids: list,
+    generators,
+    request_generators,
+    rng_offsets,
+) -> None:
+    """Replay one packed step's host bookkeeping onto the request mirrors.
+
+    Module-level (not a method) so tests can drive it through the same
+    SimpleNamespace doubles the model methods already tolerate.
+    """
+    states_map = getattr(model, "_request_audio_states", {})
+    for row, (state, request_id) in enumerate(zip(states, request_ids)):
+        if request_id in getattr(model, "_deferred_cleanup_ids", ()) or states_map.get(request_id) is not state:
+            # The request finished and was cleaned (or its id was recycled)
+            # between the commit and this replay: its mirrors are gone, and a
+            # fresh segment must not inherit this step's counters or RNG
+            # rewind.
+            continue
+        emitted: list[int] = []
+        was_finished = bool(state.get("finished", False))
+        draws = 0
+        for frame in range(frames):
+            sampled, emit, finished = host[frame][row]
+            if was_finished:
+                break
+            draws += 1
+            if emit:
+                emitted.append(int(sampled))
+            state["step"] = _codec_int_param(state, "step", 0) + 1
+            state["finished"] = bool(finished)
+            was_finished = bool(finished)
+        generator = generators[row]
+        if generator is not None:
+            # The graph always draws all K frames; only the frames the request
+            # actually consumed may advance its own generator, otherwise the
+            # random stream after an early EOS diverges from the native path.
+            base = rng_offsets[row]
+            total = generator.get_offset() - base
+            if total > 0 and not total % frames:
+                request_generators[row].set_offset(base + draws * (total // frames))
+            elif total > 0:
+                # Unreachable while every frame costs the same number of draws;
+                # if a future kernel breaks that, keep serving with the graph's
+                # full advance instead of failing the engine step.
+                request_generators[row].set_state(generator.get_state())
+                if not getattr(model, "_cuda_kstep_offset_warned", False):
+                    model._cuda_kstep_offset_warned = True
+                    logger.warning(
+                        "[kstep-cuda-graph] generator offset increment %d is not divisible by frames=%d; "
+                        "request RNG falls back to the full graph advance",
+                        total,
+                        frames,
+                    )
+        history = model._request_codec_history.setdefault(request_id, [])
+        history.extend(emitted)
+        del history[:-HISTORY_WINDOW]
+        entry = getattr(model, "_cuda_kstep_request_bank", {}).get(request_id)
+        if entry is not None and entry["state"] is state:
+            entry["signature"] = _cuda_kstep_host_signature(model, request_id, state)
+
+
+def _flush_cuda_kstep_host_pending(model: Any) -> None:
+    """Wait for the packed D2H copy and apply its deferred host bookkeeping."""
+    pending = getattr(model, "_cuda_kstep_pending", None)
+    if pending is None:
+        return
+    model._cuda_kstep_pending = None
+    event, pinned, frames, states, request_ids, generators, request_generators, rng_offsets = pending
+    event.synchronize()
+    _apply_cuda_kstep_host_frames(
+        model, pinned.tolist(), frames, states, request_ids, generators, request_generators, rng_offsets
+    )
 
 
 def _apply_codec_window_penalty_gpu(
@@ -776,6 +911,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._request_generators: dict[str, torch.Generator] = {}
         self._request_codec_device_states: dict[str, TalkerCodecDeviceState] = {}
         self._request_codec_device_inputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._request_codec_device_budgets: dict[str, tuple[TalkerCodecDeviceState, int]] = {}
         # Confirmed codec frames this model sampled, one entry per forwarded
         # frame. Under K-step the scheduler's token stream carries the 0/1
         # control rows the two-wide head emits instead, so streaming prompt
@@ -1076,6 +1212,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build request-local prefill/decode embeddings for the vLLM runner."""
+        # Prefill/chunk-boundary recompute reads the codec history mirror; a
+        # fused commit may have deferred its host bookkeeping one step back.
+        _flush_cuda_kstep_host_pending(self)
         del input_embeds
         span_len = int(input_ids.shape[0])
         is_prefill = bool(info_dict.get("_omni_is_prefill", False))
@@ -1246,6 +1385,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # true previous frame's sample lives in the request state.
         # The runner sends one-token decode rows through preprocess_decode_batch,
         # which defers this ``.item()`` EOS check to make_omni_output.
+        device_last = state.get("_kstep_last_code") if isinstance(state, dict) else None
+        if isinstance(device_last, torch.Tensor):
+            code = device_last.to(device=self.emb_code[0].weight.device, dtype=torch.long).reshape(1)
+            return input_ids, self.emb_code[0](code), {}
         k_last = state.get("last_code") if isinstance(state, dict) else None
         if isinstance(k_last, int) and k_last >= 0:
             code = torch.tensor(
@@ -1292,11 +1435,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         codec payloads to the host together with its asynchronous output.
         CPU rows retain the scalar implementation's semantics.
         """
+        # Reads state.get("finished") below; a fused commit may hold that
+        # mirror back one step, so land it before this batch's embeds.
+        _flush_cuda_kstep_host_pending(self)
         num_rows = len(req_infos)
         if input_ids.numel() != num_rows:
             raise ValueError(f"MiniCPM-o Talker batched decode needs one id per row: {input_ids.numel()} != {num_rows}")
         weight = self.emb_code[0].weight
-        codes = input_ids.reshape(-1).to(device=weight.device, dtype=torch.long)
+        codes = input_ids.reshape(-1).to(device=weight.device, dtype=torch.long).clone()
         # The runner and connector consume CPU codec ids.
         empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
         request_states = self._request_audio_states
@@ -1334,9 +1480,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # the placeholder id and its codec stream drifts (WER tail vs
             # main at identical weights). The single-frame path never sets
             # last_code, so it keeps embedding the scheduled id unchanged.
-            k_last = state.get("last_code") if isinstance(state, dict) else None
-            if isinstance(k_last, int) and k_last >= 0:
-                k_last_rows.append((row, k_last))
+            device_last = state.get("_kstep_last_code")
+            if isinstance(device_last, torch.Tensor):
+                codes[row : row + 1].copy_(device_last)
+            else:
+                k_last = state.get("last_code")
+                if isinstance(k_last, int) and k_last >= 0:
+                    k_last_rows.append((row, k_last))
             # Output construction owns the codec snapshot. An empty buffer
             # update avoids retaining the preceding step's delta.
             updates.append({"codes": {"audio": empty_codes}})
@@ -1428,6 +1578,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         hidden = model_outputs
+        _flush_cuda_kstep_host_pending(self)
         empty_speech = self._mrv2_empty_speech
         if empty_speech is None:
             raise RuntimeError("MiniCPM-o Talker MRv2 output requires its MRv2 sampler (mrv2_custom_sampler)")
@@ -1636,6 +1787,323 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return None
         return forced
 
+    def warmup_kstep_sampling_kernels(
+        self,
+        device: torch.device,
+        *,
+        dtype: torch.dtype,
+        frames: int,
+        max_rows: int = 16,
+        vocab_size: int | None = None,
+    ) -> None:
+        """Compile the K-step codec sampling kernels before the first request.
+
+        ``prepare_cuda_kstep`` allocates its workspace and compiles the codec
+        prelude on first use, i.e. inside the first frame of the first request,
+        and the seeded exponential fill it relies on compiles on its own first
+        use. Both cost 0.3-1.0 s of first-audio latency, so bind one workspace
+        per decode width here and warm the fill once.
+
+        The fill specializes on the row width (its ``numel`` argument decides
+        torch's grid policy and the Triton divisibility signature), and the
+        sampler calls it with the full model vocabulary, not the codec one.
+        """
+        target = torch.device(device)
+        cache = getattr(self, "_cuda_kstep_workspaces", None)
+        if cache is None:
+            cache = self._cuda_kstep_workspaces = {}
+        for rows in range(1, max(1, int(max_rows)) + 1):
+            key = (rows, int(frames), target, dtype)
+            workspace = cache.get(key)
+            if workspace is None:
+                workspace = TalkerCudaKStepState.allocate(rows, int(frames), target)
+                cache[key] = workspace
+            workspace.warmup_native_prelude(self._codec_eos_id, enabled=self._codec_fused_prelude)
+        # The exponential fill draws on throwaway generators: warming it must not
+        # advance the RNG stream a real request depends on. Its state table is
+        # packed (3, rows), so an odd row count leaves the offset pointer off the
+        # 16-byte boundary Triton specializes on -- warm both parities, and both
+        # the two-wide control rows and the full vocabulary.
+        widths = {2, int(_CODEC_VOCAB_SIZE)}
+        if vocab_size:
+            widths.add(int(vocab_size))
+        for rows in (1, 2):
+            for width in sorted(w for w in widths if w > 0):
+                draws = torch.empty((rows, width), dtype=torch.float32, device=target)
+                fill_exponential_rows(
+                    draws,
+                    [torch.Generator(device=target) for _ in range(rows)],
+                    list(range(rows)),
+                )
+
+    def prepare_cuda_kstep(self, hidden: torch.Tensor, frames: int, **kwargs: Any) -> TalkerCudaKStepState | None:
+        """Bind a decode batch outside capture; unsupported sampling uses the native path."""
+        _flush_cuda_kstep_host_pending(self)
+        infos = kwargs.get("model_intermediate_buffer") or []
+        spans = kwargs.get("request_token_spans") or []
+        eligible = kwargs.get("request_sample_eligible", [True] * len(infos))
+        if not infos or len(spans) != len(infos) or not all(eligible):
+            return None
+        if any(not isinstance(info, dict) or info.get("native_duplex") for info in infos):
+            return None
+        if any(int(end) - int(start) != 1 for start, end in spans):
+            return None
+        params = kwargs.get("request_sampling_params")
+        remaining = kwargs.get("request_max_tokens_remaining")
+        states = []
+        request_ids = []
+        for index, info in enumerate(infos):
+            request_id = str(info.get("request_id", index))
+            state = self._request_audio_states.get(request_id)
+            if not isinstance(state, dict):
+                state = dict(info.get("audio_state", {}) or {})
+                self._request_audio_states[request_id] = state
+            self._merge_request_codec_params(
+                state,
+                params[index] if params is not None else None,
+                max_tokens_remaining=remaining[index] if remaining is not None else None,
+            )
+            if (
+                state.get("turn_end_drain")
+                or state.get("codec_repetition_detection")
+                or state.get("codec_min_p", 0)
+                or state.get("codec_frequency_penalty", 0)
+                or state.get("codec_presence_penalty", 0)
+                or _codec_bool_param(state, "codec_ignore_eos", False)
+                or (
+                    hidden.device.type != "cuda"
+                    and _codec_float_param(state, "codec_temperature", self._codec_temperature) != 0.0
+                )
+            ):
+                return None
+            states.append(state)
+            request_ids.append(request_id)
+        key = (len(infos), int(frames), hidden.device, hidden.dtype)
+        cache = getattr(self, "_cuda_kstep_workspaces", None)
+        if cache is None:
+            cache = self._cuda_kstep_workspaces = {}
+        workspace = cache.get(key)
+        if workspace is None:
+            workspace = TalkerCudaKStepState.allocate(len(infos), frames, hidden.device)
+            cache[key] = workspace
+        workspace.warmup_native_prelude(self._codec_eos_id, enabled=self._codec_fused_prelude)
+        device = hidden.device
+        workspace.tokens.zero_()
+        workspace.emits.zero_()
+        workspace.stops.zero_()
+        workspace.uniforms.fill_(0.5)
+        bank = getattr(self, "_cuda_kstep_request_bank", None)
+        if bank is None:
+            bank = self._cuda_kstep_request_bank = {}
+        row_cache = getattr(self, "_cuda_kstep_row_params", None)
+        if row_cache is None:
+            row_cache = self._cuda_kstep_row_params = {}
+        sampling = []
+        for index, (request_id, state) in enumerate(zip(request_ids, states)):
+            signature = _cuda_kstep_host_signature(self, request_id, state)
+            entry = bank.get(request_id)
+            valid = (
+                entry is not None
+                and entry.get("ready", False)
+                and entry["state"] is state
+                and entry["signature"] == signature
+                and entry["device"] == device
+            )
+            if valid:
+                # Source slots do not alias batch rows, including during swaps.
+                for name in _CUDA_KSTEP_STATE_FIELDS:
+                    getattr(workspace, name)[index : index + 1].copy_(entry["tensors"][name])
+            else:
+                history = list(signature[2])
+                if not history:
+                    codes = state.get("codes")
+                    if isinstance(codes, torch.Tensor) and codes.numel():
+                        history = codes.reshape(-1)[-HISTORY_WINDOW:].tolist()
+                history = [int(token) for token in history]
+                for name, value in (
+                    ("history", [-1] * (HISTORY_WINDOW - len(history)) + history),
+                    ("last_tokens", history[-1] if history else 0),
+                    ("steps", signature[0]),
+                    ("finished", signature[1]),
+                ):
+                    _cuda_kstep_upload(self, workspace, name, index, value)
+                if entry is None or entry["state"] is not state or entry["device"] != device:
+                    entry = {
+                        "state": state,
+                        "device": device,
+                        "tensors": {
+                            name: torch.empty_like(getattr(workspace, name)[index : index + 1])
+                            for name in _CUDA_KSTEP_STATE_FIELDS
+                        },
+                    }
+                    bank[request_id] = entry
+                entry["signature"] = signature
+                entry["ready"] = False
+            temperature = _codec_float_param(state, "codec_temperature", self._codec_temperature)
+            row_top_k = _codec_int_param(state, "codec_top_k", self._codec_top_k)
+            row_top_p = _codec_float_param(state, "codec_top_p", self._codec_top_p)
+            stop_ids = tuple(_codec_stop_ids(state))
+            values = (
+                ("min_tokens", _codec_int_param(state, "min_tokens", self._codec_min_tokens)),
+                ("max_tokens", _codec_int_param(state, "max_tokens", self._codec_max_tokens)),
+                ("temperatures", temperature),
+                ("penalties", _codec_float_param(state, "codec_repetition_penalty", self._codec_repetition_penalty)),
+                ("top_k", row_top_k),
+                ("top_p", row_top_p),
+            )
+            previous = row_cache.get((key, index), {})
+            for name, value in values:
+                if previous.get(name) != value:
+                    _cuda_kstep_upload(self, workspace, name, index, value)
+            if previous.get("stop_ids") != stop_ids:
+                mask = [False] * workspace.stop_mask.shape[1]
+                for token in stop_ids:
+                    mask[int(token)] = True
+                _cuda_kstep_upload(self, workspace, "stop_mask", index, mask)
+            row_cache[(key, index)] = dict(values, stop_ids=stop_ids)
+            sampling.append((temperature, row_top_k, row_top_p, stop_ids))
+        sampling = tuple(sampling)
+        generators = tuple(
+            self._request_generator(request_id, hidden.device) if config[0] else None
+            for request_id, config in zip(request_ids, sampling)
+        )
+        generator_cache = getattr(self, "_cuda_kstep_generator_cache", None)
+        if generator_cache is None:
+            generator_cache = self._cuda_kstep_generator_cache = {}
+        graph_generators = generator_cache.get(key)
+        if graph_generators is None:
+            graph_generators = tuple(torch.Generator(device=hidden.device) for _ in states)
+            generator_cache[key] = graph_generators
+        bindings = getattr(self, "_cuda_kstep_rng_bindings", None)
+        if bindings is None:
+            bindings = self._cuda_kstep_rng_bindings = {}
+        for row, (graph_generator, request_generator) in enumerate(zip(graph_generators, generators)):
+            slot = (key, row)
+            if request_generator is None:
+                bindings.pop(slot, None)
+                continue
+            seed = _codec_int_param(states[row], "codec_seed", self._codec_seed)
+            identity = (request_ids[row], id(states[row]), id(request_generator), seed)
+            previous = bindings.get(slot)
+            if previous != identity:
+                # Seeding belongs to ``_request_generator``; re-seeding here would
+                # discard a generator's advanced state (and its per-request seed).
+                graph_generator.set_state(request_generator.get_state())
+                bindings[slot] = identity
+            else:
+                graph_generator.set_offset(request_generator.get_offset())
+        self._cuda_kstep_sampling = sampling
+        self._cuda_kstep_request_generators = generators
+        self._cuda_kstep_generators = tuple(
+            graph_generator if request_generator is not None else None
+            for graph_generator, request_generator in zip(graph_generators, generators)
+        )
+        self._cuda_kstep_rng_offsets = tuple(g.get_offset() if g is not None else None for g in generators)
+        self._cuda_kstep_binding = (workspace, infos, states, request_ids)
+        return workspace
+
+    def cuda_kstep_frame(self, hidden: torch.Tensor, frame: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tensor-only frame body; capture includes projection, sampling and feedback."""
+        workspace = self._cuda_kstep_binding[0]
+        tokens = workspace.sample_native(
+            self.head_code[0](hidden).float(),
+            frame,
+            self._codec_eos_id,
+            self._cuda_kstep_sampling,
+            self._cuda_kstep_generators,
+        )
+        feedback = self.emb_code[0](tokens).reshape(hidden.shape[0], -1)
+        stop_rows = hidden.new_full((hidden.shape[0], 2), float("-inf"))
+        stop_rows.scatter_(1, workspace.stops[frame, :, None].long(), 0.0)
+        return feedback, stop_rows
+
+    def commit_cuda_kstep(self, hidden: torch.Tensor) -> OmniOutput:
+        """Return fixed-width device deltas and defer packed host bookkeeping.
+
+        ``codec_frame_valid`` identifies emitted frames. The next host-state
+        reader synchronizes the pinned copy before updating counters and RNG.
+        """
+        workspace, infos, states, request_ids = self._cuda_kstep_binding
+        bank = getattr(self, "_cuda_kstep_request_bank", {})
+        for row, (request_id, state) in enumerate(zip(request_ids, states)):
+            entry = bank.get(request_id)
+            if entry is not None and entry["state"] is state:
+                for name in _CUDA_KSTEP_STATE_FIELDS:
+                    entry["tensors"][name].copy_(getattr(workspace, name)[row : row + 1])
+                entry["ready"] = True
+        frames = workspace.tokens.shape[0]
+        packed = torch.stack((workspace.tokens, workspace.emits.long(), workspace.stops.long()), dim=-1)
+        if packed.is_cuda:
+            if getattr(self, "_cuda_kstep_pending", None) is not None:
+                # Every host-state reader flushes first, so this only fires
+                # when a step somehow skipped them; apply before overwriting.
+                _flush_cuda_kstep_host_pending(self)
+            pinned = _cuda_kstep_pinned_buffer(self, frames, len(states))
+            pinned.copy_(packed, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            self._cuda_kstep_pending = (
+                event,
+                pinned,
+                frames,
+                states,
+                request_ids,
+                self._cuda_kstep_generators,
+                self._cuda_kstep_request_generators,
+                self._cuda_kstep_rng_offsets,
+            )
+        else:
+            # CPU tensors only occur in unit tests; keep the bookkeeping
+            # synchronous so the read-after-commit contract holds there.
+            _apply_cuda_kstep_host_frames(
+                self,
+                packed.tolist(),
+                frames,
+                states,
+                request_ids,
+                self._cuda_kstep_generators,
+                self._cuda_kstep_request_generators,
+                self._cuda_kstep_rng_offsets,
+            )
+        finished_snapshot = workspace.finished.clone()
+        last_snapshot = workspace.last_tokens.clone()
+        deltas: list[torch.Tensor] = []
+        valids: list[torch.Tensor] = []
+        finished_flags: list[torch.Tensor] = []
+        emits = workspace.emits
+        tokens = workspace.tokens
+        for row, (info, state) in enumerate(zip(infos, states)):
+            # Keep the full width and let the consumer crop via the
+            # ``meta.codec_frame_valid`` contract; masked_select would need a
+            # blocking read of the replay just launched.
+            delta = tokens[:, row].clone().unsqueeze(1)
+            valid = emits[:, row].clone()
+            old_codes = state.get("codes")
+            if not isinstance(old_codes, torch.Tensor):
+                old_codes = hidden.new_empty((0,), dtype=torch.long)
+            # Full-width mirror; only the host-side ``_request_codec_history``
+            # (flushed one step later) is exact, and it is the one readers use.
+            state["codes"] = torch.cat((old_codes.reshape(-1), delta.reshape(-1)))
+            # ``last_tokens`` keeps the pre-step id when nothing emits, so the
+            # unconditional snapshot matches the host loop's ``if emitted``
+            # without a device->host read.
+            state["_kstep_last_code"] = last_snapshot[row : row + 1].clone()
+            info["audio_state"] = state
+            info["audio_codes"] = {"current": delta.reshape(-1), "accumulated": state["codes"]}
+            deltas.append(delta)
+            valids.append(valid)
+            finished_flags.append(finished_snapshot[row : row + 1].clone())
+        # compute_logits expects request-major [B*K, 2] control rows.
+        stop = workspace.stops.transpose(0, 1).reshape(-1, 1).long()
+        self.batch_stop_logits = hidden.new_full((stop.shape[0], 2), float("-inf")).scatter_(1, stop, 0.0)
+        return OmniOutput(
+            text_hidden_states=hidden,
+            multimodal_outputs={
+                "codes": {"audio": deltas},
+                "meta": {"finished": finished_flags, "codec_frame_valid": valids},
+            },
+        )
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,
@@ -1644,6 +2112,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         hidden = model_outputs
+        # Non-fused paths (K-step frame loop, single-frame decode) read the
+        # step/finished/history mirrors below; a fused commit from the
+        # previous step may still hold them back.
+        _flush_cuda_kstep_host_pending(self)
         infos = kwargs.get("model_intermediate_buffer") or []
         spans = kwargs.get("request_token_spans")
         if spans is None or len(spans) != len(infos):
@@ -1680,6 +2152,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
         emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
 
+        # Hoisted out of the per-request loop: this is the same dict for every
+        # row of the frame, and the loop runs rows x frames times per step.
+        request_states = getattr(self, "_request_audio_states", None)
+        if request_states is None:
+            request_states = {}
+            self._request_audio_states = request_states
         stop_rows: list[torch.Tensor] = []
         codec_deltas: list[torch.Tensor] = []
         terminal_flags: list[torch.Tensor] = []
@@ -1690,6 +2168,36 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         row_continue, row_stop, flag_false, flag_true, empty_delta = self._step_constants(hidden)
+        # Keep one batched projection, but omit rows that exit without sampling.
+        projection_rows: list[int] = []
+        projection_indices: dict[int, int] = {}
+        for index, info in enumerate(infos):
+            if not isinstance(info, dict):
+                continue
+            start, end = spans[index]
+            end = min(int(end), int(hidden.shape[0]))
+            if int(start) >= end:
+                continue
+            request_id = str(info.get("request_id", index))
+            state = request_states.get(request_id)
+            if not isinstance(state, dict):
+                state = dict(info.get("audio_state", {}) or {})
+            if state.get("finished") or not sample_eligible[index]:
+                continue
+            if int(state.get("turn_end_drain") or _DRAIN_NONE) == _DRAIN_UNTIL_SILENT:
+                step = _codec_int_param(state, "step", 0)
+                confirmed = getattr(self, "_request_codec_history", {}).get(request_id) or []
+                _, quiet_run = _trailing_code_runs(
+                    step, confirmed[-step:] if step > 0 else [], self.silent_codec_ids, self.quiet_codec_ids
+                )
+                if quiet_run >= _TURN_END_QUIET_STOP_FRAMES:
+                    continue
+            projection_indices[index] = len(projection_rows)
+            projection_rows.append(end - 1)
+        head_logits_all = None
+        if projection_rows:
+            frame_rows = torch.tensor(projection_rows, device=hidden.device, dtype=torch.long)
+            head_logits_all = self.head_code[0](hidden.index_select(0, frame_rows)).float()
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             if emit_duplex_metadata:
@@ -1718,10 +2226,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 terminal_flags.append(flag_false)
                 continue
             request_id = str(info.get("request_id", index))
-            request_states = getattr(self, "_request_audio_states", None)
-            if request_states is None:
-                request_states = {}
-                self._request_audio_states = request_states
             state = request_states.get(request_id)
             if not isinstance(state, dict):
                 state = dict(info.get("audio_state", {}) or {})
@@ -1793,6 +2297,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # Both boundary samplers return the full sample result; the device
             # state inside it owns the eos/stop-id/limit transition (single
             # source).
+            assert head_logits_all is not None
+            projection_index = projection_indices[index]
+            frame_logits = head_logits_all[projection_index : projection_index + 1]
             if _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
                 greedy_result = self._sample_audio_code_greedy(
                     hidden[end - 1 : end],
@@ -1802,11 +2309,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     min_tokens,
                     max_tokens,
                     eos_window_masked,
+                    logits=frame_logits,
                 )
                 sample_result = greedy_result
             else:
                 sample_result = self._sample_audio_code(
-                    hidden[end - 1 : end], codes, request_id, step, eos_window_masked
+                    hidden[end - 1 : end],
+                    codes,
+                    request_id,
+                    step,
+                    eos_window_masked,
+                    logits=frame_logits,
                 )
             # The kernel ABI is int32, while the existing connector/audio-code
             # payload is int64.  Keep the compatibility cast outside the fused op.
@@ -1822,65 +2335,24 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     sample_result.emit.reshape(()).to(torch.long),
                 )
             )
-            packed_host = packed.cpu().tolist()
-            sampled_id = int(packed_host[0])
-            device_finished = bool(packed_host[1])
-            device_emit = bool(packed_host[2])
-            full_ids = state.get("codec_full_ids")
-            if isinstance(full_ids, list):
-                full_ids.append(sampled_id)
+            # Commit all request rows before the next frame reads their history.
+            pending = getattr(self, "_kstep_pending_packed", None)
+            if pending is None:
+                pending = self._kstep_pending_packed = []
+            pending.append((packed, request_id, state))
             state["step"] = _codec_int_param(state, "step", 0) + 1
-            # Single-source stop routing: the device state owns the
-            # eos/stop-id/limit transition (codec_sample_result), so the host
-            # only consumes its finished/emit decision. The _DRAIN_UNTIL_SILENT
-            # quiet-run stop above finishes before sampling, and repetition
-            # detection stays host-side -- the scheduler never sees codec ids, so the
-            # engine's check_stop cannot police the codec stream; this mirrors
-            # it over codec_full_ids exactly as the engine does over its
-            # tokens (v1/core/sched/utils.py:125-133).
-            repetition_stop = _codec_repetition_detected(state)
-            finished = device_finished or repetition_stop
-            emit_frame = device_emit
-            state["finished"] = finished
-            # MiniCPMTTS.generate_chunk consumes the boundary sample but
-            # returns only codes that were fed into the retained KV state.
-            if emit_frame:
-                codes = torch.cat([codes[-(HISTORY_WINDOW - 1) :], sampled.reshape(1)])
-                delta = sampled.reshape(1, 1)
-                if self._k_step_frames > 0:
-                    # K-step: the multi-frame loop owns sampling, so the rows
-                    # vLLM schedules for the next step carry placeholder
-                    # continue ids. Record this frame's sample so the decode
-                    # preprocess embeds the real previous frame's codec id
-                    # (the k_last branch) instead of the placeholder, and keep
-                    # the confirmed-frame history that streaming prompt
-                    # recompute rebuilds its window from -- the scheduler's
-                    # token slice holds the placeholder ids.
-                    state["last_code"] = sampled_id
-                    histories = getattr(self, "_request_codec_history", None)
-                    if not isinstance(histories, dict):
-                        # Instances built without __init__ (CPU tests,
-                        # subclasses) still need a place for the record -- the
-                        # readers at the recompute and cleanup sites already
-                        # tolerate a missing dict the same way.
-                        histories = {}
-                        self._request_codec_history = histories
-                    codec_history = histories.get(request_id)
-                    if codec_history is None:
-                        codec_history = []
-                        histories[request_id] = codec_history
-                    codec_history.append(sampled_id)
-            else:
-                delta = empty_delta
-            state["codes"] = codes
+            finished = sample_result.state.finished.reshape(()).to(torch.bool)
+            emit_frame = sample_result.emit.reshape(()).to(torch.bool)
+            delta = sampled.reshape(1, 1).masked_select(emit_frame.reshape(1, 1)).reshape(-1, 1)
+            state["_kstep_last_code"] = sampled.reshape(1)
             info["audio_state"] = state
             info["audio_codes"] = {
                 "current": sampled.reshape(1),
                 "accumulated": codes,
             }
             codec_deltas.append(delta)
-            terminal_flags.append(flag_true if finished else flag_false)
-            stop_rows.append(row_stop if finished else row_continue)
+            terminal_flags.append(torch.where(finished, flag_true, flag_false))
+            stop_rows.append(torch.where(finished, row_stop, row_continue))
 
         self.batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
@@ -1901,6 +2373,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "codes": {"audio": codec_deltas},
             "meta": meta_outputs,
         }
+        self.flush_kstep_pending()
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,
@@ -2137,12 +2610,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 full_bins=_codec_full_bins_input(request_state, hidden_state.device),
             )
             device_states[request_id] = device_state
+            device_budgets = getattr(self, "_request_codec_device_budgets", None)
+            if device_budgets is None:
+                device_budgets = {}
+                self._request_codec_device_budgets = device_budgets
+            device_budgets[request_id] = (device_state, int(max_tokens))
         else:
-            # Refresh in place, unconditionally: fill_ is a no-op when the
-            # budget did not move, and a .item() compare would sync every
-            # request every frame just to decide whether to write a value we
-            # can write regardless.
-            device_state.max_tokens.fill_(int(max_tokens))
+            # Keep the captured tensor identity stable. The host ceiling cache
+            # avoids a redundant device write on every frame; identity guards
+            # against a state rebuild for the same request id.
+            device_budgets = getattr(self, "_request_codec_device_budgets", None)
+            if device_budgets is None:
+                device_budgets = {}
+                self._request_codec_device_budgets = device_budgets
+            cached_budget = device_budgets.get(request_id)
+            if cached_budget is None or cached_budget[0] is not device_state or cached_budget[1] != int(max_tokens):
+                device_state.max_tokens.fill_(int(max_tokens))
+                device_budgets[request_id] = (device_state, int(max_tokens))
         device_inputs_by_request = getattr(self, "_request_codec_device_inputs", None)
         if device_inputs_by_request is None:
             device_inputs_by_request = {}
@@ -2174,6 +2658,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
         eos_window_masked: bool = False,
+        logits: torch.Tensor | None = None,
     ) -> TalkerCodecSampleResult:
         request_state = getattr(self, "_request_audio_states", {}).get(request_id, {})
         device_state, device_inputs, device_states = self._codec_sample_setup(
@@ -2189,7 +2674,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         min_tokens_tensor, temperature_tensor, penalty_tensor = device_inputs
         eos_id = self._codec_eos_id
         logits = prepare_codec_logits(
-            self.head_code[0](hidden_state).float(),
+            # The K-frame path projects all of the step's rows in one call and
+            # hands each row its slice; the single-frame path still projects
+            # here, so the default keeps that behaviour.
+            self.head_code[0](hidden_state).float() if logits is None else logits,
             device_state,
             min_tokens_tensor,
             temperature_tensor,
@@ -2232,6 +2720,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         min_tokens: int,
         max_tokens: int,
         eos_window_masked: bool = False,
+        logits: torch.Tensor | None = None,
     ) -> TalkerCodecSampleResult:
         """Run the greedy codec boundary while keeping sampler state on device.
 
@@ -2253,7 +2742,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         min_tokens_tensor, _, penalty_tensor = device_inputs
         result = greedy_codec_sample(
-            self.head_code[0](hidden_state).float(),
+            self.head_code[0](hidden_state).float() if logits is None else logits,
             device_state,
             min_tokens_tensor,
             penalty_tensor,
@@ -2345,21 +2834,32 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         codec_histories = getattr(self, "_request_codec_history", None)
         request_generators = getattr(self, "_request_generators", None)
         decode_codec_ids = getattr(self, "_decode_codec_ids", {})
-        for request_id in self._deferred_cleanup_ids:
+        for request_id in getattr(self, "_deferred_cleanup_ids", ()):
             request_audio_states.pop(request_id, None)
             request_condition_states.pop(request_id, None)
             if isinstance(codec_device_states, dict):
                 codec_device_states.pop(request_id, None)
             if isinstance(codec_device_inputs, dict):
                 codec_device_inputs.pop(request_id, None)
+            codec_device_budgets = getattr(self, "_request_codec_device_budgets", None)
+            if isinstance(codec_device_budgets, dict):
+                codec_device_budgets.pop(request_id, None)
             if isinstance(codec_histories, dict):
                 codec_histories.pop(request_id, None)
             if isinstance(request_generators, dict):
                 request_generators.pop(request_id, None)
             decode_codec_ids.pop(request_id, None)
+            getattr(self, "_cuda_kstep_request_bank", {}).pop(request_id, None)
+            bindings = getattr(self, "_cuda_kstep_rng_bindings", {})
+            for slot, identity in list(bindings.items()):
+                if identity[0] == request_id:
+                    del bindings[slot]
             codec_state = getattr(self, "_device_codec_state", None)
             if codec_state is not None:
                 codec_state.release(request_id)
+        pending = getattr(self, "_kstep_pending_packed", None)
+        if pending:
+            self._kstep_pending_packed = [item for item in pending if item[1] not in self._deferred_cleanup_ids]
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(
@@ -2403,6 +2903,45 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+
+    def flush_kstep_pending(self) -> None:
+        """Commit sampled rows before the next frame reads host-side state."""
+        pending = getattr(self, "_kstep_pending_packed", None)
+        if not pending:
+            return
+        self._kstep_pending_packed = []
+        packed_host = torch.stack([item[0] for item in pending]).cpu().tolist()
+        for (_, request_id, state), (sampled_id, finished, emit) in zip(pending, packed_host):
+            if (
+                request_id in getattr(self, "_deferred_cleanup_ids", ())
+                or self._request_audio_states.get(request_id) is not state
+            ):
+                continue
+            sampled_id = int(sampled_id)
+            full_ids = state.get("codec_full_ids")
+            if isinstance(full_ids, list):
+                full_ids.append(sampled_id)
+            stop = bool(finished) or _codec_repetition_detected(state)
+            state["finished"] = stop
+            if not bool(emit):
+                continue
+            codes = state.get("codes")
+            if isinstance(codes, torch.Tensor):
+                state["codes"] = torch.cat([codes[-(HISTORY_WINDOW - 1) :], codes.new_tensor([sampled_id])])
+            # K-step: the rows vLLM schedules for the next step carry
+            # placeholder continue ids, so the real previous codec id is kept
+            # here for the decode preprocess and for the confirmed-frame
+            # history streaming prompt recompute rebuilds its window from.
+            state["last_code"] = sampled_id
+            histories = getattr(self, "_request_codec_history", None)
+            if not isinstance(histories, dict):
+                histories = {}
+                self._request_codec_history = histories
+            codec_history = histories.get(request_id)
+            if codec_history is None:
+                codec_history = []
+                histories[request_id] = codec_history
+            codec_history.append(sampled_id)
 
     def _make_omni_output_single_frame(
         self,
@@ -2869,6 +3408,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         del multimodal_embeddings
         # Decode tokens live in the codec table. Prefill overwrites these
         # embeddings in preprocess with emb_text + projected thinker hidden.
+        weight = self.emb_code[0].weight
+        # Async speculative steps book draft slots as ``PLACEHOLDER_TOKEN_ID``
+        # (-1) until the previous step is sampled; the codec table is far
+        # smaller than the Thinker vocab, so the lookup would trip an index
+        # assert. The rows never contribute semantics, so clamp them.
+        if weight.numel() and input_ids.numel():
+            input_ids = input_ids.clamp(0, weight.shape[0] - 1)
         return self.emb_code[0](input_ids)
 
     def embed_input_ids(self, input_ids, **kwargs):

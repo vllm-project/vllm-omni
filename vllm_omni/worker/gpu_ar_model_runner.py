@@ -10,6 +10,8 @@ and also outputs sampled tokens.
 from __future__ import annotations
 
 import gc
+import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import nullcontext
@@ -415,6 +417,136 @@ class GPUARModelRunner(
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
 
+    def _kstep_constant_draft_tensor(self, rows: int, drafts: int) -> torch.Tensor:
+        """One cached device tensor per (rows, drafts) shape of CONTINUE drafts.
+
+        The K-step draft's value never varies -- only its shape does (batch
+        size, booked span, folded steps). Cache the live shape's tensor so a
+        propose pays no host-list build and no new device allocation; the
+        shape key changes only when the batch or the span changes. The tensor
+        is read-only downstream (`_prepare_input_ids` scatters from it,
+        `update_async_spec_token_ids` reads the CPU copy), so sharing it is
+        safe.
+        """
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        key = (rows, drafts)
+        cached = getattr(self, "_kstep_constant_draft_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        device = getattr(self, "device", None) or "cpu"
+        tensor = torch.full(
+            (rows, drafts),
+            talker_multiframe.CONTINUE_TOKEN_ID,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._kstep_constant_draft_cache = (key, tensor)
+        return tensor
+
+    def propose_draft_token_ids(self, scheduler_output, sampled_token_ids, *args, **kwargs):
+        """Carry the Talker's frame count to the scheduler, not a prediction.
+
+        Stage 1 declares a speculative_config so vLLM reserves K query
+        positions per request -- that is what grows the block table and the KV
+        slots the multi-frame loop writes into. The drafter itself has nothing
+        to say: the Talker's vLLM-level vocabulary is `continue`/`stop`, the
+        frames are generated sequentially inside one execute_model, and the
+        model's own stop row ends the request. So the draft is `continue`
+        repeated, and the rejection sampler accepts it exactly up to the frame
+        the codec sequence ended on. The helpers live in the NPU module but are
+        plain Python -- the loop they feed (``talker_multiframe.run``) is the
+        same one the CUDA runner calls.
+        """
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        frames = talker_multiframe.drafts_this_step(self)
+        if frames > 1:
+            if getattr(self, "use_async_scheduling", False):
+                # Under async scheduling the sampled ids and this step's spec
+                # booking are both unreadable here (GPU copy / one step late),
+                # so deriving the split folds on empty rows and severs the
+                # K-span feedback loop. Propose the constant draft for every
+                # row and let the scheduler trim to what it booked.
+                draft_tensor = self._kstep_constant_draft_tensor(int(self.input_batch.num_reqs), frames - 1)
+            else:
+                if isinstance(sampled_token_ids, torch.Tensor):
+                    sampled_token_ids = sampled_token_ids.cpu().tolist()
+                    sampled_token_ids = [[token for token in row if token >= 0] for row in sampled_token_ids]
+                scheduled = getattr(scheduler_output, "scheduled_spec_decode_tokens", {})
+                drafts = talker_multiframe.constant_drafts(
+                    sampled_token_ids,
+                    frames,
+                    self.input_batch.num_reqs,
+                    scheduled_draft_counts=[len(scheduled.get(req_id, [])) for req_id in self.input_batch.req_ids],
+                    fold_short_rows=True,
+                )
+                # The draft must be a device tensor: `_prepare_input_ids`
+                # scatters it directly and `_copy_draft_token_ids_to_cpu` only
+                # arms the async req-ids/event copy for tensors. The value is a
+                # constant, so one cached tensor per live shape is enough.
+                draft_tensor = self._kstep_constant_draft_tensor(
+                    int(self.input_batch.num_reqs),
+                    len(drafts[0]) if drafts and drafts[0] else 0,
+                )
+            if (
+                getattr(self, "use_async_scheduling", False)
+                and getattr(self, "draft_token_ids_event", None) is not None
+                and getattr(self, "draft_token_ids_copy_stream", None) is not None
+                and getattr(self, "draft_token_ids_cpu", None) is not None
+            ):
+                # The upstream ngram_gpu branch never arms the draft CPU copy
+                # once this override returns, which leaves the rejection sampler
+                # on the scheduler's [-1] placeholders and drops 7 of the 8
+                # frames. Arm the copy here.
+                self._draft_token_ids = draft_tensor
+                self._draft_token_req_ids = self.input_batch.req_ids.copy()
+                default_stream = torch.cuda.current_stream()
+                with torch.cuda.stream(self.draft_token_ids_copy_stream):
+                    self.draft_token_ids_copy_stream.wait_stream(default_stream)
+                    n_reqs, n_drafts = draft_tensor.shape
+                    self.draft_token_ids_cpu[:n_reqs, :n_drafts].copy_(draft_tensor, non_blocking=True)
+                    self.draft_token_ids_event.record()
+            # Publish the per-request valid draft count too: the worker path
+            # trims every booking to `1 + valid_k`, and a CPU buffer that is
+            # never written reads as zero. Every booked slot is a constant
+            # CONTINUE, so report the full count.
+            _valid_cpu = getattr(self, "_num_valid_draft_tokens_cpu", None)
+            if (
+                _valid_cpu is not None
+                and getattr(self, "_num_valid_draft_tokens_event", None) is not None
+                and getattr(self, "_num_valid_draft_tokens_copy_stream", None) is not None
+            ):
+                from vllm.v1.spec_decode.ngram_proposer_gpu import (
+                    copy_num_valid_draft_tokens,
+                )
+
+                n_reqs, n_drafts = draft_tensor.shape
+                cache = getattr(self, "_kstep_valid_draft_cache", None)
+                if cache is None:
+                    cache = self._kstep_valid_draft_cache = {}
+                valid_tensor = cache.get(int(n_drafts))
+                if valid_tensor is None:
+                    valid_tensor = torch.full(
+                        (int(self.max_num_reqs),),
+                        int(n_drafts),
+                        dtype=torch.int32,
+                        device=draft_tensor.device,
+                    )
+                    cache[int(n_drafts)] = valid_tensor
+                copy_num_valid_draft_tokens(
+                    _valid_cpu,
+                    self._num_valid_draft_tokens_copy_stream,
+                    self._num_valid_draft_tokens_event,
+                    valid_tensor,
+                    n_reqs,
+                )
+            return draft_tensor
+        # Plain steps keep the n-gram drafter: mixed batches (concurrent
+        # arrivals, stops) are single-frame steps that the uniform-span K-step
+        # declines, and the per-request drafter still covers them.
+        return super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
+
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
         from vllm_omni.distributed.ray_utils.utils import (
@@ -577,6 +709,7 @@ class GPUARModelRunner(
 
     def capture_model(self) -> int:
         result = super().capture_model()
+        self._warmup_kstep_sampler_kernels()
         if not self._has_talker_mtp_graphs():
             return result
         torch.accelerator.synchronize()
@@ -586,6 +719,84 @@ class GPUARModelRunner(
         # Report the MTP pool with the rest so the worker compares it against
         # profile_cudagraph_memory(), which includes it.
         return result + max(free_before - torch.accelerator.get_memory_info()[0], 0)
+
+    def _warmup_kstep_sampler_kernels(self) -> None:
+        """Pre-compile the sampler kernels the first K-step request would hit.
+
+        Three JIT compiles otherwise land on the first request of a serve, each
+        worth 0.3-1.0 s of first-audio latency on L20X:
+
+        * the split-row top-p pipeline, specialized on the batch width (its
+          split count is a function of it) and on the vocabulary. K-step batches
+          change width as requests join or leave, and the control rows it
+          filters are the two-wide continue/stop logits, so the codec vocabulary
+          alone is not enough;
+        * the workspace-bound codec prelude and the seeded exponential fill,
+          which the model compiles on first use inside ``prepare_cuda_kstep``.
+        """
+        if os.environ.get("KSTEP_WARMUP_SAMPLER", "1") == "0":
+            return
+        try:
+            from vllm.v1.sample.ops.topk_topp_triton import (
+                _SPLIT_MAX_BATCH,
+                apply_top_k_top_p_triton,
+            )
+        except Exception:  # pragma: no cover - upstream layout change
+            logger.warning("K-step sampler warmup skipped: import failed")
+            return
+        start = time.perf_counter()
+        try:
+            device = self.device
+            # The split count is derived from the batch width, so the widths that
+            # reach it are what matters: 1..16 for folded steps and the frame
+            # multiples of the loop. The codec vocabulary is already warmed by
+            # vLLM's own pass; the two-wide control rows are not.
+            widths = sorted(set(range(1, 17)) | set(range(8, _SPLIT_MAX_BATCH + 1, 8)))
+            for width in widths:
+                logits = torch.zeros((width, 2), device=device, dtype=torch.float32)
+                probs = torch.full((width,), 0.99, device=device, dtype=torch.float32)
+                apply_top_k_top_p_triton(logits, None, probs)
+            split_ms = (time.perf_counter() - start) * 1000.0
+            warm = getattr(self._kstep_sampling_owner(), "warmup_kstep_sampling_kernels", None)
+            if warm is not None:
+                warm(
+                    device,
+                    dtype=self.model_config.dtype,
+                    frames=self.num_spec_tokens + 1,
+                    max_rows=int(self.scheduler_config.max_num_seqs),
+                    vocab_size=int(self.model_config.get_vocab_size()),
+                )
+            torch.accelerator.synchronize()
+            logger.info(
+                "[kstep-warmup] top-p split %.0f ms, sample kernels %.0f ms (model side: %s)",
+                split_ms,
+                (time.perf_counter() - start) * 1000.0 - split_ms,
+                "warmed" if warm is not None else "no hook",
+            )
+        except Exception:  # pragma: no cover - never fail startup
+            logger.warning("K-step sampler warmup failed", exc_info=True)
+
+    def _kstep_sampling_owner(self) -> Any:
+        """Module that owns the K-step sampling hooks.
+
+        ``FULL`` cudagraph mode hands the runner a wrapper whose ``unwrap()``
+        returns the omni model, and that model re-exports the Talker's bound
+        methods -- so the bound method's ``__self__`` holds the real state.
+        """
+        model = self.model
+        unwrap = getattr(model, "unwrap", None)
+        if callable(unwrap):
+            model = unwrap()
+        for candidate in (model, getattr(model, "model", None)):
+            if candidate is None:
+                continue
+            prepare = getattr(candidate, "prepare_cuda_kstep", None)
+            owner = getattr(prepare, "__self__", None)
+            if owner is not None:
+                return owner
+            if prepare is not None:
+                return candidate
+        return model
 
     def _has_talker_mtp_graphs(self) -> bool:
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
@@ -1375,6 +1586,7 @@ class GPUARModelRunner(
                     set_batch_req_ids = getattr(self.model, "set_batch_req_ids", None)
                     if callable(set_batch_req_ids):
                         set_batch_req_ids(req_ids[:num_reqs])
+
         finally:
             if runner_assisted_context_enabled:
                 self._set_runner_assisted_full_attention_metadata_context(enabled=False)
@@ -2166,7 +2378,7 @@ class GPUARModelRunner(
         self.kv_extracted_req_ids = None
 
         if self.execute_model_state is None:
-            kv_connector_output = self.kv_connector_output
+            kv_connector_output = getattr(self, "kv_connector_output", None)
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and not get_pp_group().is_last_rank:
@@ -2216,6 +2428,10 @@ class GPUARModelRunner(
                 logits.shape[-1],
             )
 
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        if talker_multiframe.drafts_this_step(self) > 0:
+            talker_multiframe.neutralize_kstep_min_tokens(self.input_batch.sampling_metadata.logitsprocs)
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
@@ -2240,6 +2456,16 @@ class GPUARModelRunner(
         self._draft_token_req_ids = None
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
+        # A K-span step samples one id per booked row, so the sampler returns
+        # ``[rows, 1 + num_spec]`` while `_bookkeeping_sync`'s async branch
+        # expects the single-wide stash (normally written by the n-gram
+        # drafter, which this runner bypasses). Stash column 0 ourselves.
+        sampled_ids = sampler_output.sampled_token_ids
+        if isinstance(sampled_ids, torch.Tensor):
+            if sampled_ids.ndim == 2 and sampled_ids.shape[-1] > 1:
+                self.input_batch.prev_sampled_token_ids = sampled_ids[:, :1]
+        elif isinstance(sampled_ids, list) and sampled_ids and len(sampled_ids[0]) > 1:
+            self.input_batch.prev_sampled_token_ids = [row[:1] for row in sampled_ids]
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None

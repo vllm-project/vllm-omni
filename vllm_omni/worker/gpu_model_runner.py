@@ -56,6 +56,10 @@ else:
 
 logger = init_logger(__name__)
 
+# Cadence of the K-step frame histogram. A short benchmark runs a few hundred
+# forwards, so the default would stay silent exactly where the histogram
+# matters; tests override it to sample the mix of folded and full steps.
+
 
 def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return only M-RoPE kwargs accepted by the model implementation."""
@@ -2341,6 +2345,83 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 omni_query_start_loc=model_kwargs_extra.get("omni_query_start_loc"),
                 req_ids=self.input_batch.req_ids,
             )
+
+        # Talker multi-frame (K-step) decode: a decode step that schedules K
+        # positions per request runs K codec frames here, one replay each, using
+        # the same loop the NPU runner uses. Everything else -- prefill, a mixed
+        # step, another stage -- falls through to the ordinary single forward.
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        frames = talker_multiframe.applies(self.model, model_kwargs_extra)
+        if frames <= 1 and talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):
+            # Falling through would sample one frame from the last row of each
+            # span and report one stop row for a step that needs one per
+            # position: wrong codec tokens and wrong scheduler accounting, both
+            # silently. The preceding gate log says which check refused.
+            raise RuntimeError(
+                "MiniCPM-o scheduled a multi-token decode step that the multi-frame "
+                "loop declined; see the preceding '[minicpmo] multi-frame Talker "
+                "decode not engaged' line"
+            )
+        if frames > 1:
+            from vllm.forward_context import get_forward_context
+
+            from vllm_omni.worker.talker_cuda_graph import begin_cuda_narrow_step
+
+            narrow = begin_cuda_narrow_step(
+                forward_context=get_forward_context(),
+                frames=frames,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                spans=model_kwargs_extra["request_token_spans"],
+                graph_owner=self,
+            )
+
+            def run_model() -> Any:
+                try:
+                    # Bind the class explicitly: a zero-argument super() has no
+                    # __class__ cell inside this nested function. `narrow.context`
+                    # is None once a narrow step was restored (fused graph
+                    # declined); only a live step owns the one-query buffers.
+                    active = narrow is not None and narrow.context is not None
+                    return super(OmniGPUModelRunner, self)._model_forward(
+                        input_ids=None if active else input_ids,
+                        positions=narrow.positions if active else positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=narrow.inputs_embeds if active else inputs_embeds,
+                        **model_kwargs,
+                        **model_kwargs_extra,
+                    )
+                finally:
+                    finish_decode_step = getattr(self.model, "finish_decode_step_forward", None)
+                    if callable(finish_decode_step):
+                        finish_decode_step()
+
+            try:
+                model_output = talker_multiframe.run(
+                    model=self.model,
+                    run_model=run_model,
+                    after_forward=lambda: None,
+                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids,
+                    frames=frames,
+                    model_kwargs=model_kwargs,
+                    model_kwargs_extra=model_kwargs_extra,
+                    narrow=narrow,
+                )
+            finally:
+                if narrow is not None:
+                    narrow.restore()
+            # The Talker's vLLM-level head is the two-wide continue/stop row
+            # while input_batch reports vocab_size=0; without the gate the
+            # rejection sampler drops every accepted token.
+            stop_rows = getattr(self.model, "batch_stop_logits", None)
+            talker_multiframe.ensure_stop_token_vocab(
+                self,
+                stop_rows if stop_rows is not None else model_output.text_hidden_states,
+            )
+            self._omni_last_model_output = model_output
+            return model_output
 
         try:
             model_output = super()._model_forward(
