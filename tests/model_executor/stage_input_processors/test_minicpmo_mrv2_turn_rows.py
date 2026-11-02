@@ -11,8 +11,8 @@ test, not by the scheduler.
 import numpy as np
 import pytest
 import torch
-from vllm.v1.outputs import SamplerOutput
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from tests.model_executor.stage_input_processors.test_minicpmo_4_5_omni import _output
 from tests.worker_v2.test_omni_ar_model_runner import _async_output
