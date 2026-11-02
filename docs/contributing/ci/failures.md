@@ -112,6 +112,10 @@ were not retained. The gate records only process IDs and configuration booleans;
 the startup receipt records the private directory (explicitly marked if truncated).
 Neither receipt establishes why a test timed out or proves artifact delivery.
 
+The CPU step invokes a Bash script so its direct-child PID token is evaluated
+in the executing shell, outside pipeline upload and Kubernetes command expansion.
+The outer agent shell does not need to define Bash process variables.
+
 The observer adds timing overhead. Compare instrumented and uninstrumented runs
 explicitly, and do not infer a common cause from matching timeout symptoms.
 Registration is limited to the CPU step's direct pytest child; nested pytest

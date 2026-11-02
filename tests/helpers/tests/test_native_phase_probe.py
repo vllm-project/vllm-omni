@@ -266,25 +266,73 @@ def test_sigkill_retains_last_complete_checkpoint_within_budget(project):
             process.communicate(timeout=10)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="The native CPU agent runs Bash")
-def test_native_pipeline_parent_token_survives_upload_and_kubernetes(tmp_path: Path):
+@pytest.mark.skipif(os.name != "posix", reason="The native CPU agent requires POSIX shells")
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+@pytest.mark.parametrize(("enabled", "exit_status"), [(False, 0), (True, 0), (True, 7)])
+def test_native_pipeline_script_preserves_parent_token_and_pytest_status(tmp_path: Path, shell, enabled, exit_status):
     source = (_ROOT / ".buildkite/cuda/test-nightly.yml").read_text()
-    (export_line,) = [line.strip() for line in source.splitlines() if "export NATIVE_PHASE_PROBE_PARENT_PID=" in line]
-    # The uploader unescapes $$ once. Kubernetes expands the command EnvVar a
-    # second time: this exact export has no $(VAR) references, so only $$ changes.
-    uploaded = export_line.replace("$$", "$")
-    assert "$(" not in uploaded
-    container_export = uploaded.replace("$$", "$")
-    child = (
-        "import json, os; "
-        "token = os.environ['NATIVE_PHASE_PROBE_PARENT_PID']; "
-        "parent = os.getppid(); "
-        "print(json.dumps({'token': token, 'parent': parent}), flush=True); "
-        "assert token == str(parent)"
+    step = source.split("key: nightly-simple-cpu-coverage\n", 1)[1].split("mirror_hardwares:", 1)[0]
+    (command,) = [line.strip()[2:] for line in step.splitlines() if line.strip().startswith("- bash ")]
+    # The uploaded command contains no shell variables for Kubernetes to expand.
+    assert "$" not in command
+    args = shlex.split(command)
+    assert args[0] == "bash"
+    args[1] = str(_ROOT / args[1])
+    receipt = tmp_path / "pytest-receipt.json"
+    output = tmp_path / "observer-output"
+    output.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    pytest_stub = bin_dir / "pytest"
+    pytest_stub.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "report = next(arg.removeprefix('--cov-report=xml:') for arg in args if arg.startswith('--cov-report=xml:'))\n"
+        "Path(report).write_text('<testsuites/>')\n"
+        "token = os.environ.get('NATIVE_PHASE_PROBE_PARENT_PID')\n"
+        "Path(os.environ['PROBE_TEST_RECEIPT']).write_text(json.dumps(dict(\n"
+        "    args=args, token=token, parent=os.getppid(), output=os.environ.get('NATIVE_PHASE_PROBE_OUTPUT_DIR'))))\n"
+        "sys.exit(int(os.environ['PROBE_TEST_EXIT']))\n"
     )
-    # Keep a command after Python so Bash cannot replace itself with the child.
-    command = container_export + "\n" + shlex.join([sys.executable, "-c", child]) + '\nstatus=$?\nexit "$status"'
-    result = subprocess.run(["bash", "-e", "-c", command], cwd=tmp_path, capture_output=True, text=True, timeout=15)
-    assert result.returncode == 0, result.stdout + result.stderr
-    fence = json.loads(result.stdout)
-    assert fence["token"] == str(fence["parent"])
+    pytest_stub.chmod(0o755)
+    mktemp_stub = bin_dir / "mktemp"
+    mktemp_stub.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(str(output))}\n")
+    mktemp_stub.chmod(0o755)
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("NATIVE_PHASE_PROBE_")}
+    environment.update(
+        PATH=str(bin_dir) + os.pathsep + environment["PATH"],
+        VLLM_OMNI_NATIVE_PHASE_PROBE=str(int(enabled)),
+        BUILDKITE_STEP_ID="shell-regression",
+        PROBE_TEST_RECEIPT=str(receipt),
+        PROBE_TEST_EXIT=str(exit_status),
+    )
+    result = subprocess.run(
+        [shell, "-e", "-c", shlex.join(args)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == exit_status, result.stdout + result.stderr
+    observed = json.loads(receipt.read_text())
+    assert observed["args"] == [
+        "-sv",
+        "tests/",
+        "-m",
+        "core_model and cpu",
+        "--cov=vllm_omni",
+        "--cov-report=term-missing:skip-covered",
+        "--cov-report=xml:coverage-core-model-cpu-shell-regression.xml",
+    ]
+    assert (tmp_path / "coverage-core-model-cpu-shell-regression.xml.gz").is_file()
+    if enabled:
+        assert observed["token"] == str(observed["parent"])
+        assert observed["output"] == str(output)
+        assert f"shell enabled=1 pid={observed['parent']}" in result.stderr
+    else:
+        assert observed["token"] is None
+        assert observed["output"] is None
+        assert "shell enabled=0" in result.stderr
