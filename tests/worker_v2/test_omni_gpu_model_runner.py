@@ -540,13 +540,13 @@ def test_full_graph_output_without_contract_is_hidden_only():
 
 
 @pytest.mark.parametrize(
-    "runner_kind,aux_outputs",
+    "runner_kind,omni_aux_outputs",
     [("gpu", False), ("ar", False), ("generation", False), ("gpu", True), ("ar", True)],
 )
 @pytest.mark.parametrize("randomize_inputs", [False, True])
 @pytest.mark.parametrize("is_profile", [False, True])
 def test_dummy_forward_uses_upstream_execution_state(
-    runner_kind, aux_outputs, randomize_inputs, is_profile, monkeypatch
+    runner_kind, omni_aux_outputs, randomize_inputs, is_profile, monkeypatch
 ):
     from vllm.v1.worker.gpu.input_batch import InputBatch
     from vllm.v1.worker.gpu.model_runner import ExecuteModelState
@@ -563,7 +563,7 @@ def test_dummy_forward_uses_upstream_execution_state(
         runner._prev_step_idle = True
     runner._staged_writes = staged_writes.StagedWrites()
     hidden = torch.ones(1, 2)
-    aux_hidden = [hidden + 1, hidden + 2] if aux_outputs else None
+    aux_hidden = [hidden + 1, hidden + 2] if omni_aux_outputs else None
     # These are Omni-owned tuples, not the drafter's outer target-layer tuple.
     runner.use_aux_hidden_state_outputs = False
     if runner_kind != "generation":
@@ -572,7 +572,7 @@ def test_dummy_forward_uses_upstream_execution_state(
         return_value=OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
         if runner_kind == "generation"
         else (hidden, aux_hidden)
-        if aux_outputs
+        if omni_aux_outputs
         else hidden
     )
     runner._dummy_hidden = hidden
@@ -647,7 +647,7 @@ def test_dummy_forward_uses_upstream_execution_state(
         assert not runner._prev_step_idle
     else:
         runner.prepare_dummy_attn.assert_called_once_with(input_batch, True)
-    if aux_outputs:
+    if omni_aux_outputs:
         runner.model.return_value = hidden
         runner.execute_model(scheduled, dummy_run=True, valid_dummy_state_slots=True)
         assert runner._last_aux_output is None
@@ -665,6 +665,7 @@ def test_drafter_target_layers_reach_execute_state(cg_mode, monkeypatch):
     runner.model = MagicMock(return_value=(hidden, aux))
     runner.cudagraph_manager = MagicMock()
     runner.cudagraph_manager.run_fullgraph.return_value = (hidden, aux)
+    # This separate test enables the drafter tuple, unlike Omni-owned aux above.
     runner.use_aux_hidden_state_outputs = True
     runner.model_config = SimpleNamespace()
     runner.vllm_config = SimpleNamespace()

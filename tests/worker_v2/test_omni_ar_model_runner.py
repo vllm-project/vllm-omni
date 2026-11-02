@@ -323,7 +323,7 @@ def test_sample_tokens_drafts_from_target_layers_after_postprocess(monkeypatch, 
 
 @pytest.mark.parametrize(
     "steps,last_rank,has_verifier",
-    [(0, True, False), (7, False, False), (7, True, True), (7, True, False)],
+    [(0, True, False), (7, False, False), (7, True, True), (7, True, False), (0, True, None), (7, False, None)],
 )
 def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, steps, last_rank, has_verifier):
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
@@ -333,7 +333,8 @@ def test_speculative_load_requires_verifier_only_on_final_rank(monkeypatch, step
         calls.append((args, kwargs))
         self.num_speculative_steps = steps
         self.is_last_pp_rank = last_rank
-        self.rejection_sampler = object() if has_verifier else None
+        if has_verifier is not None:
+            self.rejection_sampler = object() if has_verifier else None
 
     monkeypatch.setattr(omni_ar_model_runner.OmniGPUModelRunner, "load_model", load)
     if steps and last_rank and not has_verifier:
