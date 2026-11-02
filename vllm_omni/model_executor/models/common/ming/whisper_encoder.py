@@ -81,14 +81,19 @@ class MultiHeadAttention(nn.Module):
 
         if self.use_flash_attn and q.dtype in (torch.float16, torch.bfloat16):
             max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
+            # Pass every argument by name: the classic FlashAttention signature
+            # takes the cumulative lengths first, while vLLM's dispatcher takes
+            # ``max_seqlen_q`` before ``cu_seqlens_q``. The positional order
+            # differs between the two, so binding by name is what keeps this
+            # call correct for whichever implementation is selected.
             output = flash_attn_varlen_func(
                 q,
                 k,
                 v,
-                cu_seqlens,
-                cu_seqlens,
-                max_seqlen,
-                max_seqlen,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
             )
         else:
             output = self._manual_packed_attention(q, k, v, cu_seqlens)
