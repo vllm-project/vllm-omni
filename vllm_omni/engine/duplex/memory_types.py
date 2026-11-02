@@ -3,8 +3,13 @@
 
 """Immutable inputs and receipts for session-owned memory cards."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudgetLimits
 
 DuplexMemoryAdmissionStatus = Literal["applied", "no_change", "stale", "invalid", "capacity"]
 
@@ -69,6 +74,7 @@ class DuplexContextAuxiliaryPolicy:
     max_sources: int = 8
     max_chars: int = 8192
     allow_during_response: bool = False
+    compute_budget: DuplexAuxiliaryBudgetLimits | None = None
 
 
 @dataclass(frozen=True, order=True)
@@ -113,7 +119,7 @@ class DuplexContextAuxiliaryInput:
     evidence: tuple[DuplexContextEvidence, ...]
     catalog: tuple[DuplexMemoryCardHead, ...]
     history_revision: int
-    barriers: tuple["DuplexContextBarrier", ...] = ()
+    barriers: tuple[DuplexContextBarrier, ...] = ()
 
     @property
     def work_key(self) -> tuple[object, ...]:
@@ -152,7 +158,7 @@ class DuplexMemoryProposal:
 @dataclass(frozen=True)
 class DuplexMemoryProposalBatch:
     operations: tuple[DuplexMemoryProposal, ...]
-    resolutions: tuple["DuplexMemoryResolution", ...] = ()
+    resolutions: tuple[DuplexMemoryResolution, ...] = ()
     reconciled: bool = False
 
 

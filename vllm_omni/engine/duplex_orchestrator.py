@@ -393,6 +393,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             if closing_session_ids:
                 self.session_manager.defer_request_cleanups(closing_session_ids)
             raise
+        self.session_manager.release_auxiliary_permits(cleanup_ids)
         if closing_session_ids:
             self.session_manager.finalize_closed_sessions(closing_session_ids)
         for request_id in cleanup_ids:

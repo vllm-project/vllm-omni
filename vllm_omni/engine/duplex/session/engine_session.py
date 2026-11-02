@@ -45,6 +45,7 @@ from vllm_omni.engine.duplex.memory_types import (
     DuplexMemoryCardBatch,
     DuplexMemoryProposalBatch,
 )
+from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudget, DuplexAuxiliaryBudgetLimits
 from vllm_omni.engine.duplex.session.context_ledger import DuplexContextLedger
 from vllm_omni.engine.duplex.session.context_view import DuplexHistoryView
 from vllm_omni.engine.duplex.session.context_view import render_history_view as render_context_view
@@ -258,6 +259,8 @@ class DuplexEngineSession:
     _context_ledger: DuplexContextLedger = field(default_factory=DuplexContextLedger, repr=False)
     _memory_suppression: DuplexMemorySuppression = field(default_factory=DuplexMemorySuppression, repr=False)
     _memory_context: DuplexMemoryContextState | None = field(default=None, repr=False)
+    _memory_compute_budget: DuplexAuxiliaryBudget | None = field(default=None, repr=False)
+    _memory_compute_limits: DuplexAuxiliaryBudgetLimits | None = field(default=None, repr=False)
     model_state: DuplexModelSessionState | None = field(default=None, repr=False)
     projector: RealtimeProjectionState | None = field(default=None, repr=False)
     created_monotonic: float = field(default_factory=time.monotonic)
@@ -542,6 +545,23 @@ class DuplexEngineSession:
     def memory_suppression(self) -> DuplexMemorySuppression:
         """Pending-correction eligibility, preserved with this live session."""
         return self._memory_suppression
+
+    def context_compute_budget(self, limits: DuplexAuxiliaryBudgetLimits) -> DuplexAuxiliaryBudget:
+        """Retain one account across live leases; never reset spent history."""
+        if not isinstance(limits, DuplexAuxiliaryBudgetLimits):
+            raise ValueError("invalid_auxiliary_budget_limits")
+        if self._memory_compute_budget is None:
+            if self.state != DuplexSessionState.OPEN:
+                raise ValueError("closed_session_auxiliary_budget")
+            self._memory_compute_budget = DuplexAuxiliaryBudget(limits, now=self._clock())
+            self._memory_compute_limits = limits
+        elif limits != self._memory_compute_limits:
+            raise ValueError("auxiliary_budget_limits_are_session_fixed")
+        return self._memory_compute_budget
+
+    def note_auxiliary_activity(self) -> None:
+        if self._memory_compute_budget is not None:
+            self._memory_compute_budget.note_activity(now=self._clock())
 
     def capture_memory_context(
         self, *, max_sources: int = 8, max_chars: int = 8192, excluded_item_ids: frozenset[str] = frozenset()
@@ -2145,6 +2165,8 @@ class DuplexEngineSession:
             self.state = DuplexSessionState.CLOSING
 
     def close(self) -> None:
+        if self._memory_compute_budget is not None:
+            self._memory_compute_budget.close(now=self._clock())
         self._log_response_aggregator()
         if self.perf is not None:
             self.perf.close_all()

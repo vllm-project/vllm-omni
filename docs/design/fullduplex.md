@@ -452,9 +452,16 @@ finish. Ordinary tail appends stay outside the current horizon, and barriers
 created after its cutoff survive completion. A pass missing confirmation stays
 blocked and parks until a relevant rewrite or explicit owner rescheduling.
 These checks authorize declared coverage, not the semantic correctness of a
-model's declaration. Shared compute budgets and a stage's final prompt consumer
-remain separate integrations; the L1 view policy below does not enable memory
-extraction.
+model's declaration. Optional context compute accounting charges measured text
+token IDs and reserved generation at dispatch, including failed or cancelled
+submissions. The session retains its account across live leases. Pre-dispatch
+failure refunds once; resource deferral does not spend retries. Manager-local
+private admission is released only for request IDs whose cleanup succeeded;
+failed cleanup retains the permit for teardown retry. Waiting work wakes through
+the existing mailbox and stops with its session. These internal limits are fixed
+for the session lifetime and default to disabled. Shared L2/L3 policy selection,
+Qwen deployment configuration and final prompt consumption remain separate
+integrations; the L1 view policy below does not enable memory extraction.
 
 Qwen's memory codec renders captured text as quoted JSON data with local
 evidence and barrier handles. Its strict output schema accepts upsert/retract

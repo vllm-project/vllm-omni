@@ -184,7 +184,8 @@ def test_qwen_live_memory_hooks_remain_disabled():
 
 
 @pytest.mark.asyncio
-async def test_request_round_trip_uses_only_private_stage_zero_and_owner_admission(qwen_processor, mocker):
+@pytest.mark.parametrize("metered", [False, True])
+async def test_request_round_trip_uses_only_private_stage_zero_and_owner_admission(qwen_processor, mocker, metered):
     from tests.engine.duplex.test_session_auxiliary import auxiliary_submissions, wait_until
     from tests.engine.duplex.test_session_runner import close_harness, open_harness
     from vllm_omni.engine.duplex.commands import Heartbeat
@@ -192,6 +193,7 @@ async def test_request_round_trip_uses_only_private_stage_zero_and_owner_admissi
     from vllm_omni.engine.duplex.events import SessionCreated, SessionHeartbeatAck, SessionUpdated
     from vllm_omni.engine.duplex.memory_types import DuplexContextAuxiliaryPolicy
     from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryRequest
+    from vllm_omni.engine.duplex.session.auxiliary_budget import DuplexAuxiliaryBudgetLimits
 
     h = await open_harness(auto_response=False, stage_count=3)
     try:
@@ -199,7 +201,10 @@ async def test_request_round_trip_uses_only_private_stage_zero_and_owner_admissi
         decoded: list[DuplexAuxiliaryRequest] = []
         plugin = h.runner.plugin
         mocker.patch.object(plugin, "supports_context_auxiliary_requests", True)
-        mocker.patch.object(plugin, "context_auxiliary_policy", return_value=DuplexContextAuxiliaryPolicy())
+        compute = DuplexAuxiliaryBudgetLimits(idle_s=0, cooldown_s=0) if metered else None
+        mocker.patch.object(
+            plugin, "context_auxiliary_policy", return_value=DuplexContextAuxiliaryPolicy(compute_budget=compute)
+        )
 
         async def prepare(*, context, runtime_config):
             if prepared:
@@ -238,5 +243,11 @@ async def test_request_round_trip_uses_only_private_stage_zero_and_owner_admissi
         ]
         assert len(auxiliary_submissions(h)) == 1
         assert all(s.context.stage_id == 0 for s in h.port.submissions)
+        if metered:
+            assert h.session.context_compute_budget(compute).usage(now=h.manager._clock()) == (
+                len(prepared[0].prompt["prompt_token_ids"]),
+                512,
+            )
+            assert not h.manager._auxiliary_request_permits
     finally:
         await close_harness(h)
