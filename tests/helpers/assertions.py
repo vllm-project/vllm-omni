@@ -701,7 +701,9 @@ def _assert_preset_voice_gender_from_audio(
     if expected_gender is None:
         return
     estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
-    print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")  # codeql[py/clear-text-logging-sensitive-data]: test-only diagnostic output
+    print(
+        f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}"
+    )  # codeql[py/clear-text-logging-sensitive-data]: test-only diagnostic output
     if estimated_gender != "unknown":
         assert estimated_gender == expected_gender, (
             f"{voice_name!r} is expected {expected_gender}, but {GENDER_MISMATCH_MESSAGE} {estimated_gender!r}"
