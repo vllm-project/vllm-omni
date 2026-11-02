@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
-
-import re
 
 import pytest
 import torch
