@@ -419,6 +419,30 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return free
 
     @classmethod
+    def host_registration_support(cls) -> tuple[bool, bool]:
+        from vllm_omni.platforms.cuda.host_registration import host_registration_support
+
+        return host_registration_support()
+
+    @classmethod
+    def register_host_range(cls, address: int, length: int, *, read_only: bool) -> None:
+        from vllm_omni.platforms.cuda.host_registration import register_host_range
+
+        register_host_range(address, length, read_only=read_only)
+
+    @classmethod
+    def unregister_host_range(cls, address: int) -> None:
+        from vllm_omni.platforms.cuda.host_registration import unregister_host_range
+
+        unregister_host_range(address)
+
+    @classmethod
+    def host_range_is_pinned(cls, address: int) -> bool:
+        from vllm_omni.platforms.cuda.host_registration import host_range_is_pinned
+
+        return host_range_is_pinned(address)
+
+    @classmethod
     def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
         free, total = torch.cuda.mem_get_info(device)
         return free, total

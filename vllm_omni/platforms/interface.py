@@ -21,6 +21,14 @@ if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 
 
+class HostRegistrationFailure(RuntimeError):  # noqa: N818 - name fixed by the platform registration contract
+    """Raised when a host range cannot be registered or released.
+
+    A registration failure is a capability miss, not a configuration error:
+    callers route the affected offload units through the staging path instead.
+    """
+
+
 class OmniPlatformEnum(Enum):
     """Enum for supported Omni platforms."""
 
@@ -346,6 +354,39 @@ class OmniPlatform(Platform):
     @classmethod
     def supports_cpu_offload(cls) -> bool:
         return True
+
+    # ── Host-mapping registration for the unified weight stack ──
+
+    @classmethod
+    def host_registration_support(cls) -> tuple[bool, bool]:
+        """Return ``(writable, read_only)`` host-registration support.
+
+        ``writable`` covers private host storage and rank shards, and
+        ``read_only`` covers shared mappings that are sealed before
+        registration. Platforms that cannot register existing host ranges
+        report no support, and callers use the staging path instead.
+        """
+        return False, False
+
+    @classmethod
+    def register_host_range(cls, address: int, length: int, *, read_only: bool) -> None:
+        """Register an existing, page-aligned host range with the driver.
+
+        ``address`` and ``length`` must already be page-aligned and contained
+        in one host mapping. Raise :class:`HostRegistrationFailure` when the
+        registration fails.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    def unregister_host_range(cls, address: int) -> None:
+        """Release a range registered by :meth:`register_host_range`."""
+        raise NotImplementedError
+
+    @classmethod
+    def host_range_is_pinned(cls, address: int) -> bool:
+        """Whether the driver reports the host range at ``address`` as pinned."""
+        return False
 
     @classmethod
     def supports_float64(cls) -> bool:
