@@ -5,6 +5,7 @@
 
 import pytest
 from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 
 from tests.core.sched.test_generation_scheduler_atomic_chunk import (
@@ -81,6 +82,66 @@ def test_v1_wait_uses_overridden_readiness_without_receiver(monkeypatch):
     s._process_v1_pending_omni_inputs()
     assert not s._generation_defer_batch
     assert s._generation_batch_deadline is None
+
+
+@pytest.mark.parametrize("release", ["timeout", "target"])
+def test_custom_readiness_defers_upstream_fallback_without_connector(monkeypatch, mocker, release):
+    s, clock = scheduler(monkeypatch)
+    s.chunk_transfer_adapter = None
+    ready = {"0"}
+    monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready.copy())
+    allocate = mocker.spy(s.kv_cache_manager, "allocate_slots")
+    budgets = []
+
+    def upstream(self, throttle_prefills=False):
+        # The real upstream scheduler uses this budget for allocation; pin the
+        # boundary so a readiness decision alone cannot falsely pass the test.
+        budgets.append(self.max_num_scheduled_tokens)
+        assert self.max_num_scheduled_tokens == 0
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {"finished"}
+        return output
+
+    monkeypatch.setattr(VLLMScheduler, "schedule", upstream)
+    payload = s.requests["0"].additional_information = {"audio": [1, 2]}
+    assert s.schedule().finished_req_ids == {"finished"}
+    clock[0] += 0.006
+    assert not s.schedule().num_scheduled_tokens
+    assert budgets == [0, 0]
+    allocate.assert_not_called()
+    assert s.max_num_scheduled_tokens == 32
+    assert s.requests["0"].additional_information is payload
+    assert s.requests["0"].num_computed_tokens == s.requests["0"].num_in_flight_tokens == 0
+    assert list(s.waiting) == [s.requests["0"]]
+    if release == "timeout":
+        clock[0] += 0.006
+        expected = {"0": 8}
+    else:
+        for i in range(1, 4):
+            s.waiting.add_request(s.requests[str(i)])
+            ready.add(str(i))
+        expected = {str(i): 8 for i in range(4)}
+    assert s.schedule().num_scheduled_tokens == expected
+    assert s._generation_batch_deadline is None
+    assert s.max_num_scheduled_tokens == 32
+
+
+def test_custom_readiness_fallback_restores_budget_and_queues_on_failure(monkeypatch, mocker):
+    s, _ = scheduler(monkeypatch)
+    s.chunk_transfer_adapter = None
+    monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: {"0"})
+    restore = mocker.spy(s, "_restore_omni_wait_queues")
+
+    def upstream(self, throttle_prefills=False):
+        assert self.max_num_scheduled_tokens == 0
+        raise RuntimeError("upstream failed")
+
+    monkeypatch.setattr(VLLMScheduler, "schedule", upstream)
+    with pytest.raises(RuntimeError, match="upstream failed"):
+        s.schedule()
+    assert s.max_num_scheduled_tokens == 32
+    restore.assert_called_once()
+    assert list(s.waiting) == [s.requests["0"]]
 
 
 def test_v1_cancelled_request_is_not_restored(monkeypatch):
