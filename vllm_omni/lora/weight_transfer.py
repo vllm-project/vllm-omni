@@ -47,6 +47,8 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
     """
 
     update_info_cls = MergedLoRAIPCUpdateInfo
+    supports_draft_weight_update = False
+    model: torch.nn.Module
     lora_manager: DiffusionLoRAManager
     cpu_group: torch.distributed.ProcessGroup | None = None
 
@@ -146,11 +148,9 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
             self.reset_weight_update_target()
 
     def shutdown(self) -> None:
-        """Release staged tensors and pristine weights before model teardown."""
+        """Disconnect the trainer while retaining the live merged policy."""
         if hasattr(self, "_staged"):
             self._staged.tensors.clear()
-        if hasattr(self, "lora_manager"):
-            self.lora_manager.close()
         super().shutdown()
 
 

@@ -586,7 +586,7 @@ class DiffusionLoRAManager:
                 device="cpu",  # consistent w/ vllm's behavior
                 dtype=self.dtype,
                 model_vocab_size=None,
-                weights_mapper=getattr(self.pipeline, "hf_to_vllm_mapper", None),
+                weights_mapper=None,
             )
         else:
             lora_model, peft_helper = loaded
@@ -925,6 +925,47 @@ class DiffusionLoRAManager:
         matches_scale = self._adapter_scales.get(adapter_id) == rounded_scale
         return is_active and matches_scale
 
+    def _validate_merged_factor_shapes(
+        self,
+        layer: BaseLayerWithLoRA,
+        weights: LoRALayerWeights | PackedLoRALayerWeights,
+        slice_index: int | None = None,
+    ) -> None:
+        """Reject malformed global factors before slot copying can pad them."""
+        if self.lora_application != "merged":
+            return
+        base = layer.base_layer
+        if isinstance(base, QKVParallelLinear):
+            output_sizes = [
+                base.total_num_heads * base.head_size,
+                base.total_num_kv_heads * base.head_size,
+                base.total_num_kv_heads * base.v_head_size,
+            ]
+        elif isinstance(base, MergedColumnParallelLinear):
+            output_sizes = base.output_sizes
+        else:
+            output_sizes = [base.output_size]
+        if isinstance(weights, PackedLoRALayerWeights):
+            factors = list(zip(weights.lora_a, weights.lora_b))
+            if len(factors) != len(output_sizes):
+                raise ValueError("LoRA factor shapes do not match packed output slices")
+        else:
+            factors = [(weights.lora_a, weights.lora_b)]
+            output_sizes = [sum(output_sizes) if slice_index is None else output_sizes[slice_index]]
+        for (a, b), rows in zip(factors, output_sizes):
+            if a is None and b is None:
+                continue
+            if (
+                a is None
+                or b is None
+                or a.ndim != 2
+                or b.ndim != 2
+                or a.shape[1] != base.input_size
+                or b.shape[0] != rows
+                or a.shape[0] != b.shape[1]
+            ):
+                raise ValueError(f"LoRA factor shapes require A[rank, {base.input_size}] and B[{rows}, rank]")
+
     def _bind_adapter_weights(self, lora_model: LoRAModel, scale: float) -> None:
         binding_validator = getattr(self.pipeline, "_validate_diffusion_lora_binding", None)
         # Track successful bindings for generic and model-specific validation.
@@ -941,6 +982,7 @@ class DiffusionLoRAManager:
         for full_module_name, lora_layer in self._lora_modules.items():
             lora_weights = self._get_lora_weights(lora_model, full_module_name)
             if self.lora_application == "merged" and lora_weights is not None:
+                self._validate_merged_factor_shapes(lora_layer, lora_weights)
                 scaling = (
                     lora_weights.scaling
                     if isinstance(lora_weights, PackedLoRALayerWeights)
@@ -984,11 +1026,12 @@ class DiffusionLoRAManager:
 
                     lora_a_list: list[torch.Tensor | None] = []
                     lora_b_list: list[torch.Tensor | None] = []
-                    for sub_lora in sub_loras:
+                    for slice_index, sub_lora in enumerate(sub_loras):
                         if sub_lora is None:
                             lora_a_list.append(None)
                             lora_b_list.append(None)
                             continue
+                        self._validate_merged_factor_shapes(lora_layer, sub_lora, slice_index)
                         lora_a_list.append(sub_lora.lora_a)
                         lora_b_list.append(sub_lora.lora_b * binding_scale)
 

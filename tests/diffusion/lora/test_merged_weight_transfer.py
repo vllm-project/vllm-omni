@@ -99,3 +99,23 @@ def test_duplicate_chunks_abort_without_mutating_policy(pipeline, monkeypatch):
         engine.update_weights(payload)
     assert not engine._staged.tensors
     torch.testing.assert_close(model.transformer.gate_up.weight, base, rtol=0, atol=0)
+
+
+def test_trainer_disconnect_preserves_policy_and_allows_another_session(pipeline, monkeypatch):
+    model, _, _ = pipeline
+    engine = _engine(model, monkeypatch)
+    request = _request()
+    engine.lora_manager.merge_adapter(request)
+    previous = model.transformer.gate_up.weight.detach().clone()
+
+    def receive(receiver, info):
+        receiver.model.load_weights((name, request.lora_tensors[name]) for name in info.names)
+
+    monkeypatch.setattr(IPCWeightTransferEngine, "receive_weights", receive)
+    engine.shutdown()
+    torch.testing.assert_close(model.transformer.gate_up.weight, previous, rtol=0, atol=0)
+    assert engine.lora_manager.list_adapters() == [1]
+    engine.start_weight_update()
+    engine.update_weights(_payload(request, list(request.lora_tensors)))
+    engine.finish_weight_update()
+    torch.testing.assert_close(model.transformer.gate_up.weight, previous, rtol=0, atol=0)

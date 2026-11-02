@@ -88,6 +88,25 @@ def test_invalid_replacement_preserves_policy_and_identity(pipeline):
         manager.add_adapter(_request())
 
 
+@pytest.mark.parametrize("factor", ["lora_A", "lora_B"])
+def test_undersized_factors_preserve_previous_policy(pipeline, factor):
+    model, _, _ = pipeline
+    manager = DiffusionLoRAManager(model, torch.device("cpu"), torch.bfloat16, lora_application="merged")
+    manager.merge_adapter(_request())
+    layer = model.transformer.gate_up
+    previous = layer.weight.detach().clone()
+    pointer = layer.weight.data_ptr()
+    broken = _request(2)
+    name = f"base_model.model.transformer.gate.{factor}.weight"
+    tensor = broken.lora_tensors[name]
+    broken.lora_tensors[name] = tensor[:, :-1] if factor == "lora_A" else tensor[:-1, :]
+    with pytest.raises(ValueError, match="LoRA factor shapes"):
+        manager.merge_adapter(broken)
+    torch.testing.assert_close(layer.weight, previous, rtol=0, atol=0)
+    assert layer.weight.data_ptr() == pointer
+    assert manager.list_adapters() == [1]
+
+
 def test_merged_config_reaches_stage_overrides():
     from vllm_omni.config.stage_config import build_stage_runtime_overrides
 

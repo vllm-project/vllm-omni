@@ -1472,7 +1472,10 @@ class OmniDiffusionConfig:
                 raise ValueError("Merged LoRA does not support inference weight offloading")
             if self.is_moe:
                 raise ValueError("Merged LoRA does not support MoE adapters")
-            if self.weight_transfer_config is not None and self.weight_transfer_config.get("backend") != "omni_lora_ipc":
+            if (
+                self.weight_transfer_config is not None
+                and self.weight_transfer_config.get("backend") != "omni_lora_ipc"
+            ):
                 raise ValueError("Merged LoRA weight updates require backend='omni_lora_ipc'")
         elif self.weight_transfer_config is not None and self.weight_transfer_config.get("backend") == "omni_lora_ipc":
             raise ValueError("omni_lora_ipc requires lora_application='merged'")
