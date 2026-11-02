@@ -1668,6 +1668,49 @@ class TestTTSMethods:
 
         assert exc_info.value.retryable is False
 
+    @pytest.mark.asyncio
+    async def test_audio_synthesis_error_flag_fails_batch_item_and_stream(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ) -> None:
+        from vllm_omni.entrypoints.openai.protocol.audio import (
+            BatchSpeechRequest,
+            SpeechBatchItem,
+        )
+
+        async def mock_generate():
+            yield create_mock_audio_output_for_test()
+
+        mocker.patch.object(
+            speech_server,
+            "_prepare_speech_generation",
+            new=mocker.AsyncMock(side_effect=lambda *a, **k: ("speech-synth-err", mock_generate(), {})),
+        )
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(speech_server, "_validate_tts_request", return_value=None)
+        speech_server._batch_max_items = 32
+
+        adapter = mocker.MagicMock()
+        adapter.validates_generation = False
+        adapter.collect_response_metadata = lambda _audio_output, collect: collect.__setitem__(
+            "audio_synthesis_error", True
+        )
+        mocker.patch.object(speech_server, "_get_tts_adapter", return_value=adapter)
+
+        batch_resp = await speech_server.create_speech_batch(BatchSpeechRequest(items=[SpeechBatchItem(input="Hello")]))
+        assert batch_resp.results[0].status == "error"
+        assert batch_resp.failed == 1
+        assert batch_resp.succeeded == 0
+
+        with pytest.raises(TTSGenerationError, match="failed to synthesize audio"):
+            async for _ in speech_server._generate_audio_stream(
+                generator=mock_generate(),
+                request_id="speech-stream-synth-err",
+                response_format="pcm",
+            ):
+                pass
+
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
         mock_engine_client = mocker.MagicMock()
