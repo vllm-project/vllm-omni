@@ -223,6 +223,13 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
         self._warn_unexposed_stage_hooks(model)
+        self._install_bucketed_encoders(model)
+
+    def _install_bucketed_encoders(self, model: Any) -> None:
+        """Enable length bucketing + graph pooling when the env asks for it."""
+        from vllm_omni.worker.bucketed_encoder import install_bucketed_encoders
+
+        install_bucketed_encoders(model, vllm_config=self.vllm_config)
 
     # Read on the model this runner holds. A multi-stage wrapper that builds its
     # stage module as a child must re-export them, or the runner silently takes
