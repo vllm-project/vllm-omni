@@ -38,7 +38,7 @@ text-to-video (T2V).
 ## Prompt format
 
 PAN 2 needs a structured prompt. It is trained on the captions written by its
-[reasoning backbone](https://huggingface.co/IFM/PAN2#reasoning-backbone), and
+[reasoning backbone](https://huggingface.co/IFM/PAN2#prompting-guidance), and
 expects the prompt as that caption serialized to
 **compact one-line JSON** (`json.dumps(caption, ensure_ascii=False,
 separators=(",", ":"))`). A plain one-line prompt produces unusable video. The
