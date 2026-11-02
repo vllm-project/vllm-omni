@@ -574,6 +574,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 logger.warning("AR generation batch waiting ignored: requires input readiness support")
                 self._generation_max_wait_s = 0.0
 
+    def _get_ar_coalescing_ready_request_ids(self) -> set[str]:
+        """Count candidates, leaving allocation and execution limits upstream."""
+        ready = self._get_coalescing_ready_request_ids()
+        if ready is None:
+            return set()
+        ready.update(
+            request.request_id
+            for request in self.running
+            if request.status == RequestStatus.RUNNING
+            and request.num_tokens_with_spec + request.num_output_placeholders > request.num_computed_tokens
+        )
+        for queue in (self.waiting, self.kv_holding_waiting):
+            ready.update(
+                request.request_id
+                for request in queue
+                if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            )
+        return {
+            req_id
+            for req_id in ready
+            if (request := self.requests.get(req_id)) is not None
+            and request.status in (RequestStatus.RUNNING, RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and not request.is_finished()
+        }
+
     def _should_defer_ar_generation(self, ready_ids: set[str]) -> bool:
         """Bound batch waiting without restarting the deadline as inputs arrive."""
         max_wait = getattr(self, "_generation_max_wait_s", 0.0)

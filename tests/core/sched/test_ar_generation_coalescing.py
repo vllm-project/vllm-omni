@@ -4,10 +4,13 @@
 
 import pytest
 from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.request import RequestStatus
 
 from tests.core.sched.test_generation_scheduler_atomic_chunk import FakeAdapter, _make_request
 from tests.core.sched.test_generation_scheduler_init import _config
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, VLLMScheduler
 from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -22,6 +25,14 @@ def scheduler(*, native=False, extras=None, population=4):
     s.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True) if native else None
     s._pause_state = PauseState.UNPAUSED
     s.requests = {str(i): _make_request(str(i), 8) for i in range(population)}
+    s.running = []
+    s.policy = SchedulingPolicy.FCFS
+    s.waiting = create_request_queue(s.policy)
+    s.kv_holding_waiting = create_request_queue(s.policy)
+    s.deferred_waiting = set()
+    s.use_v2_model_runner = native
+    s.max_num_active_reqs = 128
+    s.max_num_scheduled_tokens = 128
     s._init_prefill_admission_policy()
     return s
 
@@ -97,3 +108,81 @@ def test_deadline_does_not_restart_on_partial_arrivals(monkeypatch):
 def test_batch_target_policy(always_wait, population, ready, wait):
     s = scheduler(extras=knobs(generation_always_wait_target_batch=always_wait), population=population)
     assert s._should_defer_ar_generation({str(i) for i in range(ready)}) is wait
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_candidates_combine_input_prefill_and_continuation_without_duplicates(native):
+    s = scheduler(native=native, extras=knobs(), population=7)
+    receiver = s.input_coordinator if native else s.chunk_transfer_adapter
+    receiver.requests_with_ready_chunks.update({"0", "1", "4", "5", "gone"})
+    # The same stream appears in the input set and waiting queue.
+    s.waiting.add_request(s.requests["0"])
+    for i in (1, 2, 3):
+        request = s.requests[str(i)]
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = request.num_prompt_tokens
+        s.running.append(request)
+    # A normal continuation and an async continuation both have token work.
+    s.requests["1"].append_output_token_ids(1)
+    s.requests["2"].num_output_placeholders = 1
+    s.requests["2"].num_in_flight_tokens = 1
+    # Running request 3 has no work; 4 is parked; 5 is finished.
+    s.requests["4"].status = RequestStatus.WAITING_FOR_CHUNK
+    s.requests["5"].status = RequestStatus.FINISHED_ABORTED
+    s.requests["6"].status = RequestStatus.PREEMPTED
+    s.kv_holding_waiting.add_request(s.requests["6"])
+    assert s._get_ar_coalescing_ready_request_ids() == {"0", "1", "2", "6"}
+    assert receiver.requests_with_ready_chunks == {"0", "1", "4", "5", "gone"}
+
+
+def prepare_schedule_boundary(monkeypatch, s, *, fail=False):
+    """Keep the real AR gate; isolate upstream allocation and output packaging."""
+    for name in (
+        "_process_pending_omni_inputs",
+        "_resync_streaming_input_counter",
+        "_postprocess_omni_schedule_output",
+    ):
+        monkeypatch.setattr(s, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(s, "get_finished_requests_needing_kv_transfer", lambda: {})
+    monkeypatch.setattr(s, "_wrap_omni_scheduler_output", lambda output, **kwargs: output)
+    budgets = []
+
+    def upstream_schedule(self, throttle_prefills=False):
+        budgets.append(self.max_num_scheduled_tokens)
+        if fail:
+            raise RuntimeError("allocation failed")
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {"finished"}
+        if self.max_num_scheduled_tokens:
+            output.num_scheduled_tokens = {"0": 8}
+            output.total_num_scheduled_tokens = 8
+        return output
+
+    monkeypatch.setattr(VLLMScheduler, "schedule", upstream_schedule)
+    return budgets
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_schedule_defers_before_allocation_and_preserves_control_output(monkeypatch, native):
+    clock = [10.0]
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
+    s = scheduler(native=native, extras=knobs())
+    s.waiting.add_request(s.requests["0"])
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    assert s.schedule().finished_req_ids == {"finished"}
+    assert budgets == [0]
+    assert s.max_num_scheduled_tokens == 128
+    assert s.requests["0"].num_computed_tokens == 0
+    assert list(s.waiting) == [s.requests["0"]]
+    clock[0] += 0.012
+    assert s.schedule().num_scheduled_tokens == {"0": 8}
+    assert budgets == [0, 128]
+
+
+def test_schedule_restores_budget_on_upstream_exception(monkeypatch):
+    s = scheduler(extras=knobs())
+    s.waiting.add_request(s.requests["0"])
+    prepare_schedule_boundary(monkeypatch, s, fail=True)
+    with pytest.raises(RuntimeError, match="allocation failed"):
+        s.schedule()
+    assert s.max_num_scheduled_tokens == 128
