@@ -21,6 +21,8 @@ class _ProfilerServer:
     events: list[tuple[str, dict]] = field(default_factory=list)
     start_status: int = 200
     stop_status: int = 200
+    profile_error_body: str = ""
+    profile_error_content_type: str = "text/plain"
     warmup_status: int = 200
     block_generation: bool = False
     generation_started: asyncio.Event = field(default_factory=asyncio.Event)
@@ -35,7 +37,11 @@ async def profiler_server(unused_tcp_port):
         action = request.path.removeprefix("/").removesuffix("_profile")
         server.events.append((action, await request.json()))
         status = server.start_status if action == "start" else server.stop_status
-        return web.json_response({"status": "SUCCESS", "detail": "private server details"}, status=status)
+        if status >= 400:
+            return web.Response(
+                text=server.profile_error_body, content_type=server.profile_error_content_type, status=status
+            )
+        return web.json_response({"status": "SUCCESS"})
 
     async def generate(request):
         payload = await request.json()
@@ -184,13 +190,28 @@ async def test_warmup_failure_does_not_start_profiler(diffusion_benchmark, profi
 
 
 @pytest.mark.parametrize("action", ["start", "stop"])
-async def test_profiler_http_error_is_reported(diffusion_benchmark, profiler_server, benchmark_args, action):
+@pytest.mark.parametrize(
+    "body, content_type",
+    [
+        ('{"detail": "Stage 2 has no profiler configured"}', "application/json"),
+        ("Stage 2 profiler is unavailable", "text/plain"),
+        ("", "text/plain"),
+    ],
+    ids=["json", "plain-text", "empty"],
+)
+async def test_profiler_http_error_is_reported(
+    diffusion_benchmark, profiler_server, benchmark_args, action, body, content_type
+):
     setattr(profiler_server, action + "_status", 503)
+    profiler_server.profile_error_body = body
+    profiler_server.profile_error_content_type = content_type
 
     with pytest.raises(RuntimeError, match=rf"{action}.*HTTP 503") as error:
         await diffusion_benchmark.benchmark(benchmark_args)
 
-    assert "private server details" not in str(error.value)
+    assert "--profiler-config" in str(error.value)
+    if body:
+        assert body in str(error.value)
     events = [event for event, _ in profiler_server.events]
     assert events == (["warmup", "start"] if action == "start" else ["warmup", "start", "generate", "generate", "stop"])
 

@@ -1296,7 +1296,8 @@ async def _profile_measurement(
                 if response.status >= 400:
                     raise RuntimeError(
                         f"Failed to {action} profiler: HTTP {response.status}. "
-                        "Check the server --profiler-config and selected stage IDs."
+                        "Check the server --profiler-config and selected stage IDs. "
+                        f"Server response: {await response.text()}"
                     )
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             raise RuntimeError(f"Failed to {action} profiler; check server connectivity.") from error

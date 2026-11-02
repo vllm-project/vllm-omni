@@ -125,7 +125,8 @@ The profiler is disabled by default. Stage IDs must be non-negative and
 Profiler control calls are outside the reported benchmark duration. Once the
 profiler has started successfully, the benchmark also attempts to stop it if
 measurement raises an error or is cancelled. A failed profiler control request
-aborts the run with an error rather than reporting successful profiling.
+aborts the run with an error that includes the HTTP status and server response
+body to help diagnose stage or profiler configuration failures.
 Trace artifacts are written by the server to its configured directory. See the
 [profiling guide](../../docs/contributing/profiling.md#4-profiling-online-serving)
 for server configuration and supported profilers.
