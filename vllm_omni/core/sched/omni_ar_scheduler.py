@@ -134,6 +134,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     waiting: RequestQueue
     kv_holding_waiting: RequestQueue
     max_num_active_reqs: int
+    max_num_scheduled_tokens: int
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
@@ -436,6 +437,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self._get_coalescing_ready_request_ids() is None:
                 logger.warning("AR generation batch waiting ignored: requires input readiness support")
                 self._generation_max_wait_s = 0.0
+
+    def _get_ar_coalescing_ready_request_ids(self) -> set[str]:
+        """Count candidates, leaving allocation and execution limits upstream."""
+        ready = self._get_coalescing_ready_request_ids()
+        if ready is None:
+            return set()
+        ready.update(
+            request.request_id
+            for request in self.running
+            if request.status == RequestStatus.RUNNING
+            and request.num_tokens_with_spec + request.num_output_placeholders > request.num_computed_tokens
+        )
+        for queue in (self.waiting, self.kv_holding_waiting):
+            ready.update(
+                request.request_id
+                for request in queue
+                if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            )
+        return {
+            req_id
+            for req_id in ready
+            if (request := self.requests.get(req_id)) is not None
+            and request.status in (RequestStatus.RUNNING, RequestStatus.WAITING, RequestStatus.PREEMPTED)
+            and not request.is_finished()
+        }
 
     def _should_defer_ar_generation(self, ready_ids: set[str]) -> bool:
         """Bound batch waiting without restarting the deadline as inputs arrive."""
@@ -902,12 +928,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
+        defer_generation = False
+        if getattr(self, "_generation_max_wait_s", 0.0) and self._generation_min_batch_size > 1:
+            defer_generation = self._should_defer_ar_generation(self._get_ar_coalescing_ready_request_ids())
         # Talker K-frame guard: a step whose decode spans would be uneven
         # (mixed prefill+decode rows, or a first-step decode joining a
         # steady-state K-step request) must not carry the K-step drafts --
         # the multi-frame loop requires uniform decode spans and the runner
         # refuses the rest.
-        self._drop_talker_drafts_if_prefill_pending()
+        if not defer_generation:
+            self._drop_talker_drafts_if_prefill_pending()
 
         original_wait_queues = None
         if self._should_defer_waiting_admission():
@@ -922,9 +952,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         )
         if reserved_running_slots:
             self.max_num_active_reqs = max(0, original_max_num_active_reqs - reserved_running_slots)
+        original_token_budget = None
+        if defer_generation:
+            # Both runners still process control/completion work on empty
+            # steps. Defer before allocation, never discard a scheduled batch.
+            original_token_budget = self.max_num_scheduled_tokens
+            self.max_num_scheduled_tokens = 0
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            if original_token_budget is not None:
+                self.max_num_scheduled_tokens = original_token_budget
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
