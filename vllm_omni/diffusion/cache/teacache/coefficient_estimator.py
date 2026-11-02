@@ -10,6 +10,7 @@ from vllm.config import LoadConfig
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.cache.teacache.extractors import get_extractor
+from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -26,10 +27,18 @@ class DataCollectionHook(ModelHook):
         super().__init__()
         self.transformer_type = transformer_type
         self.extractor_fn = get_extractor(transformer_type)
-        self.current_trajectory: list[tuple[np.ndarray, np.ndarray]] = []
+        # One hook belongs to one local transformer/PP stage. Never concatenate
+        # CFG branches: the fitter compares adjacent entries in each trajectory.
+        self.current_trajectories: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
 
     def new_forward(self, module: torch.nn.Module, *args: Any, **kwargs: Any) -> Any:
         ctx = self.extractor_fn(module, *args, **kwargs)
+        branch = TeaCacheHook._explicit_cfg_branch(module, ctx)
+        if branch is None:
+            if self.transformer_type == "WanTransformer3DModel" and getattr(module, "do_true_cfg", False):
+                raise ValueError("Wan coefficient collection with CFG requires an explicit cfg_branch.")
+            # Preserve the single trajectory for legacy, unstamped callers.
+            branch = "positive"
         # NOTE: We upcast to float32 to also handle bfloat16.
         modulated_input_cpu = ctx.modulated_input.detach().float().cpu().numpy()
 
@@ -39,14 +48,14 @@ class DataCollectionHook(ModelHook):
             ctx.encoder_hidden_states = outputs[1]
 
         model_output_cpu = ctx.hidden_states.detach().float().cpu().numpy()
-        self.current_trajectory.append((modulated_input_cpu, model_output_cpu))
+        self.current_trajectories.setdefault(branch, []).append((modulated_input_cpu, model_output_cpu))
         return ctx.postprocess(ctx.hidden_states)
 
     def start_collection(self):
-        self.current_trajectory = []
+        self.current_trajectories = {}
 
-    def stop_collection(self) -> list[tuple[np.ndarray, np.ndarray]]:
-        return list(self.current_trajectory)
+    def stop_collection(self) -> list[list[tuple[np.ndarray, np.ndarray]]]:
+        return [list(trajectory) for trajectory in self.current_trajectories.values()]
 
 
 class DefaultAdapter:
@@ -134,7 +143,15 @@ class ZImageAdapter(DefaultAdapter):
     model_class_name = "ZImagePipeline"
 
 
+class WanAdapter(DefaultAdapter):
+    """Wan native loader; each local transformer hook collects CFG branches separately."""
+
+    model_class_name = "WanPipeline"
+    uses_tf_config = True
+
+
 _MODEL_ADAPTERS: dict[str, type[DefaultAdapter]] = {
+    "Wan": WanAdapter,
     "Bagel": BagelAdapter,
     "StableAudio": StableAudioAdapter,
     "Flux2": Flux2Adapter,
@@ -215,9 +232,7 @@ class TeaCacheCoefficientEstimator:
 
         with torch.no_grad():
             self.pipeline.forward(DiffusionRequestBatch(requests=[req]))
-        trajectory = self.hook.stop_collection()
-        if trajectory:
-            self.collected_data.append(trajectory)
+        self.collected_data.extend(self.hook.stop_collection())
         torch.accelerator.empty_cache()
 
     def estimate(self, poly_order: int = 4) -> list[float]:
