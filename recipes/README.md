@@ -93,7 +93,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`NVIDIA/SANA-Video-2B.md`](./NVIDIA/SANA-Video-2B.md) | Native and Diffusers-adapter 480p/720p T2V+I2V | 1x RTX 5090 32GB |
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
-| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
+| [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) or 1x RTX 5090 32GB with layerwise offload |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
 | [`SandAI/MAGI-2-preview-NPU.md`](./SandAI/MAGI-2-preview-NPU.md) | Online Preview-stage T2VA at 272p | 4x NPU, 112 GiB each; TP1/SP4 eager |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
