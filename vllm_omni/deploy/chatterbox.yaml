@@ -6,7 +6,8 @@
 # The one Original profile: 64 guided requests at once (128 stage 0
 # sequences), what one H100 (79.6 GiB) fits with the memory arithmetic
 # below; the H100 recipe measures it from 8 to 64 clients. TUNE PER GPU: on
-# a smaller or slower card lower max_num_seqs (and the fractions with it).
+# a smaller or slower card lower max_num_seqs and recompute the fractions
+# from that card's memory with the same arithmetic.
 pipeline: chatterbox
 model_runner: v2
 async_chunk: true

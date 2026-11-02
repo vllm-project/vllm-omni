@@ -186,7 +186,8 @@ H100 baselines in that file, which are the nightly matrix below.
   bounds the flow's and HiFT's activations for 64 utterances. The nightly
   matrix below ran with these fractions: 159,248 KV-cache tokens for Turbo
   and 297,184 for Original at startup. On a smaller card, lower
-  `max_num_seqs` and the fractions with it.
+  `max_num_seqs` and recompute the fractions from that card's memory: a
+  fraction is of the card, so the same slots take a larger one there.
 - Key flags: `conditioning_device` under stage 0 `additional_config`
   places the reference encoders: on the stages' GPU (`cuda:0`) in every CUDA
   profile, and on the CPU on NPU, XPU and MUSA through each profile's
