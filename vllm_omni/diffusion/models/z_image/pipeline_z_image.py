@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import inspect
 import json
 import os
@@ -49,6 +50,104 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+_COMPILED_FORWARD_MARKER = "_vllm_omni_forward_compiled"
+_PREPARED_IMAGE_CACHE_SIZE = 1
+
+
+def _image_encoder_cache_key(
+    image: PIL.Image.Image,
+    height: int,
+    width: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[bytes, tuple[int, int], int, int, torch.dtype, str]:
+    """Identify the pixels consumed by ``VaeImageProcessor.preprocess``."""
+    rgb_image = image if image.mode == "RGB" else image.convert("RGB")
+    digest = hashlib.sha256(rgb_image.tobytes()).digest()
+    return digest, rgb_image.size, height, width, dtype, str(device)
+
+
+def _compile_forward_once(module: nn.Module, *, mode: str) -> None:
+    if getattr(module, _COMPILED_FORWARD_MARKER, False):
+        return
+    module.forward = torch.compile(
+        module.forward,
+        mode=mode,
+        fullgraph=False,
+        dynamic=False,
+    )
+    setattr(module, _COMPILED_FORWARD_MARKER, True)
+
+
+def _compile_qwen3_text_base_model(text_encoder: nn.Module) -> bool:
+    """Compile the complete Qwen3 base model to remove per-layer Python dispatch."""
+    if getattr(getattr(text_encoder, "config", None), "model_type", None) != "qwen3":
+        return False
+    base_model = getattr(text_encoder, "model", None)
+    if not isinstance(base_model, nn.Module):
+        return False
+    _compile_forward_once(base_model, mode="default")
+    return True
+
+
+def _get_or_prepare_caption_context(
+    transformer: nn.Module,
+    cache: dict[bool, tuple],
+    apply_cfg: bool,
+    prompt_embeds: list[torch.Tensor],
+    device: torch.device,
+):
+    if type(transformer) is not ZImageTransformer2DModel:
+        return None
+    caption_context = cache.get(apply_cfg)
+    if caption_context is None:
+        caption_context = transformer.prepare_caption_context(prompt_embeds, device)
+        cache[apply_cfg] = caption_context
+    return caption_context
+
+
+def _can_share_cfg_latent_path(
+    transformer: nn.Module,
+    caption_context: tuple | None,
+    actual_batch_size: int,
+) -> bool:
+    """Whether both CFG branches have an identical pre-caption latent path."""
+    if type(transformer) is not ZImageTransformer2DModel or caption_context is None or actual_batch_size != 1:
+        return False
+    caption_lengths = caption_context[3]
+    return len(caption_lengths) == 2 and caption_lengths[0] == caption_lengths[1]
+
+
+def _apply_step_callback_outputs(
+    callback_outputs: dict[str, Any],
+    latents: torch.Tensor,
+    prompt_embeds: list[torch.Tensor],
+    negative_prompt_embeds: list[torch.Tensor],
+    caption_context_cache: dict[bool, tuple],
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+    conditioning_updated = "prompt_embeds" in callback_outputs or "negative_prompt_embeds" in callback_outputs
+    latents = callback_outputs.pop("latents", latents)
+    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+    if conditioning_updated:
+        caption_context_cache.clear()
+    return latents, prompt_embeds, negative_prompt_embeds
+
+
+def _postprocess_to_pil_via_uint8(
+    images: torch.Tensor,
+    image_processor: VaeImageProcessor,
+) -> list[PIL.Image.Image]:
+    images = image_processor.postprocess(images, output_type="pt")
+    images = images.permute(0, 2, 3, 1).to(
+        dtype=torch.float32,
+        memory_format=torch.contiguous_format,
+    )
+    images = images.mul_(255).round_().to(dtype=torch.uint8).cpu().numpy()
+    if images.shape[-1] == 1:
+        return [PIL.Image.fromarray(image.squeeze(), mode="L") for image in images]
+    return [PIL.Image.fromarray(image) for image in images]
+
 
 def get_post_process_func(
     od_config: OmniDiffusionConfig,
@@ -68,7 +167,9 @@ def get_post_process_func(
     def post_process_func(
         images: torch.Tensor,
     ):
-        return image_processor.postprocess(images)
+        if images.device.type != "cuda":
+            return image_processor.postprocess(images)
+        return _postprocess_to_pil_via_uint8(images, image_processor)
 
     return post_process_func
 
@@ -239,6 +340,24 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         )
 
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
+        self._negative_prompt_cache: dict[tuple[tuple[str, ...], int, str], list[torch.Tensor]] = {}
+        self._prepared_image_cache: dict[tuple, torch.Tensor] = {}
+
+    def _get_or_cache_prepared_image(
+        self,
+        prepared_image: torch.Tensor | None,
+        cache_key: tuple,
+    ) -> torch.Tensor:
+        cached = self._prepared_image_cache.pop(cache_key, None)
+        if cached is not None:
+            self._prepared_image_cache[cache_key] = cached
+            return cached
+        if prepared_image is None:
+            raise ValueError("A prepared image tensor is required when the image cache misses.")
+        self._prepared_image_cache[cache_key] = prepared_image
+        while len(self._prepared_image_cache) > _PREPARED_IMAGE_CACHE_SIZE:
+            self._prepared_image_cache.pop(next(iter(self._prepared_image_cache)))
+        return prepared_image
 
     def encode_prompt(
         self,
@@ -264,12 +383,22 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             else:
                 negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
             assert len(prompt) == len(negative_prompt)
-            negative_prompt_embeds = self._encode_prompt(
-                prompt=negative_prompt,
-                device=device,
-                prompt_embeds=negative_prompt_embeds,
-                max_sequence_length=max_sequence_length,
-            )
+            if negative_prompt_embeds is None:
+                cache_key = (
+                    tuple(negative_prompt),
+                    max_sequence_length,
+                    str(device or self._execution_device),
+                )
+                negative_prompt_embeds = self._negative_prompt_cache.get(cache_key)
+                if negative_prompt_embeds is None:
+                    negative_prompt_embeds = self._encode_prompt(
+                        prompt=negative_prompt,
+                        device=device,
+                        max_sequence_length=max_sequence_length,
+                    )
+                    if len(self._negative_prompt_cache) >= 8:
+                        self._negative_prompt_cache.pop(next(iter(self._negative_prompt_cache)))
+                    self._negative_prompt_cache[cache_key] = negative_prompt_embeds
         else:
             negative_prompt_embeds = []
         return prompt_embeds, negative_prompt_embeds
@@ -466,7 +595,13 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         cfg_normalization = req.sampling_params.cfg_normalize
         cfg_truncation = req.sampling_params.extra_args.get("cfg_truncation", 1.0)
         joint_attention_kwargs: dict[str, Any] | None = None
-        callback_on_step_end: Callable[[int, int, dict], None] | None = None
+        callback_on_step_end: (
+            Callable[
+                [nn.Module, int, torch.Tensor, dict[str, torch.Tensor]],
+                dict[str, Any],
+            ]
+            | None
+        ) = None
         callback_on_step_end_tensor_inputs = ["latents"]
         output_type = req.sampling_params.output_type or "pil"
 
@@ -515,9 +650,24 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 image = image[0]
 
             # Prepare image for VAE encoding using image_processor
+            prepared_image = image
             if not isinstance(image, torch.Tensor):
-                init_image = self.image_processor.preprocess(image, height, width)
-                image = init_image.to(dtype=torch.float32, device=device)
+                if isinstance(image, PIL.Image.Image) and not isinstance(generator, list):
+                    image_cache_key = _image_encoder_cache_key(
+                        image,
+                        height,
+                        width,
+                        prompt_embeds[0].dtype,
+                        device,
+                    )
+                    prepared_image = self._prepared_image_cache.get(image_cache_key)
+                else:
+                    image_cache_key = None
+                if prepared_image is None or not isinstance(prepared_image, torch.Tensor):
+                    init_image = self.image_processor.preprocess(image, height, width)
+                    prepared_image = init_image.to(dtype=torch.float32, device=device)
+                if image_cache_key is not None:
+                    prepared_image = self._get_or_cache_prepared_image(prepared_image, image_cache_key)
 
             # Initialize scheduler kwargs for img2img
             mu = calculate_shift(
@@ -559,7 +709,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                 device,
                 generator,
                 latents,
-                image,
+                prepared_image,
                 latent_timestep,
             )
         else:
@@ -617,6 +767,12 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         if not isinstance(t_norm_list, list):
             t_norm_list = [t_norm_list]
 
+        # Caption features and their two context-refiner blocks are independent
+        # of the latent and timestep. Keep the cache request-local, and only use
+        # it for the native Z-Image transformer: subclasses can inject additional
+        # per-step conditions in their forward methods.
+        caption_context_cache: dict[bool, tuple] = {}
+
         # 6. Denoising loop
         for i, t in enumerate(timesteps):
             if self.interrupt:
@@ -644,14 +800,29 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             latents_typed = latents.to(self.od_config.dtype)
 
             if apply_cfg:
-                repeat_dims = (2,) + (1,) * (latents_typed.ndim - 1)
-                latent_model_input = latents_typed.repeat(*repeat_dims)
                 prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
                 timestep_model_input = timestep.repeat(2)
             else:
-                latent_model_input = latents_typed
                 prompt_embeds_model_input = prompt_embeds
                 timestep_model_input = timestep
+
+            caption_context = _get_or_prepare_caption_context(
+                self.transformer,
+                caption_context_cache,
+                apply_cfg,
+                prompt_embeds_model_input,
+                device,
+            )
+            share_cfg_latent_path = apply_cfg and _can_share_cfg_latent_path(
+                self.transformer,
+                caption_context,
+                actual_batch_size,
+            )
+            if apply_cfg and not share_cfg_latent_path:
+                repeat_dims = (2,) + (1,) * (latents_typed.ndim - 1)
+                latent_model_input = latents_typed.repeat(*repeat_dims)
+            else:
+                latent_model_input = latents_typed
 
             if latent_model_input.ndim == 4:
                 latent_model_input = latent_model_input.unsqueeze(2)
@@ -660,11 +831,21 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
             if getattr(self, "_uses_cudagraph_trees", False):
                 # check Ming-Image
                 torch.compiler.cudagraph_mark_step_begin()
-            model_out_list = self.transformer(
-                latent_model_input_list,
-                timestep_model_input,
-                prompt_embeds_model_input,
-            )[0]
+
+            if caption_context is None:
+                model_out_list = self.transformer(
+                    latent_model_input_list,
+                    timestep_model_input,
+                    prompt_embeds_model_input,
+                )[0]
+            else:
+                model_out_list = self.transformer(
+                    latent_model_input_list,
+                    timestep_model_input,
+                    prompt_embeds_model_input,
+                    caption_context=caption_context,
+                    latent_repeat_count=2 if share_cfg_latent_path else 1,
+                )[0]
 
             if apply_cfg:
                 # Perform CFG
@@ -710,9 +891,13 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
                     callback_kwargs[k] = locals()[k]
                 callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-                latents = callback_outputs.pop("latents", latents)
-                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                latents, prompt_embeds, negative_prompt_embeds = _apply_step_callback_outputs(
+                    callback_outputs,
+                    latents,
+                    prompt_embeds,
+                    negative_prompt_embeds,
+                    caption_context_cache,
+                )
 
         if output_type == "latent":
             image = latents
@@ -735,4 +920,11 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponen
         # bring their own conditioning path.
         if self.text_encoder is not None:
             loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
+            if next(self.text_encoder.parameters()).device.type == "cuda":
+                _compile_qwen3_text_base_model(self.text_encoder)
+        if next(self.vae.parameters()).device.type == "cuda":
+            _compile_forward_once(self.vae.encoder, mode="max-autotune")
+            _compile_forward_once(self.vae.decoder, mode="max-autotune")
+        self._negative_prompt_cache.clear()
+        self._prepared_image_cache.clear()
         return loaded_weights
