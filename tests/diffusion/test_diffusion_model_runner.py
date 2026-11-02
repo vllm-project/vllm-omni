@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -362,14 +363,24 @@ def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_refresh_cache_without_request_or_pipeline_default_warns(caplog, monkeypatch):
-    monkeypatch.setattr(model_runner_module.logger, "handlers", [*model_runner_module.logger.handlers, caplog.handler])
+def test_refresh_cache_without_request_or_pipeline_default_warns(caplog):
+    # vllm_omni loggers are reparented onto the vllm logger, which does not
+    # propagate to root, so the fixture's root handler never sees this warning.
+    # Pin this logger itself: an earlier test on the same xdist worker can leave
+    # an ancestor above WARNING, and then logger.warning() emits nothing.
+    target_logger = model_runner_module.logger
+    target_logger.addHandler(caplog.handler)
+    previous_level = target_logger.level
+    target_logger.setLevel(logging.WARNING)
     cache_backend = _EnabledCacheBackend()
     runner = _make_runner(cache_backend=cache_backend, cache_backend_name="cache_dit")
     req = _make_request()
     req.sampling_params.num_inference_steps = None
-
-    DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+    try:
+        DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(previous_level)
 
     assert cache_backend.refresh_calls == []
     assert "requires num_inference_steps to be passed explicitly" in caplog.text

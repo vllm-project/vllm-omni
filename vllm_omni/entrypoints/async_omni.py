@@ -326,6 +326,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
                     lora_request=lora_request,
+                    trace_headers=trace_headers,
                     first_chunk_submitted=first_chunk_submitted,
                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                 )
@@ -341,6 +342,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                         final_output_stage_ids=final_output_stage_ids,
                         arrival_time=wall_start_ts,
                         lora_request=lora_request,
+                        trace_headers=trace_headers,
                         entry_stage_id=entry_stage_id,
                         **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                     ),
@@ -524,6 +526,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
         lora_request: Any = None,
+        trace_headers: Mapping[str, str] | None = None,
         first_chunk_submitted: asyncio.Future[None] | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> asyncio.Task:
@@ -606,6 +609,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                trace_headers=trace_headers,
                                 resumable=True,
                                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                             )
@@ -623,6 +627,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                 final_output_stage_ids=final_output_stage_ids,
                                 arrival_time=arrival_time,
                                 lora_request=lora_request,
+                                trace_headers=trace_headers,
                                 resumable=True,
                             )
                         )
@@ -652,6 +657,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    trace_headers=trace_headers,
                                     resumable=False,
                                 )
                             )
@@ -666,6 +672,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                                     final_output_stage_ids=final_output_stage_ids,
                                     arrival_time=arrival_time,
                                     lora_request=lora_request,
+                                    trace_headers=trace_headers,
                                     resumable=False,
                                     **({"kv_hints": kv_hints} if kv_hints is not None else {}),
                                 )
@@ -1612,7 +1619,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
 
     async def is_tracing_enabled(self) -> bool:
         """Check if tracing is enabled."""
-        return False
+        return self.engine.tracer_provider is not None
 
     async def notify_kv_transfer_request_rejected(
         self,
