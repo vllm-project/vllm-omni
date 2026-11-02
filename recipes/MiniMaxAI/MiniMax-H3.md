@@ -31,6 +31,19 @@ reference media is still encoded locally.
 
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
+## Optional LiteVAE video decoder
+
+To use the standard non-INT8 H3 Lite decoder, add:
+
+```bash
+--additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
+```
+
+LiteVAE changes the video decoder while preserving the video encoder and audio
+VAE. Omit `video_vae_decoder` when selecting LiteVAE. See the
+[LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for checkpoint
+requirements, decoder selection, and quality review.
+
 ## Prerequisites
 
 The checkpoint requires Hugging Face access approval. Authenticate once;
@@ -1116,6 +1129,9 @@ not supplied by this feature.
 
 ### Latent-tail continuation with global temporal positions (A+B)
 
+To continue a finished job in a separate request, see
+[MiniMax H3 Continuation Across Requests](../../docs/serving/videos_api.md#minimax-h3-continuation-across-requests).
+
 `long_video=true` selects this mode by default for Ref2VA. It can also be selected
 explicitly with `long_video_mode=continuation`. This experimental mode supports
 Ref2VA request execution with uncached denoising (`quality=lossless`); step
@@ -1959,6 +1975,7 @@ reused as they are.
 | `latent_refine_max_tokens_per_rank` | `65536` | Reject larger refine layouts before denoising. Set `0` only after validating a larger deployment. |
 | `latent_upscale` | unset | A default target applied to every request, in the request's own format. A request overrides it, and `false` opts out. |
 | `latent_refine` | unset | A default refine strength applied to every request. A request overrides it, and `false` opts out. |
+| `latent_cache_clips` | `16` | Finished clips whose latents each DiT worker keeps for `continue_from`. `0` disables continuation. |
 
 The `latent_upscale` request value is a multiplier (`2.0`), `false`, or an
 object naming one mode: `{"scale": 2.0}`, `{"width": …, "height": …}` or

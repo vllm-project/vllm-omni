@@ -71,6 +71,7 @@ def test_finish_requests_cleans_input_coordinator_for_finished_ids(
     scheduler.waiting = []
     scheduler.kv_holding_waiting = []
     scheduler.deferred_waiting = set()
+    scheduler._outputs_awaiting_stage_payload = {}
 
     def fake_finish_requests(self, request_ids, finished_status):
         assert request_ids == ["req-a", "req-b"]
@@ -161,6 +162,7 @@ def test_native_oversized_chunk_uses_real_finish_cleanup_and_emits_one_error(
     scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.running = []
     scheduler.deferred_waiting = set()
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.requests = {request.request_id: request, healthy.request_id: healthy}
     if queue_name == "running":
         scheduler.running.append(request)

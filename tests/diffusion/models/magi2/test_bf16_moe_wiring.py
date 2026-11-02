@@ -10,7 +10,7 @@ import torch
 import vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe as moe
 import vllm_omni.diffusion.models.magi2.layers.musa.mh_moe as musa_moe
 from tests.helpers.mark import hardware_marks
-from vllm_omni.diffusion.models.magi2 import fused_moe_kernels
+from vllm_omni.diffusion.models.magi2.layers.cuda import fused_moe_kernels
 from vllm_omni.diffusion.models.magi2.parallel import Magi2ParallelGroup
 from vllm_omni.platforms import current_omni_platform
 
