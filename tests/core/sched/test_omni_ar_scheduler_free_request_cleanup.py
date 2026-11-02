@@ -203,22 +203,30 @@ def _tagged_finished_request(request_id: str, final_stage_id: int) -> _FakeFinis
     return request
 
 
-@pytest.mark.parametrize("final_stage_id", [0, 1], ids=["stage0-final", "kv-transfer"])
-def test_free_request_leaves_no_omits_kv_transfer_cache_entry(final_stage_id):
+@pytest.mark.parametrize(
+    ("final_stage_id", "transfer_state"),
+    [(0, "none"), (1, "none"), (1, "active"), (1, "waiting"), (1, "acked")],
+    ids=["stage0-final", "new-transfer", "active-transfer", "waiting-extraction", "acked-transfer"],
+)
+def test_free_request_leaves_no_omits_kv_transfer_cache_entry(final_stage_id, transfer_state):
     """_free_request() reads the final-stage flags through the real
     _should_transfer_kv_for_request(), which re-caches them; the entry must
     still be gone once the request is freed, or a KV-sending AR stage keeps
     one entry per finished request."""
+    from vllm.config import VllmConfig
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
     sched = _make_scheduler()
     del sched._should_transfer_kv_for_request  # use the real method
     sched._omni_kv_config = {"need_send_cache": True}
-    sched.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    sched.vllm_config = MagicMock(spec=VllmConfig, kv_transfer_config=None)
     sched.transfer_triggered_requests = set()
     sched.active_kv_transfers = set()
     sched.waiting_for_transfer_free = set()
     sched._kv_wait_start_ts = {}
     sched.requests_needing_kv_transfer = {}
-    sched.kv_cache_manager = SimpleNamespace(get_block_ids=lambda req_id: ([3, 5],))
+    sched.kv_cache_manager = MagicMock(spec=KVCacheManager)
+    sched.kv_cache_manager.get_block_ids.return_value = ([3, 5],)
     sched._get_confirmed_num_computed_tokens = lambda request: 4
     sched.requests = {}
     sched._free_blocks = MagicMock(side_effect=lambda request: sched.requests.pop(request.request_id))
@@ -226,9 +234,16 @@ def test_free_request_leaves_no_omits_kv_transfer_cache_entry(final_stage_id):
     for i in range(8):
         request = _tagged_finished_request(f"req-{i}", final_stage_id)
         sched.requests[request.request_id] = request
+        if transfer_state != "none":
+            sched.transfer_triggered_requests.add(request.request_id)
+        if transfer_state == "active":
+            sched.active_kv_transfers.add(request.request_id)
+        elif transfer_state == "waiting":
+            sched.waiting_for_transfer_free.add(request.request_id)
         sched._free_request(request)
+        assert request.request_id not in sched._omits_kv_transfer_cache
 
-    if final_stage_id == 1:
+    if final_stage_id == 1 and transfer_state != "acked":
         # Blocks are held for KV extraction; the extraction ack frees them later.
         assert sched.waiting_for_transfer_free == {f"req-{i}" for i in range(8)}
         for req_id in sorted(sched.waiting_for_transfer_free):
