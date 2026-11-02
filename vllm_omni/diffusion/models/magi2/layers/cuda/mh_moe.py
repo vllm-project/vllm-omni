@@ -14,11 +14,6 @@ from vllm.triton_utils import HAS_TRITON, tl, triton
 
 from vllm_omni.platforms import current_omni_platform
 
-from ...fused_moe_kernels import (
-    global_sort_routes,
-    invoke_fused_moe_bf16,
-    triton_mh_moe_forward,
-)
 from ...parallel import Magi2ParallelGroup
 from ..native.mh_moe import Magi2MultiHeadMoE as NativeMagi2MultiHeadMoE
 from ..native.mh_moe import (
@@ -26,6 +21,11 @@ from ..native.mh_moe import (
     RoutingScore,
     _reference_topk_probs_and_indices,
     torch_mh_moe_forward,
+)
+from .fused_moe_kernels import (
+    global_sort_routes,
+    invoke_fused_moe_bf16,
+    triton_mh_moe_forward,
 )
 
 try:  # Triton's precise exp; ``tl.exp`` lowers to the 29-ULP ex2 approximation.

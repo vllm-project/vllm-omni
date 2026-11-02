@@ -3,13 +3,14 @@
 
 """The client-event vocabulary a full-duplex session accepts.
 
-Seven of the seventeen are events OpenAI's Realtime API has no equivalent for,
+Eight of the eighteen are events OpenAI's Realtime API has no equivalent for,
 because they only make sense when the model and the user can talk at the same
 time: the user cuts in (``barge_in``), the client reports how much audio it
 played (``playback.ack``), a turn transition is signalled locally
 (``turn.signal``), input is abandoned without committing (``input.cancel``),
-text is pushed into a live turn (``input.text.append``), and the session is
-kept alive or closed explicitly (``session.heartbeat`` / ``session.close``).
+text is pushed into a live turn (``input.text.append``), the session is
+kept alive or closed explicitly (``session.heartbeat`` / ``session.close``), and
+the server's per-turn stage work is read back (``session.stats.get``).
 Two more are OpenAI commands carrying duplex-only fields (Tier 2).
 
 The remaining eight are OpenAI's, unchanged, and re-exported from
@@ -21,7 +22,7 @@ handed events its clients never send.
 
 None of these carries the engine's mailbox rendering: ``payload()`` and its
 channel live in ``vllm_omni.engine.duplex.commands``, because for four of the
-seventeen the runner's channel is not the client event type at all.
+eighteen the runner's channel is not the client event type at all.
 """
 
 from __future__ import annotations
@@ -131,6 +132,13 @@ class Heartbeat(RealtimeCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class GetSessionStats(RealtimeCommand):
+    """Ask for the session's server-side performance stats (answered by ``session.stats``)."""
+
+    wire_type: ClassVar[str] = "session.stats.get"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CloseSession(RealtimeCommand):
     """Graceful close requested through the command stream (``session.close``)."""
 
@@ -140,7 +148,7 @@ class CloseSession(RealtimeCommand):
 
 #: The complete command vocabulary a duplex client may send: the eight Tier 1
 #: classes re-exported unchanged, the two Tier 2 classes defined above, and the
-#: seven Tier 3 ones. A duplex consumer imports from here and never reaches
+#: eight Tier 3 ones. A duplex consumer imports from here and never reaches
 #: past this module into ``vllm_omni.protocol.realtime``, so a command that
 #: later grows a duplex extension changes only this file.
 __all__ = [
@@ -163,6 +171,7 @@ __all__ = [
     "BargeIn",
     "CancelInput",
     "CloseSession",
+    "GetSessionStats",
     "Heartbeat",
     "SignalTurn",
 ]

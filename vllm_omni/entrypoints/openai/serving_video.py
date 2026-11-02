@@ -287,6 +287,12 @@ class OmniOpenAIServingVideo:
         return any(item.supports_latent_mask_editing for item in metadata)
 
     @property
+    def supports_latent_continuation(self) -> bool:
+        """Return whether the configured diffusion model can continue a cached clip."""
+        _, metadata = self._resolve_diffusion_metadata()
+        return any(item.supports_latent_continuation for item in metadata)
+
+    @property
     def is_minimax_h3(self) -> bool:
         config = self._resolve_diffusion_od_config()
         architectures = set(self._get_model_architectures(config))
@@ -564,6 +570,10 @@ class OmniOpenAIServingVideo:
             if redacted:
                 loggable = {**loggable, **redacted}
             logger.info("Applied extra_params: %s", loggable)
+
+        if self.supports_latent_continuation:
+            # Server-owned: the job id is the only key a later continue_from can name.
+            gen_params.extra_args["latent_cache_key"] = reference_id
 
         self._apply_lora(request.lora, gen_params)
 
