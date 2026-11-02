@@ -296,7 +296,7 @@ class AuKVAEDecodeGraph:
         self._cache.clear()
         self._plain_pools.clear()
 
-    def _pad_for(self, device: torch.device) -> torch.Tensor:
+    def pad_for(self, device: torch.device) -> torch.Tensor:
         """The [latent_dim] normalized latent that AuKVAE.decode maps to raw zero."""
         pad = self._pad_latent
         if pad is None or pad.device != device:
@@ -305,6 +305,8 @@ class AuKVAEDecodeGraph:
             pad = -mean / scale
             self._pad_latent = pad
         return pad
+
+    _pad_for = pad_for
 
     def compiled_bucket(self, frames: int) -> int | None:
         """The smallest captured compile-bucket that holds frames latents, or None past the largest."""

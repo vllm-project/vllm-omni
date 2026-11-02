@@ -340,6 +340,7 @@ class AuKCUDAGraphWrapper:
 
         target_frames = x.shape[1]
         orig_batch = x.shape[0]
+        orig_x_mask = x_mask
         x_buck, x_mask, text_buck, c_mask_buck, ref_buck, ref_mask_buck = self._bucket_inputs(
             x, text, c_mask, ref, ref_mask, x_mask
         )
@@ -348,7 +349,7 @@ class AuKCUDAGraphWrapper:
         if key in self._uncapturable_loop_keys:
             return self._run_eager_loop(
                 x=x,
-                x_mask=x_mask,
+                x_mask=orig_x_mask,
                 text=text,
                 c_mask=c_mask,
                 ref=ref,
@@ -391,6 +392,7 @@ class AuKCUDAGraphWrapper:
                 self._uncapturable_loop_keys.add(key)
                 return self._run_eager_loop(
                     x=x,
+                    x_mask=orig_x_mask,
                     text=text,
                     c_mask=c_mask,
                     ref=ref,

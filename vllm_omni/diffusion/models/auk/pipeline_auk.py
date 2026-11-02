@@ -737,9 +737,11 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
 
             wav = None
             if any(item.output_type != "latent" for item in items):
-                # Zero out padded positions so the non-causal decoder input convolution
-                # (conv_pre) does not bleed unmasked noise into the trailing valid audio samples.
-                decode_latents = latents.masked_fill(~x_mask.unsqueeze(-1), 0.0)
+                # Fill padded positions with the normalized silence latent so the non-causal
+                # decoder input convolution (conv_pre) does not bleed unmasked noise into the
+                # trailing valid audio samples, matching exact-length decode and graph padding.
+                pad = self.vae_decode.pad_for(latents.device)
+                decode_latents = torch.where(x_mask.unsqueeze(-1), latents, pad)
                 # Transfer the group once rather than copying each waveform separately.
                 wav = self.vae_decode(decode_latents).detach().to(device="cpu", dtype=torch.float32)
                 if not torch.isfinite(wav).all():
