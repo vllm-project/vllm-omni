@@ -17,6 +17,24 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 CHUNK = 50
 
 
+@pytest.mark.parametrize(
+    "backend, chunked, expected",
+    [
+        ("fa2", False, False),
+        ("fa2", True, True),
+        ("fa3", False, True),
+        ("fa3", True, True),
+        ("flashinfer", False, False),
+        ("flashinfer", True, False),
+    ],
+)
+def test_attention_uses_pages_layout_contract(backend, chunked, expected):
+    """Pin the layout policy shared by metadata construction and graph allocation."""
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import attention_uses_pages
+
+    assert attention_uses_pages(backend, chunked) is expected
+
+
 def _attention(lengths, backend, chunk_size=None, width=None):
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
         build_row_attention,
