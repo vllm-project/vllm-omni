@@ -45,6 +45,9 @@ steps:
           - >-
             pytest -s -v
             tests/diffusion/layers/test_activation.py
+            tests/diffusion/models/magi2/test_npu_attention.py
+            tests/diffusion/models/magi2/test_npu_layers.py
+            tests/diffusion/models/magi2/test_npu_moe.py
             -m 'core_model and npu and A5'
             --run-level 'core_model'
 

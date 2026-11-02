@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, cast
 
@@ -142,6 +142,10 @@ class DuplexCapabilities:
     stage_handoff_transport: str | None = None
     chunk_period_ms: int | None = 1000
     target_barge_in_latency_ms: int | None = 1000
+    #: The deployment collects per-turn stage work and answers ``session.stats.get``
+    #: (RFC #8325). Set by the engine from ``duplex_session.collect_stats``, never by
+    #: a plugin; see :func:`apply_session_stats_capability`.
+    supports_session_stats: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -187,6 +191,7 @@ class DuplexCapabilities:
             "stage_handoff_transport": self.stage_handoff_transport,
             "chunk_period_ms": self.chunk_period_ms,
             "target_barge_in_latency_ms": self.target_barge_in_latency_ms,
+            "supports_session_stats": self.supports_session_stats,
         }
 
     def accepts_input_modality(self, modality: str) -> bool:
@@ -211,6 +216,18 @@ class DuplexCapabilities:
         if has_video and not has_audio and not self.allows_video_without_audio():
             return "This duplex model requires audio; video-only append is not allowed"
         return None
+
+
+def apply_session_stats_capability(capabilities: DuplexCapabilities, collect_stats: bool) -> DuplexCapabilities:
+    """Advertise ``supports_session_stats`` exactly when the deployment collects stats.
+
+    The plugin builds its capabilities without seeing the deploy flag, so every
+    caller of ``plugin.capabilities()`` passes the result through here; the
+    advertised value and the runner's check then cannot disagree.
+    """
+    if capabilities.supports_session_stats == bool(collect_stats):
+        return capabilities
+    return replace(capabilities, supports_session_stats=bool(collect_stats))
 
 
 @dataclass
