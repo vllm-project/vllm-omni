@@ -315,7 +315,8 @@ class DiffusionParallelConfig:
       convolutions.
     - "spatial_shard_width": Same as "spatial_shard_height" but sharded along width.
 
-    The "spatial_shard_*" modes are decode-only and currently require
+    The "spatial_shard_*" modes are decode-only for Wan; HunyuanImage3 on NPU
+    also supports encode in "spatial_shard_height" mode. These modes require
     ``vae_patch_parallel_size`` to match the DiT group size; otherwise the VAE
     falls back to tile-parallel decode at runtime.
     """

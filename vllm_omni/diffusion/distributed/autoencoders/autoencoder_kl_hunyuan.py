@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Any
 
@@ -13,6 +13,7 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     TileTask,
 )
 from vllm_omni.diffusion.models.hunyuan_image3.autoencoder import AutoencoderKLConv3D
+from vllm_omni.diffusion.models.hunyuan_image3.layers import spatial_vae_forward
 
 logger = init_logger(__name__)
 
@@ -119,6 +120,11 @@ class DistributedAutoencoderKLHunyuan(AutoencoderKLConv3D, DistributedVaeMixin):
         return self.tile_merge(coord_tensor_map, grid_spec)
 
     def spatial_tiled_encode(self, x: torch.Tensor):
+        if self.is_distributed_enabled():
+            result = spatial_vae_forward(self, x, "encode")
+            if result is not None:
+                return result
+
         if not self.is_distributed_enabled():
             return super().spatial_tiled_encode(x)
 
@@ -134,6 +140,11 @@ class DistributedAutoencoderKLHunyuan(AutoencoderKLConv3D, DistributedVaeMixin):
         )
 
     def spatial_tiled_decode(self, z: torch.Tensor):
+        if self.is_distributed_enabled():
+            result = spatial_vae_forward(self, z, "decode")
+            if result is not None:
+                return result
+
         if not self.is_distributed_enabled():
             return super().spatial_tiled_decode(z)
 
