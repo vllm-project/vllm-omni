@@ -54,7 +54,7 @@ from vllm_omni.utils.mm_outputs import (
     partition_payload_list,
     snapshot_mm_payload,
 )
-from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor
+from vllm_omni.worker.duplex_reanchor import apply_duplex_window_reanchor, validate_duplex_kv_cache
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.lmcache_model_runner_mixin import LMCacheHiddenStateMixin
 from vllm_omni.worker.mamba_prefix_cache import prepare_mamba_prefix_cache
@@ -481,6 +481,10 @@ class GPUARModelRunner(
         if output_token_ids != sampling_metadata.output_token_ids:
             return replace(sampling_metadata, output_token_ids=output_token_ids)
         return sampling_metadata
+
+    def initialize_kv_cache(self, *args, **kwargs) -> None:
+        super().initialize_kv_cache(*args, **kwargs)
+        validate_duplex_kv_cache(self)
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable | None:
         deferred_state_corrections_fn = super()._update_states(scheduler_output)

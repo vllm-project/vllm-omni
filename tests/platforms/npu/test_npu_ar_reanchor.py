@@ -104,3 +104,71 @@ def test_shared_dispatch(use_helper):
     output = object()
     namespace["apply_duplex_window_reanchor"](runner, output)
     assert events == [(runner, output)]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("use_helper", [False, True])
+def test_internal_typeerror_never_retries(legacy, use_helper):
+    from types import SimpleNamespace
+
+    path = Path(__file__).resolve().parents[3] / "vllm_omni/worker/duplex_reanchor.py"
+    namespace: dict[str, Any] = {}
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)
+    effects = []
+
+    def old_hook(runner):
+        effects.append("rotated")
+        raise TypeError("internal failure")
+
+    def new_hook(runner, scheduler_output=None):
+        effects.append("rotated")
+        raise TypeError("internal failure")
+
+    hook = old_hook if legacy else new_hook
+    runner = SimpleNamespace(model=SimpleNamespace())
+    if use_helper:
+        runner._duplex_window_helper = SimpleNamespace(maybe_apply_reanchor=hook)
+    else:
+        runner.model.apply_duplex_kv_reanchor = hook
+    with pytest.raises(TypeError, match="internal failure"):
+        namespace["apply_duplex_window_reanchor"](runner, object())
+    assert effects == ["rotated"]
+
+
+@pytest.mark.parametrize("has_command,is_minicpmo", [(True, True), (False, True), (True, False)])
+def test_shared_dispatch_fallback(monkeypatch, has_command, is_minicpmo):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    path = Path(__file__).resolve().parents[3] / "vllm_omni/worker/duplex_reanchor.py"
+    namespace: dict[str, Any] = {}
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)
+    calls = []
+    module = ModuleType("vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_kv")
+    setattr(
+        module,
+        "MiniCPMO45DuplexWorkerHelper",
+        SimpleNamespace(maybe_apply_reanchor=lambda runner, scheduler_output: calls.append((runner, scheduler_output))),
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    model = type("Model", (), {"__module__": "minicpmo_4_5" if is_minicpmo else "other"})()
+    runner = SimpleNamespace(
+        model=model,
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["r"]),
+        model_intermediate_buffer={"r": {"duplex": {"stage0_reanchor": {}} if has_command else {}}},
+    )
+    output = object()
+    namespace["apply_duplex_window_reanchor"](runner, output)
+    assert calls == ([(runner, output)] if has_command and is_minicpmo else [])
+
+
+@pytest.mark.parametrize("backend", ["npu", "gpu"])
+def test_cache_validation_follows_allocation(backend):
+    root = Path(__file__).resolve().parents[3] / "vllm_omni"
+    path = root / (
+        "platforms/npu/worker/npu_ar_model_runner.py" if backend == "npu" else "worker/gpu_ar_model_runner.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "initialize_kv_cache")
+    assert "super().initialize_kv_cache" in ast.unparse(method.body[0])
+    assert "validate_duplex_kv_cache(self)" in ast.unparse(method.body[1])

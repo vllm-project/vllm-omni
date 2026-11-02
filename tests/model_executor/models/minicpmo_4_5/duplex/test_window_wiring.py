@@ -1711,3 +1711,20 @@ def test_flattened_split_cache_noncontiguous_storage():
     torch.testing.assert_close(keys[1].view(16, 2, 8), expected)
     torch.testing.assert_close(values, before[..., 16:])
     torch.testing.assert_close(keys[0], before[0, :, :16])
+
+
+@pytest.mark.parametrize("head_dim,rotary_dim,width", [(16, 8, 32), (8, 8, 17)])
+def test_flattened_layout_preflight_rejects_invalid_config(head_dim, rotary_dim, width):
+    validate = rotate_cached_keys.__globals__["flattened_key_cache_view"]
+    with pytest.raises(ValueError):
+        validate(torch.zeros(4, 16, width), 16, head_dim, rotary_dim)
+
+
+def test_flattened_layout_preflight_preserves_storage():
+    validate = rotate_cached_keys.__globals__["flattened_key_cache_view"]
+    storage = torch.randn(4, 16, 32)
+    key = storage[..., :16]
+    before = storage.clone()
+    view = validate(key, 16, 8, 8)
+    assert view.data_ptr() == key.data_ptr()
+    torch.testing.assert_close(storage, before)
