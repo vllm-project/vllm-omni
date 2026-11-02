@@ -11,6 +11,7 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, Sequence
@@ -63,6 +64,15 @@ class _SubmitRevokedError(Exception):
 
 
 CACHE_RESET_TIMEOUT_S = 60.0
+
+
+def ar_level2_wake_enabled() -> bool:
+    """Whether AR stages may wake after ``sleep(level=2)`` (``VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS=1``).
+
+    Level 2 discards the weights, so the caller must rewrite every parameter
+    (e.g. an RL full-weight sync) before generating again.
+    """
+    return os.environ.get("VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS", "0") == "1"
 
 
 class AsyncOmni(AsyncOmniBase, EngineClient):
@@ -1384,7 +1394,7 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 for sid in ar_stage_ids
             )
             self._record_stage_sleep(ar_stage_ids, sleep_tags)
-            if level == 2:
+            if level == 2 and not ar_level2_wake_enabled():
                 self._level2_sleeping = True
 
         if diffusion_stage_ids:
@@ -1469,7 +1479,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 "wake_up() after sleep(level=2) is not yet implemented: weights were "
                 "discarded from GPU and reloading from disk is not yet supported. "
                 "Use sleep(level=1) instead, which offloads weights to CPU RAM "
-                "and supports fast DMA restore."
+                "and supports fast DMA restore. AR-only callers that rewrite every "
+                "weight after wake (RL weight sync) can set "
+                "VLLM_OMNI_AR_SLEEP_DISCARD_WEIGHTS=1."
             )
         ar_stage_ids, diffusion_stage_ids = self._split_stage_ids_by_type(stage_ids)
         target_stage_ids = ar_stage_ids + diffusion_stage_ids
