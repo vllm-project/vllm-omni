@@ -3099,6 +3099,20 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         return input_ids
 
+    @staticmethod
+    def _first_step_query_seq_lens(
+        model_kwargs: dict[str, Any],
+        batch: int,
+        query_len: int,
+        seq_len: int,
+    ) -> tuple[list[int], list[int]]:
+        output = model_kwargs.get("tokenizer_output")
+        real_pos = getattr(output, "real_pos", None) if output is not None else None
+        if real_pos is None or int(real_pos.shape[0]) != batch:
+            return [query_len] * batch, [seq_len] * batch
+        seq_lens = [int(row[-1].item()) for row in real_pos]
+        return list(seq_lens), seq_lens
+
     def _maybe_handle_ar_kv_reuse(
         self,
         input_ids,
@@ -3108,10 +3122,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         cfg_rank,
         device,
     ):
-        if is_forward_context_available() and get_forward_context().paged_kv_cached_prefix_len:
-            # Local hits are sliced after conditional-image embeddings are
-            # prepared in forward_call; the AR path must not truncate them.
-            return input_ids, 0
+        if is_forward_context_available():
+            context = get_forward_context()
+            if context.paged_kv_cached_prefix_len or context.paged_kv_cached_prefix_lens:
+                # Local hits are sliced after conditional-image embeddings are
+                # prepared in forward_call; the AR path must not truncate them.
+                return input_ids, 0
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         computed_tokens = get_paged_kv_computed_tokens()
         if computed_tokens and computed_tokens[0] > 0:
@@ -3333,8 +3349,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             cfg_rank = None
 
         b, _, q_len1, seq_len = attention_mask.shape
-        query_lens = [q_len1] * b
-        seq_lens = [seq_len] * b
+        query_lens, seq_lens = self._first_step_query_seq_lens(model_kwargs, b, q_len1, seq_len)
         model_kwargs["query_lens"] = query_lens
         model_kwargs["seq_lens"] = seq_lens
         model_kwargs["attention_mask"] = attention_mask.to(latents.device)
@@ -3457,7 +3472,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     attention_mask = model_kwargs.get("attention_mask")
                     b, _, q_len1, seq_len = attention_mask.shape
                     query_lens = [q_len1] * b
-                    seq_lens = [seq_len] * b
+                    prev_seq_lens = model_kwargs.get("seq_lens")
+                    seq_lens = (
+                        list(prev_seq_lens)
+                        if isinstance(prev_seq_lens, list) and len(prev_seq_lens) == b
+                        else [seq_len] * b
+                    )
                     model_kwargs["query_lens"] = query_lens
                     model_kwargs["seq_lens"] = seq_lens
 

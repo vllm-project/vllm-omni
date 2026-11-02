@@ -43,6 +43,9 @@ class ForwardContext:
     # Block-aligned prefix already resident in Scheduler-owned pages for the
     # active request-level prefill. Zero keeps the cold/full-prefill path.
     paged_kv_cached_prefix_len: int = 0
+    # Per-row prefix cuts when a packed request group has mixed hit lengths.
+    # None means every row uses ``paged_kv_cached_prefix_len``.
+    paged_kv_cached_prefix_lens: tuple[int, ...] | None = None
     # Active Worker-side paged KV adapter.  The adapter is installed only for
     # the duration of a paged forward; dense forwards leave this as ``None``.
     # Keep the field opaque here to avoid coupling the common context module to

@@ -1617,6 +1617,21 @@ class HunyuanImage3Pipeline(
         return attention_mask
 
     @staticmethod
+    def _normalize_cached_prefix_lens(
+        cached_prefix_len: int | list[int] | tuple[int, ...],
+        num_rows: int,
+    ) -> list[int]:
+        if isinstance(cached_prefix_len, int):
+            return [cached_prefix_len] * num_rows
+        prefixes = [int(prefix) for prefix in cached_prefix_len]
+        if len(prefixes) != num_rows:
+            raise ValueError(
+                "Hunyuan paged prefix slicing requires one cached prefix per row: "
+                f"prefixes={len(prefixes)}, rows={num_rows}"
+            )
+        return prefixes
+
+    @staticmethod
     def _slice_cached_prefix_inputs(
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None,
@@ -1626,7 +1641,7 @@ class HunyuanImage3Pipeline(
         gen_timestep_scatter_index: torch.Tensor | None,
         query_lens: list[int] | None,
         seq_lens: list[int] | None,
-        cached_prefix_len: int,
+        cached_prefix_len: int | list[int] | tuple[int, ...],
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1637,27 +1652,33 @@ class HunyuanImage3Pipeline(
         list[int],
         int,
     ]:
-        """Remove a cached first-step prefix while preserving full KV lengths."""
+        """Remove a cached first-step prefix while preserving full KV lengths.
 
-        seq_len = int(inputs_embeds.shape[1])
-        if (
-            query_lens is None
-            or seq_lens is None
-            or len(query_lens) != inputs_embeds.shape[0]
-            or len(seq_lens) != len(query_lens)
-        ):
+        Packed request batches right-pad heterogeneous prompts, so logical
+        ``seq_lens`` / ``query_lens`` may be shorter than the tensor width.
+        Mixed prefix hits cut each row independently and right-pad the remaining
+        query to a shared tensor width.
+        """
+
+        tensor_len = int(inputs_embeds.shape[1])
+        num_rows = int(inputs_embeds.shape[0])
+        if query_lens is None or seq_lens is None or len(query_lens) != num_rows or len(seq_lens) != len(query_lens):
             raise ValueError("Hunyuan paged prefix execution requires one query/sequence length per row")
-        if any(query_len != seq_len for query_len in query_lens) or any(
-            logical_len != seq_len for logical_len in seq_lens
-        ):
+        if any(query_len != logical_len for query_len, logical_len in zip(query_lens, seq_lens)):
             raise ValueError(
                 "Hunyuan paged prefix slicing requires an untrimmed first-step tensor: "
-                f"query_lens={query_lens}, tensor_len={seq_len}"
+                f"query_lens={query_lens}, seq_lens={seq_lens}, tensor_len={tensor_len}"
             )
-        if not 0 < cached_prefix_len < seq_len:
+        if any(logical_len <= 0 or logical_len > tensor_len for logical_len in seq_lens):
+            raise ValueError(
+                "Hunyuan paged prefix slicing requires logical lengths inside the padded tensor: "
+                f"seq_lens={seq_lens}, tensor_len={tensor_len}"
+            )
+        prefixes = HunyuanImage3Pipeline._normalize_cached_prefix_lens(cached_prefix_len, num_rows)
+        if any(prefix < 0 or prefix >= logical_len for prefix, logical_len in zip(prefixes, seq_lens)):
             raise ValueError(
                 "Hunyuan cached prefix must leave a non-empty first-step suffix: "
-                f"cached={cached_prefix_len}, seq_len={seq_len}"
+                f"cached={prefixes}, seq_lens={seq_lens}"
             )
         if (
             attention_mask is None
@@ -1667,16 +1688,56 @@ class HunyuanImage3Pipeline(
             or gen_timestep_scatter_index is None
         ):
             raise ValueError("Hunyuan paged prefix slicing is missing first-step layout tensors")
+        if not any(prefixes):
+            return (
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                custom_pos_emb,
+                image_mask,
+                gen_timestep_scatter_index,
+                list(query_lens),
+                tensor_len,
+            )
 
+        sliced_query_lens = [query_len - prefix for query_len, prefix in zip(query_lens, prefixes)]
+        uniform_prefix = prefixes[0]
+        if all(prefix == uniform_prefix for prefix in prefixes):
+            return (
+                inputs_embeds[:, uniform_prefix:],
+                attention_mask[:, :, uniform_prefix:, :],
+                position_ids[:, uniform_prefix:],
+                tuple(pos[:, uniform_prefix:] for pos in custom_pos_emb),
+                image_mask[:, uniform_prefix:],
+                gen_timestep_scatter_index - uniform_prefix,
+                sliced_query_lens,
+                tensor_len - uniform_prefix,
+            )
+
+        out_query = max(sliced_query_lens)
+        sliced_embeds = inputs_embeds.new_zeros(num_rows, out_query, *inputs_embeds.shape[2:])
+        sliced_positions = position_ids.new_zeros(num_rows, out_query, *position_ids.shape[2:])
+        sliced_image_mask = image_mask.new_zeros(num_rows, out_query, *image_mask.shape[2:])
+        sliced_mask = attention_mask.new_zeros(num_rows, attention_mask.shape[1], out_query, attention_mask.shape[-1])
+        sliced_rope = tuple(pos.new_zeros(num_rows, out_query, *pos.shape[2:]) for pos in custom_pos_emb)
+        sliced_scatter = gen_timestep_scatter_index.clone()
+        for row, (prefix, logical_len, remaining) in enumerate(zip(prefixes, seq_lens, sliced_query_lens)):
+            sliced_embeds[row, :remaining] = inputs_embeds[row, prefix:logical_len]
+            sliced_positions[row, :remaining] = position_ids[row, prefix:logical_len]
+            sliced_image_mask[row, :remaining] = image_mask[row, prefix:logical_len]
+            sliced_mask[row, :, :remaining, :] = attention_mask[row, :, prefix:logical_len, :]
+            for src, dest in zip(custom_pos_emb, sliced_rope):
+                dest[row, :remaining] = src[row, prefix:logical_len]
+            sliced_scatter[row] = gen_timestep_scatter_index[row] - prefix
         return (
-            inputs_embeds[:, cached_prefix_len:],
-            attention_mask[:, :, cached_prefix_len:, :],
-            position_ids[:, cached_prefix_len:],
-            tuple(pos[:, cached_prefix_len:] for pos in custom_pos_emb),
-            image_mask[:, cached_prefix_len:],
-            gen_timestep_scatter_index - cached_prefix_len,
-            [query_len - cached_prefix_len for query_len in query_lens],
-            seq_len - cached_prefix_len,
+            sliced_embeds,
+            sliced_mask,
+            sliced_positions,
+            sliced_rope,
+            sliced_image_mask,
+            sliced_scatter,
+            sliced_query_lens,
+            out_query,
         )
 
     def prepare_inputs_for_generation(
@@ -2009,11 +2070,17 @@ class HunyuanImage3Pipeline(
         bsz, seq_len, n_embd = inputs_embeds.shape
 
         paged_kv_cached_prefix_len = 0
+        paged_kv_cached_prefix_lens: tuple[int, ...] | None = None
         if first_step and self._uses_scheduler_paged_kv():
             if not is_forward_context_available():
                 raise RuntimeError("Hunyuan paged prefix execution requires an Omni ForwardContext")
-            paged_kv_cached_prefix_len = int(get_forward_context().paged_kv_cached_prefix_len)
-        if paged_kv_cached_prefix_len:
+            context = get_forward_context()
+            paged_kv_cached_prefix_len = int(context.paged_kv_cached_prefix_len)
+            paged_kv_cached_prefix_lens = context.paged_kv_cached_prefix_lens
+        prefix_cut: int | tuple[int, ...] | None = paged_kv_cached_prefix_lens or (
+            paged_kv_cached_prefix_len if paged_kv_cached_prefix_len else None
+        )
+        if prefix_cut:
             if ar_kv_reuse_len:
                 raise ValueError("Hunyuan cannot combine imported AR KV and Scheduler prefix-cache hits")
             (
@@ -2034,11 +2101,11 @@ class HunyuanImage3Pipeline(
                 gen_timestep_scatter_index,
                 query_lens,
                 seq_lens,
-                paged_kv_cached_prefix_len,
+                prefix_cut,
             )
             logger.debug(
-                "Hunyuan prefix slice: cached_prefix_len=%d query_len=%d",
-                paged_kv_cached_prefix_len,
+                "Hunyuan prefix slice: cached_prefix_len=%s query_len=%d",
+                prefix_cut,
                 seq_len,
             )
 
@@ -2648,6 +2715,30 @@ class HunyuanImage3Pipeline(
                     return int(rows[0].kv_start_pos)
         return 0
 
+    @staticmethod
+    def _cfg_major_row_values(
+        values: list[int],
+        num_requests: int,
+        prepared_layout: request_layout_utils.HunyuanPreparedLayout | None,
+    ) -> list[int]:
+        if num_requests <= 0:
+            return []
+        if len(values) != num_requests:
+            raise ValueError(
+                "Hunyuan CFG-major expand requires one value per request: "
+                f"values={len(values)}, requests={num_requests}"
+            )
+        if prepared_layout is None:
+            cfg_factor = 1
+        else:
+            if prepared_layout.num_branches % num_requests:
+                raise ValueError(
+                    "Hunyuan packed branches do not divide request count: "
+                    f"branches={prepared_layout.num_branches}, requests={num_requests}"
+                )
+            cfg_factor = prepared_layout.num_branches // num_requests
+        return [values[request_idx] for _ in range(cfg_factor) for request_idx in range(num_requests)]
+
     def _layout_branch_spans(
         self,
         layout: request_layout_utils.HunyuanPreparedLayout,
@@ -2672,26 +2763,42 @@ class HunyuanImage3Pipeline(
         has_ar_kv = bool(self._extract_ar_kv_from_request(request))
         if layout is None:
             seq_lens: tuple[int, ...] = ()
-            token_width = 0
             num_image_tokens = 0
             branch_spans: tuple[tuple[tuple[int, int], ...], ...] = ()
             cfg_factor = 1 + int(guidance_scale > 1.0)
+            token_width = 0
         else:
             seq_lens = tuple(int(row[-1].item()) for row in layout.tokenizer_output.real_pos)
-            token_width = int(layout.tokenizer_output.tokens.shape[1])
             num_image_tokens = request_layout_utils.hunyuan_num_image_tokens(layout.generated_image_info)
             branch_spans = tuple(
                 tuple(self._layout_branch_spans(layout, branch)) for branch in range(layout.num_branches)
             )
             cfg_factor = request_layout_utils.hunyuan_cfg_factor(layout.generated_image_info, guidance_scale)
+            token_width = int(layout.tokenizer_output.tokens.shape[1])
         cached_prefix = self._request_cached_prefix_len(request)
         if self._uses_scheduler_paged_kv():
+            remaining_query = tuple(max(seq_len - cached_prefix, 0) for seq_len in seq_lens)
             structure: tuple[Any, ...] = tuple(
-                _piecewise_segment_modes(list(spans), cached_prefix, max(seq_len - cached_prefix, 0))
-                for spans, seq_len in zip(branch_spans, seq_lens, strict=True)
+                _piecewise_segment_modes(list(spans), cached_prefix, query_len)
+                for spans, query_len in zip(branch_spans, remaining_query, strict=True)
             )
-        else:
-            structure = branch_spans
+            # Packed paged batches right-pad heterogeneous prompts. Group by
+            # remaining segment structure, not full prefix+image seq_len / pad
+            # width / raw hit length. Image-token geometry is the sequence
+            # length that must match; remaining query_len is encoded in
+            # ``structure`` (mode sequence after the cached prefix is sliced).
+            return (
+                cfg_factor,
+                guidance_scale,
+                int(sampling.num_inference_steps or 50),
+                int(sampling.height or 1024),
+                int(sampling.width or 1024),
+                num_image_tokens,
+                has_ar_kv,
+                request.request_id if has_ar_kv else None,
+                structure,
+            )
+        structure = branch_spans
         return (
             cfg_factor,
             guidance_scale,
@@ -2771,9 +2878,20 @@ class HunyuanImage3Pipeline(
         if ar_kv_kwargs and len(requests) > 1:
             raise ValueError("Hunyuan native AR-KV connector stays single-request until that workstream lands.")
 
-        cached_prefix = self._request_cached_prefix_len(requests[0])
+        request_prefixes = [self._request_cached_prefix_len(request) for request in requests]
+        row_prefixes = self._cfg_major_row_values(request_prefixes, len(requests), prepared_layout)
         if is_forward_context_available():
-            get_forward_context().paged_kv_cached_prefix_len = cached_prefix
+            context = get_forward_context()
+            unique_prefixes = set(row_prefixes)
+            if len(unique_prefixes) == 1:
+                context.paged_kv_cached_prefix_len = row_prefixes[0]
+                context.paged_kv_cached_prefix_lens = None
+            else:
+                context.paged_kv_cached_prefix_len = 0
+                context.paged_kv_cached_prefix_lens = tuple(row_prefixes)
+
+        computed_tokens = [tuple(getattr(request, "kv_computed_tokens", ()) or ()) for request in requests]
+        kv_computed_tokens = computed_tokens[0] if len(set(computed_tokens)) == 1 else ()
 
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
@@ -2787,7 +2905,7 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
             prepared_layout=prepared_layout,
-            kv_computed_tokens=getattr(requests[0], "kv_computed_tokens", ()),
+            kv_computed_tokens=kv_computed_tokens,
             paged_request_ids=[request.request_id for request in requests],
             **ar_kv_kwargs,
         )
