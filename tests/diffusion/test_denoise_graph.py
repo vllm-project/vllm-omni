@@ -225,6 +225,20 @@ def test_build_runner_allows_step_independent_attention(platform, overrides):
     assert build_denoise_graph_runner(_od_config(**overrides), _affine, "T") is not None
 
 
+@pytest.mark.parametrize(
+    ("device_type", "multi_rank", "refused"), [("xpu", True, True), ("xpu", False, False), ("cuda", True, False)]
+)
+def test_multi_rank_xpu_stays_eager(platform, monkeypatch, device_type, multi_rank, refused):
+    # XPU graphs leak the buffers of captured collectives, so multi-rank DiTs must not capture there.
+    platform.device_type = device_type
+    monkeypatch.setattr(graph_mod, "_capture_agreement_group", lambda: object() if multi_rank else None)
+    monkeypatch.setattr(cuda_graph_mod.GraphedForward, "_agree", lambda self, ok: ok)
+
+    runner = build_denoise_graph_runner(_od_config(), _affine, "T")
+
+    assert (runner is None) is refused
+
+
 def test_write_through_reuses_storage_only_when_layout_matches():
     dst = torch.zeros(2, 3)
     src = torch.ones(2, 3)
