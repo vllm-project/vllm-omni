@@ -136,6 +136,9 @@ before transformer execution, so local attention does not read the step index.
 
 Distributed modes other than strict Ulysses, cache acceleration, paged/quantized
 KV, step serving and MiniMax integration are outside this PoC.
+Attention layout transitions do not reset residual-cache history. This PR adds no
+SeaCache hooks or cache invalidation; the existing runtime validation rejects
+combining strategies with cache acceleration.
 
 ## Validation
 
