@@ -3,6 +3,8 @@
 """Real-shape checks for MammothModa2's fused QK norm/RoPE and shared CUDA
 attention backend against the native shared RMSNorm path."""
 
+import os
+
 import pytest
 import torch
 from diffusers.models.attention_processor import Attention
@@ -10,20 +12,31 @@ from diffusers.models.attention_processor import Attention
 import vllm_omni.diffusion.attention.backends.sdpa as sdpa_backend
 import vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model as mammoth_dit
 from tests.helpers.mark import hardware_marks
+from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import TransformerBlock
 
+from .helpers import initialize_block_weights
 from .test_dit_attention import _reference_attention
 
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.advanced_model,
-    pytest.mark.cuda,
-    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
+    pytest.mark.usefixtures("mock_tp1"),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1),
 ]
 
 # MammothModa2-Preview gen_dit_config: hidden 2520, 21 heads, 7 KV heads, head_dim 120.
 DIM, HEADS, KV_HEADS = 2520, 21, 7
+
+
+@pytest.fixture(autouse=True)
+def _set_diffusion_config():
+    """Construct attention layers with the same config path used in production."""
+    with set_current_diffusion_config(OmniDiffusionConfig()):
+        yield
 
 
 def _norm_attention(head_dim, dtype):
@@ -31,6 +44,24 @@ def _norm_attention(head_dim, dtype):
     attn.norm_q = RMSNorm(head_dim)
     attn.norm_k = RMSNorm(head_dim)
     return attn.to(device="cuda", dtype=dtype)
+
+
+def test_explicit_attention_backend_environment_reaches_dit_layer():
+    backend_name = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
+    if backend_name is None or backend_name.lower() == "auto":
+        pytest.skip("no explicit diffusion attention backend")
+    assert backend_name is not None
+
+    block = TransformerBlock(
+        48,
+        6,
+        2,
+        multiple_of=8,
+        ffn_dim_multiplier=1.0,
+        norm_eps=1e-5,
+    )
+    expected_backend = DiffusionAttentionBackendEnum[backend_name.upper()].get_class()
+    assert block.attn.omni_attn.attn_backend is expected_backend
 
 
 def test_unpaired_rope_preserves_native_arithmetic(monkeypatch):
@@ -96,6 +127,7 @@ def test_production_rope_uses_fused_qk_norm_rope(monkeypatch, force_native):
         .to(torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(block)
     hidden = torch.randn(2, seq, DIM, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(2, seq, dtype=torch.bool, device="cuda")
     mask[0, -37:] = False
@@ -151,6 +183,7 @@ def test_real_shape_matches_previous_arithmetic_bf16(seq):
         .to(torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(block)
     hidden = torch.randn(2, seq, DIM, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(2, seq, dtype=torch.bool, device="cuda")
     mask[0, seq - 300 :] = False
@@ -181,6 +214,7 @@ def test_empty_text_stream_on_the_default_backend():
         .to(torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(block)
     hidden = torch.randn(1, 0, DIM, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(1, 0, dtype=torch.bool, device="cuda")
     angles = torch.rand(1, 0, block.head_dim, device="cuda")
@@ -218,6 +252,7 @@ def test_fp32_falls_back_to_sdpa_and_matches_reference(monkeypatch, seq, force_g
         .to(dt)
         .eval()
     )
+    initialize_block_weights(block)
     hidden = torch.randn(1, seq, DIM, device="cuda", dtype=dt)
     mask = torch.ones(1, seq, dtype=torch.bool, device="cuda")
     mask[:, -13:] = False
@@ -428,6 +463,7 @@ def test_model_prepares_three_rope_tables_with_one_threshold_lookup(monkeypatch,
         .to(torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(model)
     hidden = torch.randn(2, 4, 4, 4, device="cuda", dtype=torch.bfloat16)
     text = torch.randn(2, 4, 32, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(2, 4, device="cuda", dtype=torch.bool)

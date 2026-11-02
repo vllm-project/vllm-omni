@@ -65,7 +65,8 @@ unstructured keyword dictionaries:
   validation;
 - `skip_softmax` is consumed by TRTLLM; and
 - `block_sparse` is consumed by block-sparse backends such as RainFusion; and
-- `fastvideo_vsa_topk` is consumed by FastVideo VSA.
+- `fastvideo_vsa_topk` is consumed by FastVideo VSA; and
+- `sparge` is consumed by the XPU SPARGE INT8 sparse attention backend.
 
 A backend reads only the fields it owns and rejects incompatible values. New
 options should be added to a shared typed spec only when more than one backend
@@ -104,6 +105,20 @@ incompatible platform implementations raise `TypeError`. Unselected overrides
 have no effect. Backend capabilities, constructor options, and shared
 parallel dispatch remain unchanged and must be honored by the specialization.
 
+For explicit block-sparse attention, the model owns tiling, routing and any
+compression correction. The shared provider layer consumes that mask, its
+logical block size and valid-token counts. It owns kernel availability,
+provider-specific sparse metadata, transport padding and execution. The cuDNN
+provider consumes tile64 or tile128 directly; selecting it does not change
+the model's top-k policy. Startup checks and execution use the same provider
+resolution path.
+
+The explicit Triton provider accepts H3 tile64/128 on SM80+ in BF16.
+For tile128 it expands the selected mask into 64-token compute blocks
+without recomputing top-k or splitting the softmax reduction. Ada tile128
+auto selection uses this provider. Explicit unsupported precision and
+missing-kernel errors remain startup failures, not runtime fallbacks.
+
 Use a new backend for a new provider/capability contract. `custom_attention`
 instead owns communication and requires `skip_sequence_parallel=True`.
 
@@ -141,3 +156,16 @@ MiniMax-H3 supplies `MiniMaxH3VSAImpl` through `impl_overrides`.
 `models/minimax_h3/attention/fastvideo_h3.py` owns its prefix layout, video tiling, and
 learned compression gate. Pooling, block-map construction, and tile64 provider
 calls are shared through `attention/ops/block_sparse.py`.
+
+## CosyVoice3 Ascend graph region
+
+CosyVoice3 has an opt-in, model-owned NPU graph adapter around the complete
+Flow Euler solve. The adapter directly calls the FIA inference API for dense,
+noncausal FP16/BF16 DiT attention with a boolean key-padding mask. It converts
+keep-mask semantics to FIA's blocked-mask semantics and preserves masking of
+padded query outputs in the model. FIA also serves the adapter's eager warmup
+and graph-limit fallback paths. Selecting another backend does not replace FIA
+while the adapter is enabled. Disable the adapter to exercise the generic
+backend path. The ordinary selector and other models are unchanged.
+See the [CosyVoice3 serving guide](../../user_guide/examples/online_serving/text_to_speech.md#ascend-stage-1-graph-regions)
+for enablement, supported dtypes, capture limits, and failure behavior.

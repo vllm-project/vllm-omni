@@ -12,13 +12,10 @@ from .runtime_config import _VoxCPM2RuntimeConfig
 
 
 class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
-    """VoxCPM2 scheduler variant for full unified decode graph serving.
+    """Preserve MRV1 decode-only graph admission; MRV2 accepts mixed batches.
 
-    VoxCPM2's full unified decode graph only applies to pure decode batches.
-    When a decode-ready request is already running, this scheduler defers new
-    waiting admissions for the current tick so the decode batch can stay on the
-    VoxCPM2 graph path. This is a model-local serving policy, not a generic AR
-    scheduler rule.
+    MRV2 full and chunked prefills share the mixed varlen graph path, so running
+    decode requests do not require deferring new waiting requests.
     """
 
     def _unified_decode_graph_enabled(self) -> bool:
@@ -29,6 +26,9 @@ class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
 
     def _should_defer_waiting_for_unified_decode_graph(self) -> bool:
         if not self._unified_decode_graph_enabled():
+            return False
+        if getattr(self.vllm_config.model_config, "use_v2_model_runner", False):
+            # Mixed batches admit both full and chunked prefills.
             return False
         if not (self.waiting or self.kv_holding_waiting) or not self.running:
             return False

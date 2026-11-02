@@ -281,6 +281,10 @@ NOTE: be careful to test adequately when refactoring classes that take this styl
 | `expected_dims` | int \| None | Expected tensor rank for validation (optional) |
 | `split_output` | bool | `False`: shard **input** params; `True`: shard **output** tensors |
 | `auto_pad` | bool | Auto-pad if sequence not divisible by world_size (default: `False`) |
+| `clone_shard` | bool | Give multi-rank shards their own contiguous storage (default: `False`); single-rank inputs are unchanged |
+
+With `clone_shard=True`, memory savings require callers to drop their references to the full tensor.
+Other references to the same storage also keep the full allocation alive.
 
 **SequenceParallelOutput Parameters:**
 

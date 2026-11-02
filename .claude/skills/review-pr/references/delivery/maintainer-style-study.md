@@ -1,8 +1,8 @@
 # Maintainer Review Style
 
-Use this reference only when turning proved findings into comments. The baseline
-maintainer samples favor short, direct comments and reserve long explanations
-for architecture or non-obvious failure paths.
+Use this reference when turning proved findings or specific evidence gaps into
+comments. The baseline maintainer samples favor short, direct comments and
+reserve long explanations for architecture or non-obvious failure paths.
 
 Official docs: [contributing and review process](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/).
 
@@ -64,6 +64,39 @@ recurs across at least three PRs or is supported by current repository guidance.
 - Keep non-blocking cleanup in a linked follow-up only after the current PR is
   safe. If a revision fixes only part of a failure chain, continue the existing
   thread with the remaining trigger instead of opening a duplicate finding.
+
+## Consolidated replies with multiple actions
+
+Use a short action checklist for several independent next steps. Aim for 2-4
+items when that fits the evidence; do not invent work or omit a real blocker
+to meet a count. A single action can remain one sentence; zero findings is valid.
+
+- Lead with the useful request. Keep any scope/head line short; link a short SHA
+  to the full commit when a revision is relevant.
+- Write each `- [ ]` item as a verb plus a concrete contributor-owned deliverable
+  or completion condition. Put only necessary reasons or evidence underneath.
+- Keep verified defects, evidence gaps, and optional suggestions distinct.
+  Preserve each defect's source location, trigger, impact, and fix direction.
+- Read existing discussion and replies first. Include only remaining relevant
+  actions; do not repeat resolved requests or unchanged nudges.
+- Do not add routine maintainer/CI status sections, workflow explanations, or
+  edit-history boilerplate. Mention a testing limitation briefly only when it
+  materially affects the request or verdict. Never imply a completed review or
+  validation that did not occur.
+- To withdraw a mistaken contributor-directed L2 request, one line is enough:
+  "Please disregard my earlier request for CUDA L2 results."
+
+### Reviewer CI responsibilities
+
+Never ask contributors to provide the project's CUDA L2/Buildkite result.
+Maintainers handle CI admission and inspect matching-head results. Keep these
+checks in the review record rather than routinely narrating them to contributors.
+Check actual labels and runs; distinguish missing admission, queued/running,
+failed, passed, and unknown. Do not require an L2 result before its trigger label.
+Applicable current-head L2 remains required at the existing approval/merge gate,
+subject to the documented docs-only skip. This does not replace justified local
+regression, reproduction, or matched A/B evidence and grants no authority to apply
+labels, rerun CI, or launch compute.
 
 ## Write the finding
 

@@ -124,6 +124,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         scheduler = self.vllm_config.scheduler_config
         capture_sample_graphs(self, scheduler.max_num_seqs)
 
+    def release_auxiliary_graphs(self) -> None:
+        from .full_sample_graph import release_sample_graphs
+
+        release_sample_graphs(self)
+
     def create_omni_model_state(self, vllm_config, encoder_cache, device):
         from .model_state import HiggsModelState
 

@@ -9,6 +9,7 @@ import os
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,12 @@ from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderMediaConditioning,
     MiniMaxH3EncoderMediaInput,
+    MiniMaxH3TimelineGuide,
+)
+from vllm_omni.model_executor.models.minimax_h3.continuation_request import (
+    continuation_output_frames,
+    resolve_continuation_request,
+    window_frame_index,
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import max_output_seconds, resolve_long_video_mode
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
@@ -40,6 +47,10 @@ from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     sample_reference_video_frames,
     validate_reference_audio_files,
     validate_reference_audio_waveforms,
+)
+from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
+    MINIMAX_H3_TIMELINE_GUIDES_KEY,
+    prepare_timeline_guides,
 )
 
 MINIMAX_H3_FPS = 24
@@ -123,10 +134,18 @@ def _resolve_fl2va_keyframe_indices(extra: Mapping[str, Any], image_count: int) 
     return raw_indices
 
 
-def _validate_ref2va_reference_counts(image_count: int, video_count: int, audio_count: int) -> None:
+def _validate_ref2va_reference_counts(
+    image_count: int,
+    video_count: int,
+    audio_count: int,
+    *,
+    latent_continuation: bool = False,
+) -> None:
     if min(image_count, video_count, audio_count) < 0:
         raise OmniClientError("MiniMax H3 reference counts must be non-negative")
-    if image_count + video_count == 0:
+    # A cross-request continuation is guided by cached latents of the clip it
+    # continues, so it needs no image or video reference of its own.
+    if image_count + video_count == 0 and not latent_continuation:
         raise OmniClientError("ref2va requires at least one image or video reference")
     if image_count > 9:
         raise OmniClientError("ref2va accepts at most 9 image references")
@@ -142,11 +161,31 @@ def _validate_reference_image(image: Image.Image) -> None:
     resolve_minimax_h3_reference_image_shape(image)
 
 
+def continuation_inherits_source_canvas(task: str, sampling: Any) -> bool:
+    """Whether a T2VA ``continue_from`` request names no canvas and so keeps its source clip's."""
+    extra = sampling.extra_args or {}
+    target = extra.get("target") if isinstance(extra.get("target"), Mapping) else {}
+    return (
+        task == "t2va"
+        and resolve_continuation_request(extra) is not None
+        and target.get("aspect_ratio", extra.get("aspect_ratio")) is None
+        and getattr(sampling, "height", None) is None
+        and getattr(sampling, "width", None) is None
+    )
+
+
 def resolve_minimax_h3_shape(
     task: str,
     sampling: Any,
     image: Image.Image | None,
+    *,
+    continuation_window: bool = True,
 ) -> tuple[int, int, int, int, int]:
+    """Resolve the sampled canvas and length.
+
+    A ``continue_from`` request describes the clip it returns; its sampled
+    window prepends the hidden overlap unless ``continuation_window`` is off.
+    """
     # The diffusion package exports a pipeline that imports this shared module.
     from vllm_omni.diffusion.models.minimax_h3.time_request import (
         MINIMAX_H3_SHAPE_PLANNER,
@@ -178,17 +217,36 @@ def resolve_minimax_h3_shape(
         requested_frames = int(sampling.num_frames)
     else:
         requested_frames = 124 if task == "ref2va" else 209
-    if not MINIMAX_H3_MIN_OUTPUT_SECONDS <= requested_frames / fps <= max_seconds:
-        raise OmniClientError(f"MiniMax H3 output duration must be {duration_range}, got {requested_frames / fps:.3f}")
+    # Cap on the 17n+5 grid so num_frames accepts what the same duration aligns to.
+    max_frames = minimax_h3_align_frame_count(int(max_seconds * fps))
+    if requested_frames / fps < MINIMAX_H3_MIN_OUTPUT_SECONDS or requested_frames > max_frames:
+        raise OmniClientError(
+            f"MiniMax H3 output duration must be {duration_range} (at most {max_frames} frames), "
+            f"got {requested_frames / fps:.3f}"
+        )
     num_frames = minimax_h3_align_frame_count(requested_frames)
+    continuation = resolve_continuation_request(extra) if continuation_window else None
+    if continuation is not None:
+        num_frames = continuation.overlap_frames + continuation_output_frames(num_frames)
+        if num_frames > max_frames:
+            raise OmniClientError(
+                f"MiniMax H3 continuation output must be at most {max_frames - continuation.overlap_frames} frames, "
+                f"got {requested_frames / fps:.3f} seconds"
+            )
 
     height = getattr(sampling, "height", None)
     width = getattr(sampling, "width", None)
-    aspect_ratio = resolve_minimax_h3_aspect_ratio(
-        task,
-        target.get("aspect_ratio", extra.get("aspect_ratio")),
-        image,
-    )
+    if task == "t2va" and (height is None) != (width is None) and resolve_continuation_request(extra) is not None:
+        # A lone dimension would otherwise be replaced by the inherited source canvas.
+        raise OmniClientError("MiniMax H3 continue_from needs both height and width, or neither")
+    requested_aspect_ratio = target.get("aspect_ratio", extra.get("aspect_ratio"))
+    if task == "t2va" and requested_aspect_ratio is None and resolve_continuation_request(extra) is not None:
+        # A continuation needs no aspect ratio of its own: an explicit size wins
+        # below. Without one this canvas is provisional; only the diffusion worker
+        # holds the source clip, and it substitutes the source's canvas
+        # (see continuation_inherits_source_canvas).
+        requested_aspect_ratio = "16:9"
+    aspect_ratio = resolve_minimax_h3_aspect_ratio(task, requested_aspect_ratio, image)
     raw_short_edge = target.get("short_edge", extra.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE))
     if isinstance(raw_short_edge, bool) or not isinstance(raw_short_edge, (int, np.integer)):
         raise OmniClientError(
@@ -234,13 +292,17 @@ def _prepare_encoder_images(
     *,
     height: int,
     width: int,
+    guided: bool = False,
 ) -> list[Any]:
     if not images:
         return []
     if task == "ref2va":
+        # Guided references are kept within the output area: they ride through
+        # every denoising step next to the guide anchors.
+        max_area = width * height if guided else None
         return [
             image.resize(
-                resolve_minimax_h3_reference_image_shape(image),
+                resolve_minimax_h3_reference_image_shape(image, max_area=max_area),
                 Image.Resampling.LANCZOS,
             )
             for image in images
@@ -258,6 +320,9 @@ def _image_to_tensor(image: Image.Image) -> torch.Tensor:
 def _frames_to_tensor(frames: Sequence[Any]) -> torch.Tensor:
     if len(frames) == 0:
         raise ValueError("MiniMax H3 reference video must contain frames")
+    if isinstance(frames, np.ndarray) and frames.dtype == np.uint8 and frames.ndim == 4 and frames.shape[-1] == 3:
+        # Keep the existing owned, contiguous output without converting each RGB frame through PIL.
+        return torch.from_numpy(np.array(frames, copy=True, order="C"))
     return torch.stack(
         [
             _image_to_tensor(frame if isinstance(frame, Image.Image) else Image.fromarray(np.asarray(frame)))
@@ -294,8 +359,9 @@ def _canonical_video_edit_mask(
     latent_t: int,
     latent_h: int,
     latent_w: int,
+    num_frames: int,
 ) -> torch.Tensor:
-    """Normalize every accepted request shape to one full latent grid."""
+    """Normalize every accepted request shape, including raw frame-space masks, to one full latent grid."""
     mask = _edit_mask(value, name="video_noise_mask")
     token_shape = (latent_t, latent_h // 2, latent_w // 2)
     full_shape = (latent_t, latent_h, latent_w)
@@ -313,10 +379,109 @@ def _canonical_video_edit_mask(
         if not candidate.ndim or candidate.shape[0] != 1:
             break
         candidate = candidate.squeeze(0)
+    if candidate.ndim in (2, 3):
+        return _resize_video_edit_mask(
+            candidate,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            num_frames=num_frames,
+        )
     raise OmniClientError(
         "MiniMax H3 video_noise_mask shape must be "
-        f"scalar, ({row_count},), {token_shape}, or {full_shape}; got {tuple(mask.shape)}"
+        f"scalar, ({row_count},), {token_shape}, {full_shape}, [H, W], or [T, H, W]; got {tuple(mask.shape)}"
     )
+
+
+def _resize_video_edit_mask(
+    mask: torch.Tensor,
+    *,
+    latent_t: int,
+    latent_h: int,
+    latent_w: int,
+    num_frames: int,
+) -> torch.Tensor:
+    """Resize a raw ``[H, W]`` or frame-space ``[T, H, W]`` mask to ``[latent_t, latent_h, latent_w]``."""
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    grid = torch.nn.functional.interpolate(mask.unsqueeze(1), size=(latent_h, latent_w), mode="area").squeeze(1)
+    if grid.shape[0] == 1:
+        return grid.expand(latent_t, latent_h, latent_w).contiguous()
+    # Fit to the output length the way the source video is fitted, so the edit boundary does not drift.
+    if grid.shape[0] < num_frames:
+        grid = torch.cat([grid, grid[-1:].expand(num_frames - grid.shape[0], *grid.shape[1:])], dim=0)
+    return _temporal_group_max_pool(grid[:num_frames], latent_t=latent_t)
+
+
+def _temporal_group_max_pool(mask: torch.Tensor, *, latent_t: int) -> torch.Tensor:
+    """Max-pool frames onto the latents the causal video VAE encodes them into."""
+    clip = 17
+    frame_count = mask.shape[0]
+    num_chunks = -(-frame_count // clip)
+    padded = num_chunks * clip
+    if frame_count < padded:
+        mask = torch.cat([mask, mask[-1:].expand(padded - frame_count, *mask.shape[1:])], dim=0)
+    tokens: list[torch.Tensor] = []
+    for c in range(num_chunks):
+        chunk = mask[c * clip : (c + 1) * clip]
+        # Per 17-frame clip, token 0 covers frame 0 and token k covers frames 4k-3..4k; the VAE drops the last 3.
+        tokens.append(chunk[0:1].amax(dim=0))
+        for k in range(1, 5):
+            tokens.append(chunk[4 * k - 3 : 4 * k + 1].amax(dim=0))
+    result = torch.stack(tokens)[:-3]
+    if result.shape[0] != latent_t:
+        raise OmniClientError(
+            f"MiniMax H3 video_noise_mask temporal depth {frame_count} does not map to {latent_t} latents"
+        )
+    return result
+
+
+def _frames_to_audio_t(frames: int) -> int:
+    return round(frames * 5 / 3)
+
+
+def _frame_latents(num_frames: int) -> torch.Tensor:
+    """The causal-VAE latent each pixel frame of a ``17n+5`` clip encodes into."""
+    frames = torch.arange(num_frames)
+    return 5 * (frames // 17) + (frames % 17 + 3) // 4
+
+
+def _continuation_video_edit_mask(
+    value: Any,
+    *,
+    requested_frames: int,
+    output_frames: int,
+    overlap: int,
+    latent_h: int,
+    latent_w: int,
+) -> torch.Tensor:
+    """Map a mask written for the requested clip onto a window that hides ``overlap`` frames first.
+
+    The mask is read in the geometry the request describes, expanded to its
+    pixel frames, stretched onto the returned frames, and pooled with a
+    regenerated (1) overlap in front, so every accepted shape keeps its meaning.
+    """
+    requested_latent_t = (requested_frames - 5) // 17 * 5 + 2
+    latents = _canonical_video_edit_mask(
+        value, latent_t=requested_latent_t, latent_h=latent_h, latent_w=latent_w, num_frames=requested_frames
+    )
+    frames = latents[_frame_latents(requested_frames)]
+    frames = frames[(torch.arange(output_frames) * requested_frames) // output_frames]
+    window = torch.cat((frames.new_ones((overlap, latent_h, latent_w)), frames))
+    return _temporal_group_max_pool(window, latent_t=(overlap + output_frames - 5) // 17 * 5 + 2)
+
+
+def _continuation_audio_edit_mask(
+    value: Any,
+    *,
+    requested_audio_t: int,
+    output_audio_t: int,
+    overlap_audio_t: int,
+) -> torch.Tensor:
+    """Audio counterpart of :func:`_continuation_video_edit_mask` on the 40-Hz latent grid."""
+    mask = _canonical_audio_edit_mask(value, audio_t=requested_audio_t)
+    mask = mask[:, (torch.arange(output_audio_t) * requested_audio_t) // output_audio_t]
+    return torch.cat((mask.new_ones((2, overlap_audio_t)), mask), dim=1)
 
 
 def _canonical_audio_edit_mask(value: Any, *, audio_t: int) -> torch.Tensor:
@@ -451,8 +616,11 @@ def prepare_encoder_inputs(
         for image in raw_images:
             _validate_reference_image(image)
     elif task == "ref2va":
-        _validate_ref2va_reference_counts(len(raw_images), len(videos), len(audio_values))
-        if not raw_images and not videos:
+        latent_continuation = extra_args.get("continue_from") is not None
+        _validate_ref2va_reference_counts(
+            len(raw_images), len(videos), len(audio_values), latent_continuation=latent_continuation
+        )
+        if not raw_images and not videos and not latent_continuation:
             raise OmniClientError("ref2va requires an image or video condition")
     else:
         raise OmniClientError(f"unsupported MiniMax H3 task {task!r}")
@@ -470,19 +638,50 @@ def prepare_encoder_inputs(
         raw_video_edit_mask is None and raw_audio_edit_mask is None
     ):
         raise OmniClientError("MiniMax H3 edit sources require video_noise_mask or audio_noise_mask")
-    video_edit_mask = (
-        _canonical_video_edit_mask(
-            raw_video_edit_mask,
-            latent_t=latent_t,
-            latent_h=height // 16,
-            latent_w=width // 16,
+    # A continuation samples a window whose first ``overlap`` frames are hidden;
+    # every frame-addressed input below refers to the returned frames after it.
+    continuation = resolve_continuation_request(extra_args)
+    overlap = continuation.overlap_frames if continuation is not None else 0
+    output_frames = num_frames - overlap
+    requested_frames = (
+        resolve_minimax_h3_shape(
+            task, diffusion_sampling_params, raw_images[0] if raw_images else None, continuation_window=False
+        )[2]
+        if continuation is not None
+        else num_frames
+    )
+    video_edit_mask = None
+    if raw_video_edit_mask is not None:
+        video_edit_mask = (
+            _continuation_video_edit_mask(
+                raw_video_edit_mask,
+                requested_frames=requested_frames,
+                output_frames=output_frames,
+                overlap=overlap,
+                latent_h=height // 16,
+                latent_w=width // 16,
+            )
+            if continuation is not None
+            else _canonical_video_edit_mask(
+                raw_video_edit_mask,
+                latent_t=latent_t,
+                latent_h=height // 16,
+                latent_w=width // 16,
+                num_frames=num_frames,
+            )
         )
-        if raw_video_edit_mask is not None
-        else None
-    )
-    audio_edit_mask = (
-        _canonical_audio_edit_mask(raw_audio_edit_mask, audio_t=audio_t) if raw_audio_edit_mask is not None else None
-    )
+    audio_edit_mask = None
+    if raw_audio_edit_mask is not None:
+        audio_edit_mask = (
+            _continuation_audio_edit_mask(
+                raw_audio_edit_mask,
+                requested_audio_t=_frames_to_audio_t(requested_frames),
+                output_audio_t=audio_t - _frames_to_audio_t(overlap),
+                overlap_audio_t=_frames_to_audio_t(overlap),
+            )
+            if continuation is not None
+            else _canonical_audio_edit_mask(raw_audio_edit_mask, audio_t=audio_t)
+        )
     # An all-generate mask has no clean source dependency and remains a no-op.
     if video_edit_mask is not None and bool(torch.all(video_edit_mask == 1.0).item()):
         video_edit_mask = None
@@ -499,11 +698,31 @@ def prepare_encoder_inputs(
     if audio_edit_mask is not None and source_audio is None and source_video is None:
         raise OmniClientError("MiniMax H3 audio_noise_mask requires source_audio or source_video")
 
+    raw_guides = multi_modal_data.get(MINIMAX_H3_TIMELINE_GUIDES_KEY)
+    if raw_guides is not None:
+        # Guides change the packed layout, so every feature that rebuilds or
+        # extends that layout is rejected before any media is decoded.
+        if resolve_long_video_mode(extra_args, task) == "continuation":
+            raise OmniClientError("MiniMax H3 timeline guides do not support continuation; use long_video_mode=full")
+        if video_edit_mask is not None or audio_edit_mask is not None:
+            raise OmniClientError("MiniMax H3 timeline guides cannot be combined with latent-mask editing")
+        if lock_audio:
+            raise OmniClientError("MiniMax H3 timeline guides cannot be combined with audio_mode=lock_source")
+    if continuation is not None and isinstance(raw_guides, Sequence) and not isinstance(raw_guides, (str, bytes)):
+        raw_guides = [
+            {**guide, "frame_index": window_frame_index(guide["frame_index"], overlap)}
+            if isinstance(guide, Mapping) and type(guide.get("frame_index")) is int
+            else guide
+            for guide in raw_guides
+        ]
+    timeline_guides = prepare_timeline_guides(raw_guides, width=width, height=height, num_frames=num_frames)
+
     images = _prepare_encoder_images(
         task,
         raw_images,
         height=height,
         width=width,
+        guided=bool(timeline_guides),
     )
     keyframe_indices = _resolve_fl2va_keyframe_indices(extra_args, len(images)) if task == "fl2va" else []
     video_timestamps: list[list[float]] = []
@@ -529,31 +748,11 @@ def prepare_encoder_inputs(
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
                     )
-                for item in prepared_videos:
-                    full_frames = load_video_frames(item["prepared_path"])
-                    encoded_video_inputs.append(_frames_to_tensor(full_frames))
-                    sampled = sample_reference_video_frames(
-                        item["prepared_path"],
-                        decoded_frames=full_frames,
-                    )
-                    video_timestamps.append(sampled["block_timestamps"])
-                    frames = np.stack(sampled["frames"])
-                    frame_count = int(frames.shape[0])
-                    qwen_video_inputs.append(
-                        (
-                            frames,
-                            {
-                                "total_num_frames": frame_count,
-                                "fps": MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
-                                "duration": frame_count / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
-                                "video_backend": "minimax_h3",
-                                "frames_indices": list(range(frame_count)),
-                                "do_sample_frames": False,
-                            },
-                        )
-                    )
-                    if item["input_has_audio"]:
-                        waveform, sample_rate = load_video_audio(
+                audio_pool = ThreadPoolExecutor(max_workers=1)
+                try:
+                    audio_futures = [
+                        audio_pool.submit(
+                            load_video_audio,
                             item["original_path"],
                             start_time_seconds=float(item.get("start_time_seconds", 0.0)),
                             duration_seconds=item.get(
@@ -561,9 +760,40 @@ def prepare_encoder_inputs(
                                 item.get("duration_seconds"),
                             ),
                         )
-                        video_audio_inputs.append((waveform.float().contiguous(), int(sample_rate)))
-                    else:
-                        video_audio_inputs.append(None)
+                        if item["input_has_audio"]
+                        else None
+                        for item in prepared_videos
+                    ]
+                    for item, audio_future in zip(prepared_videos, audio_futures):
+                        full_frames = load_video_frames(item["prepared_path"])
+                        encoded_video_inputs.append(_frames_to_tensor(full_frames))
+                        sampled = sample_reference_video_frames(
+                            item["prepared_path"],
+                            decoded_frames=full_frames,
+                        )
+                        video_timestamps.append(sampled["block_timestamps"])
+                        frames = np.stack(sampled["frames"])
+                        frame_count = int(frames.shape[0])
+                        qwen_video_inputs.append(
+                            (
+                                frames,
+                                {
+                                    "total_num_frames": frame_count,
+                                    "fps": MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+                                    "duration": frame_count / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+                                    "video_backend": "minimax_h3",
+                                    "frames_indices": list(range(frame_count)),
+                                    "do_sample_frames": False,
+                                },
+                            )
+                        )
+                        if audio_future is not None:
+                            waveform, sample_rate = audio_future.result()
+                            video_audio_inputs.append((waveform.float().contiguous(), int(sample_rate)))
+                        else:
+                            video_audio_inputs.append(None)
+                finally:
+                    audio_pool.shutdown(wait=True, cancel_futures=True)
         audio_index = 0
         for video_index, item in enumerate(prepared_videos, start=1):
             if item["input_has_audio"]:
@@ -583,13 +813,16 @@ def prepare_encoder_inputs(
                     source_video,
                     target_width=width,
                     target_height=height,
-                    target_frame_count=num_frames,
+                    target_frame_count=output_frames,
                     workdir=workdir,
                 )
                 edit_video_frames = load_video_frames(edit_video_metadata["prepared_path"])
             except subprocess.CalledProcessError as exc:
                 raise OmniClientError("MiniMax H3 could not decode source_video for editing") from exc
             video_edit = _frames_to_tensor(edit_video_frames)
+            if overlap:
+                # The hidden overlap is regenerated (mask 1); its source frames are placeholders.
+                video_edit = torch.cat((video_edit[:1].expand(overlap, *video_edit.shape[1:]), video_edit))
 
     audio_edit: tuple[torch.Tensor, int] | None = None
     if audio_edit_mask is not None:
@@ -604,16 +837,20 @@ def prepare_encoder_inputs(
             try:
                 waveform, sample_rate = load_video_audio(
                     str(source_video),
-                    duration_seconds=float(num_frames) / MINIMAX_H3_FPS,
+                    duration_seconds=float(output_frames) / MINIMAX_H3_FPS,
                 )
             except subprocess.CalledProcessError as exc:
                 raise OmniClientError("MiniMax H3 could not decode source_video audio for editing") from exc
         if waveform.ndim not in (1, 2) or int(sample_rate) <= 0:
             raise OmniClientError("MiniMax H3 edit audio requires a waveform and positive sample rate")
-        max_samples = max(1, int(round(float(num_frames) / MINIMAX_H3_FPS * int(sample_rate))))
+        max_samples = max(1, int(round(float(output_frames) / MINIMAX_H3_FPS * int(sample_rate))))
         waveform = waveform[..., :max_samples].float().contiguous()
         if waveform.shape[-1] == 0:
             raise OmniClientError("MiniMax H3 edit audio must not be empty")
+        if overlap:
+            # Silence under the hidden overlap, which the audio mask regenerates.
+            silence = waveform.new_zeros((*waveform.shape[:-1], int(round(overlap / MINIMAX_H3_FPS * sample_rate))))
+            waveform = torch.cat((silence, waveform), dim=-1)
         audio_edit = (waveform, int(sample_rate))
 
     if raw_audio is not None and not lock_audio:
@@ -642,6 +879,7 @@ def prepare_encoder_inputs(
         video_edit_mask=video_edit_mask,
         audio_edit=audio_edit,
         audio_edit_mask=audio_edit_mask,
+        timeline_guides=timeline_guides,
     )
     audio_inputs = _effective_audio_inputs(
         media_input.video_audios,
@@ -671,6 +909,66 @@ def _image_from_tensor(value: torch.Tensor) -> Image.Image:
     return Image.fromarray(array, mode="RGB")
 
 
+def _encode_guide_frames(guide: MiniMaxH3TimelineGuide, video_vae: Any, height: int, width: int) -> torch.Tensor | None:
+    if guide.frames is None:
+        return None
+    frames = guide.frames.detach().cpu().to(torch.uint8).contiguous()
+    if guide.is_clip:
+        rows, shape = video_vae.encode_video(np.asarray(frames.numpy()))
+        latent_t = int(shape[0])
+    else:
+        rows = video_vae.encode_image(_image_from_tensor(frames[0]))
+        latent_t = 1
+    if tuple(rows.shape) != (latent_t * (height // 32) * (width // 32), 96):
+        raise ValueError(f"MiniMax H3 timeline guide VAE returned rows {tuple(rows.shape)}")
+    return rows.to(dtype=torch.float32).contiguous()
+
+
+def _timeline_guide_conditioning(
+    media: MiniMaxH3EncoderMediaInput,
+    visual_rows: Sequence[torch.Tensor | None],
+    *,
+    audio_vae: Any,
+    component_scope: Callable[[Any], AbstractContextManager[Any]],
+) -> tuple[tuple[dict[str, Any], ...], torch.Tensor | None, torch.Tensor | None]:
+    """Build ordered guide blocks with their visual and audio anchor rows."""
+    if not media.timeline_guides:
+        return (), None, None
+    latent_h, latent_w = media.height // 16, media.width // 16
+    frame_rows = (latent_h // 2) * (latent_w // 2)
+    blocks: list[dict[str, Any]] = []
+    audio_rows: list[torch.Tensor] = []
+    for guide, rows in zip(media.timeline_guides, visual_rows, strict=True):
+        block: dict[str, Any] = {"frame_index": int(guide.start)}
+        if rows is not None:
+            block.update(
+                kind="video" if guide.is_clip else "image",
+                latent_t=rows.shape[0] // frame_rows,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                ref_audio_t=0,
+            )
+        if guide.audio is not None:
+            if audio_vae is None:
+                raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")
+            with component_scope(audio_vae):
+                encoded, length = audio_vae.encode_waveform(*guide.audio)
+            length = int(length)
+            if length < 1 or tuple(encoded.shape) != (2 * length, 32):
+                raise ValueError("MiniMax H3 timeline guide audio VAE returned empty or invalid stereo rows")
+            # Rows are channel-major: crop time per channel, not the flat prefix.
+            cropped = min(length, guide.audio_limit)
+            audio_rows.append(encoded.reshape(2, length, 32)[:, :cropped].reshape(-1, 32).to(torch.float32))
+            block.update(kind="video_audio" if rows is not None else "audio", ref_audio_t=cropped)
+        blocks.append(block)
+    present = [rows for rows in visual_rows if rows is not None]
+    return (
+        tuple(blocks),
+        torch.cat(present).contiguous() if present else None,
+        torch.cat(audio_rows).contiguous() if audio_rows else None,
+    )
+
+
 def encode_media(
     media: MiniMaxH3EncoderMediaInput,
     *,
@@ -698,7 +996,9 @@ def encode_media(
     visual_rows: list[torch.Tensor] = []
     visual_shapes: list[tuple[int, int, int]] = []
     video_edit_clean_rows: torch.Tensor | None = None
-    if media.images or media.videos or media.video_edit is not None:
+    guide_visual_rows: list[torch.Tensor | None] = [None] * len(media.timeline_guides)
+    has_guide_frames = any(guide.frames is not None for guide in media.timeline_guides)
+    if media.images or media.videos or media.video_edit is not None or has_guide_frames:
         if video_vae is None:
             raise RuntimeError("MiniMax H3 video VAE is not resident on this rank")
         with component_scope(video_vae):
@@ -724,6 +1024,11 @@ def encode_media(
                         f"expected {expected_shape} and ({expected_rows}, 96)"
                     )
                 video_edit_clean_rows = rows.to(dtype=torch.float32).contiguous()
+            # Guide stills and clips share the video VAE collective with the
+            # references, so every visual participant encodes them as well.
+            guide_visual_rows = [
+                _encode_guide_frames(guide, video_vae, media.height, media.width) for guide in media.timeline_guides
+            ]
 
     if not emit_conditioning:
         return None
@@ -749,6 +1054,12 @@ def encode_media(
                     int(source_audio_t),
                     target_audio_t=media.audio_t,
                 )
+    guide_blocks, guide_visual, guide_audio = _timeline_guide_conditioning(
+        media,
+        guide_visual_rows,
+        audio_vae=audio_vae,
+        component_scope=component_scope,
+    )
     reference_lengths = audio_lengths[:-1] if media.audio_mode == "lock_source" else audio_lengths
     if reference_lengths:
         if any(length < 80 or length > 600 for length in reference_lengths):
@@ -813,4 +1124,7 @@ def encode_media(
         audio_edit_clean_rows=audio_edit_clean_rows,
         audio_edit_mask=audio_edit_mask,
         audio_edit_source_t=audio_edit_source_t,
+        guide_blocks=guide_blocks,
+        guide_visual_condition=guide_visual,
+        guide_audio_condition=guide_audio,
     )
