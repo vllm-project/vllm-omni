@@ -250,6 +250,7 @@ def test_generate_video_appends_timeline_guides_port_last():
         "fast_h3",
         "latent_edit",
         "timeline_guides",
+        "control",
     ]
     assert schema["optional"]["timeline_guides"] == ("H3_TIMELINE_GUIDES",)
     assert VLLMOmniGenerateVideo.RETURN_TYPES == ("VIDEO",)
