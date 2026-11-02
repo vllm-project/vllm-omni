@@ -44,7 +44,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
 vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
 ```
 
-For more details on parallelism acceleration, see the [Parallelism Acceleration Guide](../../diffusion/parallelism_acceleration.md).
+For more details on parallelism acceleration, see the [Parallelism Acceleration Guide](../../../docs/user_guide/diffusion/parallelism/overview.md).
 
 ## API Calls
 
