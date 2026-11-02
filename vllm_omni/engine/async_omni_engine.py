@@ -228,6 +228,7 @@ class AsyncOmniEngine(OmniEngineBase):
         message_type: Literal["add_request", "streaming_update"] = "add_request",
         yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
+        requested_replica_id: int | None = None,
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
         trace_headers = capture_trace_headers(trace_headers)
@@ -411,6 +412,7 @@ class AsyncOmniEngine(OmniEngineBase):
             yield_stage_id=yield_stage_id,
             entry_stage_id=entry_stage_id,
             lora_request=lora_request,
+            requested_replica_id=requested_replica_id,
         )
 
     def _build_cfg_companions(
@@ -532,6 +534,7 @@ class AsyncOmniEngine(OmniEngineBase):
         resumable: bool = False,
         yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
+        requested_replica_id: int | None = None,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
 
@@ -557,6 +560,7 @@ class AsyncOmniEngine(OmniEngineBase):
             resumable=resumable,
             yield_stage_id=yield_stage_id,
             entry_stage_id=entry_stage_id,
+            requested_replica_id=requested_replica_id,
             kv_hints=kv_hints,
         )
         try:
@@ -597,6 +601,7 @@ class AsyncOmniEngine(OmniEngineBase):
         resumable: bool = False,
         yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
+        requested_replica_id: int | None = None,
     ) -> tuple[StageSubmissionMessage, list[AddCompanionRequestMessage]]:
         """Build the ADD message plus CFG companions without enqueueing."""
         # Client requests must never bring the server-reserved artifact-dirs
@@ -625,6 +630,7 @@ class AsyncOmniEngine(OmniEngineBase):
                 resumable=resumable,
                 yield_stage_id=yield_stage_id,
                 entry_stage_id=entry_stage_id,
+                requested_replica_id=requested_replica_id,
                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
             )
             # CFG companions are built before the parent is admitted, so the group
@@ -858,6 +864,7 @@ class AsyncOmniEngine(OmniEngineBase):
         resumable: bool = False,
         yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
+        requested_replica_id: int | None = None,
     ) -> None:
         """Async add_request API.
 
@@ -884,6 +891,7 @@ class AsyncOmniEngine(OmniEngineBase):
             resumable=resumable,
             yield_stage_id=yield_stage_id,
             entry_stage_id=entry_stage_id,
+            requested_replica_id=requested_replica_id,
             **({"kv_hints": kv_hints} if kv_hints is not None else {}),
         )
         outcome: dict[str, bool] = {"parent_enqueued": False}
