@@ -79,6 +79,11 @@ outputs = omni.generate(
 
 For distilled few-step LoRAs, pass `lora_backend="distill"` together with one or more concrete `.safetensors` files. The weights are fused into the base model once at init; subsequent `generate()` calls do not need a `LoRARequest`.
 
+For Qwen-Image pipelines, single-file `lora_A`/`lora_B` weights may include
+the `.default` adapter suffix and may omit the `transformer.` prefix. These
+names are normalized before fusion. If no weights match the transformer,
+loading raises an error instead of registering the adapter as fused.
+
 ##### Supported pipelines
 
 For Qwen-Image and Wan pipelines, the distill backend calls `pipeline.load_lora_weights(...)` during worker initialization.
