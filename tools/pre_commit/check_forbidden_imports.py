@@ -57,6 +57,9 @@ CHECK_IMPORTS = {
             # Round-trips ErrorSummary through pickle on purpose: RFC 01 ships it
             # inside all_gather_object messages, which pickle the object.
             "tests/diffusion/weight_stack/test_errors.py",
+            # Round-trips RoundMessage through pickle on purpose: confirmation
+            # messages travel inside all_gather_object, which pickles them.
+            "tests/diffusion/weight_stack/test_group.py",
             "tests/helpers/process.py",
             "vllm_omni/diffusion/distributed/group_coordinator.py",
         },
