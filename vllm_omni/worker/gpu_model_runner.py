@@ -934,7 +934,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         self.input_batch.refresh_metadata()
 
         # Incrementally update ngram_gpu tensors after batch is stable
-        if is_ngram_gpu:
+        if is_ngram_gpu and not preserve_batch:
             update_ngram_gpu_tensors_incremental(
                 self.input_batch,
                 self.token_ids_gpu_tensor,
