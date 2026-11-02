@@ -3197,6 +3197,9 @@ class OrchestratorBase:
                             memo,
                             shared_types=(torch.Tensor,),
                         )
+                        additional_information = base_input["additional_information"]
+                        if isinstance(additional_information, dict):
+                            additional_information.pop("input_stream", None)
                 else:
                     base_input = {}
 

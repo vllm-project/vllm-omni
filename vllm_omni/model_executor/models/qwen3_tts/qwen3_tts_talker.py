@@ -838,9 +838,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             raise ValueError("Input streaming requires interleaved CustomVoice")
         model_config = vllm_config.model_config
         if (
-            not model_config.final_output
-            or model_config.engine_output_type != "audio"
-            or request.resumable
+            request.resumable
             or not model_config.use_v2_model_runner
             or vllm_config.num_speculative_tokens
             or vllm_config.cache_config.enable_prefix_caching
@@ -849,7 +847,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             or vllm_config.parallel_config.data_parallel_size != 1
         ):
             raise ValueError(
-                "Input streaming requires a fused audio Talker, MRv2, TP=PP=DP=1, no prefix cache or speculation"
+                "Input streaming requires MRv2, TP=PP=DP=1, no resumable prompt, prefix cache or speculation"
             )
         capacity = min(request.max_tokens - 1, model_config.max_model_len - request.num_prompt_tokens - 1)
         return Qwen3TTSTextInput(
