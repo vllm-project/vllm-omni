@@ -57,7 +57,7 @@ select the Soprano pipeline. Do not edit `config.json` to imitate another model.
 | NVIDIA driver | 610.47 |
 | PyTorch / runtime | 2.13.0+cu130 / CUDA 13.0; driver capability is not the PyTorch runtime version |
 | vLLM / Transformers | 0.32.0 / 5.19.0 |
-| Runtime implementation | Record the current checkout with `git rev-parse HEAD`; the initial qualification was at `0fe4fc9c87ff5632d697ca2822db901c917aae11`, before subsequent upstream runner integration |
+| Runtime implementation | Post-integration runtime validated at `301ed5c37361dec9d5136d0e7a6a4303d0184d73`; the qualification-only documentation update preserves its runtime, benchmark and test trees |
 | Checkpoint revision | `27b5a5f5f541a1db3a51d6fd1b0fc7147b92cd01` |
 
 ## Setup
@@ -224,16 +224,16 @@ saved audio after stopping services, avoiding ASR GPU contention.
 | --- | --- |
 | Native eager FP32, offline and Speech API | Locally executed with the pinned checkpoint |
 | [Async chunk streaming](../../docs/design/feature/async_chunk.md) | PCM/SSE deltas, chunk 4; complete WAV also supported on this profile |
-| Concurrent HTTP | C1/C2/C4/C8 measured; still one sequence per stage, not GPU batch 8 |
+| Concurrent HTTP | Historical C1/C2/C4/C8 measurements; integrated runner rechecked for cancellation with a peer; still one sequence per stage, not GPU batch 8 |
 | Continuous playback | Not guaranteed: the pre-integration matched-55W experiment had 4/3000 requests with >100 ms deficits, maximum 362 ms; not remeasured on the integrated runner |
 | [Quantization](../../docs/user_guide/quantization/overview.md), BF16 AR | Unqualified; no INT8/INT4/FP8 or BF16 combination tested here |
 | Multiple GPUs, TP>1, DP/PP, GPU batching>1 | Not qualified; no provided multi-device profile |
 | CUDA graphs / speculative multi-token decoding | Streaming explicitly rejects these combinations; complete-response combinations are unqualified |
 | Prefix caching / chunked prefill | Disabled; unqualified combinations |
 | Other hardware/platforms | CPU-only inference, desktop 4090, L4/H100, AMD/ROCm, Ascend, Intel, macOS/MPS and native Windows not qualified by this recipe |
-| Quality | English ASR and manual-review checklist available; human listening/MOS pending, no cloning SIM acceptance |
+| Quality | Historical English ASR and manual-review checklist; fresh online content assertions; human listening/MOS pending, no cloning SIM acceptance |
 
-The initial command replay at `0fe4fc9c87ff5632d697ca2822db901c917aae11` produced 98304 samples
+The post-integration command replay at `301ed5c37361dec9d5136d0e7a6a4303d0184d73` produced 98304 samples
 (3.072 seconds) per fixed-text WAV at 32000 Hz mono. The streaming profile's
 WAV, raw PCM and 12 SSE audio deltas were sample-identical; the SSE terminal
 event was present. The documented benchmark smoke completed 20/20 requests,
