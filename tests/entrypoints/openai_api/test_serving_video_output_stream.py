@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import anyio
 import numpy as np
@@ -772,6 +772,7 @@ class TestStreamingVideoOutputPromptUpdate:
         engine_client.submit_interaction_async.assert_awaited_once_with(
             request_id,
             interaction={"event_id": "ui-update-42", "event": {"prompt": "new scene"}},
+            on_error=ANY,
         )
 
     def test_prompt_update_rejects_duplicate_event_id(self, mocker: MockerFixture):
@@ -829,6 +830,7 @@ class TestStreamingVideoOutputPromptUpdate:
         engine_client.submit_interaction_async.assert_awaited_once_with(
             request_id,
             interaction={"event_id": "ui-update-42", "event": {"prompt": "new scene"}},
+            on_error=ANY,
         )
 
     def test_prompt_update_forwards_transition_chunks(self, mocker: MockerFixture):
@@ -882,6 +884,7 @@ class TestStreamingVideoOutputPromptUpdate:
                 "event": {"prompt": "fade to sunset"},
                 "transition_chunks": 5,
             },
+            on_error=ANY,
         )
 
     def test_prompt_update_rejects_empty_prompt(self, mocker: MockerFixture):
@@ -1032,6 +1035,70 @@ class TestStreamingVideoOutputPromptUpdate:
 
         engine_client.submit_interaction_async.assert_awaited_once()
 
+    def test_prompt_update_late_rejection_returns_correlated_error(self, mocker: MockerFixture):
+        """A rejection after the queued ack is a correlated error; streaming continues."""
+
+        submissions: list[Any] = []
+
+        async def fake_submit(request_id, *, interaction, on_error=None):
+            submissions.append(on_error)
+
+        async def mock_generate(*_args, **_kwargs):
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws",
+                images=[_fake_video_frames(2)],
+                final_output_type="image",
+                finished=False,
+            )
+            while not submissions:
+                await asyncio.sleep(0.01)
+            await submissions[0]("ui-update-42", "Failed interaction for request req-ws: prompt embeds are not ready")
+            # The rejected event_id is free again; wait for its resubmission.
+            while len(submissions) < 2:
+                await asyncio.sleep(0.01)
+            yield OmniRequestOutput.from_diffusion(
+                request_id="req-ws",
+                images=[_fake_video_frames(2)],
+                final_output_type="image",
+                finished=True,
+            )
+
+        app, _handler, engine_client = _build_test_app(
+            mocker=mocker,
+            streaming_chunks=[(b"mp4-chunk-0", False), (b"mp4-chunk-1", True)],
+            mock_generate=mock_generate,
+        )
+        engine_client.submit_interaction_async.side_effect = fake_submit
+        interaction = {
+            "type": "session.interaction",
+            "interaction": {"event_id": "ui-update-42", "event": {"prompt": "new scene"}},
+        }
+
+        with TestClient(app) as client:
+            with client.websocket_connect("/v1/realtime/video") as ws:
+                ws.send_json({"type": "session.start", "prompt": "initial"})
+                request_id = ws.receive_json()["request_id"]
+                assert _receive_video_chunk(ws)[1] == b"mp4-chunk-0"
+
+                ws.send_json(interaction)
+                assert ws.receive_json()["type"] == "session.interaction.queued"
+                err = ws.receive_json()
+                assert err["type"] == "error"
+                assert err["code"] == "interaction_failed"
+                assert err["request_id"] == request_id
+                assert err["event_id"] == "ui-update-42"
+                assert "Failed to apply interaction" in err["message"]
+
+                ws.send_json(interaction)
+                assert ws.receive_json()["type"] == "session.interaction.queued"
+
+                assert _receive_video_chunk(ws)[1] == b"mp4-chunk-1"
+                done = ws.receive_json()
+                assert done["type"] == "session.done"
+                assert done["chunks"] == 2
+
+        assert engine_client.submit_interaction_async.await_count == 2
+
     @pytest.mark.asyncio
     async def test_prompt_update_accepted_via_async_handler(self, mocker: MockerFixture):
         """interaction acknowledgement is sent while generation is in progress."""
@@ -1084,6 +1151,7 @@ class TestStreamingVideoOutputPromptUpdate:
                 "event": {"prompt": "mid-stream update"},
                 "transition_chunks": 2,
             },
+            on_error=ANY,
         )
 
     @pytest.mark.asyncio
@@ -1112,7 +1180,7 @@ class TestStreamingVideoOutputPromptUpdate:
         engine_client.reserve_streaming_interaction = mocker.AsyncMock(return_value=12.5)
         engine_client.release_streaming_interaction = mocker.AsyncMock()
 
-        async def submit(request_id, *, interaction, track_playback):
+        async def submit(request_id, *, interaction, track_playback, on_error=None):
             del request_id
             assert track_playback is True
             delivered_ids.append(interaction["event_id"])
@@ -1225,6 +1293,7 @@ class TestStreamingVideoOutputPromptUpdate:
                 },
                 "transition_chunks": 2,
             },
+            on_error=ANY,
         )
 
 
@@ -1310,7 +1379,7 @@ async def test_control_ack_outbox_keeps_fifo_and_media_pair(mocker: MockerFixtur
 
     handler, engine, ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
 
-    async def submit(_request_id, *, interaction):
+    async def submit(_request_id, *, interaction, on_error=None):
         ids.append(interaction["event_id"])
         if len(ids) == 2:
             delivered.set()
