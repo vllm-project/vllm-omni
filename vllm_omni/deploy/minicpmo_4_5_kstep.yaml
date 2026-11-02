@@ -18,7 +18,10 @@
 #   KSTEP_PLAIN_STEP=1     run plain single-frame steps (no K-span booking)
 #   KSTEP_CUDA_GRAPH=0     disable the narrow-row CUDA graph replay
 #   KSTEP_CUDA_NARROW=0    disable the narrow-row graph cache entirely
-#   KSTEP_MAX_ROWS=<n>     cap the batch width that still runs the K-frame loop
+#   KSTEP_MAX_ROWS=<n>     debugging only: lower the batch width that still runs
+#                          the K-frame loop. Values below max_num_seqs drop wide
+#                          batches onto the degraded path and cost 30-40% at
+#                          c16/c32; the default (max_num_seqs) is the shipping one.
 #   KSTEP_WARMUP_SAMPLER=0 skip the sampler warmup at load
 base_config: minicpmo_4_5.yaml
 
