@@ -94,8 +94,20 @@ def log_mel_spectrogram(audio: Any, n_mels: int = 128, padding: int = 479) -> to
 
     Returns:
         Log mel-spectrogram tensor of shape (n_mels, T)
+
+    Raises:
+        ValueError: If the waveform contains no samples.
     """
     audio = _normalize_audio(audio)
+    if audio.numel() == 0:
+        raise ValueError("Step-Audio2 audio input must contain at least one sample.")
+    # One encoder/adapter feature needs three valid mel frames, plus the two
+    # boundary frames excluded by padding_mels. Pad short, non-empty waveforms
+    # with silence before STFT so they retain a placeholder without changing
+    # the reference attention mask for ordinary audio.
+    min_samples = 5 * 160 - max(padding, 0)
+    if audio.shape[-1] < min_samples:
+        audio = F.pad(audio, (0, min_samples - audio.shape[-1]))
     if padding > 0:
         audio = F.pad(audio, (0, padding))
     window = torch.hann_window(400, device=audio.device)
@@ -121,14 +133,7 @@ def padding_mels(data: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         padded_feats: Padded tensor of shape (batch, n_mels, max_T)
         feats_lengths: Lengths of each sequence
     """
-    # Keep the full mel length, including the two boundary frames produced by
-    # Step-Audio2's 479-sample right padding.  The Step-Audio2 reference
-    # implementation uses this same length for prompt expansion and encoder
-    # masking.  Dropping the boundary frames here makes very short, non-empty
-    # audio inconsistent:
-    # prompt expansion produces one placeholder while the encoder produces no
-    # embeddings.
-    feats_lengths = torch.tensor([s.size(1) for s in data], dtype=torch.int32)
+    feats_lengths = torch.tensor([s.size(1) - 2 for s in data], dtype=torch.int32)
     feats = [s.t() for s in data]
     padded_feats = pad_sequence(feats, batch_first=True, padding_value=0)
     return padded_feats.transpose(1, 2), feats_lengths
@@ -346,7 +351,7 @@ def calculate_audio_feature_length(mel_length: int) -> int:
        - Output length: (encoder_output - 1) // 2 + 1
 
     Args:
-        mel_length: Length of mel spectrogram (time steps)
+        mel_length: Valid mel time steps, excluding the two STFT boundary frames
 
     Returns:
         Final feature length after encoder + adapter
@@ -355,7 +360,7 @@ def calculate_audio_feature_length(mel_length: int) -> int:
         >>> calculate_audio_feature_length(1000)
         125
     """
-    encoder_output_len = (mel_length + 1) // 2 // 2
+    encoder_output_len = (mel_length + 1) // 4
 
     adapter_output_len = (encoder_output_len - 1) // 2 + 1
 
@@ -533,9 +538,12 @@ class StepAudio2MultiModalProcessor(BaseMultiModalProcessor[StepAudio2Processing
                 audio_lens_list = list(audio_lens) if hasattr(audio_lens, "__iter__") else [audio_lens]
 
             for length in audio_lens_list:
-                if length > 0:
-                    feature_len = calculate_audio_feature_length(int(length))
-                    feature_lens.append(feature_len)
+                if length <= 0:
+                    raise ValueError("Step-Audio2 audio lengths must be positive.")
+                feature_len = calculate_audio_feature_length(int(length))
+                if feature_len <= 0:
+                    raise ValueError("Step-Audio2 audio must produce at least one audio feature.")
+                feature_lens.append(feature_len)
 
         # CRITICAL: Align feature_lens with mm_items['audio'] count
         if num_audio_items > 0:
