@@ -90,11 +90,13 @@ because it can run a tensor-parallel collective.
 
 ## GPU memory accounting and output snapshots
 
-Workers size the KV cache from upstream profiling's `non_kv_cache_memory`
-(device consumption plus transient peak headroom), then reserve CUDA graph
-and auxiliary graph memory separately. Reconstructing consumption from model
-weights and profiling-window increments misses persistent runner buffers
-allocated before profiling starts.
+Workers size the KV cache from model weights, persistent runner buffers
+allocated before profiling starts (torch allocations beyond the weights at
+that point), the profiling-window peak increase and non-torch memory, then
+reserve CUDA graph and auxiliary graph memory separately. Upstream
+profiling's `non_kv_cache_memory` is not used, because it also counts memory
+the caching allocator reserves without allocating, such as graph pools
+captured at model load; co-located stage budgets are tuned without it.
 
 MRv2 asynchronous output snapshots reuse one capacity buffer per dtype/device
 group in each ring slot. The slot waits for its previous device-to-host copy

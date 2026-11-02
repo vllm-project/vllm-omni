@@ -41,15 +41,20 @@ def _fresh_once_loggers():
         getattr(vllm_logger, name).cache_clear()
 
 
-def _fake_memory_profiling(*, non_torch: int, torch_peak: int, persistent_buffers: int = 0):
+def _fake_memory_profiling(
+    *, non_torch: int, torch_peak: int, persistent_buffers: int = 0, reserved_unallocated: int = 0
+):
     """A stand-in for ``vllm.utils.mem_utils.memory_profiling`` context manager."""
 
     @contextmanager
     def _mp(snapshot, weights_memory):  # noqa: ARG001 - signature parity only
         # Buffers allocated before profile_run are resident but absent from
         # both model_memory_usage and the profiling-window peak increase.
-        consumed = weights_memory + persistent_buffers + non_torch
+        # Reserved-but-unallocated allocator memory (e.g. graph pools captured
+        # at load) shows up only in the device-level consumption.
+        consumed = weights_memory + persistent_buffers + non_torch + reserved_unallocated
         yield SimpleNamespace(
+            before_profile=SimpleNamespace(torch_allocated=weights_memory + persistent_buffers),
             non_torch_increase=non_torch,
             torch_peak_increase=torch_peak,
             total_consumed=consumed,
@@ -127,6 +132,19 @@ def test_determine_available_memory_reserves_preprofile_runtime_buffers(monkeypa
     assert worker.total_consumed == 14 * GIB
 
 
+def test_determine_available_memory_ignores_reserved_unallocated_memory(monkeypatch):
+    """Co-located stage budgets are tuned without allocator slack such as load-time graph pools."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, reserved_unallocated=7 * GIB),
+    )
+
+    assert worker.determine_available_memory() == 17 * GIB
+    assert worker.total_consumed == 18 * GIB
+
+
 def test_determine_available_memory_does_not_count_retained_peak_twice(monkeypatch):
     """Persistent allocations made during profiling are already in consumption."""
     worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
@@ -134,6 +152,7 @@ def test_determine_available_memory_does_not_count_retained_peak_twice(monkeypat
     @contextmanager
     def profile_memory(snapshot, weights_memory):
         yield SimpleNamespace(
+            before_profile=SimpleNamespace(torch_allocated=10 * GIB),
             non_torch_increase=1 * GIB,
             torch_peak_increase=5 * GIB,
             total_consumed=14 * GIB,
