@@ -76,6 +76,11 @@ _DIFFUSION_MODELS = {
         "pipeline_z_image",
         "ZImagePipeline",
     ),
+    "BriaFibo2Pipeline": (
+        "bria_fibo2",
+        "pipeline_bria_fibo2",
+        "BriaFibo2Pipeline",
+    ),
     "OvisImagePipeline": (
         "ovis_image",
         "pipeline_ovis_image",
@@ -719,6 +724,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "QwenImage21Pipeline": "get_qwen_image_21_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
     "ZImagePipeline": "get_post_process_func",
+    "BriaFibo2Pipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "MammothModa2DiTPipeline": "get_mammoth_moda2_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",
@@ -807,6 +813,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     # where mod_folder and mod_relname are  defined and mapped using `_DIFFUSION_MODELS` via the `arch` key
     "BagelPipeline": "get_bagel_pre_process_func",
     "GlmImagePipeline": "get_glm_image_pre_process_func",
+    "BriaFibo2Pipeline": "get_bria_fibo2_pre_process_func",
     "BooguImagePipeline": "get_boogu_image_pre_process_func",
     "BooguImageTurboPipeline": "get_boogu_image_pre_process_func",
     "QwenImageEditPipeline": "get_qwen_image_edit_pre_process_func",
