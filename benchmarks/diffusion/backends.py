@@ -47,6 +47,7 @@ class RequestFuncInput:
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     default_bot_task: str | None = DEFAULT_EDITS_BOT_TASK
     video_job_timeout: float = 900.0
+    request_timeout: float | None = None
 
 
 @dataclass
@@ -59,6 +60,23 @@ class RequestFuncOutput:
     stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
+
+
+def _request_timeout_kwargs(
+    request: RequestFuncInput, session: aiohttp.ClientSession
+) -> dict[str, aiohttp.ClientTimeout]:
+    if request.request_timeout is None:
+        return {}
+    timeout = session.timeout
+    return {
+        "timeout": aiohttp.ClientTimeout(
+            total=None if request.request_timeout == 0 else request.request_timeout,
+            connect=timeout.connect,
+            sock_read=timeout.sock_read,
+            sock_connect=timeout.sock_connect,
+            ceil_threshold=timeout.ceil_threshold,
+        )
+    }
 
 
 def _guess_mime_type(path: str) -> str:
@@ -142,7 +160,7 @@ async def async_request_image_edits(
         )
 
     try:
-        async with session.post(edits_url, data=form) as response:
+        async with session.post(edits_url, data=form, **_request_timeout_kwargs(input, session)) as response:
             if response.status == 200:
                 resp_json = await response.json()
                 output.response_body = resp_json
@@ -215,7 +233,7 @@ async def async_request_chat_completions(
         payload["extra_body"] = extra_body
 
     try:
-        async with session.post(input.api_url, json=payload) as response:
+        async with session.post(input.api_url, json=payload, **_request_timeout_kwargs(input, session)) as response:
             if response.status == 200:
                 resp_json = await response.json()
                 output.response_body = resp_json
@@ -304,7 +322,9 @@ async def async_request_openai_image_generations(
     }
 
     try:
-        async with session.post(input.api_url, json=payload, headers=headers) as response:
+        async with session.post(
+            input.api_url, json=payload, headers=headers, **_request_timeout_kwargs(input, session)
+        ) as response:
             if response.status == 200:
                 resp_json = await response.json()
                 output.response_body = resp_json
@@ -396,7 +416,7 @@ async def async_request_v1_videos(
         resp_json = {}
 
         # invoke a post request (POST /v1/videos)
-        async with session.post(input.api_url, data=form) as response:
+        async with session.post(input.api_url, data=form, **_request_timeout_kwargs(input, session)) as response:
             if response.status == 200:
                 resp_json = await response.json()
                 job_id = resp_json.get("id")
@@ -419,7 +439,7 @@ async def async_request_v1_videos(
         while job_status not in {"completed", "failed"}:
             await asyncio.sleep(poll_interval)
 
-            async with session.get(job_url) as poll_response:
+            async with session.get(job_url, **_request_timeout_kwargs(input, session)) as poll_response:
                 if poll_response.status != 200:
                     output.error = f"Polling failed HTTP {poll_response.status}: {await poll_response.text()}"
                     output.success = False
@@ -443,7 +463,7 @@ async def async_request_v1_videos(
 
         # invoke a get request (GET /v1/videos/{video_id}/content)
         content_url = f"{job_url}/content"
-        async with session.get(content_url) as content_response:
+        async with session.get(content_url, **_request_timeout_kwargs(input, session)) as content_response:
             if content_response.status != 200:
                 output.error = (
                     f"Content retrieval failed HTTP {content_response.status}: {await content_response.text()}"
@@ -469,7 +489,7 @@ async def async_request_v1_videos(
 
         if job_id is not None:
             try:
-                async with session.delete(f"{input.api_url}/{job_id}") as _:
+                async with session.delete(f"{input.api_url}/{job_id}", **_request_timeout_kwargs(input, session)) as _:
                     pass
             except Exception as e:
                 print(f"Failed to clean up video job {job_id}: {e}")

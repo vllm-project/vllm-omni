@@ -126,3 +126,45 @@ async def test_benchmark_does_not_start_measurement_after_failed_warmup(
         await diffusion_benchmark.benchmark(warmup_args)
 
     assert len(sent) == warmup_args.warmup_requests
+
+
+@pytest.mark.parametrize(
+    "arguments, expected", [([], 300.0), (["--request-timeout", "600"], 600.0), (["--request-timeout", "0"], 0.0)]
+)
+async def test_request_timeout_cli_defaults_and_overrides(diffusion_benchmark, arguments, expected):
+    assert diffusion_benchmark.build_parser().parse_args(arguments).request_timeout == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "-inf"])
+async def test_request_timeout_rejects_invalid_budgets(diffusion_benchmark, value, capsys):
+    with pytest.raises(SystemExit) as error:
+        diffusion_benchmark.build_parser().parse_args([f"--request-timeout={value}"])
+    assert error.value.code == 2
+    assert "non-negative finite" in capsys.readouterr().err
+
+
+async def test_timeout_reaches_warmups_measurement_and_result_json(
+    monkeypatch, mocker, diffusion_benchmark, warmup_args, input_requests, tmp_path, capsys
+):
+    warmup_args.request_timeout = 0.0
+    warmup_args.output_file = str(tmp_path / "results.json")
+    seen_timeouts = []
+
+    async def successful_request(request, session, progress):
+        seen_timeouts.append(request.request_timeout)
+        return RequestFuncOutput(success=True, latency=0.1)
+
+    monkeypatch.setitem(
+        diffusion_benchmark.backends_function_mapping["2i"],
+        warmup_args.endpoint,
+        (successful_request, warmup_args.endpoint),
+    )
+    dataset = mocker.Mock(spec=diffusion_benchmark.RandomDataset)
+    dataset.get_requests.return_value = input_requests
+    monkeypatch.setattr(diffusion_benchmark, "RandomDataset", mocker.Mock(return_value=dataset))
+
+    await diffusion_benchmark.benchmark(warmup_args)
+
+    assert seen_timeouts == [0.0] * (warmup_args.warmup_requests + len(input_requests))
+    assert diffusion_benchmark.json.loads((tmp_path / "results.json").read_text())["request_timeout"] == 0.0
+    assert "HTTP request timeout (s):" in capsys.readouterr().out
