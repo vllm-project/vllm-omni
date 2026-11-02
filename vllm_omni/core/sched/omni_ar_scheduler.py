@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -492,19 +493,28 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # but a {0, num_spec} *mix* is itself uneven: the next schedule()
         # books a width-1 row for the empty buffer next to a 1+num_spec row
         # for the full one, so any multi-value set goes.
-        if len(lens) <= 1:
+        if lens == [num_spec]:
             return
-        logger.error(
-            "[kstep] uneven draft buffers %s across %d running requests; "
-            "clearing every buffer so the next step schedules a uniform "
-            "(padded) single-frame span instead of the non-uniform span "
-            "the multi-frame loop declines",
-            lens,
-            len(running),
-        )
+        # Mixed widths would force the next step onto a single-frame span,
+        # wasting stage 1's K-position reservation and halving wide-batch
+        # throughput. Fill the short buffers to ``num_spec`` so consecutive
+        # steps all run the multi-frame loop.
+        from vllm_omni.platforms.npu.worker.talker_multiframe import CONTINUE_TOKEN_ID
+
+        filled = 0
         for req in running:
-            if req.spec_token_ids:
-                req.spec_token_ids = []
+            have = len(getattr(req, "spec_token_ids", ()) or ())
+            if have < num_spec:
+                req.spec_token_ids = [CONTINUE_TOKEN_ID] * num_spec
+                filled += 1
+        if filled:
+            logger.debug(
+                "[kstep] padded %d short draft buffers %s to num_spec=%d across %d running requests",
+                filled,
+                lens,
+                num_spec,
+                len(running),
+            )
 
     def _talker_kstep_armed(self) -> bool:
         """True when this scheduler drives the Talker multi-frame decode.
@@ -587,6 +597,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         Continuation drafts are stateless, so dropping them is free.
         """
         if not self._talker_kstep_armed():
+            return
+        if isinstance(self, AsyncVLLMScheduler):
+            # Async scheduling re-arms the placeholders after every step and
+            # delivers the draft inside the worker, so clearing here would
+            # fight the bookkeeping; _enforce_kstep_span_uniformity handles
+            # the scheduled output instead.
             return
         num_spec = int(getattr(self, "num_spec_tokens", 0) or 0)
         max_len = getattr(self, "max_model_len", None)
@@ -678,6 +694,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
           draftless step ``constant_drafts`` re-arms the full K-step, so
           one single-frame step is all the recovery the pipeline needs.
 
+        CUDA eager execution with a dynamic draft lookup is the exception:
+        for a pure decode batch, trim every row to the requested width before
+        upstream books computed/in-flight tokens. Static graphs and NPU keep
+        the full-or-single-frame guard above.
+
         Rows wider than 1 without drafts are prefill/extend rows; they may
         only coexist with single-frame decode rows, so any drafts go.
         """
@@ -687,15 +708,61 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         spec_tokens = scheduler_output.scheduled_spec_decode_tokens
         if not num_scheduled_tokens:
             return
+        dynamic_lookup = getattr(self, "dynamic_sd_lookup", None)
+        vllm_config = getattr(self, "vllm_config", None)
+        device_config = getattr(vllm_config, "device_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        dynamic_cuda = (
+            dynamic_lookup is not None
+            and getattr(device_config, "device_type", None) == "cuda"
+            and getattr(model_config, "enforce_eager", False)
+        )
+        if dynamic_cuda:
+            target = int(dynamic_lookup[len(num_scheduled_tokens)])
+            max_drafts = int(getattr(self, "num_spec_tokens", 0) or 0)
+            if not 0 <= target <= max_drafts:
+                raise ValueError(f"Dynamic Talker draft count {target} is outside [0, {max_drafts}]")
+            uniform_decode = len(spec_tokens) == len(num_scheduled_tokens) and all(
+                len(drafts) >= target and num_scheduled_tokens[rid] == len(drafts) + 1
+                for rid, drafts in spec_tokens.items()
+            )
+            if uniform_decode:
+                for rid, drafts in list(spec_tokens.items()):
+                    num_scheduled_tokens[rid] = target + 1
+                    if target:
+                        spec_tokens[rid] = drafts[:target]
+                    else:
+                        del spec_tokens[rid]
+                scheduler_output.total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+                scheduler_output.num_spec_tokens_to_schedule = target
+                return
         changed = False
         min_frames = None
-        if any(n > 1 and rid not in spec_tokens for rid, n in num_scheduled_tokens.items()):
-            # Mixed step: a prefill/extend row next to a drafted decode row
-            # is exactly the non-uniform shape the runner dies on.
-            if spec_tokens:
-                for rid in spec_tokens:
-                    num_scheduled_tokens[rid] = 1
-                spec_tokens.clear()
+        async_scheduler = getattr(self, "_spec_token_placeholders", None) is not None
+        k_span = 1 + int(getattr(self, "num_spec_tokens", 0) or 0)
+        if async_scheduler:
+            # Under async scheduling a placeholder-armed request books
+            # 1+num_spec rows with an empty ``scheduled_spec_decode_tokens``
+            # (the drafts arrive via the runner's async propose). Such a row
+            # is the full executable shape, not a mixed/prefill row.
+            mixed = any(n > 1 and n != k_span and rid not in spec_tokens for rid, n in num_scheduled_tokens.items())
+        else:
+            mixed = any(n > 1 and rid not in spec_tokens for rid, n in num_scheduled_tokens.items())
+        if mixed:
+            # A prefill/extend row next to a drafted decode row is the
+            # non-uniform shape the runner refuses. Fold drafted rows (and
+            # async K-width placeholders) to width 1; leave genuine prefill
+            # rows alone or prompt tokens are dropped.
+            fold_ids = set(spec_tokens)
+            if async_scheduler:
+                fold_ids.update(
+                    rid for rid, n in num_scheduled_tokens.items() if rid not in spec_tokens and n == k_span
+                )
+            for rid in fold_ids:
+                num_scheduled_tokens[rid] = 1
+            for rid in list(spec_tokens):
+                spec_tokens.pop(rid, None)
+            if fold_ids:
                 changed = True
                 min_frames = 0
         elif spec_tokens:
@@ -752,6 +819,58 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._enforce_kstep_span_uniformity(scheduler_output)
         super()._update_after_schedule(scheduler_output)
 
+    def _kstep_row_budget(self) -> int:
+        """Rows the batch may reach before the step drops to a 1-wide width.
+
+        A step narrower than the K frames pays the whole per-step cost for a
+        single frame, so the budget has to cover the running set the engine
+        admits, not a hand-picked number: with ``max_num_seqs: 16`` a budget of
+        8 turned every 9..16-row step into a 1-wide one and cost 33-40% of the
+        c=16/c=32 throughput (25 ms/step against main's 3.7), while a budget of
+        16 keeps the frames and lands within 3-5% of main.
+        """
+        override = os.environ.get("KSTEP_MAX_ROWS")
+        if override:
+            try:
+                return max(1, int(override))
+            except ValueError:
+                pass
+        config = getattr(self, "scheduler_config", None) or getattr(
+            getattr(self, "vllm_config", None), "scheduler_config", None
+        )
+        max_num_seqs = getattr(config, "max_num_seqs", None)
+        try:
+            return max(1, int(max_num_seqs))
+        except (TypeError, ValueError):
+            return 1
+
+    def _talker_plain_step_for_wide_batch(self) -> int | None:
+        """Drop the Talker's K-frame width for a wide decode batch.
+
+        Returns the previous ``num_spec_tokens`` when the caller must restore it,
+        None when the step keeps its K-step width.
+        """
+        if os.environ.get("KSTEP_PLAIN_STEP", "1") == "0":
+            return None
+        if not self._talker_kstep_armed():
+            return None
+        if isinstance(self, AsyncVLLMScheduler):
+            # The placeholder mechanism already sizes every decode request at
+            # 1+num_spec; zeroing here would desynchronise that bookkeeping.
+            # Keep the width and leave uneven steps to
+            # _enforce_kstep_span_uniformity.
+            return None
+        device_config = getattr(getattr(self, "vllm_config", None), "device_config", None)
+        if getattr(device_config, "device_type", None) != "cuda":
+            return None
+        num_spec = int(getattr(self, "num_spec_tokens", 0) or 0)
+        if num_spec <= 0:
+            return None
+        if len(self.running) <= self._kstep_row_budget():
+            return None
+        self.num_spec_tokens = 0
+        return num_spec
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -767,6 +886,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # the multi-frame loop requires uniform decode spans and the runner
         # refuses the rest.
         self._drop_talker_drafts_if_prefill_pending()
+        # Wide batches do not pay for the K-frame step: above the row budget the
+        # Talker is throughput-bound, and scheduling 1 + num_spec rows per request
+        # only adds KV writes and padding. Fall back to the plain one-token decode
+        # (what main ships) for those steps.
+        plain_step_spec_tokens = self._talker_plain_step_for_wide_batch()
 
         original_wait_queues = None
         if self._should_defer_waiting_admission():
@@ -784,6 +908,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         try:
             scheduler_output = super().schedule(throttle_prefills)
         finally:
+            if plain_step_spec_tokens is not None:
+                self.num_spec_tokens = plain_step_spec_tokens
             self.max_num_active_reqs = original_max_num_active_reqs
             if original_wait_queues is not None:
                 original_waiting, original_kv_holding = original_wait_queues
@@ -804,10 +930,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
-        return self._wrap_omni_scheduler_output(
+        _wrapped = self._wrap_omni_scheduler_output(
             scheduler_output,
             finished_requests_needing_kv_transfer=finished_reqs,
         )
+        return _wrapped
 
     def update_from_output(
         self,
@@ -2286,3 +2413,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
 class OmniARAsyncScheduler(OmniARScheduler, AsyncVLLMScheduler):
     """Asynchronous AutoRegressive scheduler."""
+
+    def _update_after_schedule(self, scheduler_output):
+        # MRO: OmniARScheduler._update_after_schedule (runs the K-step span
+        # rewrite before the in-flight booking) -> AsyncVLLMScheduler
+        # (booking + placeholder re-arm).
+        super()._update_after_schedule(scheduler_output)
+        if not self._talker_kstep_armed():
+            return
+        placeholders = getattr(self, "_spec_token_placeholders", None)
+        if not placeholders:
+            return
+        # Talker streaming keeps requests in is_prefill_chunk state while the
+        # stage-0 backlog drains, and upstream only arms placeholders for
+        # non-prefill requests. Arm them here too: the schedule guard keeps
+        # backlog steps at width 1 and the spec width takes over once drained.
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            if request is None or request.spec_token_ids:
+                continue
+            if request.is_prefill_chunk:
+                request.spec_token_ids = placeholders

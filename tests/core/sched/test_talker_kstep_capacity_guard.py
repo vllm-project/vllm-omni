@@ -105,3 +105,140 @@ def test_unknown_capacity_keeps_the_pre_drop_behaviour():
     assert sched._talker_waiting_prefill_may_run() is True
     OmniARScheduler._drop_talker_drafts_if_prefill_pending(sched)
     assert running[0].spec_token_ids == []
+
+
+def _dynamic_sched(*, device="cuda", eager=True):
+    sched = _sched(running=[], waiting=[], max_num_running_reqs=16)
+    sched.num_spec_tokens = 7
+    from vllm.config import SpeculativeConfig
+    from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+
+    config = SpeculativeConfig(
+        method="ngram",
+        num_speculative_tokens=7,
+        prompt_lookup_min=1,
+        prompt_lookup_max=1,
+        num_speculative_tokens_per_batch_size=[[1, 1, 7], [2, 2, 3], [3, 16, 0]],
+    )
+    sched.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+        config.num_speculative_tokens_per_batch_size, 16, config.num_speculative_tokens
+    )
+    sched.vllm_config = SimpleNamespace(
+        device_config=SimpleNamespace(device_type=device),
+        model_config=SimpleNamespace(enforce_eager=eager),
+    )
+    return sched
+
+
+def _booked_output(widths):
+    return SimpleNamespace(
+        num_scheduled_tokens={rid: n + 1 for rid, n in enumerate(widths)},
+        scheduled_spec_decode_tokens={rid: list(range(n)) for rid, n in enumerate(widths)},
+        total_num_scheduled_tokens=sum(n + 1 for n in widths),
+        num_spec_tokens_to_schedule=7,
+    )
+
+
+def test_dynamic_cuda_trims_current_step_not_only_next_proposal():
+    sched = _dynamic_sched()
+    output = _booked_output([7, 7])
+    OmniARScheduler._enforce_kstep_span_uniformity(sched, output)
+    assert output.num_scheduled_tokens == {0: 4, 1: 4}
+    assert output.scheduled_spec_decode_tokens == {0: [0, 1, 2], 1: [0, 1, 2]}
+    assert output.total_num_scheduled_tokens == 8
+    assert output.num_spec_tokens_to_schedule == 3
+    # The schedule() backstop must not change the already-booked output.
+    OmniARScheduler._enforce_kstep_span_uniformity(sched, output)
+    assert output.total_num_scheduled_tokens == 8
+
+
+def test_dynamic_cuda_can_return_to_full_k_on_next_step():
+    sched = _dynamic_sched()
+    short = _booked_output([7, 7])
+    OmniARScheduler._enforce_kstep_span_uniformity(sched, short)
+    full = _booked_output([7])
+    OmniARScheduler._enforce_kstep_span_uniformity(sched, full)
+    assert full.num_scheduled_tokens == {0: 8}
+    assert full.num_spec_tokens_to_schedule == 7
+
+
+def test_dynamic_cuda_zero_drafts_books_single_frames():
+    output = _booked_output([7, 7, 7])
+    OmniARScheduler._enforce_kstep_span_uniformity(_dynamic_sched(), output)
+    assert output.num_scheduled_tokens == {0: 1, 1: 1, 2: 1}
+    assert output.scheduled_spec_decode_tokens == {}
+    assert output.total_num_scheduled_tokens == 3
+    assert output.num_spec_tokens_to_schedule == 0
+
+
+def test_dynamic_cuda_insufficient_budget_keeps_single_frame_fallback():
+    output = _booked_output([7, 2])
+    OmniARScheduler._enforce_kstep_span_uniformity(_dynamic_sched(), output)
+    assert output.num_scheduled_tokens == {0: 1, 1: 1}
+    assert output.scheduled_spec_decode_tokens == {}
+
+
+def test_async_mixed_folds_placeholder_and_draft_rows_preserving_prefill():
+    """Mixed async steps fold decode rows, never truncate prompt extension."""
+    sched = _dynamic_sched()
+    sched._spec_token_placeholders = [-1] * 7
+    output = _booked_output([7, 7, 7])
+    # Request 0 is a real drafted decode row, request 1 is an async
+    # placeholder-armed K-width row with no scheduler spec entry, and request 2
+    # is a genuine prompt extension that must remain fully booked.
+    output.scheduled_spec_decode_tokens = {0: list(range(7))}
+    output.num_scheduled_tokens[2] = 20
+    output.total_num_scheduled_tokens = 7 + 8 + 20
+
+    OmniARScheduler._enforce_kstep_span_uniformity(sched, output)
+
+    assert output.num_scheduled_tokens == {0: 1, 1: 1, 2: 20}
+    assert output.scheduled_spec_decode_tokens == {}
+    assert output.total_num_scheduled_tokens == 22
+
+
+def test_dynamic_cuda_does_not_trim_prefill_rows():
+    output = _booked_output([7])
+    output.num_scheduled_tokens[1] = 20
+    output.total_num_scheduled_tokens += 20
+    OmniARScheduler._enforce_kstep_span_uniformity(_dynamic_sched(), output)
+    assert output.num_scheduled_tokens == {0: 1, 1: 20}
+    assert output.total_num_scheduled_tokens == 21
+
+
+def test_dynamic_lookup_does_not_enable_narrow_static_graph_or_npu():
+    for device, eager in [("cuda", False), ("npu", True)]:
+        output = _booked_output([7, 7])
+        OmniARScheduler._enforce_kstep_span_uniformity(_dynamic_sched(device=device, eager=eager), output)
+        assert output.num_scheduled_tokens == {0: 8, 1: 8}
+        assert output.num_spec_tokens_to_schedule == 7
+
+
+def test_dynamic_width_is_booked_by_real_upstream_accounting():
+    class RequestState(SimpleNamespace):
+        __hash__ = object.__hash__
+
+    sched = object.__new__(OmniARScheduler)
+    fixture = _dynamic_sched()
+    sched.vllm_config = fixture.vllm_config
+    sched.dynamic_sd_lookup = fixture.dynamic_sd_lookup
+    sched.num_spec_tokens = fixture.num_spec_tokens
+    sched._talker_kstep_armed = lambda: True
+    sched.defer_block_free = False
+    sched._inflight_prefills = set()
+    sched.requests = {
+        rid: RequestState(
+            num_computed_tokens=100,
+            num_in_flight_tokens=0,
+            num_tokens=101,
+            num_output_placeholders=0,
+            use_structured_output=False,
+        )
+        for rid in range(2)
+    }
+    output = _booked_output([7, 7])
+    output.has_structured_output_requests = False
+    sched._update_after_schedule(output)
+    assert [r.num_computed_tokens for r in sched.requests.values()] == [104, 104]
+    assert [r.num_in_flight_tokens for r in sched.requests.values()] == [4, 4]
+    assert output.total_num_scheduled_tokens == 8
