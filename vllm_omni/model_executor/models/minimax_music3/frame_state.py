@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-request AR state for MiniMax Music 3.
 
 The talker accumulates one 32768-dimensional conditioning frame per decode
@@ -26,7 +26,9 @@ class FrameBuffer:
     """Rolling buffer of conditioning frames addressed by absolute frame index.
 
     Frames before an emitted window's hop point are dropped, so peak memory is
-    bounded by the window size rather than by the length of the song.
+    bounded by the window size rather than by the length of the song. Without
+    async_chunk no window is emitted and the buffer holds the whole song, up to
+    about 590 MB of bf16 frames at the 9,000-frame cap.
     """
 
     def __init__(self) -> None:
