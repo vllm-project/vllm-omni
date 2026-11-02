@@ -694,6 +694,7 @@ class HiFTGenerator(nn.Module):
         self.register_buffer("_npu_istft_basis", inverse.to(parameter.device), persistent=False)
         self._npu_istft_window = self.stft_window.detach().float().cpu().clone()
         self._npu_istft_envelopes: dict[tuple, torch.Tensor] = {}
+        self._npu_istft_envelope_accesses: set[tuple] | None = None
 
     def remove_weight_norm(self) -> int:
         """Fold the generator's frozen weight norms into plain weights.
@@ -796,11 +797,13 @@ class HiFTGenerator(nn.Module):
             # Validate NOLA once on CPU. Window-only data is independent of
             # the queued forward and is primed during HiFT graph warmup.
             envelope = _istft_envelope(self._npu_istft_window, n_fft, hop, n_frames).to(magnitude.device)
-            # The finalizer is eager and its returned waveform owns storage;
-            # no graph retains these envelopes. Bound arbitrary tail lengths.
+            # Bound arbitrary tail lengths in the eager cache. Captured graphs
+            # retain only the exact envelope keys they touched separately.
             if len(self._npu_istft_envelopes) >= 64:
                 self._npu_istft_envelopes.pop(next(iter(self._npu_istft_envelopes)))
             self._npu_istft_envelopes[key] = envelope
+        if self._npu_istft_envelope_accesses is not None:
+            self._npu_istft_envelope_accesses.add(key)
         magnitude = magnitude.clamp(max=1e2)
         real, imag = magnitude * phase.cos(), magnitude * phase.sin()
         with torch.autocast("npu", enabled=False):

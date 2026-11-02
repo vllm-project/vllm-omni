@@ -53,7 +53,7 @@ def decoder():
     return d
 
 
-def call(d, request_id, codes, first=False, finished=False):
+def call(d, request_id, codes, first=False, finished=False, left=0):
     return d.forward(
         input_ids=torch.tensor(codes, dtype=torch.long),
         seq_token_counts=[len(codes)],
@@ -63,6 +63,7 @@ def call(d, request_id, codes, first=False, finished=False):
                 "meta": {
                     "req_id": [request_id],
                     "first_audio": first,
+                    "left_context_size": left,
                     "finished": finished,
                 },
             }
@@ -70,14 +71,16 @@ def call(d, request_id, codes, first=False, finished=False):
     ).multimodal_outputs
 
 
-@pytest.mark.parametrize("first", [False, True])
-def test_trim_only_delivered_frame_without_losing_causal_history(first):
+@pytest.mark.parametrize("first,left", [(False, 0), (True, 0), (False, 2)])
+def test_trim_only_delivered_frame_without_losing_causal_history(first, left):
     d = decoder()
-    first_output = call(d, "a", [1, 2], first=first)
-    expected = torch.tensor([[3.0], [3.0]])[:, 1:] if first else torch.tensor([[3.0], [3.0]])
+    codes = [3, 5, 1, 4, 6, 2] if left else [1, 2]
+    first_output = call(d, "a", codes, first=first, left=left)
+    value = 21.0 if left else 3.0
+    expected = torch.full((2, 1), value)[:, int(first) :]
     torch.testing.assert_close(first_output["model_outputs"][0], expected)
     rest = call(d, "a", [2, 3], finished=True)
-    torch.testing.assert_close(rest["model_outputs"][0], torch.tensor([[8.0], [8.0]]))
+    torch.testing.assert_close(rest["model_outputs"][0], torch.full((2, 1), value + 5))
     if first:
         assert bool(rest[FIRST_AUDIO_REQUIRED_KEY][0])
     assert not d._stream_req_slots and not d._stream_first_audio_requests

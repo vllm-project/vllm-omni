@@ -356,7 +356,14 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         from transformers import AutoProcessor
 
         model_id = self.engine_client.model_config.model
-        proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        if self._moss_variant == "local":
+            # AutoProcessor injects loader-only kwargs (e.g. revision) that
+            # Local's custom from_pretrained forwards to ProcessorMixin.__init__.
+            # Invoke the checkpoint's loader directly, as for Realtime below.
+            processor_cls = get_class_from_dynamic_module("processing_moss_tts.MossTTSLocalProcessor", model_id)
+            proc = processor_cls.from_pretrained(model_id, trust_remote_code=True)
+        else:
+            proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
         if hasattr(proc, "audio_tokenizer"):
             device = self._resolve_ref_encoder_device()
             proc._vllm_omni_ref_encoder_device = device
@@ -479,6 +486,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         proc = self._get_moss_processor()
 
         user_kwargs: dict[str, Any] = {"text": request.input or ""}
+        if v == "local" and request.token_count is not None:
+            user_kwargs["tokens"] = request.token_count
         resolve_keys: dict[int, str] = {}
         if v in ("tts", "local", "ttsd"):
             user_kwargs["reference"], resolve_keys = await self._encode_moss_references(
@@ -510,6 +519,8 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         if v == "local" and request.ref_text and request.ref_text.strip():
             reference = user_kwargs.pop("reference")
             user_kwargs["text"] = request.ref_text.strip() + " " + (request.input or "")
+            if request.token_count is not None:
+                user_kwargs["tokens"] = request.token_count + int(reference[0].shape[0])
             fast = _local_continuation_prompt(proc, user_kwargs, reference)
             if fast is None:
                 user_msg = proc.build_user_message(**user_kwargs)
@@ -529,6 +540,10 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             "prompt_token_ids": text_ids,
             "codes": {"ref": audio_codes},
         }
+        if v == "local" and request.ref_text and request.ref_text.strip():
+            # Only continuation has an assistant audio prefix. Generation's
+            # user-side reference conditions the talker, not the decoder.
+            params["meta"] = {"ref_code_len": int(reference[0].shape[0])}
         if request.max_new_tokens is not None:
             params["max_new_frames"] = [request.max_new_tokens]
         if 0 in resolve_keys:
