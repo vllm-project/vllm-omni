@@ -17,6 +17,19 @@ TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
     }
 )
 
+# Connector `extra` keys that are unique per launch (see `load_omni_transfer_config`),
+# but don't affect the model graph, and are therefore excluded from the compile cache key.
+PER_LAUNCH_EXTRA_KEYS = frozenset({"wakeup_scope"})
+
+
+def connector_hash_factors(connector_config: dict[str, Any]) -> dict[str, Any]:
+    """Filters the entries of a serialized connector dict to get the config to be used for the
+    compile cache key (i.e., everything except PER_LAUNCH_EXTRA_KEYS)."""
+    factors = {key: value for key, value in connector_config.items() if key not in PER_LAUNCH_EXTRA_KEYS}
+    if isinstance(factors.get("extra"), dict):
+        factors["extra"] = connector_hash_factors(factors["extra"])
+    return factors
+
 
 def get_stage_connector_role(model_config: Any) -> str | None:
     """Return the configured stage connector direction, if explicit."""

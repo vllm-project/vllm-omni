@@ -6,7 +6,8 @@
         "hardware_marks": {
           "res": {
             "cuda": ["H100", "B200"],
-            "npu": "A3"
+            "npu": "A3",
+            "rocm": "MI325"
           },
           "num_cards": 2
         }

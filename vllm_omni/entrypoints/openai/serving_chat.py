@@ -3,12 +3,10 @@
 
 import asyncio
 import base64
-import copy
 import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from io import BytesIO
@@ -145,8 +143,9 @@ from vllm_omni.entrypoints.openai.protocol.images import (
 )
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
-    clone_sampling_params,
     get_default_sampling_params_list,
+    merge_llm_sampling_params,
+    to_sampling_params_list,
 )
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
@@ -421,12 +420,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         cls,
         diffusion_engine: AsyncOmni,
         model_name: str,
+        enable_force_include_usage: bool = False,
     ) -> "OmniOpenAIServingChat":
         """Create a chat serving instance for diffusion models.
 
         Args:
             diffusion_engine: The async diffusion engine
             model_name: Name of the model being served
+            enable_force_include_usage: Always send a usage chunk on streams
 
         Returns:
             OmniOpenAIServingChat instance configured for diffusion mode
@@ -441,6 +442,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_model_name = model_name
         instance._diffusion_extra_body_params = None
         instance._diffusion_extra_output_params = None
+        instance.enable_force_include_usage = enable_force_include_usage
         instance.engine_client = None
         instance.has_kv_connector = False
         # Extra body/output params are resolved lazily on first use; see
@@ -653,12 +655,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Handle diffusion mode
         if self._diffusion_mode:
-            return await self._create_diffusion_chat_completion(
+            response = await self._create_diffusion_chat_completion(
                 request,
                 normalized_extra_args,
                 diffusion_request_args,
                 raw_request,
             )
+            if request.stream and isinstance(response, ChatCompletionResponse):
+                return self._diffusion_chat_completion_stream_generator(request, response)
+            return response
 
         request_timestamp = time.time()
         if raw_request is not None:
@@ -923,7 +928,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if self.enable_prompt_tokens_details:
                     mm_token_counts = _get_mm_token_counts(engine_prompt)
                 if hasattr(request, "sampling_params_list"):
-                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list, request=request)
+                    sampling_params_list = to_sampling_params_list(
+                        self.engine_client,
+                        request.sampling_params_list,
+                        request_overrides=self._request_sampling_overrides(request),
+                    )
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
@@ -986,6 +995,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     arrival_time=request_timestamp,
                     lora_request=lora_request,
                     entry_stage_id=entry_stage_id,
+                    watermarking=request.watermarking,
                 )
 
                 generators.append(generator)
@@ -1428,113 +1438,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(
-        self,
-        sampling_params_list: list[dict],
-        request: ChatCompletionRequest | None = None,
-        *,
-        merge_llm_defaults: bool = True,
-    ) -> list[Any]:
-        """Convert request dicts to stage-typed sampling params objects.
-
-        Partial LLM dictionaries inherit deploy defaults, then explicit top-level
-        request parameters on the comprehension stage. Explicit stage fields win.
-        Video sessions set ``merge_llm_defaults=False`` so provided stage dicts
-        use constructor defaults instead, preserving their replacement semantics.
-
-        For diffusion stages, build ``OmniDiffusionSamplingParams`` so
-        downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
-        requires a dataclass) works. For LLM stages build ``SamplingParams``.
-        If callers provide params for fewer stages than the native pipeline has
-        (for example AURA has three semantic models but four engine stages),
-        append cloned deploy defaults for the omitted tail stages.
-        """
-        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
-        default_params_list = list(getattr(self.engine_client, "default_sampling_params_list", []) or [])
-        final_sampling_params_list: list[Any] = []
-        for idx, sampling_params in enumerate(sampling_params_list):
-            stage_config = stage_configs[idx] if idx < len(stage_configs) else None
-            stage_type = get_stage_type(stage_config)
-            target_cls = OmniDiffusionSamplingParams if stage_type == "diffusion" else SamplingParams
-            if isinstance(sampling_params, dict):
-                if target_cls is SamplingParams and merge_llm_defaults:
-                    default = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
-                    final_sampling_params_list.append(
-                        self._merge_llm_sampling_params(default, stage_config, sampling_params, request)
-                    )
-                else:
-                    final_sampling_params_list.append(target_cls(**sampling_params))
-            elif isinstance(sampling_params, target_cls):
-                final_sampling_params_list.append(sampling_params)
-            elif isinstance(sampling_params, SamplingParams | OmniDiffusionSamplingParams):
-                # Cross-typed (e.g. user passed SamplingParams but this is a
-                # diffusion stage) — rebuild via a dict round-trip so we end
-                # up with the correct target class.
-                as_dict = {
-                    f.name: getattr(sampling_params, f.name)
-                    for f in (fields(sampling_params) if is_dataclass(sampling_params) else [])
-                } or sampling_params.__dict__
-                final_sampling_params_list.append(target_cls(**as_dict))
-            else:
-                raise ValueError(f"Invalid sampling params: {sampling_params}")
-        for idx in range(len(final_sampling_params_list), len(stage_configs)):
-            stage_config = stage_configs[idx]
-            is_comprehension = (
-                stage_config.get("is_comprehension", False)
-                if isinstance(stage_config, Mapping)
-                else getattr(stage_config, "is_comprehension", False)
-            )
-            if request is not None and is_comprehension and get_stage_type(stage_config) != "diffusion":
-                default = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
-                final_sampling_params_list.append(self._merge_llm_sampling_params(default, stage_config, {}, request))
-            elif idx < len(default_params_list):
-                final_sampling_params_list.append(clone_sampling_params(default_params_list[idx]))
-            else:
-                final_sampling_params_list.append(SamplingParams())
-        return final_sampling_params_list
-
-    def _merge_llm_sampling_params(
-        self,
-        default_params: SamplingParams | dict[str, Any],
-        stage_config: Any,
-        overrides: dict[str, Any],
-        request: ChatCompletionRequest | None,
-    ) -> SamplingParams:
-        """Merge raw configuration before constructing normalized runtime params."""
-        model_config = getattr(stage_config, "model_config", stage_config)
-        if isinstance(model_config, Mapping):
-            raw_defaults = model_config.get("default_sampling_params", default_params)
-        else:
-            raw_defaults = getattr(model_config, "default_sampling_params", default_params)
-        if raw_defaults is None:
-            merged = {}
-        elif isinstance(raw_defaults, Mapping):
-            merged = dict(raw_defaults)
-        elif isinstance(default_params, dict):
-            merged = dict(default_params)
-        else:
-            # Compatibility for clients without raw stage configuration. Keep
-            # their runtime policies; explicit and inferred values are ambiguous.
-            merged = {
-                name: getattr(default_params, name)
-                for name in SamplingParams.__struct_fields__
-                if not name.startswith("_") and name != "output_text_buffer_length"
-            }
-        is_comprehension = (
-            stage_config.get("is_comprehension", False)
-            if isinstance(stage_config, Mapping)
-            else getattr(stage_config, "is_comprehension", False)
-        )
-        if request is not None and is_comprehension:
-            merged.update(self._request_sampling_overrides(request))
-        extra_args = merged.get("extra_args")
-        merged.update(overrides)
-        if isinstance(extra_args, dict) and isinstance(overrides.get("extra_args"), dict):
-            merged["extra_args"] = {**extra_args, **overrides["extra_args"]}
-        # Constructors derive cache/stop/greedy state from the final values.
-        # Nested dictionaries must never alias deploy defaults or request data.
-        return SamplingParams(**copy.deepcopy(merged))
-
     def _get_comprehension_stage_index(self) -> int:
         for idx, stage in enumerate(self.engine_client.stage_configs):
             is_comprehension = (
@@ -1561,30 +1464,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         "frequency_penalty",
         "presence_penalty",
     }
-
-    def _apply_request_overrides(
-        self,
-        default_params: SamplingParams,
-        request: ChatCompletionRequest,
-    ) -> SamplingParams:
-        """Clone default params and override with user-provided request values.
-
-        Starts with YAML defaults and only overrides fields that the user
-        explicitly provided (non-None values) in the request.
-
-        max_tokens uses the deploy YAML default unless explicitly overridden.
-
-        Args:
-            default_params: Default SamplingParams from the resolved pipeline and deploy configuration.
-            request: The chat completion request containing user-provided values.
-
-        Returns:
-            New SamplingParams with YAML defaults overridden by request values.
-        """
-        params = default_params.clone()
-        for field_name, value in self._request_sampling_overrides(request).items():
-            setattr(params, field_name, value)
-        return params
 
     def _request_sampling_overrides(self, request: ChatCompletionRequest) -> dict[str, Any]:
         """Select explicit request values without introducing protocol defaults."""
@@ -1686,8 +1565,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
             if idx == comprehension_idx:
-                params = self._merge_llm_sampling_params(
-                    default_params, self.engine_client.stage_configs[idx], {}, request
+                params = merge_llm_sampling_params(
+                    default_params, self.engine_client.stage_configs[idx], {}, self._request_sampling_overrides(request)
                 )
                 sampling_params_list.append(params)
             else:
@@ -2950,7 +2829,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # the fields of FunctionDefinition are a superset of the
                 # tool call outputs and can be used for parsing
                 assert content is not None
-                tool_calls = TypeAdapter(list[FunctionDefinition]).validate_json(content)
+                tool_calls: list[FunctionDefinition] = TypeAdapter(list[FunctionDefinition]).validate_json(content)
                 tool_call_ids = []
                 for tool_call in tool_calls:
                     tool_call_ids.append(
@@ -4125,6 +4004,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 prompt=gen_prompt,
                 sampling_params_list=sampling_params_list,
                 request_id=request_id,
+                watermarking=request.watermarking,
             ):
                 result = output
             if result is None:
@@ -4313,6 +4193,90 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 f"Image generation failed: {str(e)}",
                 status_code=500,
             )
+
+    async def _diffusion_chat_completion_stream_generator(
+        self,
+        request: ChatCompletionRequest,
+        response: ChatCompletionResponse,
+    ) -> AsyncGenerator[str, None]:
+        """Replay a finished diffusion chat completion as OpenAI SSE chunks.
+
+        Single-stage diffusion pipelines return their whole output (text,
+        images or audio) from one forward pass, so each choice is sent as one
+        content delta followed by a terminal ``finish_reason`` chunk.
+        """
+        chunk_object_type: Final = "chat.completion.chunk"
+        modality = "text"
+        content_choices: list[ChatCompletionResponseStreamChoice] = []
+        finish_choices: list[ChatCompletionResponseStreamChoice] = []
+        for choice in response.choices:
+            message = choice.message
+            content: Any = message.content
+            if content is None and message.audio is not None:
+                # Match the multistage stream: audio is sent as base64 content.
+                content = message.audio.data
+                modality = "audio"
+            elif isinstance(content, list):
+                modality = "image"
+            # model_construct keeps list (image) content, which DeltaMessage
+            # would otherwise reject as non-str.
+            delta = DeltaMessage.model_construct(role=message.role)
+            object.__setattr__(delta, "content", content)
+            delta.__pydantic_fields_set__.add("content")
+            content_choices.append(
+                ChatCompletionResponseStreamChoice(index=choice.index, delta=delta, logprobs=None, finish_reason=None)
+            )
+            finish_choices.append(
+                ChatCompletionResponseStreamChoice(
+                    index=choice.index,
+                    delta=DeltaMessage(),
+                    logprobs=None,
+                    finish_reason=choice.finish_reason,
+                    stop_reason=choice.stop_reason,
+                )
+            )
+
+        chunks = [
+            OmniChatCompletionStreamResponse(
+                id=response.id,
+                object=chunk_object_type,
+                created=response.created,
+                choices=content_choices,
+                model=response.model,
+                modality=modality,
+            ),
+            OmniChatCompletionStreamResponse(
+                id=response.id,
+                object=chunk_object_type,
+                created=response.created,
+                choices=finish_choices,
+                model=response.model,
+                modality=modality,
+                metrics=getattr(response, "metrics", None),
+            ),
+        ]
+        include_usage, include_continuous_usage = should_include_usage(
+            request.stream_options, self.enable_force_include_usage
+        )
+        if include_continuous_usage and response.usage is not None:
+            # The output is already complete, so every replayed chunk carries
+            # the final cumulative usage.
+            for chunk in chunks:
+                chunk.usage = response.usage
+        if include_usage and response.usage is not None:
+            chunks.append(
+                OmniChatCompletionStreamResponse(
+                    id=response.id,
+                    object=chunk_object_type,
+                    created=response.created,
+                    choices=[],
+                    model=response.model,
+                    usage=response.usage,
+                )
+            )
+        for chunk in chunks:
+            yield f"data: {chunk.model_dump_json(exclude_unset=True, warnings=False)}\n\n"
+        yield "data: [DONE]\n\n"
 
     def _extract_diffusion_prompt_and_media(
         self,

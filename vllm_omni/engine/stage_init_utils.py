@@ -50,6 +50,7 @@ from vllm_omni.config.omni_config import (
     VllmOmniDiffusionStageConfig,
 )
 from vllm_omni.config.stage_config import StageType
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
@@ -63,6 +64,7 @@ from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
 from vllm_omni.transformers_utils.repo_utils import hf_api
+from vllm_omni.watermarking.utils import to_vllm_watermark_config
 
 logger = init_logger(__name__)
 
@@ -1141,12 +1143,14 @@ def _project_omni_stage_engine_args(
                         stacklevel=2,
                     )
     if not is_diffusion:
-        # These values configure OmniDiffusionConfig or its worker process;
-        # OmniEngineArgs has no matching fields for LLM stages.
+        # These defaults configure diffusion loading or its worker process.
+        # Do not project them onto LLM stages, even when OmniEngineArgs also
+        # declares a field to preserve explicit diffusion CLI values.
         model_excluded_fields.update(
             {
                 "disable_autocast",
                 "enable_multithread_weight_load",
+                "enable_broadcast_weight_load",
                 "num_weight_load_threads",
             }
         )
@@ -1204,6 +1208,8 @@ def _project_omni_stage_engine_args(
     # The legacy builder always emits this key, including for pipelines such
     # as Audex that intentionally defer architecture discovery to HF config.
     engine_args["model_arch"] = copy.deepcopy(stage_config.model_config.model_arch)
+    # Preserve the legacy adapter key even when the topology leaves it unset.
+    engine_args["scheduling_metadata_adapter"] = stage_config.model_config.scheduling_metadata_adapter
     _maybe_set_qwen3_omni_moe_backend(
         engine_args,
         moe_backend_is_explicit="moe_backend" in getattr(stage_config.model_config, "_omni_explicit_fields", ()),
@@ -1540,6 +1546,7 @@ def build_vllm_config(
     headless: bool = False,
     api_process_count: int = 1,
     api_process_rank: int = 0,
+    watermark_config: WatermarkConfig | None = None,
 ) -> tuple[Any, type]:
     """Build engine args, then create VllmConfig and executor_class.
 
@@ -1573,6 +1580,17 @@ def build_vllm_config(
         filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
 
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
+
+    # extract the vLLM config arg from Omni's watermark config if we have text watermarking
+    # explicitly configured and it's supported, otherwise delegate to vLLM's default.
+    # NOTE: text watermarking in vLLM is only implemented for model runner v2.
+    vllm_wm_config = to_vllm_watermark_config(
+        watermark_config,
+        stage_config.final_output_type,
+        omni_engine_args.use_v2_model_runner,
+    )
+    if vllm_wm_config is not None:
+        omni_engine_args.watermark_config = vllm_wm_config
 
     # Guard against a per-stage world size that its assigned ``devices`` cannot
     # satisfy (issue #5003). A top-level ``--tensor-parallel-size`` is broadcast
