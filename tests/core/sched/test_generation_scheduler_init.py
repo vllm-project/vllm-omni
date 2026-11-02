@@ -136,3 +136,15 @@ def test_v1_batch_waiting_rejects_parallel_topologies(construct_scheduler, tp, p
     config = _config(native=False, tp=tp, pp=pp, extras={"generation_min_batch_size": 4, "generation_max_wait_ms": 10})
     with pytest.raises(ValueError, match="TP1/PP1"):
         construct_scheduler(config)
+
+
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_batch_target_option_requires_a_boolean(construct_scheduler, value):
+    with pytest.raises(ValueError, match="generation_always_wait_target_batch must be a boolean"):
+        construct_scheduler(_config(native=False, extras={"generation_always_wait_target_batch": value}))
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_batch_target_option_reaches_each_runner(construct_scheduler, native):
+    scheduler = construct_scheduler(_config(native=native, extras={"generation_always_wait_target_batch": True}))
+    assert scheduler._generation_always_wait_target_batch is True
