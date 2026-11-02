@@ -34,7 +34,7 @@ async def _publish(engine: AsyncOmni, factors: list[tuple[str, torch.Tensor]]) -
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_qwen_image_merged_lora_changes_and_restores_generation():
     with ExitStack() as after:
@@ -70,7 +70,16 @@ async def test_qwen_image_merged_lora_changes_and_restores_generation():
         a = torch.ones(1, projection.input_size, dtype=torch.float16)
         b = torch.full((projection.output_size, 1), 32, dtype=torch.float16)
         await engine.init_weight_transfer_engine({"packed": False})
+        torch.accelerator.reset_peak_memory_stats()
+        memory_before = (torch.accelerator.memory_allocated(), torch.accelerator.memory_reserved())
         await _publish(engine, [(f"{prefix}.lora_A.weight", a), (f"{prefix}.lora_B.weight", b)])
+        memory_after = (
+            torch.accelerator.memory_allocated(),
+            torch.accelerator.memory_reserved(),
+            torch.accelerator.max_memory_allocated(),
+            torch.accelerator.max_memory_reserved(),
+        )
+        print(f"Qwen-Image merged IPC HBM before={memory_before} after/peak={memory_after}", flush=True)
         assert weight.data_ptr() == pointer
         assert not torch.equal(weight, base)
         merged = await generate("merged_lora_active")

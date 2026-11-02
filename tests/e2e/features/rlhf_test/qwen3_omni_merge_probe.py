@@ -4,6 +4,8 @@
 
 from typing import TYPE_CHECKING
 
+import torch
+
 if TYPE_CHECKING:
     from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner as LegacyRunner
     from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
@@ -11,6 +13,19 @@ if TYPE_CHECKING:
 
 class Qwen3OmniMergeProbe:
     model_runner: "LegacyRunner | OmniARModelRunner"
+
+    def merged_memory_probe(self, reset: bool = False) -> dict[str, int]:
+        if reset:
+            torch.accelerator.reset_peak_memory_stats()
+        free, total = torch.accelerator.get_memory_info()
+        return {
+            "allocated": torch.accelerator.memory_allocated(),
+            "reserved": torch.accelerator.memory_reserved(),
+            "peak_allocated": torch.accelerator.max_memory_allocated(),
+            "peak_reserved": torch.accelerator.max_memory_reserved(),
+            "free": free,
+            "total": total,
+        }
 
     def merged_q_projection(self) -> dict:
         for name, module in self.model_runner.model.named_modules():
