@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Length bucketing + CUDA-graph pooling for variable-length encoders.
+"""Length bucketing for variable-length encoders.
 
 One self-contained, deployment-tunable feature. When
 ``VLLM_OMNI_AUDIO_BUCKET_SECONDS`` is set, :func:`install_bucketed_encoders`
 (which the worker calls after the weights are loaded) patches the shared
 multimodal processor to record every item's real length, then wraps each
-matching encoder so it buckets the batch by length rung and replays one captured
-graph per ``(batch, rung)`` pair from a single shared memory pool.
+matching encoder so it buckets the batch by length rung and computes each rung
+window eagerly.
 
 No model code is required. Lengths are always host values (the processor records
 them from the raw waveforms), so the feature never reads a device value back and
@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import regex as re
 import torch
@@ -37,36 +37,17 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 __all__ = [
-    "BucketedGraphPool",
     "LengthBucketingConfig",
     "install_bucketed_encoders",
 ]
 
 _ENV_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_SECONDS"
-_ENV_BATCH_SIZES = "VLLM_OMNI_AUDIO_BUCKET_BATCH_SIZES"
-_ENV_MAX_SECONDS = "VLLM_OMNI_AUDIO_BUCKET_MAX_SECONDS"
 _ENV_MODULES = "VLLM_OMNI_AUDIO_BUCKET_MODULES"
 _ENV_TIME_AXIS = "VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS"
 _FRAMES_PER_SECOND = 100  # 10 ms mel hop; seconds ladder -> frames
 _MODULE_PATTERN = r"(?:^|\.)(?:encoder|audio_encoder|speech_encoder|audio_tower|whisper_encoder)$"
 _BUCKET_FRAMES_KEY = "encoder_bucket_frames"
-_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
-_MAX_BATCH_SECONDS = 256
 _EAGER_CHUNK = 8
-_DEFAULT_NUM_WARMUP_ITERS = 2
-
-
-def _capture_sizes_from_env() -> tuple[int, ...]:
-    raw = os.environ.get(_ENV_BATCH_SIZES, "").strip()
-    if not raw:
-        return _CAPTURE_SIZES
-    sizes = tuple(sorted({int(item) for item in raw.split(",") if item.strip()}))
-    return sizes or _CAPTURE_SIZES
-
-
-def _max_batch_length_from_env() -> int:
-    seconds = float(os.environ.get(_ENV_MAX_SECONDS, str(_MAX_BATCH_SECONDS)))
-    return int(seconds * _FRAMES_PER_SECOND)
 
 
 # ----------------------------------------------------- fixed-length shims
@@ -145,16 +126,6 @@ def _rungs_from_env() -> tuple[int, ...] | None:
     return tuple(max(1, int(round(s * _FRAMES_PER_SECOND))) for s in seconds)
 
 
-# ------------------------------------------------------------------ graph pool
-
-
-@dataclass
-class _Entry:
-    graph: torch.cuda.CUDAGraph
-    inputs: list[torch.Tensor]
-    output: torch.Tensor = field(repr=False)
-
-
 def _as_tensor(output):
     if torch.is_tensor(output):
         return output
@@ -164,82 +135,6 @@ def _as_tensor(output):
     if torch.is_tensor(hidden):
         return hidden
     return None
-
-
-class BucketedGraphPool:
-    """Capture and replay one encoder graph per ``(batch, rung)`` pair.
-
-    All graphs share one memory pool, so peak activation memory is that of the
-    largest capture. A ``(batch, rung)`` pair is skipped when ``batch * rung``
-    exceeds ``max_batch_length``, so long inputs never pair with large batches;
-    an uncaptured shape reports ``None`` for eager fallback.
-    """
-
-    def __init__(
-        self,
-        forward: Callable[..., object],
-        *,
-        length_buckets: Sequence[int],
-        capture_sizes: Sequence[int] = _CAPTURE_SIZES,
-        max_batch_length: int | None = _MAX_BATCH_SECONDS * _FRAMES_PER_SECOND,
-        num_warmup_iters: int = _DEFAULT_NUM_WARMUP_ITERS,
-    ) -> None:
-        self.forward = forward
-        self.length_buckets = tuple(sorted(set(int(rung) for rung in length_buckets)))
-        self.capture_sizes = tuple(sorted(set(int(size) for size in capture_sizes)))
-        self.max_batch_length = max_batch_length
-        if not self.length_buckets or not self.capture_sizes:
-            raise ValueError("length buckets and capture sizes must be non-empty")
-        self.num_warmup_iters = num_warmup_iters
-
-        pad_ladder = sorted(self.capture_sizes)
-        self.max_pad_size = pad_ladder[-1]
-        self._bs_to_padded = [0] * (self.max_pad_size + 1)
-        for batch in range(1, self.max_pad_size + 1):
-            self._bs_to_padded[batch] = next(size for size in pad_ladder if size >= batch)
-
-        self.entries: dict[tuple[int, int], _Entry] = {}
-
-    def pad_batch(self, batch: int) -> int:
-        return self._bs_to_padded[batch]
-
-    def capture(self, make_inputs: Callable[[int, int], Sequence[torch.Tensor]]) -> None:
-        pool = None
-        with torch.inference_mode():
-            for rung in reversed(self.length_buckets):
-                for batch in reversed(self.capture_sizes):
-                    if batch > 1 and self.max_batch_length is not None and batch * rung > self.max_batch_length:
-                        continue
-                    inputs = list(make_inputs(batch, rung))
-                    for _ in range(self.num_warmup_iters):
-                        self.forward(*inputs)
-                    torch.accelerator.synchronize(inputs[0].device)
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph, pool=pool):
-                        output = _as_tensor(self.forward(*inputs))
-                    if output is None:
-                        raise TypeError("encoder returned an unsupported output type")
-                    if pool is None:
-                        pool = graph.pool()
-                    self.entries[(batch, rung)] = _Entry(graph, inputs, output)
-
-        logger.info(
-            "Captured %d bucketed encoder graphs (batches %s, rungs %s)",
-            len(self.entries),
-            self.capture_sizes,
-            self.length_buckets,
-        )
-
-    def execute(self, *inputs: torch.Tensor, key: tuple[int, int] | None = None) -> torch.Tensor | None:
-        entry = self.entries.get(key or (inputs[0].size(0), inputs[0].size(1)))
-        if entry is None:
-            return None
-        if any(a.shape != b.shape for a, b in zip(entry.inputs, inputs)):
-            return None
-        for buffer, tensor in zip(entry.inputs, inputs):
-            buffer.copy_(tensor)
-        entry.graph.replay()
-        return entry.output
 
 
 # ------------------------------------------------------------- generic wrapper
@@ -258,7 +153,7 @@ def _split_output(output):
 
 
 class _BucketedEncoder:
-    """Wraps one encoder ``forward`` with per-rung bucketing and graph replay."""
+    """Wraps one encoder ``forward`` with per-rung length bucketing."""
 
     def __init__(self, module: nn.Module, name: str, ladder: LengthBucketingConfig):
         self.module = module
@@ -266,8 +161,6 @@ class _BucketedEncoder:
         self.ladder = ladder
         self._original = module.forward
         self._shim = None  # optional fixed-window recipe; used ONLY for bucketed windows
-        self.pool: BucketedGraphPool | None = None
-        self._pool_failed = False
         self._rebuild = None
         self._lengths: tuple[int, ...] | None = None
         self._disabled = False
@@ -334,9 +227,8 @@ class _BucketedEncoder:
 
         try:
             if self._rebuild is None:
-                # First eligible call: serve it eagerly (also learning how to
-                # rebuild the output type and the output/input ratio), then
-                # capture the pool once for the calls that follow.
+                # First eligible call: serve it eagerly, learning how to rebuild
+                # the output type; later eligible calls take the bucketed path.
                 output = self._original(*args, **kwargs)
                 split = _split_output(output)
                 if split is None:
@@ -348,7 +240,6 @@ class _BucketedEncoder:
                     )
                     return output
                 self._rebuild = split[1]
-                self._capture(features, mask, length_arg)
                 return output
             container = self._bucketed(features, lengths, mask, length_arg)
             return self._rebuild(container)
@@ -384,7 +275,7 @@ class _BucketedEncoder:
 
         container: torch.Tensor | None = None
         for rung, indices in groups.items():
-            step = self.pool.max_pad_size if self.pool is not None else _EAGER_CHUNK
+            step = _EAGER_CHUNK
             for start in range(0, len(indices), step):
                 chunk = indices[start : start + step]
                 hidden = self._run_chunk(features, lengths, mask, length_arg, rung, chunk)
@@ -407,14 +298,8 @@ class _BucketedEncoder:
         return merged
 
     def _run_chunk(self, features, lengths, mask, length_arg, rung, chunk):
-        pool = self.pool if not self._pool_failed else None
-        padded = pool.pad_batch(len(chunk)) if pool is not None else len(chunk)
-        inputs = self._build_inputs(features, lengths, mask, length_arg, rung, chunk, padded)
-        if pool is not None:
-            hidden = pool.execute(*inputs, key=(padded, rung))
-            if hidden is not None:
-                return hidden
-        # Eager fallback in small chunks to bound transient activation memory.
+        # Compute each sub-chunk eagerly, chunked to bound transient activation
+        # memory.
         outs = [
             self._tensor_forward(*self._build_inputs(features, lengths, mask, length_arg, rung, sub, len(sub)))
             for sub in self._chunks(chunk, _EAGER_CHUNK)
@@ -472,38 +357,6 @@ class _BucketedEncoder:
         if tensor is None:
             raise TypeError(f"encoder {self.name!r} returned an unsupported output type")
         return tensor
-
-    def _capture(self, features, mask, length_arg):
-        if self._pool_failed:
-            return
-        try:
-            device, dtype = features.device, features.dtype
-            n_mels = features.size(1) if self._axis == 2 else features.size(2)
-            total = self._time_dim(features)
-
-            def make_inputs(batch, rung):
-                if self._axis == 2:
-                    x = torch.zeros((batch, n_mels, rung), device=device, dtype=dtype)
-                else:
-                    x = torch.zeros((batch, rung, n_mels), device=device, dtype=dtype)
-                if mask is not None:
-                    width = max(1, rung * mask.size(1) // total)
-                    return (x, torch.ones((batch, width), device=device, dtype=mask.dtype))
-                if length_arg is not None:
-                    return (x, torch.full((batch,), rung, device=device, dtype=length_arg.dtype))
-                return (x,)
-
-            self.pool = BucketedGraphPool(
-                self._tensor_forward,
-                length_buckets=self.ladder.buckets,
-                capture_sizes=_capture_sizes_from_env(),
-                max_batch_length=_max_batch_length_from_env(),
-            )
-            self.pool.capture(make_inputs)
-        except Exception:
-            self._pool_failed = True
-            self.pool = None
-            logger.warning("Failed to capture bucketed encoder graphs for %r; staying eager", self.name, exc_info=True)
 
 
 # --------------------------------------------------------------- auto install

@@ -107,16 +107,14 @@ environment variables.
 
 ### Encoder length bucketing
 
-Length bucketing + CUDA-graph pooling for variable-length encoders. It applies only to
+Length bucketing for variable-length encoders. It applies only to
 encoder call sites that feed one globally padded batch (inputs at a non-true, batch/global
 padded length); call sites already feeding true-length or length-packed inputs have no
 padding waste to recover and fall back to the original forward. When a wrapped encoder's
 call is ineligible (keyword args, non-CUDA, no published lengths, unsupported output, or
-no matching fixed-window recipe), the wrapper returns the untouched forward unchanged.
+no matching fixed-window recipe, or over-long/empty batches), the wrapper returns the untouched forward unchanged.
 
-| `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 100` mel frames. Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; an item longer than the largest rung is truncated to that rung (keep the ladder at least as long as the longest clip to avoid truncation). No matching module name means the feature is a no-op. | Experimental |
-| `VLLM_OMNI_AUDIO_BUCKET_BATCH_SIZES` | Comma-separated ints; default `1,2,4,8,16,32` | Batch padding ladder for bucketed-encoder graph capture | Smaller batches larger than a captured size are padded up to the next captured size. | Experimental |
-| `VLLM_OMNI_AUDIO_BUCKET_MAX_SECONDS` | Float seconds; default `256` | Upper bound on `batch * rung` frames for a single captured graph | `(batch, rung)` pairs above the bound are not captured and run eager in chunks. | Experimental |
+| `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 100` mel frames. Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name means the feature is a no-op. | Experimental |
 | `VLLM_OMNI_AUDIO_BUCKET_MODULES` | Regex | Overrides the wrapped-module name pattern (default matches names ending in `encoder`, `audio_encoder`, `speech_encoder`, `audio_tower`, or `whisper_encoder`) | Use to opt in module names outside the default pattern, e.g. `reference_encoder`. | Experimental |
 | `VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS` | `1`, `2`, or `auto`; default `auto` | Which feature axis is time: `1` for time-major `(B, T, D)`, `2` for channels-first `(B, mel, T)` | `auto` infers from the length scale; the fixed-window Whisper recipe always uses axis `2`. | Experimental |
 
