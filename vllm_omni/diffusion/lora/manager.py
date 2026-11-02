@@ -29,6 +29,7 @@ from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
     from_layer_diffusion,
+    validate_generic_peft_ranks,
 )
 from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -467,6 +468,10 @@ class DiffusionLoRAManager:
                 model_vocab_size=None,
                 weights_mapper=None,
             )
+
+            # Use the same capacity plan as layer replacement, before loading
+            # changes the registry or buffers. PEFT rank/scaling stay intact.
+            validate_generic_peft_ranks(lora_model.loras, max_lora_rank=self._get_lora_buffer_capacity(peft_helper.r))
         else:
             lora_model, peft_helper = loaded
 
@@ -638,6 +643,13 @@ class DiffusionLoRAManager:
                     self._lora_modules[full_module_name] = lora_layer
                     logger.debug("Replaced layer: %s -> %s", full_module_name, type(lora_layer).__name__)
 
+    def _get_lora_buffer_capacity(self, min_rank: int) -> int:
+        """Return the existing or next allocated rank bucket without mutating it."""
+        current = getattr(self, "_max_lora_rank", 0)
+        if min_rank <= current:
+            return current
+        return self._get_smallest_valid_max_rank(min_rank)
+
     def _ensure_moe_lora_context(self) -> None:
         """Wrap MoE runners and publish mapping before the first forward.
 
@@ -702,10 +714,9 @@ class DiffusionLoRAManager:
         If a later adapter has a larger rank, we need to reinitialize those
         buffers and re-apply the currently active adapter.
         """
-        if min_rank <= self._max_lora_rank:
+        valid_max_rank = self._get_lora_buffer_capacity(min_rank)
+        if valid_max_rank == self._max_lora_rank:
             return
-
-        valid_max_rank = self._get_smallest_valid_max_rank(min_rank)
 
         logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank)
         self._max_lora_rank = valid_max_rank
