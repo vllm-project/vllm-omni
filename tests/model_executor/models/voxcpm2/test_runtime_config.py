@@ -4,6 +4,8 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import re
+
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
@@ -113,7 +115,13 @@ class _CountingEstimator(torch.nn.Module):
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
 def test_cfg_value_rejects_nonfinite(value: str) -> None:
-    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value='nan'.* must be finite"):
+    # Pin the yaml key AND the raw value (the way the env-var test at the
+    # bottom of this file does): a bare "must be finite" match would pass
+    # even if the message stopped naming the key or echoed a wrong value.
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"voxcpm2_runtime_config.cfg_value={value!r}") + ".*must be finite",
+    ):
         _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"cfg_value": value})))
 
 
@@ -261,5 +269,9 @@ def test_cfg_value_yaml_boolean_rejected(monkeypatch, bad):
     monkeypatch.delenv("VLLM_OMNI_SPEECH_CFG_VALUE", raising=False)
     # yaml's cfg_value: true would float()-coerce to 1.0 (CFG effectively
     # off); the coercion entry must reject it before the helper sees it.
-    with pytest.raises(ValueError, match="voxcpm2_runtime_config.cfg_value=True.*not a boolean"):
+    # Pattern built from the parameter so both arms pin their own value.
+    with pytest.raises(
+        ValueError,
+        match=re.escape(f"voxcpm2_runtime_config.cfg_value={bad!r}") + ".*not a boolean",
+    ):
         _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"cfg_value": bad})))
