@@ -88,3 +88,41 @@ def test_prefix_cache_matches_full_recompute(monkeypatch, hop_tokens, pages):
         torch.testing.assert_close(output, reference, rtol=1e-4, atol=1e-4)
     assert model._flow_prefix_cache.num_pages == pages
     assert model._flow_prefix_cache.used_pages == 0
+
+
+@torch.inference_mode()
+def test_empty_nonfinal_hop_preserves_prefix_pages(monkeypatch):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.flow_prefix_cache import PAGE_FRAMES
+
+    model = _tiny_streaming_flow(monkeypatch)
+    page_bytes = 2 * STEPS * PAGE_FRAMES * (2 * DEPTH * DIM + DIM) * 4
+    monkeypatch.setenv("COSYVOICE3_FLOW_PREFIX_CACHE_GIB", str(64.5 * page_bytes / 2**30))
+    request = dict(
+        token=torch.randint(0, 64, (1, 98)),
+        prompt_token=torch.randint(0, 64, (1, PROMPT)),
+        prompt_feat=torch.randn(1, 2 * PROMPT, 80),
+        embedding=torch.randn(1, 192),
+    )
+    first = dict(request, token=request["token"][:, :48], token_offset_tokens=0)
+    [(mel, state)] = model._stream_prefix_mels([first], STEPS)
+    cache = model._flow_prefix_cache
+    pages, committed, used = list(state.pages), state.committed, cache.used_pages
+    allocated = cache.allocated_bytes
+    assert allocated == 64 * page_bytes
+    assert committed == 150
+    empty = dict(first, token_offset_tokens=45, cache_state={"flow_prefix": state})
+    [(mel, retained)] = model._stream_prefix_mels([empty], STEPS)
+    assert mel.shape == (1, 80, 0)
+    assert retained is state
+    assert state.pages == pages
+    assert state.committed == committed
+    assert cache.used_pages == used
+
+    # A later real hop still uses the retained prefix and matches recomputation.
+    following = dict(request, token_offset_tokens=45, cache_state={"flow_prefix": state})
+    [(actual, retained)] = model._stream_prefix_mels([following], STEPS)
+    [expected] = model._stream_flow_mels([following], STEPS)
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    cache.release(retained)
+    assert cache.used_pages == 0
+    assert cache.allocated_bytes == allocated

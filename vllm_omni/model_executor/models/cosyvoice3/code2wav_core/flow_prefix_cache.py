@@ -374,6 +374,15 @@ class FlowPrefixCache:
         _ACTIVE_CACHE = self
 
     @property
+    def allocated_bytes(self) -> int:
+        """Bytes in the preallocated KV/conv pool, including its scratch page.
+
+        Excludes CUDA graphs, allocator overhead, weights and solver temporaries.
+        Releasing request pages does not shrink these tensors.
+        """
+        return self.kv.numel() * self.kv.element_size() + self.conv_input.numel() * self.conv_input.element_size()
+
+    @property
     def used_pages(self) -> int:
         return self.num_pages - 1 - len(self.free_pages)
 

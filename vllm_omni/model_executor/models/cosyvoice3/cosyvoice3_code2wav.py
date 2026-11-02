@@ -591,9 +591,10 @@ class CosyVoice3Code2Wav(nn.Module):
             if cache.chunk % self.token_mel_ratio != 0:
                 raise ValueError("Flow prefix cache needs attention chunks aligned to codec tokens")
             logger.info(
-                "CosyVoice3 Flow prefix cache: %d pages of %d frames (%.2f GiB)",
+                "CosyVoice3 Flow prefix cache: %d pages of %d frames (%.3f GiB allocated, %.3f GiB budget)",
                 cache.num_pages,
                 PAGE_FRAMES,
+                cache.allocated_bytes / 2**30,
                 capacity / 2**30,
             )
             self._flow_prefix_cache = cache
@@ -929,7 +930,11 @@ class CosyVoice3Code2Wav(nn.Module):
             end = (tokens.shape[1] - lookahead) * ratio
             emit = item["prompt_feat"].shape[1] + max(0, int(item.get("token_offset_tokens", 0))) * ratio
             start = min(state.committed, emit // cache.chunk * cache.chunk)
-            if end <= start or not cache.reserve(state, end):
+            if end <= start:
+                # An empty non-final hop does not abandon the request's prefix.
+                results[index] = (weight.new_empty((1, self.output_size, 0)), state)
+                continue
+            if not cache.reserve(state, end):
                 cache.release(state)
                 continue
             # mu of tokens [first, end / ratio): their lookahead tokens are all

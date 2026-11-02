@@ -173,6 +173,27 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
+The packed-streaming profiles preallocate a shared Flow prefix pool:
+`cosyvoice3_packed_streaming.yaml` budgets 8 GiB and
+`cosyvoice3_packed_streaming_optimized_standard.yaml` budgets 16 GiB.
+Override `COSYVOICE3_FLOW_PREFIX_CACHE_GIB` in the codec stage's `env` mapping
+of a copied deploy YAML; `0` disables the prefix cache. The budget is rounded
+down to whole pages, including one reserved scratch page; a positive budget
+must hold at least two pages. Request completion returns pages to this pool,
+not to the device allocator. Pool exhaustion falls back to full Flow
+recomputation and can reduce throughput. Startup logs distinguish the actual
+pool tensor allocation from the configured budget; neither is total GPU memory.
+Weights, solver temporaries and CUDA graphs require additional headroom.
+
+For a budget comparison, run the same head and profile at C32 with budgets
+0, 4, 8 and 16 GiB, using a fresh server for each arm. Keep the model, sampling,
+runner, prompts, warmup and other optimizations fixed. Record startup and
+steady-state peak device memory, throughput, TTFA, audio underruns and quality
+for each arm; repeat runs and report OOM arms as failures. Device-level sampled
+memory (for example from `nvidia-smi`) includes other GPU processes and can miss
+short peaks: isolate the GPU and report the sampling interval. Do not label
+pool tensor bytes as a measured C32 peak or infer budget-independent speedups.
+
 For an experimental CUDA deployment with both Talker and Code2Wav on Model
 Runner V2, select the explicit streaming profile:
 
