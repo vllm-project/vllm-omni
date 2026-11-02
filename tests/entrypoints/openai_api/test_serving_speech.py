@@ -1241,6 +1241,23 @@ class TestSpeechAPI:
         assert b"Invalid voice" in response.body
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stream_options", [{}, {"stream": True}, {"stream_format": "sse"}, {"stream_format": "audio"}]
+    )
+    async def test_diffusion_speech_rejects_unsupported_streaming(self, mocker, monkeypatch, tmp_path, stream_options):
+        monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
+        generation = mocker.patch.object(server, "_create_diffusion_speech", new_callable=mocker.AsyncMock)
+        response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", **stream_options))
+        if stream_options:
+            assert response.status_code == 400
+            assert b"Streaming" in response.body
+            generation.assert_not_awaited()
+        else:
+            assert response is generation.return_value
+            generation.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_diffusion_speech_reports_audio_format_and_duration_na(self, mocker: MockerFixture):
         """Diffusion servers report the same audio headers as the AR path."""
         mock_engine = mocker.MagicMock()
