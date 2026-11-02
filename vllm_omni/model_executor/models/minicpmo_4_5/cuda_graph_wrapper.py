@@ -61,6 +61,13 @@ def codec_frame_range(value, *, name: str) -> range:
     return range(int(value[0]), int(value[1]) + 1)
 
 
+def _exact_batch_sizes(connector_config) -> list[int]:
+    """``hift_graph_exact_batch_sizes``: a missing key defaults to ``(1,)``,
+    an explicit empty list disables exact-shape graphs."""
+    sizes = connector_config.get("hift_graph_exact_batch_sizes")
+    return sorted({int(b) for b in (sizes if sizes is not None else (1,)) if int(b) > 0})
+
+
 def empty_hift_outputs(speech_feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """HiFT ``(speech, source)`` for a zero-width mel, without launching the vocoder."""
     batch_size = int(speech_feat.shape[0])
@@ -158,9 +165,7 @@ class HiFTGraphWrapper:
             codec_frame_range(connector_config.get(name), name=name)
             for name in ("hift_graph_first_chunk_frames", "hift_graph_continuation_frames")
         )
-        self.exact_batch_sizes = sorted(
-            {int(b) for b in connector_config.get("hift_graph_exact_batch_sizes") or (1,) if int(b) > 0}
-        )
+        self.exact_batch_sizes = _exact_batch_sizes(connector_config)
         self.exact_shapes = self.derive_exact_shapes()
         # Ordered (capture order) and hashable (replay lookups).
         self._exact_keys = dict.fromkeys((b, *shape) for b in self.exact_batch_sizes for shape in self.exact_shapes)
@@ -1137,6 +1142,33 @@ def _materialize_att_rows(rows: list) -> list[torch.Tensor]:
     return [row.materialize() if isinstance(row, ResidentAttCache) else row for row in rows]
 
 
+def _pack_att_cache(att: object) -> object:
+    """``(depth, 2, N, H, T, D)`` split K/V pairs -> upstream ``(depth, N, H, T, 2D)``.
+
+    The fused/ragged bodies keep K and V in a leading ``2`` so a layer slice is
+    one contiguous pair; upstream ``blocks_forward_chunk`` (and the NPU attention
+    patch) instead expects the ``[K | V]`` packed slice per layer. Anything that
+    is not a split tensor is returned untouched (the ``[None] * depth``
+    placeholder of a cold start).
+    """
+    if not isinstance(att, torch.Tensor) or att.ndim != 6:
+        return att
+    return torch.cat((att[:, 0], att[:, 1]), dim=-1)
+
+
+def _packed_att_buffer(att: torch.Tensor) -> torch.Tensor:
+    """Empty upstream-layout cache buffer with the frames of a split buffer."""
+    depth, _, batch, heads, frames, head_dim = att.shape
+    return att.new_empty((depth, batch, heads, frames, 2 * head_dim))
+
+
+def _unpack_att_cache(packed: torch.Tensor, att: torch.Tensor) -> None:
+    """Copy an upstream ``[K | V]`` cache back into the split K/V buffer."""
+    width = int(packed.shape[-1]) // 2
+    att[:, 0].copy_(packed[..., :width])
+    att[:, 1].copy_(packed[..., width:])
+
+
 class _WholeEulerStatics(NamedTuple):
     """A Whole-Euler graph's static inputs (``lengths`` only with a ragged body)."""
 
@@ -1353,7 +1385,20 @@ class WholeEulerCFMGraphWrapper:
                     kwargs["slots"] = (statics.slot_rows, statics.slot_positions)
                 estimate = self.ragged_body(self.estimator, *args, statics.lengths, **kwargs)
             else:
-                estimate = self.estimator.blocks_forward_chunk(*args)
+                # Upstream walks the layers itself and needs the ``[K | V]``
+                # packed cache, while the kept buffers are split by K/V half;
+                # pack in and unpack the result back (captured with the graph).
+                packed_out = _packed_att_buffer(out_att_cache[step])
+                estimate = self.estimator.blocks_forward_chunk(
+                    estimator_input,
+                    statics.time_embeddings[step],
+                    statics.attn_mask,
+                    statics.cnn_cache[step],
+                    _pack_att_cache(statics.att_cache[step]),
+                    out_cnn_cache[step],
+                    packed_out,
+                )
+                _unpack_att_cache(packed_out, out_att_cache[step])
 
             cur_x = _euler_step(cur_x, estimate, dt, self.inference_cfg_rate, batch_size)
 

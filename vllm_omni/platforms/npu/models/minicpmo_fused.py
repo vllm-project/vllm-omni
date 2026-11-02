@@ -115,7 +115,12 @@ def attention(attn, x, att_cache, attn_mask, kv, *, min_cache_frames: int):
     if cached >= min_cache_frames:
         behind_keys = keys[:, :, frames:]
         behind_values = values[:, :, frames:]
-        if att_cache[0].data_ptr() != behind_keys.data_ptr() or att_cache[0].stride() != behind_keys.stride():
+        if (
+            att_cache[0].data_ptr() != behind_keys.data_ptr()
+            or att_cache[0].stride() != behind_keys.stride()
+            or att_cache[1].data_ptr() != behind_values.data_ptr()
+            or att_cache[1].stride() != behind_values.stride()
+        ):
             behind_keys[:, :, :cached].copy_(att_cache[0])
             behind_values[:, :, :cached].copy_(att_cache[1])
         keys[:, :, :frames].copy_(k)
@@ -127,8 +132,11 @@ def attention(attn, x, att_cache, attn_mask, kv, *, min_cache_frames: int):
         span = int(k.shape[2])
         keys[:, :, :span].copy_(k)
         values[:, :, :span].copy_(v)
-    # ``keys`` already carries exactly the live span here, so no mask split.
-    mask = _expand_attn_mask_for_npu(attn_mask, frames, int(keys.shape[-2]))
+    # Slice to the live span explicitly: the caller may size ``kv`` wider than
+    # frames + cached, and the tail of that capacity is not defined here.
+    span = frames + cached
+    keys, values = keys[:, :, :span], values[:, :, :span]
+    mask = _expand_attn_mask_for_npu(attn_mask, frames, span)
     out = F.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
     return attn.proj(out.transpose(1, 2).reshape(batch, frames, -1))
 
@@ -259,7 +267,12 @@ def attention_npu(attn, hidden, att_cache, attn_mask, kv, slots=None):
         )
     behind_keys = keys[:, :, frames:]
     behind_values = values[:, :, frames:]
-    if cached and (att_cache[0].data_ptr() != behind_keys.data_ptr() or att_cache[0].stride() != behind_keys.stride()):
+    if cached and (
+        att_cache[0].data_ptr() != behind_keys.data_ptr()
+        or att_cache[0].stride() != behind_keys.stride()
+        or att_cache[1].data_ptr() != behind_values.data_ptr()
+        or att_cache[1].stride() != behind_values.stride()
+    ):
         behind_keys[:, :, :cached].copy_(att_cache[0])
         behind_values[:, :, :cached].copy_(att_cache[1])
     packed = qkv.view(batch, frames, 3, int(attn.num_heads), int(attn.head_dim))
@@ -287,7 +300,16 @@ def attention_npu(attn, hidden, att_cache, attn_mask, kv, slots=None):
         raise ValueError(
             f"NPU fused attention mask/cache mismatch: mask has {mask.shape[-1]} keys, cache has {capacity}"
         )
-    out = F.scaled_dot_product_attention(query, keys, values, attn_mask=mask)
+    if mask is None:
+        # Without a mask the whole capacity would be attended, but only
+        # ``frames + cached`` keys are defined; slice to the live span so the
+        # uninitialized tail cannot contribute.
+        live = frames + cached
+        out = F.scaled_dot_product_attention(
+            query, keys[:, :, :live], values[:, :, :live], attn_mask=None
+        )
+    else:
+        out = F.scaled_dot_product_attention(query, keys, values, attn_mask=mask)
     out = out.transpose(1, 2).reshape(batch * frames, -1)
     return F.linear(out, attn.proj.weight, attn.proj.bias).view(batch, frames, -1)
 

@@ -1814,75 +1814,39 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     terminal_flags.append(flag_true)
                     continue
                 eos_window_masked = silent_run < _TURN_END_SILENT_FRAMES
-            host_id: int | None = None
-            if self._k_step_frames > 0:
-                # Reuse the next row's head only when its row binding matches.
-                if pending_lg is not None and pending_lg_row == index:
-                    lg_dev: torch.Tensor | None = pending_lg
-                else:
-                    lg_dev = None
-                pending_lg = None
-                host_id, device_finished, device_emit = self._sample_audio_code_host(
-                    hidden[end - 1 : end],
-                    codes,
-                    request_id,
-                    state,
-                    step,
-                    min_tokens,
-                    max_tokens,
-                    eos_window_masked,
-                    lg_dev=lg_dev,
-                )
-                # Queue the next head after this row's blocking D2H, so the
-                # current transfer does not wait for the next row's head.
-                nxt = index + 1
-                if nxt < len(infos):
-                    s2, e2 = spans[nxt]
-                    e2 = min(int(e2), int(hidden.shape[0]))
-                    if e2 > s2:
-                        pending_lg = self.head_code[0](hidden[e2 - 1 : e2]).float().reshape(-1).detach()
-                        pending_lg_row = nxt
-            elif _codec_float_param(state, "codec_temperature", self._codec_temperature) == 0.0:
-                greedy_result = self._sample_audio_code_greedy(
-                    hidden[end - 1 : end],
-                    codes,
-                    request_id,
-                    step,
-                    min_tokens,
-                    max_tokens,
-                    eos_window_masked,
-                )
-                sample_result = greedy_result
+            # Reuse the next row's head only when its row binding matches.
+            if pending_lg is not None and pending_lg_row == index:
+                lg_dev: torch.Tensor | None = pending_lg
             else:
-                sample_result = self._sample_audio_code(
-                    hidden[end - 1 : end], codes, request_id, step, eos_window_masked
-                )
-            if host_id is None:
-                # The kernel ABI is int32, while the existing connector/audio-code
-                # payload is int64.  Keep the compatibility cast outside the fused op.
-                sampled = sample_result.sampled_token.to(torch.long).reshape(())
-                # Review P2-3: the host needs sampled_id plus the device
-                # finished/emit decision every frame; pack the three scalars
-                # into one D2H transfer so a K-frame step costs one device
-                # sync per frame instead of three.
-                packed = torch.stack(
-                    (
-                        sampled,
-                        sample_result.state.finished.reshape(()).to(torch.long),
-                        sample_result.emit.reshape(()).to(torch.long),
-                    )
-                )
-                packed_host = packed.cpu().tolist()
-                sampled_id = int(packed_host[0])
-                device_finished = bool(packed_host[1])
-                device_emit = bool(packed_host[2])
-            else:
-                # Host sampling already resolved the three scalars in a
-                # single logits D2H; one small H2D keeps the downstream
-                # device-side consumers (codes cat, connector payload) on
-                # their existing types.
-                sampled = torch.tensor(host_id, dtype=torch.long, device=hidden.device).reshape(())
-                sampled_id = int(host_id)
+                lg_dev = None
+            pending_lg = None
+            # The K-step path always samples on host (the switch and the device
+            # samplers were removed with it); the single-frame path returned above.
+            host_id, device_finished, device_emit = self._sample_audio_code_host(
+                hidden[end - 1 : end],
+                codes,
+                request_id,
+                state,
+                step,
+                min_tokens,
+                max_tokens,
+                eos_window_masked,
+                lg_dev=lg_dev,
+            )
+            # Queue the next head after this row's blocking D2H, so the
+            # current transfer does not wait for the next row's head.
+            nxt = index + 1
+            if nxt < len(infos):
+                s2, e2 = spans[nxt]
+                e2 = min(int(e2), int(hidden.shape[0]))
+                if e2 > s2:
+                    pending_lg = self.head_code[0](hidden[e2 - 1 : e2]).float().reshape(-1).detach()
+                    pending_lg_row = nxt
+            # Host sampling resolved the three scalars in a single logits D2H;
+            # one small H2D keeps the downstream device-side consumers (codes
+            # cat, connector payload) on their existing types.
+            sampled = torch.tensor(host_id, dtype=torch.long, device=hidden.device).reshape(())
+            sampled_id = int(host_id)
             full_ids = state.get("codec_full_ids")
             if isinstance(full_ids, list):
                 full_ids.append(sampled_id)
@@ -1904,29 +1868,28 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if emit_frame:
                 codes = torch.cat([codes[-(HISTORY_WINDOW - 1) :], sampled.reshape(1)])
                 delta = sampled.reshape(1, 1)
-                if self._k_step_frames > 0:
-                    # K-step: the multi-frame loop owns sampling, so the rows
-                    # vLLM schedules for the next step carry placeholder
-                    # continue ids. Record this frame's sample so the decode
-                    # preprocess embeds the real previous frame's codec id
-                    # (the k_last branch) instead of the placeholder, and keep
-                    # the confirmed-frame history that streaming prompt
-                    # recompute rebuilds its window from -- the scheduler's
-                    # token slice holds the placeholder ids.
-                    state["last_code"] = sampled_id
-                    histories = getattr(self, "_request_codec_history", None)
-                    if not isinstance(histories, dict):
-                        # Instances built without __init__ (CPU tests,
-                        # subclasses) still need a place for the record -- the
-                        # readers at the recompute and cleanup sites already
-                        # tolerate a missing dict the same way.
-                        histories = {}
-                        self._request_codec_history = histories
-                    codec_history = histories.get(request_id)
-                    if codec_history is None:
-                        codec_history = []
-                        histories[request_id] = codec_history
-                    codec_history.append(sampled_id)
+                # K-step: the multi-frame loop owns sampling, so the rows
+                # vLLM schedules for the next step carry placeholder
+                # continue ids. Record this frame's sample so the decode
+                # preprocess embeds the real previous frame's codec id
+                # (the k_last branch) instead of the placeholder, and keep
+                # the confirmed-frame history that streaming prompt
+                # recompute rebuilds its window from -- the scheduler's
+                # token slice holds the placeholder ids.
+                state["last_code"] = sampled_id
+                histories = getattr(self, "_request_codec_history", None)
+                if not isinstance(histories, dict):
+                    # Instances built without __init__ (CPU tests,
+                    # subclasses) still need a place for the record -- the
+                    # readers at the recompute and cleanup sites already
+                    # tolerate a missing dict the same way.
+                    histories = {}
+                    self._request_codec_history = histories
+                codec_history = histories.get(request_id)
+                if codec_history is None:
+                    codec_history = []
+                    histories[request_id] = codec_history
+                codec_history.append(sampled_id)
             else:
                 delta = empty_delta
             state["codes"] = codes
