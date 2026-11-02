@@ -48,6 +48,20 @@ HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [151643, 151671],
             },
+            # The v2 path's self-owned sampler captures tensor-valued temperature/
+            # top-k/top-p only; text-generation sampling machinery is not wired into it.
+            mrv2_unsupported_sampling_params=(
+                "frequency_penalty",
+                "presence_penalty",
+                "repetition_penalty",
+                "logprobs",
+                "prompt_logprobs",
+                "min_tokens",
+                "min_p",
+                "allowed_token_ids",
+                "bad_words",
+                "logit_bias",
+            ),
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
         ),
         StagePipelineConfig(

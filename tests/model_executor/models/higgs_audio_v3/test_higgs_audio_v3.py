@@ -64,6 +64,71 @@ class TestHiggsAudioV3Config:
         assert config.num_real_codes == 1024
         assert config.tie_modality_embeddings is True
 
+    def test_mrv2_flags_follow_runner_by_default(self):
+        """Tri-state resolution: None follows the runner; v1 turns all off."""
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config()
+        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
+        assert all(
+            getattr(v2, name) is True
+            for name in (
+                "audio_async_prompt_mode",
+                "audio_async_payload",
+                "audio_mrv2_static_inputs",
+                "audio_mrv2_slot_parameters",
+                "audio_mrv2_direct_payload",
+                "audio_mrv2_sample_graph_buckets",
+                "audio_mrv2_async_state_indices",
+                "audio_mrv2_fused_state",
+            )
+        )
+        v1 = config.resolve_mrv2_defaults(use_v2_model_runner=False)
+        assert all(getattr(v1, name) is False for name in v2.__dataclass_fields__)
+
+    def test_mrv2_structural_flags_cannot_be_disabled_under_v2(self):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        for name in ("audio_async_payload", "audio_async_prompt_mode"):
+            config = HiggsAudioV3Config(**{name: False})
+            with pytest.raises(ValueError, match=name):
+                config.resolve_mrv2_defaults(use_v2_model_runner=True)
+
+    def test_mrv2_non_structural_flags_overridable(self):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config(audio_mrv2_static_inputs=False)
+        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
+        assert v2.audio_mrv2_static_inputs is False
+        assert v2.audio_async_payload is True
+
+    def test_mrv2_explicit_flags_warn_when_ignored_under_v1(self, caplog):
+        from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
+            HiggsAudioV3Config,
+        )
+
+        config = HiggsAudioV3Config(audio_mrv2_static_inputs=True, audio_mrv2_fused_state=True)
+        with caplog.at_level("WARNING", logger="vllm_omni.transformers_utils.configs.higgs_audio_v3"):
+            v1 = config.resolve_mrv2_defaults(use_v2_model_runner=False)
+        assert v1.audio_mrv2_static_inputs is False
+        assert v1.audio_mrv2_fused_state is False
+        assert any(
+            "audio_mrv2_static_inputs" in message and "audio_mrv2_fused_state" in message for message in caplog.messages
+        )
+
+        # The same explicit values are honored, not warned about, under v2.
+        caplog.clear()
+        v2 = config.resolve_mrv2_defaults(use_v2_model_runner=True)
+        assert v2.audio_mrv2_static_inputs is True
+        assert v2.audio_mrv2_fused_state is True
+        assert not caplog.records
+
     def test_custom_audio_encoder_config(self):
         from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
             HiggsAudioV3Config,
@@ -1555,8 +1620,9 @@ class TestRegistry:
     def test_deploy_yaml_uses_native_flashinfer(self):
         from vllm_omni.config.stage_config import load_deploy_config
 
+        # The V1 opt-out profiles keep the FLASHINFER shape; the default yaml
+        # flipped to MRV2 (FLASH_ATTN) and is anchored separately below.
         for name in (
-            "higgs_multimodal_qwen3.yaml",
             "higgs_multimodal_qwen3_high_throughput.yaml",
             "higgs_multimodal_qwen3_low_latency.yaml",
         ):
@@ -1566,6 +1632,31 @@ class TestRegistry:
             stage_0 = next(stage for stage in deploy_config.stages if stage.stage_id == 0)
             assert stage_0.attention_backend == "FLASHINFER"
             assert stage_0.engine_extras["attention_config"] == {"use_trtllm_attention": False}
+
+    def test_deploy_yaml_flipped_default_shape(self):
+        """The flipped default yaml anchors the validated MRV2 shape."""
+        from vllm_omni.config.stage_config import load_deploy_config
+
+        yaml_path = get_deploy_config_path("higgs_multimodal_qwen3.yaml")
+        deploy = load_deploy_config(yaml_path)
+        assert deploy.model_runner == "v2"
+        assert deploy.async_chunk is True
+        stage0, stage1 = deploy.stages
+        assert stage0.attention_backend == "FLASH_ATTN"
+        assert stage0.enforce_eager is False
+        assert stage0.async_scheduling is True
+        assert stage0.engine_extras["enable_prefix_caching"] is False
+        # Connector geometry matches the codec graph windows (25 + 8 = 33);
+        # first chunk is one 8-frame graph window.
+        extra = deploy.connectors["connector_of_shared_memory"]["extra"]
+        assert extra["codec_chunk_frames"] == 25
+        assert extra["codec_left_context_frames"] == 8
+        assert extra["codec_right_holdback_frames"] == 0
+        assert extra["initial_codec_chunk_frames"] == 8
+        # Stage-1 codec CUDA graph windows follow the connector geometry.
+        hf_overrides = stage1.engine_extras["hf_overrides"]
+        assert hf_overrides["codec_graph_single_max_frames"] == 33
+        assert hf_overrides["codec_graph_batch_sizes"] == list(range(1, 17))
 
 
 # ---- AC-3: Prompt Builder ----
