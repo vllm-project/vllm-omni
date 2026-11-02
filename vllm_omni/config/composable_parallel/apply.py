@@ -197,7 +197,7 @@ def _check_devices(runtime: dict[str, Any], cfg: OmniParallelConfig, *, role: Ro
     )
 
 
-def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> None:
+def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey, check_devices: bool) -> None:
     declared = set(cfg.l1_owners.keys())
     if hasattr(stage, "parallel_config") and hasattr(stage, "runtime_config"):
         parallel = stage.parallel_config
@@ -221,14 +221,15 @@ def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> No
                     f"num_replicas={cfg.stage_replica_size} but structured config already set {existing}"
                 )
             stage.runtime_config.num_replicas = cfg.stage_replica_size
-        check_device_layout(
-            stage.runtime_config.devices,
-            tensor_parallel_size=cfg.tensor_parallel_size,
-            data_parallel_size=cfg.data_parallel_size,
-            pipeline_parallel_size=cfg.pipeline_parallel_size,
-            num_replicas=int(stage.runtime_config.num_replicas or 1),
-            role=role,
-        )
+        if check_devices:
+            check_device_layout(
+                stage.runtime_config.devices,
+                tensor_parallel_size=cfg.tensor_parallel_size,
+                data_parallel_size=cfg.data_parallel_size,
+                pipeline_parallel_size=cfg.pipeline_parallel_size,
+                num_replicas=int(stage.runtime_config.num_replicas or 1),
+                role=role,
+            )
         return
 
     engine_args = stage.yaml_engine_args
@@ -240,12 +241,15 @@ def _apply_to_stage(stage: Any, cfg: OmniParallelConfig, *, role: RoleKey) -> No
         _set_explicit(engine_args, "enable_expert_parallel", True, role=role)
     if "stage_replica" in declared:
         _set_num_replicas(runtime, cfg.stage_replica_size, role=role)
-    _check_devices(runtime, cfg, role=role)
+    if check_devices:
+        _check_devices(runtime, cfg, role=role)
 
 
 def apply_strategy_specs(
     stages: list[Any],
     strategy_specs: Mapping[RoleKey, Sequence[StrategySpec]],
+    *,
+    check_devices: bool = True,
 ) -> StrategyApplyResult:
     """Overlay per-role strategy specs onto a merged stage list.
 
@@ -254,6 +258,10 @@ def apply_strategy_specs(
         strategy_specs: maps a role (a ``model_stage`` name, e.g. ``"thinker"``)
             to that stage's stack of ``StrategySpec`` (one per declared mesh
             axis). Role keys are ``model_stage`` names (str).
+        check_devices: validate each stage's device count against the
+            strategy world size on the merged stages. Callers that layer CLI /
+            ``--stage-overrides`` devices on top afterwards pass ``False`` and
+            run :func:`check_device_layout` on the effective layout instead.
 
     Returns:
         A :class:`StrategyApplyResult` with the mutated stages and the derived
@@ -274,7 +282,7 @@ def apply_strategy_specs(
     for key, specs in strategy_specs.items():
         stage = _resolve_stage(stages, key)
         cfg = translate_strategy_stack(specs)
-        _apply_to_stage(stage, cfg, role=key)
+        _apply_to_stage(stage, cfg, role=key, check_devices=check_devices)
         result.per_role_config[key] = cfg
         stage_id = getattr(stage, "stage_id", None)
         if stage_id is not None:
