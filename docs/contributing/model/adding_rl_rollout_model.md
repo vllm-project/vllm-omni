@@ -98,7 +98,7 @@ select parameters. Name matching alone does not prove reload support.
 
 Before setting `supports_weight_reload`, verify the complete loading path. The
 shared integration point is
-[`diffusion/model_loader/weight_reload.py`](../../../vllm_omni/diffusion/model_loader/weight_reload.py).
+[`diffusion/model_loader/weight_reload.py`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/model_loader/weight_reload.py).
 
 The pipeline must satisfy all of the following:
 
