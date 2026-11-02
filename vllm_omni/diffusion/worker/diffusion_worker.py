@@ -85,6 +85,7 @@ from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config, resolv
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.errors import OmniClientError, client_error_metadata
 from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
@@ -1643,13 +1644,21 @@ class WorkerProc:
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             result = self.worker.execute_method(method, *args, **kwargs)
         except Exception as e:
-            logger.error(f"Error executing RPC: {e}", exc_info=True)
+            # Client errors are logged once, without a traceback, where they
+            # are handled: here for rank-status RPCs, else in the busy loop.
+            # The executor folds status tracebacks into its error message, so
+            # client errors carry none there either.
+            client_error = isinstance(e, OmniClientError)
+            if not client_error:
+                logger.error(f"Error executing RPC: {e}", exc_info=True)
+            elif collect_rank_status:
+                logger.warning("Rejected RPC request: %s", e)
             status.update(
                 {
                     "ok": False,
                     "error": str(e),
                     "error_type": type(e).__name__,
-                    "traceback": traceback.format_exc(),
+                    "traceback": None if client_error else traceback.format_exc(),
                 }
             )
             if not collect_rank_status:
@@ -1729,7 +1738,11 @@ class WorkerProc:
                     if should_reply:
                         self._return_result(result, rpc_id=rpc_id)
                 except Exception as e:
-                    logger.error(f"Error processing RPC: {e}", exc_info=True)
+                    if isinstance(e, OmniClientError):
+                        # Request validation failure, not a server fault.
+                        logger.warning("Rejected RPC request: %s", e)
+                    else:
+                        logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)
                     _cleanup_after_execution_error(e)
                     # Apply the same reply gate as the success path so
@@ -1738,17 +1751,22 @@ class WorkerProc:
                     output_rank = msg.get("output_rank")
                     exec_all_ranks = msg.get("exec_all_ranks", False)
                     wave_id = msg.get("wave_id")
+                    # Synchronous replies carry the same client-error status as
+                    # the async envelope so the executor can restore a 4xx.
+                    error_status_code, error_type = client_error_metadata(e)
+                    error_reply = {
+                        "status": "error",
+                        "error": error,
+                        "error_status_code": error_status_code,
+                        "error_type": error_type,
+                        "wave_id": wave_id,
+                    }
                     if self.result_mq is not None:
                         if rpc_id is not None:
                             # Async RPC: must complete the executor's pending
-                            # future so collective_rpc() doesn't hang.
-                            self._enqueue_result(
-                                AsyncDiffusionOutput(
-                                    kind=AsyncOutputKind.RPC_RESULT,
-                                    rpc_id=rpc_id,
-                                    error=error,
-                                )
-                            )
+                            # future so collective_rpc() doesn't hang. Keep
+                            # client-error status so the API can answer 4xx.
+                            self._enqueue_result(AsyncDiffusionOutput.rpc_error(rpc_id, e))
                         elif output_rank is None and exec_all_ranks:
                             # DP multi-concurrency: primary ranks reply, tagged
                             from vllm.distributed.parallel_state import (
@@ -1773,12 +1791,10 @@ class WorkerProc:
                                     dp_rank = get_data_parallel_rank()
                                 except Exception:
                                     dp_rank = self.gpu_id
-                                self._return_result(
-                                    {"status": "error", "error": error, "dp_rank": dp_rank, "wave_id": wave_id}
-                                )
+                                self._return_result({**error_reply, "dp_rank": dp_rank})
                         elif output_rank is None or output_rank == self.gpu_id:
                             # Normal RPC: only the expected rank replies
-                            self._return_result({"status": "error", "error": error, "wave_id": wave_id})
+                            self._return_result(error_reply)
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

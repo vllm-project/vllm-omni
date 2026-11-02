@@ -32,6 +32,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
 from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -353,6 +354,83 @@ class TestRequestModeDispatch:
         thread.join(timeout=2)
 
         assert [result.error for result in results] == ["0", "1"]
+
+    @pytest.mark.parametrize(
+        "other_reply",
+        ["ok", "server-error", "client-error"],
+        ids=[
+            "client-error-restored",
+            "server-error-outranks-client-error",
+            "first-client-error-wins-over-other-status",
+        ],
+    )
+    def test_dlo_dp_multi_rank_error_reply_restores_client_error(self, monkeypatch, other_reply):
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        logger = Mock()
+        monkeypatch.setattr(executor_module, "logger", logger)
+        executor, req_q, res_q = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=2),
+        )
+        executor._sync_result_buffer = res_q
+
+        def worker():
+            wave_id = req_q.get(timeout=2)["wave_id"]
+            res_q.put(
+                {
+                    "status": "error",
+                    "error": "bad overlap",
+                    "error_status_code": 422,
+                    "error_type": "X",
+                    "dp_rank": 0,
+                    "wave_id": wave_id,
+                }
+            )
+            if other_reply == "ok":
+                res_q.put({"dp_rank": 1, "output": _tagged_output("1"), "wave_id": wave_id})
+            elif other_reply == "server-error":
+                res_q.put({"status": "error", "error": "cuda failed", "dp_rank": 1, "wave_id": wave_id})
+            else:
+                res_q.put(
+                    {
+                        "status": "error",
+                        "error": "lora conflict",
+                        "error_status_code": 409,
+                        "error_type": "Y",
+                        "dp_rank": 1,
+                        "wave_id": wave_id,
+                    }
+                )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        with pytest.raises(Exception) as exc_info:
+            executor.collective_rpc("execute_model", unique_reply_rank=None, exec_all_ranks=True)
+        thread.join(timeout=2)
+
+        suppressed_logs = [call for call in logger.warning.call_args_list if "not raised" in call.args[0]]
+        if other_reply == "server-error":
+            assert type(exc_info.value) is RuntimeError
+            assert "cuda failed" in str(exc_info.value)
+            # The dropped client error stays visible for debugging.
+            (call,) = suppressed_logs
+            assert call.args[2] == 1
+            assert "dp_rank 0: OmniClientError: bad overlap" in call.args[3]
+            return
+
+        # Otherwise the first collected client error is raised with its status.
+        assert isinstance(exc_info.value, OmniClientError)
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.error_type == "X"
+        assert str(exc_info.value) == "bad overlap"
+        if other_reply == "ok":
+            assert not suppressed_logs
+        else:
+            (call,) = suppressed_logs
+            assert call.args[2] == 1
+            assert "dp_rank 1: OmniClientError: lora conflict" in call.args[3]
 
     @pytest.mark.parametrize(
         ("tp_size", "sp_size", "pp_size", "cfg_size", "expected_primary_ranks"),
@@ -943,6 +1021,15 @@ class TestSerialEngineOperations:
 
         with pytest.raises(RuntimeError, match="kaboom"):
             engine.collective_rpc("bad", unique_reply_rank=0)
+
+    def test_serial_collective_rpc_restores_client_error(self):
+        engine, _, _, res_q = _make_engine()
+        res_q.put({"status": "error", "error": "bad overlap", "error_status_code": 400, "error_type": "X"})
+
+        with pytest.raises(OmniClientError, match="bad overlap") as exc_info:
+            engine.collective_rpc("bad", unique_reply_rank=0)
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.error_type == "X"
 
     def test_collective_rpc_closed_executor_raises(self):
         engine, executor, _, _ = _make_engine()

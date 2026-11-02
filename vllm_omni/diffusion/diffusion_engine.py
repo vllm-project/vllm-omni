@@ -74,7 +74,7 @@ from vllm_omni.diffusion.utils.pipeline_utils import (
 )
 from vllm_omni.diffusion.utils.prompt_utils import pre_tokenized_prompt_keys
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
-from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
+from vllm_omni.errors import OmniClientError, raise_client_error_or
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics.utils import (
     diffusion_scheduler_waiting_metrics,
@@ -586,13 +586,12 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            if is_client_error_status(output.error_status_code):
-                raise client_error_from_metadata(
-                    output.error,
-                    status_code=output.error_status_code,
-                    error_type=output.error_type,
-                )
-            raise RuntimeError(output.error)
+            raise_client_error_or(
+                output.error,
+                status_code=output.error_status_code,
+                error_type=output.error_type,
+                fallback=RuntimeError,
+            )
         if output.request_started:
             return format_empty_diffusion_outputs(
                 request,
