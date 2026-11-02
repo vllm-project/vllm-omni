@@ -777,6 +777,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def shutdown(self) -> None:
         """Shut down the TTS thread pool executor."""
+        if self._adapter is not None:
+            self._adapter.shutdown()
         if self._tts_executor is not None:
             self._tts_executor.shutdown(wait=False, cancel_futures=True)
             self._tts_executor = None

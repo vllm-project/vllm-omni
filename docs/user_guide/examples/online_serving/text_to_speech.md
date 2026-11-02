@@ -18,6 +18,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | AuK / AuK-Flash | assembled local bundle | ✓ (`ref_audio`) | HTTP audio after full generation | — | — |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
+| Chatterbox Turbo / Original | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | ✓ (`ref_audio`, no transcript) | ✓ (PCM / WAV + WebSocket) | built-in `default` or uploaded audio | ✓ |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
@@ -29,6 +30,39 @@ For the full list of supported architectures across all modalities, see
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 For offline inference of any of these models, see the [offline TTS hub](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/text_to_speech/README.md).
+
+## Chatterbox Turbo and Original
+
+Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
+reference recording. No reference transcript is needed. Install the conditioning
+extra with `uv pip install -e '.[chatterbox]'`.
+
+```bash
+vllm-omni serve ResembleAI/chatterbox-turbo --omni --port 8091
+# Use ResembleAI/chatterbox for Original.
+```
+
+Use the common curl/SDK and PCM streaming clients above with `voice: default`,
+or supply `ref_audio` as a data URL. Both use the shared one-second minimum;
+Turbo repeats a clip of five seconds or less until it is longer, where
+upstream refuses it. Both expose WAV/PCM/MP3/FLAC
+non-streaming responses and PCM/WAV streaming. Original additionally accepts
+`extra_params: {exaggeration: 0.5, cfg_weight: 0.5}`; Turbo rejects those controls.
+
+For browser playback, install `vllm-omni[demo]` and run the shared
+[speech streaming player](https://github.com/vllm-project/vllm-omni/tree/main/apps/tts_streaming_player/README.md):
+
+```bash
+uv run apps/tts_streaming_player/gradio_demo.py --sample-rate 24000
+```
+
+It does not sentence-segment long text; use the shared WebSocket speech
+frontend for long narration. Multilingual is unsupported.
+
+See the [H100 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/ResembleAI/Chatterbox-H100.md) for
+profiles, qualification scope and concurrency limitations.
+
+---
 
 ## Common Quick Start
 
