@@ -227,6 +227,20 @@ def test_preencode_rejects_invalid_batch_frames_before_generation(batch_frames):
         handler.shutdown()
 
 
+def test_minwm_malformed_trajectory_is_rejected_before_generation():
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "MinWMAction2VPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    request = VideoGenerationRequest(prompt="test", extra_params={"trajectory": "w*4,x*2"})
+    try:
+        with pytest.raises(HTTPException, match="Unknown trajectory direction") as exc:
+            asyncio.run(handler.generate_video_bytes(request, "invalid-trajectory"))
+        assert exc.value.status_code == 400
+        assert engine.captured_prompt is None
+    finally:
+        handler.shutdown()
+
+
 def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
     from vllm_omni.entrypoints.openai.serving_video import VideoGenerationArtifacts
 

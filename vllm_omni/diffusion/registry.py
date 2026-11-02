@@ -201,6 +201,16 @@ _DIFFUSION_MODELS = {
         "pipeline_abot_world",
         "ABotWorldCausalPipeline",
     ),
+    "SelfForcingPipeline": (
+        "self_forcing",
+        "pipeline_self_forcing",
+        "SelfForcingPipeline",
+    ),
+    "MinWMAction2VPipeline": (
+        "minwm",
+        "pipeline_minwm",
+        "MinWMAction2VPipeline",
+    ),
     "LongCatImagePipeline": (
         "longcat_image",
         "pipeline_longcat_image",
@@ -480,6 +490,10 @@ _NO_CACHE_ACCELERATION = {
     "TaoMateH3Pipeline",
     "CausVidWanPipeline",
     "ABotWorldCausalPipeline",
+    # Four-step causal DMD: every step is a different timestep of one AR
+    # block, so there is no repeated step for cache_dit / tea_cache to skip.
+    "SelfForcingPipeline",
+    "MinWMAction2VPipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
     # branch) across denoising steps, which conflicts with cache_dit / tea_cache
     # step-skipping hooks.
@@ -746,6 +760,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
     "TaoMateH3Pipeline": "get_taomate_h3_post_process_func",
     "ABotWorldCausalPipeline": "get_abot_world_post_process_func",
+    "SelfForcingPipeline": "get_self_forcing_post_process_func",
+    "MinWMAction2VPipeline": "get_self_forcing_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",

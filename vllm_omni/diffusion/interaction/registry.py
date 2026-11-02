@@ -31,4 +31,10 @@ STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
     "TaoMateH3Pipeline": {
         "prompt": TaoMateH3PromptInteractionHandler,
     },
+    "SelfForcingPipeline": {
+        "prompt": PromptInteractionHandler,
+    },
+    "MinWMAction2VPipeline": {
+        "prompt": PromptInteractionHandler,
+    },
 }

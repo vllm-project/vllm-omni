@@ -37,6 +37,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ar_diffusion_paged_attention,
     paged_write_attn,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.paging import paging_block_size
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -166,6 +167,59 @@ class _LingBotSPPrepare(nn.Module):
             )
         cosine, sine = rotary_emb
         return hidden_states, camera_hidden_states, timestep_projection, cosine, sine
+
+
+def _paged_direct_attention(
+    query: torch.Tensor,
+    visible_key: torch.Tensor,
+    visible_value: torch.Tensor,
+    *,
+    chunk_tokens: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Attend over the visible window through the realtime path's block-table kernel.
+
+    Package the visible window as a block table and call the same block-table entry point as the
+    realtime path (FlashAttention on CUDA, the fused kernel on NPU) so direct replay is a numerical
+    oracle for paged execution, rather than a comparison between two different attention kernels. A
+    chunk that is not a legal page (FA2 pages only in multiples of 16 tokens) is paged at the
+    kernel's finest unit instead; the padding past ``seq_lens`` is never read.
+    """
+    block_size = paging_block_size(chunk_tokens)
+    padding = -visible_key.shape[1] % block_size
+    key_pages, value_pages = visible_key[0], visible_value[0]
+    if padding:
+        key_pages = F.pad(key_pages, (0, 0, 0, 0, 0, padding))
+        value_pages = F.pad(value_pages, (0, 0, 0, 0, 0, padding))
+    key_cache = key_pages.unflatten(0, (-1, block_size))
+    value_cache = value_pages.unflatten(0, (-1, block_size))
+    block_count = key_cache.shape[0]
+    block_table = torch.arange(
+        block_count,
+        dtype=torch.int32,
+        device=query.device,
+    ).unsqueeze(0)
+    query_start_loc = torch.tensor(
+        [0, query.shape[1]],
+        dtype=torch.int32,
+        device=query.device,
+    )
+    seq_lens = torch.tensor(
+        [visible_key.shape[1]],
+        dtype=torch.int32,
+        device=query.device,
+    )
+    return ar_diffusion_paged_attention(
+        query,
+        key_cache,
+        value_cache,
+        block_table=block_table,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        max_query_len=query.shape[1],
+        max_seq_len=visible_key.shape[1],
+        softmax_scale=softmax_scale,
+    )
 
 
 class LingBotSelfAttention(nn.Module):
@@ -324,21 +378,58 @@ class LingBotSelfAttention(nn.Module):
         update_cache: bool = True,
         _projection_lease: Lease | None = None,
     ) -> torch.Tensor:
-        # Project logical [B, S, D] tokens into TP-local
-        # [B, S, num_local_heads, head_dim].
-        qkv, _ = self.qkv(hidden_states)
-        query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        query = query.unflatten(2, (self.num_local_heads, self.head_dim))
-        key = key.unflatten(2, (self.num_local_heads, self.head_dim))
-        value = value.unflatten(2, (self.num_local_heads, self.head_dim))
+        query, key, value = self.project_qkv(hidden_states)
         if rotary_emb is not None:
             cos, sin = rotary_emb
             query = self.rotary_embedding(query, cos, sin)
             key = self.rotary_embedding(key, cos, sin)
+        output = self.attend(
+            query,
+            key,
+            value,
+            cache=cache,
+            current_start=current_start,
+            sink_tokens=sink_tokens,
+            update_cache=update_cache,
+        )
+        if self.ulysses_world_size > 1:
+            # A leased projection fuses the head->sequence exchange with ``o``, so its result is already projected.
+            if _projection_lease is not None:
+                destination = _projection_lease.projection_input.unflatten(2, (40, 128))
+                all_to_all_4D(output, 1, 2, self.ulysses_group, _output_destination=destination)
+                _projection_lease.mark_projection_written()
+                return _projection_lease.finish()[0]
+            output = SeqAllToAll4D.apply(self.ulysses_group, output, 1, 2, False)
+        return self.o(output.flatten(2, 3))
 
+    def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project logical [B, S, D] tokens into normalized TP-local [B, S, num_local_heads, head_dim] q/k/v."""
+        qkv, _ = self.qkv(hidden_states)
+        query, key, value = qkv.split((self.tp_inner_dim, self.tp_inner_dim, self.tp_inner_dim), dim=-1)
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+        return (
+            query.unflatten(2, (self.num_local_heads, self.head_dim)),
+            key.unflatten(2, (self.num_local_heads, self.head_dim)),
+            value.unflatten(2, (self.num_local_heads, self.head_dim)),
+        )
+
+    def attend(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cache: LingBotAttentionCache | ARDiffusionPagedLayerInputs,
+        current_start: int,
+        sink_tokens: int,
+        update_cache: bool,
+    ) -> torch.Tensor:
+        """Attend position-encoded TP-local q/k/v over ``cache``, before ``o``.
+
+        Under Ulysses the q/k/v arrive sequence-sharded and are exchanged to head shards here, before the cache
+        sees them; the output is returned head-sharded, and ``forward`` exchanges it back alongside ``o``.
+        """
         if self.ulysses_world_size > 1:
             # One fused sequence->head all-to-all for q/k/v instead of three:
             # (B, S/N, 3, H, D) -> (B, S, 3, H/N, D). Same head-group assignment
@@ -377,51 +468,13 @@ class LingBotSelfAttention(nn.Module):
                 update_cache=update_cache,
             )
             if (query.is_cuda or query.device.type == "npu") and query.shape[0] == 1:
-                # Package the visible window as a block table and call the
-                # same block-table entry point as the realtime path
-                # (FlashAttention on CUDA, the fused kernel on NPU) so direct
-                # replay is a numerical oracle for paged execution, rather
-                # than a comparison between two different attention kernels.
-                block_size = key.shape[1]
-                key_cache = visible_key[0].unflatten(0, (-1, block_size))
-                value_cache = visible_value[0].unflatten(0, (-1, block_size))
-                block_count = key_cache.shape[0]
-                block_table = torch.arange(
-                    block_count,
-                    dtype=torch.int32,
-                    device=query.device,
-                ).unsqueeze(0)
-                query_start_loc = torch.tensor(
-                    [0, query.shape[1]],
-                    dtype=torch.int32,
-                    device=query.device,
-                )
-                seq_lens = torch.tensor(
-                    [visible_key.shape[1]],
-                    dtype=torch.int32,
-                    device=query.device,
-                )
-                output = ar_diffusion_paged_attention(
-                    query,
-                    key_cache,
-                    value_cache,
-                    block_table=block_table,
-                    query_start_loc=query_start_loc,
-                    seq_lens=seq_lens,
-                    max_query_len=query.shape[1],
-                    max_seq_len=visible_key.shape[1],
-                    softmax_scale=self.head_dim**-0.5,
+                # ``key`` is still the current chunk alone; the history is only in ``visible_key``.
+                output = _paged_direct_attention(
+                    query, visible_key, visible_value, chunk_tokens=key.shape[1], softmax_scale=self.head_dim**-0.5
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
-        if self.ulysses_world_size > 1:
-            if _projection_lease is not None:
-                destination = _projection_lease.projection_input.unflatten(2, (40, 128))
-                all_to_all_4D(output, 1, 2, self.ulysses_group, _output_destination=destination)
-                _projection_lease.mark_projection_written()
-                return _projection_lease.finish()[0]
-            output = SeqAllToAll4D.apply(self.ulysses_group, output, 1, 2, False)
-        return self.o(output.flatten(2, 3))
+        return output
 
 
 class LingBotCrossAttention(nn.Module):

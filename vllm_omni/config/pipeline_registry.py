@@ -108,6 +108,7 @@ from vllm_omni.model_executor.models.ming_tts.pipeline import (
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_DECODE_PIPELINE, MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_music3.pipeline import MINIMAX_MUSIC3_PIPELINE
+from vllm_omni.model_executor.models.minwm.pipeline import MINWM_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
     MOSS_TTS_LOCAL_PIPELINE,
     MOSS_TTS_PIPELINE,
@@ -128,6 +129,7 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
     resolve_qwen3_omni_pipeline,
 )
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_FUSED_PIPELINE, QWEN3_TTS_PIPELINE
+from vllm_omni.model_executor.models.self_forcing.pipeline import SELF_FORCING_PIPELINE
 from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
@@ -210,6 +212,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,
     "minimax_h3_disaggregated_decode": MINIMAX_H3_DECODE_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
+    "minwm": MINWM_PIPELINE,
     "moss_tts_delay": MOSS_TTS_PIPELINE,
     "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
@@ -233,6 +236,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_omni_moe_thinker_only": QWEN3_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,
+    "self_forcing": SELF_FORCING_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
     "taomate_h3": TAOMATE_H3_PIPELINE,
