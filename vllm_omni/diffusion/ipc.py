@@ -279,8 +279,9 @@ def _tensor_to_shm(
     handle = _array_to_shm(tensor.numpy())
     handle.update(
         {
-            # The receiver adopts the segment instead of copying it again.
-            "borrow_on_unpack": True,
+            # Opted-in transfers are adopted by the receiver instead of copied
+            # out. Borrowed segments occupy /dev/shm until their last view dies.
+            "borrow_on_unpack": enable_registered_shm,
             "__tensor_shm__": True,
             "torch_dtype": str(original_dtype),
             "torch_dtype_view": bf16_view,
@@ -544,8 +545,10 @@ def pack_diffusion_output_shm(
     the default stream).  The caller must synchronize *d2h_stream* afterward.
 
     ``enable_registered_shm`` opts explicitly identified video tensors into
-    direct CUDA-to-SHM transfer and borrowed CPU views. Other payloads keep
-    their existing transport. Registration is per transfer, without pooling.
+    direct CUDA-to-SHM transfer and borrowed CPU views; where registration is
+    unavailable, they still borrow the plain SHM segment. Other payloads are
+    copied out and unlinked on unpack, so /dev/shm holds them only in flight.
+    Registration is per transfer, without pooling.
 
     Packing is failure-atomic: every SHM segment created during the call is
     tracked and unlinked if any part of the payload fails to pack, and field

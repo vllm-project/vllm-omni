@@ -518,6 +518,30 @@ def test_pack_value_preserves_dtype_shape_and_values_for_bfloat16() -> None:
         _cleanup_shm_handle(packed)
 
 
+@pytest.mark.parametrize("enable_registered_shm", [False, True])
+def test_only_opted_in_host_tensors_borrow_shm_on_unpack(enable_registered_shm: bool) -> None:
+    tensor = torch.arange(_large_numel(torch.float32), dtype=torch.float32)
+    packed = diffusion_ipc._tensor_to_shm(tensor, enable_registered_shm=enable_registered_shm)
+
+    try:
+        assert packed["borrow_on_unpack"] is enable_registered_shm
+        segment = shared_memory.SharedMemory(name=packed["name"])
+        try:
+            unpacked = _unpack_if_shm_handle(packed)
+            # Write through the unlinked segment: only a borrowed view sees it.
+            np.ndarray(tensor.shape, dtype=np.float32, buffer=segment.buf)[0] = -1.0
+            assert (unpacked[0].item() == -1.0) is enable_registered_shm
+            torch.testing.assert_close(unpacked[1:], tensor[1:])
+            del unpacked
+        finally:
+            segment.close()
+        # Either way the receiver unlinks the name.
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=packed["name"])
+    finally:
+        _cleanup_shm_handle(packed)
+
+
 def test_pack_value_packs_non_contiguous_large_tensor_values() -> None:
     tensor = torch.arange(_large_numel(torch.float32) * 2, dtype=torch.float32).reshape(-1, 2)[:, 0]
     assert not tensor.is_contiguous()
