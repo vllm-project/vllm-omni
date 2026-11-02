@@ -43,7 +43,11 @@ class TestKeyBasedReadWrite:
         assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() - 1) is None
         assert connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1)[0] == {"value": 7}
 
-    @pytest.mark.parametrize("key", ["test_key_1", "speech-" + uuid.uuid4().hex + "-" + uuid.uuid4().hex + "_0_0"])
+    @pytest.mark.parametrize(
+        "key",
+        ["test_key_1", "speech-" + uuid.uuid4().hex + "-" + uuid.uuid4().hex + "_0_0"],
+        ids=["plain-key", "speech-key"],
+    )
     def test_put_then_get_by_key(self, connector, key):
         data = {"hello": "world", "n": 42}
         ok, size, meta = connector.put("s0", "s1", key, data)
