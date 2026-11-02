@@ -10,6 +10,7 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
 from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 
@@ -115,16 +116,11 @@ def scheduler(monkeypatch, initial=(), delayed=()):
         for i in range(8)
     }
     s.running = list(s.requests.values())
-    s.input_coordinator = SimpleNamespace(
-        requests_with_ready_chunks=set(),
-        finished_requests=set(),
-        input_terminal_req_ids=set(),
-        pending_chunk_registrations=[],
-    )
+    s.input_coordinator = OmniSchedulingCoordinator(stage_id=1, async_chunk=True)
     s.chunk_transfer_adapter = None
     s._latest_omni_connector_output = None
     s._outputs_awaiting_stage_payload = {}
-    s._omni_connector_output_inbox = Inbox(clock, initial, delayed)
+    monkeypatch.setattr(s, "_omni_connector_output_inbox", Inbox(clock, initial, delayed), raising=False)
     return s, clock
 
 
