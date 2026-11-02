@@ -114,11 +114,23 @@ padding waste to recover and fall back to the original forward. When a wrapped e
 call is ineligible (keyword args, non-CUDA, no published lengths, unsupported output, or
 no matching fixed-window recipe, or over-long/empty batches), the wrapper returns the untouched forward unchanged.
 
-Numerically, the path is **lossy for unmasked encoders** (e.g. the fixed-window Whisper
-family): feature-off attends over the full extractor padding while the bucketed path
-attends over the smaller rung window, so the two outputs differ measurably (per-row
-on/off cosine down to ~0.5 on short clips). Mask/length-aware encoders stay exact. See the
-encoder bucketing PR measurements for the per-row on/off table.
+Numerically, the path is **lossy for unmasked, absolute-positional encoders** (the
+fixed-window Whisper family, e.g. Covo-Audio-Chat): feature-off attends over the full
+extractor padding while the bucketed path attends over the smaller rung window, so the
+two outputs differ. **Mask-aware encoders stay lossless** (e.g. Step-Audio-2-mini, whose
+`AudioEncoder` masks padding via `make_non_pad_mask`): the on/off outputs are identical
+in fp32 and nearly identical in bfloat16.
+
+Measured on the real checkpoints, the main numbers are (reference data; the exact
+values depend on the actual audio length distribution):
+
+* Covo-Audio-Chat (lossy): per-row on/off cosine down to ~0.5 on short clips, WER
+  24.5% -> 24.7% (off -> on) on LibriSpeech test-clean, ~1.85x encoder speedup, and
+  E2E at max-concurrency 16: TTFT P50 104.2 -> 92.3 ms (-11%), throughput 23.2 -> 28.2
+  req/s (+21.7%).
+* Step-Audio-2-mini (lossless): on/off cosine 1.0 in fp32 (~0.997 in bfloat16), WER
+  1.6% -> 1.5% on LibriSpeech test-clean (greedy), and 1.62-3.7x encoder speedup
+  depending on the batch length mix.
 
 | `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 100` mel frames. Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name means the feature is a no-op. | Experimental |
 | `VLLM_OMNI_AUDIO_BUCKET_MODULES` | Regex | Overrides the wrapped-module name pattern (default matches names ending in `encoder`, `audio_encoder`, `speech_encoder`, `audio_tower`, or `whisper_encoder`) | Use to opt in module names outside the default pattern, e.g. `reference_encoder`. | Experimental |

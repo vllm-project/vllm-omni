@@ -129,7 +129,7 @@ def _rungs_from_env() -> tuple[int, ...] | None:
 def _as_tensor(output):
     if torch.is_tensor(output):
         return output
-    if isinstance(output, tuple) and len(output) == 1 and torch.is_tensor(output[0]):
+    if isinstance(output, tuple) and len(output) >= 1 and torch.is_tensor(output[0]):
         return output[0]
     hidden = getattr(output, "last_hidden_state", None)
     if torch.is_tensor(hidden):
@@ -141,14 +141,33 @@ def _as_tensor(output):
 
 
 def _split_output(output):
-    """Return ``(tensor, rebuild)`` for tensor or HuggingFace-style outputs."""
+    """Return ``(features, rebuild, aux_spec)`` describing an encoder output.
+
+    ``features`` is the tensor the bucketed path re-groups. ``rebuild(features,
+    aux)`` reconstructs the original output type. ``aux_spec`` is ``None`` except
+    for encoders that return ``(features, per-item lengths)``, in which case it is
+    ``("lengths", dtype, device)`` and the bucketed path also re-groups ``aux``.
+    """
     if torch.is_tensor(output):
-        return output, lambda tensor: tensor
+        return output, (lambda features, aux: features), None
     if isinstance(output, tuple) and len(output) == 1 and torch.is_tensor(output[0]):
-        return output[0], lambda tensor: (tensor,)
+        return output[0], (lambda features, aux: (features,)), None
+    if (
+        isinstance(output, tuple)
+        and len(output) == 2
+        and torch.is_tensor(output[0])
+        and torch.is_tensor(output[1])
+        and output[1].dim() == 1
+    ):
+        lengths = output[1]
+        return (
+            output[0],
+            (lambda features, aux: (features, aux)),
+            ("lengths", lengths.dtype, lengths.device),
+        )
     hidden = getattr(output, "last_hidden_state", None)
     if torch.is_tensor(hidden) and dataclasses.is_dataclass(output):
-        return hidden, lambda tensor: dataclasses.replace(output, last_hidden_state=tensor)
+        return hidden, (lambda features, aux: dataclasses.replace(output, last_hidden_state=features)), None
     return None
 
 
@@ -162,6 +181,7 @@ class _BucketedEncoder:
         self._original = module.forward
         self._shim = None  # optional fixed-window recipe; used ONLY for bucketed windows
         self._rebuild = None
+        self._aux_spec = None  # e.g. ("lengths", dtype, device) for (features, lengths) outputs
         self._lengths: tuple[int, ...] | None = None
         self._disabled = False
         self._truncation_warned = False
@@ -240,9 +260,10 @@ class _BucketedEncoder:
                     )
                     return output
                 self._rebuild = split[1]
+                self._aux_spec = split[2]
                 return output
-            container = self._bucketed(features, lengths, mask, length_arg)
-            return self._rebuild(container)
+            bucketed, aux = self._bucketed(features, lengths, mask, length_arg)
+            return self._rebuild(bucketed, aux)
         except Exception:
             self._disabled = True
             logger.warning("Bucketed encoder %r failed; falling back to eager", self.name, exc_info=True)
@@ -274,18 +295,24 @@ class _BucketedEncoder:
             groups.setdefault(self.ladder.padded_length(length), []).append(index)
 
         container: torch.Tensor | None = None
+        aux_container: torch.Tensor | None = None
         for rung, indices in groups.items():
             step = _EAGER_CHUNK
             for start in range(0, len(indices), step):
                 chunk = indices[start : start + step]
-                hidden = self._run_chunk(features, lengths, mask, length_arg, rung, chunk)
+                hidden, aux = self._run_chunk(features, lengths, mask, length_arg, rung, chunk)
                 hidden = hidden[: len(chunk)]
                 if container is None or container.size(1) < hidden.size(1):
                     container = self._grow(container, hidden.new_zeros((len(lengths), hidden.size(1), hidden.size(-1))))
                 for row, index in enumerate(chunk):
                     container[index, : hidden.size(1)] = hidden[row]
+                if aux is not None:
+                    if aux_container is None:
+                        aux_container = aux.new_zeros((len(lengths),))
+                    for row, index in enumerate(chunk):
+                        aux_container[index] = aux[row]
         assert container is not None, "empty batch"
-        return container
+        return container, aux_container
 
     @staticmethod
     def _grow(previous, wanted):
@@ -304,7 +331,9 @@ class _BucketedEncoder:
             self._tensor_forward(*self._build_inputs(features, lengths, mask, length_arg, rung, sub, len(sub)))
             for sub in self._chunks(chunk, _EAGER_CHUNK)
         ]
-        return torch.cat(outs, dim=0)
+        feats = torch.cat([o[0] for o in outs], dim=0)
+        aux = torch.cat([o[1] for o in outs], dim=0) if outs[0][1] is not None else None
+        return feats, aux
 
     def _build_inputs(self, features, lengths, mask, length_arg, rung, chunk, padded):
         if any(lengths[index] > rung for index in chunk) and not self._truncation_warned:
@@ -353,10 +382,16 @@ class _BucketedEncoder:
         # compute. Ineligible calls (kwargs/2-D/non-CUDA/grad/stream-capturing)
         # and the eager prime call still go through the untouched forward.
         target = self._shim if self._shim is not None else self._original
-        tensor = _as_tensor(target(*inputs))
-        if tensor is None:
+        output = target(*inputs)
+        features = _as_tensor(output)
+        if features is None:
             raise TypeError(f"encoder {self.name!r} returned an unsupported output type")
-        return tensor
+        aux = None
+        if self._aux_spec is not None and self._aux_spec[0] == "lengths":
+            # The encoder returned (features, per-item lengths); carry the
+            # lengths through so _bucketed can re-order them to the item order.
+            aux = output[1][: features.size(0)]
+        return features, aux
 
 
 # --------------------------------------------------------------- auto install

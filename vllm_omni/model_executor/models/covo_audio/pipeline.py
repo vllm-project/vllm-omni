@@ -51,3 +51,30 @@ COVO_AUDIO_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+# ASR / audio-understanding only: fused_thinker_talker (stage 0) without the
+# code2wav waveform stage. Text-only decoding — used to measure encoder-bucketing
+# lossiness without paying the BigVGAN/flow vocoder cost.
+COVO_AUDIO_THINKER_ONLY_PIPELINE = PipelineConfig(
+    model_type="covo_audio_thinker_only",
+    default_deploy_config_name="covo_audio_thinker_only.yaml",
+    model_arch="CovoAudioForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="fused_thinker_talker",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            engine_output_type="latent",
+            sampling_constraints={
+                "detokenize": True,
+                "stop_token_ids": [151645],
+                "ignore_eos": True,
+            },
+        ),
+    ),
+)

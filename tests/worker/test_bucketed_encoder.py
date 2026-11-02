@@ -244,6 +244,52 @@ def test_published_lengths_apply_alongside_positional_mask(bucket_env):
         torch.testing.assert_close(out[row, :length], solo, rtol=0, atol=1e-6)
 
 
+class LengthReturningEncoder(nn.Module):
+    """Mask-aware encoder returning ``(features, per-item output lengths)`` —
+    the Step-Audio2 / Ming ``forward_padded`` contract."""
+
+    def forward(self, x: torch.Tensor, x_len: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x_len = x_len.to(x.device)  # host-side length contract
+        w = (torch.arange(x.size(1), device=x.device) < x_len.unsqueeze(1)).to(x.dtype)
+        features = (x * w.unsqueeze(-1)).cumsum(dim=1)
+        out_len = (x_len + 1) // 2
+        return features, out_len
+
+
+class LengthReturningToyModel(nn.Module):
+    """Embed path that calls the encoder as ``encoder(feats, host_lengths)``."""
+
+    def __init__(self):
+        super().__init__()
+        self.encoder = LengthReturningEncoder()
+
+    def embed_multimodal(self, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.encoder(kwargs["audio_features"], kwargs["audio_lens"])
+
+
+def test_length_returning_encoder_buckets_losslessly(bucket_env):
+    """(features, lengths) encoders must bucket losslessly: each row's true-length
+    prefix equals its solo result and the output lengths are the true per-item
+    lengths (not rung-padded)."""
+    model = LengthReturningToyModel().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    feats = make_features()
+    lens = torch.tensor(LENGTHS, dtype=torch.long)  # host-side 1-D lengths
+
+    with torch.inference_mode():
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)
+        out_features, out_lens = model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    assert out_features.shape[0] == len(LENGTHS)
+    assert out_lens.shape == (len(LENGTHS),)
+    for row, length in enumerate(LENGTHS):
+        solo_features, solo_len = wrapper._original(feats[row : row + 1, :length], lens[row : row + 1])
+        torch.testing.assert_close(out_features[row, :length], solo_features[0], rtol=0, atol=1e-6)
+        assert out_lens[row].item() == solo_len.item()
+
+
 def test_module_pattern_env_override(bucket_env, monkeypatch):
     """VLLM_OMNI_AUDIO_BUCKET_MODULES selects which module names wrap."""
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_MODULES", r"(?:^|\.)my_frontend$")

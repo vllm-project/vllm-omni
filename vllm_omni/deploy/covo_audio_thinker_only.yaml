@@ -1,0 +1,25 @@
+# Covo-Audio-Chat thinker-only (ASR/text) deploy: fused_thinker_talker → text,
+# skipping the code2wav vocoder stage. Single GPU, text output only.
+#
+# Used for encoder length-bucketing lossiness evaluation (WER), where the
+# BigVGAN/flow vocoder cost is irrelevant and only the transcription text
+# matters. Decoding is greedy (temperature 0).
+pipeline: covo_audio_thinker_only
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.6
+    mm_processor_cache_gb: 0
+    devices: "0"
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 512
+      seed: 42
+      repetition_penalty: 1.05

@@ -251,6 +251,9 @@ class AudioEncoder(nn.Module):
             x: encoded features, shape (batch_size, T//4, n_state)
             x_len: updated lengths, shape (batch_size,)
         """
+        # Accept a host-side length so the length-bucketed encoder wrapper can
+        # read it without a D2H sync; move it to the feature device here.
+        x_len = x_len.to(x.device)
         T = x.size(-1)
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
@@ -735,9 +738,11 @@ class StepAudio2ThinkerForConditionalGeneration(nn.Module, SupportsMultiModal, S
         audio_mels = audio_input["audio_mels"]
         audio_lens = audio_input["audio_lens"]
         if not isinstance(audio_lens, torch.Tensor):
-            audio_lens = torch.tensor(audio_lens, device=self.device)
+            # Host-side length: the length-bucketed encoder wrapper reads it
+            # without a D2H sync; AudioEncoder.forward moves it to the device.
+            audio_lens = torch.tensor(audio_lens, dtype=torch.long)
         else:
-            audio_lens = audio_lens.to(self.device)
+            audio_lens = audio_lens.cpu()
 
         audio_features, audio_lens = self.encoder(audio_mels, audio_lens)
 
