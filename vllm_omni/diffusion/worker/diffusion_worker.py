@@ -330,7 +330,13 @@ class DiffusionWorker:
             if not skip_load_model:
                 self.load_model(load_format=self.od_config.diffusion_load_format)
                 self._init_weight_transfer_engine()
-                self.init_lora_manager()
+                # MoE LoRA wrappers are built eagerly here, and constructing a
+                # ``CustomOp`` (e.g. ``FusedMoEModularMethod``) dispatches its
+                # forward, which reads the compilation config from the current
+                # ``VllmConfig``. Publish it for the duration, as the other
+                # model-touching init steps do.
+                with set_current_vllm_config(self.vllm_config):
+                    self.init_lora_manager()
         except Exception:
             # init_device() owns process-global distributed state. If anything
             # after it fails, unwind that state before another inline worker is

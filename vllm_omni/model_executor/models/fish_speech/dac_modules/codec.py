@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from the fish-speech 0.1.0 PyPI release (Apache-2.0)
 # https://pypi.org/project/fish-speech/0.1.0/
 # Copyright (c) Fish Audio
@@ -320,8 +320,7 @@ class DAC(nn.Module):
             audio_lengths = torch.LongTensor([length + right_pad]).to(audio_data.device)
 
         z = self.encoder(audio_data)
-        vq_results = self.quantizer(z, n_quantizers, **kwargs)
-        indices = vq_results.codes
+        indices = self.quantizer.encode(z, n_quantizers, **kwargs)
         indices_lens = torch.ceil(audio_lengths / self.frame_length).long()
         return indices, indices_lens
 

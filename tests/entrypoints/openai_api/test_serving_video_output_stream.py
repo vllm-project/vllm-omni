@@ -1580,6 +1580,8 @@ async def test_video_abort_passes_deadline_to_rpc_waiter(mocker: MockerFixture):
     client.request_states = {"internal": state}
     client.abort = partial(AsyncOmni.abort, client)
     client._abort = partial(AsyncOmniBase._abort, client)
+    client._pending_submits = {}
+    client._settle_pending_submits = partial(AsyncOmniBase._settle_pending_submits, client)
     engine = mocker.Mock(spec=OmniEngineBase)
     engine._shutdown_called = False
     engine.request_queue = mocker.Mock()

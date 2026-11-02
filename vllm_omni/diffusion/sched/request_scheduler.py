@@ -8,6 +8,7 @@ from dataclasses import fields, replace
 from typing import TYPE_CHECKING
 
 from vllm_omni.diffusion.data import uses_rank_local_dp_concurrency
+from vllm_omni.diffusion.model_metadata import REQUEST_IDENTITY_EXTRA_ARGS
 from vllm_omni.diffusion.offloader.config import TEXT_ENCODER_COMPONENT, resolve_offload
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
@@ -52,8 +53,10 @@ def _normalize_explicit_flow_shift(value: float | str | None) -> float | None:
 
 
 def build_rank_local_dp_extra_args_signature(request: OmniDiffusionRequest) -> str:
-    """Compare full extra_args for admission and dispatch of collective waves."""
-    return json.dumps(getattr(request.sampling_params, "extra_args", None), sort_keys=True, default=repr)
+    """Compare scheduling extra_args for admission and dispatch, excluding request identities."""
+    extra_args = getattr(request.sampling_params, "extra_args", None) or {}
+    schedule = {key: value for key, value in extra_args.items() if key not in REQUEST_IDENTITY_EXTRA_ARGS}
+    return json.dumps(schedule, sort_keys=True, default=repr)
 
 
 def is_empty_dp_prompt(prompt: object) -> bool:
