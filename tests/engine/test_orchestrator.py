@@ -2263,6 +2263,30 @@ async def test_stage_pool_pinned_submit_preserves_route_and_legacy_round_robin(s
     assert pool.select_replica_id("companion", affinity_request_id="ordinary-1") == 1
 
 
+@pytest.mark.parametrize("hook", ["hub", "lb"])
+def test_stage_pool_pin_is_honoured_with_distributed_attachment(hook: str) -> None:
+    """A pin addresses the attached client directly, so it survives hub/LB mode.
+
+    The load balancer only chooses replicas for unpinned requests; a session
+    reservation from the duplex placement owner must still reach its replica.
+    """
+    clients = [FakeStageClient(), FakeStageClient()]
+    pool = StagePool(0, clients, output_processor=FakeOutputProcessor())
+    if hook == "hub":
+        pool.attach_hub(SimpleNamespace())
+    else:
+        pool.attach_load_balancer(SimpleNamespace())
+
+    assert pool.bind_request_to_replica("pinned", 1) == 1
+    assert pool.get_bound_replica_id("pinned") == 1
+
+    # Detaching the replica still refuses the pin; this is the check that makes
+    # the distributed case safe, so it must not be weakened by the guard removal.
+    pool.clients[1] = None
+    with pytest.raises(StageUnavailableError, match="is unavailable"):
+        pool.bind_request_to_replica("other", 1)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["submit_initial", "submit_update"])
 @pytest.mark.parametrize("failure", ["unavailable", "detached", "out_of_range", "negative", "conflict"])

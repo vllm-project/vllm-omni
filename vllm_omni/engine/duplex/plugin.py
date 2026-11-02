@@ -1003,8 +1003,16 @@ def validate_duplex_replica_policy(
     """Validate replica policy before workers start and against the actual stage pools."""
     if runtime_config.replica_policy == "legacy":
         return
-    if distributed:
-        raise ValueError("duplex_session.replica_policy=least_sessions does not support distributed hub/LB mode")
+    if distributed and runtime_config.replica_groups is None:
+        # A distributed pool exposes replicas through the hub, so the number of
+        # attached replicas is not known when this runs -- and ``num_replicas``
+        # counts ``None`` holes left by replicas that already detached. Deriving
+        # groups from a startup snapshot would therefore reserve slots that are
+        # not serviceable. Distributed deployments must declare the topology.
+        raise ValueError(
+            "duplex_session.replica_policy=least_sessions in distributed hub/LB mode "
+            "requires duplex_session.replica_groups to declare the stage replica topology"
+        )
     cap = runtime_config.max_sessions_per_replica
     assert cap is not None
     # This capability depends on the requested capacity for some plugins; the

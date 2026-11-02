@@ -275,8 +275,8 @@ def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
 @pytest.mark.parametrize(
     ("replica_policy", "replica_cap", "single_stage_mode", "supports_sharing", "error"),
     [
-        ("least_sessions", 1, True, False, "does not support distributed hub/LB mode"),
-        ("least_sessions", 2, True, False, "does not support distributed hub/LB mode"),
+        ("least_sessions", 1, True, False, "requires duplex_session.replica_groups"),
+        ("least_sessions", 2, True, False, "requires duplex_session.replica_groups"),
         ("least_sessions", 2, False, False, "set max_sessions_per_replica to 1"),
         ("least_sessions", 1, False, False, None),
         ("least_sessions", 2, False, True, None),
