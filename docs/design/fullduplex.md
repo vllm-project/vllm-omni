@@ -436,9 +436,20 @@ coverage, and earlier source edits requeue their slots. Unrelated tail appends
 do not invalidate captured evidence or replenish a failed unit's retry budget.
 Explicit barrier resolutions and card mutations are preflighted together;
 rejection commits neither. A partial page or text fragment cannot clear a global
-barrier. Recovery from stale triggers and suppression overflow, shared compute
-budgets and a stage's final prompt consumption remain separate integrations;
-the existing L1 view policy below does not enable memory extraction.
+barrier.
+
+Stale trigger references and suppression overflow start a recovery scan with a
+fixed source horizon. Each legal text fragment and catalogue page needs an
+explicit reconciliation declaration; an empty extraction alone is insufficient.
+Target rewrites and external catalogue changes invalidate completed recovery
+coverage. New keys require replay against earlier evidence before recovery can
+finish. Ordinary tail appends stay outside the current horizon, and barriers
+created after its cutoff survive completion. A pass missing confirmation stays
+blocked and parks until a relevant rewrite or explicit owner rescheduling.
+These checks authorize declared coverage, not the semantic correctness of a
+model's declaration. Shared compute budgets and a stage's final prompt consumer
+remain separate integrations; the L1 view policy below does not enable memory
+extraction.
 
 A plugin opts a stage in by returning a `DuplexContextViewPolicy` from
 `context_view_policy(stage_id=..., runtime_config=...)`. The default is `None`:

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
@@ -28,6 +28,7 @@ from vllm_omni.engine.duplex.memory_types import (
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.history_snapshot import DuplexHistorySnapshot
 
 
 def _text(message: dict[str, object]) -> str:
@@ -97,12 +98,67 @@ class DuplexMemoryContextState:
         self._limits: tuple[int, int, frozenset[str]] | None = None
         self._pass: _CatalogPass | None = None
         self._next_pass_id = 1
+        self._recovery: _ReconciliationPass | None = None
+        self._next_recovery_id = 1
+        self._force_recovery = False
 
     def note_change(self, slot_order: int) -> None:
+        if self._recovery is not None and slot_order < self._recovery.target:
+            self._recovery.rewrite_pending = True
         end = self._pending.work.end if self._pending is not None else self._cursor
         frontier = max(self._cursor, end)
         if slot_order < frontier.slot_order or (slot_order == frontier.slot_order and frontier.char_offset > 0):
             self._dirty_order = slot_order if self._dirty_order is None else min(slot_order, self._dirty_order)
+
+    def restart_reconciliation(self) -> None:
+        """Explicitly reschedule a parked pass; ordinary traffic cannot do so."""
+        self._force_recovery = True
+        self._recovery = None
+        self._pending = None
+        self._pass = None
+
+    def _sync_recovery(self, session: DuplexEngineSession, snapshot: DuplexHistorySnapshot) -> None:
+        if self._recovery is None:
+            if not self._force_recovery and not session.memory_suppression.reconciliation_required(snapshot):
+                return
+            cutoff, overflow_generation = session.memory_suppression.begin_reconciliation()
+            self._recovery = _ReconciliationPass(
+                self._next_recovery_id,
+                session._conversation.next_slot_order,
+                cutoff,
+                overflow_generation,
+                session.epoch,
+                session.config_revision,
+                session.context_ledger.card_catalog_revision,
+                tuple(head.fact_key for head in session.context_ledger.card_catalog()),
+            )
+            self._next_recovery_id += 1
+            self._force_recovery = False
+            self._cursor = DuplexMemoryCursor()
+            self._pass = None
+            self._pending = None
+            self._dirty_order = None
+        recovery = self._recovery
+        if (
+            recovery.rewrite_pending
+            or recovery.catalog_revision != session.context_ledger.card_catalog_revision
+            or recovery.epoch != session.epoch
+            or recovery.config_revision != session.config_revision
+        ):
+            recovery.rewrite_epoch += 1
+            recovery.rewrite_pending = False
+            recovery.epoch = session.epoch
+            recovery.config_revision = session.config_revision
+            recovery.catalog_revision = session.context_ledger.card_catalog_revision
+            recovery.keys = tuple(head.fact_key for head in session.context_ledger.card_catalog())
+            recovery.known_keys = set(recovery.keys)
+            recovery.replay_keys.clear()
+            recovery.confirmed = True
+            recovery.parked = False
+            self._cursor = DuplexMemoryCursor()
+            self._pass = None
+            self._pending = None
+            self._dirty_order = None
 
     def capture(
         self,
@@ -136,6 +192,9 @@ class DuplexMemoryContextState:
             self._pass = None
         snapshot = session.history_snapshot()
         session.context_ledger.refresh(snapshot)
+        self._sync_recovery(session, snapshot)
+        if self._recovery is not None and self._recovery.parked:
+            return None
         catalog = session.context_ledger.card_catalog()
         if self._pass is not None:
             if (
@@ -155,6 +214,9 @@ class DuplexMemoryContextState:
             snapshot.messages, snapshot.item_ids, snapshot.source_ids, snapshot.source_revisions, strict=True
         ):
             source = sources[source_id]
+            if self._recovery is not None and source.slot_order >= self._recovery.target:
+                end = max(end, DuplexMemoryCursor(self._recovery.target))
+                break
             if source.slot_order < self._cursor.slot_order:
                 continue
             if item_id in excluded_item_ids:
@@ -181,10 +243,14 @@ class DuplexMemoryContextState:
             )
             if remaining == 0 or len(evidence) == max_sources:
                 break
+        else:
+            if self._recovery is not None:
+                end = max(end, DuplexMemoryCursor(self._recovery.target))
         if not evidence:
             self._cursor = end
-            return None
-        keys = tuple(head.fact_key for head in catalog)
+            if self._recovery is None or end < DuplexMemoryCursor(self._recovery.target):
+                return None
+        keys = tuple(head.fact_key for head in catalog) if self._recovery is None else self._recovery.keys
         self._pass = _CatalogPass(
             pass_id=self._next_pass_id,
             epoch=session.epoch,
@@ -217,6 +283,9 @@ class DuplexMemoryContextState:
             pass_id=current_pass.pass_id,
             catalog_page=current_pass.page,
             suppression_version=session.memory_suppression.version,
+            reconciliation_id=None if self._recovery is None else self._recovery.reconciliation_id,
+            reconciliation_target=None if self._recovery is None else self._recovery.target,
+            rewrite_epoch=0 if self._recovery is None else self._recovery.rewrite_epoch,
         )
         page_keys = frozenset(current_pass.pages[current_pass.page])
         grants: list[DuplexContextBarrier] = []
@@ -258,6 +327,7 @@ class DuplexMemoryContextState:
             or context.work.config_revision != session.config_revision
             or context.work.catalog_revision != session.context_ledger.card_catalog_revision
             or context.work.suppression_version != session.memory_suppression.version
+            or (self._recovery is not None and self._recovery.rewrite_pending)
         ):
             return False
         return self._evidence_matches(session, context.evidence)
@@ -311,6 +381,8 @@ class DuplexMemoryContextState:
             not isinstance(proposal, DuplexMemoryProposalBatch)
             or not isinstance(proposal.operations, tuple)
             or not isinstance(proposal.resolutions, tuple)
+            or type(proposal.reconciled) is not bool
+            or (proposal.reconciled and context.work.reconciliation_id is None)
         ):
             return DuplexMemoryAdmission("invalid", reason_code="invalid_memory_proposal")
         if len(proposal.operations) > 8 or len(proposal.resolutions) > 8:
@@ -388,6 +460,14 @@ class DuplexMemoryContextState:
             new_keys = tuple(
                 head.fact_key for head in session.context_ledger.card_catalog() if head.fact_key not in known
             )
+            if self._recovery is not None:
+                recovery = self._recovery
+                recovery.confirmed = recovery.confirmed and proposal.reconciled
+                recovery.catalog_revision = session.context_ledger.card_catalog_revision
+                discovered = {head.fact_key for head in session.context_ledger.card_catalog()} - recovery.known_keys
+                new_keys = tuple(sorted(discovered))
+                recovery.replay_keys.update(discovered)
+                recovery.known_keys.update(discovered)
             current_pass.pages.extend(new_keys[index : index + 16] for index in range(0, len(new_keys), 16))
             current_pass.catalog_revision = session.context_ledger.card_catalog_revision
             current_pass.page += 1
@@ -400,6 +480,24 @@ class DuplexMemoryContextState:
                 self._pass = None
             self._pending = None
             self._generation += 1
+            if (
+                self._recovery is not None
+                and self._pass is None
+                and self._cursor >= DuplexMemoryCursor(self._recovery.target)
+            ):
+                recovery = self._recovery
+                if recovery.replay_keys:
+                    recovery.keys = tuple(sorted(recovery.replay_keys))
+                    recovery.replay_keys.clear()
+                    self._cursor = DuplexMemoryCursor()
+                elif recovery.confirmed:
+                    session.memory_suppression.finish_reconciliation(
+                        barrier_cutoff=recovery.barrier_cutoff,
+                        overflow_generation=recovery.overflow_generation,
+                    )
+                    self._recovery = None
+                else:
+                    recovery.parked = True
         return result
 
 
@@ -416,3 +514,24 @@ class _CatalogPass:
     pages: list[tuple[str, ...]]
     catalog_revision: int
     page: int = 0
+
+
+@dataclass
+class _ReconciliationPass:
+    reconciliation_id: int
+    target: int
+    barrier_cutoff: int
+    overflow_generation: int
+    epoch: int
+    config_revision: int
+    catalog_revision: int
+    keys: tuple[str, ...]
+    rewrite_epoch: int = 0
+    rewrite_pending: bool = False
+    confirmed: bool = True
+    parked: bool = False
+    known_keys: set[str] = field(default_factory=set)
+    replay_keys: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.known_keys = set(self.keys)

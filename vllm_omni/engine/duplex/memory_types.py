@@ -102,6 +102,9 @@ class DuplexContextAuxiliaryWork:
     pass_id: int = 0
     catalog_page: int = 0
     suppression_version: int = 0
+    reconciliation_id: int | None = None
+    reconciliation_target: int | None = None
+    rewrite_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -136,6 +139,7 @@ class DuplexMemoryProposal:
 class DuplexMemoryProposalBatch:
     operations: tuple[DuplexMemoryProposal, ...]
     resolutions: tuple["DuplexMemoryResolution", ...] = ()
+    reconciled: bool = False
 
 
 @dataclass(frozen=True)

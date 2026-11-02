@@ -555,6 +555,11 @@ class DuplexEngineSession:
     def memory_context_matches(self, context: DuplexContextAuxiliaryInput) -> bool:
         return self._memory_context is not None and self._memory_context.matches(self, context)
 
+    def restart_memory_reconciliation(self) -> None:
+        if self._memory_context is None:
+            self._memory_context = DuplexMemoryContextState()
+        self._memory_context.restart_reconciliation()
+
     def admit_memory_result(
         self, *, context: DuplexContextAuxiliaryInput, proposal: DuplexMemoryProposalBatch
     ) -> DuplexMemoryAdmission:

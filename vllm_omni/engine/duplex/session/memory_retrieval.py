@@ -148,6 +148,8 @@ class DuplexMemorySuppression:
         self._next_id = 1
         self._version = 0
         self._overflowed = False
+        self._overflow_generation = 0
+        self._reconciling = False
 
     @property
     def version(self) -> int:
@@ -155,7 +157,7 @@ class DuplexMemorySuppression:
 
     @property
     def suppress_all(self) -> bool:
-        return self._overflowed or any(barrier.keys is None for barrier in self._barriers.values())
+        return self._reconciling or self._overflowed or any(barrier.keys is None for barrier in self._barriers.values())
 
     @property
     def suppressed_keys(self) -> frozenset[str]:
@@ -163,6 +165,31 @@ class DuplexMemorySuppression:
 
     def barriers(self) -> tuple[DuplexMemoryBarrier, ...]:
         return tuple(self._barriers.values())
+
+    def reconciliation_required(self, snapshot: DuplexHistorySnapshot) -> bool:
+        return (
+            self._reconciling
+            or self._overflowed
+            or any(not _current_evidence(snapshot, barrier.evidence) for barrier in self._barriers.values())
+        )
+
+    def begin_reconciliation(self) -> tuple[int, int]:
+        if not self._reconciling:
+            self._reconciling = True
+            self._version += 1
+        return self._next_id - 1, self._overflow_generation
+
+    def finish_reconciliation(self, *, barrier_cutoff: int, overflow_generation: int) -> None:
+        """Owner-only: all current legal text/pages need explicit confirmation."""
+        for barrier_id in tuple(self._barriers):
+            if barrier_id <= barrier_cutoff:
+                del self._barriers[barrier_id]
+                del self._coverage[barrier_id]
+                del self._coverage_generations[barrier_id]
+        if self._overflow_generation == overflow_generation:
+            self._overflowed = False
+        self._reconciling = False
+        self._version += 1
 
     def stage(self) -> "DuplexMemorySuppression":
         """Detach bounded proof metadata for an owner-only admission transaction."""
@@ -173,6 +200,8 @@ class DuplexMemorySuppression:
         staged._next_id = self._next_id
         staged._version = self._version
         staged._overflowed = self._overflowed
+        staged._overflow_generation = self._overflow_generation
+        staged._reconciling = self._reconciling
         return staged
 
     def commit(self, staged: "DuplexMemorySuppression") -> None:
@@ -183,6 +212,8 @@ class DuplexMemorySuppression:
         self._next_id = staged._next_id
         self._version = staged._version
         self._overflowed = staged._overflowed
+        self._overflow_generation = staged._overflow_generation
+        self._reconciling = staged._reconciling
 
     def block(
         self,
@@ -200,9 +231,9 @@ class DuplexMemorySuppression:
             if barrier.evidence == evidence and barrier.keys == keys:
                 return barrier
         if len(self._barriers) == 256:
-            if not self._overflowed:
-                self._overflowed = True
-                self._version += 1
+            self._overflowed = True
+            self._overflow_generation += 1
+            self._version += 1
             return None
         self._version += 1
         required_keys = frozenset(head.fact_key for head in catalog) if keys is None else keys
