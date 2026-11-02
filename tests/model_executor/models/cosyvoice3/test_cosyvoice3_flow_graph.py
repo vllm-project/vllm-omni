@@ -153,12 +153,14 @@ def test_flow_graph_metadata_retains_loaded_buffers(monkeypatch, backend, stream
     next_key, *next_layout = runner._layout((19, 31), streaming)
     assert next_key == key
     runner._load(state, *next_layout, noise, noise, noise, spks, time_span)
+    # Row boundaries must refresh even when one-frame slots keep packed order.
+    assert not torch.equal(attention.cu_seqlens_q, snapshots["cu_seqlens_q"])
     for name, before in snapshots.items():
         # Check the metadata already handed to the consumer, not a new object.
         assert getattr(attention, name) is getattr(state, name)
-        if backend == "fa3" and name == "slot_frames":
-            # One-frame FA3 pages stay in packed order when only row boundaries
+        if attention.page_size == 1 and name == "slot_frames":
+            # One-frame pages stay in packed order when only row boundaries
             # change; the graph allocation and padding slots are unchanged.
             assert torch.equal(attention.slot_frames, before)
-        else:
+        elif name != "cu_seqlens_q":
             assert not torch.equal(getattr(attention, name), before)
