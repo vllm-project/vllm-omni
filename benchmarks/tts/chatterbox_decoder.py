@@ -61,12 +61,7 @@ def main():
     deploy = resolve_deploy_yaml(
         DEPLOY_DIR / ("chatterbox_turbo.yaml" if args.variant == "turbo" else "chatterbox.yaml")
     )
-    decoder = S3GenDecoder(
-        config,
-        deploy["stages"][1]["max_model_len"],
-        deploy["connectors"]["connector_of_shared_memory"]["extra"]["codec_left_context_frames"],
-        deploy["stages"][1]["seed"],
-    ).eval()
+    decoder = S3GenDecoder(config, deploy["stages"][1]["max_model_len"], deploy["stages"][1]["seed"]).eval()
     weights = load_file(str(args.model / config.s3gen_weights))
     decoder.load_state_dict(
         {name: value for name, value in weights.items() if not name.startswith(REFERENCE_ENCODER_PREFIXES)},
