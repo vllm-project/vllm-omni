@@ -14,6 +14,19 @@ def _env_flag(name: str, default: str) -> bool:
     return os.environ.get(name, default) not in _FALSE_ENV_VALUES
 
 
+def _positive_env_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer, got {raw_value!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {raw_value!r}")
+    return value
+
+
 def cosyvoice3_batch_flow_enabled() -> bool:
     """Return whether cross-request Stage-1 flow batching is enabled."""
     return _env_flag("COSYVOICE3_BATCH_FLOW", "0")
@@ -26,9 +39,27 @@ def cosyvoice3_batch_flow_debug() -> bool:
 
 def cosyvoice3_batch_flow_profile(name: str):
     """Create a profiler scope only when batching diagnostics are enabled."""
-    if cosyvoice3_batch_flow_debug():
+    npu = getattr(torch, "npu", None)
+    is_capturing = getattr(npu, "is_current_stream_capturing", None)
+    capturing = False
+    if callable(is_capturing):
+        try:
+            capturing = bool(is_capturing())
+        except (RuntimeError, TypeError):
+            capturing = False
+    if cosyvoice3_batch_flow_debug() and not capturing:
         return torch.profiler.record_function(name)
     return nullcontext()
+
+
+def cosyvoice3_stage1_npu_graph_enabled() -> bool:
+    """Return whether the opt-in Stage-1 NPU graph adapter is enabled."""
+    return _env_flag("COSYVOICE3_STAGE1_NPU_GRAPH", "0")
+
+
+def cosyvoice3_stage1_npu_graph_max() -> int:
+    """Return the validated per-region Stage-1 NPU graph cache limit."""
+    return _positive_env_int("COSYVOICE3_STAGE1_NPU_GRAPH_MAX", 8)
 
 
 def cosyvoice3_full_response_enabled() -> bool:
