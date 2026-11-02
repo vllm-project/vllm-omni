@@ -37,6 +37,12 @@ pytest_plugins = (
 def pytest_configure(config):
     # Opt in only for the existing CPU shell's direct pytest child. Consume the
     # registration token so nested pytest sessions cannot create extra observers.
+    # xdist workers instead consume one controller-issued, process-local grant.
+    worker_authorized = False
+    if os.environ.get("VLLM_OMNI_NATIVE_PHASE_PROBE") == "1":
+        from tests.helpers import native_phase_probe
+
+        worker_authorized = native_phase_probe.consume_worker_authorization(config)
     if os.environ.get("VLLM_OMNI_NATIVE_PHASE_PROBE") == "1":
         # A timeout can prevent the terminal summary and artifact upload. Keep
         # a bounded receipt of the gate without logging arbitrary env values.
@@ -52,7 +58,7 @@ def pytest_configure(config):
             pass  # Diagnostic output must not change the original test result.
     if (
         os.environ.get("VLLM_OMNI_NATIVE_PHASE_PROBE") == "1"
-        and os.environ.get("NATIVE_PHASE_PROBE_PARENT_PID") == str(os.getppid())
+        and (os.environ.get("NATIVE_PHASE_PROBE_PARENT_PID") == str(os.getppid()) or worker_authorized)
         and "NATIVE_PHASE_PROBE_OUTPUT_DIR" in os.environ
     ):
         os.environ.pop("NATIVE_PHASE_PROBE_PARENT_PID", None)

@@ -522,7 +522,7 @@ class OmniBase(PDDisaggregationMixin):
             self._raise_nonfatal_error_message(msg)
 
         if not isinstance(msg, OutputMessage):
-            logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg.type)
+            logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, getattr(msg, "type"))
             return True, None, None, None
 
         req_id = msg.request_id

@@ -25,6 +25,49 @@ _CHECKPOINT_RESERVE = 4096
 _TOTAL_RESERVE = _SUMMARY_RESERVE + 2 * _CHECKPOINT_RESERVE
 _VERSION = 2
 _OUTPUT_ENV = "NATIVE_PHASE_PROBE_OUTPUT_DIR"
+_WORKER_AUTH = "omni_native_phase_probe"
+_WORKER_LIMITS: pytest.StashKey[tuple[int, int]] = pytest.StashKey()
+_WORKER_GRANTS: pytest.StashKey[int] = pytest.StashKey()
+
+
+def consume_worker_authorization(config: pytest.Config) -> bool:
+    worker = getattr(config, "workerinput", None)
+    if not isinstance(worker, dict):
+        return False
+    grant = worker.pop(_WORKER_AUTH, None)
+    if not isinstance(grant, dict) or grant.get("workerid") != worker.get("workerid"):
+        return False
+    events, size = grant.get("events"), grant.get("bytes")
+    if not isinstance(events, int) or not 1 <= events <= 100000:
+        return False
+    if not isinstance(size, int) or not 16384 <= size <= 64 * 1024 * 1024:
+        return False
+    config.stash[_WORKER_LIMITS] = events, size
+    return True
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node) -> None:
+    # The registered controller has already consumed the shell token. Grants
+    # live only in xdist's worker channel, never in a child's environment.
+    config = node.config
+    if getattr(config.option, "numprocesses", None) != 4:
+        return
+    issued = config.stash.get(_WORKER_GRANTS, 0)
+    if issued >= 4:
+        _write_terminal(config, "worker restart has no remaining observation budget")
+        return
+    try:
+        events = int(os.environ.get("NATIVE_PHASE_PROBE_MAX_EVENTS", "2000"))
+        size = int(os.environ.get("NATIVE_PHASE_PROBE_MAX_BYTES", str(2 * 1024 * 1024)))
+        if not 4 <= events <= 100000 or not 4 * 16384 <= size <= 64 * 1024 * 1024:
+            raise ValueError("invalid shared worker budget")
+        node.workerinput[_WORKER_AUTH] = dict(
+            workerid=node.workerinput["workerid"], events=events // 4, bytes=size // 4
+        )
+        config.stash[_WORKER_GRANTS] = issued + 1
+    except Exception as error:
+        _write_terminal(config, "worker observation disabled (" + type(error).__name__ + ")")
 
 
 def _write_terminal(config: pytest.Config, message: str) -> None:
@@ -49,6 +92,9 @@ class Observer:
         self.slow = float(os.environ.get("NATIVE_PHASE_PROBE_SLOW_SECONDS", "1.0"))
         self.max_events = int(os.environ.get("NATIVE_PHASE_PROBE_MAX_EVENTS", "2000"))
         self.max_bytes = int(os.environ.get("NATIVE_PHASE_PROBE_MAX_BYTES", str(2 * 1024 * 1024)))
+        limits = config.stash.get(_WORKER_LIMITS, None)
+        if limits is not None:
+            self.max_events, self.max_bytes = limits
         self.checkpoint_interval = int(os.environ.get("NATIVE_PHASE_PROBE_CHECKPOINT_REPORTS", "1000"))
         if not math.isfinite(self.slow) or self.slow < 0:
             raise ValueError("invalid slow threshold")
@@ -384,6 +430,9 @@ class Observer:
 def pytest_configure(config: pytest.Config) -> None:
     config.stash[_KEY] = None
     if _OUTPUT_ENV not in os.environ:
+        return
+    if not hasattr(config, "workerinput") and getattr(config.option, "numprocesses", None):
+        # Runtime phases execute in workers. The controller only grants budgets.
         return
     try:
         observer = Observer(config)

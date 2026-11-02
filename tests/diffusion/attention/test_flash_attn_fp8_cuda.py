@@ -168,6 +168,10 @@ class TestForwardCudaQuantDispatch:
         monkeypatch.setattr(FlashAttentionImpl, "_forward_varlen_dense", _varlen_forward)
         # Both dense providers can be installed; explicitly force the varlen-dense fallback.
         monkeypatch.setattr(fa_utils, "HAS_FLASH_ATTN", True)
+        monkeypatch.setattr(fa_utils, "IS_FLASH_ATTN_4", False)
+        monkeypatch.setattr(fa_utils, "dense_flash_attn_func_for", lambda _dtype: None)
+        monkeypatch.setattr(fa_utils, "IS_FLASH_ATTN_4", False)
+        monkeypatch.setattr(fa_utils, "optional_fa3_fwd_dense_func", None)
         monkeypatch.setattr(fa_utils, "flash_attn_func", None)
         monkeypatch.setattr(fa_utils, "optional_fa3_fwd_dense_func", None)
         extra = {} if dtype_value is None else {"kv_cache_dtype": dtype_value}

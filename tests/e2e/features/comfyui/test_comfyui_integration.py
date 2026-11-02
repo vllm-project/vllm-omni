@@ -634,8 +634,36 @@ def mock_async_omni(
         _mock_preprocess_chat,
     )
 
-    if server_case.tokenizer is not None:
-        mocker.patch("transformers.AutoTokenizer.from_pretrained", return_value=server_case.tokenizer)
+    # Voice clone resolves inline ref_audio and estimates prompt length before
+    # the mocked engine runs. Those steps must not fetch a checkpoint or decode
+    # media: the client call has no deadline, so a stuck fetch holds the worker.
+    async def _resolve_ref_audio_without_fetch(self, ref_audio_str: str):
+        del self, ref_audio_str
+        import numpy as np
+
+        return np.zeros(24000, dtype=np.float32), 24000, "test-ref-audio"
+
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.serving_speech.OmniOpenAIServingSpeech._resolve_ref_audio_array",
+        _resolve_ref_audio_without_fetch,
+    )
+
+    def _fake_tokenizer(text, padding=False, **kwargs):
+        del padding, kwargs
+        return {"input_ids": [1] * max(len(text), 1)}
+
+    mocker.patch(
+        "transformers.AutoTokenizer.from_pretrained",
+        return_value=server_case.tokenizer if server_case.tokenizer is not None else _fake_tokenizer,
+    )
+
+    import comfyui_vllm_omni.nodes as comfy_nodes
+
+    class _DeadlineClient(comfy_nodes.VLLMOmniClient):
+        def __init__(self, base_url: str, timeout: float | None = 60, **kwargs):
+            super().__init__(base_url, timeout=60 if timeout is None else timeout, **kwargs)
+
+    monkeypatch.setattr(comfy_nodes, "VLLMOmniClient", _DeadlineClient)
 
     mock_instance = mocker.AsyncMock(spec=RealAsyncOmni)
     mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
@@ -671,7 +699,7 @@ def mock_async_omni(
 
 
 @pytest.fixture
-def api_server(server_case: ServerCase, mock_async_omni, tmp_path, request: pytest.FixtureRequest):
+def api_server(server_case: ServerCase, mock_async_omni, tmp_path, request: pytest.FixtureRequest, single_threaded_cpu):
     """Set up a API server in background process from command line with parametrized model name and mocked AsyncOmni."""
     # Override the STORAGE_MANAGER path to a writable temp directory before
     # forking the server subprocess.  The default /tmp/storage may be owned

@@ -189,6 +189,59 @@ def test_registration_token_fences_nested_pytest_sessions(project, mode):
         assert summary["phases"]["call"]["outcomes"]["passed"] == 1
 
 
+@pytest.mark.parametrize("mode", ["on", "off", "wrong_parent", "missing_parent"])
+def test_xdist_workers_observe_phases_with_one_use_bounded_grants(project, mode):
+    root, output, environment = project
+    source = (_ROOT / "tests/conftest.py").read_text()
+    hook = next(
+        node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name == "pytest_configure"
+    )
+    hook_source = ast.get_source_segment(source, hook)
+    assert hook_source is not None
+    (root / "tests/conftest.py").write_text("import os\n" + hook_source + "\n")
+    (root / "tests/test_cases.py").unlink()
+    (root / "nested_gate.py").write_text(
+        "def pytest_sessionstart(session):\n"
+        "    assert not session.config.pluginmanager.hasplugin('native-phase-probe')\n"
+    )
+    for index in range(4):
+        (root / f"tests/test_worker_{index}.py").write_text(
+            "import gc, os, subprocess, sys\nimport pytest\n"
+            f"pytestmark = pytest.mark.xdist_group(name='worker-{index}')\n"
+            "@pytest.fixture\ndef lifecycle():\n    gc.collect()\n    yield\n    gc.collect()\n"
+            "def test_nested(lifecycle):\n"
+            "    gc.collect()\n"
+            f"    assert os.environ.get('NATIVE_PHASE_PROBE_PARENT_PID') == {'-1' if mode == 'wrong_parent' else None!r}\n"
+            "    args = ['-p', 'nested_gate', '--collect-only', '-q']\n"
+            "    assert subprocess.run([sys.executable, '-m', 'pytest', *args], timeout=15).returncode == 0\n"
+            "    assert pytest.main(args) == 0\n"
+        )
+    environment.update(VLLM_OMNI_NATIVE_PHASE_PROBE="0" if mode == "off" else "1")
+    if mode in {"on", "wrong_parent"}:
+        environment["NATIVE_PHASE_PROBE_PARENT_PID"] = str(os.getpid()) if mode == "on" else "-1"
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "xdist", "-p", "no:cacheprovider", "-q", "-n", "4", "--dist=loadgroup"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "4 passed" in result.stdout
+    directories = list(output.iterdir())
+    assert len(directories) == (4 if mode == "on" else 0)
+    summaries = [json.loads((directory / "summary.json").read_text()) for directory in directories]
+    assert sum(summary["phases"]["call"]["outcomes"]["passed"] for summary in summaries) == (4 if mode == "on" else 0)
+    assert all(summary["limits"]["events"] == 500 for summary in summaries)
+    assert all(summary["limits"]["total_bytes"] == 524288 for summary in summaries)
+    assert sum(summary["events_emitted"] for summary in summaries) <= 2000
+    assert sum(path.stat().st_size for directory in directories for path in directory.iterdir()) <= 2097152
+    if summaries:
+        assert all(summary["phases"]["call"]["reports"] > 0 for summary in summaries)
+        assert sum(stat["count"] for summary in summaries for stat in summary["gc_by_generation"].values()) > 0
+
+
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL requires POSIX")
 def test_sigkill_retains_last_complete_checkpoint_within_budget(project):
     root, output, environment = project
@@ -323,6 +376,10 @@ def test_native_pipeline_script_preserves_parent_token_and_pytest_status(tmp_pat
         "tests/",
         "-m",
         "core_model and cpu",
+        "-n",
+        "4",
+        "--dist",
+        "loadgroup",
         "--cov=vllm_omni",
         "--cov-report=term-missing:skip-covered",
         "--cov-report=xml:coverage-core-model-cpu-shell-regression.xml",

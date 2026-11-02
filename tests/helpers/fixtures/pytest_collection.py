@@ -83,16 +83,35 @@ def pytest_configure_node(node):
             return
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
+    # xdist's worker copies ``xdist_group`` onto the nodeid in its own
+    # collection hook. This hook has to run first, or ``--dist=loadgroup``
+    # never sees the group and schedules each test on its own.
     _pin_xdist_serial(config, items)
 
 
 def _pin_xdist_serial(config, items):
-    """Pin unmarked tests to one worker except the validated Simple CPU lane."""
+    """Pin unmarked tests to one xdist worker.
+
+    Only tests explicitly marked ``pytest.mark.xdist`` run concurrently.
+    Others are pinned to a single xdist worker. ``--dist=loadgroup`` honors
+    that group; ``--dist=loadfile`` does not, so the CPU coverage job must
+    not select it.
+
+    ``cpu`` tests are that job's set. They opt in here, one xdist group per
+    module, so workers can split files without splitting a module or running
+    an unmarked test beside them.
+    """
     if not config.pluginmanager.hasplugin("xdist"):
         return
     if config.stash.get(_CPU_XDIST_SCOPE, None) is not None:
         return
     for item in items:
-        if not item.get_closest_marker("xdist"):
-            item.add_marker(pytest.mark.xdist_group(name="serial"))
+        if item.get_closest_marker("xdist"):
+            continue
+        if item.get_closest_marker("cpu"):
+            item.add_marker(pytest.mark.xdist)
+            item.add_marker(pytest.mark.xdist_group(name=f"file:{item.path.as_posix()}"))
+            continue
+        item.add_marker(pytest.mark.xdist_group(name="serial"))

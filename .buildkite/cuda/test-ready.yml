@@ -129,6 +129,18 @@ steps:
         "
     mirror_hardwares: l4_1
 
+  - label: "CUDA IPC Weight Sharing · 2-GPU"
+    depends_on: upload-ready-pipeline
+    timeout_in_minutes: 15
+    source_file_dependencies:
+      - "vllm_omni/distributed/weight_sharing/"
+      - "tests/distributed/weight_sharing/"
+      - "tests/helpers/mark.py"
+      - ".buildkite/cuda/test-ready.yml"
+    commands:
+      - pytest -sv tests/distributed/weight_sharing/test_cuda_ipc_pairing.py -m 'core_model and cuda and L4 and cards_2' --run-level 'core_model'
+    mirror_hardwares: l4_2
+
   - label: "Entrypoints Test"
     depends_on: upload-ready-pipeline
     # Workaround https://github.com/vllm-project/vllm-omni/issues/8016: shutdown()

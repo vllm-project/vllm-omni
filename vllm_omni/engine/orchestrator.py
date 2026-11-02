@@ -3715,13 +3715,13 @@ class Orchestrator(OrchestratorBase):
         if isinstance(msg, NextStageInputMessage):
             await self._handle_next_stage_input(msg)
             return True
-        msg_type = msg.type
+        msg_type = getattr(msg, "type")
         if msg_type == "add_request":
-            await self._handle_add_request(msg)
+            await self._handle_add_request(cast(StageSubmissionMessage, msg))
         elif msg_type == "streaming_update":
-            await self._handle_streaming_update(msg)
+            await self._handle_streaming_update(cast(StageSubmissionMessage, msg))
         elif msg_type == "add_companion_request":
-            await self._handle_add_companion(msg)
+            await self._handle_add_companion(cast(AddCompanionRequestMessage, msg))
         elif msg_type == "interaction":
             interaction = cast(InteractionMessage, msg)
             try:

@@ -21,7 +21,7 @@ else
   printf 'native-phase-probe: shell enabled=0 pid=%s\n' "${BASHPID}" >&2
 fi
 REPORT="coverage-core-model-cpu-${BUILDKITE_STEP_ID:-local}.xml"
-pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:"${REPORT}"
+pytest -sv tests/ -m 'core_model and cpu' -n 4 --dist loadgroup --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:"${REPORT}"
 EXIT=$?
 gzip -9 -f "${REPORT}"
 exit "$EXIT"

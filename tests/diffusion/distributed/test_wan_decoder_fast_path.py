@@ -211,6 +211,8 @@ def _sharded_worker(
 def test_sharded_fast_path_on_every_rank(autocast: bool, level: str) -> None:
     manager = mp.get_context("spawn").Manager()
     return_dict = manager.dict()
+    # Ranks of this test share one port. A fixed offset collides with other
+    # files that also listen on 29610 while xdist runs them together.
     port = str(get_open_port())
     mp.spawn(
         _sharded_worker,
