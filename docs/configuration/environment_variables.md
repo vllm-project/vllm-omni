@@ -114,6 +114,12 @@ padding waste to recover and fall back to the original forward. When a wrapped e
 call is ineligible (keyword args, non-CUDA, no published lengths, unsupported output, or
 no matching fixed-window recipe, or over-long/empty batches), the wrapper returns the untouched forward unchanged.
 
+Numerically, the path is **lossy for unmasked encoders** (e.g. the fixed-window Whisper
+family): feature-off attends over the full extractor padding while the bucketed path
+attends over the smaller rung window, so the two outputs differ measurably (per-row
+on/off cosine down to ~0.5 on short clips). Mask/length-aware encoders stay exact. See the
+encoder bucketing PR measurements for the per-row on/off table.
+
 | `VLLM_OMNI_AUDIO_BUCKET_SECONDS` | Comma-separated float seconds; unset disables bucketing | Enables length bucketing for encoders; each rung is `seconds * 100` mel frames. Read when the worker installs bucketed encoders after weight load | Must cover the longest audio in the workload; a batch with an item longer than the largest rung is routed to the original forward (keep the ladder at least as long as the longest clip). No matching module name means the feature is a no-op. | Experimental |
 | `VLLM_OMNI_AUDIO_BUCKET_MODULES` | Regex | Overrides the wrapped-module name pattern (default matches names ending in `encoder`, `audio_encoder`, `speech_encoder`, `audio_tower`, or `whisper_encoder`) | Use to opt in module names outside the default pattern, e.g. `reference_encoder`. | Experimental |
 | `VLLM_OMNI_AUDIO_BUCKET_TIME_AXIS` | `1`, `2`, or `auto`; default `auto` | Which feature axis is time: `1` for time-major `(B, T, D)`, `2` for channels-first `(B, mel, T)` | `auto` infers from the length scale; the fixed-window Whisper recipe always uses axis `2`. | Experimental |
