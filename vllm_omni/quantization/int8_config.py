@@ -341,6 +341,61 @@ class LazyWeightMixin:
         """
         return torch.get_default_device()
 
+    def _finish_weight_processing(self, layer: torch.nn.Module) -> None:
+        """Mark processing complete and return the layer to host when requested."""
+        layer._already_called_process_weights_after_loading = True
+        if self._offload_after_quant:
+            layer.to("cpu")
+
+    def _finalize_if_ready(self, layer: torch.nn.Module) -> None:
+        """Quantize and offload only after every transformed parameter is loaded."""
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        if getattr(layer, "_loaded_numel", 0) != layer.weight.numel():
+            return
+        # Quantizers may replace the bias while processing the weights. Loading a
+        # cached reference afterwards would then update the obsolete parameter.
+        # Unless the bias loader tracked completion, leave finalization to the
+        # regular post-load sweep, which is guaranteed to run after all tensors.
+        if getattr(layer, "has_bias", False) and not getattr(layer, "_lazy_bias_loaded", False):
+            return
+
+        self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
+
+    def _install_bias_load_tracking(self, layer: torch.nn.Module) -> None:
+        """Track bias loading so a weight-first checkpoint cannot finalize early."""
+        if getattr(layer, "_lazy_bias_loader_tracked", False):
+            return
+        if not getattr(layer, "has_bias", False):
+            return
+
+        bias = getattr(layer, "bias", None)
+        if bias is None:
+            return
+        bias_loader = getattr(bias, "weight_loader", None)
+        if bias_loader is None:
+            return
+
+        layer._lazy_bias_loader_tracked = True
+        layer._lazy_bias_loaded = False
+        layer._lazy_bias_loaded_numel = 0
+
+        def patched_bias_loader(param, loaded_weight, *args, **kwargs):
+            copy_numel_counter = CopyNumelCounter()
+            with copy_numel_counter:
+                res = bias_loader(param, loaded_weight, *args, **kwargs)  # type: ignore[misc]
+            loaded_numel = min(copy_numel_counter.copied_numel, param.numel())
+            layer._lazy_bias_loaded_numel = min(
+                layer._lazy_bias_loaded_numel + loaded_numel,
+                param.numel(),
+            )
+            if layer._lazy_bias_loaded_numel == param.numel():
+                layer._lazy_bias_loaded = True
+                self._finalize_if_ready(layer)
+            return res
+
+        bias.weight_loader = patched_bias_loader
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -364,6 +419,7 @@ class LazyWeightMixin:
             # track how many elements we have updated
             if not hasattr(layer, "_loaded_numel"):
                 layer._loaded_numel = 0
+                self._install_bias_load_tracking(layer)
 
                 # when the first `loaded_weight` is about to be
                 # loaded to `param`, materialize `param` just-in-time
@@ -387,25 +443,10 @@ class LazyWeightMixin:
                 res = weight_loader(param, loaded_weight, *args, **kwargs)  # type: ignore[misc]
             layer._loaded_numel += copy_numel_counter.copied_numel
 
-            # if we have loaded all of the elements, call
-            # process_weights_after_loading
-            target_loaded_numel = layer.weight.numel()
-            if layer._loaded_numel == target_loaded_numel:
-                self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
-
-                # Prevent the usual `process_weights_after_loading` call from doing
-                # anything
-                layer._already_called_process_weights_after_loading = True
-
-                # This layer's weight is final, so nothing needs it on the
-                # accelerator until inference.
-                if self._offload_after_quant:
-                    layer.to("cpu")
-
-                # Note that we keep `layer._loaded_numel` around just in case
-                # there is logic added to vllm in the future which calls a
-                # weight loader twice - we do not want to re-initialize in
-                # that case.
+            # Finalize only after all parameters transformed by the quantizer
+            # have been loaded. The counters stay around in case a loader is
+            # called again; finalization itself is guarded by the usual flag.
+            self._finalize_if_ready(layer)
 
             return res
 
@@ -456,10 +497,10 @@ class UnquantizedHostLinearMethod(LazyWeightMixin, UnquantizedLinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Unquantized weights need no post-load transform.
 
-        The mixin calls this when the weight is fully loaded, right before it
-        flags the layer — and the flag is what keeps the loader's post-load
-        sweep from bouncing the host tensor to the accelerator and back.
+        The completion flag keeps the loader's post-load sweep from bouncing
+        the host tensor to the accelerator and back.
         """
+        self._finish_weight_processing(layer)
 
 
 class Int8LinearMethod(BaseInt8LinearMethod):
@@ -570,8 +611,7 @@ class Int8OnlineLinearMethod(LazyWeightMixin, Int8LinearMethod):
         setattr(layer, i_zp_name, None)
         setattr(layer, azp_adj_name, None)
 
-        # Prevent duplicate processing (e.g., during weight reload)
-        layer._already_called_process_weights_after_loading = True
+        self._finish_weight_processing(layer)
 
 
 class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
@@ -611,5 +651,4 @@ class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
         replace_parameter(layer, "weight", qweight)
         replace_parameter(layer, "weight_scale", weight_scale)
 
-        # Prevent duplicate processing (e.g., during weight reload)
-        layer._already_called_process_weights_after_loading = True
+        self._finish_weight_processing(layer)
