@@ -223,7 +223,11 @@ class _Graph:
 
 
 class MossReferenceEncoderGraphs:
-    """Encode prepared reference waveforms with captured tokenizer graphs."""
+    """Shared reference graph interface and batching, with CUDA capture/replay.
+
+    Other backends override capture and bucket replay while reusing the
+    tokenizer core, frame-aligned buckets, selection and output ordering.
+    """
 
     def __init__(
         self,
@@ -364,6 +368,7 @@ class MossReferenceEncoderGraphs:
         similar-length clips.
         """
         out: list[torch.Tensor | None] = [None] * len(wavs)
+        captured = set(self.captured)
         order = sorted(range(len(wavs)), key=lambda i: -int(wavs[i].shape[-1]))
         pos = 0
         while pos < len(order):
@@ -371,17 +376,20 @@ class MossReferenceEncoderGraphs:
             # Fine singleton buckets reduce padding without fragmenting an
             # already assembled batch into separate graph replays.
             buckets = self._singleton_buckets if len(order) - pos == 1 else self._buckets
-            samples = next((s for s in buckets if s >= longest and (1, s) in self._graphs), None)
+            samples = next((s for s in buckets if s >= longest and (1, s) in captured), None)
             if samples is None:
                 pos += 1  # longer than every bucket: left to the caller
                 continue
-            widest = max(b for b in self._batch_sizes if (b, samples) in self._graphs)
+            widest = max(b for b in self._batch_sizes if (b, samples) in captured)
             rows = order[pos : pos + widest]
-            batch = next(b for b in self._batch_sizes if b >= len(rows) and (b, samples) in self._graphs)
-            for row, codes in zip(rows, self._replay(self._graphs[(batch, samples)], [wavs[i] for i in rows])):
+            batch = next(b for b in self._batch_sizes if b >= len(rows) and (b, samples) in captured)
+            for row, codes in zip(rows, self._replay_bucket(batch, samples, [wavs[i] for i in rows])):
                 out[row] = codes
             pos += len(rows)
         return out
+
+    def _replay_bucket(self, batch: int, samples: int, wavs: list[torch.Tensor]) -> list[torch.Tensor]:
+        return self._replay(self._graphs[(batch, samples)], wavs)
 
     def _replay(self, entry: _Graph, wavs: list[torch.Tensor]) -> list[torch.Tensor]:
         if self._transfer_buffers is not None and all(w.device.type == "cpu" for w in wavs):
