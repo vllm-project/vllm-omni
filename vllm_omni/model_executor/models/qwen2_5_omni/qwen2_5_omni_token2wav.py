@@ -6,6 +6,7 @@
 ############################
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -85,6 +86,29 @@ class Qwen2_5OmniDiTRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+@dataclass
+class DiTEvalInvariants:
+    """Loop-invariant tensors shared by every ODE eval of one solve.
+
+    A flow-matching solve evaluates the DiT ``(num_steps - 1) * 4`` times
+    (RK4) with a fixed code sequence, reference mel and mel length, so the
+    codec text embedding, the ECAPA speaker encoding of the reference mel and
+    the rotary tables are identical in every eval. Computing them once per
+    solve instead of once per eval is bit-exact by construction (same ops on
+    the same inputs) and removes the per-eval overhead the solve used to pay
+    — including inside a captured whole-solve CUDA graph, where the invariant
+    kernels were replayed per eval.
+    """
+
+    text_embedding: torch.Tensor
+    text_embedding_unconditioned: torch.Tensor | None
+    # Post-ECAPA condition vector (CFG batch-concatenated when applicable),
+    # already unsqueezed and repeated to the mel length.
+    speaker_condition: torch.Tensor
+    # (cos, sin) rotary tables for the eval batch (2 under CFG, else 1).
+    position_embeddings: tuple[torch.Tensor, torch.Tensor]
+
+
 class DiTInputEmbedding(nn.Module):
     def __init__(self, config: Qwen2_5OmniDiTConfig):
         super().__init__()
@@ -103,16 +127,24 @@ class DiTInputEmbedding(nn.Module):
         drop_audio_cond: bool | None = False,
         code_embed_uncond: bool | None = None,
         apply_cfg: bool | None = True,
+        precomputed_condition: torch.Tensor | None = None,
     ):
         if apply_cfg:
             hidden_states = torch.cat([hidden_states, hidden_states], dim=0)
             speaker_embedding = torch.cat([speaker_embedding, torch.zeros_like(speaker_embedding)], dim=0)
-            condition_vector = torch.cat([condition_vector, torch.zeros_like(condition_vector)], dim=0)
             code_embed = torch.cat([code_embed, code_embed_uncond], dim=0)
+            if precomputed_condition is None:
+                condition_vector = torch.cat([condition_vector, torch.zeros_like(condition_vector)], dim=0)
         elif drop_audio_cond:  # cfg for cond audio
             condition_vector = torch.zeros_like(condition_vector)
             speaker_embedding = torch.zeros_like(speaker_embedding)
-        condition_vector = self.spk_encoder(condition_vector).unsqueeze(1).repeat(1, hidden_states.size(1), 1)
+        if precomputed_condition is None:
+            condition_vector = self.spk_encoder(condition_vector).unsqueeze(1).repeat(1, hidden_states.size(1), 1)
+        else:
+            # Per-solve invariant (see DiTEvalInvariants): the encoder output
+            # for this solve's fixed condition, already concatenated and
+            # length-matched outside the eval loop.
+            condition_vector = precomputed_condition
         hidden_states = self.proj(torch.cat((hidden_states, condition_vector, code_embed, speaker_embedding), dim=-1))
 
         return hidden_states
@@ -734,6 +766,14 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         run the identical kernels.
         """
         conditioning_vector = conditioning_vector.unsqueeze(1).repeat(1, initial_state.shape[1], 1)
+        # Every eval of this solve runs the same code embedding, ECAPA
+        # speaker encoding and rotary tables; compute them once here.
+        invariants = self._build_eval_invariants(
+            reference_mel,
+            quantized_code,
+            initial_state,
+            apply_cfg=guidance_scale >= 1e-5,
+        )
 
         def ode_function(time_step, hidden_states):
             if guidance_scale < 1e-5:
@@ -746,6 +786,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                     drop_audio_conditioning=False,
                     drop_code=False,
                     apply_cfg=False,
+                    eval_invariants=invariants,
                 )
                 return prediction
 
@@ -756,11 +797,46 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
                 condition_vector=reference_mel,
                 time_step=time_step,
                 apply_cfg=True,
+                eval_invariants=invariants,
             )
             guided_prediction, null_prediction = torch.chunk(model_output, 2, dim=0)
             return guided_prediction + (guided_prediction - null_prediction) * guidance_scale
 
         return ode_function
+
+    def _build_eval_invariants(
+        self,
+        reference_mel,
+        quantized_code,
+        initial_state,
+        apply_cfg,
+    ) -> DiTEvalInvariants:
+        """Compute the per-solve loop invariants for ``_build_ode_function``.
+
+        Mirrors the exact branch structure of ``forward`` / ``input_embed``
+        so each hoisted value is bit-identical to what every eval used to
+        recompute from the same fixed inputs.
+        """
+        text_embedding = self.text_embed(quantized_code, drop_code=False)
+        if apply_cfg:
+            text_embedding_unconditioned = self.text_embed(quantized_code, drop_code=True)
+            condition = torch.cat([reference_mel, torch.zeros_like(reference_mel)], dim=0)
+        else:
+            text_embedding_unconditioned = None
+            condition = reference_mel
+        speaker_condition = self.input_embed.spk_encoder(condition).unsqueeze(1).repeat(1, initial_state.shape[1], 1)
+        # The rotary tables depend only on (batch, seq_len, dtype, device);
+        # under CFG the eval batch is 2 (guided + null half). A stride-0
+        # expand carries the shape without copying the ODE state.
+        batch = 2 if apply_cfg else initial_state.shape[0]
+        rotary_input = initial_state if batch == initial_state.shape[0] else initial_state[:1].expand(batch, -1, -1)
+        position_embeddings = self.rotary_embed(rotary_input)
+        return DiTEvalInvariants(
+            text_embedding=text_embedding,
+            text_embedding_unconditioned=text_embedding_unconditioned,
+            speaker_condition=speaker_condition,
+            position_embeddings=position_embeddings,
+        )
 
     def _solve_flow_matching(
         self,
@@ -803,6 +879,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         drop_audio_conditioning=False,
         drop_code=False,
         apply_cfg=True,
+        eval_invariants: DiTEvalInvariants | None = None,
     ):
         batch_size = hidden_states.shape[0]
         if time_step.ndim == 0:
@@ -810,8 +887,14 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
 
         # Compute embeddings
         time_embedding = self.time_embed(time_step)
-        text_embedding = self.text_embed(quantized_code, drop_code=False if apply_cfg else drop_code)
-        text_embedding_unconditioned = self.text_embed(quantized_code, drop_code=True) if apply_cfg else None
+        if eval_invariants is None:
+            text_embedding = self.text_embed(quantized_code, drop_code=False if apply_cfg else drop_code)
+            text_embedding_unconditioned = self.text_embed(quantized_code, drop_code=True) if apply_cfg else None
+        else:
+            # Per-solve loop invariants (see DiTEvalInvariants): identical
+            # values the eval used to recompute from the fixed solve inputs.
+            text_embedding = eval_invariants.text_embedding
+            text_embedding_unconditioned = eval_invariants.text_embedding_unconditioned
 
         hidden_states = self.input_embed(
             hidden_states,
@@ -821,10 +904,14 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
             drop_audio_cond=drop_audio_conditioning,
             code_embed_uncond=text_embedding_unconditioned,
             apply_cfg=apply_cfg,
+            precomputed_condition=None if eval_invariants is None else eval_invariants.speaker_condition,
         )
 
         # Compute positional encodings
-        position_embeddings = self.rotary_embed(hidden_states)
+        if eval_invariants is None:
+            position_embeddings = self.rotary_embed(hidden_states)
+        else:
+            position_embeddings = eval_invariants.position_embeddings
 
         # Transformer blocks
         for transformer_block in self.transformer_blocks:

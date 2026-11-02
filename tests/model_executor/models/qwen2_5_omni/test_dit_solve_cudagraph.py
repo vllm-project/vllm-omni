@@ -126,23 +126,34 @@ def _eager_sample(model, inputs):
 
 @pytest.fixture(scope="module")
 def dit_model():
-    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.config import (
+        DeviceConfig,
+        VllmConfig,
+        get_current_vllm_config_or_none,
+        set_current_vllm_config,
+    )
     from vllm.distributed import (
         init_distributed_environment,
         initialize_model_parallel,
+        model_parallel_is_initialized,
     )
 
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    init_distributed_environment(
-        world_size=1,
-        rank=0,
-        distributed_init_method=f"tcp://127.0.0.1:{port}",
-        local_rank=0,
-    )
-    set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cuda"))).__enter__()
-    initialize_model_parallel(tensor_model_parallel_size=1)
+    # Guarded so this file can run in the same pytest process as sibling test
+    # files whose fixtures perform the same setup.
+    if not torch.distributed.is_initialized():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+            local_rank=0,
+        )
+    if get_current_vllm_config_or_none() is None:
+        set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cuda"))).__enter__()
+    if not model_parallel_is_initialized():
+        initialize_model_parallel(tensor_model_parallel_size=1)
 
     from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_token2wav import (
         Qwen2_5OmniToken2WavDiTModel,
