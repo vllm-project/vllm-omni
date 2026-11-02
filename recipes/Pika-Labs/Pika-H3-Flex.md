@@ -38,7 +38,7 @@ VLLM_OMNI_VAE_LEGACY_TEMPORAL=1 \
 vllm serve Pika-Labs/Pika-H3-Flex --omni --trust-remote-code \
   --task-type ref2va --num-gpus 4 --tensor-parallel-size 4 \
   --text-encoder-tp-size 4 --usp 1 --ring 1 \
-  --vae-patch-parallel-size 1 --vae-parallel-mode tile --vae-use-tiling \
+  --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling \
   --enforce-eager --diffusion-attention-backend CUDNN_ATTN \
   --diffusion-quantization-config '{"transformer":null,"text_encoder":null,"video_vae":null,"audio_vae":null}' \
   --additional-config '{"minimax_h3_vae_audio_overlap":true}' \

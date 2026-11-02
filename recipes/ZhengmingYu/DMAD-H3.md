@@ -43,7 +43,7 @@ VLLM_OMNI_VAE_LEGACY_TEMPORAL=1 \
 vllm serve /models/MiniMax-H3/FL2VA --omni --trust-remote-code \
   --task-type fl2va --num-gpus 4 --tensor-parallel-size 4 \
   --text-encoder-tp-size 4 --usp 1 --ring 1 \
-  --vae-patch-parallel-size 1 --vae-parallel-mode tile --vae-use-tiling \
+  --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling \
   --enforce-eager --diffusion-attention-backend CUDNN_ATTN \
   --diffusion-quantization-config '{"transformer":null,"text_encoder":null,"video_vae":null,"audio_vae":null}' \
   --lora-path /models/DMAD/minimax_h3/dmad_minimax_h3_4step_full_critic.safetensors \
@@ -99,10 +99,11 @@ separate qualification in vLLM-Omni.
 ## Tests
 
 Local real-weight HTTP validation on four SM120 GPUs covered both four-step
-adapters, the eight-step adapter, eight-step 2560x1440 upscaling, and switching
+adapters, the eight-step adapter, four/eight-step 2560x1440 upscaling, and switching
 back to Pika's six-step FL2VA adapter without restarting. Every MP4 decoded
-fully: 124 frames at 24 fps, with 32 kHz stereo audio. The eight-step native
-and upscaled outputs had identical decoded PCM hashes. Requests with a
+fully: 124 frames at 24 fps, with 32 kHz stereo audio. For both step counts,
+native and upscaled outputs had identical decoded PCM hashes. Four-step 2K
+also exercised four-card VAE tile decoding. Requests with a
 mismatched step count, audio shift, or latent refinement returned HTTP 400.
 
 The published DMAD rollout and this sampler also produced identical video
