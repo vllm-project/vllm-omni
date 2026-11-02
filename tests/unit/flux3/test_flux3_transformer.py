@@ -23,7 +23,6 @@ from vllm_omni.diffusion.models.flux3.flux3_transformer import (
     _build_lora_weights_mapper,
     _build_qkv_weights_mapper,
     _build_split_qkv_checkpoint_mapper,
-    _resolve_fuse_qkv,
 )
 
 # ---------------------------------------------------------------------------
@@ -192,17 +191,6 @@ class TestShapeInvariants:
             "image_cond": IMAGE_C,
         }
 
-    def test_nvfp4_qkv_layout_stays_split(self):
-        """NVFP4 blocks keep split projections to preserve per-projection scales."""
-
-        class NvFp4Config:
-            def get_name(self):
-                return "modelopt_fp4"
-
-        config = NvFp4Config()
-        assert _resolve_fuse_qkv(config) is False
-        assert _resolve_fuse_qkv(None) is True
-
     def test_mixed_qkv_layout_maps_checkpoint_to_each_block(self):
         mapper, stacked = _build_qkv_weights_mapper(
             {"content_mode_blocks.image.0": True, "content_mode_blocks.image_cond.0": False},
@@ -291,7 +279,6 @@ class TestShapeInvariants:
         ("quant_name", "expected_packed_mapping"),
         [
             ("modelopt", {"qkv": ["q_proj", "k_proj", "v_proj"]}),
-            ("modelopt_fp4", {}),
         ],
     )
     def test_quant_config_sees_flux3_runtime_names(self, quant_name, expected_packed_mapping):

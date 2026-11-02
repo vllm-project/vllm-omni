@@ -65,25 +65,6 @@ def _join_prefix(prefix: str, name: str) -> str:
 _QKV_PACKED_MODULES_MAPPING = {"qkv": ["q_proj", "k_proj", "v_proj"]}
 
 
-def _is_nvfp4_quant_config(quant_config: "QuantizationConfig | None") -> bool:
-    """Return True for NVFP4 configs that need per-projection Q/K/V scale handling."""
-    if quant_config is None:
-        return False
-    get_name = getattr(quant_config, "get_name", None)
-    return callable(get_name) and get_name() == "modelopt_fp4"
-
-
-def _resolve_fuse_qkv(
-    quant_config: "QuantizationConfig | None",
-    kernel_backend: str = "vllm",
-) -> bool:
-    """Return the QKV layout compatible with the selected quantization method."""
-    if _is_nvfp4_quant_config(quant_config):
-        # NVFP4 blocks keep split projections to preserve the separate scales.
-        return False
-    return True
-
-
 def _build_qkv_weights_mapper(
     fused_by_prefix: dict[str, bool],
 ) -> tuple[WeightsMapper, list[tuple[str, str, str]]]:
@@ -806,8 +787,7 @@ class Flux3Transformer2DModel(nn.Module, SupportsQuant):
             return
         if (hf_to_vllm_mapper := self.hf_to_vllm_mapper) is not None:
             self.quant_config.apply_vllm_mapper(hf_to_vllm_mapper.get_rename_mapper())
-        if not _is_nvfp4_quant_config(self.quant_config):
-            _set_quant_config_packed_qkv_mapping(self.quant_config, _QKV_PACKED_MODULES_MAPPING)
+        _set_quant_config_packed_qkv_mapping(self.quant_config, _QKV_PACKED_MODULES_MAPPING)
 
     def __init__(
         self,
@@ -830,11 +810,7 @@ class Flux3Transformer2DModel(nn.Module, SupportsQuant):
         od_config: OmniDiffusionConfig | None = None,
     ):
         super().__init__()
-        self.kernel_adapter = build_flux3_kernel_adapter(
-            qk_norm_rope=_qk_norm_rope,
-            od_config=od_config,
-            quant_config=quant_config,
-        )
+        self.kernel_adapter = build_flux3_kernel_adapter(qk_norm_rope=_qk_norm_rope)
         self.hidden_size = hidden_size
         self.head_dim = hidden_size // num_heads
         self.depth = depth
@@ -846,13 +822,10 @@ class Flux3Transformer2DModel(nn.Module, SupportsQuant):
         if unknown_out_modes:
             raise ValueError(f"Flux3 out_modes must be image stream names, got: {unknown_out_modes}")
         content_modalities = tuple(self._MODALITY_CHANNELS)
-        fused_qkv_by_prefix = {
-            prefix: _resolve_fuse_qkv(
-                quant_config,
-                self.kernel_adapter.backend,
-            )
-            for prefix in _iter_qkv_prefixes(content_modalities, depth, depth_single_blocks, depth_late_blocks)
-        }
+        fused_qkv_by_prefix = dict.fromkeys(
+            _iter_qkv_prefixes(content_modalities, depth, depth_single_blocks, depth_late_blocks),
+            True,
+        )
         self.packed_modules_mapping = _QKV_PACKED_MODULES_MAPPING if any(fused_qkv_by_prefix.values()) else {}
         _set_quant_config_packed_qkv_mapping(quant_config, self.packed_modules_mapping)
         self._split_qkv_checkpoint_mapper = _build_split_qkv_checkpoint_mapper(fused_qkv_by_prefix)

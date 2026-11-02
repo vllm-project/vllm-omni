@@ -939,6 +939,12 @@ class Flux3Pipeline(
         flow_shift = float(sp.extra_args.get("flow_shift", self.od_config.flow_shift or self._default_flow_shift))
         height = sp.height or height or default_height
         width = sp.width or width or default_width
+        num_outputs = int(getattr(sp, "num_outputs_per_prompt", 1) or 1)
+        if num_outputs > 1:
+            raise ValueError(f"Flux3 generates one image per request; got num_outputs_per_prompt={num_outputs}")
+        align = self.image_vae_scale_factor * 2
+        if height % align or width % align:
+            raise ValueError(f"Flux3 requires height and width to be multiples of {align}, got {height}x{width}")
         num_inference_steps = (
             sp.num_inference_steps
             if sp.num_inference_steps is not None

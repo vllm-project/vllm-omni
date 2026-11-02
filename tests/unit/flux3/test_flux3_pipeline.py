@@ -459,6 +459,13 @@ class TestLoading:
 
         assert _flux3_sampler_config({"sampler": {"guidance": None}})["guidance"] is None
 
+    def test_flow_match_sigmas_never_end_at_zero(self):
+        from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+
+        for steps, shift in ((1, 1.0), (16, 3.0), (50, 7.0)):
+            scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=steps, shift=shift)
+            assert scheduler.sigmas[-1] > 0
+
     def test_direct_quantized_package_path_is_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         model_root = tmp_path / "flux3"
         self._write_f3_package_config(model_root)
@@ -922,6 +929,7 @@ class TestForwardContract:
         pipe._default_guidance_scale = 3.5
         pipe._default_flow_shift = 6.93
         pipe._default_size = (1024, 1024)
+        pipe.image_vae_scale_factor = 8
         return pipe
 
     @staticmethod
