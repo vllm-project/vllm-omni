@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.gr00t.policy import Gr00tPolicy
@@ -17,6 +18,9 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
+
+# Modules the action head runs once per denoising step.
+_ACTION_HEAD_COMPILE_TARGETS = ("model", "action_encoder", "action_decoder")
 
 
 def _to_float32_action_dict(actions: Mapping[str, Any]) -> dict[str, np.ndarray]:
@@ -40,6 +44,7 @@ class Gr00tN1d7Pipeline(nn.Module):
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
+        self.od_config = od_config
         model_config = od_config.model_config
         self.model_path = od_config.model
         self.embodiment_tag = str(model_config.get("embodiment_tag") or "OXE_DROID_RELATIVE_EEF_RELATIVE_JOINT")
@@ -84,6 +89,48 @@ class Gr00tN1d7Pipeline(nn.Module):
                 f"policy_server_config.embodiment_tag={psc_embodiment!r} != "
                 f"model_config.embodiment_tag={self.embodiment_tag!r}."
             )
+
+    def setup_compile(self) -> None:
+        """Compile the action head's per-step modules; the Qwen3-VL backbone stays eager.
+
+        The runner calls this only when ``enforce_eager`` is off and the platform
+        supports inductor. The action head runs once per denoising step with shapes
+        fixed by the checkpoint, while the backbone's token count varies per
+        observation, so only the action head is compiled.
+        """
+        action_head = self.policy.model.action_head
+        granularity = self.od_config.diffusion_compile_granularity
+        dynamic = self.od_config.diffusion_compile_dynamic
+        compiled: list[str] = []
+        if granularity == "full":
+            for name in _ACTION_HEAD_COMPILE_TARGETS:
+                try:
+                    getattr(action_head, name).compile(dynamic=dynamic)
+                except Exception as exc:
+                    logger.warning("GR00T: torch.compile of action_head.%s failed (%s); it stays eager.", name, exc)
+                else:
+                    compiled.append(name)
+        else:
+            model = action_head.model
+            repeated = set(getattr(model, "_repeated_blocks", ()))
+            num_blocks = sum(type(module).__name__ in repeated for module in model.modules())
+            try:
+                regionally_compile(model, dynamic=dynamic)
+            except Exception as exc:
+                logger.warning("GR00T: regional compile of action_head.model failed (%s); it stays eager.", exc)
+            else:
+                if num_blocks:
+                    compiled.append(f"model ({num_blocks} blocks)")
+
+        if compiled:
+            logger.info(
+                "GR00T: compiled action_head %s (granularity=%s, dynamic=%s).",
+                ", ".join(compiled),
+                granularity,
+                dynamic,
+            )
+        else:
+            logger.warning("GR00T: no action-head module was compiled; the policy runs eager.")
 
     def reset(self) -> dict[str, Any]:
         return self.policy.reset() or {}
