@@ -190,7 +190,8 @@ mode leaves the latents bitwise unchanged at the same latency.
 - Known limitations: one GPU only (no TP, SP, CFG parallelism or HSDP); no
   Cache-DiT or TeaCache, since the four DMD steps are all distinct; the
   deprecated AR-Diffusion tick control plane is not supported; streaming
-  decode requires the untiled VAE path.
+  decode requires the untiled VAE path, so the stepwise deploy refuses
+  `--vae-use-tiling` at startup; request mode can still tile.
 
 ## Supported features
 
