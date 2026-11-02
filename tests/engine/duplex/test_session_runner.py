@@ -1197,8 +1197,6 @@ async def test_admitted_pcm16_append_that_decodes_past_the_limit_is_rejected_cle
 class _SplitDetector:
     """Splits every append into one 1 s segment and its remainder."""
 
-    vad = None  # never asks the batcher to score a frame
-
     def segment_steps(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
         yield from ()
         return self.process_segments(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
@@ -3669,8 +3667,6 @@ async def test_stale_epoch_append_does_not_own_request_start() -> None:
 
 class _ScriptedDetector:
     """A turn detector that answers each appended chunk with a pre-decided result."""
-
-    vad = None  # never asks the batcher to score a frame
 
     def __init__(self, results: list[object]) -> None:
         self._results = list(results)
