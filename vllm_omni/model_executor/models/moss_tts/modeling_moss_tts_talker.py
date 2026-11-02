@@ -555,19 +555,16 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
         """
         device = last_h.device
         n_vq = self.n_vq
+        # _initial_state/_advance_state keep these counters as Python ints.
+        # Callers must not store device tensors here: int(tensor) would sync.
         audio_lengths = int(state.get("audio_lengths", 0))
         delayed_lengths = int(state.get("delayed_lengths", -1))
 
-        idx = torch.arange(n_vq, device=device)
-        pre_mask = idx < audio_lengths
-        if delayed_lengths == -1:
-            post_mask = torch.ones(n_vq, dtype=torch.bool, device=device)
-        else:
-            post_mask = idx > (delayed_lengths - 1)
-        sampling_mask = pre_mask & post_mask
-
         codes = torch.full((n_vq,), self.audio_pad_code, dtype=torch.long, device=device)
-        if not bool(sampling_mask.any()):
+        # Both mask bounds are CPU state already; avoid CUDA any/nonzero syncs.
+        active_start = max(0, delayed_lengths)
+        active_end = min(n_vq, audio_lengths)
+        if active_start >= active_end:
             return codes
 
         audio_top_k = 25
@@ -580,8 +577,7 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             all_logits[:, -1] = float("-inf")  # invalid sentinel
             all_logits[:, self.audio_pad_code] = float("-inf")
 
-            active_idx = sampling_mask.nonzero(as_tuple=True)[0]  # (n_active,)
-            active_logits = all_logits[active_idx]  # (n_active, V+1)
+            active_logits = all_logits[active_start:active_end]  # (n_active, V+1)
             active_logits = active_logits / max(audio_temp, 1e-6)
             if audio_top_k > 0 and audio_top_k < active_logits.shape[-1]:
                 top_vals, _ = torch.topk(active_logits, audio_top_k, dim=-1)
@@ -592,13 +588,11 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
                     active_logits,
                 )
             probs = torch.softmax(active_logits, dim=-1)
-            codes[active_idx] = torch.multinomial(probs, num_samples=1).squeeze(-1).long()
+            codes[active_start:active_end] = torch.multinomial(probs, num_samples=1).squeeze(-1).long()
             return codes
 
         # Fallback: per-head loop (used before load_weights() completes).
-        for i in range(n_vq):
-            if not bool(sampling_mask[i]):
-                continue
+        for i in range(active_start, active_end):
             head = self.audio_heads[i]
             logits = head(last_h).reshape(-1)  # (V,)
             logits[..., -1] = float("-inf")
