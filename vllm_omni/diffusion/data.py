@@ -190,6 +190,14 @@ def validate_omni_diffusion_kwargs(
         raise ValueError(f"Unknown diffusion config field(s){suffix}: {names}")
 
 
+def is_quantized_attention_dtype(dtype: str | None) -> bool:
+    """Whether the unified attention precision knob requests quantization.
+
+    This classifies the knob, not backend support or explicit backend quant specs.
+    """
+    return dtype not in (None, "auto", "float")
+
+
 def parse_kv_cache_skip_selector(
     selector: str | list[int] | tuple[int, ...] | set[int] | None,
 ) -> set[int] | None:
@@ -2524,7 +2532,7 @@ def validate_kv_cache_dtype_vs_attention_specs(
     is contradictory intent — fail fast instead of picking one silently. A pure
     ``flashinfer_backend`` variant pin without dtypes is not a conflict.
     """
-    if kv_cache_dtype in (None, "auto", "float") or attention_config is None:
+    if not is_quantized_attention_dtype(kv_cache_dtype) or attention_config is None:
         return
     specs = [attention_config.default, *attention_config.per_role.values()]
     for spec in specs:

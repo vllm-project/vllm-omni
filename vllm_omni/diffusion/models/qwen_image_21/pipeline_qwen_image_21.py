@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
@@ -24,11 +24,12 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, is_quantized_attention_dtype
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage21 import (
     DistributedAutoencoderKLQwenImage21,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
@@ -1375,23 +1376,35 @@ class QwenImage21Pipeline(
         )
 
     @staticmethod
-    def _split_decode_groups(
+    def _group_states_by_key(
         states: list["StepRequestState"],
+        key_fn: Callable[["StepRequestState"], tuple[Any, ...]],
     ) -> list[list["StepRequestState"]]:
-        """Split a decode batch into homogeneous baked-prefix-length groups.
+        """Group requests by key, preserving first-seen and within-group order.
 
-        Preserves first-seen group order and relative order within each group.
         Callers stitch per-group noise preds back into the input request order.
         """
         groups: dict[tuple[Any, ...], list[StepRequestState]] = {}
         order: list[tuple[Any, ...]] = []
         for state in states:
-            key = QwenImage21Pipeline._decode_group_key(state)
+            key = key_fn(state)
             if key not in groups:
                 order.append(key)
                 groups[key] = []
             groups[key].append(state)
         return [groups[key] for key in order]
+
+    @staticmethod
+    def _group_by_prefix_lengths(states: list["StepRequestState"]) -> list[list["StepRequestState"]]:
+        """Group requests with matching baked conditional/unconditional KV lengths."""
+        return QwenImage21Pipeline._group_states_by_key(states, QwenImage21Pipeline._decode_group_key)
+
+    @staticmethod
+    def _group_by_prefix_lengths_and_step(states: list["StepRequestState"]) -> list[list["StepRequestState"]]:
+        """Also require one denoise step per group for the scalar step selector."""
+        return QwenImage21Pipeline._group_states_by_key(
+            states, lambda state: (*QwenImage21Pipeline._decode_group_key(state), state.step_index)
+        )
 
     @staticmethod
     def _needs_decode_seq_len_split(states: list["StepRequestState"]) -> bool:
@@ -1474,12 +1487,26 @@ class QwenImage21Pipeline(
         if not states:
             raise ValueError("QwenImage21Pipeline.denoise_step requires per-request states on the InputBatch.")
 
-        if self._needs_decode_seq_len_split(states):
+        # A single Attention call has one scalar step selector. Requests at
+        # different steps must not inherit the first request's precision policy.
+        # Skip selectors affect the unified quantization knob only; native
+        # precision and explicit backend quant specs do not vary with this step.
+        split_by_step = (
+            is_quantized_attention_dtype(getattr(self.od_config, "diffusion_kv_cache_dtype", None))
+            and bool(getattr(self.od_config, "diffusion_kv_cache_skip_step_indices", None))
+            and len({state.step_index for state in states}) > 1
+        )
+        if self._needs_decode_seq_len_split(states) or split_by_step:
             # Local import: InputBatch is only TYPE_CHECKING at module scope.
             from vllm_omni.diffusion.worker.input_batch import InputBatch as _InputBatch
 
             preds_by_id: dict[str, torch.Tensor] = {}
-            for group in self._split_decode_groups(states):
+            groups = (
+                self._group_by_prefix_lengths_and_step(states)
+                if split_by_step
+                else self._group_by_prefix_lengths(states)
+            )
+            for group in groups:
                 group_pred = self._denoise_step_homogeneous(_InputBatch.make_batch(group))
                 if group_pred is None:
                     return None
@@ -1595,14 +1622,19 @@ class QwenImage21Pipeline(
         else:
             negative_kwargs = None
 
-        noise_pred = self.predict_noise_maybe_with_cfg(
-            input_batch.do_true_cfg,
-            input_batch.true_cfg_scale,
-            positive_kwargs,
-            negative_kwargs,
-            input_batch.cfg_normalize,
-            output_slice=latents.size(1),
-        )
+        step_indices = {state.step_index for state in states}
+        set_forward_context_denoise_step_idx(next(iter(step_indices)) if len(step_indices) == 1 else None)
+        try:
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                input_batch.do_true_cfg,
+                input_batch.true_cfg_scale,
+                positive_kwargs,
+                negative_kwargs,
+                input_batch.cfg_normalize,
+                output_slice=latents.size(1),
+            )
+        finally:
+            set_forward_context_denoise_step_idx(None)
 
         if take_ownership:
             # Remember the padded VLM length baked into the per-request KV so a
