@@ -2333,14 +2333,26 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 tails = self.query_start_loc.cpu[1 : count + 1].to(torch.long) - 1
                 if count and bool((tails >= 0).all()) and bool((tails < input_ids.numel()).all()):
                     cpu_input_tail_ids = self.input_ids.cpu.index_select(0, tails).tolist()
-            update_decode_metadata(
-                cpu_input_tail_ids=cpu_input_tail_ids,
-                input_ids=input_ids,
-                positions=positions,
-                inputs_embeds=inputs_embeds,
-                omni_query_start_loc=model_kwargs_extra.get("omni_query_start_loc"),
-                req_ids=self.input_batch.req_ids,
-            )
+            decode_meta_kwargs: dict[str, Any] = {
+                "cpu_input_tail_ids": cpu_input_tail_ids,
+                "input_ids": input_ids,
+                "positions": positions,
+                "inputs_embeds": inputs_embeds,
+                "omni_query_start_loc": model_kwargs_extra.get("omni_query_start_loc"),
+                "req_ids": self.input_batch.req_ids,
+            }
+            # CUDA-graph FULL replay skips Python model.forward, so per-step
+            # runtime payloads (e.g. MammothModa2 generated_len) must be
+            # refreshed here, outside capture. Models that opt into
+            # supports_omni_decode_step_metadata must not rely on Python
+            # forward to cache values later read from compute_logits.
+            runtime_infos = model_kwargs_extra.get("runtime_additional_information")
+            if runtime_infos is not None:
+                decode_meta_kwargs["runtime_additional_information"] = runtime_infos
+            model_buffer = model_kwargs_extra.get("model_intermediate_buffer")
+            if model_buffer is not None:
+                decode_meta_kwargs["model_intermediate_buffer"] = model_buffer
+            update_decode_metadata(**decode_meta_kwargs)
 
         try:
             model_output = super()._model_forward(
