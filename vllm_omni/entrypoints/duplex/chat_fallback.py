@@ -264,8 +264,14 @@ def build_chat_request(request: DuplexFallbackRequest, *, model: str) -> ChatCom
         kwargs["max_tokens"] = max_tokens
     kwargs.update(_realtime_extra_body(response_config))
 
-    chat_request = ChatCompletionRequest(**kwargs)
     modalities = response_config.get("modalities")
+    voice = response_config.get("voice")
+    if isinstance(modalities, list | tuple) and "audio" in modalities and isinstance(voice, str) and voice:
+        # A session voice is explicit and must retain strict speaker validation.
+        if (kwargs.get("voice") or kwargs.get("speaker")) is None:
+            kwargs["speaker"] = voice
+
+    chat_request = ChatCompletionRequest(**kwargs)
     if isinstance(modalities, list | tuple):
         object.__setattr__(chat_request, "modalities", list(modalities))
     if "audio" in (modalities if isinstance(modalities, list | tuple) else ()):
@@ -274,7 +280,6 @@ def build_chat_request(request: DuplexFallbackRequest, *, model: str) -> ChatCom
         if audio_format == "pcm16":
             audio_format = "pcm"
         audio_request: dict[str, object] = {"format": audio_format}
-        voice = response_config.get("voice")
         if isinstance(voice, str) and voice:
             audio_request["voice"] = voice
         speed = response_config.get("speed")

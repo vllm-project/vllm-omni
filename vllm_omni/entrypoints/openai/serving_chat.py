@@ -1146,8 +1146,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         await self._attach_minicpmo45_reference_audio(engine_prompt, request)
         await self._attach_ming3_reference_audio(engine_prompt, request)
 
-        speaker = self._resolve_chat_speaker(request)
-        normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
+        supported_speakers = self._get_supported_speakers()
+        speaker = self._resolve_chat_speaker(request, supported_speakers)
+        normalized = validate_requested_speaker(speaker, supported_speakers)
         if normalized is not None:
             prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
             prompt_additional_information["speaker"] = [normalized]
@@ -1177,16 +1178,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return additional_information
 
     @staticmethod
-    def _resolve_chat_speaker(request: ChatLikeRequest | ResponsesRequest) -> Any:
-        """Resolve root speaker fields before the nested chat-audio voice."""
+    def _resolve_chat_speaker(
+        request: ChatLikeRequest | ResponsesRequest,
+        supported_speakers: set[str] | None = None,
+    ) -> str | None:
+        """Honor root speakers; ignore unsupported nested chat-audio voices."""
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         if speaker is not None:
-            return speaker
+            return speaker if isinstance(speaker, str) else None
 
         audio_params = getattr(request, "audio", None)
         if isinstance(audio_params, Mapping):
-            return audio_params.get("voice")
-        return getattr(audio_params, "voice", None)
+            speaker = audio_params.get("voice")
+        else:
+            speaker = getattr(audio_params, "voice", None)
+        if not isinstance(speaker, str):
+            return None
+        if supported_speakers and speaker.strip().lower() not in supported_speakers:
+            return None
+        return speaker
 
     def _input_modalities(self, messages: list[ChatCompletionMessageParam]) -> set[str]:
         """Return the modalities of the media parts in ``messages``."""
