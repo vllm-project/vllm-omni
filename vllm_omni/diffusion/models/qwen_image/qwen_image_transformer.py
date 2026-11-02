@@ -881,6 +881,34 @@ class QwenImageCrossAttention(nn.Module):
         return img_attn_output, txt_attn_output
 
 
+def _modulation_linear(dim: int, quant_config: QuantizationConfig | None, prefix: str) -> nn.Module:
+    """Build a block's ``dim -> 6 * dim`` AdaLN modulation projection.
+
+    Across 60 blocks, ``img_mod``/``txt_mod`` hold ~1/3 of the DiT weights
+    (~13.6 GB in BF16) but only run on the ``[B, dim]`` timestep embedding.
+    Shard them column-parallel and all-gather the small output, so each TP rank
+    keeps 1/tp of the weights and still gets the full scale/shift/gate.
+    Pre-quantized layers (AutoRound ``txt_mod``) stay replicated.
+    """
+    if quant_config is None:
+        return ColumnParallelLinear(
+            dim,
+            6 * dim,
+            bias=True,
+            gather_output=True,
+            return_bias=False,
+            prefix=prefix,
+        )
+    return ReplicatedLinear(
+        dim,
+        6 * dim,
+        bias=True,
+        return_bias=False,
+        quant_config=quant_config,
+        prefix=prefix,
+    )
+
+
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -904,14 +932,7 @@ class QwenImageTransformerBlock(nn.Module):
         # The re-quantized W4A16 checkpoint keeps img_mod.1 in full precision.
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
-                dim,
-                6 * dim,
-                bias=True,
-                return_bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.img_mod.1",
-            ),
+            _modulation_linear(dim, quant_config=None, prefix=f"{prefix}.img_mod.1"),
         )
         self.img_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = QwenImageCrossAttention(
@@ -935,14 +956,7 @@ class QwenImageTransformerBlock(nn.Module):
         # AutoRound keeps txt_mod.1 quantized inside transformer_blocks.
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            ReplicatedLinear(
-                dim,
-                6 * dim,
-                bias=True,
-                return_bias=False,
-                quant_config=txt_mod_quant_config,
-                prefix=f"{prefix}.txt_mod.1",
-            ),
+            _modulation_linear(dim, quant_config=txt_mod_quant_config, prefix=f"{prefix}.txt_mod.1"),
         )
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         # Text doesn't need separate attention - it's handled by img_attn joint computation
