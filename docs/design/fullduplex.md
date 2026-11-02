@@ -460,6 +460,26 @@ for queue updates and the final validity check before delivery.
   accumulates the snapshot into the active response, so
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
+- **Session stats (busy RTF, RFC #8325).** Opt-in with
+  `duplex_session.collect_stats`. `ModelChannel` stamps each Stage-0 append's
+  envelope with `duplex.perf_chunk = [epoch, seq]` (a seq retried after a failed
+  submit gets a fresh id, so the aborted submit's late spans are ignored); the orchestrator copies the
+  producing step's chunk into forwarded updates and the chunk transfer adapter
+  into connector payloads. Stage schedulers (`DuplexStageWorkRecorder`) time
+  every step of a request that carries a chunk and return the spans on
+  `OmniEngineCoreOutput.stage_work`, which the orchestrator hands to the
+  session as it collects them. `DuplexEngineSession.perf`
+  (`SessionPerfLedger`) groups chunks by turn with their acceptance times and
+  spans (a chunk is done at its last span end), and records each turn's emitted audio through the
+  response it belongs to; turns close on model-turn completion, barge-in or
+  close. The runner answers `session.stats.get` from the ledger on
+  the ordered mailbox; clients derive busy RTF and stall ratio
+  (`vllm_omni.benchmarks.duplex_session_metrics`). A turn is reported final
+  only after the model turn completed, its responses ended and every chunk was
+  handled; cancelled turns never become final, and later spans are counted in
+  `late_spans`. With the flag off nothing is stamped or attached, and stage
+  schedulers check only newly scheduled requests. Single-host only: the API and
+  stage processes must share one `CLOCK_MONOTONIC`.
 
 Model plugins may opt into one bounded auxiliary request per Session. The
 Session-owned `SessionMemoryRuntime` gives it a separate resource identity,

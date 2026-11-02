@@ -22,6 +22,7 @@ For the full list of supported architectures across all modalities, see
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
 | IndexTTS-2 | `IndexTeam/IndexTTS-2` | ✓ (`ref_audio` or uploaded `voice`) | `stream=true` response, non-chunk | uploaded audio voice only; no presets | — |
 | IndexTTS-2.5 | native `checkpoints/` bundle | ✓ (`ref_audio` or uploaded `voice`) | `stream=true` response, non-chunk | uploaded audio voice only; no presets | — |
+| Kokoro-82M | `hexgrad/Kokoro-82M` | — (54 built-in voices) | ✓ (PCM / WAV stream, one chunk per ≤510 phonemes) | `af_heart` (default), `bm_george`, `ef_dora`, ... | — |
 | Ming-omni-tts | `inclusionAI/Ming-omni-tts-0.5B` | ✓ (`ref_audio` / `speaker_embedding`) | ✓ (PCM stream) | IP labels + structured `instructions` | — |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
@@ -1180,3 +1181,47 @@ curl -N -X POST http://localhost:8091/v1/audio/speech \
 - `guidance_scale`/`cfg_scale` must be `1.0`; `negative_prompt` is rejected (CFG companion support is a follow-up).
 - `instructions` without `ref_audio` is voice design; with `ref_audio`+`ref_text` it is voice direction.
 - See [`recipes/BreezeBlue/Breeze-TTS-2.md`](../../../recipes/BreezeBlue/Breeze-TTS-2.md) for the full recipe and the offline example under [`examples/offline_inference/text_to_speech/breeze_tts_2/`](../../offline_inference/text_to_speech/breeze_tts_2/).
+
+---
+
+## Kokoro-82M
+
+Single-stage non-autoregressive TTS at 24 kHz mono with 54 built-in voices in nine languages. Long input is split into chunks of at most 510 phonemes; streaming responses deliver one chunk at a time.
+
+### Prerequisites
+
+Same `vllm-omni[kokoro]` extra and spaCy model as the [offline Kokoro section](../../offline_inference/text_to_speech/README.md#kokoro-82m).
+
+### Launch
+
+```bash
+vllm-omni serve hexgrad/Kokoro-82M --omni --port 8091
+# or:
+./kokoro/run_server.sh
+```
+
+### Sending requests
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "hexgrad/Kokoro-82M", "input": "Hello from Kokoro.", "voice": "af_heart"}' \
+    --output kokoro.wav
+
+# Streamed raw PCM (24 kHz, s16le), British voice, 20% faster:
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "hexgrad/Kokoro-82M", "input": "Colour and flavour.", "voice": "bm_george",
+         "speed": 1.2, "stream": true, "stream_format": "audio", "response_format": "pcm"}' \
+    --output kokoro.pcm
+```
+
+`GET /v1/audio/voices` lists the available voices.
+
+### Notes
+
+- `voice` selects a built-in style pack (default `af_heart`); its first letter selects the G2P language. `language` overrides it with one of `en-us`, `en-gb`, `es`, `fr-fr`, `hi`, `it`, `pt-br`, `ja`, `zh`.
+- `speed` (0.25-4.0) is native, so it also works with streaming.
+- `seed` makes a request reproducible.
+- Voice cloning and instruction fields (`ref_audio`, `ref_text`, `instructions`, `task_type`, ...) are rejected with HTTP 400 rather than ignored.
+- Japanese (`j*`) and Mandarin (`z*`) voices need `misaki[ja]` / `misaki[zh]` on the server; without them those requests get HTTP 400. A non-streaming request that fails during synthesis gets HTTP 500 rather than empty audio; a stream that fails ends early.

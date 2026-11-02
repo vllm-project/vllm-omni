@@ -10,7 +10,7 @@ import os
 
 import torch
 
-from ...fused_moe_kernels import global_sort_routes, triton_mh_moe_forward
+from ..cuda.fused_moe_kernels import global_sort_routes, triton_mh_moe_forward
 from ..cuda.mh_moe import BF16Magi2MultiHeadMoE, _bf16_fused_moe_forward
 from ..native.mh_moe import torch_mh_moe_forward
 
