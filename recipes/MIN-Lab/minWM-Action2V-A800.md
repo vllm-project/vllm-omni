@@ -171,7 +171,9 @@ a Self-Forcing three-frame block.
   self-attention rejects Ulysses sequence parallelism when the model loads, so
   `--usp` above 1 fails at startup even for requests without a trajectory; no
   Cache-DiT or TeaCache, since the four DMD steps are all distinct; no live
-  camera control; streaming decode requires the untiled VAE path.
+  camera control; streaming decode requires the untiled VAE path, so the
+  stepwise deploy refuses `--vae-use-tiling` at startup; request mode can still
+  tile.
 
 ## Supported features
 

@@ -47,7 +47,14 @@ def test_cameras_carry_one_normalized_intrinsic_per_frame() -> None:
     np.testing.assert_allclose(intrinsics[0].numpy(), [[0.5, 0.0, 0.5], [0.0, 0.5, 0.5], [0.0, 0.0, 1.0]])
 
 
-@pytest.mark.parametrize(("trajectory", "message"), [("w*2,x*1", "Unknown trajectory direction"), ("w2", "segment")])
+@pytest.mark.parametrize(
+    ("trajectory", "message"),
+    [
+        ("w*2,x*1", "Unknown trajectory direction"),
+        ("w2", "segment"),
+        pytest.param("w*" + "9" * 5000, "too many digits", id="count-past-the-int-digit-limit"),
+    ],
+)
 def test_malformed_trajectories_are_rejected(trajectory: str, message: str) -> None:
     with pytest.raises(OmniClientError, match=message):
         trajectory_viewmats(trajectory, num_latent_frames=3)
@@ -63,5 +70,5 @@ def test_step_counts_past_the_requested_frames_are_rejected_before_a_pose_is_bui
         raise AssertionError("poses were built before the step count was validated")
 
     monkeypatch.setattr(camera, "invert_rigid", unreachable)
-    with pytest.raises(ValueError, match="latent frames"):
+    with pytest.raises(OmniClientError, match="latent frames"):
         trajectory_viewmats(trajectory, num_latent_frames=20)
