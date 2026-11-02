@@ -15,6 +15,9 @@ from vllm_omni.metrics.utils import (
     count_tokens_from_outputs,
     count_video_frames,
     extract_diffusion_vae_decode_ms,
+    extract_mm_output,
+    iter_mm_outputs,
+    iter_output_entries,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -170,3 +173,47 @@ def test_extract_vae_decode_ms_ignores_other_targets(durations: dict[str, float]
 def test_extract_vae_decode_ms_without_stage_durations() -> None:
     # Pipelines pass stage_durations=None when the profiler is off.
     assert extract_diffusion_vae_decode_ms(DiffusionOutput(stage_durations=None)) is None
+
+
+def _pooling_request_output(data: object) -> SimpleNamespace:
+    """A pooling stage's request output: ``outputs`` holds one PoolingOutput.
+
+    vLLM's ``OutputProcessor._new_request_output`` unwraps the one-element
+    list before building ``PoolingRequestOutput``, so ``outputs`` is a single
+    ``PoolingOutput`` and not a list of completions.
+    """
+    return SimpleNamespace(outputs=SimpleNamespace(data=data))
+
+
+def test_iter_output_entries_wraps_single_pooling_output() -> None:
+    pooling_output = SimpleNamespace(data=SimpleNamespace(shape=(2, 2)))
+
+    entries = iter_output_entries(SimpleNamespace(outputs=pooling_output))
+
+    assert entries == [pooling_output]
+
+
+def test_iter_output_entries_keeps_completion_list() -> None:
+    completions = [SimpleNamespace(text="a"), SimpleNamespace(text="b")]
+
+    entries = iter_output_entries(SimpleNamespace(outputs=completions))
+
+    assert entries == completions
+
+
+def test_iter_output_entries_without_outputs() -> None:
+    assert iter_output_entries(SimpleNamespace(outputs=None)) == []
+    assert iter_output_entries(SimpleNamespace()) == []
+
+
+def test_iter_mm_outputs_ignores_single_pooling_output() -> None:
+    # A PoolingOutput is not iterable and carries no multimodal_output.
+    assert iter_mm_outputs(_pooling_request_output(SimpleNamespace(shape=(2, 2)))) == []
+
+
+def test_extract_mm_output_ignores_single_pooling_output() -> None:
+    assert extract_mm_output(_pooling_request_output(SimpleNamespace(shape=(2, 2)))) == {}
+
+
+def test_count_tokens_from_outputs_ignores_single_pooling_output() -> None:
+    assert count_tokens_from_outputs([_pooling_request_output(SimpleNamespace(shape=(2, 2)))]) == 0
