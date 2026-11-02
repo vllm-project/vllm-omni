@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Register the Triton top-k/top-p kernel for MRv2 startup warmup on CUDA.
+"""Register the Triton top-k/top-p kernels for MRv2 startup warmup on CUDA.
 
 On CUDA, the v2 model runner samples top-k/top-p rows with FlashInfer's fused
-sampler, so vLLM does not register ``_topk_topp_kernel`` for JIT warmup, and
-its scheduler-driven sampler warmup (unseeded requests) never reaches it.
-Requests with an explicit seed are not eligible for the fused sampler and run
-that Triton kernel instead. Every Qwen3-Omni talker request does
-(``seed: 42, top_k: 50`` in the deploy config), so without this registration
-the first one JIT-compiles the kernel mid-request.
+sampler, so vLLM registers its native top-k/top-p kernels for JIT warmup only
+on ROCm, and its scheduler-driven sampler warmup (unseeded requests) never
+reaches them. Requests with an explicit seed are not eligible for the fused
+sampler and run those Triton kernels instead: ``_topk_topp_kernel`` for top-k
+rows, plus the split top-p kernels for small batches with an active top-p.
+Every Qwen3-Omni talker request is seeded (``seed: 42, top_k: 50`` in the
+deploy config), so without this registration the first one JIT-compiles the
+kernel mid-request.
 
 The registration only adds compile keys; vLLM compiles them in
 ``kernel_warmup``, before the JIT monitor activates.
@@ -25,10 +27,10 @@ logger = init_logger(__name__)
 
 
 def register_top_k_top_p_warmup(worker: Any) -> bool:
-    """Register ``_topk_topp_kernel`` with the v2 runner's JIT warmup registry.
+    """Register vLLM's native top-k/top-p kernels with the v2 runner's JIT warmup registry.
 
     Must run before ``compile_or_warm_up_model`` reaches ``kernel_warmup``.
-    Returns whether the kernel was registered.
+    Returns whether the kernels were registered.
     """
     if not getattr(worker, "use_v2_model_runner", False) or not current_platform.is_cuda():
         return False
@@ -43,9 +45,17 @@ def register_top_k_top_p_warmup(worker: Any) -> bool:
 
     if not HAS_TRITON:
         return False
-    from vllm.v1.sample.ops.topk_topp_triton import _topk_topp
+    try:
+        from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
+    except ImportError:
+        logger.warning(
+            "Skipping top-k/top-p sampler warmup: "
+            "vllm.v1.sample.ops.topk_topp_sampler.register_top_k_top_p_warmups is not importable. "
+            "Seeded top-k/top-p requests may JIT-compile sampling kernels on the first requests."
+        )
+        return False
 
     with registry.activate():
-        _topk_topp.register_warmup()
-    logger.debug("Registered the Triton top-k/top-p sampling kernel for JIT warmup.")
+        register_top_k_top_p_warmups()
+    logger.debug("Registered the Triton top-k/top-p sampling kernels for JIT warmup.")
     return True
