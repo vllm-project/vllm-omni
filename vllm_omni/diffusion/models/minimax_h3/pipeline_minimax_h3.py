@@ -9,7 +9,7 @@ import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import fields, replace
 from itertools import groupby
 from pathlib import Path
@@ -620,6 +620,40 @@ def _dit_rank_world() -> tuple[Any, int, int]:
         return None, 0, 1
     group = get_world_group().device_group
     return group, dist.get_rank(group), dist.get_world_size(group)
+
+
+def _coordinate_encoder_prefetch_error(exc: BaseException | None) -> None:
+    """Agree early per-rank load failures without waiting on accelerator streams."""
+    _, rank, world_size = _dit_rank_world()
+    if world_size == 1:
+        if exc is not None:
+            raise exc
+        return
+    cpu_group = get_world_group().cpu_group
+    success = torch.tensor(int(exc is None), dtype=torch.int32, device="cpu")
+    dist.all_reduce(success, op=dist.ReduceOp.MIN, group=cpu_group)
+    if success.item():
+        return
+    local = None
+    if exc is not None:
+        local = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "status_code": getattr(exc, "status_code", None),
+            "error_type": getattr(exc, "error_type", None),
+        }
+    errors: list[Any] = [None] * world_size
+    dist.all_gather_object(errors, local, group=cpu_group)
+    origin, info = next((i, error) for i, error in enumerate(errors) if error is not None)
+    if rank == origin:
+        assert exc is not None
+        raise exc
+    message = f"[encoder rank {origin}] {info['type']}: {info['message']}"
+    if info.get("status_code") is not None:
+        raise client_error_from_metadata(
+            message, status_code=int(info["status_code"]), error_type=info.get("error_type")
+        )
+    raise RuntimeError(message)
 
 
 def _broadcast_rank0_exception(exc: Exception | None) -> None:
@@ -1728,6 +1762,8 @@ class MiniMaxH3Pipeline(
         self,
         input_ids: torch.Tensor,
         vision_kwargs: dict[str, torch.Tensor],
+        *,
+        encoder_staged: bool = False,
     ) -> torch.Tensor:
         encode_kwargs: dict[str, Any] = vision_kwargs
         if os.environ.get("VLLM_OMNI_H3_HIDDEN_DEVICE", "0") == "1":
@@ -1736,6 +1772,9 @@ class MiniMaxH3Pipeline(
             # Invoke nn.Module.__call__ so the generic model-level offloader
             # swaps the resident DiT and encoder.
             return self.text_encoder(input_ids, **encode_kwargs)
+
+        if encoder_staged:
+            return self.text_encoder.encode_ids(input_ids, **encode_kwargs)
 
         if self._uses_manual_component_offload(self.text_encoder):
             if isinstance(self.text_encoder, MiniMaxH3Qwen3VLEncoder):
@@ -2824,51 +2863,84 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(str(exc)) from exc
         return videos
 
+    @contextmanager
+    def _encoder_non_block_prefetch_scope(self, rank: int):
+        """Own manual DLO residency across CPU preparation and result broadcast."""
+        with ExitStack() as stack:
+            staged = False
+            error = None
+            try:
+                if (
+                    rank < self.text_encoder_tp_size
+                    and not getattr(self, "_model_cpu_offload_modules", None)
+                    and getattr(self.text_encoder, "_omni_layerwise_enabled", False)
+                    and self._uses_manual_component_offload(self.text_encoder)
+                ):
+                    if isinstance(self.text_encoder, MiniMaxH3Qwen3VLEncoder):
+                        self.text_encoder.prepare_packed_offload()
+                    stack.enter_context(self._component_on_device(self.text_encoder))
+                    staged = True
+            except BaseException as exc:
+                error = exc
+            # A device collective here would follow the stager's ready wait and
+            # force DMA completion before rank0 can start CPU preprocessing.
+            _coordinate_encoder_prefetch_error(error)
+            yield staged
+
     def encode_prompt(self, prepared: PreparedEncoderInputs | None) -> tuple[torch.Tensor, torch.Tensor]:
         _, rank, _ = _dit_rank_world()
-        ids = tags = hidden = None
-        vision_kwargs: dict[str, torch.Tensor] = {}
-        error = None
-        if rank == 0:
-            try:
-                if prepared is None:
-                    raise ValueError("rank 0 must prepare MiniMax H3 text inputs")
-                if prepared.images:
-                    vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
-                    vision_kwargs.update(
-                        pixel_values=vision["pixel_values"],
-                        image_grid_thw=vision["image_grid_thw"],
-                    )
-                if prepared.qwen_videos:
-                    vision = self.processor.video_processor(
-                        videos=[frames for frames, _ in prepared.qwen_videos],
-                        do_sample_frames=False,
-                        return_tensors="pt",
-                    )
-                    vision_kwargs.update(
-                        pixel_values_videos=vision["pixel_values_videos"],
-                        video_grid_thw=vision["video_grid_thw"],
-                    )
-                ids, tags = build_minimax_h3_presentation(
-                    self.tokenizer,
-                    prompt=prepared.prompt,
-                    task=prepared.media.task,
-                    condition_labels=prepared.condition_labels,
-                    image_grid_thw=vision_kwargs.get("image_grid_thw"),
-                    video_grid_thw=vision_kwargs.get("video_grid_thw"),
-                    video_timestamps=prepared.video_timestamps,
-                    merge_size=int(self.processor.image_processor.merge_size),
-                )
-            except Exception as exc:
-                error = exc
-        _broadcast_rank0_exception(error)
-        if rank < self.text_encoder_tp_size:
-            ids = self._distribute_encode_inputs(ids, vision_kwargs)
-            hidden = self._encode_text_hidden(ids, vision_kwargs)
-        return (
-            _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
-            _broadcast_tensor(tags, dtype=torch.long, device=self.device),
+        scope = (
+            self._encoder_non_block_prefetch_scope(rank)
+            if os.environ.get("VLLM_OMNI_H3_NONBLOCK_PREFETCH", "0") == "1"
+            else nullcontext(False)
         )
+        with scope as encoder_staged:
+            ids = tags = hidden = None
+            vision_kwargs: dict[str, torch.Tensor] = {}
+            error = None
+            if rank == 0:
+                try:
+                    if prepared is None:
+                        raise ValueError("rank 0 must prepare MiniMax H3 text inputs")
+                    if prepared.images:
+                        vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
+                        vision_kwargs.update(
+                            pixel_values=vision["pixel_values"],
+                            image_grid_thw=vision["image_grid_thw"],
+                        )
+                    if prepared.qwen_videos:
+                        vision = self.processor.video_processor(
+                            videos=[frames for frames, _ in prepared.qwen_videos],
+                            do_sample_frames=False,
+                            return_tensors="pt",
+                        )
+                        vision_kwargs.update(
+                            pixel_values_videos=vision["pixel_values_videos"],
+                            video_grid_thw=vision["video_grid_thw"],
+                        )
+                    ids, tags = build_minimax_h3_presentation(
+                        self.tokenizer,
+                        prompt=prepared.prompt,
+                        task=prepared.media.task,
+                        condition_labels=prepared.condition_labels,
+                        image_grid_thw=vision_kwargs.get("image_grid_thw"),
+                        video_grid_thw=vision_kwargs.get("video_grid_thw"),
+                        video_timestamps=prepared.video_timestamps,
+                        merge_size=int(self.processor.image_processor.merge_size),
+                    )
+                except Exception as exc:
+                    error = exc
+            _broadcast_rank0_exception(error)
+            if rank < self.text_encoder_tp_size:
+                ids = self._distribute_encode_inputs(ids, vision_kwargs)
+                if encoder_staged:
+                    hidden = self._encode_text_hidden(ids, vision_kwargs, encoder_staged=True)
+                else:
+                    hidden = self._encode_text_hidden(ids, vision_kwargs)
+            return (
+                _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
+                _broadcast_tensor(tags, dtype=torch.long, device=self.device),
+            )
 
     def _distribute_media_inputs(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaInput:
         group, rank, world_size = _dit_rank_world()

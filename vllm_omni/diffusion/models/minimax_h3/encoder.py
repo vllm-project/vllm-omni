@@ -31,6 +31,7 @@ complete ``[seq, 5120]`` hidden state.
 from __future__ import annotations
 
 import itertools
+import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -1282,6 +1283,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
 
     def prepare_packed_offload(self) -> None:
         """Build reusable host packs for the manually staged NPU encoder."""
+        if os.environ.get("VLLM_OMNI_H3_ENCODER_PACKED_OFFLOAD", "0") != "1":
+            return
         if not self.is_loaded or self.device_target.type != "npu":
             return
         if getattr(self, "_omni_non_block_stager", None) is not None:
