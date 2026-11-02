@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -14,8 +15,9 @@ import numpy as np
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.perf import PerfStats
@@ -129,6 +131,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
     core scheduling logic.
     """
 
+    waiting: RequestQueue
+    kv_holding_waiting: RequestQueue
     max_num_active_reqs: int
 
     def _update_request_with_output(
@@ -401,6 +405,60 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._prefill_admission_max_wait_s * 1000,
                 self._prefill_admission_min_running,
             )
+
+        self._generation_min_batch_size = int(extra.get("generation_min_batch_size", 1))
+        self._generation_max_wait_s = float(extra.get("generation_max_wait_ms", 0)) / 1000
+        self._generation_always_wait_target_batch = extra.get("generation_always_wait_target_batch", False)
+        self._generation_batch_deadline: float | None = None
+        if self._generation_min_batch_size < 1:
+            raise ValueError("generation_min_batch_size must be positive")
+        if not math.isfinite(self._generation_max_wait_s) or self._generation_max_wait_s < 0:
+            raise ValueError("generation_max_wait_ms must be finite and nonnegative")
+        if not isinstance(self._generation_always_wait_target_batch, bool):
+            raise ValueError("generation_always_wait_target_batch must be a boolean")
+        if self._generation_min_batch_size > 1 and self._generation_max_wait_s:
+            if any(
+                extra.get(key)
+                for key in (
+                    "ar_prefill_admission_min_batch",
+                    "ar_prefill_admission_max_wait_ms",
+                    "ar_prefill_admission_min_running",
+                )
+            ):
+                raise ValueError("generation coalescing and ar_prefill_admission_* cannot be enabled together")
+            if self._generation_min_batch_size > self.max_num_running_reqs:
+                raise ValueError("generation_min_batch_size must not exceed max_num_seqs")
+            parallel = self.vllm_config.parallel_config
+            if parallel.tensor_parallel_size != 1 or parallel.pipeline_parallel_size != 1:
+                raise ValueError("AR generation batch waiting requires TP1/PP1")
+            if extra.get("generation_coalescing_policy", "fixed") != "fixed":
+                raise ValueError("AR generation batch waiting supports only the fixed coalescing policy")
+            if self._get_coalescing_ready_request_ids() is None:
+                logger.warning("AR generation batch waiting ignored: requires input readiness support")
+                self._generation_max_wait_s = 0.0
+
+    def _should_defer_ar_generation(self, ready_ids: set[str]) -> bool:
+        """Bound batch waiting without restarting the deadline as inputs arrive."""
+        max_wait = getattr(self, "_generation_max_wait_s", 0.0)
+        target = getattr(self, "_generation_min_batch_size", 1)
+        if not max_wait or target <= 1 or self._pause_state != PauseState.UNPAUSED:
+            self._generation_batch_deadline = None
+            return False
+        if self._generation_always_wait_target_batch:
+            target = min(target, len(self.requests))
+            release = len(ready_ids) >= target
+        else:
+            release = len(ready_ids) >= target or len(self.requests) < target
+        if not ready_ids or release:
+            self._generation_batch_deadline = None
+            return False
+        now = time.monotonic()
+        if self._generation_batch_deadline is None:
+            self._generation_batch_deadline = now + max_wait
+        if now >= self._generation_batch_deadline:
+            self._generation_batch_deadline = None
+            return False
+        return True
 
     def _should_defer_waiting_admission(self) -> bool:
         min_batch = getattr(self, "_prefill_admission_min_batch", 0)
