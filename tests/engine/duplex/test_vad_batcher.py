@@ -649,6 +649,79 @@ async def test_a_failed_model_run_does_not_stop_the_batcher(variant: _Variant) -
         _assert_same_trace(trace, reference, f"session {i} after the failure")
 
 
+async def test_a_cancelled_smart_turn_job_stays_with_its_session(variant: _Variant) -> None:
+    """Shutting the executor down with ``cancel_futures=True`` (as the session manager does) cancels a
+    queued Smart Turn job: only its session degrades to ``smart_turn_error``; the session whose job was
+    already running and server_vad sessions are unaffected."""
+    entered, release = threading.Event(), threading.Event()
+    queued = threading.Event()
+    jobs: list = []
+
+    class _Recording(ThreadPoolExecutor):
+        def submit(self, fn, /, *args, **kwargs):
+            future = super().submit(fn, *args, **kwargs)
+            jobs.append(future)
+            if len(jobs) == 2:
+                queued.set()
+            return future
+
+    def slow_turn_scorer(window: np.ndarray) -> float:
+        entered.set()
+        release.wait(10)
+        return 0.9
+
+    backend = _Instrumented(variant.backend)
+    executor = _Recording(1)  # one worker: the second Smart Turn job queues behind the first
+    batcher = TurnDetectionBatcher(executor)
+    pcm = np.concatenate([_speech("complete.wav"), _silence(2.0)]).tobytes()
+
+    running, running_trace = _Session([base64.b64encode(pcm).decode("ascii")], semantic=True), _Trace()
+    running_task = asyncio.ensure_future(
+        _run_batched(
+            batcher,
+            running,
+            _detector(running, backend, variant, running_trace, turn_scorer=slow_turn_scorer),
+            running_trace,
+        )
+    )
+    while not entered.is_set():
+        await asyncio.sleep(0.002)
+    cancelled, cancelled_trace = _Session([base64.b64encode(pcm).decode("ascii")], semantic=True), _Trace()
+    cancelled_task = asyncio.ensure_future(
+        _run_batched(
+            batcher,
+            cancelled,
+            _detector(cancelled, backend, variant, cancelled_trace, turn_scorer=lambda w: 0.9),
+            cancelled_trace,
+        )
+    )
+    while not queued.is_set():
+        await asyncio.sleep(0.002)
+
+    servers = _sessions(3, semantic_every=0, seed=5)
+    references = [_reference(session, variant) for session in servers]
+    traces = [_Trace() for _ in servers]
+    server_tasks = asyncio.gather(
+        *(
+            _run_batched(batcher, s, _detector(s, backend, variant, traces[i]), traces[i], jitter_seed=i)
+            for i, s in enumerate(servers)
+        )
+    )
+    executor.shutdown(wait=False, cancel_futures=True)
+    assert jobs[1].cancelled()
+    release.set()
+    await asyncio.wait_for(asyncio.gather(running_task, cancelled_task, server_tasks), timeout=30)
+    batcher.close()
+
+    for i, (trace, reference) in enumerate(zip(traces, references)):
+        _assert_same_trace(trace, reference, f"server_vad session {i}")
+    running_segments, cancelled_segments = running_trace.segments[0], cancelled_trace.segments[0]
+    assert isinstance(running_segments, list) and isinstance(cancelled_segments, list)
+    running_results = [s.result for s in running_segments if s.result.should_commit]
+    assert [(r.commit_reason, r.turn_complete_probability) for r in running_results] == [("semantic_complete", 0.9)]
+    assert any(s.result.semantic_decision == "smart_turn_error" for s in cancelled_segments)
+
+
 async def test_close_finishes_submitted_appends_and_refuses_new_ones(variant: _Variant) -> None:
     backend = _Instrumented(variant.backend, delay_s=0.002)
     batcher, executor = _batcher()
