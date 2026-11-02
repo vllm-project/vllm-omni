@@ -258,6 +258,23 @@ class EncoderBatches:
             hook.remove()
 
 
+async def wait_for_admission(adapter: ChatterboxAdapter, requests: list[asyncio.Task]) -> None:
+    """Wait at most 30 s until every request, each its own reference, holds an admission slot.
+
+    The caller holds the encoder batch, so no request can end first: one that
+    does raises its own error here instead of leaving the wait to time out.
+    """
+
+    async def admitted() -> None:
+        while len(adapter.conditioning_pending) < len(requests):
+            if ended := [request for request in requests if request.done()]:
+                ended[0].result()
+                raise AssertionError(f"{len(ended)} of {len(requests)} requests ended before all were admitted")
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(admitted(), 30)
+
+
 def test_entry_stage_selects_chatterbox():
     assert detect_tts_model_type("chatterbox_t3", None) == "chatterbox"
 
@@ -366,9 +383,8 @@ async def test_a_whole_admission_of_references_is_encoded_together_and_cached(
     sources = [reference(seconds + 0.04 * index, seed=index) for index in range(ADMISSION)]
     try:
         requests = [asyncio.create_task(concurrent.resolve_voice(source)) for source in sources]
-        await asyncio.to_thread(batches.started.wait, 30)
-        while len(concurrent.conditioning_pending) < ADMISSION:
-            await asyncio.sleep(0.01)
+        assert await asyncio.to_thread(batches.started.wait, 30)
+        await wait_for_admission(concurrent, requests)
         batches.released.set()
         voices = await asyncio.wait_for(asyncio.gather(*requests), 120)
         encoded = list(batches.batches)
@@ -393,7 +409,7 @@ async def test_a_prompt_build_does_not_wait_behind_an_encoder_batch(adapter):
     batches = EncoderBatches(encoder(adapter), hold=True)
     try:
         reference_request = asyncio.create_task(adapter.resolve_voice(reference(6, seed=7)))
-        await asyncio.to_thread(batches.started.wait, 30)
+        assert await asyncio.to_thread(batches.started.wait, 30)
         prepared = await asyncio.wait_for(adapter.build(OpenAICreateSpeechRequest(input="hello"), [], False), 30)
         assert not reference_request.done()
         batches.released.set()
@@ -410,7 +426,7 @@ async def test_reference_singleflight_survives_waiter_cancellation(adapter):
     batches = EncoderBatches(encoder(adapter), hold=True)
     try:
         first = asyncio.create_task(adapter.resolve_voice(reference(6, seed=1)))
-        await asyncio.to_thread(batches.started.wait, 30)
+        assert await asyncio.to_thread(batches.started.wait, 30)
         second = asyncio.create_task(adapter.resolve_voice(reference(6, seed=1, mime="audio/x-wav")))
         await asyncio.sleep(0.1)
         first.cancel()
@@ -436,7 +452,7 @@ async def test_short_reference_is_repeated_and_encoded_with_its_batch(adapter):
     batches = EncoderBatches(encoder(adapter), hold=True)
     try:
         blocker = asyncio.create_task(adapter.resolve_voice(reference(6, seed=9)))
-        await asyncio.to_thread(batches.started.wait, 30)
+        assert await asyncio.to_thread(batches.started.wait, 30)
         pair = [
             asyncio.create_task(adapter.resolve_voice(reference(2, seed=2))),
             asyncio.create_task(adapter.resolve_voice(reference(6, seed=3))),
@@ -488,10 +504,9 @@ async def test_cancelled_wave_cannot_overfill_encoder_queue(
     batches = EncoderBatches(encoder(original), hold=True)
     try:
         first = [asyncio.create_task(original.resolve_voice(reference(1, seed=index))) for index in range(admission)]
-        await asyncio.to_thread(batches.started.wait, 30)
+        assert await asyncio.to_thread(batches.started.wait, 30)
         # Every first-wave request holds a slot before the wave is cancelled.
-        while len(original.conditioning_pending) < admission:
-            await asyncio.sleep(0.01)
+        await wait_for_admission(original, first)
         for request in first:
             request.cancel()
         await asyncio.gather(*first, return_exceptions=True)
@@ -518,7 +533,7 @@ async def test_shutdown_cancels_encoder_waiters(adapter):
     batches = EncoderBatches(encoder(adapter), hold=True)
     try:
         request = asyncio.create_task(adapter.resolve_voice(reference(6, seed=4)))
-        await asyncio.to_thread(batches.started.wait, 30)
+        assert await asyncio.to_thread(batches.started.wait, 30)
         adapter.shutdown()
         adapter.shutdown()
         with pytest.raises(asyncio.CancelledError):
