@@ -18,6 +18,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
+from vllm_omni.core.sched.duplex_stage_work import set_request_perf_chunk
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
@@ -647,6 +648,7 @@ def test_scheduler_chunk_gate_preserves_kv_holding_queue(build_adapter, active_s
     scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
     scheduler.deferred_waiting = set()
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.running = []
     scheduler.chunk_transfer_adapter = adapter
     scheduler.input_coordinator = None
@@ -1383,6 +1385,28 @@ def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, 
 
     snapshot.assert_not_called()
     assert adapter._pending_save_reqs.popleft()["request"] is request
+
+
+def test_save_stamps_the_producing_steps_chunk_not_a_queued_update(build_adapter, monkeypatch):
+    """Session stats (RFC #8325): a resumable stop can apply the queued chunk-B update to
+    the Talker request before chunk A's final output is saved; the payload must still name A."""
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-talker", RequestStatus.RUNNING, external_req_id="ext-talker")
+    set_request_perf_chunk(request, (0, 2))
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)),
+    )
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter.save_async(multimodal_output=None, request=request, duplex_perf_chunk=(0, 1))
+    task = adapter._pending_save_reqs.popleft()
+    assert task["duplex_perf_chunk"] == (0, 1)
+    adapter._send_single_request_for_generation(task)
+    assert connector.put.call_args.kwargs["data"].meta.duplex_perf_chunk == [0, 1]
+
+    # Without an explicit chunk the request's current one is used.
+    adapter.save_async(multimodal_output=None, request=request)
+    assert adapter._pending_save_reqs.popleft()["duplex_perf_chunk"] == (0, 2)
 
 
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):
@@ -2707,6 +2731,7 @@ def test_finish_requests_reclaims_resumable_segment_and_reuses_capacity(
 
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.chunk_transfer_adapter = adapter
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
     scheduler.requests = {request.request_id: request}
     scheduler.running = [request] if placement == "running" else []
@@ -2755,6 +2780,7 @@ def test_finish_requests_does_not_reopen_off_queue_resumable_segment(build_adapt
 
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.chunk_transfer_adapter = adapter
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
     scheduler.requests = {request.request_id: request}
     scheduler.running = []
@@ -3013,6 +3039,7 @@ def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
 
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched.chunk_transfer_adapter = adapter
+    sched._outputs_awaiting_stage_payload = {}
     sched.requests = {}
     sched.running = []
     sched.waiting = []
@@ -3029,6 +3056,7 @@ def _parked_sender_scheduler(adapter, session):
     """A minimal OmniARScheduler holding one parked streaming session."""
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
     scheduler.chunk_transfer_adapter = adapter
+    scheduler._outputs_awaiting_stage_payload = {}
     scheduler.input_coordinator = None
     scheduler.requests = {session.request_id: session}
     scheduler.running = []
