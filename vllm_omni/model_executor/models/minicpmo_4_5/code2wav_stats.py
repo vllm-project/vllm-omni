@@ -51,7 +51,9 @@ class Code2WavSolveStats:
         self._batches: Counter[tuple[str, int]] = Counter()
         self._ragged: Counter[str] = Counter()
         self._pending = 0
-        self._first_ts: float | None = None
+        # Window-local start: a global first timestamp would measure the load
+        # and graph-capture phase, not the serving window, in `duty`.
+        self._window_start: float | None = None
         self._last_ts: float | None = None
         self._window_busy = 0.0
 
@@ -64,13 +66,13 @@ class Code2WavSolveStats:
         if not self._enabled:
             return
         now = time.perf_counter()
-        if self._first_ts is None:
-            self._first_ts = now
-        elif self._last_ts is not None:
+        if self._last_ts is not None:
             # Gap between consecutive solves: the window "busy" time. It
             # overstates stage-2 work by the solve latency itself, which is
             # what makes duty a usable saturation indicator, not a profile.
             self._window_busy += now - self._last_ts
+        else:
+            self._window_start = now
         self._last_ts = now
         self._solves += 1
         self._frames[(kind, int(frames))] += 1
@@ -85,7 +87,7 @@ class Code2WavSolveStats:
         """Emit the current window and start a new one."""
         if not self._enabled or not self._pending:
             return
-        wall = (self._last_ts - self._first_ts) if self._first_ts and self._last_ts else 0.0
+        wall = (self._last_ts - self._window_start) if self._window_start and self._last_ts else 0.0
         parts = []
         for kind in sorted({key[0] for key in self._frames}):
             frames = sorted((f, n) for (k, f), n in self._frames.items() if k == kind)
@@ -111,6 +113,7 @@ class Code2WavSolveStats:
         self._batches.clear()
         self._ragged.clear()
         self._window_busy = 0.0
+        self._window_start = None
         self._last_ts = None
 
     def summary(self) -> dict[str, object]:
