@@ -232,6 +232,7 @@ async def _load_input_images(
             _validate_url_not_ssrf(inp)
             async with httpx.AsyncClient(timeout=60) as client:
                 try:
+                    # codeql[py/server-side-request-forgery]: validated above
                     resp = await client.get(inp)
                     resp.raise_for_status()
                     img = open_image(io.BytesIO(resp.content))
