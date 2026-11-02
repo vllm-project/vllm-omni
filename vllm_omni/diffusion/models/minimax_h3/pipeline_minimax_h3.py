@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
@@ -31,7 +32,7 @@ from vllm_omni.diffusion.cache.cachedit import (
 )
 from vllm_omni.diffusion.cache.teacache.hook import TeaCacheHook
 from vllm_omni.diffusion.cancellation import check_request_cancellation
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_world_group, init_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
@@ -268,13 +269,25 @@ def _resolve_minimax_h3_model_root(
     partition: str,
     *,
     load_text_encoder: bool,
+    load_transformer: bool = True,
 ) -> Path:
     path = Path(model)
     if path.is_dir():
         if path.name in {"FL2VA", "Ref2VA"}:
             return path.parent
         return path
-    if is_minimax_h3_modular(model, revision):
+    if not load_transformer:
+        # A single-file DiT supplies the transformer; only the shared encoders,
+        # VAEs and release metadata come from the base repository.
+        component_partition = "FL2VA"
+        components = ["video_vae", "audio_vae"]
+        if load_text_encoder:
+            components += ["text_encoder", "tokenizer", "processor"]
+        allow_patterns = [f"{component_partition}/model_index.json"]
+        allow_patterns += [f"{component_partition}/{component}/**" for component in components]
+        if partition in {"ref2va", "combined"}:
+            allow_patterns.append("Ref2VA/model_index.json")
+    elif is_minimax_h3_modular(model, revision):
         from vllm_omni.model_executor.models.minimax_h3.checkpoint import minimax_h3_transformer_subfolder
 
         component = minimax_h3_transformer_subfolder(model=model, revision=revision)
@@ -994,11 +1007,35 @@ class MiniMaxH3Pipeline(
             self._PROFILER_TARGETS.remove("encode_prompt")
         if not self.load_vae_encoder:
             self._PROFILER_TARGETS.remove("_encode_local_media")
-        modular = is_minimax_h3_modular(str(od_config.model), od_config.revision)
+        single_file = Path(str(od_config.model)).is_file()
+        component_model = str(od_config.model)
+        component_revision = od_config.revision
+        checkpoint_path = None
+        if single_file:
+            from .single_file import (
+                MINIMAX_H3_BASE_MODEL,
+                MINIMAX_H3_BASE_REVISION,
+                MiniMaxH3SingleFileSpec,
+            )
+
+            # Keep the snapshot filename: Hub cache files are symlinks to blobs.
+            checkpoint_path = Path(str(od_config.model)).absolute()
+            spec = MiniMaxH3SingleFileSpec.from_file(checkpoint_path)
+            od_config.set_tf_model_config(TransformerConfig.from_dict(spec.transformer_config))
+            custom_args = od_config.custom_pipeline_args or {}
+            component_model = str(custom_args.get("base_model", MINIMAX_H3_BASE_MODEL))
+            component_revision = custom_args.get("base_revision")
+            if component_revision is None and component_model == MINIMAX_H3_BASE_MODEL:
+                component_revision = MINIMAX_H3_BASE_REVISION
+        modular = not single_file and is_minimax_h3_modular(component_model, component_revision)
         self.partition = _minimax_h3_partition_for_task(
             getattr(od_config, "task_type", None),
             str(od_config.model),
         )
+        if single_file and self.partition == "combined":
+            raise ValueError(
+                "a single-file MiniMax-H3 checkpoint holds one DiT; pass --task-type t2va, fl2va or ref2va"
+            )
         control_path = getattr(od_config, "controlnet_model_path", None)
         if control_path:
             if not Path(control_path).is_file() or Path(control_path).suffix != ".safetensors":
@@ -1026,10 +1063,11 @@ class MiniMaxH3Pipeline(
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         model_root = _resolve_minimax_h3_model_root(
-            str(od_config.model),
-            od_config.revision,
+            component_model,
+            component_revision,
             self.partition,
             load_text_encoder=self.load_text_encoder,
+            load_transformer=not single_file,
         )
         if modular:
             model_path = model_root
@@ -1092,13 +1130,20 @@ class MiniMaxH3Pipeline(
             else model_path
         )
         transformer_component = self._fasth3_checkpoint.transformer_component if modular else "transformer"
+        if single_file:
+            # Both tasks use the same base encoders and VAEs. Only their release
+            # metadata and conditioning differ; the selected file supplies each DiT.
+            model_path = model_root / "FL2VA"
+            vae_model_path = model_path
+            encoder_model_path = model_path
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=str(model_path),
-                subfolder=transformer_component,
-                revision=od_config.revision,
+                model_or_path=str(checkpoint_path.parent if checkpoint_path is not None else model_path),
+                subfolder=None if single_file else transformer_component,
+                revision=None if single_file else od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=False,
+                allow_patterns_overrides=[glob.escape(checkpoint_path.name)] if checkpoint_path is not None else None,
             )
         ]
         if control_path:
@@ -1116,11 +1161,14 @@ class MiniMaxH3Pipeline(
         if ref2va_model_path is not None:
             self.weights_sources.append(
                 DiffusersPipelineLoader.ComponentSource(
-                    model_or_path=str(ref2va_model_path),
-                    subfolder="transformer",
-                    revision=od_config.revision,
+                    model_or_path=str(checkpoint_path.parent if checkpoint_path is not None else ref2va_model_path),
+                    subfolder=None if single_file else "transformer",
+                    revision=None if single_file else od_config.revision,
                     prefix="transformers_ref.",
                     fall_back_to_pt=False,
+                    allow_patterns_overrides=[glob.escape(checkpoint_path.name)]
+                    if checkpoint_path is not None
+                    else None,
                 )
             )
             self._dit_modules.append("transformers_ref")
@@ -1161,6 +1209,7 @@ class MiniMaxH3Pipeline(
             od_config,
             quant_config=transformer_quant_config,
             diffusers_weights=modular,
+            grouped_qkv_weights=not single_file,
         )
         if self._fasth3_checkpoint is not None:
             spec = self._fasth3_checkpoint
@@ -1184,6 +1233,7 @@ class MiniMaxH3Pipeline(
                 od_config,
                 quant_config=transformer_quant_config,
                 diffusers_weights=modular,
+                grouped_qkv_weights=not single_file,
             )
 
         self._vdn = VDNCheckpoint.from_od_config(od_config, self.transformer)
@@ -1212,7 +1262,7 @@ class MiniMaxH3Pipeline(
             "minimax_h3_adaln_cache_path",
             expected_partition,
             self._fasth3.source if self._fasth3 is not None else None,
-            eligible=transformer_quant_config is None and not modular and self._vdn is None,
+            eligible=transformer_quant_config is None and not modular and not single_file and self._vdn is None,
         )
         if ref2va_model_path is not None:
             self._configure_adaln_sidecar(
@@ -1220,7 +1270,7 @@ class MiniMaxH3Pipeline(
                 "minimax_h3_ref_adaln_cache_path",
                 "ref2va",
                 None,
-                eligible=transformer_quant_config is None and not modular,
+                eligible=transformer_quant_config is None and not modular and not single_file,
             )
 
         if self.load_text_encoder:
@@ -1269,7 +1319,7 @@ class MiniMaxH3Pipeline(
                     DiffusersPipelineLoader.ComponentSource(
                         model_or_path=str(encoder_model_path),
                         subfolder="text_encoder",
-                        revision=od_config.revision,
+                        revision=component_revision,
                         prefix="text_encoder.",
                         fall_back_to_pt=False,
                     )
@@ -1352,6 +1402,17 @@ class MiniMaxH3Pipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=(od_config.enable_diffusion_pipeline_profiler)
         )
+
+    def remap_checkpoint_key(self, name: str) -> str | None:
+        """Expose curve keys to loader-owned host-weight binding plans."""
+        prefix, _, key = name.partition(".")
+        transformer = getattr(self, prefix, None)
+        if isinstance(transformer, MiniMaxH3DiTModel) and transformer.arch.adaln_curve_grid is not None:
+            if key == "adaln_t_table":
+                return f"{prefix}.time_embedder.table"
+            if key in {"adaln_basis", "adaln_mean"}:
+                return None
+        return name
 
     def load_weights(
         self,

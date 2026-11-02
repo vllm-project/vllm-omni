@@ -29,6 +29,14 @@ class DirectMmapAdapter(Protocol):
     ) -> DirectMmapTensorPolicy | None: ...
 
 
+def _restore_h3_fp32(
+    weight: torch.Tensor, *, transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+) -> torch.Tensor:
+    if transform is not None:
+        weight = transform(weight)
+    return weight.float()
+
+
 class _MiniMaxH3DirectMmapAdapter:
     """TP1 runtime-layout contract already enforced by MiniMax-H3's loader."""
 
@@ -40,14 +48,10 @@ class _MiniMaxH3DirectMmapAdapter:
         runtime_name: str,
         target: torch.Tensor,
     ) -> DirectMmapTensorPolicy:
-        del target
         transform = None
         suffix = ".qkv_proj.weight"
         if runtime_name.endswith(suffix):
-            from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
-                MiniMaxH3Attention,
-                _reorder_grouped_qkv_to_qkv,
-            )
+            from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
 
             attention_path = runtime_name[: -len(suffix)]
             attention = self.pipeline.get_submodule(attention_path)
@@ -56,12 +60,24 @@ class _MiniMaxH3DirectMmapAdapter:
                     f"MiniMax-H3 direct-mmap adapter expected attention at {attention_path!r}, "
                     f"got {type(attention).__name__}"
                 )
-            transform = partial(
-                _reorder_grouped_qkv_to_qkv,
-                num_query_groups=attention.total_num_heads,
-                heads_per_group=1,
-                head_dim=attention.head_dim,
-            )
+            model_path = runtime_name.split(".", 1)[0]
+            model = self.pipeline.get_submodule(model_path)
+            if getattr(model, "_grouped_qkv_weights", True):
+                from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+                    _reorder_grouped_qkv_to_qkv,
+                )
+
+                transform = partial(
+                    _reorder_grouped_qkv_to_qkv,
+                    num_query_groups=attention.total_num_heads,
+                    heads_per_group=1,
+                    head_dim=attention.head_dim,
+                )
+        if target.dtype == torch.float32:
+            # Native loading copies stored BF16 tensors into H3's FP32 heads,
+            # norms and compressed curve projections. Prove the same conversion
+            # for consumers that bypass the ordinary weight loader.
+            transform = partial(_restore_h3_fp32, transform=transform)
         return DirectMmapTensorPolicy(
             allow_custom_loader=True,
             transform=transform,

@@ -1638,7 +1638,14 @@ class OmniDiffusionConfig:
             self.diffusion_load_format = "default"
             self.model_class_name = native_single_file_model
             self.diffusers_pipeline_cls = None
-            self.set_tf_model_config(TransformerConfig())
+            if native_single_file_model == "MiniMaxH3Pipeline":
+                from vllm_omni.diffusion.models.minimax_h3.single_file import MiniMaxH3SingleFileSpec
+
+                spec = MiniMaxH3SingleFileSpec.from_file(self.model)
+                self.set_tf_model_config(TransformerConfig.from_dict(spec.transformer_config))
+                self.update_multimodal_support()
+            else:
+                self.set_tf_model_config(TransformerConfig())
             return
 
         try:

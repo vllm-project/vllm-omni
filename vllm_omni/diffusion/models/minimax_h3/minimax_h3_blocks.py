@@ -110,6 +110,7 @@ class MiniMaxH3DiTArchConfig:
     timestep_input_dim: int = 256
     time_embed_hidden_size: int = 5376
     time_embed_dim: int = 2688
+    adaln_curve_grid: int | None = None
     adaln_out_features: int = 18 * 5376
     final_adaln_out_features: int = 2 * 5376
     rope_inv_freq_len: int = 16
@@ -590,6 +591,9 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
+        # Compressed ComfyUI-layout checkpoints store the activated time
+        # embedding as curve coordinates and project them in FP32 (no SiLU).
+        self._use_adaln_curve = arch.adaln_curve_grid is not None
         # Allocate host weights from the start: moving them after construction
         # would still require enough VRAM for the complete resident model.
         with torch.device("cpu") if self._offload_weights else nullcontext():
@@ -598,8 +602,8 @@ class MiniMaxH3AdalnProj(nn.Module):
                 out_features,
                 bias=True,
                 gather_output=True,
-                params_dtype=_BF16_DTYPE,
-                quant_config=quant_config,
+                params_dtype=_FP32_DTYPE if self._use_adaln_curve else _BF16_DTYPE,
+                quant_config=None if self._use_adaln_curve else quant_config,
                 prefix=f"{prefix}.linear",
             )
 
@@ -651,12 +655,15 @@ class MiniMaxH3AdalnProj(nn.Module):
         self._prepare_weight_stager(t_emb.device)
 
         def project() -> torch.Tensor:
-            x = nn.functional.silu(t_emb)
+            if self._use_adaln_curve:
+                x = t_emb.to(_FP32_DTYPE)
+            else:
+                x = nn.functional.silu(t_emb).to(_BF16_DTYPE)
             if self._weight_stager is None:
-                return self.linear(x.to(_BF16_DTYPE))[0]
+                return self.linear(x)[0]
             self._weight_stager.load()
             try:
-                return self.linear(x.to(_BF16_DTYPE))[0]
+                return self.linear(x)[0]
             finally:
                 self._weight_stager.offload()
 
