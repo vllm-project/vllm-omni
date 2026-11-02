@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 
@@ -10,7 +11,8 @@ from enum import Enum
 # Today this is the logical FLASH_ATTN selector, which resolves to a native
 # paged backend per platform (CUDA FlashAttention/FA3, Ascend FIA). Other
 # diffusion backends have no paged path and would have to fall back to dense
-# attention, which a paged request must never do silently.
+# attention, which a paged request must never do silently. Keep this set in
+# sync with the backends that advertise ``supports_paged_kv``.
 PAGED_KV_ATTENTION_BACKENDS = frozenset({"FLASH_ATTN"})
 
 # Whether an omitted ``diffusion_kv_mode`` may select paged execution. The
@@ -24,10 +26,6 @@ PAGED_KV_IMPLICIT_DEFAULT_ENABLED = False
 # ``diffusion_kv_mode`` given) selection stays on the dense path.
 REASON_IMPLICIT_DISABLED = "paged KV is not the default yet (pending parity evidence)"
 REASON_MODEL_NOT_PAGED = "model has no paged KV integration"
-REASON_STEP_EXECUTION = "step_execution is not implemented on the paged path"
-REASON_OFFLOAD = "offload is not validated with paged KV"
-REASON_LEGACY_IMPORT = "imported AR KV is not connector-aware yet"
-REASON_ATTENTION_BACKEND = "attention backend does not advertise paged KV"
 REASON_ROW_CAPACITY = "no BlockTable row capacity is known for the request"
 
 
@@ -116,12 +114,66 @@ class DiffusionKVResolution:
         return self.mode is DiffusionKVCacheMode.PAGED_SCHEDULER
 
 
+def _parallel_layout_field(parallel_config: object, name: str, default: object) -> object:
+    """Read one parallel-layout field from a mapping or a config object."""
+
+    if parallel_config is None:
+        return default
+    if isinstance(parallel_config, Mapping):
+        value = parallel_config.get(name, default)
+    else:
+        value = getattr(parallel_config, name, default)
+    return default if value is None else value
+
+
+def _parallel_degree(parallel_config: object, name: str) -> int:
+    """Return a parallel degree, tolerating an unnormalized config value."""
+
+    value = _parallel_layout_field(parallel_config, name, 1)
+    if isinstance(value, int):
+        # ``bool`` is an ``int``, and both are valid for these fields.
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 1
+    return 1
+
+
+def _sequence_parallel_incompatibility(parallel_config: object) -> str | None:
+    """Return why the sequence-parallel layout cannot serve paged KV.
+
+    These are the layouts the paged attention adapter rejects when the first
+    layer is registered (Ring, AllGather-KV, non-strict Ulysses). Checking them
+    from the parallel configuration keeps an incompatible topology from
+    resolving to paged and failing later, at model build.
+    """
+
+    if _parallel_degree(parallel_config, "ring_degree") > 1:
+        return (
+            "paged_scheduler does not support Ring sequence parallelism; "
+            "use strict Ulysses or disable sequence parallelism"
+        )
+    if _parallel_degree(parallel_config, "allgather_degree") > 1:
+        return (
+            "paged_scheduler does not support AllGather-KV sequence parallelism; "
+            "use strict Ulysses or disable sequence parallelism"
+        )
+    ulysses_degree = _parallel_degree(parallel_config, "ulysses_degree")
+    ulysses_mode = str(_parallel_layout_field(parallel_config, "ulysses_mode", "strict"))
+    if ulysses_degree > 1 and ulysses_mode != "strict":
+        return f"paged_scheduler supports only strict Ulysses sequence parallelism; got ulysses_mode={ulysses_mode!r}"
+    return None
+
+
 def _paged_incompatibility(
     *,
     step_execution: bool,
     offload_enabled: bool,
     legacy_imported_kv: bool,
     attention_backend: object,
+    parallel_config: object,
 ) -> str | None:
     """Return why paged execution cannot run, or ``None`` when it can."""
 
@@ -146,20 +198,22 @@ def _paged_incompatibility(
             f"({', '.join(sorted(PAGED_KV_ATTENTION_BACKENDS))}); "
             f"got {normalize_attention_backend(attention_backend)!r}"
         )
-    return None
+    return _sequence_parallel_incompatibility(parallel_config)
 
 
 def resolve_diffusion_kv_cache_mode(
     mode: object,
     *,
-    model_supports_paged_kv: bool = False,
+    model_paged_kv_default_eligible: bool = False,
     max_rows_per_request: int | None = None,
     model_default_max_rows: int | None = None,
     step_execution: bool = False,
     offload_enabled: bool = False,
     legacy_imported_kv: bool = False,
     attention_backend: object = None,
-    allow_implicit_paged: bool = PAGED_KV_IMPLICIT_DEFAULT_ENABLED,
+    parallel_config: object = None,
+    paged_only_features: tuple[str, ...] = (),
+    allow_implicit_paged: bool | None = None,
 ) -> DiffusionKVResolution:
     """Resolve the diffusion KV ownership mode.
 
@@ -167,15 +221,27 @@ def resolve_diffusion_kv_cache_mode(
     explicit ``paged_scheduler`` selection is validated strictly: an
     incompatible combination raises instead of silently degrading. When no mode
     is given, paged execution is selected only when implicit paged execution is
-    enabled, the model declares support, and the runtime configuration can
-    actually run it; every other case stays on the dense path and reports why.
+    enabled, the model is eligible to default to it, and the runtime
+    configuration can actually run it; every other case stays on the dense path
+    and reports why.
+
+    ``paged_only_features`` names the enabled features that only run on the
+    paged path (prefix caching, native KV transfer). They do not select paged
+    execution by themselves, but an incompatible combination is reported here
+    instead of after the caller has already failed a mode-dependent check on
+    the dense path.
+
+    ``attention_backend`` must be the backend the paged self-attention role
+    resolves to, not the raw ``default`` entry: a ``per_role`` override wins in
+    the attention layer. ``parallel_config`` may be a mapping or the resolved
+    parallel config object; it is read for the sequence-parallel layout.
 
     An explicit ``paged_scheduler`` selection is deliberately **not** gated on
-    ``model_supports_paged_kv``: the capability registry only decides the
-    implicit default, while an explicit selection is validated against runtime
-    compatibility. That keeps a paged integration usable while its metadata is
-    still being added, and an unsupported model still fails at model build when
-    it has no paged attention path.
+    ``model_paged_kv_default_eligible``: the capability registry only decides
+    the implicit default, while an explicit selection is validated against
+    runtime compatibility. That keeps a paged integration usable while its
+    metadata is still being added, and an unsupported model still fails at
+    model build when it has no paged attention path.
     """
 
     parsed = parse_diffusion_kv_cache_mode(mode)
@@ -193,6 +259,7 @@ def resolve_diffusion_kv_cache_mode(
             offload_enabled=offload_enabled,
             legacy_imported_kv=legacy_imported_kv,
             attention_backend=attention_backend,
+            parallel_config=parallel_config,
         )
         if incompatibility is not None:
             raise ValueError(incompatibility)
@@ -206,24 +273,35 @@ def resolve_diffusion_kv_cache_mode(
         )
 
     # No mode requested: resolve from capability and compatibility.
-    if not model_supports_paged_kv:
+    incompatibility = _paged_incompatibility(
+        step_execution=step_execution,
+        offload_enabled=offload_enabled,
+        legacy_imported_kv=legacy_imported_kv,
+        attention_backend=attention_backend,
+        parallel_config=parallel_config,
+    )
+    if paged_only_features and incompatibility is not None:
+        # These features only run on the paged path, so report the real reason
+        # up front instead of letting the configuration fall back to dense and
+        # fail a less specific mode-dependent check afterwards.
+        raise ValueError(f"{' and '.join(paged_only_features)} requires paged Diffusion KV, but {incompatibility}")
+    if not model_paged_kv_default_eligible:
         return DiffusionKVResolution(
             mode=DiffusionKVCacheMode.DENSE_LEGACY,
             max_rows_per_request=max_rows_per_request,
             reason=REASON_MODEL_NOT_PAGED,
         )
+    if allow_implicit_paged is None:
+        # Read at call time so a deployment can flip the gate without having to
+        # rebuild the callers, and so tests can exercise the enabled path
+        # through the real config classes.
+        allow_implicit_paged = PAGED_KV_IMPLICIT_DEFAULT_ENABLED
     if not allow_implicit_paged:
         return DiffusionKVResolution(
             mode=DiffusionKVCacheMode.DENSE_LEGACY,
             max_rows_per_request=max_rows_per_request,
             reason=REASON_IMPLICIT_DISABLED,
         )
-    incompatibility = _paged_incompatibility(
-        step_execution=step_execution,
-        offload_enabled=offload_enabled,
-        legacy_imported_kv=legacy_imported_kv,
-        attention_backend=attention_backend,
-    )
     if incompatibility is not None:
         return DiffusionKVResolution(
             mode=DiffusionKVCacheMode.DENSE_LEGACY,

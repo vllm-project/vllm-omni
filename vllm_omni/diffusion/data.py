@@ -1305,17 +1305,25 @@ class OmniDiffusionConfig:
         # Resolve the KV ownership mode before any mode-dependent validation so
         # an omitted diffusion_kv_mode can select paged execution, and so both
         # config classes validate the effective mode rather than the raw input.
+        #
+        # The metadata lookup uses the resolved pipeline class name. This class
+        # is authoritative here because the stage payload always carries it: the
+        # deploy projection resolves ``model_class_name`` from ``model_arch``
+        # before the stage config is serialized, so this is not the later
+        # ``enrich_config`` discovery.
         requested_kv_mode = self.diffusion_kv_mode
         metadata = get_diffusion_model_metadata(self.model_class_name)
         kv_resolution = resolve_diffusion_kv_cache_mode(
             requested_kv_mode,
-            model_supports_paged_kv=metadata.supports_paged_kv,
+            model_paged_kv_default_eligible=metadata.paged_kv_default_eligible,
             max_rows_per_request=self.diffusion_kv_max_rows_per_request,
             model_default_max_rows=metadata.paged_kv_max_rows_per_request,
             step_execution=bool(self.step_execution),
             offload_enabled=self._has_diffusion_offload_enabled(),
             legacy_imported_kv=bool(self.omni_kv_config.get("need_recv_cache", False)),
-            attention_backend=self._explicit_attention_backend(),
+            attention_backend=self._paged_attention_backend(),
+            parallel_config=self.parallel_config,
+            paged_only_features=self._paged_only_features(),
         )
         self.diffusion_kv_mode = kv_resolution.mode
         self.diffusion_kv_max_rows_per_request = kv_resolution.max_rows_per_request
@@ -1328,7 +1336,7 @@ class OmniDiffusionConfig:
             )
         elif (
             requested_kv_mode is None
-            and metadata.supports_paged_kv
+            and metadata.paged_kv_default_eligible
             and kv_resolution.reason != REASON_IMPLICIT_DISABLED
         ):
             # Once the implicit default is enabled, an incompatible stage would
@@ -1557,26 +1565,32 @@ class OmniDiffusionConfig:
             or self.diffusion_offload_config
         )
 
-    def _explicit_attention_backend(self) -> str | None:
-        """Return the explicitly selected diffusion attention backend, if any.
+    def _paged_only_features(self) -> tuple[str, ...]:
+        """Return the enabled features that only run on the paged KV path."""
 
-        Only the global default role is considered: it carries the dense and
-        paged attention dispatch for the pipeline's self-attention layers. A
-        backend without a paged implementation cannot serve a paged request, so
-        an implicit resolution stays on the dense path for it.
+        features = []
+        if self.enable_prefix_caching:
+            features.append("enable_prefix_caching")
+        if self.kv_transfer_config is not None:
+            features.append("kv_transfer_config")
+        return tuple(features)
+
+    def _paged_attention_backend(self) -> str | None:
+        """Return the attention backend the paged self-attention role resolves to.
+
+        Paged KV is a self-attention feature (cross attention rejects a paged
+        cache role), and the attention layer resolves a role through
+        ``per_role[role]`` -> ``per_role[role_category]`` -> ``default``. Reading
+        only ``default`` would miss a ``per_role`` override that selects a
+        backend without a paged implementation.
+
+        Both config classes normalize ``diffusion_attention_config`` before
+        resolving the KV mode, so the effective backend (including the
+        ``DIFFUSION_ATTENTION_BACKEND`` fallback) is readable here.
         """
 
-        # Both config classes normalize ``diffusion_attention_config`` before
-        # resolving the KV mode, so the effective backend (including the
-        # DIFFUSION_ATTENTION_BACKEND fallback) is readable here.
-        default_spec = getattr(self.diffusion_attention_config, "default", None)
-        backend = getattr(default_spec, "backend", None)
-        if backend is None:
-            return None
-        if isinstance(backend, str):
-            return backend
-        # Accept the enum form (``DiffusionAttentionBackendEnum.FLASH_ATTN``).
-        return getattr(backend, "name", None)
+        spec, _source = self.diffusion_attention_config.resolve_with_source(role="self", role_category="self")
+        return None if spec is None else spec.backend
 
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
         if tf_config.quant_config is None:

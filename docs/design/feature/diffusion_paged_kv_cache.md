@@ -312,6 +312,20 @@ and a prepared memory-profile request. The main fields are:
 | `gpu_memory_utilization` | Automatic pool sizing when no byte budget is supplied |
 | `diffusion_attention_backend` | Must resolve to `FLASH_ATTN` for the current paged implementation |
 
+Both diffusion config classes (`OmniDiffusionConfig` and the deploy
+`_DiffusionConfigProjection`) share one resolver and one compatibility check, so
+a stage cannot serialize a mode the runtime would reject. An explicit
+`paged_scheduler` is validated strictly and fails at config time instead of
+degrading; an omitted `diffusion_kv_mode` resolves from the model integration's
+`paged_kv_default_eligible` metadata, and the implicit default stays behind
+`PAGED_KV_IMPLICIT_DEFAULT_ENABLED` until the RFC's parity evidence is attached.
+The compatibility check covers step execution, weight offload, imported AR KV,
+the backend the paged self-attention role resolves to, and the sequence-parallel
+layout. Row capacity is inherited from the model integration
+(`paged_kv_max_rows_per_request`) when a deployment does not set it, and the
+deploy projection leaves it unset so the runtime resolves it rather than
+freezing it into the serialized stage config.
+
 The user guide contains the stage YAML and `vllm serve --omni` example.
 Use request execution for the current Hunyuan integration; the unsupported
 batching and step modes are summarized in [Execution Modes](#execution-modes).
