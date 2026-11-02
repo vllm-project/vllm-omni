@@ -1335,8 +1335,10 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     ) -> SamplerOutput:
         """Generate current-step codec rows after LM token sampling.
 
-        V1 uses stable integer batch rows. MRv2 supplies one request id per
-        logits row so audio history survives compaction and row reuse.
+        V1 uses stable integer batch rows. MRV2 supplies one request id per
+        logits row so audio history survives compaction and row reuse. Both
+        callers finish LM token sampling on their own; audio-code sampling and
+        per-request state progression stay shared.
         """
         self._last_logits_hidden = None
         if hidden is None:

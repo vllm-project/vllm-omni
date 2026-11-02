@@ -21,6 +21,7 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 
 import pytest
+from vllm.platforms import current_platform
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
@@ -37,6 +38,10 @@ SERVER_ARGS = ["--trust-remote-code", "--disable-log-stats"]
 # test driver; the engine subprocesses inherit through env_dict).
 SERVER_ENV = {"VLLM_USE_DEEP_GEMM": "0", "VLLM_MOE_USE_DEEP_GEMM": "0"}
 
+# The mrv2 opt-in profile runs the talker on model_runner v2 with the codec
+# stage on v1. Under v2 the talker delegates LM token sampling to the native
+# staged sampler, so penalties and logprobs stay in the request surface —
+# unlike Higgs v3, whose owned sampler narrows it.
 TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
@@ -46,7 +51,17 @@ TEST_PARAMS = [
             env_dict=SERVER_ENV,
         ),
         id="higgs_audio_v2_plain_text",
-    )
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("higgs_audio_v2_mrv2.yaml"),
+            server_args=SERVER_ARGS,
+            env_dict=SERVER_ENV,
+        ),
+        id="higgs_audio_v2_mrv2",
+        marks=pytest.mark.skipif(not current_platform.is_cuda(), reason="MRV2 validation is CUDA-only"),
+    ),
 ]
 
 DEFAULT_SPEECH_TIMEOUT_S = 180.0

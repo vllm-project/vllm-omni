@@ -11,6 +11,9 @@
 # WAV/PCM streaming convention in serving_speech.py. To run a strictly
 # non-streaming smoke test, set ``codec_streaming: false`` in the connector
 # extras below.
+#
+# This profile runs both stages on v1. For the MRV2 opt-in (talker on
+# model_runner v2, codec stage on v1), use higgs_audio_v2_mrv2.yaml.
 async_chunk: false
 
 connectors:
