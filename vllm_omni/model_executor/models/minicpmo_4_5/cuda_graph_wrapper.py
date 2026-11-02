@@ -1208,6 +1208,49 @@ def _materialize_att_rows(rows: list) -> list[torch.Tensor]:
     return [row.materialize() if isinstance(row, ResidentAttCache) else row for row in rows]
 
 
+def _pack_att_cache(att: object) -> object:
+    """``(depth, 2, N, H, T, D)`` split K/V pairs -> upstream ``(depth, N, H, T, 2D)``.
+
+    The fused/ragged bodies keep K and V in a leading ``2`` so a layer slice is
+    one contiguous pair; upstream ``blocks_forward_chunk`` (and the NPU attention
+    patch) instead expects the ``[K | V]`` packed slice per layer. ``None`` and
+    the ``[None] * depth`` placeholder of a cold start pass through untouched;
+    every other shape is a layout mismatch and fails loudly here instead of
+    reaching the upstream ``cat`` and failing there.
+    """
+    if att is None:
+        return None
+    if isinstance(att, (list, tuple)):
+        if all(row is None for row in att):
+            return att
+        raise TypeError(
+            "_pack_att_cache expects one split K/V tensor per step or a list of "
+            f"None placeholders, got a {type(att).__name__} of "
+            f"{type(att[0]).__name__ if len(att) else 'nothing'}"
+        )
+    if not isinstance(att, torch.Tensor):
+        raise TypeError(f"_pack_att_cache expects a tensor or None, got {type(att).__name__}")
+    if att.ndim != 6:
+        raise ValueError(
+            "_pack_att_cache expects a (depth, 2, batch, heads, frames, head_dim) "
+            f"split K/V cache, got shape {tuple(att.shape)}"
+        )
+    return torch.cat((att[:, 0], att[:, 1]), dim=-1)
+
+
+def _packed_att_buffer(att: torch.Tensor) -> torch.Tensor:
+    """Empty upstream-layout cache buffer with the frames of a split buffer."""
+    depth, _, batch, heads, frames, head_dim = att.shape
+    return att.new_empty((depth, batch, heads, frames, 2 * head_dim))
+
+
+def _unpack_att_cache(packed: torch.Tensor, att: torch.Tensor) -> None:
+    """Copy an upstream ``[K | V]`` cache back into the split K/V buffer."""
+    width = int(packed.shape[-1]) // 2
+    att[:, 0].copy_(packed[..., :width])
+    att[:, 1].copy_(packed[..., width:])
+
+
 class _WholeEulerStatics(NamedTuple):
     """A Whole-Euler graph's static inputs (``lengths`` only with a ragged body)."""
 
