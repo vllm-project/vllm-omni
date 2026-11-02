@@ -25,6 +25,9 @@ class VoxCPM2Adapter(ARTTSAdapter):
     stage_keys = frozenset({"latent_generator"})
     model_archs = frozenset({"VoxCPM2TalkerForConditionalGeneration"})
     name = "voxcpm2"
+    # Stage-0 logits are a stop head; audio latents come from a diffusion
+    # sampler, so SamplingParams.temperature has no effect.
+    supports_temperature = False
     # The talker architecture is authoritative and is tested ahead of every
     # stage key, so a VoxCPM2 talker deployed under a stage key another model
     # claims still resolves to VoxCPM2.
