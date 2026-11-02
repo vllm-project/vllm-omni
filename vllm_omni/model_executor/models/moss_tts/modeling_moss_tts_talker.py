@@ -28,6 +28,7 @@ from vllm_omni.model_executor.models.moss_tts.configuration_moss_tts import (
     MossTTSLocalConfig,
     MossTTSRealtimeConfig,
 )
+from vllm_omni.model_executor.models.moss_tts.fused_codec import build_fused_codec, fused_codec_enabled
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local import (
     MossTTSRealtimeLocalTransformer,
     _normalize_generators,
@@ -1385,6 +1386,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             ("audio_codes", "accumulated"),
             ("hidden_states", "last"),
         }
+        # Its separate checkpoint and dtype stay outside the talker's module tree.
+        self.__dict__["fused_codec"] = None
+        if fused_codec_enabled(vllm_config):
+            self.mm_outputs_fresh_per_step = True
 
     # ------------------------------------------------------------------
     # vLLM hooks
@@ -1880,9 +1885,12 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         # First audio is part of the MRV2 streaming slot-state path. Load it
         # here so its weights and graphs count toward model memory profiling.
         model_config = self.vllm_config.model_config
+        if fused_codec_enabled(self.vllm_config):
+            self.__dict__["fused_codec"] = build_fused_codec(self.vllm_config)
         if (
             model_config.use_v2_model_runner
             and model_config.async_chunk
+            and self.fused_codec is None
             and supports_in_process_first_audio(self.vllm_config)
         ):
             from .first_frame_decoder import MossFirstFrameDecoder

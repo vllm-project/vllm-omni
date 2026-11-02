@@ -138,6 +138,37 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
     ),
 )
 
+# Single-stage MOSS-TTS-Local: the talker decodes its codec chunks in process
+# and emits PCM as the final output. No codec stage, no connector. Selected by
+# ``pipeline: moss_tts_local_fused`` (moss_tts_local_fused.yaml).
+MOSS_TTS_LOCAL_FUSED_PIPELINE = PipelineConfig(
+    model_type="moss_tts_local_fused",
+    default_deploy_config_name="moss_tts_local_fused.yaml",
+    single_stage_async_chunk=True,
+    model_arch="MossTTSLocalModel",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            scheduler_cls="vllm_omni.model_executor.models.moss_tts.fused_scheduler.MossFusedScheduler",
+            model_stage="moss_tts_local",
+            supports_native_mrv2_data_plane=True,
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            final_output=True,
+            final_output_type="audio",
+            # The API output processor tags ``model_outputs`` by this modality.
+            engine_output_type="audio",
+            # Codec stream state lives in request slots of this stage.
+            supports_running_prefix_cache_reset=False,
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [151645],
+            },
+        ),
+    ),
+)
+
 # The pipeline config is otherwise the same for all variants; the per-variant
 # differences (n_vq, backbone size, generation strategy) are encoded in the
 # HF config.json and the deploy YAML. Realtime and Local are split out because
@@ -146,6 +177,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
 
 
 __all__ = [
+    "MOSS_TTS_LOCAL_FUSED_PIPELINE",
     "MOSS_TTS_PIPELINE",
     "MOSS_TTS_REALTIME_PIPELINE",
     "MOSS_TTS_LOCAL_PIPELINE",

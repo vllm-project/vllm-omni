@@ -1,0 +1,52 @@
+# Single-stage MOSS-TTS-Local-Transformer-v1.5 on one CUDA GPU.
+# The talker and streaming codec share one process, without a connector or MPS.
+# This profile needs room for a 32 GiB KV cache, codec weights, state and graphs.
+pipeline: moss_tts_local_fused
+model_runner: v2
+async_chunk: true
+
+speech_cache:
+  resolve_max_bytes: 2147483648  # 2 GiB
+  resolve_max_entries: 2048
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.60
+    enable_prefix_caching: true
+    async_scheduling: true
+    # Bound prefill work so new prompts do not monopolize streaming decode.
+    max_num_batched_tokens: 512
+    max_model_len: 4096
+    devices: "0"
+    kv_cache_memory_bytes: 34359738368  # 32 GiB
+    hf_overrides:
+      mrv2_batch_prefill: true
+      mrv2_direct_tokens: true
+      # Completing prefills join the step's single post-forward MTP batch.
+      mrv2_eager_mtp: true
+      codec_attention_backend: triton_slot
+    attention_config:
+      backend: TRITON_ATTN
+    compilation_config:
+      mode: 0
+      cudagraph_mode: FULL
+      max_cudagraph_capture_size: 512
+      cudagraph_num_of_warmups: 1
+    additional_config:
+      moss_fused_codec:
+        initial_codec_chunk_frames: 1   # 80 ms first audio chunk
+        codec_chunk_ramp_frames: [3, 7] # Bridge the first chunk to steady decoding
+        codec_chunk_frames: 15          # 1.2 s steady chunks
+        fused_decode_packed_interval: 2
+        # The first frame shares the packed decoder and goes ahead of step output.
+        fused_early_first_audio: 1
+        fused_decode_last_wait_steps: 1
+        fused_codec_precise_deps: 1
+    default_sampling_params:
+      temperature: 1.7
+      top_p: 0.8
+      top_k: 25
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0
