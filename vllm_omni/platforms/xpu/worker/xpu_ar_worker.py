@@ -16,10 +16,12 @@ class XPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase, XPUWorker):
 
     model_runner_cls = XPUARModelRunner
 
-    def init_device(self):
-        super().init_device()
+    def _make_model_runner(self):
+        # Built once here, from XPUWorker's init_device: model_config's
+        # use_v2_model_runner (deploy ``model_runner``) picks the omni runner.
         if self.use_v2_model_runner:
-            # OMNI: v2 model runner does not yet include omni hooks.
-            logger.warning("OMNI XPUARWorker forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
-        self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
+            from vllm_omni.platforms.xpu.worker.xpu_omni_v2_model_runner import XPUOmniARModelRunner
+
+            logger.info("Using MR v2 XPUOmniARModelRunner for omni AR stage.")
+            return XPUOmniARModelRunner(self.vllm_config, self.device)
+        return self.model_runner_cls(self.vllm_config, self.device)

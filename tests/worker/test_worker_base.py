@@ -611,3 +611,34 @@ def test_xpu_workers_reuse_omni_gpu_worker_base(module_name, class_name):
     assert mro.index(OmniGPUWorkerBase) < mro.index(module.XPUWorker)
     for method in ("_maybe_get_memory_pool_context", "sleep", "wake_up", "handle_sleep_task", "handle_wake_task"):
         assert getattr(worker_cls, method) is getattr(OmniGPUWorkerBase, method)
+
+
+@pytest.mark.parametrize(
+    "module_name, class_name, v2_runner",
+    [
+        ("vllm_omni.platforms.xpu.worker.xpu_ar_worker", "XPUARWorker", "XPUOmniARModelRunner"),
+        ("vllm_omni.platforms.xpu.worker.xpu_generation_worker", "XPUGenerationWorker", "XPUOmniGenerationModelRunner"),
+    ],
+)
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_xpu_workers_build_only_the_selected_runner(monkeypatch, module_name, class_name, v2_runner, use_v2):
+    module = pytest.importorskip(module_name)
+    worker_cls = getattr(module, class_name)
+    built = []
+
+    def fake_runner(name):
+        def build(vllm_config, device):
+            built.append((name, vllm_config, device))
+            return name
+
+        return build
+
+    monkeypatch.setattr(worker_cls, "model_runner_cls", staticmethod(fake_runner("v1")))
+    v2_module = pytest.importorskip("vllm_omni.platforms.xpu.worker.xpu_omni_v2_model_runner")
+    monkeypatch.setattr(v2_module, v2_runner, fake_runner("v2"))
+    worker = worker_cls.__new__(worker_cls)
+    worker.use_v2_model_runner = use_v2
+    worker.vllm_config, worker.device = object(), "xpu:0"
+
+    assert worker._make_model_runner() == ("v2" if use_v2 else "v1")
+    assert built == [("v2" if use_v2 else "v1", worker.vllm_config, worker.device)]
