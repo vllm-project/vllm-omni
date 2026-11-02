@@ -3,6 +3,8 @@
 """AR execution coalescing uses a bounded gate, separate from admission."""
 
 import pytest
+from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
@@ -10,14 +12,16 @@ from vllm.v1.request import RequestStatus
 
 from tests.core.sched.test_generation_scheduler_atomic_chunk import FakeAdapter, _make_request
 from tests.core.sched.test_generation_scheduler_init import _config
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler, VLLMScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler, VLLMScheduler
 from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
+from vllm_omni.outputs import OmniConnectorOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def scheduler(*, native=False, extras=None, population=4):
-    s = OmniARScheduler.__new__(OmniARScheduler)
+def scheduler(*, native=False, extras=None, population=4, async_scheduling=False):
+    scheduler_cls = OmniARAsyncScheduler if async_scheduling else OmniARScheduler
+    s = scheduler_cls.__new__(scheduler_cls)
     s.vllm_config = _config(native=native, extras=extras)
     s.max_num_running_reqs = 128
     s._native_data_plane = native
@@ -186,3 +190,199 @@ def test_schedule_restores_budget_on_upstream_exception(monkeypatch):
     with pytest.raises(RuntimeError, match="allocation failed"):
         s.schedule()
     assert s.max_num_scheduled_tokens == 128
+
+
+@pytest.mark.parametrize("tp,pp", [(2, 1), (1, 2)])
+def test_rejects_unsupported_topology(tp, pp):
+    s = scheduler()
+    s.vllm_config.parallel_config.tensor_parallel_size = tp
+    s.vllm_config.parallel_config.pipeline_parallel_size = pp
+    s.vllm_config.additional_config = knobs()
+    with pytest.raises(ValueError, match="TP1/PP1"):
+        s._init_prefill_admission_policy()
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_unsupported_input_source_disables_waiting(native):
+    s = scheduler(native=native)
+    s.vllm_config.additional_config = knobs()
+    s.chunk_transfer_adapter = None
+    s.input_coordinator = OmniSchedulingCoordinator(stage_id=0, async_chunk=True) if native else None
+    s._init_prefill_admission_policy()
+    assert s._generation_max_wait_s == 0
+
+
+@pytest.mark.parametrize("pause", [PauseState.PAUSED_ALL, PauseState.PAUSED_NEW])
+def test_pause_clears_coalescing_deadline(pause):
+    s = scheduler(extras=knobs())
+    assert s._should_defer_ar_generation({"0"})
+    s._pause_state = pause
+    assert not s._should_defer_ar_generation({"0"})
+    assert s._generation_batch_deadline is None
+
+
+def test_empty_candidates_clear_deadline(monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
+    s = scheduler(extras=knobs())
+    assert s._should_defer_ar_generation({"0"})
+    clock[0] += 0.006
+    assert not s._should_defer_ar_generation(set())
+    assert s._generation_batch_deadline is None
+    assert s._should_defer_ar_generation({"1"})
+    assert s._generation_batch_deadline == pytest.approx(10.018)
+
+
+@pytest.mark.parametrize("extras", [None, knobs(generation_min_batch_size=1), knobs(generation_max_wait_ms=0)])
+def test_disabled_coalescing_keeps_normal_budget(monkeypatch, extras):
+    s = scheduler(extras=extras)
+    s.waiting.add_request(s.requests["0"])
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    s.schedule()
+    assert budgets == [128]
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_new_ready_requests_release_before_deadline(monkeypatch, native):
+    clock = [10.0]
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
+    s = scheduler(native=native, extras=knobs())
+    s.waiting.add_request(s.requests["0"])
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    s.schedule()
+    clock[0] += 0.003
+    for i in range(1, 4):
+        s.waiting.add_request(s.requests[str(i)])
+    s.schedule()
+    assert budgets == [0, 128]
+    assert s._generation_batch_deadline is None
+    assert clock[0] == 10.003
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_cancellation_during_wait_releases_remaining_request(monkeypatch, native):
+    s = scheduler(native=native, extras=knobs())
+    s.waiting.add_request(s.requests["0"])
+    s.waiting.add_request(s.requests["1"])
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    s.schedule()
+    aborted = s.requests.pop("1")
+    aborted.status = RequestStatus.FINISHED_ABORTED
+    s.schedule()
+    assert budgets == [0, 128]
+    assert aborted not in s.waiting
+    assert s._generation_batch_deadline is None
+
+
+def test_native_notifications_update_readiness_before_gate(monkeypatch):
+    s = scheduler(native=True, extras=knobs())
+    s._init_omni_connector_output_inbox()
+    s._latest_omni_connector_output = None
+    s._outputs_awaiting_stage_payload = {}
+    for request in s.requests.values():
+        s.waiting.add_request(request)
+    process_inputs = s._process_pending_omni_inputs
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    monkeypatch.setattr(s, "_process_pending_omni_inputs", process_inputs)
+    s.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"0"}))
+    s.schedule()
+    assert budgets == [0]
+    assert s.input_coordinator.requests_with_ready_chunks == {"0"}
+    assert s.requests["0"].num_computed_tokens == 0
+    assert s.requests["1"].status == RequestStatus.WAITING_FOR_CHUNK
+    s.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"1", "2"}, chunk_finished_req_ids={"3"}))
+    s.schedule()
+    assert budgets == [0, 128]
+    assert s._generation_batch_deadline is None
+
+
+def test_orchestrator_readiness_override_enables_ar_gate(monkeypatch):
+    s = scheduler()
+    ready: set[str] = set()
+    monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready.copy())
+    s.chunk_transfer_adapter = None
+    s.vllm_config.additional_config = knobs()
+    s._init_prefill_admission_policy()
+    assert s._generation_max_wait_s == 0.012
+    s.requests["0"].status = RequestStatus.RUNNING
+    s.requests["0"].num_computed_tokens = s.requests["0"].num_prompt_tokens
+    s.running.append(s.requests["0"])
+    budgets = prepare_schedule_boundary(monkeypatch, s)
+    ready.add("0")
+    s.schedule()
+    assert budgets == [0]
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_real_upstream_empty_step_preserves_tokens_and_emits_finished_ids(
+    monkeypatch, mocker, native, async_scheduling
+):
+    clock = [10.0]
+    monkeypatch.setattr("vllm_omni.core.sched.omni_ar_scheduler.time.monotonic", lambda: clock[0])
+    s = scheduler(native=native, extras=knobs(), async_scheduling=async_scheduling)
+    s.waiting.add_request(s.requests["0"])
+    # Isolate input transport and output packaging, retaining upstream schedule
+    # and accounting. Cache allocations must never run on a deferred step.
+    monkeypatch.setattr(s, "_process_pending_omni_inputs", lambda model_mode: None)
+    monkeypatch.setattr(s, "_postprocess_omni_schedule_output", lambda *args, **kwargs: None)
+    monkeypatch.setattr(s, "get_finished_requests_needing_kv_transfer", lambda: {})
+    monkeypatch.setattr(s, "_wrap_omni_scheduler_output", lambda output, **kwargs: output)
+    s.current_step = 0
+    s.vllm_config.speculative_config = None
+    s.scheduler_config = s.vllm_config.scheduler_config
+    s.scheduler_config.max_num_batched_tokens = 128
+    s.scheduler_config.long_prefill_token_threshold = 0
+    s.adaptive_long_prefill_threshold = False
+    s.prefill_capacity_bound = False
+    s.max_num_encoder_input_tokens = 0
+    s.num_waiting_for_streaming_input = 0
+    s.lora_config = None
+    s.prev_step_scheduled_req_ids = set()
+    s.finished_req_ids = {"finished"}
+    s.reset_preempted_req_ids = set()
+    s.num_spec_tokens = 0
+    s.dynamic_sd_lookup = None
+    s.log_stats = False
+    s.defer_block_free = False
+    s.connector = s.aux_output_connector = s.ec_connector = None
+    s.needs_kv_cache_zeroing = False
+    cache = mocker.Mock(spec=KVCacheManager)
+    cache.take_boundary_state_offloads.return_value = {}
+    cache.take_kv_cache_block_copies.return_value = ([], [])
+    cache.take_new_block_ids.return_value = []
+    s.kv_cache_manager = cache
+    encoder = mocker.Mock(spec=EncoderCacheManager)
+    encoder.get_freed_mm_hashes.return_value = []
+    encoder.get_manager_metadata.return_value = None
+    s.encoder_cache_manager = encoder
+    output = s.schedule()
+    assert output.num_scheduled_tokens == {}
+    assert output.finished_req_ids == {"finished"}
+    assert s.finished_req_ids == set()
+    cache.allocate_slots.assert_not_called()
+    assert s.requests["0"].num_computed_tokens == s.requests["0"].num_in_flight_tokens == 0
+    assert s.max_num_scheduled_tokens == 128
+    # On expiry the real upstream scheduler resumes allocation/accounting.
+    request = s.requests["0"]
+    s.waiting.remove_requests([request])
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_prompt_tokens
+    request.append_output_token_ids(1)
+    s.running.append(request)
+    s.max_model_len = 256
+    s.num_sampled_tokens_per_step = 1
+    s.num_prefill_lookahead = 1
+    s.num_lookahead_tokens = 0
+    s.need_mamba_block_aligned_split = False
+    s.use_pp = False
+    s.decode_stagger = 1
+    s._inflight_prefills = set()
+    cache.allocate_slots.return_value = KVCacheBlocks(blocks=())
+    clock[0] += 0.012
+    output = s.schedule()
+    assert output.num_scheduled_tokens == {"0": 1}
+    assert request.num_computed_tokens == request.num_prompt_tokens + 1
+    assert request.num_in_flight_tokens == 1
+    assert request.num_output_placeholders == int(async_scheduling)
+    cache.allocate_slots.assert_called_once()

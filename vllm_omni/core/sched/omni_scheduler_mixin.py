@@ -343,7 +343,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         Return None for an unsupported input source, or an empty set for a
         supported source with no ready input. Subclasses receiving input from
         the orchestrator can override this hook. It is also queried during
-        generation scheduler initialization, before requests are registered.
+        coalescing policy initialization, before requests are registered.
 
         Native notifications may not yet be applied to the coordinator, so
         include the supplied outputs. Terminal signals allow final work to
