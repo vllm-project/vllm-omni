@@ -50,6 +50,7 @@ def test_data_collection_hook_resolves_extractor_at_init():
     hook = DataCollectionHook("ZImageTransformer2DModel")
     assert hook.extractor_fn is extract_zimage_context
     assert hook.current_trajectory == []
+    assert hook.current_trajectories == {"positive": [], "negative": []}
 
     with pytest.raises(ValueError, match="Unknown model type"):
         DataCollectionHook("NotARegisteredTransformer")

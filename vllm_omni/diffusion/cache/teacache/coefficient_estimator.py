@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from __future__ import annotations
+
 import os
 from typing import Any
 
@@ -16,9 +18,17 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+Trajectory = list[tuple[np.ndarray, np.ndarray]]
+BranchTrajectories = dict[str, Trajectory]
+
 
 class DataCollectionHook(ModelHook):
-    """Hook to collect modulated inputs and model outputs for TeaCache coefficient estimation."""
+    """Hook to collect modulated inputs and model outputs for TeaCache coefficient estimation.
+
+    Trajectories are grouped by CFG branch (``teacache_branch`` from the extractor)
+    so consecutive-step relative L1 pairs never cross the positive/negative boundary.
+    Runtime TeaCache keeps separate caches per branch; the fit must mirror that.
+    """
 
     _HOOK_NAME = "teacache_collector"
 
@@ -26,11 +36,25 @@ class DataCollectionHook(ModelHook):
         super().__init__()
         self.transformer_type = transformer_type
         self.extractor_fn = get_extractor(transformer_type)
-        self.current_trajectory: list[tuple[np.ndarray, np.ndarray]] = []
+        self.current_trajectories: BranchTrajectories = {"positive": [], "negative": []}
+        # Legacy flat view kept for older tests/callers; prefer current_trajectories.
+        self.current_trajectory: Trajectory = []
 
     def new_forward(self, module: torch.nn.Module, *args: Any, **kwargs: Any) -> Any:
         ctx = self.extractor_fn(module, *args, **kwargs)
-        # NOTE: We upcast to float32 to also handle bfloat16.
+        extra_states = getattr(ctx, "extra_states", None) or {}
+
+        # i2i KV WRITE is not a denoising step; do not enter the fit trajectories.
+        if extra_states.get("teacache_bypass"):
+            outputs = ctx.run_transformer_blocks()
+            ctx.hidden_states = outputs[0]
+            if len(outputs) > 1 and ctx.encoder_hidden_states is not None:
+                ctx.encoder_hidden_states = outputs[1]
+            return ctx.postprocess(ctx.hidden_states)
+
+        # NOTE: Upcast to float32 before leaving the GPU. A bf16 running mean
+        # drops small contributions (spacing near 1.0 is ~2^-7 ≈ 0.0078), so
+        # the collected tensors used for polyfit must accumulate in fp32.
         modulated_input_cpu = ctx.modulated_input.detach().float().cpu().numpy()
 
         outputs = ctx.run_transformer_blocks()
@@ -39,14 +63,20 @@ class DataCollectionHook(ModelHook):
             ctx.encoder_hidden_states = outputs[1]
 
         model_output_cpu = ctx.hidden_states.detach().float().cpu().numpy()
+        branch = extra_states.get("teacache_branch") or "positive"
+        if branch not in ("positive", "negative"):
+            raise ValueError(f"Invalid teacache_branch={branch!r}; expected 'positive' or 'negative'.")
+        self.current_trajectories.setdefault(branch, []).append((modulated_input_cpu, model_output_cpu))
         self.current_trajectory.append((modulated_input_cpu, model_output_cpu))
         return ctx.postprocess(ctx.hidden_states)
 
     def start_collection(self):
+        self.current_trajectories = {"positive": [], "negative": []}
         self.current_trajectory = []
 
-    def stop_collection(self) -> list[tuple[np.ndarray, np.ndarray]]:
-        return list(self.current_trajectory)
+    def stop_collection(self) -> BranchTrajectories:
+        """Return per-branch trajectories collected since ``start_collection``."""
+        return {branch: list(steps) for branch, steps in self.current_trajectories.items() if steps}
 
 
 class DefaultAdapter:
@@ -164,18 +194,40 @@ def calculate_relative_l1(tensor_current: np.ndarray, tensor_next: np.ndarray) -
     return diff / norm
 
 
+def iter_same_branch_trajectories(
+    collected_data: list[Trajectory] | list[BranchTrajectories],
+) -> list[Trajectory]:
+    """Flatten collected samples into same-branch trajectories only."""
+    trajectories: list[Trajectory] = []
+    for sample in collected_data:
+        if isinstance(sample, dict):
+            trajectories.extend(steps for steps in sample.values() if steps)
+        else:
+            trajectories.append(sample)
+    return trajectories
+
+
 def estimate_teacache_coefficients(
-    collected_data: list[list[tuple[np.ndarray, np.ndarray]]], poly_order: int = 4
+    collected_data: list[Trajectory] | list[BranchTrajectories],
+    poly_order: int = 4,
 ) -> list[float]:
-    """Estimate polynomial coefficients for TeaCache using np.polyfit."""
+    """Estimate polynomial coefficients for TeaCache using np.polyfit.
+
+    Accepts either legacy flat trajectories or per-branch trajectory dicts.
+    Relative L1 pairs are formed only between consecutive steps of the same
+    branch trajectory (never across CFG branches).
+    """
     input_diffs, output_diffs = [], []
 
-    for sample in collected_data:
+    for sample in iter_same_branch_trajectories(collected_data):
         for t in range(len(sample) - 1):
             feat_in_curr, feat_out_curr = sample[t]
             feat_in_next, feat_out_next = sample[t + 1]
             input_diffs.append(calculate_relative_l1(feat_in_curr, feat_in_next))
             output_diffs.append(calculate_relative_l1(feat_out_curr, feat_out_next))
+
+    if not input_diffs:
+        raise RuntimeError("No same-branch step pairs available for coefficient estimation.")
 
     x = np.array(input_diffs, dtype=np.float64)
     y = np.array(output_diffs, dtype=np.float64)
@@ -210,7 +262,7 @@ class TeaCacheCoefficientEstimator:
         self.pipeline = adapter.load_pipeline(model_path, device, dtype)
         self.transformer, self.transformer_type = adapter.get_transformer(self.pipeline)
         self.hook = DataCollectionHook(self.transformer_type)
-        self.collected_data: list[list[tuple[np.ndarray, np.ndarray]]] = []
+        self.collected_data: list[BranchTrajectories] = []
         adapter.install_hook(self.transformer, self.hook)
 
     def collect_from_prompt(self, prompt: str, **generate_kwargs):

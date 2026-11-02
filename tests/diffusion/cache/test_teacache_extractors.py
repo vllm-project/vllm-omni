@@ -1412,9 +1412,7 @@ class TestGlmImageExtractor:
             "mod": state.previous_modulated_input.detach().clone(),
             "res": None if state.previous_residual is None else state.previous_residual.detach().clone(),
             "enc": (
-                None
-                if state.previous_residual_encoder is None
-                else state.previous_residual_encoder.detach().clone()
+                None if state.previous_residual_encoder is None else state.previous_residual_encoder.detach().clone()
             ),
             "forward_cnt": hook._forward_cnt,
         }
