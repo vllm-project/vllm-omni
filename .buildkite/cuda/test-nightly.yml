@@ -601,9 +601,12 @@ steps:
             export NATIVE_PHASE_PROBE_MAX_EVENTS=2000
             export NATIVE_PHASE_PROBE_MAX_BYTES=2097152
             export NATIVE_PHASE_PROBE_CHECKPOINT_REPORTS=1000
+            printf 'native-phase-probe: shell enabled=1 pid=%s pytest=%s output=%s\n' "$${BASHPID}" "$$(command -v pytest)" "$${PROBE_OUTPUT}" >&2
           else
             echo "native-phase-probe: output unavailable; original pytest continues" >&2
           fi
+        else
+          printf 'native-phase-probe: shell enabled=0 pid=%s\n' "$${BASHPID}" >&2
         fi
         REPORT="coverage-core-model-cpu-$${BUILDKITE_STEP_ID:-local}.xml"
         pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}

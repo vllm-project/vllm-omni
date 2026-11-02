@@ -34,6 +34,7 @@ def _write_terminal(config: pytest.Config, message: str) -> None:
             reporter.write_line("native-phase-probe: " + message)
         else:
             sys.stderr.write("native-phase-probe: " + message + "\n")
+            sys.stderr.flush()
     except Exception:
         pass
 
@@ -385,7 +386,14 @@ def pytest_configure(config: pytest.Config) -> None:
     if _OUTPUT_ENV not in os.environ:
         return
     try:
-        config.stash[_KEY] = Observer(config)
+        observer = Observer(config)
+        config.stash[_KEY] = observer
+        directory = str(observer.directory)
+        _write_terminal(
+            config,
+            f"started pid={os.getpid()} directory={json.dumps(directory[:256])} "
+            f"directory_truncated={len(directory) > 256}",
+        )
     except Exception as error:
         # Observer failures never replace the test session's exit status.
         _write_terminal(

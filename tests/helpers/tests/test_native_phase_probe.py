@@ -131,7 +131,7 @@ def test_probe_preserves_collection_reports_exit_and_gc_cleanup(project, collect
         assert "PAYLOAD_DO_NOT_RECORD" not in path.read_text()
 
 
-@pytest.mark.parametrize("mode", ["off", "wrong_parent", "on"])
+@pytest.mark.parametrize("mode", ["off", "wrong_parent", "missing_parent", "missing_output", "invalid_output", "on"])
 def test_registration_token_fences_nested_pytest_sessions(project, mode):
     root, output, environment = project
     # Exercise the real loader hook without importing unrelated runtime fixtures.
@@ -161,8 +161,26 @@ def test_registration_token_fences_nested_pytest_sessions(project, mode):
     if mode != "off":
         environment["VLLM_OMNI_NATIVE_PHASE_PROBE"] = "1"
     environment["NATIVE_PHASE_PROBE_PARENT_PID"] = str(os.getpid()) if mode == "on" else "-1"
+    if mode == "missing_parent":
+        environment.pop("NATIVE_PHASE_PROBE_PARENT_PID")
+    if mode in {"missing_output", "invalid_output"}:
+        environment["NATIVE_PHASE_PROBE_PARENT_PID"] = str(os.getpid())
+        if mode == "missing_output":
+            environment.pop("NATIVE_PHASE_PROBE_OUTPUT_DIR")
+        else:
+            environment["NATIVE_PHASE_PROBE_OUTPUT_DIR"] = str(output / "absent")
     result, _ = _run(project, observed=False)
     assert result.returncode == 0, result.stdout + result.stderr
+    log = result.stdout + result.stderr
+    if mode == "off":
+        assert "native-phase-probe:" not in log
+    else:
+        assert "native-phase-probe: gate pid=" in log
+        assert f"token_present={mode != 'missing_parent'}" in log
+        assert f"token_matches={mode in {'on', 'missing_output', 'invalid_output'}}" in log
+        assert f"output_configured={mode != 'missing_output'}" in log
+        assert ("native-phase-probe: started pid=" in log) == (mode == "on")
+        assert ("disabled; output unavailable or invalid" in log) == (mode == "invalid_output")
     directories = list(output.iterdir())
     assert len(directories) == (1 if mode == "on" else 0)
     if directories:
@@ -236,8 +254,9 @@ def test_sigkill_retains_last_complete_checkpoint_within_budget(project):
         assert checkpoint["gc_by_generation"]["2"]["count"] >= 10
         assert sum(path.stat().st_size for path in directory.iterdir()) <= 16384
         process.kill()
-        process.communicate(timeout=10)
+        stdout, stderr = process.communicate(timeout=10)
         assert process.returncode == -signal.SIGKILL
+        assert "native-phase-probe: started pid=" in stdout + stderr
         assert (directory / "checkpoint.json").read_bytes() == complete
         assert not (directory / "summary.json").exists()
         assert sum(path.stat().st_size for path in directory.iterdir()) <= 16384

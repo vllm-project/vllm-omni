@@ -105,6 +105,13 @@ checkpoints describe only the observed prefix. A checkpoint or a summary is not
 proof of complete coverage or passing tests. Verify actual artifact receipt
 after a timeout; loss of the pod or agent can prevent upload.
 
+The job log includes bounded shell, registration-gate and successful observer
+startup receipts before tests run. These distinguish a missing opt-in, a refused
+parent token, invalid output configuration and a started observer whose files
+were not retained. The gate records only process IDs and configuration booleans;
+the startup receipt records the private directory (explicitly marked if truncated).
+Neither receipt establishes why a test timed out or proves artifact delivery.
+
 The observer adds timing overhead. Compare instrumented and uninstrumented runs
 explicitly, and do not infer a common cause from matching timeout symptoms.
 Registration is limited to the CPU step's direct pytest child; nested pytest

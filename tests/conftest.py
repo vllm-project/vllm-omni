@@ -37,6 +37,19 @@ pytest_plugins = (
 def pytest_configure(config):
     # Opt in only for the existing CPU shell's direct pytest child. Consume the
     # registration token so nested pytest sessions cannot create extra observers.
+    if os.environ.get("VLLM_OMNI_NATIVE_PHASE_PROBE") == "1":
+        # A timeout can prevent the terminal summary and artifact upload. Keep
+        # a bounded receipt of the gate without logging arbitrary env values.
+        receipt = (
+            f"native-phase-probe: gate pid={os.getpid()} ppid={os.getppid()} "
+            f"token_present={'NATIVE_PHASE_PROBE_PARENT_PID' in os.environ} "
+            f"token_matches={os.environ.get('NATIVE_PHASE_PROBE_PARENT_PID') == str(os.getppid())} "
+            f"output_configured={'NATIVE_PHASE_PROBE_OUTPUT_DIR' in os.environ}\n"
+        )
+        try:
+            os.write(2, receipt.encode("ascii"))
+        except OSError:
+            pass  # Diagnostic output must not change the original test result.
     if (
         os.environ.get("VLLM_OMNI_NATIVE_PHASE_PROBE") == "1"
         and os.environ.get("NATIVE_PHASE_PROBE_PARENT_PID") == str(os.getppid())
