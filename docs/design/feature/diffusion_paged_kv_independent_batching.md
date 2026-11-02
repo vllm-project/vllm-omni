@@ -2,9 +2,9 @@
 
 This document is the implementation contract for enabling HunyuanImage-3.0
 independent-request batching and step execution under
-`diffusion_kv_mode=paged_scheduler`. It is a design contract, not a support
-claim. The current Hunyuan paged runtime remains request-level until a
-follow-up pipeline PR lands this contract.
+`diffusion_kv_mode=paged_scheduler`. It is a design contract, not a user-guide
+support claim. HunyuanImage3 now implements the three slices below for local
+paged KV; native AR-KV multi-request and the user guide remain out of scope.
 
 Terminology follows the
 [diffusion continuous batching design](diffusion_continuous_batching.md).
@@ -40,7 +40,10 @@ request (1 without CFG, 2 for standard cond/uncond).
 
 ## Current Blockers
 
-| Path | Configuration | Current Hunyuan paged blocker |
+These were the Hunyuan paged blockers this contract removed. They stay in the
+table so the slice split remains reviewable.
+
+| Path | Configuration | Former Hunyuan paged blocker |
 | --- | --- | --- |
 | Single-request step | `step_execution=true`, `max_num_seqs=1` | `prepare_encode` / `denoise_step` raise when paged is active |
 | Step continuous batching | `step_execution=true`, `max_num_seqs>1` | The same raise, plus `TORCH_SDPA` via `_ensure_grouped_attention_backend_supported`, plus later-step span shifting |
