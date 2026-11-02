@@ -254,3 +254,89 @@ def test_length_stop_is_unchanged_outside_ordinary_turn_minicpmo(monkeypatch, se
     request.max_tokens = 2
     _step(scheduler, request, [], [12])
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
+
+def _held(scheduler, request):
+    scheduler.running = [request]
+    scheduler.current_step = 7
+    request.next_decode_eligible_step = 0
+    held = scheduler._hold_minicpmo45_terminal_steps()
+    return held, request.next_decode_eligible_step
+
+
+def test_step_that_may_end_the_reply_holds_the_next_schedule(monkeypatch):
+    # In flight: last input 11 plus three drafts; all accepted would reach 4 outputs.
+    scheduler, request = _scheduler(monkeypatch, speculative=True)
+    request.max_tokens = 5
+    request.num_output_placeholders = 4
+    held, eligible = _held(scheduler, request)
+    assert held == [(request, 0)]
+    assert eligible > scheduler.current_step + 1
+
+
+def test_step_far_from_the_limit_is_not_held(monkeypatch):
+    scheduler, request = _scheduler(monkeypatch, speculative=True)
+    request.num_output_placeholders = 4
+    held, eligible = _held(scheduler, request)
+    assert held == [] and eligible == 0
+
+
+def test_terminal_forward_is_draft_free_and_never_scheduled_twice(monkeypatch):
+    scheduler, request = _scheduler(monkeypatch)
+    request.max_tokens = 2
+    _step(scheduler, request, [], [12])
+    request.spec_token_ids = [-1, -1, -1]
+    held, _ = _held(scheduler, request)
+    assert held == [] and request.spec_token_ids == []
+    # schedule() booked the terminal forward; it is in flight now.
+    request.num_output_placeholders = 1
+    request.spec_token_ids = [-1, -1, -1]
+    held, eligible = _held(scheduler, request)
+    assert held == [(request, 0)] and eligible > scheduler.current_step + 1
+    assert request.spec_token_ids == []
+
+
+def test_other_models_are_never_held(monkeypatch):
+    scheduler, request = _scheduler(monkeypatch, model_arch="Qwen3OmniMoeForConditionalGeneration")
+    request.max_tokens = 2
+    request.num_output_placeholders = 4
+    assert _held(scheduler, request) == ([], 0)
+
+
+def test_final_token_at_the_model_length_fails_instead_of_hanging(monkeypatch):
+    # schedule() cannot admit an input at position max_model_len - 1.
+    scheduler, request = _scheduler(monkeypatch)
+    scheduler.max_model_len = 4
+    _step(scheduler, request, [], [12])
+    assert request.status == RequestStatus.FINISHED_ERROR
+
+
+def test_resumable_session_keeps_the_existing_length_stop(monkeypatch):
+    scheduler, request = _scheduler(monkeypatch)
+    request.max_tokens = 2
+    request.resumable = True
+    _step(scheduler, request, [], [12])
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
+
+@pytest.mark.parametrize(
+    "ids,positions,rows,ok",
+    [
+        ([12], [3], 1, True),
+        ([1, 2, 11, 12], [0, 1, 2, 3], 4, True),
+        ([12, 99], [3, 4], 2, False),
+        ([12], [3], 2, False),
+        ([11], [3], 1, False),
+        ([12, 12], [3, 3], 2, False),
+    ],
+    ids=["single", "recompute", "draft-after", "row-count", "wrong-id", "duplicate"],
+)
+def test_own_row_check_needs_consecutive_rows_ending_at_the_final_token(ids, positions, rows, ok):
+    from vllm_omni.model_executor.models.minicpmo_4_5.handoff import ends_with_own_row
+
+    payload = {
+        "latent_input_ids": torch.tensor(ids).reshape(-1, 1),
+        "latent_positions": torch.tensor(positions).reshape(-1, 1),
+        "latent": torch.zeros(rows, 2),
+    }
+    assert ends_with_own_row(payload, 3, 12) is ok
