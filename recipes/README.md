@@ -64,6 +64,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`FastVideo/FastH3-Omni.md`](./FastVideo/FastH3-Omni.md) | FastH3 Omni eight-step Ref2VA, multi-GPU serving | Shared eight-GPU profile; PRO 5000 baseline in recipe |
 | [FastH3 RefOmni Single Card](<./FastVideo/FastH3 RefOmni Single Card.md>) | Single-card installation, serving, and generation guide | RTX 4090 / 5090 / DGX Spark / RTX PRO 6000 Blackwell |
 | [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
+| [`ekwek/Soprano-1.1-80M-RTX4090-Laptop.md`](./ekwek/Soprano-1.1-80M-RTX4090-Laptop.md) | Native eager English fixed-voice TTS, offline WAV and online PCM/SSE | 1x RTX 4090 Laptop 16GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
