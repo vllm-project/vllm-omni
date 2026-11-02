@@ -4,6 +4,7 @@
 
 import threading
 import time
+import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import torch
 from vllm import SamplingParams
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle
+from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.worker_v2.delivery import DeliveryCancelledError, DeliveryState, OmniDeliveryManager
 from vllm_omni.worker_v2.native_output_worker import NativeOutputWorker
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
@@ -50,6 +52,7 @@ def _bare_plane(*, delivery_timeout_s=1.0, shutdown_timeout_s=1.0):
         _native_output_closed=False,
         _native_outputs_in_flight=defaultdict(int),
         _native_terminal_pending=set(),
+        _deferred_shm_releases=set(),
         _async_chunk=True,
         _pending_full_payload_send={},
         _put_req_chunk=defaultdict(int),
@@ -160,6 +163,52 @@ def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk
     assert terminal.output_token_count == 2
     assert plane.record.cleaned == ["internal"]
     assert not plane._native_outputs_in_flight and not plane._native_terminal_pending
+
+
+@pytest.mark.parametrize("stop", ["token", "length"])
+@pytest.mark.parametrize("text_tokens", [[21], [21, 22, 23]])
+def test_qwen3_full_payload_preserves_last_text_embedding(plane, stop, text_tokens):
+    """A sampled stop has no input embedding; keep the last spoken input row."""
+    from vllm_omni.model_executor.stage_input_processors import qwen3_omni as q3
+
+    plane._async_chunk = False
+    plane._full_payload_replace_keys_cached = frozenset()
+    request = _new_request()
+    request.resumable = False
+    request.sampling_params = SamplingParams(
+        stop_token_ids=[2150], max_tokens=len(text_tokens) + 1 if stop == "length" else 10
+    )
+    plane.register_request(request)
+    embeddings = torch.arange((len(request.prompt_token_ids) + len(text_tokens)) * 2).reshape(-1, 2).float()
+    hidden = embeddings + 100
+
+    def emit(start, end, sampled):
+        plane.reserve_outputs(["internal"])
+        _complete(
+            plane,
+            [{"hidden_states.layer_0": embeddings[start:end], "hidden_states.layer_24": hidden[start:end]}],
+            token=sampled,
+        )
+
+    prompt_len = len(request.prompt_token_ids)
+    emit(0, prompt_len, text_tokens[0])
+    for i in range(len(text_tokens)):
+        sampled = text_tokens[i + 1] if i + 1 < len(text_tokens) else (2150 if stop == "token" else 24)
+        emit(prompt_len + i, prompt_len + i + 1, sampled)
+    # A forward already in flight after the sampled stop must remain excluded.
+    emit(0, 1, 99)
+    plane.request_terminal({"internal"})
+    [(snapshot, accumulated)] = plane.record.batches[0]
+    plane._get_model_config = lambda: SimpleNamespace(
+        use_v2_model_runner=True,
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24)),
+    )
+    payload = q3.thinker2talker_full_payload(plane, accumulated, snapshot)
+
+    assert payload is not None
+    torch.testing.assert_close(payload["embed"]["prefill"], embeddings)
+    torch.testing.assert_close(payload["hidden_states"]["output"], hidden)
+    assert payload["ids"]["all"] == request.prompt_token_ids + text_tokens + [sampled]
 
 
 @pytest.mark.parametrize("ignore_eos", [False, True])
@@ -754,3 +803,31 @@ def test_native_snapshot_distinguishes_fresh_samples_from_ledger_tail(plane):
     assert next_snapshot.last_output_token_id == 2150
     assert next_snapshot.sampled_token_ids == []
     assert first.sampled_token_ids == [2150]
+
+
+def test_release_reclaims_segments_no_downstream_stage_consumed(plane):
+    """A text-only request never runs the Talker, so the producer must unlink."""
+    ext_id = f"release_{uuid.uuid4().hex}"
+    connector = SharedMemoryConnector({"stage_id": 0})
+    plane.__dict__.update(_omni_connector=connector, _stage_id=0, _request_ids_mapping={})
+    plane.register_request(_new_request(external_req_id=ext_id))
+    sibling_key = f"{ext_id}_1_0_0"
+    try:
+        for key in (f"{ext_id}_0_0", sibling_key):
+            assert connector.put("0", "1", key, key)[0]
+
+        # Released while the terminal marker is still unsent: nothing yet.
+        assert plane.release_shm_resources([ext_id]) == 0
+        assert f"{ext_id}_0_0" in connector._pending_keys
+        assert connector.put("0", "1", f"{ext_id}_0_1", "finish")[0]
+        plane._cleanup_finished_entries(["internal"])
+
+        assert not plane._deferred_shm_releases
+        assert not any(k.startswith(f"{ext_id}_0_") for k in connector._pending_keys)
+        assert connector.get("0", "1", f"{ext_id}_0_1") is None
+        assert connector.get("0", "1", sibling_key)[0] == sibling_key
+
+        assert connector.put("0", "1", f"{ext_id}_0_2", "late")[0]
+        assert plane.release_shm_resources([ext_id, "unknown"]) == 1
+    finally:
+        connector.close()

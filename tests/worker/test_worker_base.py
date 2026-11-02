@@ -41,17 +41,20 @@ def _fresh_once_loggers():
         getattr(vllm_logger, name).cache_clear()
 
 
-def _fake_memory_profiling(*, non_torch: int, torch_peak: int):
+def _fake_memory_profiling(*, non_torch: int, torch_peak: int, persistent_buffers: int = 0):
     """A stand-in for ``vllm.utils.mem_utils.memory_profiling`` context manager."""
 
     @contextmanager
     def _mp(snapshot, weights_memory):  # noqa: ARG001 - signature parity only
-        # total_consumed mirrors upstream vllm.utils.mem_utils.MemoryProfilingResult
-        # (added by upstream 58b2012aa2) and is read by OmniGPUWorkerBase.
+        # Buffers allocated before profile_run are resident but absent from
+        # both model_memory_usage and the profiling-window peak increase.
+        consumed = weights_memory + persistent_buffers + non_torch
         yield SimpleNamespace(
             non_torch_increase=non_torch,
             torch_peak_increase=torch_peak,
-            total_consumed=torch_peak + non_torch,
+            total_consumed=consumed,
+            transient_peak_headroom=torch_peak,
+            non_kv_cache_memory=consumed + torch_peak,
         )
 
     return _mp
@@ -108,7 +111,39 @@ def test_determine_available_memory_populates_total_consumed(monkeypatch):
 
     OmniGPUWorkerBase.determine_available_memory(worker)
 
-    assert worker.total_consumed == 3 * GIB
+    assert worker.total_consumed == 11 * GIB
+
+
+def test_determine_available_memory_reserves_preprofile_runtime_buffers(monkeypatch):
+    """MRv2's resident buffers must not be handed to the KV allocator."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, persistent_buffers=3 * GIB),
+    )
+
+    assert worker.determine_available_memory() == 14 * GIB
+    assert worker.total_consumed == 14 * GIB
+
+
+def test_determine_available_memory_does_not_count_retained_peak_twice(monkeypatch):
+    """Persistent allocations made during profiling are already in consumption."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+
+    @contextmanager
+    def profile_memory(snapshot, weights_memory):
+        yield SimpleNamespace(
+            non_torch_increase=1 * GIB,
+            torch_peak_increase=5 * GIB,
+            total_consumed=14 * GIB,
+            transient_peak_headroom=2 * GIB,
+            non_kv_cache_memory=16 * GIB,
+        )
+
+    monkeypatch.setattr(base, "memory_profiling", profile_memory)
+    assert worker.determine_available_memory() == 14 * GIB
+    assert worker.peak_activation_memory == 2 * GIB
 
 
 def test_determine_available_memory_clamps_to_zero(monkeypatch):
@@ -151,7 +186,7 @@ def test_determine_available_memory_reserves_cudagraph_memory(monkeypatch, apply
         assert worker.cudagraph_memory_estimate == (4 if apply_estimate else 0) * GIB
         # Warmup adds the actual graph memory separately when suggesting a KV budget.
         assert worker.peak_activation_memory == 2 * GIB
-        assert worker.total_consumed == 3 * GIB
+        assert worker.total_consumed == 11 * GIB
     # With the reserve off there is no extra capture pass at all.
     assert calls == ["profile-enter", "model", "profile-exit", *(["graphs"] if apply_estimate else [])] * 2
 
@@ -332,7 +367,7 @@ def test_auxiliary_graphs_are_measured_released_and_reserved(monkeypatch, caplog
     # capture_model() reports only the runner's graphs, so the estimate it is
     # compared with leaves the auxiliary pool out; the persistent total keeps it.
     assert worker.cudagraph_memory_estimate == graphs
-    assert worker.total_consumed == 3 * GIB + 2 * GIB
+    assert worker.total_consumed == 11 * GIB + 2 * GIB
     reserved = "\n".join(record.getMessage() for record in caplog.records)
     assert f"Reserved {base.format_gib(graphs + 2 * GIB)} GiB for CUDA graphs" in reserved
     assert f"({base.format_gib(0)} GiB still held after release)" in reserved
