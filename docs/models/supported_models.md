@@ -71,6 +71,7 @@ th {
 | `Pi0Pipeline` | π0 (Pi-Zero) VLA | `lerobot/pi0_base` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi0.md) |
 | `Pi05Pipeline` | π0.5 VLA | `lerobot/pi05_base` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md) |
 | `Sam3Pipeline` | SAM 3 / SAM 3.1 promptable image segmentation; SAM 3 video concept segmentation and tracking | `facebook/sam3.1`, `facebook/sam3` | ✅︎ | | | | [Image](https://github.com/vllm-project/vllm-omni/blob/main/recipes/facebook/SAM3.1-H200.md), [Video](https://github.com/vllm-project/vllm-omni/blob/main/recipes/facebook/SAM3-Video-H200.md) |
+| `VideoDepthAnythingPipeline` | Video Depth Anything relative and metric video depth estimation | `depth-anything/Video-Depth-Anything-Small`, `depth-anything/Metric-Video-Depth-Anything-Small` (and Base/Large) | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/depth-anything/Video-Depth-Anything-H200.md) |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | | — |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
