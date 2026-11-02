@@ -188,7 +188,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # force_kv_transfer); payload_id invalidates the entry when the
         # object is replaced.
         self._omits_kv_transfer_cache: dict[str, tuple[int, bool, bool]] = {}
-        # MiniCPM-o length stops waiting for their final own row.
+        # MiniCPM-o length stops waiting for their final own row. The terminal-row
+        # helpers read it directly: update_from_output calls them only when the
+        # map exists, and schedule() only past the MiniCPM-o model check.
         self._minicpmo45_terminal_rows: dict[str, _MiniCPMO45TerminalRow] = {}
 
         # KV-wait start ts for the vllm_omni:kv_wait_s metric; see
@@ -2089,10 +2091,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             return True
         # schedule() can admit one draft-free input only below this bound.
         if request.num_tokens > self.max_model_len - self.num_sampled_tokens_per_step:
-            logger.warning(
-                "MiniCPM-o request %s stopped at max_model_len; its final token gets no Talker conditioning row",
-                request.request_id,
-            )
+            logger.warning_once("MiniCPM-o replies that stop at max_model_len get no Talker row for their final token")
             return True
         if missing != 1 or request.num_output_placeholders or request.num_in_flight_tokens:
             logger.warning("MiniCPM-o request %s cannot take a draft-free terminal forward", request.request_id)

@@ -237,6 +237,31 @@ def test_eos_stop_finishes_without_a_terminal_forward(monkeypatch, eos):
     assert request.status == RequestStatus.FINISHED_STOPPED
 
 
+def test_end_token_at_the_length_limit_stops_without_a_terminal_forward(monkeypatch):
+    # Stage 0 stops at the turn end ids, and vLLM checks stop ids before the length.
+    scheduler, request = _scheduler(monkeypatch)
+    request.max_tokens = 2
+    _step(scheduler, request, [], [_TTS_EOS])
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    assert scheduler._minicpmo45_terminal_rows == {}
+
+
+def test_length_stop_after_an_end_token_outside_the_stop_list_ends_length_capped(monkeypatch):
+    # Without the end ids in the stop list, the reply runs on past one; the
+    # terminal forward still returns the final token's own row.
+    scheduler, request = _scheduler(monkeypatch)
+    request.sampling_params.stop_token_ids = []
+    request.output_token_ids = [11, _TTS_EOS]
+    request.num_computed_tokens = 3
+    request.max_tokens = 3
+    _step(scheduler, request, [], [12])
+    assert not request.is_finished()
+    _step(scheduler, request, [], [999], _payload(12, 4))
+    assert request.output_token_ids == [11, _TTS_EOS, 12]
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler._minicpmo45_terminal_rows == {}
+
+
 def test_length_limit_inside_accepted_drafts_finishes_without_a_terminal_forward(monkeypatch):
     # Drafts 12, 13 accepted, bonus 14 trimmed by the limit: 13 was an input.
     scheduler, request = _scheduler(monkeypatch, speculative=True)
@@ -315,12 +340,12 @@ def test_context_limit_stop_keeps_the_length_finish(monkeypatch, speculative, dr
     scheduler, request = _scheduler(monkeypatch, speculative=speculative)
     scheduler.max_model_len = 2 + 1 + len(sampled)
     warnings = []
-    monkeypatch.setattr(ar_sched_mod.logger, "warning", lambda *args: warnings.append(args))
+    monkeypatch.setattr(ar_sched_mod.logger, "warning_once", lambda *args, **kwargs: warnings.append(args))
     _step(scheduler, request, drafts, sampled)
     assert request.output_token_ids == [11, *sampled]
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
     assert scheduler._minicpmo45_terminal_rows == {}
-    assert [w[1] for w in warnings if "max_model_len" in w[0]] == [request.request_id]
+    assert [w for w in warnings if "max_model_len" in w[0]] != []
 
 
 def test_release_keeps_an_eligible_step_written_during_schedule(monkeypatch):
