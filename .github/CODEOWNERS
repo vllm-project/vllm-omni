@@ -55,9 +55,6 @@
 # — docs/design/module/input_output_modality_contracts.md
 /vllm_omni/engine/messages.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
 /vllm_omni/engine/serialization.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
-/vllm_omni/engine/mm_outputs.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
-/vllm_omni/engine/output_modality.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
-/vllm_omni/engine/output_processor.py @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
 
 # Input/output modality contracts — docs/design/module/input_output_modality_contracts.md
 /vllm_omni/inputs/ @Sy0307 @amy-why-3459 @Gaohan123 @alex-jw-brooks
