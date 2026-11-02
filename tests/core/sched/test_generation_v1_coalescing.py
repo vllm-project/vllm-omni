@@ -3,6 +3,8 @@
 
 """V1 coalescing preserves scheduler state until a batch can execute."""
 
+from types import SimpleNamespace
+
 import pytest
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -85,11 +87,15 @@ def test_v1_wait_uses_overridden_readiness_without_receiver(monkeypatch):
 
 
 @pytest.mark.parametrize("release", ["timeout", "target"])
-def test_custom_readiness_defers_upstream_fallback_without_connector(monkeypatch, mocker, release):
+@pytest.mark.parametrize("source", ["override", "stage_zero"])
+def test_input_readiness_defers_upstream_fallback_without_connector(monkeypatch, mocker, release, source):
     s, clock = scheduler(monkeypatch)
     s.chunk_transfer_adapter = None
     ready = {"0"}
-    monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready.copy())
+    if source == "override":
+        monkeypatch.setattr(s, "_get_coalescing_ready_request_ids", lambda: ready.copy())
+    else:
+        s.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
     allocate = mocker.spy(s.kv_cache_manager, "allocate_slots")
     budgets = []
 
@@ -124,6 +130,8 @@ def test_custom_readiness_defers_upstream_fallback_without_connector(monkeypatch
     assert s.schedule().num_scheduled_tokens == expected
     assert s._generation_batch_deadline is None
     assert s.max_num_scheduled_tokens == 32
+    if source == "stage_zero":
+        assert s._get_coalescing_ready_request_ids() == set()
 
 
 def test_custom_readiness_fallback_restores_budget_and_queues_on_failure(monkeypatch, mocker):

@@ -354,12 +354,13 @@ V1 retains persistent batch rows across coalescing-only deferred steps while
 still cleaning up finished requests, avoiding full token-history resends caused
 solely by the batch wait. Ordinary empty steps retain their existing behavior.
 
-The default readiness hook supports legacy async-chunk receivers and native
-async-chunk coordinators. Unsupported input sources disable AR batch waiting
-with a warning. Orchestrator-fed stages can opt in through a scheduler override
-of `OmniSchedulerMixin._get_coalescing_ready_request_ids()`; it must return a
-set, including an empty set before input arrives, and be safe to call during
-initialization. No model-specific readiness override is supplied here.
+The default readiness hook supports legacy async-chunk receivers, native
+async-chunk coordinators, and orchestrator-fed Stage 0. For Stage 0 without a
+connector receive path, queued `WAITING` and `PREEMPTED` requests count as
+input-ready; streams parked for another append do not. Unsupported input sources
+disable AR batch waiting with a warning. Other input sources can override
+`OmniSchedulerMixin._get_coalescing_ready_request_ids()`; it must return a set,
+including an empty set before input arrives, and be safe during initialization.
 
 ### Code2Wav Batch Configuration
 
@@ -385,10 +386,12 @@ waiting. V1 async-chunk receivers support TP1/PP1 for stateful and stateless
 stages with `generation_coalescing_policy: fixed` (the default). V1 polls
 readiness on scheduler ticks; it does not block the scheduler thread or consume
 deferred chunks. Its dispatch time includes scheduler tick granularity.
-`generation_coalescing_policy: idle_wait` remains native MRV2-only. Sender-only
-stages and plain prompt inputs do not acquire V1 batch waiting by default.
+`generation_coalescing_policy: idle_wait` remains native MRV2-only. V1 also
+supports orchestrator-fed Stage 0, including sender-only stages, using queued
+input readiness as described above. Other plain prompt inputs do not acquire
+V1 batch waiting by default.
 Custom schedulers can override `OmniSchedulerMixin._get_coalescing_ready_request_ids()`
-to supply input-ready IDs, for example from orchestrator-fed inputs. The hook
+to supply input-ready IDs for other input sources. The hook
 returns `None` for unsupported input sources and a set (possibly empty) for
 supported sources; execution eligibility remains scheduler-specific. It is
 also queried during coalescing policy initialization. Batch waiting must still
