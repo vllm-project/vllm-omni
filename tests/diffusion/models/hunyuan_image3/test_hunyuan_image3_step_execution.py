@@ -221,6 +221,62 @@ def test_ar_reuse_does_not_consume_local_prefix_hits(local_prefix_hit):
         assert "cond_vae_images" not in kwargs
 
 
+@pytest.mark.parametrize("computed", [(8, 6), (8, 8), (12, 12)])
+def test_native_reuse_uses_combined_boundary_and_prefills_only_cfg_gap(mocker, computed):
+    from contextlib import nullcontext
+
+    from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
+        DiffusionPagedAttentionMetadata,
+        DiffusionPagedAttentionRow,
+    )
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+        HunyuanImage3Text2ImagePipeline,
+    )
+
+    pipe = object.__new__(HunyuanImage3Text2ImagePipeline)
+    pipe.model = mocker.Mock()
+    input_ids = torch.arange(32).reshape(2, 16)
+    kwargs = dict(
+        query_lens=[16, 16],
+        attention_mask=torch.ones(2, 1, 16, 16),
+        position_ids=input_ids.clone(),
+        custom_pos_emb=(torch.ones(2, 16, 2), torch.ones(2, 16, 2)),
+        image_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+        gen_timestep_scatter_index=torch.tensor([[12], [12]]),
+    )
+    runtime = SimpleNamespace(
+        metadata=DiffusionPagedAttentionMetadata(
+            prefill_rows=tuple(
+                DiffusionPagedAttentionRow(
+                    request_id="request", sequence_id=row, query_len=16 - start, seq_len=16, kv_start_pos=start
+                )
+                for row, start in enumerate(computed)
+            ),
+            denoise_rows=tuple(
+                DiffusionPagedAttentionRow(
+                    request_id="request", sequence_id=row, query_len=4, seq_len=16, kv_start_pos=12
+                )
+                for row in range(2)
+            ),
+        ),
+        adapter=SimpleNamespace(prepare_batch=lambda rows: rows, activate=lambda _batch: nullcontext()),
+    )
+    with set_forward_context(paged_kv_runtime=runtime):
+        output, reuse_len = pipe._maybe_handle_ar_kv_reuse(input_ids, kwargs, 1, False, None, torch.device("cpu"))
+
+    assert reuse_len == computed[0]
+    torch.testing.assert_close(output, input_ids[:, computed[0] :])
+    assert kwargs["query_lens"] == [16 - computed[0]] * 2
+    assert [row.kv_start_pos for row in runtime.metadata.prefill_rows] == [computed[0]] * 2
+    if computed[1] < computed[0]:
+        prefill = pipe.model.forward_call.call_args.kwargs
+        torch.testing.assert_close(prefill["input_ids"], input_ids[1:, computed[1] : computed[0]])
+        assert prefill["ar_kv_reuse_len"] == computed[1]
+    else:
+        pipe.model.forward_call.assert_not_called()
+
+
 def test_hunyuan_step_group_key_ignores_step_index_for_later_steps():
     pipeline = _pipeline()
     states = [_state("req-0", 1), _state("req-1", 3)]

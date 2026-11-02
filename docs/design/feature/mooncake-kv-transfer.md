@@ -22,6 +22,13 @@ The example sets `transfer_timeout: 60.0` seconds explicitly. Cancellation
 queued during a synchronous receive is processed when that receive completes
 or times out; it does not interrupt the remote write.
 
+With `enable_prefix_caching: true` on DiT, local prefix hits reduce the pages
+requested from AR. Mooncake transfers only the missing suffix; full hits send
+an empty-page notification to release the source. See
+[diffusion prefix caching](prefix_caching.md#diffusion-kv-prefix-caching) for
+allocation and publication semantics. The measurements below predate this
+combination and do not validate its accuracy or performance.
+
 ## Reference configuration
 
 | Stage | Replicas | Devices | Parallelism | KV cache |

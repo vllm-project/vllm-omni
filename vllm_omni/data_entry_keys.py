@@ -24,6 +24,8 @@ FIRST_AUDIO_KEY = "_omni_first_audio"
 FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+# Source preprocessing context carried in native KV handoff metadata.
+SOURCE_MM_PROCESSOR_KWARGS_KEY = "source_mm_processor_kwargs"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
 # Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry
 # an async-chunk placeholder's prewarm payload. Values stay top-level tensors or

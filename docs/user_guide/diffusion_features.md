@@ -46,7 +46,7 @@ cache, TeaCache and Cache-DiT.
 | TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits |
 | TP2/SP2 (Ulysses) + EP, CFGP1 | Validated reference-image prefix hits; CFG guidance does not require CFG parallelism |
 | Other SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
-| AR-imported KV / cross-stage missing-page transfer | Not covered by local prefix caching |
+| Native Mooncake AR KV import + prefix caching | Local hits retained; only missing suffix pages imported. Combined E2E accuracy/performance validation pending |
 | Sleep mode | Rejected with prefix caching; discarded KV pages would leave stale cache hits |
 | TeaCache / Cache-DiT, offload, quantization | Not validated with prefix hits |
 | Step execution | Not supported with HunyuanImage3 paged KV; use request-level execution |

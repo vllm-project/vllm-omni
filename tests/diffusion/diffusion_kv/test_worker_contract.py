@@ -111,8 +111,10 @@ def test_runner_builds_prefill_and_denoise_rows_from_scheduler_metadata() -> Non
     ] == [("req-0", 0, 4, 2, 6), ("req-0", 1, 5, 2, 7)]
 
 
-def test_runner_builds_suffix_prefill_row_for_a_prefix_hit() -> None:
+@pytest.mark.parametrize("native_config", [False, True])
+def test_runner_builds_suffix_prefill_row_for_a_prefix_hit(native_config: bool) -> None:
     runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.od_config.kv_transfer_config = object() if native_config else None
     metadata = DiffusionKVMetadata(
         request_id="req-0",
         allocation_generation=1,
@@ -132,6 +134,39 @@ def test_runner_builds_suffix_prefill_row_for_a_prefix_hit() -> None:
 
     row = attn_metadata.prefill_rows[0]
     assert (row.kv_start_pos, row.query_len, row.seq_len) == (4, 8, 12)
+
+
+def test_runner_preserves_cfg_boundaries_for_local_hit_plus_native_import() -> None:
+    runner = make_runner(DiffusionKVCacheMode.PAGED_SCHEDULER)
+    runner.od_config.kv_transfer_config = object()
+    metadata = DiffusionKVMetadata(
+        request_id="req-0",
+        allocation_generation=1,
+        sequences=(
+            DiffusionKVSequenceMetadata(
+                0,
+                8,
+                4,
+                12,
+                ([1, 2, 3],),
+                cached_prefix_len=4,
+                num_computed_tokens=8,
+            ),
+            DiffusionKVSequenceMetadata(
+                1,
+                8,
+                4,
+                12,
+                ([4, 5, 6],),
+                cached_prefix_len=4,
+                num_computed_tokens=6,
+            ),
+        ),
+    )
+
+    attn_metadata = runner._build_paged_attention_metadata([metadata])
+
+    assert [(row.kv_start_pos, row.query_len) for row in attn_metadata.prefill_rows] == [(8, 4), (6, 6)]
 
 
 def test_runner_selects_only_local_cfg_parallel_row(monkeypatch: pytest.MonkeyPatch) -> None:

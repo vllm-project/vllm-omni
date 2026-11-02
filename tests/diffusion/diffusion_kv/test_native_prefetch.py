@@ -211,7 +211,7 @@ class _Connector:
         self.metas = []
 
     def get_num_new_matched_tokens(self, request, computed):
-        return 4, True
+        return max(len(request.prompt_token_ids) - computed, 0), True
 
     def update_state_after_alloc(self, request, blocks, tokens):
         self.commits.append(request.request_id)
@@ -230,7 +230,7 @@ class _Connector:
         return False, None
 
 
-def _scheduler(monkeypatch, num_blocks=24):
+def _scheduler(monkeypatch, num_blocks=24, *, enable_prefix_caching=False):
     monkeypatch.setattr("vllm_omni.platforms.current_omni_platform.is_cuda", lambda: True)
     connector = _Connector()
     monkeypatch.setattr(
@@ -259,20 +259,26 @@ def _scheduler(monkeypatch, num_blocks=24):
         kv_vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=64),
             max_in_flight_tokens=64,
-            cache_config=SimpleNamespace(enable_prefix_caching=False),
+            cache_config=SimpleNamespace(enable_prefix_caching=enable_prefix_caching),
         ),
     )
     return scheduler, connector
 
 
-def _request(rid):
+def _request(rid, *, prefix_len=4, cache_token_ids=()):
     return OmniDiffusionRequest(
         prompt=rid,
         request_id=rid,
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         diffusion_kv_requests=tuple(
             DiffusionKVRequest(
-                f"{rid}/{row}", sequence_id=row, prefix_len=4, target_len=4, seq_len=8, prompt_token_ids=[1] * 4
+                f"{rid}/{row}",
+                sequence_id=row,
+                prefix_len=prefix_len,
+                target_len=4,
+                seq_len=prefix_len + 4,
+                prompt_token_ids=[1] * prefix_len,
+                cache_token_ids=cache_token_ids,
             )
             for row in range(2)
         ),
@@ -281,9 +287,91 @@ def _request(rid):
             "transfer_id": f"xfer-{rid}",
             "remote_engine_id": "ar",
             "remote_bootstrap_addr": "localhost:8998",
-            "num_transfer_tokens": 4,
+            "num_transfer_tokens": prefix_len,
         },
     )
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("prefix_len", [4, 8])
+def test_prefetch_combines_local_hits_and_preserves_pending_pages(monkeypatch, prefix_len, prefetch):
+    scheduler, connector = _scheduler(monkeypatch, enable_prefix_caching=True)
+    scheduler._native_prefetch_enabled = prefetch
+    manager = scheduler._diffusion_kv_manager
+    seed = DiffusionKVRequest("seed/0", sequence_id=0, prefix_len=4, target_len=4, seq_len=8, cache_token_ids=range(4))
+    assert manager.reserve_request("seed", (seed,)) is not None
+    manager.publish_request("seed")
+    manager.free_request("seed")
+    for rid in ("A", "B"):
+        scheduler.add_request(_request(rid, prefix_len=prefix_len, cache_token_ids=range(prefix_len)))
+
+    output = scheduler.schedule()
+
+    assert output.scheduled_request_ids == ["A"]
+    required = {"A/0", "A/1"} if prefix_len > 4 else set()
+    expected_transfers = required | ({"B/0", "B/1"} if prefetch and prefix_len > 4 else set())
+    assert output.kv_transfer_request_ids == expected_transfers
+    if prefetch:
+        assert output.kv_required_request_ids == required
+    assert output.kv_connector_metadata == ("A/0", "A/1")
+    assert connector.commits[:2] == ["A/0", "A/1"]
+    if not prefetch:
+        return
+    assert output.kv_prefetch_request_ids == ({"B/0", "B/1"} if prefix_len > 4 else set())
+    assert output.kv_prefetch_connector_metadata == ("B/0", "B/1")
+    b_metadata = manager.get_metadata("B")
+    assert [row.cached_prefix_len for row in b_metadata.sequences] == [4, 4]
+    assert [row.num_computed_tokens for row in b_metadata.sequences] == [prefix_len, prefix_len]
+    scheduler.finish_requests("B", DiffusionRequestStatus.FINISHED_ABORTED)
+    if prefix_len == 4:
+        assert not manager.has_request("B")
+        assert "B" not in scheduler._kv_loading_request_ids
+        assert not scheduler.completed_kv_drains()
+        assert connector.commits.count("B/0") == connector.commits.count("B/1") == 1
+        return
+    assert manager.has_request("B")
+    scheduler.update_kv_connector_output(_completed("B/0"))
+    assert manager.has_request("B")
+    assert not scheduler.completed_kv_drains()
+    scheduler.update_kv_connector_output(_completed("B/1"))
+    assert scheduler.completed_kv_drains() == {"B"}
+    # The engine releases only after Worker block-table cleanup.
+    assert manager.has_request("B")
+    scheduler.release_kv_drains({"B"})
+    assert not manager.has_request("B")
+    assert manager.has_request("A")
+    assert connector.commits.count("B/0") == connector.commits.count("B/1") == 1
+
+
+@pytest.mark.parametrize("prefetch", [False, True])
+@pytest.mark.parametrize("hit_row", [0, 1])
+def test_cfg_empty_notification_does_not_block_receive_cleanup(monkeypatch, prefetch, hit_row):
+    scheduler, connector = _scheduler(monkeypatch, enable_prefix_caching=True)
+    scheduler._native_prefetch_enabled = prefetch
+    manager = scheduler._diffusion_kv_manager
+    seed = DiffusionKVRequest("seed/0", sequence_id=0, prefix_len=4, target_len=4, seq_len=8, cache_token_ids=range(4))
+    manager.reserve_request("seed", (seed,))
+    manager.publish_request("seed")
+    manager.free_request("seed")
+    request = _request("A", prefix_len=8, cache_token_ids=range(8))
+    request.diffusion_kv_requests[hit_row].prompt_token_ids = [1] * 4
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    missing = {f"A/{1 - hit_row}"}
+    assert output.kv_transfer_request_ids == missing
+    assert scheduler._loading_sequence_ids(["A"]) == missing
+    assert output.kv_connector_metadata == ("A/0", "A/1")
+    assert connector.commits == ["A/0", "A/1"]
+    scheduler.finish_requests("A", DiffusionRequestStatus.FINISHED_ABORTED)
+    scheduler.update_kv_connector_output(_completed(f"A/{hit_row}"))
+    assert manager.has_request("A")
+    assert not scheduler.completed_kv_drains()
+    scheduler.update_kv_connector_output(_completed(*missing))
+    assert scheduler.completed_kv_drains() == {"A"}
+    scheduler.release_kv_drains({"A"})
+    assert not manager.has_request("A")
 
 
 def test_scheduler_prefetches_one_waiting_request_and_reuses_allocation(monkeypatch):
@@ -363,7 +451,7 @@ def test_pending_prefetch_reuses_transfer_when_admitted(monkeypatch):
     scheduler.finish_requests("A", DiffusionRequestStatus.FINISHED_COMPLETED)
     output = scheduler.schedule()
     assert output.scheduled_request_ids == ["B"]
-    assert output.kv_required_request_ids == {"B/0", "B/1"}
+    assert output.kv_required_request_ids == {"B/1"}
     assert not output.kv_transfer_request_ids
     assert len(connector.commits) == 4
 
@@ -386,10 +474,10 @@ def test_prefetch_reservation_error_does_not_fail_current_request(monkeypatch):
     manager = scheduler._diffusion_kv_manager
     reserve = manager.reserve_request
 
-    def fail_b(request_id, requests):
+    def fail_b(request_id, requests, **kwargs):
         if request_id == "B":
             raise ValueError("invalid B layout")
-        return reserve(request_id, requests)
+        return reserve(request_id, requests, **kwargs)
 
     monkeypatch.setattr(manager, "reserve_request", fail_b)
     output = scheduler.schedule()
@@ -412,10 +500,10 @@ def test_invalid_prefetch_boundary_is_rejected_before_reservation(monkeypatch):
     manager = scheduler._diffusion_kv_manager
     reserve = manager.reserve_request
 
-    def fail_if_b_reserved(request_id, requests):
+    def fail_if_b_reserved(request_id, requests, **kwargs):
         if request_id == "B":
             raise AssertionError("invalid B must be rejected before reservation")
-        return reserve(request_id, requests)
+        return reserve(request_id, requests, **kwargs)
 
     monkeypatch.setattr(manager, "reserve_request", fail_if_b_reserved)
     output = scheduler.schedule()

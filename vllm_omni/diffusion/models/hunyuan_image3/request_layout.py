@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 
+from vllm_omni.data_entry_keys import SOURCE_MM_PROCESSOR_KWARGS_KEY
 from vllm_omni.diffusion.diffusion_kv.kv_cache_utils import get_cache_namespace, hash_prefix_cache_value
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -447,9 +448,18 @@ def prepare_hunyuan_prefix_cache(request: OmniDiffusionRequest) -> None:
     if images:
         # Match Worker: an explicitly supplied generator overrides the seed.
         # Conditional VAE samples latents, so image bytes alone are not enough.
-        if sampling.generator is not None:
-            generators = sampling.generator if isinstance(sampling.generator, list) else [sampling.generator]
+        if request.kv_transfer_params is not None:
+            source_mm_kwargs = request.kv_transfer_params.get(SOURCE_MM_PROCESSOR_KWARGS_KEY) or {}
+            # A DiT seed does not identify AR's sampled reference latents.
+            # Without source RNG identity, retain text hits only.
             random_state: object = (
+                ("ar-mm-processor-kwargs", source_mm_kwargs)
+                if source_mm_kwargs.get("vae_generator_seed") is not None
+                else ("ar-request-local-random-state", request.request_id)
+            )
+        elif sampling.generator is not None:
+            generators = sampling.generator if isinstance(sampling.generator, list) else [sampling.generator]
+            random_state = (
                 "generator-state",
                 tuple((str(generator.device), generator.get_state()) for generator in generators),
             )
@@ -467,7 +477,12 @@ def prepare_hunyuan_prefix_cache(request: OmniDiffusionRequest) -> None:
             )
         )
 
-    namespace = get_cache_namespace("hunyuan-image3-primary-v4", sampling)
+    model_namespace = "hunyuan-image3-primary-v4"
+    if request.kv_transfer_params is not None:
+        # Producer model/encoding semantics must not alias locally computed KV
+        # or a different source engine, even with identical DiT inputs.
+        model_namespace += "/ar-import/" + str(request.kv_transfer_params.get("remote_engine_id"))
+    namespace = get_cache_namespace(model_namespace, sampling)
     output = layout.tokenizer_output
     joint_rows = output.joint_image_slices or [[] for _ in range(layout.num_branches)]
     prepared = []

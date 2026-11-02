@@ -557,12 +557,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         f"request={request_metadata.request_id!r}, sequence={sequence.sequence_id}, "
                         f"active={active_seq_len}, allocated={sequence.seq_len}"
                     )
-                # Imported AR KV and local hits have separate owners.
-                kv_start_pos = (
-                    sequence.num_computed_tokens
-                    if getattr(self.od_config, "kv_transfer_config", None) is not None
-                    else sequence.cached_prefix_len
-                )
+                # Imported rows include received tokens; local-only rows may
+                # carry their hit solely in cached_prefix_len.
+                kv_start_pos = max(sequence.num_computed_tokens, sequence.cached_prefix_len)
                 prefill_rows.append(
                     DiffusionPagedAttentionRow(
                         request_id=request_metadata.request_id,
@@ -826,13 +823,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                         "Diffusion KV metadata count must match the request batch: "
                         f"metadata={len(diffusion_kv_metadata)}, requests={len(reqs)}"
                     )
-                native_kv_transfer = getattr(self.od_config, "kv_transfer_config", None) is not None
+                native_kv_transfer = getattr(self.od_config, "kv_transfer_config", None) is not None and any(
+                    req.kv_transfer_params is not None for req in reqs
+                )
                 if native_kv_transfer:
                     for req, metadata in zip(reqs, diffusion_kv_metadata, strict=True):
                         # This field is consumed by Hunyuan only for native
                         # AR->DiT transfer. Local prefix hits must still run
                         # their VAE/ViT conditioning path.
-                        req.kv_computed_tokens = tuple(seq.num_computed_tokens for seq in metadata.sequences)
+                        if req.kv_transfer_params is not None:
+                            req.kv_computed_tokens = tuple(seq.num_computed_tokens for seq in metadata.sequences)
                 paged_metadata = self._build_paged_attention_metadata(diffusion_kv_metadata)
                 paged_kv_cached_prefix_len = 0
                 if not native_kv_transfer:
@@ -1156,6 +1156,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if (
                     sched_new_req.diffusion_kv_metadata is not None
                     and getattr(self.od_config, "kv_transfer_config", None) is not None
+                    and sched_new_req.req.kv_transfer_params is not None
                 ):
                     new_state.extra["kv_computed_tokens"] = tuple(
                         seq.num_computed_tokens for seq in sched_new_req.diffusion_kv_metadata.sequences
