@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Independent CUDA storage sharing; importing this package does not start CUDA.
+"""Independent device storage sharing; importing this package starts no device.
 
 Callers supply finalized read-only weights and matching rank/GPU identities.
 They route opaque metadata over their existing trusted control plane and report
@@ -25,6 +25,7 @@ from .contracts import (
     WeightSharingError,
     WeightSpec,
 )
+from .torch_npu_ipc_codec import TorchNpuIpcCodec
 
 __all__ = [
     "CloseResult",
@@ -39,6 +40,7 @@ __all__ = [
     "TensorSpec",
     "ThreadOwnershipError",
     "TorchCudaIpcBackend",
+    "TorchNpuIpcCodec",
     "WeightManifest",
     "WeightSharingBackend",
     "WeightSharingError",

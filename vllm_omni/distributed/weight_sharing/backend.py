@@ -127,8 +127,9 @@ def _storage_operation(control: _Control, storage_id: str) -> Iterator[None]:
 class TorchCudaIpcBackend:
     """One backend per owner; session_status may be queried by other threads.
 
-    The codec is injectable for independent CPU tests. Production callers should
-    use the default TorchCudaIpcCodec, which rejects unsupported devices/ABIs.
+    The default codec is TorchCudaIpcCodec. Ascend callers inject
+    TorchNpuIpcCodec; both reject unsupported devices/ABIs. The historical class
+    name is retained so existing CUDA callers need no migration.
     All mutations execute on the owner thread, including control-plane receipts
     and failure reports. No worker, scheduler or process manager is imported here.
     The caller authenticates/routes metadata; identity checks here prevent stale
