@@ -268,7 +268,10 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_model_len": 16384,
                 "max_num_batched_tokens": 16384,
                 "max_num_seqs": 1,
-                "gpu_memory_utilization": 0.9,
+                # Thinker owns its card. On a 22 GiB L4, util 0.9 leaves 0.8 GiB
+                # of KV after the 16.78 GiB weights, runner buffers and the
+                # 16384-token prefill peak; one 16384-token request needs 0.88 GiB.
+                "gpu_memory_utilization": 0.95,
                 "skip_mm_profiling": True,
                 "default_sampling_params": {"max_tokens": 128},
             },
