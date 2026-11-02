@@ -29,7 +29,7 @@ from vllm_omni.diffusion.forward_context import (
     is_forward_context_available,
     set_forward_context_denoise_step_idx,
 )
-from vllm_omni.diffusion.graph import build_denoise_graph_runner
+from vllm_omni.diffusion.graph import build_denoise_graph_runner, release_denoise_graphs_after_denoise
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -2485,6 +2485,7 @@ class HunyuanImage3Pipeline(
         output_type = kwargs.get("output_type", "pil")
         generator = state.extra.get(_STEP_GENERATOR)
         latents = state.latents
+        release_denoise_graphs_after_denoise(self.od_config, getattr(self, "_denoise_graph_runner", None))
         if output_type == "latent":
             return DiffusionOutput(
                 output=latents,

@@ -102,6 +102,19 @@ leave headroom. For example, Wan2.2-T2V-A14B with TP4, 480x832, 17 frames peaked
 at 32.6 GB per card with graphs against 31.6 GB without. At 33 frames the graph
 run ran out of memory in VAE decode where the eager run fit.
 
+`diffusion_graph_release_after_denoise` drops the captured graphs at the end of
+each denoise loop and returns their pools before decode, so decode peaks as in
+eager. Every request then pays a capture again, so prefer it only when decode
+does not fit otherwise:
+
+```python
+omni = Omni(
+    model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    diffusion_use_graph=True,
+    diffusion_graph_release_after_denoise=True,
+)
+```
+
 ## Related options
 
 `enable_cuda_graph_decode` captures the KV-cache decode steps of Qwen-Image-2.1

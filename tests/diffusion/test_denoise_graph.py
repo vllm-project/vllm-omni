@@ -27,6 +27,7 @@ from vllm_omni.diffusion.graph import (
     DENOISE_GRAPH_MAX_ENTRIES,
     build_denoise_graph_runner,
     invalidate_denoise_graphs,
+    release_denoise_graphs_after_denoise,
     write_through,
 )
 
@@ -136,6 +137,40 @@ def test_invalidate_denoise_graphs_drops_every_runner_and_keeps_capturing(platfo
     torch.testing.assert_close(runners[0](x=torch.ones(2)), torch.full((2,), 3.0))
     assert runners[0].stats()["captures"] == 2
     assert runners[0].enabled
+
+
+@pytest.mark.parametrize("release", [True, False])
+def test_release_after_denoise_frees_graph_pools_only_when_configured(platform, release):
+    emptied = []
+    platform.empty_cache = lambda: emptied.append(True)
+    od_config = _od_config(diffusion_graph_release_after_denoise=release)
+    runner = build_denoise_graph_runner(od_config, _affine, "T")
+    runner(x=torch.ones(2))
+    # With release on, each capture first returns the previous decode's cached blocks.
+    assert len(emptied) == (1 if release else 0)
+
+    release_denoise_graphs_after_denoise(od_config, runner)
+
+    assert runner.num_graphs == (0 if release else 1)
+    assert len(emptied) == (2 if release else 0)
+    # The next request recaptures and stays correct.
+    torch.testing.assert_close(runner(x=torch.ones(2)), torch.full((2,), 3.0))
+    assert runner.stats()["captures"] == (2 if release else 1) and runner.enabled
+    assert len(emptied) == (3 if release else 0)
+
+
+def test_release_capture_context_skips_empty_cache_inside_an_outer_capture(platform):
+    platform.empty_cache = lambda: pytest.fail("empty_cache inside a capture")
+    runner = build_denoise_graph_runner(_od_config(diffusion_graph_release_after_denoise=True), _affine, "T")
+    platform.outer_capture = True
+
+    torch.testing.assert_close(runner(x=torch.ones(2)), torch.full((2,), 3.0))
+
+
+def test_release_after_denoise_ignores_eager_pipelines(platform):
+    platform.empty_cache = lambda: pytest.fail("nothing to release")
+
+    release_denoise_graphs_after_denoise(_od_config(diffusion_graph_release_after_denoise=True), None)
 
 
 def test_platform_without_graphs_stays_eager(platform):
