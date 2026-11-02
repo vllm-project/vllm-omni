@@ -254,6 +254,51 @@ def test_request_registered_during_a_burst_is_polled_before_it_ends():
     assert connector.late_at < stream_len // 2
 
 
+class _MissThenReadyConnector(_Connector):
+    """r0 always has its next chunk queued; r1 misses once, then becomes ready."""
+
+    def __init__(self, stream_len: int) -> None:
+        super().__init__()
+        self.stream_len = stream_len
+        self.r0_chunks = 0
+        self.r1_queued = False
+        self.r1_at: int | None = None
+        self.done = threading.Event()
+
+    def get(self, from_stage, to_stage, get_key, metadata=None):
+        result = super().get(from_stage, to_stage, get_key, metadata)
+        if get_key.startswith("r1_0_"):
+            if result is None and not self.r1_queued:
+                self.r1_queued = True
+                self.put("0", "1", "r1_0_0", {"embed": {"decode": [0]}})
+            elif result is not None:
+                self.r1_at = self.r0_chunks
+                self.done.set()
+        elif result is not None and get_key.startswith("r0_0_"):
+            self.r0_chunks += 1
+            if self.r0_chunks < self.stream_len:
+                self.put("0", "1", f"r0_0_{self.r0_chunks}", {"embed": {"decode": [self.r0_chunks]}})
+            else:
+                self.done.set()
+        return result
+
+
+def test_registered_request_that_missed_is_polled_again_during_a_burst():
+    stream_len = 200
+    connector = _MissThenReadyConnector(stream_len)
+    host = _host(connector)
+    connector.put("0", "1", "r0_0_0", {"embed": {"decode": [0]}})
+    host._recv_thread = threading.Thread(target=_Host._recv_loop, args=(host,), daemon=True)
+    host._recv_thread.start()
+    try:
+        assert connector.done.wait(timeout=10)
+    finally:
+        host.shutdown_omni_connectors()
+    assert connector.r1_queued
+    assert connector.r1_at is not None
+    assert connector.r1_at < stream_len // 2
+
+
 def test_burst_receive_yields_the_model_thread():
     legacy_gets, legacy_iters, legacy_rows = _burst(_legacy_loop)
     drain_gets, drain_iters, drain_rows = _burst(_Host._recv_loop)

@@ -27,6 +27,20 @@ class _BaseSampler:
         self.upstream_rows.append(int(logits.shape[0]))
         return logits.argmax(dim=-1), logits
 
+    def __call__(self, logits, input_batch):
+        # Like upstream: every row is sampled, unfinished prefills are dropped later.
+        slots = input_batch.idx_mapping_np
+        sampled, _ = self._sample_random(
+            logits,
+            torch.from_numpy(slots).to(torch.int64),
+            slots,
+            torch.zeros(len(slots), dtype=torch.int64),
+            None,
+            None,
+            False,
+        )
+        return sampled
+
 
 def _sampler(requests: dict[int, SamplingParams]) -> tuple[Qwen3OmniTalkerSampler, _BaseSampler]:
     base = _BaseSampler()
@@ -60,6 +74,52 @@ def test_seeded_row_stream_does_not_depend_on_batch_mates():
     assert alone_base.upstream_rows == []
     # Only the greedy row reaches the upstream sampler.
     assert mixed_base.upstream_rows == [1] * 8
+
+
+def _batch(slots: list[int], computed: list[int], scheduled: list[int], prefill: list[int]) -> SimpleNamespace:
+    computed_np = np.array(computed, dtype=np.int32)
+    prefill_np = np.array(prefill, dtype=np.int32)
+    return SimpleNamespace(
+        num_reqs=len(slots),
+        idx_mapping_np=np.array(slots, dtype=np.intp),
+        num_scheduled_tokens=np.array(scheduled, dtype=np.int32),
+        num_computed_prefill_tokens_np=computed_np,
+        prefill_len_np=prefill_np,
+        has_prefill=bool((computed_np < prefill_np).any()),
+    )
+
+
+def _accepted_codes(other: dict[int, SamplingParams], discarded_steps: int) -> list[int]:
+    """Slot 0 is seeded with a 12-token prefill, sliced into discarded steps first."""
+    sampler, _ = _sampler({0: SamplingParams(temperature=0.9, seed=42), **other})
+    slots = [0, *other]
+    rest = [0] * len(other)
+    torch.manual_seed(1)
+    for step in range(discarded_steps):
+        state = sampler._generators[0].get_state()
+        sampler(torch.randn(len(slots), _VOCAB), _batch(slots, [step, *rest], [1, *rest], [12, *rest]))
+        assert torch.equal(sampler._generators[0].get_state(), state)
+    computed = discarded_steps
+    first = sampler(
+        torch.full((len(slots), _VOCAB), 0.0), _batch(slots, [computed, *rest], [12 - computed, *rest], [12, *rest])
+    )
+    codes = [int(first[0])]
+    torch.manual_seed(2)
+    for _ in range(8):
+        sampled = sampler(torch.randn(len(slots), _VOCAB), _batch(slots, [12, *rest], [1, *rest], [12, *rest]))
+        codes.append(int(sampled[0]))
+    return codes
+
+
+@pytest.mark.parametrize(
+    "other",
+    [{}, {1: SamplingParams(temperature=0.0)}, {1: SamplingParams(temperature=0.9, seed=7)}],
+    ids=["seeded-only", "mixed-greedy", "two-seeded"],
+)
+def test_discarded_prefill_steps_do_not_advance_the_seeded_stream(other):
+    expected = _accepted_codes(other, discarded_steps=0)
+    assert _accepted_codes(other, discarded_steps=1) == expected
+    assert _accepted_codes(other, discarded_steps=3) == expected
 
 
 def test_unseeded_step_stays_on_upstream_sampler():

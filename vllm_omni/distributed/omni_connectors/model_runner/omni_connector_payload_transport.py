@@ -52,6 +52,8 @@ def _recv_poll_seconds() -> float:
 
 
 _RECV_POLL_S = _recv_poll_seconds()
+# Upper bound, in drain passes, on how long a missed request waits behind a burst.
+_RECV_DRAIN_REPOLL_PASSES = 8
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.base import (
@@ -1004,8 +1006,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         requests are polled again. A miss means that chunk is not in the
         connector yet; rescanning it opens a missing lock file and holds the
         GIL against the model thread for the whole burst. Requests registered
-        during a burst join it on the next pass, so a long stream does not
-        hold back another request's first chunk. The wait is also the
+        during a burst join it on the next pass, and every
+        ``_RECV_DRAIN_REPOLL_PASSES`` passes the requests that missed are
+        polled again, so a long stream does not hold back another request's
+        first or next chunk. The wait is also the
         recheck for a non-AR payload deferred until the scheduler takes the
         previous one.
         """
@@ -1033,15 +1037,21 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
 
             known = set(pending_ids)
             active = pending_ids
+            passes = 0
             while active and not self._stop_event.is_set():
                 active = self._poll_pending_requests_once(active)
                 if not active:
                     break
+                passes += 1
                 with self._lock:
-                    arrived = [req_id for req_id in self._pending_load_reqs if req_id not in known]
-                if arrived:
-                    known.update(arrived)
-                    active = [*active, *arrived]
+                    if passes % _RECV_DRAIN_REPOLL_PASSES == 0:
+                        polled = set(active)
+                        joined = [req_id for req_id in self._pending_load_reqs if req_id not in polled]
+                    else:
+                        joined = [req_id for req_id in self._pending_load_reqs if req_id not in known]
+                if joined:
+                    known.update(joined)
+                    active = [*active, *joined]
 
             if not self._stop_event.is_set():
                 self._wait_for_next_payload(generation)

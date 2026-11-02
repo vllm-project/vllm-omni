@@ -21,6 +21,8 @@ import torch
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
@@ -51,6 +53,25 @@ class Qwen3OmniTalkerSampler(OmniSampler):
         generator = torch.Generator(device=self.base_sampler.penalties_state.device)
         generator.manual_seed(int(seed))
         self._generators[req_idx] = generator
+
+    def __call__(self, logits: torch.Tensor, input_batch: InputBatch) -> SamplerOutput:
+        # Upstream samples a row for every request, then drops the token of an
+        # unfinished chunked prefill. Like V1, that draw must not advance the
+        # request's stream, or the token budget would shift every later draw.
+        held = [(generator, generator.get_state()) for generator in self._unfinished_prefill_generators(input_batch)]
+        output = self.base_sampler(logits, input_batch)
+        for generator, state in held:
+            generator.set_state(state)
+        return output
+
+    def _unfinished_prefill_generators(self, input_batch: InputBatch) -> list[torch.Generator]:
+        if not self._generators or not input_batch.has_prefill:
+            return []
+        num_reqs = input_batch.num_reqs
+        seq_lens = input_batch.num_computed_prefill_tokens_np[:num_reqs] + input_batch.num_scheduled_tokens[:num_reqs]
+        unfinished = seq_lens < input_batch.prefill_len_np[:num_reqs]
+        slots = {int(slot) for slot in input_batch.idx_mapping_np[:num_reqs][unfinished]}
+        return [self._generators[slot] for slot in slots if slot in self._generators]
 
     def _sample_like_v1(
         self,
