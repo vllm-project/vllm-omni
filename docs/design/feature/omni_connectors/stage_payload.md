@@ -98,6 +98,45 @@ An unsupported backend must implement this capability before being used for
 synchronous remote-only payloads. Existing asynchronous `get()` users are
 unchanged.
 
+### Connector support at startup
+
+For a diffusion stage declaring `stage_input_payload_keys`, regular startup
+checks the resolved connection graph before building worker startup plans.
+Headless startup uses the same check before launching its local replicas. Every
+configured incoming edge must declare deadline-aware receive support. Errors
+identify the stage, edge (for example, `0→1`), and connector.
+
+A middle stage currently resolves one connector, preferring its outgoing edge.
+The preflight therefore also rejects incoming connector types that differ from
+the resolved connector type, even when both types support deadline receive.
+For example, `E --NIXL--> G --SHM--> D` is rejected, as is either mixed
+Mooncake/SHM direction. This does not add mixed-backend or multi-input routing,
+validate all backend parameters, or prove that peers can communicate.
+
+`OmniDiffusionConfig` also validates an explicitly configured connector for
+direct configuration callers. A missing or empty `type` is an error, not an
+implicit SHM selection; unknown names are reported separately from unsupported
+capabilities. An unsupported configured pairing is rejected even if a particular
+request could otherwise supply sufficient inline data.
+
+| Connector | Synchronous diffusion payload receive | Backend responsibility |
+| --- | --- | --- |
+| `SharedMemoryConnector` | Supported between processes sharing host memory | Nonblocking read-lock acquisition; return absence on contention; shared runtime retries. Copy and deserialize after acquiring the lock. |
+| `NixlConnector` | Supported, including network transfers | Deadline-aware socket and completion waits, generation-scoped claims, deferred active-DMA cleanup, discovery recovery. |
+| `MooncakeStoreConnector` / `MooncakeConnector` | Not supported | Implement the deadline contract and explicitly register the capability before enabling this path. |
+| `MooncakeTransferEngineConnector` | Not supported | Same deadline contract and registration requirement. |
+| `MoriTransferEngineConnector` | Not supported | Same deadline contract and registration requirement. |
+| `YuanrongConnector` / `YuanrongTransferEngineConnector` | Not supported | Same deadline contract and registration requirement. |
+| Other/custom connectors | Opt-in required | Implement `get_with_deadline` and register with `supports_deadline_receive=True`; implement `abandon_get` when discovery creates ownership. Do not inherit an unbounded blocking call. |
+
+Custom connectors that implement `get_with_deadline()` must register with
+`OmniConnectorFactory.register_connector(..., supports_deadline_receive=True)`.
+Capability inspection does not construct a connector or load its native backend.
+Stages without payload input keys, including existing asynchronous AR `get()`
+users, are unaffected. Inline payload configurations without a connector are
+also unaffected. This support matrix concerns stage payloads, not native KV
+transfer or all uses of the listed connectors.
+
 The deadline covers retry sleeps, metadata socket waits, and NIXL completion
 polling. It is **not a hard real-time bound** on Python execution, allocation,
 serialization, individual native driver calls, device copies, or payload-group
@@ -247,16 +286,14 @@ a recoverable discovery claim.
 
 ## Reusing the Interface
 
-| Backend | Synchronous support | Backend responsibility |
-| --- | --- | --- |
-| SharedMemory | Implemented | Nonblocking read-lock acquisition; return absence on contention; shared runtime retries. Copy and deserialize after acquiring the lock. |
-| NIXL | Implemented | Deadline-aware socket and completion waits, generation-scoped claims, deferred active-DMA cleanup, discovery recovery. |
-| Other existing connectors | Opt-in required | Implement `get_with_deadline`; implement `abandon_get` only when discovery creates ownership. Do not inherit an unbounded blocking call. |
+See [Connector support at startup](#connector-support-at-startup) for the support
+matrix and backend responsibilities.
 
 To add a model, declare input/output keys and use ordinary prompt and output
 structures. To add a backend, implement the connector capability and ownership
-tests, register it through the existing factory, and select it in deploy
-configuration. Neither requires a backend-specific diffusion model runner.
+tests, register it through the existing factory with
+`supports_deadline_receive=True`, and select it in deploy configuration. Neither
+requires a backend-specific diffusion model runner.
 
 Worker teardown disables offloading, closes the manager after draining
 prefetch, then tears down native KV and distributed resources in `finally`
@@ -267,6 +304,8 @@ Repeated manager close is safe, including for an unused manager.
 
 | Test module | Main invariants |
 | --- | --- |
+| `tests/diffusion/test_stage_payload_topology_validation.py` | Incoming-edge checks, mixed-type rejection before startup, shipped deploy YAMLs, legacy and explicit empty-key configurations. |
+| `tests/diffusion/test_stage_payload_connector_validation.py` | Lazy capability checks, explicit type/name errors, custom registration, built-in implementation consistency, platform SHM selection. |
 | `tests/diffusion/test_diffusion_stage_payload.py` | Warmup bypass, strict missing-payload errors, valid inline fallback, source-stage endpoints, TP/SP fanout, standalone HSDP election and SHM fanout, handle publication. |
 | `tests/diffusion/test_diffusion_model_runner.py` | New-request receive and final-only stepwise publication with cached external identity. |
 | `tests/distributed/omni_connectors/test_nixl_connector.py` | Lost replies, same-claim recovery, deadlines, generation isolation, active DMA retention, deferred close and ACKs. |

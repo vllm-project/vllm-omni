@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import regex as re
+from omegaconf import DictConfig
 from vllm.logger import init_logger
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
@@ -54,6 +55,7 @@ from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
+    OmniTransferConfig,
 )
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
@@ -2042,6 +2044,28 @@ def get_stage_connector_spec(
                 extra["to_stage"] = int(to_stage)
             return {"name": spec.name, "extra": extra}
     return {}
+
+
+def validate_diffusion_stage_payload_topology(
+    stage_configs: Sequence[BaseVllmOmniStageConfig | DictConfig],
+    transfer_config: OmniTransferConfig | None,
+) -> None:
+    """Preflight resolved payload edges before constructing any stage workers."""
+    from vllm_omni.distributed.omni_connectors.utils.initialization import validate_stage_payload_connectors
+
+    for stage_cfg in stage_configs:
+        if isinstance(stage_cfg, VllmOmniDiffusionStageConfig):
+            # The projection has already applied deploy/CLI precedence. Do not
+            # build engine args here: model-path resolution can download weights.
+            input_keys = stage_cfg.diffusion_config.stage_input_payload_keys
+        elif isinstance(stage_cfg, BaseVllmOmniStageConfig):
+            continue
+        elif _get_attr_or_item(stage_cfg, "stage_type", "llm") == "diffusion":
+            input_keys = _get_attr_or_item(stage_cfg.engine_args, "stage_input_payload_keys", ())
+        else:
+            continue
+        if input_keys:
+            validate_stage_payload_connectors(transfer_config, stage_cfg.stage_id)
 
 
 def build_diffusion_config(

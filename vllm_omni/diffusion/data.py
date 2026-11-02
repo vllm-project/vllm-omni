@@ -1313,6 +1313,15 @@ class OmniDiffusionConfig:
             self.omni_kv_config = dict(self.omni_kv_config)
         else:
             raise TypeError("omni_kv_config must be a mapping")
+        if self.stage_input_payload_keys and self.omni_kv_config.get("connector_config") is not None:
+            from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+
+            connector_config = self.omni_kv_config["connector_config"]
+            if not isinstance(connector_config, Mapping):
+                raise ValueError(f"Stage {self.stage_id}: connector_config must be a mapping.")
+            OmniConnectorFactory.validate_deadline_receive(
+                connector_config.get("type"), context=f"Stage {self.stage_id}"
+            )
         if self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and self.omni_kv_config.get(
             "need_recv_cache", False
         ):

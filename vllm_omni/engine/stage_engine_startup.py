@@ -1550,6 +1550,7 @@ def launch_headless_diffusion_replicas(
 ) -> None:
     """Prepare diffusion config, launch replicas, monitor, and clean up."""
     omni_transfer_config = stage_init_utils.load_omni_transfer_config_for_model(model, config_path)
+    stage_init_utils.validate_diffusion_stage_payload_topology([stage_cfg], omni_transfer_config)
     omni_conn_cfg, omni_from, omni_to = initialization.resolve_omni_kv_config_for_stage(
         omni_transfer_config,
         stage_id,
@@ -1561,6 +1562,7 @@ def launch_headless_diffusion_replicas(
         else stage_init_utils.extract_legacy_stage_metadata(stage_cfg)
     )
     if omni_conn_cfg:
+        assert omni_from is not None and omni_to is not None
         inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
     # Headless single-stage launch must still infer cross-stage TP topology
     # from the loaded deploy config so heterogeneous KV routing keys match the
