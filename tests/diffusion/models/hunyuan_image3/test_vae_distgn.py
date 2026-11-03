@@ -96,3 +96,35 @@ def test_layout_contract_rejects_unsupported_input(layout, shape):
 
     with pytest.raises(ValueError):
         dist_group_norm(torch.randn(shape), 32, None, None, 1e-6, layout=layout)
+
+
+@pytest.mark.parametrize("activation", ["swish", "identity"])
+def test_independent_tiles_keep_native_norm_even_for_large_npu_shapes(adapter, activation):
+    from types import SimpleNamespace
+
+    x = SimpleNamespace(
+        device=SimpleNamespace(type="npu"),
+        dtype=torch.float32,
+        ndim=5,
+        is_contiguous=lambda: True,
+        numel=lambda: 16 * 1024 * 1024,
+    )
+    expected = torch.randn(1, 32, 1, 2, 2)
+    calls = []
+
+    class NativeNorm:
+        num_groups = 32
+        weight = torch.ones(32)
+        bias = torch.zeros(32)
+        eps = 1e-6
+
+        def __call__(self, actual):
+            assert actual is x
+            calls.append(actual)
+            return expected
+
+    with torch.no_grad():
+        actual = adapter.__globals__["vae_group_norm_for_conv"](x, NativeNorm(), activation)
+    reference = torch.nn.functional.silu(expected) if activation == "swish" else expected
+    assert torch.equal(actual, reference)
+    assert len(calls) == 1

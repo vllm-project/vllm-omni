@@ -72,6 +72,11 @@ def test_checkpoint_keys_and_native_fallback(native, accelerated):
     assert all("forward" not in m.__dict__ and "attention" not in m.__dict__ for m in actual.modules())
 
 
+def test_conditional_encode_never_enters_spatial_execution():
+    # This gate must run before tensor, device, or process-group inspection.
+    assert spatial_vae.spatial_vae_forward(object(), object(), "encode") is None
+
+
 def test_spatial_context_is_reset_on_failure(monkeypatch):
     monkeypatch.setattr(dist, "get_world_size", lambda group: 1)
     monkeypatch.setattr(dist, "get_rank", lambda group: 0)
@@ -186,7 +191,7 @@ def test_spatial_gate_reuses_executor_and_falls_back_before_execution(monkeypatc
         parallel_size=2 if case == "group_mismatch" else 4,
         parallel_mode="spatial_shard_width" if case == "width_mode" else "spatial_shard_height",
     )
-    vae = SimpleNamespace(distributed_executor=executor, ffactor_spatial=16, encoder=network)
+    vae = SimpleNamespace(distributed_executor=executor, decoder=network)
     x = SimpleNamespace(
         device=SimpleNamespace(type="npu"),
         ndim=5,
@@ -202,7 +207,7 @@ def test_spatial_gate_reuses_executor_and_falls_back_before_execution(monkeypatc
 
     monkeypatch.setattr(spatial_vae, "run_spatial_vae", execute)
     with torch.no_grad():
-        result = spatial_vae.spatial_vae_forward(vae, x, "encode")
+        result = spatial_vae.spatial_vae_forward(vae, x, "decode")
     if case == "supported":
         assert result is sentinel
         assert calls == [(network, x, group)]

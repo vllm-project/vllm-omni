@@ -36,37 +36,11 @@ def vae_group_norm_silu(x: torch.Tensor, norm: torch.nn.GroupNorm) -> torch.Tens
 
 
 def vae_group_norm_for_conv(x: torch.Tensor, norm: torch.nn.GroupNorm, activation: str = "swish") -> torch.Tensor:
-    """Select the NPU fusion by capability; retain native dtype/autograd fallback."""
+    """Use distributed fusion only inside an explicit spatial VAE context."""
     if activation not in ("swish", "identity"):
         raise ValueError(f"Unsupported GroupNorm activation: {activation}")
     if VAE_SPATIAL_CONTEXT.get() is not None:
         return global_group_norm(x, norm, activation)
-    eligible = (
-        x.device.type in ("npu", "privateuseone")
-        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and x.ndim == 5
-        and norm.num_groups == 32
-        and norm.weight is not None
-        and norm.bias is not None
-        and x.is_contiguous()
-        and 16 * 1024 * 1024 <= x.numel() < 2**31
-        and not torch.is_grad_enabled()
-        and not torch.compiler.is_compiling()
-    )
-    if eligible:
-        from vllm_omni.platforms.npu.layers.dist_group_norm import dist_group_norm
-
-        # Like eager GroupNorm, NPU autocast promotes normalization to FP32.
-        value = x.float() if torch.is_autocast_enabled("npu") else x
-        return dist_group_norm(
-            value,
-            norm.num_groups,
-            norm.weight,
-            norm.bias,
-            norm.eps,
-            activation=activation,
-            local_only=True,
-            layout="NCTHW",
-        )
+    # Preserve conditional-image encoding numerics on the independent-tile path.
     y = norm(x)
     return F.silu(y) if activation == "swish" else y

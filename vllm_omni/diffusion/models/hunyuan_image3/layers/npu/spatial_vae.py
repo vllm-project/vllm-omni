@@ -29,6 +29,10 @@ def spatial_vae_forward(
 ) -> torch.Tensor | None:
     if stage not in ("encode", "decode"):
         raise ValueError(f"Unknown VAE stage: {stage}")
+    # Keep conditional-image latents on the established tile encoder.
+    # Full-image normalization changes the conditioning seen by DiT.
+    if stage == "encode":
+        return None
     if vae.distributed_executor.parallel_mode != "spatial_shard_height":
         return None
     if x.device.type not in ("npu", "privateuseone") or torch.is_grad_enabled() or torch.compiler.is_compiling():
@@ -36,12 +40,11 @@ def spatial_vae_forward(
     executor = vae.distributed_executor
     group = executor.group
     world = dist.get_world_size(group)
-    alignment = vae.ffactor_spatial if stage == "encode" else 1
-    network = vae.encoder if stage == "encode" else vae.decoder
+    network = vae.decoder
     if world <= 1 or executor.parallel_size != world or executor.parallel_mode != "spatial_shard_height":
         logger.warning_once("HunyuanImage3 spatial VAE requires a matching VAE device group; using tile execution")
         return None
-    if x.ndim != 5 or x.shape[3] % (world * alignment) or not x.numel():
+    if x.ndim != 5 or x.shape[3] % world or not x.numel():
         logger.warning_once(
             "HunyuanImage3 spatial %s requires aligned nonempty NCTHW input; got %s", stage, tuple(x.shape)
         )

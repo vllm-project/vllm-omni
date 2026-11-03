@@ -1,13 +1,12 @@
 # HunyuanImage3 VAE DistGN
 
 NPU layers are selected by `hunyuan_image3/layers/__init__.py`, following the
-existing CUDA layer dispatch. Supported local GN calls select fusion by device,
-dtype, shape and execution capability; unsupported calls retain native behavior.
-No model environment variable controls fusion. Local fusion preserves eager
-GroupNorm's FP32 output under NPU autocast; it does not fuse a lower-precision
-consumer cast by default.
+existing CUDA layer dispatch. Independent tiles retain native GroupNorm and
+SiLU, including the caller's autocast precision. DistGN is selected only inside
+the explicit spatial decode context. No model environment variable controls
+fusion.
 
-For experimental full-feature spatial encode/decode, use the existing parallel
+For experimental spatial decode, use the existing parallel
 configuration rather than an environment variable:
 
 ```yaml
@@ -18,8 +17,18 @@ parallel_config:
 ```
 
 The VAE parallel size must match the existing DiT device group. For HunyuanImage3
-on NPU this mode applies to both encode and decode. Height must divide by group
-size times `ffactor_spatial` for encode, or group size for decode. Unsupported
+on NPU this mode applies to decode only. Conditional-image encoding retains the
+established tile path, including its normalization domain and autocast precision.
+VAE encode is sensitive to numerical changes in fused operators: even local
+GN fusion with the same tile boundaries introduced small posterior differences
+that were amplified during the tested MXFP8 TI2I inference. Changing encode to
+full-image normalization introduced an additional, independent difference in
+conditioning. For this reason, encode retains native GN and SiLU as well as the
+original tiling, normalization domain, and precision; neither local fusion nor
+spatial DistGN is enabled for encode. These observations concern pixel
+consistency and do not establish that every numerical change affects semantics.
+
+Decode latent height must divide by the group size. Unsupported
 inputs/configurations retain the tile path. The default `tile` mode retains
 independent-tile statistics and never activates cross-rank GN.
 
