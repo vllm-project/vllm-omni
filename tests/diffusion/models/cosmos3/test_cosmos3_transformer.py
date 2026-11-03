@@ -509,6 +509,8 @@ def test_edge_validates_required_relu2_weights() -> None:
     model.num_hidden_layers = 1
     model.qk_norm_for_diffusion = True
     model.use_und_k_norm_for_gen = True
+    model.owns_reasoner = True
+    model.owns_generator = True
 
     complete = {
         "transformer.language_model.layers.0.mlp.up_proj.weight",
@@ -534,6 +536,52 @@ def test_edge_validates_required_relu2_weights() -> None:
     model.validate_loaded_weights(missing_k_norm)
 
 
+@pytest.mark.parametrize(
+    ("owned_towers", "loaded", "rejected"),
+    [
+        (
+            ("reasoner",),
+            {
+                "transformer.language_model.layers.0.mlp.up_proj.weight",
+                "transformer.language_model.layers.0.mlp.down_proj.weight",
+            },
+            "gen_layers.0.mlp.up_proj",
+        ),
+        (
+            ("generator",),
+            {
+                "transformer.gen_layers.0.mlp.up_proj.weight",
+                "transformer.gen_layers.0.mlp.down_proj.weight",
+            },
+            "language_model.layers.0.mlp.up_proj",
+        ),
+    ],
+)
+def test_edge_weight_validation_only_requires_the_towers_this_stage_owns(
+    owned_towers: tuple[str, ...], loaded: set[str], rejected: str
+) -> None:
+    """A tower-split stage loads half the checkpoint and is judged against that half."""
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
+        Cosmos3EdgeVFMTransformer,
+    )
+
+    model = object.__new__(Cosmos3EdgeVFMTransformer)
+    nn.Module.__init__(model)
+    model.num_hidden_layers = 1
+    model.qk_norm_for_diffusion = True
+    model.use_und_k_norm_for_gen = False
+    model.owns_reasoner = "reasoner" in owned_towers
+    model.owns_generator = "generator" in owned_towers
+
+    model.validate_loaded_weights(loaded)
+
+    # An empty checkpoint is still rejected, and the complaint names only the tower
+    # this stage owns -- the other one is never looked for.
+    with pytest.raises(ValueError, match="missing required weights") as excinfo:
+        model.validate_loaded_weights(set())
+    assert rejected not in str(excinfo.value)
+
+
 def test_edge_weight_validation_skips_pp_missing_layers(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm.model_executor.models import utils as model_utils
     from vllm.model_executor.models.utils import PPMissingLayer
@@ -548,6 +596,8 @@ def test_edge_weight_validation_skips_pp_missing_layers(monkeypatch: pytest.Monk
         model.num_hidden_layers = 2
         model.qk_norm_for_diffusion = True
         model.use_und_k_norm_for_gen = True
+        model.owns_reasoner = True
+        model.owns_generator = True
         # PP=2 layout from make_layers: each stage owns one GEN layer and the
         # UND backbone lives only on the first stage.
         model.language_model = nn.Linear(1, 1) if first else PPMissingLayer()
@@ -1574,6 +1624,62 @@ def test_compute_rope_freqs_places_text_video_action_and_sound_positions() -> No
     )
     _, offset_gen_pos = rotary.position_ids
     assert offset_gen_pos[0, 0].tolist() == [102, 103, 104, 105, 106, 107]
+
+
+# The loader builds each stage on its card, so an unowned tower must never be
+# constructed: building both and pruning one still pays the full peak.
+
+
+def _tower_transformer(owned_towers, num_hidden_layers: int = 2):
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
+
+    return Cosmos3VFMTransformer(
+        SimpleNamespace(
+            tf_model_config=_tiny_cosmos3_config(num_hidden_layers=num_hidden_layers),
+            dtype=torch.float32,
+        ),
+        owned_towers=owned_towers,
+    )
+
+
+def test_a_reasoner_only_transformer_builds_no_gen_blocks() -> None:
+    model = _tower_transformer(("reasoner",))
+
+    assert (model.owns_reasoner, model.owns_generator) == (True, False)
+    assert len(model.language_model.layers) == 2
+    assert len(model.gen_layers) == 0
+    # Still a real ModuleList: cache-dit and the offload rings introspect it.
+    assert isinstance(model.gen_layers, nn.ModuleList)
+
+
+def test_a_generator_only_transformer_builds_no_und_blocks() -> None:
+    model = _tower_transformer(("generator",))
+
+    assert (model.owns_reasoner, model.owns_generator) == (False, True)
+    assert len(model.gen_layers) == 2
+    assert len(model.language_model.layers) == 0
+    # No embedding table and no final norm either -- those are the reasoner's.
+    assert not hasattr(model.language_model, "embed_tokens")
+    assert not any(name.startswith("language_model.") for name, _ in model.named_parameters())
+
+
+@pytest.mark.parametrize(
+    ("owned_towers", "expected"),
+    [
+        (None, {"reasoner", "generator"}),
+        (("reasoner",), {"reasoner"}),
+        (("generator",), {"generator"}),
+    ],
+)
+def test_offload_components_cover_exactly_the_towers_this_stage_owns(owned_towers, expected) -> None:
+    """An advertised empty tower would evict the resident one on every forward."""
+    assert set(_tower_transformer(owned_towers)._model_cpu_offload_components()) == expected
+
+
+@pytest.mark.parametrize("owned_towers", [(), ("bogus",), ("reasoner", "bogus")])
+def test_an_unknown_or_empty_tower_selection_is_rejected(owned_towers) -> None:
+    with pytest.raises(ValueError, match="is not a non-empty subset of"):
+        _tower_transformer(owned_towers)
 
 
 def test_shard_gen_prep_rejects_inputs_already_in_execution_layout(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -822,6 +822,64 @@ def test_install_discovers_generation_and_opt_in_reasoner(monkeypatch) -> None:
     assert all(isinstance(layer.quant_method, Cosmos3MixedPrecisionLinearMethod) for layer in generation)
 
 
+class TestInstallOnATowerDisaggregatedStage:
+    """An unowned tower is an empty ModuleList; that must not read as "not quantized"."""
+
+    @staticmethod
+    def _fake_linear_cls():
+        class _FakeLinear(torch.nn.Module):
+            def __init__(self, prefix: str) -> None:
+                super().__init__()
+                self.prefix = prefix
+                self.input_size_per_partition = 4
+                self.output_size_per_partition = 2
+                self.quant_method = SimpleNamespace(name="fp8")
+
+        return _FakeLinear
+
+    @pytest.fixture
+    def linear_cls(self, monkeypatch):
+        cls = self._fake_linear_cls()
+        monkeypatch.setattr(runtime_impl, "LinearBase", cls)
+        strategy = Fp8W8A8W8A16Strategy()
+        monkeypatch.setattr(strategy, "accepts", lambda method: getattr(method, "name", None) == "fp8")
+        monkeypatch.setattr(runtime_impl, "_STRATEGIES", (strategy,))
+        return cls
+
+    @staticmethod
+    def _transformer(linear_cls, *, owns_reasoner: bool, owns_generator: bool):
+        return SimpleNamespace(
+            owns_reasoner=owns_reasoner,
+            owns_generator=owns_generator,
+            # The unowned tower is built empty, not omitted.
+            gen_layers=torch.nn.Sequential(*([linear_cls("generation.q_proj")] if owns_generator else [])),
+            language_model=SimpleNamespace(
+                layers=torch.nn.Sequential(*([linear_cls("reasoner.q_proj")] if owns_reasoner else [])),
+            ),
+        )
+
+    @pytest.mark.parametrize("reasoner", ["native", "a16"])
+    def test_reasoner_only_stage_installs(self, linear_cls, reasoner: str) -> None:
+        """``reasoner="native"`` on a reasoner-only stage wraps nothing and must not raise."""
+        transformer = self._transformer(linear_cls, owns_reasoner=True, owns_generator=False)
+        runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner=reasoner))
+
+        runtime.install(transformer)
+
+        wrapped = isinstance(transformer.language_model.layers[0].quant_method, Cosmos3MixedPrecisionLinearMethod)
+        assert wrapped is (reasoner == "a16")
+
+    @pytest.mark.parametrize("reasoner", ["native", "a16"])
+    def test_generator_only_stage_wraps_the_generation_path(self, linear_cls, reasoner: str) -> None:
+        """``reasoner="a16"`` must not look for layers on a replay stub."""
+        transformer = self._transformer(linear_cls, owns_reasoner=False, owns_generator=True)
+        runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig(reasoner=reasoner))
+
+        runtime.install(transformer)
+
+        assert isinstance(transformer.gen_layers[0].quant_method, Cosmos3MixedPrecisionLinearMethod)
+
+
 def test_install_skips_reasoner_on_non_first_pipeline_stage(monkeypatch) -> None:
     from vllm.model_executor.models.utils import PPMissingLayer
 

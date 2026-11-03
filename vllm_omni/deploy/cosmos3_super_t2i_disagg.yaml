@@ -1,0 +1,78 @@
+# nvidia/Cosmos3-Super-Text2Image, one stage per Mixture-of-Transformers tower:
+#
+#   stage 0 "reasoner"   UND tower          1 GPU
+#         |  per-layer text K/V (~256 KiB per token per branch, bf16)
+#   stage 1 "generator"  GEN tower + VAE    1 GPU  ->  image
+#
+# Each tower is ~58 GiB in bf16 and fits on one H200, so every parallel degree is
+# 1. The K/V handoff goes through the stage connector, not NCCL. The reasoner logs
+# each payload's size and warns past COSMOS3_UND_PAYLOAD_WARN_MIB.
+#
+# Parallelism is stage-local. The reasoner gathers the KV heads before the payload
+# leaves it, and each generator rank slices out its own heads, so the stages may use
+# different tensor_parallel_size values. Keep each a divisor of num_kv_heads (8):
+# the generator rejects a bad split at bind time (_check_head_range), but the
+# reasoner only fails later, inside attention.
+#
+# Only tensor_parallel_size is read from this file. Other degrees (ulysses, ring,
+# cfg, hsdp) set here do not reach the engine: pass them on the CLI
+# (--ulysses-degree, --cfg-parallel-size, ...) and check the startup banner. With
+# one card per stage, guided requests run both CFG branches sequentially on stage 1.
+#
+# The topology is declared in vllm_omni/diffusion/models/cosmos3_pipeline_config.py
+# and selected only by the `pipeline:` key, so other Cosmos3 deployments are unaffected.
+pipeline: cosmos3_omni_disagg
+
+# A T2I request is one indivisible unit; async_chunk would also require a
+# per-stage async_chunk_process_next_stage_input_func.
+async_chunk: false
+
+# No per-stage default_sampling_params: request-level params replace them on every
+# path, and the two stages must resolve identical text conditioning (the generator
+# looks branches up by a fingerprint of the tokenized prompt). Divergence fails the
+# request with a replay-table miss.
+stages:
+  # Stage 0: UND tower only. Runs once per request branch, then idles. It reads the
+  # VAE config for the latent scale factors but never loads the VAE weights.
+  #
+  # `devices` are logical indexes into the shared CUDA_VISIBLE_DEVICES, so "0" and
+  # "1" are two different cards.
+  - stage_id: 0
+    devices: "0"
+    # Cosmos3 does not support request batching; DiffusionEngine rejects > 1.
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    parallel_config:
+      tensor_parallel_size: 1
+      data_parallel_size: 1
+      pipeline_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      use_hsdp: false
+    engine_args:
+      model_config:
+        # Guardrails need `cosmos-guardrail`. Enable them on both stages or neither:
+        # stage 0 checks the prompt, stage 1 the decoded image.
+        guardrails: false
+
+  # Stage 1: GEN tower + VAE. The UND tower is a replay stub fed from stage 0, so
+  # no UND weights load here. sequence_parallel_size is derived from
+  # ulysses_degree * ring_degree; set those on the CLI, not here.
+  - stage_id: 1
+    devices: "1"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    parallel_config:
+      tensor_parallel_size: 1
+      data_parallel_size: 1
+      pipeline_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      use_hsdp: false
+    engine_args:
+      model_config:
+        guardrails: false

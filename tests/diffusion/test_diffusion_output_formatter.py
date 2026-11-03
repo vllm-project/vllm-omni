@@ -463,6 +463,56 @@ def test_format_empty_diffusion_outputs_preserves_custom_output() -> None:
     assert result.finished is False
 
 
+def test_formatter_drops_the_stage_handoff_payload_from_the_echoed_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``prompt["extra"]`` carries stage-to-stage tensors (e.g. Cosmos3's UND K/V);
+    it must not be echoed to the caller, but the request itself keeps it."""
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    kv = torch.zeros(1, 2, 2, 4)
+    prompt = {
+        "prompt": "a red car",
+        "negative_prompt": "blurry",
+        "modalities": ["image"],
+        "extra": {"cosmos3_und_kv": {"branch": [(kv, kv)]}},
+    }
+    request = _request(prompt)
+
+    [result] = format_diffusion_outputs(
+        request=request,
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data={"image": ["image-0"]},
+        postprocess_output=normalize_diffusion_postprocess_output({"image": ["image-0"]}),
+    )
+
+    assert result.prompt == {"prompt": "a red car", "negative_prompt": "blurry", "modalities": ["image"]}
+    assert "extra" in request.prompt
+
+
+def test_format_empty_diffusion_outputs_drops_the_stage_handoff_payload() -> None:
+    [result] = format_empty_diffusion_outputs(_request({"prompt": "p", "extra": {"k": torch.zeros(1)}}))
+
+    assert result.prompt == {"prompt": "p"}
+
+
+def test_formatter_leaves_prompts_without_a_handoff_payload_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(output_formatter, "supports_audio_output", lambda _: False)
+    prompt = {"prompt": "p", "modalities": ["image"]}
+
+    [result] = format_diffusion_outputs(
+        request=_request(prompt),
+        od_config=_config(),
+        diffusion_output=DiffusionOutput(output=None),
+        output_data={"image": ["image-0"]},
+        postprocess_output=normalize_diffusion_postprocess_output({"image": ["image-0"]}),
+    )
+
+    assert result.prompt is prompt
+
+
 @pytest.mark.parametrize("key", ["segmentation", "video_segmentation", "video_depth"])
 def test_formatter_routes_segmentation_payload_to_multimodal_output(
     monkeypatch: pytest.MonkeyPatch,
