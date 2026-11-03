@@ -163,7 +163,10 @@ def _apply_contiguous_kv_patch() -> None:
     try:
         import importlib
 
-        runner_module = importlib.import_module("vllm_ascend.worker.model_runner_v1")
+        try:
+            runner_module = importlib.import_module("vllm_ascend.worker.v1.model_runner")
+        except ImportError:
+            runner_module = importlib.import_module("vllm_ascend.worker.model_runner_v1")
     except Exception as error:  # pragma: no cover - non-ascend builds
         logger.warning("[npu] contiguous KV patch not applied: %s", error)
         return

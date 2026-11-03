@@ -1,12 +1,22 @@
-# Explicit CUDA Model Runner V2 profile. `qwen3_tts.yaml` now selects V2 by
-# default (experimental); this file is kept for scripts that name the MRV2
-# profile explicitly and for the platform fallbacks below.
+# Explicit Model Runner V2 profile for CUDA and NPU. The shipped default
+# keeps NPU on V1 until the NPU MRv2 hardware acceptance is complete.
 base_config: qwen3_tts.yaml
 model_runner: v2
 
 platforms:
   npu:
-    model_runner: v1
+    model_runner: v2
+    stages:
+      - stage_id: 0
+        # Ascend Talker supports PIECEWISE graph capture.
+        enforce_eager: false
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        # Code2Wav uses the MRv2 generation runner eagerly on Ascend.
+        enforce_eager: true
+        compilation_config:
+          cudagraph_mode: NONE
   xpu:
     model_runner: v1
   rocm:
