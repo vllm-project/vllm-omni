@@ -12,9 +12,9 @@ in a single attached browser. Neither produces something a CDN can fan out or a
 normal player can open, and neither measures when a frame first becomes visible.
 
 This packager turns each generated fragment into an LL-HLS *part* the moment it
-arrives, and republishes the playlist. Every generated chunk is 9 frames at 16fps
-in the reference config, which is 0.5625s: already part-sized, so no re-encoding
-and no transcode is involved. Bytes pass through untouched.
+arrives, and republishes the playlist. Bytes pass through untouched: no
+re-encoding and no transcode is involved. Each part's duration and whether it
+starts on a keyframe are read from the fragment's own boxes.
 
 The number that matters is not render time. It is prompt-to-glass: render, mux,
 write, publish, fetch, decode, first frame. This records the terms it can see.
@@ -25,7 +25,10 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from itertools import groupby
 from pathlib import Path
+
+from fmp4 import fragment_timing, track_timescale
 
 
 @dataclass
@@ -35,9 +38,11 @@ class PartRecord:
     index: int
     uri: str
     duration: float
+    independent: bool
     bytes: int
     received_at: float
     published_at: float
+    segment: int
 
     @property
     def publish_latency(self) -> float:
@@ -49,19 +54,20 @@ class PartRecord:
 class LLHLSPackager:
     """Write a live LL-HLS playlist as fragments arrive.
 
-    ``parts_per_segment`` groups parts into segments. With 0.5625s parts, 4 parts
-    gives 2.25s segments, which keeps the playlist small while staying inside the
-    usual 3x target-duration guidance for part hold-back.
+    Each fragment is one part. A parent segment closes when a keyframe-led part
+    arrives, so every segment starts on a keyframe and a late joiner can begin
+    decoding at any segment boundary. Segment length follows the stream's GOP
+    structure rather than a fixed part count.
     """
 
     out_dir: Path
-    part_duration: float
-    parts_per_segment: int = 4
     playlist_name: str = "stream.m3u8"
 
+    _timescale: int = 0
     _parts: list[PartRecord] = field(default_factory=list)
-    _pending: list[bytes] = field(default_factory=list)
-    _segment_index: int = 0
+    _pending: list[bytes] = field(default_factory=list)  # bytes of the open segment
+    _pending_duration: float = 0.0
+    _segment_durations: list[float] = field(default_factory=list)  # closed segments
     _t0: float | None = None
     started_at: float | None = None
 
@@ -74,8 +80,10 @@ class LLHLSPackager:
         """Write the init segment and mark the clock start.
 
         Called once, on the first fragment. The init segment becomes EXT-X-MAP,
-        which every player fetches before any media.
+        which every player fetches before any media. Its timescale converts each
+        fragment's sample durations to seconds.
         """
+        self._timescale = track_timescale(init_segment)
         self._t0 = time.perf_counter()
         self.started_at = self._t0
         (self.out_dir / "init.mp4").write_bytes(init_segment)
@@ -90,29 +98,28 @@ class LLHLSPackager:
         if self._t0 is None:
             raise RuntimeError("start() must be called with the init segment first")
         received_at = received_at if received_at is not None else time.perf_counter()
+        timing = fragment_timing(data, self._timescale)
+
+        # A keyframe starts a new parent segment. The segment being closed is written
+        # to disk here, before the playlist that lists it is updated.
+        if self._pending and timing.independent:
+            self._close_segment()
 
         index = len(self._parts)
         uri = f"part{index:05d}.m4s"
         (self.out_dir / uri).write_bytes(data)
         self._pending.append(data)
-
-        # A part belongs to a parent segment. When the segment completes, that
-        # full segment file has to exist on disk: LL-HLS players fetch parts for
-        # the live edge, but ordinary players and anyone joining late fetch the
-        # segment. Writing only parts leaves those requests 404ing.
-        if len(self._pending) == self.parts_per_segment:
-            seg = f"segment{self._segment_index:05d}.m4s"
-            (self.out_dir / seg).write_bytes(b"".join(self._pending))
-            self._segment_index += 1
-            self._pending.clear()
+        self._pending_duration += timing.duration
 
         record = PartRecord(
             index=index,
             uri=uri,
-            duration=self.part_duration,
+            duration=timing.duration,
+            independent=timing.independent,
             bytes=len(data),
             received_at=received_at,
             published_at=0.0,
+            segment=len(self._segment_durations),
         )
         self._parts.append(record)
         self._write_playlist()
@@ -120,46 +127,54 @@ class LLHLSPackager:
         return record
 
     def finish(self) -> None:
-        """Flush any partial trailing segment, then append the end marker."""
+        """Close the open segment, then append the end marker."""
         if self._pending:
-            seg = f"segment{self._segment_index:05d}.m4s"
-            (self.out_dir / seg).write_bytes(b"".join(self._pending))
-            self._segment_index += 1
-            self._pending.clear()
+            self._close_segment()
         self._write_playlist(ended=True)
+
+    def _close_segment(self) -> None:
+        """Write the open segment's file and make it an advertised, closed segment."""
+        seg = f"segment{len(self._segment_durations):05d}.m4s"
+        (self.out_dir / seg).write_bytes(b"".join(self._pending))
+        self._segment_durations.append(self._pending_duration)
+        self._pending.clear()
+        self._pending_duration = 0.0
 
     # -- playlist ------------------------------------------------------------
 
     def _write_playlist(self, ended: bool = False) -> None:
-        seg_dur = self.part_duration * self.parts_per_segment
+        part_target = max((p.duration for p in self._parts), default=0.0)
+        durations = self._segment_durations
+        longest = max([*durations, self._pending_duration])
         lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:9",
-            f"#EXT-X-TARGETDURATION:{max(1, round(seg_dur))}",
-            f"#EXT-X-PART-INF:PART-TARGET={self.part_duration:.5f}",
-            # Part hold-back must be at least three part durations per the spec.
-            f"#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,PART-HOLD-BACK={self.part_duration * 3:.5f}",
+            f"#EXT-X-TARGETDURATION:{max(1, round(longest))}",
+            f"#EXT-X-PART-INF:PART-TARGET={part_target:.5f}",
+            # Hold-back is three part targets, as the spec requires. There is no
+            # CAN-BLOCK-RELOAD: a static file server cannot hold a playlist reload,
+            # so the playlist does not claim one.
+            f"#EXT-X-SERVER-CONTROL:PART-HOLD-BACK={part_target * 3:.5f}",
             "#EXT-X-MEDIA-SEQUENCE:0",
             '#EXT-X-MAP:URI="init.mp4"',
         ]
 
-        for i, part in enumerate(self._parts):
-            lines.append(f'#EXT-X-PART:DURATION={part.duration:.5f},URI="{part.uri}",INDEPENDENT=YES')
-            # Close a segment every parts_per_segment parts. The parts are the
-            # media; EXTINF here just gives non-LL players a segment boundary.
-            if (i + 1) % self.parts_per_segment == 0:
-                lines.append(f"#EXTINF:{seg_dur:.5f},")
-                lines.append(f"segment{i // self.parts_per_segment:05d}.m4s")
+        # Each segment's parts are listed, then its EXTINF and URI. The URI appears
+        # only once the segment is closed and its file is on disk.
+        for seg, parts in groupby(self._parts, key=lambda p: p.segment):
+            for part in parts:
+                attrs = f'DURATION={part.duration:.5f},URI="{part.uri}"'
+                if part.independent:
+                    attrs += ",INDEPENDENT=YES"
+                lines.append(f"#EXT-X-PART:{attrs}")
+            if seg < len(durations):
+                lines.append(f"#EXTINF:{durations[seg]:.5f},")
+                lines.append(f"segment{seg:05d}.m4s")
 
         if ended:
-            leftover = len(self._parts) % self.parts_per_segment
-            if leftover:
-                lines.append(f"#EXTINF:{self.part_duration * leftover:.5f},")
-                lines.append(f"segment{len(self._parts) // self.parts_per_segment:05d}.m4s")
             lines.append("#EXT-X-ENDLIST")
         else:
-            nxt = f"part{len(self._parts):05d}.m4s"
-            lines.append(f'#EXT-X-PRELOAD-HINT:TYPE=PART,URI="{nxt}"')
+            lines.append(f'#EXT-X-PRELOAD-HINT:TYPE=PART,URI="part{len(self._parts):05d}.m4s"')
 
         (self.out_dir / self.playlist_name).write_text("\n".join(lines) + "\n")
 
@@ -170,11 +185,12 @@ class LLHLSPackager:
         if not self._parts or self._t0 is None:
             return {}
         first = self._parts[0]
-        media_seconds = len(self._parts) * self.part_duration
+        media_seconds = sum(p.duration for p in self._parts)
         wall = self._parts[-1].published_at - self._t0
         pub = [p.publish_latency for p in self._parts]
         return {
             "parts": len(self._parts),
+            "segments": len(self._segment_durations) + (1 if self._pending else 0),
             "media_seconds": round(media_seconds, 3),
             "wall_seconds": round(wall, 3),
             "realtime_factor": round(media_seconds / wall, 3) if wall > 0 else None,

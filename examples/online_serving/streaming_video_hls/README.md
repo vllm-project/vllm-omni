@@ -33,6 +33,13 @@ step from LL-HLS. This takes that step.
 WebSocket framing and MP4 box boundaries are independent, so the splitter accepts bytes
 in any slicing rather than assuming one binary frame equals one fragment.
 
+Each part's duration and keyframe flag come from its fragment's own `trun` and `tfhd`
+boxes, not from the generation chunk size. A parent segment closes at every fragment
+that starts on a keyframe, so each segment starts on a keyframe and a late joiner can
+begin decoding at any segment. Segment length therefore follows the server's keyframe
+interval. The playlist does not advertise blocking reload: a static file server cannot
+hold a reload, so players poll and use the preload hint for the live edge.
+
 ## Run
 
 Start a server as in `streaming_video_generation/README.md`:
@@ -62,6 +69,7 @@ python -m http.server 8080 --directory out/live
 ```json
 {
   "parts": 11,
+  "segments": 11,
   "media_seconds": 6.188,
   "realtime_factor": 10.281,
   "publish_latency_ms": { "mean": 0.771, "max": 2.903 },

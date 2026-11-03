@@ -21,7 +21,7 @@ Requires ``websockets`` (the upstream example already depends on it):
 
 Usage:
 
-    python3 src/client.py --host 127.0.0.1 --port 8000 \\
+    python3 hls_client.py --host 127.0.0.1 --port 8000 \\
         --model BestWishYsh/Helios-Distilled \\
         --prompt "A serene lakeside sunrise with mist over the water." \\
         --width 640 --height 384 --fps 16 --num-frames 99 \\
@@ -87,68 +87,68 @@ async def run(a: argparse.Namespace) -> int:
     out = Path(a.out)
     splitter = FragmentedMP4Splitter()
     packager: LLHLSPackager | None = None
-    part_duration: float | None = None
 
     marks: dict[str, float] = {}
     chunks = 0
     started = False
 
-    # max_size=None: fragments can exceed the default 1MiB frame cap.
-    async with websockets.connect(url, max_size=None, open_timeout=a.timeout) as ws:
-        marks["connected"] = time.perf_counter()
-        await ws.send(json.dumps(build_session_start(a)))
-        marks["session_start_sent"] = time.perf_counter()
-        print(f"connected {url}")
+    try:
+        # max_size=None: fragments can exceed the default 1MiB frame cap.
+        async with websockets.connect(url, max_size=None, open_timeout=a.timeout) as ws:
+            marks["connected"] = time.perf_counter()
+            await ws.send(json.dumps(build_session_start(a)))
+            marks["session_start_sent"] = time.perf_counter()
+            print(f"connected {url}")
 
-        async for message in ws:
-            now = time.perf_counter()
+            async for message in ws:
+                now = time.perf_counter()
 
-            if isinstance(message, (bytes, bytearray)):
-                marks.setdefault("first_binary", now)
-                for frag in splitter.feed(bytes(message)):
-                    if not started:
-                        if splitter.init_segment is None:
-                            print("fragment before init segment; cannot package", file=sys.stderr)
-                            return 1
-                        packager = LLHLSPackager(out_dir=out, part_duration=part_duration or 9 / 16)
-                        packager.start(splitter.init_segment)
-                        marks["init_written"] = time.perf_counter()
-                        started = True
-                    assert packager is not None
-                    rec = packager.add_fragment(frag, received_at=now)
-                    marks.setdefault("first_part_published", rec.published_at)
-                    chunks += 1
-                    print(f"  part {rec.index:>3}  {rec.bytes:>8}B  publish {rec.publish_latency * 1000:.2f}ms")
-                continue
+                if isinstance(message, (bytes, bytearray)):
+                    marks.setdefault("first_binary", now)
+                    for frag in splitter.feed(bytes(message)):
+                        if not started:
+                            if splitter.init_segment is None:
+                                print("fragment before init segment; cannot package", file=sys.stderr)
+                                return 1
+                            packager = LLHLSPackager(out_dir=out)
+                            packager.start(splitter.init_segment)
+                            marks["init_written"] = time.perf_counter()
+                            started = True
+                        assert packager is not None
+                        rec = packager.add_fragment(frag, received_at=now)
+                        marks.setdefault("first_part_published", rec.published_at)
+                        chunks += 1
+                        frame_type = "keyframe" if rec.independent else "delta"
+                        print(f"  part {rec.index:>3}  {rec.duration:.4f}s  {frame_type:<8}  "
+                              f"{rec.bytes:>8}B  publish {rec.publish_latency * 1000:.2f}ms")
+                    continue
 
-            msg = json.loads(message)
-            kind = msg.get("type")
+                msg = json.loads(message)
+                kind = msg.get("type")
 
-            if kind == "video.start":
-                marks["video_start"] = now
-                cfg = msg.get("config") or {}
-                fps = cfg.get("fps") or a.fps
-                # Derive part duration from the first metadata rather than assuming:
-                # frames-per-chunk is a model/config property, not a constant.
-                print(f"video.start request_id={msg.get('request_id')} fps={fps}")
-            elif kind == "video.chunk_metadata":
-                nf = msg.get("num_frames")
-                if part_duration is None and nf:
-                    part_duration = nf / (a.fps or 16)
-                    print(f"  chunk shape: {nf} frames -> part duration {part_duration:.5f}s")
-            elif kind == "session.done":
-                marks["session_done"] = now
-                print(f"session.done chunks={msg.get('chunks')} stopped={msg.get('stopped')}")
-                break
-            elif kind == "error":
-                print(f"server error: {msg.get('message')}", file=sys.stderr)
-                return 1
+                if kind == "video.start":
+                    marks["video_start"] = now
+                    cfg = msg.get("config") or {}
+                    fps = cfg.get("fps") or a.fps
+                    print(f"video.start request_id={msg.get('request_id')} fps={fps}")
+                elif kind == "session.done":
+                    marks["session_done"] = now
+                    print(f"session.done chunks={msg.get('chunks')} stopped={msg.get('stopped')}")
+                    break
+                elif kind == "error":
+                    print(f"server error: {msg.get('message')}", file=sys.stderr)
+                    return 1
+    finally:
+        # Close the playlist on every exit, including a server error or a dropped
+        # socket. Otherwise a viewer who already opened it waits on parts that will
+        # never arrive.
+        if packager is not None:
+            packager.finish()
 
     if packager is None:
         print("no fragments received", file=sys.stderr)
         return 1
 
-    packager.finish()
     report = packager.report()
 
     t0 = marks["session_start_sent"]

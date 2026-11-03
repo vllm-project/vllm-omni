@@ -121,3 +121,160 @@ class FragmentedMP4Splitter:
     def buffered(self) -> int:
         """Bytes held pending a complete box. Useful as a stall signal."""
         return len(self._buf)
+
+
+# Sample flag bits from ISO/IEC 14496-12. A set sample_is_non_sync_sample bit means
+# the sample cannot be decoded without earlier samples.
+_NON_SYNC = 0x00010000
+
+_TFHD_BASE_DATA_OFFSET = 0x000001
+_TFHD_SAMPLE_DESCRIPTION = 0x000002
+_TFHD_DEFAULT_DURATION = 0x000008
+_TFHD_DEFAULT_SIZE = 0x000010
+_TFHD_DEFAULT_FLAGS = 0x000020
+
+_TRUN_DATA_OFFSET = 0x000001
+_TRUN_FIRST_SAMPLE_FLAGS = 0x000004
+_TRUN_SAMPLE_DURATION = 0x000100
+_TRUN_SAMPLE_SIZE = 0x000200
+_TRUN_SAMPLE_FLAGS = 0x000400
+_TRUN_SAMPLE_COMPOSITION = 0x000800
+
+
+def _u32(buf: bytes, pos: int) -> int:
+    return struct.unpack_from(">I", buf, pos)[0]
+
+
+def _children(buf: bytes, start: int, end: int):
+    """Yield (type, payload_start, box_end) for each child box in buf[start:end]."""
+    i = start
+    while i + 8 <= end:
+        size = _u32(buf, i)
+        typ = buf[i + 4 : i + 8].decode("latin-1")
+        header = 8
+        if size == 1:
+            size = struct.unpack_from(">Q", buf, i + 8)[0]
+            header = 16
+        elif size == 0:
+            size = end - i
+        if size < header or i + size > end:
+            return
+        yield typ, i + header, i + size
+        i += size
+
+
+def _find(buf: bytes, start: int, end: int, *path: str) -> tuple[int, int] | None:
+    """Payload range of the first box at ``path``, nested under buf[start:end]."""
+    for typ, p0, p1 in _children(buf, start, end):
+        if typ == path[0]:
+            if len(path) == 1:
+                return p0, p1
+            return _find(buf, p0, p1, *path[1:])
+    return None
+
+
+def track_timescale(init: bytes) -> int:
+    """Ticks per second of the track in an init segment, from its mdhd box."""
+    found = _find(init, 0, len(init), "moov", "trak", "mdia", "mdhd")
+    if found is None:
+        raise ValueError("init segment has no mdhd box")
+    p0, _ = found
+    # mdhd payload: version and flags, then creation and modification times (8 bytes
+    # each in version 0, 16 each in version 1), then the timescale.
+    version = init[p0]
+    return _u32(init, p0 + 4 + (16 if version == 1 else 8))
+
+
+@dataclass(frozen=True)
+class FragmentTiming:
+    """What a media fragment declares about its own timing."""
+
+    duration: float  # seconds of media in the fragment
+    independent: bool  # first sample is a sync sample: a player can start decoding here
+
+
+def _tfhd_defaults(buf: bytes, p0: int) -> tuple[int | None, int | None]:
+    """The tfhd default sample duration and default sample flags, if present."""
+    flags = _u32(buf, p0) & 0xFFFFFF
+    pos = p0 + 8  # version and flags, then track_ID
+    if flags & _TFHD_BASE_DATA_OFFSET:
+        pos += 8
+    if flags & _TFHD_SAMPLE_DESCRIPTION:
+        pos += 4
+    default_duration = None
+    if flags & _TFHD_DEFAULT_DURATION:
+        default_duration = _u32(buf, pos)
+        pos += 4
+    if flags & _TFHD_DEFAULT_SIZE:
+        pos += 4
+    default_flags = _u32(buf, pos) if flags & _TFHD_DEFAULT_FLAGS else None
+    return default_duration, default_flags
+
+
+def _trun(buf: bytes, p0: int, default_duration: int | None, default_flags: int | None) -> tuple[int, bool]:
+    """Total ticks in one trun, and whether its first sample is a sync sample."""
+    flags = _u32(buf, p0) & 0xFFFFFF
+    count = _u32(buf, p0 + 4)
+    pos = p0 + 8
+    if flags & _TRUN_DATA_OFFSET:
+        pos += 4
+    first_flags = None
+    if flags & _TRUN_FIRST_SAMPLE_FLAGS:
+        first_flags = _u32(buf, pos)
+        pos += 4
+
+    ticks = 0
+    first_sync = False
+    for n in range(count):
+        duration = default_duration
+        if flags & _TRUN_SAMPLE_DURATION:
+            duration = _u32(buf, pos)
+            pos += 4
+        if flags & _TRUN_SAMPLE_SIZE:
+            pos += 4
+        sample_flags = default_flags
+        if flags & _TRUN_SAMPLE_FLAGS:
+            sample_flags = _u32(buf, pos)
+            pos += 4
+        if flags & _TRUN_SAMPLE_COMPOSITION:
+            pos += 4
+        if duration is None:
+            raise ValueError("sample has no duration: no trun duration and no tfhd default")
+        ticks += duration
+        if n == 0:
+            if first_flags is not None:
+                sample_flags = first_flags
+            # Unknown flags count as not independent. Claiming a keyframe we cannot
+            # see would send players to a frame they cannot decode.
+            first_sync = sample_flags is not None and not (sample_flags & _NON_SYNC)
+    return ticks, first_sync
+
+
+def fragment_timing(fragment: bytes, timescale: int) -> FragmentTiming:
+    """Read a moof+mdat fragment's duration and whether it starts on a keyframe.
+
+    Durations come from the sample durations in each trun, falling back to the
+    tfhd default. Independence comes from the first sample's sync flag.
+    """
+    moof = _find(fragment, 0, len(fragment), "moof")
+    if moof is None:
+        raise ValueError("fragment has no moof box")
+    traf = _find(fragment, moof[0], moof[1], "traf")
+    if traf is None:
+        raise ValueError("moof has no traf box")
+
+    ticks = 0
+    first_sync: bool | None = None
+    default_duration: int | None = None
+    default_flags: int | None = None
+    for typ, p0, _ in _children(fragment, traf[0], traf[1]):
+        if typ == "tfhd":
+            default_duration, default_flags = _tfhd_defaults(fragment, p0)
+        elif typ == "trun":
+            run_ticks, run_sync = _trun(fragment, p0, default_duration, default_flags)
+            ticks += run_ticks
+            if first_sync is None:
+                first_sync = run_sync
+    if first_sync is None:
+        raise ValueError("traf has no trun")
+    return FragmentTiming(duration=ticks / timescale, independent=first_sync)
