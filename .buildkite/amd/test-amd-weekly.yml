@@ -287,6 +287,101 @@ steps:
             fi
             (exit "$$status")
 
+      # CUDA weekly names these files at core_model and also sweeps slow Omni
+      # cases at full_model. MERGE already runs the same eight nodes at
+      # core_model. This weekly job is the full-weight contract. Both files
+      # are MI325 cards_2; CUDA's offline mark is cards_4 and is not claimed.
+      - label: "Qwen2.5-Omni expansion · 2-GPU"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 195
+        source_file_dependencies: omni_qwen2_5_omni_expansion
+        artifact_paths:
+          - artifacts/rocm-qwen25-omni-weekly/**/*
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export ROCM_QWEN25_WEEKLY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen25-omni-weekly"
+          - mkdir -p "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_mix_to_text_audio_001[omni_server0]"
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_audio_in_video_boundaries[False-omni_server0]"
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_audio_in_video_boundaries[True-omni_server0]"
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_text_to_text_001[omni_server0]"
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_speaker_001[Chelsie-omni_server0]"
+              "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py::test_speaker_001[ETHAN-omni_server0]"
+              "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py::test_mix_to_audio[omni_runner0-rocm]"
+              "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py::test_text_to_text[omni_runner0-rocm]"
+            )
+            printf '%s\n' "$${nodes[@]}" | sort > \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/expected-nodes.txt"
+            pytest -q \
+              tests/e2e/online_serving/test_qwen2_5_omni_expansion.py \
+              tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py \
+              -m "slow and rocm and MI325 and omni and cards_2" \
+              --collect-only \
+              --run-level full_model \
+              --shard-id=0 --num-shards=1 \
+              | tee "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/collection.log"
+            collection_status="$${PIPESTATUS[0]}"
+            if [[ "$$collection_status" -ne 0 ]]; then
+              exit "$$collection_status"
+            fi
+            sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/collection.log" \
+              | sort > "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/collected-nodes.txt"
+            if ! diff -u \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/expected-nodes.txt" \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/collected-nodes.txt"
+            then
+              echo "Expected exactly eight Qwen2.5-Omni weekly ROCm nodes; collection drifted." >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra \
+                tests/e2e/online_serving/test_qwen2_5_omni_expansion.py \
+                tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py \
+                -m "slow and rocm and MI325 and omni and cards_2" \
+                --run-level full_model \
+                --shard-id=0 --num-shards=1 \
+                --junitxml="$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 8 or skipped != 0:
+                print(
+                    f"Expected exactly eight executed Qwen2.5-Omni weekly tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN25_WEEKLY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
   - group: "HunyuanImage Expert Parallel"
     steps:
       - label: "HunyuanImage Expert Parallel Startup"

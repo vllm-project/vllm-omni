@@ -1509,6 +1509,26 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
             "omni_ming_flash_omni_function",
             "Expected exactly seven executed Ming-flash-omni offline tests",
         ),
+        "Qwen2.5-Omni expansion · 2-GPU": (
+            "mi300_2",
+            195,
+            "cards_2",
+            "tests/e2e/online_serving/test_qwen2_5_omni_expansion.py",
+            (
+                "test_mix_to_text_audio_001[omni_server0]",
+                "test_audio_in_video_boundaries[False-omni_server0]",
+                "test_audio_in_video_boundaries[True-omni_server0]",
+                "test_text_to_text_001[omni_server0]",
+                "test_speaker_001[Chelsie-omni_server0]",
+                "test_speaker_001[ETHAN-omni_server0]",
+                "test_mix_to_audio[omni_runner0-rocm]",
+                "test_text_to_text[omni_runner0-rocm]",
+            ),
+            "artifacts/rocm-qwen25-omni-weekly/**/*",
+            "Expected exactly eight Qwen2.5-Omni weekly ROCm nodes",
+            "omni_qwen2_5_omni_expansion",
+            "Expected exactly eight executed Qwen2.5-Omni weekly tests",
+        ),
     }
 
     assert group["group"] == "Omni E2E Weekly"
@@ -1545,11 +1565,60 @@ def test_weekly_omni_e2e_is_full_weight_and_weekly_only() -> None:
     assert "test_audio_to_text_audio_001" not in mimo_command
     assert "tests/e2e/online_serving/test_ming_flash_omni_expansion.py" not in weekly_text
     assert "test_covo_audio_expansion.py" not in weekly_text
-    assert "test_qwen2_5_omni_expansion.py" not in weekly_text
+    qwen_deps = dependencies["omni_qwen2_5_omni_expansion"]
+    for dependency in (
+        "tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py",
+        "tests/conftest.py",
+        "tests/helpers/client.py",
+        "tests/helpers/fixtures/runtime.py",
+        "tests/helpers/runtime.py",
+    ):
+        assert dependency in qwen_deps
+    qwen_weekly = "\n".join(_find_step("Qwen2.5-Omni expansion · 2-GPU", AMD_WEEKLY_PIPELINE)["commands"])
+    assert 'collection_status="$${PIPESTATUS[0]}"' in qwen_weekly
+    merge_qwen = "\n".join(_find_step("Omni Model Test Qwen2-5-Omni", AMD_MERGE_PIPELINE)["commands"])
+    assert len(re.findall(r"--run-level\s+['\"]?core_model['\"]?", merge_qwen)) == 2
+    merge_text = AMD_MERGE_PIPELINE.read_text(encoding="utf-8")
+    assert "Qwen2.5-Omni expansion · 2-GPU" not in merge_text
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         for label in jobs:
             assert label not in text
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 8, 0, None, 0),
+        (0, 8, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 8, 0, None, 1),
+        (0, 8, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_qwen25_omni_weekly_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Qwen2.5-Omni expansion · 2-GPU",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly eight executed Qwen2.5-Omni weekly tests",
+        artifact_env="ROCM_QWEN25_WEEKLY_ARTIFACT_DIR",
+        job_id_prefix="qwen25-omni-weekly-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
 
 
 def test_cosyvoice_offline_zero_shot_runs_nightly_on_rocm() -> None:
