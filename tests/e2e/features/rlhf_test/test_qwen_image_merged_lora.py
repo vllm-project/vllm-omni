@@ -60,16 +60,20 @@ async def test_qwen_image_merged_lora_changes_and_restores_generation():
         targets = [
             (name, module)
             for name, module in pipeline.named_modules()
-            if name.startswith("transformer.") and name.endswith(".to_q") and hasattr(module, "input_size")
+            if name.startswith("transformer.") and name.endswith(".to_qkv") and hasattr(module, "input_size")
         ]
-        assert targets, "No Qwen-Image transformer to_q projection found"
+        assert targets, "No Qwen-Image transformer to_qkv projection found"
         name, projection = targets[0]
         weight = projection.weight
         base = weight.detach().clone()
         pointer = weight.data_ptr()
-        prefix = f"base_model.model.{name}"
+        # Factors ride the checkpoint-side to_q name; the engine packs them
+        # onto the fused to_qkv's q rows via stacked_params_mapping.
+        checkpoint_name = name.replace(".to_qkv", ".to_q")
+        prefix = f"base_model.model.{checkpoint_name}"
         a = torch.ones(1, projection.input_size, dtype=torch.float16)
-        b = torch.full((projection.output_size, 1), 32, dtype=torch.float16)
+        q_rows = projection.total_num_heads * projection.head_size
+        b = torch.full((q_rows, 1), 32, dtype=torch.float16)
         await engine.init_weight_transfer_engine({"packed": False})
         torch.accelerator.reset_peak_memory_stats()
         memory_before = (torch.accelerator.memory_allocated(), torch.accelerator.memory_reserved())
