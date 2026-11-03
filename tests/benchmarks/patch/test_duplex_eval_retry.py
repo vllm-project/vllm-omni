@@ -388,9 +388,7 @@ async def test_timeout_logging_distinguishes_inner_and_outer_timeouts(monkeypatc
     clock = _FakeClock()
     logged: list[str] = []
     monkeypatch.setattr(patch, "_omni_request_timeout_s", lambda: 50.0)
-    monkeypatch.setattr(
-        patch, "logger", SimpleNamespace(warning=lambda message, *args: logged.append(message % args))
-    )
+    monkeypatch.setattr(patch, "logger", SimpleNamespace(warning=lambda message, *args: logged.append(message % args)))
     second = _session_result()
 
     async def generate_sample(*_args, **_kwargs):

@@ -123,9 +123,7 @@ def test_the_fake_client_mirrors_the_real_client_surface() -> None:
     ``RealtimeDuplexClient`` had no such method: the swallowed
     ``AttributeError`` ended the padding with zero units sent.
     """
-    real_coroutines = {
-        name for name, attr in vars(RealtimeDuplexClient).items() if asyncio.iscoroutinefunction(attr)
-    }
+    real_coroutines = {name for name, attr in vars(RealtimeDuplexClient).items() if asyncio.iscoroutinefunction(attr)}
     fake_coroutines = {name for name, attr in vars(_RecordingClient).items() if asyncio.iscoroutinefunction(attr)}
 
     assert fake_coroutines <= real_coroutines
@@ -170,9 +168,7 @@ async def test_padding_works_against_the_real_client() -> None:
     assert first["duration_ms"] == 20
     assert first["audio_end_ms"] == 20
     assert base64.b64decode(first["audio"]) == bytes(640)  # 20 ms of zeroed PCM16
-    assert [event["audio_end_ms"] for event in sent] == sorted(
-        event["audio_end_ms"] for event in sent
-    )
+    assert [event["audio_end_ms"] for event in sent] == sorted(event["audio_end_ms"] for event in sent)
 
 
 async def test_sample_pads_only_after_its_commit(monkeypatch, tmp_path) -> None:
@@ -287,4 +283,3 @@ async def test_stalled_input_is_bounded_and_the_sample_still_lands(monkeypatch, 
     assert result.metadata["response_done"] is True
     assert result.metadata["input_timeout"] in result.error
     assert result.output.exists()  # the sample still lands its artifacts
-
