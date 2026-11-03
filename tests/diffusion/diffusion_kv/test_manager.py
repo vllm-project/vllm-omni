@@ -217,6 +217,42 @@ def test_lru_evicts_many_distinct_prefixes_without_exhausting_pool(num_rows: int
         )
 
 
+@pytest.mark.parametrize(("atomic_spans", "expected_hit"), [((), 8), (((1, 10),), 0)])
+def test_partial_hit_rolls_back_when_cow_exceeds_pool_capacity(atomic_spans, expected_hit) -> None:
+    manager = _manager(5, enable_prefix_caching=True, cache_granularity=1)
+    cold = _request("cold", 0, prefix_len=10, seq_len=14, cache_token_ids=range(10), atomic_cache_spans=atomic_spans)
+    assert manager.reserve_request("cold", (cold,)) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    warm = _request("warm", 0, prefix_len=10, seq_len=14, cache_token_ids=range(10), atomic_cache_spans=atomic_spans)
+    metadata = manager.reserve_request("warm", (warm,))
+    assert metadata is not None
+    assert metadata.sequences[0].cached_prefix_len == expected_hit
+    assert not metadata.block_copies
+    manager.free_request("warm")
+    assert manager.native_manager.block_pool.get_num_free_blocks() == 4
+
+
+def test_cow_capacity_rollback_preserves_shared_cfg_pages() -> None:
+    manager = _manager(7, enable_prefix_caching=True, cache_granularity=1)
+    cold = _request("cold", 0, prefix_len=10, seq_len=14, cache_token_ids=range(10))
+    assert manager.reserve_request("cold", (cold,)) is not None
+    manager.publish_request("cold")
+    manager.free_request("cold")
+
+    # Two cold rows need eight pages, but sharing two complete prefix pages
+    # lets both rows fit in the six-page pool without a partial-tail COW.
+    rows = tuple(_request("warm", i, prefix_len=10, seq_len=14, cache_token_ids=range(10)) for i in range(2))
+    metadata = manager.reserve_request("warm", rows)
+    assert metadata is not None
+    assert [row.cached_prefix_len for row in metadata.sequences] == [8, 8]
+    assert not metadata.block_copies
+    assert metadata.sequences[0].block_ids[0][:2] == metadata.sequences[1].block_ids[0][:2]
+    manager.free_request("warm")
+    assert manager.native_manager.block_pool.get_num_free_blocks() == 6
+
+
 def test_lru_reclaims_partial_cow_aliases_and_retained_blocks() -> None:
     # Native caching reserves one null block; six configured blocks leave the
     # five physical blocks required by four request pages plus one COW source.

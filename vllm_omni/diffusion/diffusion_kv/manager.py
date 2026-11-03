@@ -276,29 +276,35 @@ class DiffusionKVCacheManager:
             for request, result in zip(requests, hit_results, strict=True)
         ]
         cached_prefix_len = min(safe_hit_lens)
-        # A boundary safe for one CFG row can bisect another row's atomic
-        # span. Roll back until the shared boundary is safe for every row.
-        while True:
-            common_safe_len = min(self._safe_cached_prefix_len(request, cached_prefix_len) for request in requests)
-            if common_safe_len == cached_prefix_len:
-                break
-            cached_prefix_len = common_safe_len
-        computed_blocks = [
-            self._clip_computed_blocks(
-                result[0],
-                hit_len=result[1],
-                cached_prefix_len=cached_prefix_len,
-            )
-            for result in hit_results
-        ]
         for request, result in zip(requests, hit_results, strict=True):
             request.shared_prefix_boundary = result[2]
 
-        required_blocks = self._get_empty_pool_required_blocks(
-            requests,
-            computed_blocks,
-            cached_prefix_len,
-        )
+        while True:
+            # A boundary safe for one CFG row can bisect another row's atomic
+            # span. Roll back until the shared boundary is safe for every row.
+            while True:
+                common_safe_len = min(self._safe_cached_prefix_len(request, cached_prefix_len) for request in requests)
+                if common_safe_len == cached_prefix_len:
+                    break
+                cached_prefix_len = common_safe_len
+            computed_blocks = [
+                self._clip_computed_blocks(
+                    result[0],
+                    hit_len=result[1],
+                    cached_prefix_len=cached_prefix_len,
+                )
+                for result in hit_results
+            ]
+            required_blocks = self._get_empty_pool_required_blocks(requests, computed_blocks, cached_prefix_len)
+            if required_blocks <= self._empty_pool_num_free_blocks or cached_prefix_len == 0:
+                break
+            # A partial tail retains a source page in addition to its private
+            # COW destination. Try a shorter hit before rejecting a request
+            # that would fit cold. Preserve shared CFG pages where possible.
+            cached_prefix_len = max(
+                (cached_prefix_len - 1) // int(group.kv_cache_spec.block_size) * int(group.kv_cache_spec.block_size)
+                for group in self.native_manager.kv_cache_config.kv_cache_groups
+            )
         if required_blocks > self._empty_pool_num_free_blocks:
             raise DiffusionKVAdmissionError(
                 f"Diffusion KV request {public_request_id!r} cannot fit even when the block pool is empty: "
