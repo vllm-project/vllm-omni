@@ -7,7 +7,7 @@ import torch
 
 from tests.diffusion.models.taomate_h3.test_taomate_h3_cpu import _native_manager_case
 from tests.helpers.mark import hardware_marks
-from vllm_omni.diffusion.models.taomate_h3.cuda_graph import GraphedForward
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 
 pytestmark = [
     pytest.mark.core_model,
