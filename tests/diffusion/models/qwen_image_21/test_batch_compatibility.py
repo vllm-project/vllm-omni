@@ -196,6 +196,7 @@ def test_preprocess_stages_rgba_vae_images_and_resized_prompt_images(preprocess)
     (vae_image,) = info["vae_images"]
     # RGB input gains an opaque alpha channel for the RGBA VAE; the frame dim is
     # inserted for the 3D (video-capable) VAE.
+    assert info["vae_images_are_latents"] is False
     assert vae_image.shape[1] == 4
     assert vae_image.shape[2] == 1
     (prompt_image,) = info["prompt_image"]

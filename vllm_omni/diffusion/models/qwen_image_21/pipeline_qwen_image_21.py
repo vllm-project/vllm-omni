@@ -293,6 +293,7 @@ def get_qwen_image_21_pre_process_func(
 
         prompt["additional_information"]["prompt_image"] = prompt_images
         prompt["additional_information"]["vae_images"] = vae_images
+        prompt["additional_information"]["vae_images_are_latents"] = False
         prompt["additional_information"]["input_image_sizes"] = input_image_sizes
         prompt["additional_information"]["calculated_height"] = calculated_height
         prompt["additional_information"]["calculated_width"] = calculated_width
@@ -911,7 +912,14 @@ class QwenImage21Pipeline(
         device,
         generator,
         latents=None,
+        *,
+        image_is_latent: bool = False,
     ):
+        """Prepare target noise and pack explicitly identified condition images.
+
+        Raw RGBA pixels and normalized VAE latents can have the same channel
+        count; their representation must be supplied by the caller.
+        """
         height = 2 * (int(height) // (self.vae_scale_factor * 2))
         width = 2 * (int(width) // (self.vae_scale_factor * 2))
 
@@ -920,7 +928,12 @@ class QwenImage21Pipeline(
             all_image_latents = []
             for image in vae_images:
                 image = image.to(device=device, dtype=dtype)
-                encoded = image if image.shape[1] == self.latent_channels else self._encode_vae_image(image, generator)
+                if image_is_latent:
+                    if image.ndim != 5 or image.shape[1] != self.latent_channels:
+                        raise ValueError("Normalized Qwen image latents must have BCTHW layout and latent_channels.")
+                    encoded = image
+                else:
+                    encoded = self._encode_vae_image(image, generator)
                 if batch_size > encoded.shape[0]:
                     if batch_size % encoded.shape[0] != 0:
                         raise ValueError(
@@ -1020,6 +1033,7 @@ class QwenImage21Pipeline(
                 {
                     "prompt_images": info.get("prompt_image"),
                     "vae_images": info.get("vae_images"),
+                    "vae_images_are_latents": info.get("vae_images_are_latents", False),
                     "input_image_sizes": info.get("input_image_sizes"),
                 }
             )
@@ -1053,16 +1067,22 @@ class QwenImage21Pipeline(
             input_image_sizes = per_request_images[0]["input_image_sizes"] or []
             if any(entry["input_image_sizes"] != input_image_sizes for entry in per_request_images):
                 raise ValueError("All image-conditioned requests in a batch must share condition image sizes.")
+            latent_flags = [entry.get("vae_images_are_latents", False) for entry in per_request_images]
+            if any(type(flag) is not bool for flag in latent_flags):
+                raise ValueError("vae_images_are_latents must be an explicit boolean.")
+            if len(set(latent_flags)) != 1:
+                raise ValueError("Cannot batch raw pixels with pre-encoded image latents.")
             image_latents = []
             for slot in range(len(input_image_sizes)):
                 image = torch.cat([entry["vae_images"][slot] for entry in per_request_images], dim=0).to(
                     device=self.device, dtype=prompt_embeds.dtype
                 )
-                image_latents.append(
-                    image
-                    if image.shape[1] == self.latent_channels
-                    else self._encode_vae_image(image, generator=generator)
-                )
+                if latent_flags[0]:
+                    if image.ndim != 5 or image.shape[1] != self.latent_channels:
+                        raise ValueError("Normalized Qwen image latents must have BCTHW layout and latent_channels.")
+                    image_latents.append(image)
+                else:
+                    image_latents.append(self._encode_vae_image(image, generator=generator))
         return {
             "version": 1,
             "prompt_embeds": prompt_embeds,
@@ -1191,6 +1211,7 @@ class QwenImage21Pipeline(
             self.device,
             generator,
             latents,
+            image_is_latent=True,
         )
 
         img_shapes = [
@@ -1498,7 +1519,12 @@ class QwenImage21Pipeline(
         return split_diffusion_output_by_request(result, batch, num_outputs_per_prompt=num_outputs)
 
     def _prepare_dummy_denoise_payload(self, batch: DiffusionRequestBatch) -> None:
-        """Supply the encoder payload absent from a stage-local warmup."""
+        """Profile G conservatively at the configured maximum text length.
+
+        G has no encoder to determine the real prompt length during local
+        warmup. This upper bound can reserve more memory than FULL's warmup
+        with encoded text; it does not change runtime request sequence lengths.
+        """
         for request in batch.requests:
             if DiffusionRequestBatch.get_prompt_field(request.prompt, "qwen_image_21_conditioning") is not None:
                 continue

@@ -335,6 +335,20 @@ supports batch execution when the scheduler actually admits multiple compatible
 requests; `max_num_seqs` alone does not guarantee a full batch. BF16 results can
 still depend on actual batch composition.
 
+A generator-only worker has no encoder during its local warmup. Its dummy
+conditioning intentionally uses the configured `max_sequence_length` (or the
+pipeline maximum, normally 8192) for both positive and negative branches. This
+is a conservative memory profile and can exceed a FULL worker's profile using
+real encoded text. It does not pad every real request to that length; lowering
+the supported request length requires setting an appropriate explicit limit.
+
+Preprocessed `vae_images` are raw RGBA pixels unless the internal conditioning
+input explicitly sets `vae_images_are_latents: true`. That flag means the
+values are already normalized VAE latents; channel count is only validated,
+never used to infer representation. The ENCODE output `image_latents` always
+contains normalized latents, and G passes them to `prepare_latents()` with
+`image_is_latent=True` to avoid a second VAE encode.
+
 ## Parameters
 
 | Parameter | Default | Notes |

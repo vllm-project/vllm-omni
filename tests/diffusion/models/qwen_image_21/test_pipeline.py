@@ -56,6 +56,7 @@ def test_encode_batch_preserves_encoder_batch_and_request_conditioning(mocker, i
                             torch.full((1, 4, 1, height // 16, width // 16), float(10 * index + slot))
                             for slot, (width, height) in enumerate(sizes)
                         ],
+                        "vae_images_are_latents": True,
                         "input_image_sizes": sizes,
                     },
                 },
@@ -142,6 +143,7 @@ def test_prepare_latents_duplicates_condition_latents_request_major():
         num_channels_latents=4,
         height=64,
         width=64,
+        image_is_latent=True,
         dtype=torch.float32,
         device=torch.device("cpu"),
         generator=torch.Generator().manual_seed(0),
@@ -163,6 +165,7 @@ def test_prepare_latents_without_duplication_when_rows_match_batch():
         num_channels_latents=4,
         height=32,
         width=32,
+        image_is_latent=True,
         dtype=torch.float32,
         device=torch.device("cpu"),
         generator=torch.Generator().manual_seed(0),
@@ -182,6 +185,7 @@ def test_prepare_latents_rejects_non_divisible_duplication():
             num_channels_latents=4,
             height=64,
             width=64,
+            image_is_latent=True,
             dtype=torch.float32,
             device=torch.device("cpu"),
             generator=torch.Generator().manual_seed(0),
@@ -198,6 +202,7 @@ def test_prepare_latents_rejects_generator_list_length_mismatch():
             num_channels_latents=4,
             height=32,
             width=32,
+            image_is_latent=True,
             dtype=torch.float32,
             device=torch.device("cpu"),
             generator=[torch.Generator().manual_seed(0)],
@@ -215,6 +220,7 @@ def test_prepare_latents_concatenates_multiple_condition_images():
         num_channels_latents=4,
         height=32,
         width=32,
+        image_is_latent=True,
         dtype=torch.float32,
         device=torch.device("cpu"),
         generator=torch.Generator().manual_seed(0),
@@ -562,3 +568,68 @@ def test_stage_generator_and_decoder_use_native_batches(mocker, num_outputs):
     torch.testing.assert_close(decode.call_args.args[0], packed)
     for i, output in enumerate(outputs):
         torch.testing.assert_close(output.output, decoded[i * num_outputs : (i + 1) * num_outputs])
+
+
+@pytest.mark.parametrize("already_latent", [False, True])
+def test_conditioning_uses_explicit_image_representation_with_equal_channels(mocker, already_latent):
+    pipeline = _toy_pipeline()
+    pipeline.device = torch.device("cpu")
+    # Raw RGBA has four channels too: channel count cannot determine representation.
+    image = torch.ones(1, 4, 1, 2, 2)
+    encoded = torch.full_like(image, 7)
+    mocker.patch.object(
+        pipeline,
+        "encode_prompt",
+        return_value=(torch.ones(1, 2, 4), torch.ones(1, 2), torch.zeros(1, 2, dtype=torch.bool)),
+    )
+    encode_vae = mocker.patch.object(pipeline, "_encode_vae_image", return_value=encoded)
+    info = {
+        "prompt_images": [Image.new("RGBA", (32, 32))],
+        "vae_images": [image],
+        "input_image_sizes": [(32, 32)],
+        "vae_images_are_latents": already_latent,
+    }
+    conditioning = pipeline._encode_conditioning(["prompt"], None, [info], 1.0, 128)
+    torch.testing.assert_close(conditioning["image_latents"][0], image if already_latent else encoded)
+    if already_latent:
+        encode_vae.assert_not_called()
+    else:
+        encode_vae.assert_called_once()
+
+
+@pytest.mark.parametrize("already_latent", [False, True])
+def test_prepare_latents_uses_explicit_image_representation(mocker, already_latent):
+    pipeline = _toy_pipeline()
+    image = torch.ones(1, 4, 1, 2, 2)
+    encode_vae = mocker.patch.object(pipeline, "_encode_vae_image", return_value=image * 7)
+    _, conditioning = pipeline.prepare_latents(
+        [image],
+        1,
+        4,
+        32,
+        32,
+        torch.float32,
+        torch.device("cpu"),
+        torch.Generator().manual_seed(1),
+        image_is_latent=already_latent,
+    )
+    torch.testing.assert_close(conditioning, torch.full((1, 4, 4), 1.0 if already_latent else 7.0))
+    assert encode_vae.call_count == (0 if already_latent else 1)
+
+
+@pytest.mark.parametrize("max_sequence_length,expected", [(None, 8192), (128, 128)])
+def test_generator_dummy_profiles_configured_maximum_text_length(max_sequence_length, expected):
+    pipeline = _toy_pipeline()
+    pipeline.device = torch.device("cpu")
+    pipeline._max_length = 8192
+    pipeline.od_config.tf_model_config = {"context_in_dim": 4}
+    request = OmniDiffusionRequest(
+        request_id="dummy",
+        prompt="warmup",
+        sampling_params=OmniDiffusionSamplingParams(max_sequence_length=max_sequence_length),
+    )
+    pipeline._prepare_dummy_denoise_payload(DiffusionRequestBatch(requests=[request]))
+    conditioning = request.prompt["qwen_image_21_conditioning"]
+    assert conditioning["prompt_embeds"].shape == (1, expected, 4)
+    assert conditioning["negative_prompt_embeds"].shape == (1, expected, 4)
+    assert request.sampling_params.max_sequence_length == max_sequence_length
