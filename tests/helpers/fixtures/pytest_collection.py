@@ -5,7 +5,9 @@
 
 All ``pytest_collection_modifyitems`` policies live here so their order is
 explicit. Add a named helper and call it from the hook; do not register a
-second ``pytest_collection_modifyitems`` in another plugin.
+second ``pytest_collection_modifyitems`` in another plugin. Policies placed
+after ``_partition_cpu_suite`` see only the selected timing shard, not the
+full filtered collection.
 """
 
 from __future__ import annotations
