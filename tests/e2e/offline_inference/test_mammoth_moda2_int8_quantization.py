@@ -162,8 +162,7 @@ def checkpoint_pair(request) -> tuple[str, str]:
     return str(bf16), str(int8)
 
 
-# NOTE: provisional — will be finalized from the value measured on the target
-# GPU.
+# Minimum BF16/INT8 logprob cosine similarity for the A/B consistency gate.
 MIN_LOGPROB_COSINE = 0.90
 
 # Require at least five aligned greedy steps so the logprob gate cannot score
