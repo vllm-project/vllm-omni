@@ -326,6 +326,13 @@ source_file_dependencies:
     - vllm_omni/model_extras/bagel.py
     - vllm_omni/worker/base.py
 
+  diffusion_bagel_weekly:
+    - tests/e2e/online_serving/test_bagel.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/deploy/bagel.yaml
+    - vllm_omni/diffusion/models/bagel/
+    - vllm_omni/model_executor/models/bagel/
+
   omni_qwen3_omni_shm_leak_function:
     - *qwen3_omni
     - tests/e2e/online_serving/test_qwen3_omni_shm_leak.py

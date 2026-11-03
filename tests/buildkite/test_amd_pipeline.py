@@ -1624,6 +1624,73 @@ def test_qwen25_omni_weekly_executes_junit_guard_before_exit(
     )
 
 
+def test_bagel_weekly_selects_only_the_rocm_img2img_node() -> None:
+    step = _find_step("Bagel img2img · 1-GPU", AMD_WEEKLY_PIPELINE)
+    command = "\n".join(step["commands"])
+    node = "tests/e2e/online_serving/test_bagel.py::test_bagel_img2img_online[omni_server0]"
+    dependencies = yaml.safe_load(AMD_SOURCE_DEPENDENCIES.read_text(encoding="utf-8"))["source_file_dependencies"]
+
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 90
+    assert step["source_file_dependencies"] == "diffusion_bagel_weekly"
+    assert step["artifact_paths"] == ["artifacts/rocm-bagel-weekly/**/*"]
+    assert "slow and diffusion and rocm and MI325 and cards_1" in command
+    assert "--run-level full_model" in command
+    assert "timeout --signal=TERM --kill-after=2m 75m" in command
+    assert node in command
+    assert "H100-only Bagel nodes were collected." in command
+    assert "test_bagel_img2img_online[omni_server0]" in command
+    assert "Expected exactly one Bagel weekly ROCm node" in command
+    assert "Expected exactly one executed Bagel weekly test" in command
+    assert "skipped != 0" in command
+    bagel_deps = dependencies["diffusion_bagel_weekly"]
+    assert "tests/e2e/online_serving/test_bagel.py" in bagel_deps
+    source = Path("tests/e2e/online_serving/test_bagel.py").read_text(encoding="utf-8")
+    img2img_marks = source.split("def test_bagel_img2img_online", maxsplit=1)[0]
+    assert '@hardware_test(res={"cuda": "H100", "rocm": "MI325"})' in img2img_marks
+    text2img_marks = img2img_marks.split("def test_bagel_text2img_online", maxsplit=1)[0]
+    assert '"rocm"' not in text2img_marks
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, AMD_NIGHTLY_PIPELINE):
+        assert "Bagel img2img · 1-GPU" not in pipeline_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_bagel_weekly_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    _assert_nightly_junit_guard(
+        tmp_path,
+        pipeline_path=AMD_WEEKLY_PIPELINE,
+        step_label="Bagel img2img · 1-GPU",
+        command_fragment="pytest -s -v -ra",
+        expected_message="Expected exactly one executed Bagel weekly test",
+        artifact_env="ROCM_BAGEL_WEEKLY_ARTIFACT_DIR",
+        job_id_prefix="bagel-weekly-guard",
+        pytest_status=pytest_status,
+        tests=tests,
+        skipped=skipped,
+        timeout_status=timeout_status,
+        expected_status=expected_status,
+    )
+
+
 def test_cosyvoice_offline_zero_shot_runs_nightly_on_rocm() -> None:
     path = "tests/e2e/offline_inference/test_cosyvoice3_expansion.py"
     markers = "slow and tts and rocm and MI325 and cards_1"
