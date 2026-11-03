@@ -137,6 +137,10 @@ def test_npu_host_lengths_custom_op_preserves_mutation_and_valid_lengths(monkeyp
         HEAD_DIM**-0.5,
         3,
         5,
+        torch.empty(0),
+        torch.empty(0),
+        False,
+        0,
     )
     assert seen == [(3, 5)]
     torch.testing.assert_close(key_pool[slots], keys)
@@ -1410,3 +1414,77 @@ def test_contiguous_kv_gather_path_matches_paged_path_gpu(monkeypatch, history_c
     assert torch.isfinite(gathered).all()
     # Same kernel family on the same K/V: only accumulation order differs.
     torch.testing.assert_close(gathered, paged, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.cpu
+def test_npu_host_lengths_staging_refreshes_partial_boundary_and_reuses_prefix(monkeypatch):
+    monkeypatch.setattr(paged_attention_module, "contiguous_kv_gather_enabled", lambda: True)
+    provider = ModuleType("torch_npu")
+    provider.npu_fusion_attention = lambda q, k, v, **kw: (k.clone(),)
+    monkeypatch.setitem(sys.modules, "torch_npu", provider)
+    keys = torch.randn(4, 4, 1, 2)
+    values = torch.randn_like(keys)
+    stages = [torch.empty(16, 1, 2), torch.empty(16, 1, 2)]
+    table = torch.tensor([[2, 0, 3, 1]])
+    kwargs = dict(
+        block_table=table,
+        query_start_loc=torch.tensor([0, 11]),
+        seq_lens=torch.tensor([11]),
+        max_seq_len=16,
+        softmax_scale=1.0,
+        host_lengths=(11, 11),
+        stage_key=stages[0],
+        stage_value=stages[1],
+        stage_first_block=1,
+    )
+    query = torch.randn(11, 1, 2)
+    paged_attention_module._npu_paged_attention(query, keys, values, **kwargs)
+    prefix = stages[0][:4].clone()
+    # Current tokens begin inside logical block 1; restage that whole block,
+    # including its history prefix, and the partial last block (logical 2).
+    keys[0].add_(2)
+    keys[3].sub_(3)
+    output = paged_attention_module._npu_paged_attention(query, keys, values, **kwargs, reuse_history=True)
+    torch.testing.assert_close(output, keys[table[0]].flatten(0, 1)[:11], rtol=0, atol=0)
+    torch.testing.assert_close(stages[0][:4], prefix, rtol=0, atol=0)
+    # New session/window restages even the prefix.
+    keys[2].add_(7)
+    output = paged_attention_module._npu_paged_attention(query, keys, values, **kwargs)
+    torch.testing.assert_close(output, keys[table[0]].flatten(0, 1)[:11], rtol=0, atol=0)
+
+
+@pytest.mark.cpu
+def test_npu_host_lengths_ragged_context_reuse_and_session_reset():
+    manager, adapter, state = ModuleType("manager"), ModuleType("adapter"), ModuleType("state")
+    adapter.num_computed_tokens = 5
+    state.adapter = state.signature = None
+    manager.block_size = 4
+    manager.history_staging = [(torch.empty(16, 1, 2), torch.empty(16, 1, 2))]
+    manager.history_staging_state = state
+    context = paged_attention_module.ARDiffusionPagedForwardContext(
+        kv_cache=manager,
+        adapter=adapter,
+        kv_branch="positive",
+        history_block_ids=[2, 0],
+        seq_len=6,
+        commit_current=False,
+        max_video_tokens=16,
+        current_video_block_ids=[0, 3],
+        kv_len=11,
+        max_seq_len=16,
+        block_table=torch.tensor([[2, 0, 3, 1]]),
+    )
+    context._prepare_history_staging(0, allow_partial_blocks=True)
+    assert context.staging_enabled and not context.reuse_history
+    assert context.stage_first_block == 1
+    context._prepare_history_staging(0, allow_partial_blocks=True)
+    assert context.reuse_history
+    context._prepare_history_staging(0)  # existing CUDA/CPU ragged policy stays conservative
+    assert not context.reuse_history
+    replacement = ModuleType("replacement")
+    replacement.num_computed_tokens = 5
+    context.adapter = replacement
+    context._prepare_history_staging(0, allow_partial_blocks=True)
+    assert not context.reuse_history
+    context._prepare_history_staging(1, allow_partial_blocks=True)
+    assert not context.staging_enabled
