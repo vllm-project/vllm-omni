@@ -601,7 +601,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         if hasattr(model, "load_lora_weights"):
             lora_scale = getattr(self.od_config, "lora_scale", 1.0)
-            if lora_scale > 1.0:
+            if any(scale > 1.0 for scale in (lora_scale if isinstance(lora_scale, list) else [lora_scale])):
                 logger.warning("lora_scale > 1.0 may not take any effect when using distilled LoRA backend.")
             logger.info("Fusing distilled LoRA weights from %s into %s", lora_path, model.__class__.__name__)
             model.load_lora_weights(lora_path)
