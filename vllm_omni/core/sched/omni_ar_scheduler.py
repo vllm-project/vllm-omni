@@ -1014,9 +1014,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             terminal_row = terminal_rows.get(req_id) if terminal_rows else None
             if terminal_row is not None:
                 # The final token is already committed: keep this forward's
-                # rows, never its sample, and release its placeholder.
+                # rows, never its sample. The placeholder belongs to the last
+                # step in flight, so release it once nothing is in flight.
                 generated_token_ids = []
-                request.num_output_placeholders = max(0, request.num_output_placeholders - num_tokens_scheduled)
+                if request.num_in_flight_tokens <= 0:
+                    request.num_output_placeholders = 0
 
             stale_async_tokens = int(getattr(request, "async_tokens_to_discard", 0) or 0)
             async_output_is_stale = bool(generated_token_ids and stale_async_tokens > 0)
@@ -2112,8 +2114,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """Restore the length stop once the forward returned the final own row."""
         from vllm_omni.model_executor.models.minicpmo_4_5.handoff import ends_with_own_row
 
-        if not request.is_finished() and request.num_computed_tokens < request.num_tokens:
-            # A recompute after preemption has not reached the final token.
+        if not request.is_finished() and (
+            request.num_computed_tokens < request.num_tokens or request.num_in_flight_tokens > 0
+        ):
+            # A recompute after preemption has not returned the final token;
+            # the terminal forward itself is always scheduled alone.
             return False
         self._minicpmo45_terminal_rows.pop(request.request_id, None)
         if request.is_finished():
