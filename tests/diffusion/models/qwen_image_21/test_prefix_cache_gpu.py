@@ -105,21 +105,33 @@ def test_partial_prefix_hits_match_cache_off(monkeypatch, tmp_path):
                     assert min(allocation["hits"]) > 0
                 if name == "changed_later_image":
                     assert allocation["copies"], "Partial image hits must exercise Worker tail-page COW"
+                assert array.shape == expected[name].shape
                 delta = array[..., :3].astype(np.float64) - expected[name][..., :3].astype(np.float64)
                 mse = float(np.mean(delta**2))
                 psnr = None if mse == 0 else 10 * math.log10(255**2 / mse)
+                alpha_mse: float | None = None
+                alpha_psnr: float | None = None
+                alpha_max_abs: float | None = None
+                if array.shape[-1] == 4:
+                    alpha_delta = array[..., 3].astype(np.float64) - expected[name][..., 3].astype(np.float64)
+                    alpha_mse = float(np.mean(alpha_delta**2))
+                    alpha_psnr = None if alpha_mse == 0 else 10 * math.log10(255**2 / alpha_mse)
+                    alpha_max_abs = float(np.abs(alpha_delta).max())
                 metrics.append(
                     {
                         "case": name,
                         "bitwise": bool(np.array_equal(array, expected[name])),
                         "max_abs": float(np.abs(delta).max()),
                         "psnr_db": psnr,
+                        "alpha_max_abs": alpha_max_abs,
+                        "alpha_psnr_db": alpha_psnr,
                         **allocation,
                     }
                 )
                 # Bitwise equality is recorded where observed; other CUDA
                 # kernels must still meet this explicit image-level tolerance.
                 assert mse == 0 or (psnr is not None and psnr >= 40), metrics[-1]
+                assert alpha_mse is None or alpha_mse == 0 or (alpha_psnr is not None and alpha_psnr >= 40), metrics[-1]
         finally:
             omni.close()
             del omni
