@@ -5,7 +5,12 @@ MiniMax-H3 partition. Pika uses six transformer forwards with fresh noise betwee
 steps, rather than H3's ordinary Euler update. Video and stereo audio are sampled
 together. The integration uses H3's existing LoRA manager and serving APIs.
 
-For official numerical comparison, start with the [reference configuration](#compare-with-official-numerical-results) and [complex people / 2K examples](#complex-people-examples-and-numerical-evidence).
+This recipe covers the official open weights at native 480p / 768p. Pika's
+[hosted API](https://huggingface.co/Pika-Labs/Pika-H3-Flex#pika-api-extensions)
+also provides 1080p, 2K and 4K generation; those API extensions are outside
+the local open-weight integration.
+
+For official numerical comparison, start with the [reference configuration](#compare-with-official-numerical-results) and [complex people examples](#complex-people-examples-and-numerical-evidence).
 
 ## Download (optional)
 
@@ -132,48 +137,6 @@ Then add these fields to each Pika request:
 On this ordinary H3 endpoint, scale 0 disables Pika and restores the base H3
 sampling contract. Select the matching FL2VA paths for T2VA/FL2VA.
 
-## Optional 2K output
-
-Pika's public weights do not include its hosted 2K generator. For local 2K
-output, use the existing H3 latent upscaler after Pika's six steps and before
-video decoding. This is an additional community model, not native 2K Pika or
-the hosted Draft-to-Video service.
-
-```bash
-hf download LBH-123-AI/Minimax_h3_latent_Upscaler \
-  --revision 3f941d5d182014dd5c0a5e16330420ee2d4aa0c6 \
-  --include 'minimax_h3_latent_upscaler_3d_conv_v1/*bf16.safetensors' \
-  --local-dir /models/h3-upscaler
-```
-
-Replace the server's `--additional-config` value with:
-
-```json
-{
-  "minimax_h3_vae_audio_overlap": true,
-  "latent_upscaler_path": "/models/h3-upscaler/minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"
-}
-```
-
-Keep the request's generation canvas at 832x480 or a published 768p bucket and
-add the output target to `extra_params`:
-
-```json
-{
-  "task": "ref2va",
-  "flow_shift": 12,
-  "audio_flow_shift": 3,
-  "latent_upscale": {"width": 2560, "height": 1440}
-}
-```
-
-Audio and frame count stay unchanged. Upscale-only runs no extra denoising
-steps. `latent_refine` is rejected for an active Pika adapter: H3's truncated
-Euler refinement cannot replace Pika's released six-step sampler. A separate
-[Open-H3-Regenerate-2K server](../Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md)
-is another existing route for re-rendering drafts, with its own weights and
-sampling contract; its combination with Pika is not qualified here.
-
 ## Reused optimizations and boundaries
 
 | Optimization | Behavior |
@@ -209,17 +172,14 @@ the original native partition.
   This validates sampler math and RNG layout, not full-model pixel parity.
 - Real-weight HTTP generation covered T2VA at 480p and 768p, first-frame,
   last-frame and first/last-frame FL2VA, and image-conditioned Ref2VA.
-  FL2VA and Ref2VA both produced
-  2560x1440 output with the community upscaler. Five-second samples contained
+  Five-second samples contained
   124 frames at 24 fps and 32 kHz stereo audio; all streams decoded fully.
-- For each adapter, decoding the audio from the matching 480p and 2K outputs
-  produced identical PCM hashes. Invalid step counts and generic refinement
-  returned HTTP 400.
+  Invalid step counts and generic refinement returned HTTP 400.
 - Direct model-ID deployment also generated Ref2VA from a combined image,
-  video-with-audio and audio reference at 832x480 and 2560x1440. These runs used
+  video-with-audio and audio reference at 832x480. This run used
   the pinned adapter cache and an explicit local original-H3 base override;
-  cold network downloading of the base was not exercised. The two outputs
-  again had identical decoded audio. Request adapter overrides were rejected.
+  cold network downloading of the base was not exercised.
+  Request adapter overrides were rejected.
 - Independent official and native HTTP runs now cover three complex adult
   scenes with the FL2VA adapter: a watchmaker's tool handoff, three chefs
   working through occlusion and steam, and three full-body dancers crossing
@@ -234,22 +194,20 @@ the original native partition.
 The comparison videos place the official output on the left and native
 vLLM-Omni on the right. Exact prompts, request payloads, source revisions,
 per-step metrics and reproduction scripts are included in the
-[validation bundle](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-people-validation.tar.gz).
+[validation bundle](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-original-validation.tar.gz).
 
-| Scene | Official / native comparison | Native 2K output |
-| --- | --- | --- |
-| Watch repair: three adults, overlapping hands and tool handoff | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-workshop-comparison.mp4) | [2560x1440 video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-workshop-2k.mp4) |
-| Kitchen: three chefs, bowl handoff, steam and camera movement | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-kitchen-comparison.mp4) | — |
-| Dance: three adults, full bodies, turns and crossing paths | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-dance-comparison.mp4) | — |
+| Scene | Official / native comparison |
+| --- | --- |
+| Watch repair: three adults, overlapping hands and tool handoff | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-workshop-comparison.mp4) |
+| Kitchen: three chefs, bowl handoff, steam and camera movement | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-kitchen-comparison.mp4) |
+| Dance: three adults, full bodies, turns and crossing paths | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-dance-comparison.mp4) |
 
 Across the eight native-resolution Pika/DMAD comparisons, pre-encoding RGB
 values differ by at most 1/255, with minimum PSNR 99.18 dB.
 Audio waveforms match exactly. RGB comparison is before H.264 compression;
-the two MP4 encoders need not produce identical bytes. The 2K case preserves
-the corresponding native-resolution latent and waveform, then applies the
-community upscaler; there is no official local Pika 2K target for pixel parity.
-See the [metrics](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-people-comparison.json) and
-[reproduction guide](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-people-README.txt).
+the two MP4 encoders need not produce identical bytes.
+See the [metrics](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-original-comparison.json) and
+[reproduction guide](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-original-README.txt).
 
 To reproduce the watch-repair prompt against the reference-mode FL2VA
 server above, download the retained prompts and submit the same parameters
@@ -267,15 +225,7 @@ curl --fail http://127.0.0.1:8000/v1/videos/sync \
   --output pika-people-workshop.mp4
 ```
 
-Select `.kitchen` or `.dance` for the other prompts. For 2K, configure the
-server's community upscaler and add `latent_upscale` as described above.
-
-The earlier image-conditioned examples are also available:
-[FL2VA 2K](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-fl2va-2k.mp4),
-[Ref2VA image 2K](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-ref2va-image-2k.mp4), and
-[Ref2VA mixed-reference 2K](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-ref2va-mixed-2k.mp4).
-Their full original request payloads were not retained. These historical
-functional samples do not establish Ref2VA numerical parity.
+Select `.kitchen` or `.dance` for the other prompts.
 
 Reference-mode results do not qualify the optimized cuDNN/fused-operator
 configuration for bitwise equivalence or establish a perceptual-quality
@@ -307,4 +257,3 @@ stand-in transformers. No new performance or perceptual-quality claim is made.
 
 - [Pika model card](https://huggingface.co/Pika-Labs/Pika-H3-Flex)
 - [Pika sampler reference](https://github.com/Pika-Labs/Pika-H3-Flex/tree/06bd434ce0b6e287e6f6c4058420460f47ba031b)
-- [Community latent upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
