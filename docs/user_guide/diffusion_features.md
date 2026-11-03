@@ -49,10 +49,10 @@ cache, TeaCache and Cache-DiT.
 | Model / combination | Scope |
 |---------------------|-------|
 | HunyuanImage3 standalone DiT | Stable text/reference-image prefix reuse; dynamic image tokens are excluded |
-| Qwen-Image 2.1 (`QwenImage21Pipeline`) | Block-causal reference-image and text prefix reuse across requests (TP1/TP2, Ulysses SP2, CFG=1 and CFG>1); skips condition-image VAE encoding when the cached prefix covers all reference images |
+| Qwen-Image 2.1 (`QwenImage21Pipeline`) | Block-causal reference-image and text prefix reuse across requests; skips condition-image VAE encoding on covering hits. GPU validation is configuration-specific; see the [recipe](../../recipes/Qwen/Qwen-Image-2.1.md#scheduler-managed-paged-kv-and-cross-request-prefix-caching-diffusionkvcachemodepaged_scheduler) for GPU, precision, and parallelism details |
 | TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits (HunyuanImage3) |
 | TP2/SP2 (Ulysses) + EP, CFGP1 | Validated reference-image prefix hits; CFG guidance does not require CFG parallelism |
-| Other SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
+| Other HunyuanImage3 SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
 | AR-imported KV / cross-stage missing-page transfer | Not covered by local prefix caching |
 | Sleep mode | Rejected with prefix caching; discarded KV pages would leave stale cache hits |
 | TeaCache / Cache-DiT, offload, quantization | Not validated with prefix hits |
@@ -62,6 +62,13 @@ cache, TeaCache and Cache-DiT.
 This table describes prefix-cache scope; the general parallelism tables below do
 not establish prefix-hit compatibility. Floating-point kernel differences still
 require accuracy validation. `dense_legacy` remains the default.
+Qwen paged KV disables decode CUDA graphs and does not support FP8 prefix-KV
+storage. Image layout and CFG rows remain isolated; changing a later reference
+image's size or the number of references does not reuse an earlier layout.
+Qwen requests can provide `cache_salt` to isolate prefix reuse by application
+policy. Numerical comparisons must distinguish observed bitwise equality from
+tolerance-based parity; cache-on versus cache-off alone does not measure the
+performance or numerical difference from default dense execution.
 
 #### Lossless Acceleration
 
