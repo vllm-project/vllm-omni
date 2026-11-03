@@ -448,6 +448,29 @@ class TestBatchSplitDelivery:
             assert futures[rid].result(timeout=1.0) is outputs[rid]
 
 
+@pytest.mark.parametrize("wait_before_delivery", [False, True])
+def test_registered_batch_unpack_failure_reaches_every_request(mocker, wait_before_delivery):
+    executor = _make_executor()
+    batch_id = "broken-shm"
+    per_req_map = {f"{batch_id}/{rid}": rid for rid in ("r0", "r1")}
+    executor._batch_split_map[batch_id] = per_req_map
+    waiters = {key: executor.wait_output_ready(key) for key in per_req_map} if wait_before_delivery else {}
+    output = mocker.Mock()
+    mocker.patch.object(executor_module, "unpack_diffusion_output_shm", side_effect=ValueError("corrupt SHM"))
+
+    _feed_one_msg_to_pump(
+        executor,
+        AsyncDiffusionOutput(kind=AsyncOutputKind.OUTPUT_READY, async_output_id=batch_id, output=output),
+    )
+
+    for key in per_req_map:
+        result = (waiters[key] if wait_before_delivery else executor.wait_output_ready(key)).result(timeout=1)
+        assert result.error == "corrupt SHM"
+    output.get_request_output.assert_not_called()
+    assert executor._batch_split_map == {}
+    assert executor._completed_outputs == {}
+
+
 class TestShutdownCleansUpFutures:
     """Test that shutdown cancels pending futures."""
 

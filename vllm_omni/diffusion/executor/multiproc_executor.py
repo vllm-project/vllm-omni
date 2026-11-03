@@ -1007,7 +1007,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         self._finish_output(batch_id, output_result, exc)
                 if per_req_map is not None:
                     # Batch result: split into per-request DiffusionOutputs.
-                    self._deliver_batch_split(per_req_map, msg.output, msg.error)
+                    self._deliver_batch_split(
+                        per_req_map, output_result, msg.error or (str(exc) if exc is not None else None)
+                    )
 
     def _finish_output(
         self,
