@@ -26,7 +26,11 @@ class SopranoForCausalLM(Qwen3ForCausalLM):
         if vllm_config.model_config.dtype != torch.float32:
             raise ValueError("Soprano's validated offline AR baseline requires dtype=float32; BF16 is not validated")
         if os.environ.get("TRITON_F32_DEFAULT") != "ieee":
-            raise ValueError("Soprano FP32 AR requires TRITON_F32_DEFAULT=ieee for full-precision attention")
+            raise ValueError(
+                "Soprano's validated CUDA FP32 profiles (soprano.yaml / soprano_streaming.yaml) require "
+                "TRITON_F32_DEFAULT=ieee before starting vllm serve or the offline Omni process. "
+                "Export it in the launcher environment so worker processes inherit full-precision attention."
+            )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     def forward(

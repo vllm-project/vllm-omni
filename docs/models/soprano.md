@@ -21,6 +21,9 @@ Shared entrypoints are documented in the [offline TTS hub](../user_guide/example
 - Set `TRITON_F32_DEFAULT=ieee` before Python starts. Both packaged profiles
   use eager FP32, v1 runner, one sequence per stage on GPU0, a 64 MiB AR KV
   cache, no CUDA graph pool, no prefix caching and no chunked prefill.
+- The pinned checkpoint uses untied input/output embeddings. Stage 0 audits
+  the native AR weights; stage 1 loads `decoder.pth` strictly without reading
+  the AR tensor iterator. Re-exported tied-weight variants are unqualified.
 - The production `offline.synthesize` frontend cleans/splits whole English
   utterances, validates all units before submission, and concatenates audio
   in sentence order. Low-level `Omni.generate` and the Speech API each accept
@@ -37,6 +40,9 @@ Shared entrypoints are documented in the [offline TTS hub](../user_guide/example
   predictors, and flush ends at `2048 * (T - 1)` samples. Short generations
   can finish before a regular chunk. Request state is released at finish,
   error and cancellation, including worker-slot reuse.
+- A failed decoder stream stays failed for subsequent chunks of that request.
+  Its failure marker is retained until the runner's finish/abort callback;
+  late chunks cannot create a new window in the middle of the utterance.
 - Streaming keeps the native offline predictor sequence. The original HF
   streaming path consumes a different sequence; natural sampled waveforms
   are not a numerical parity oracle. Even identical predictors can yield

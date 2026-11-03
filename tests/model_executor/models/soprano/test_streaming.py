@@ -63,6 +63,7 @@ def wrapper(decoder):
     nn.Module.__init__(result)
     result.decoder = decoder
     result._streams = {}
+    result._failed_streams = set()
     return result
 
 
@@ -127,6 +128,49 @@ def test_abort_error_finish_and_request_slot_reuse():
     output = model(runtime_additional_information=[payload(states(0), error="bad handoff")], request_ids=["bad"])
     assert bool(output.multimodal_outputs["audio_synthesis_error"][0])
     assert not model._streams
+
+
+@pytest.mark.parametrize("error_finished", [False, True])
+def test_failed_stream_stays_failed_until_request_cleanup(error_finished):
+    model = wrapper(IntervalDecoder())
+    output = model(
+        runtime_additional_information=[payload(states(4)[:, :511], chunk_size=4, finished=error_finished)],
+        request_ids=["failed"],
+    ).multimodal_outputs
+    assert bool(output["audio_synthesis_error"][0])
+    assert output["model_outputs"][0].numel() == 0
+    assert not model._streams
+
+    peer = states(8, offset=10000)
+    peer_audio = []
+    for step in range(2):
+        ids = ["failed", "peer"] if step == 0 else ["peer", "failed"]
+        rows = {
+            "failed": payload(states(4), chunk_size=4, finished=step == 1),
+            "peer": payload(peer[4 * step : 4 * (step + 1)], chunk_size=4, finished=step == 1),
+        }
+        output = model(runtime_additional_information=[rows[key] for key in ids], request_ids=ids).multimodal_outputs
+        failed_row, peer_row = ids.index("failed"), ids.index("peer")
+        assert bool(output["audio_synthesis_error"][failed_row])
+        assert output["model_outputs"][failed_row].numel() == 0
+        assert not bool(output["audio_synthesis_error"][peer_row])
+        peer_audio.append(output["model_outputs"][peer_row])
+        assert "failed" not in model._streams
+    assert torch.equal(torch.cat(peer_audio), peer[:-1, 0].repeat_interleave(2048))
+    assert model._failed_streams == {"failed"}
+
+    model.on_requests_finished(["failed", "peer"])
+    assert not model._streams and not model._failed_streams
+    recovered = []
+    for step in range(2):
+        output = model(
+            runtime_additional_information=[payload(peer[4 * step : 4 * (step + 1)], chunk_size=4, finished=step == 1)],
+            request_ids=["failed"],
+        ).multimodal_outputs
+        assert not bool(output["audio_synthesis_error"][0])
+        recovered.append(output["model_outputs"][0])
+    assert torch.equal(torch.cat(recovered), peer[:-1, 0].repeat_interleave(2048))
+    assert not model._streams and not model._failed_streams
 
 
 @dataclass

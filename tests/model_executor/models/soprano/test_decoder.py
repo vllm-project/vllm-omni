@@ -48,3 +48,26 @@ def test_production_loader_rejects_incomplete_decoder_checkpoint(tmp_path, mocke
     model = SopranoDecoderForGeneration(vllm_config=config)
     with pytest.raises(RuntimeError, match="Missing key"):
         model.load_weights(iter(()))
+
+
+def test_decoder_loader_does_not_read_stage_zero_weights(tmp_path, mocker):
+    from vllm.config import VllmConfig
+
+    from vllm_omni.model_executor.models.soprano import soprano_decoder
+
+    decoder = torch.nn.Linear(2, 2)
+    state = {"weight": torch.ones(2, 2), "bias": torch.zeros(2)}
+    torch.save(state, tmp_path / "decoder.pth")
+    mocker.patch.object(soprano_decoder, "SopranoDecoder", return_value=decoder)
+    config = mocker.Mock(spec=VllmConfig)
+    config.model_config = mocker.Mock(model=str(tmp_path), dtype=torch.float32)
+    config.device_config = mocker.Mock(device=torch.device("cpu"))
+
+    def stage_zero_weights():
+        pytest.fail("The decoder must not materialize AR tensors owned by stage zero")
+        yield "lm_head.weight", torch.empty(0)
+
+    model = soprano_decoder.SopranoDecoderForGeneration(vllm_config=config)
+    assert model.load_weights(stage_zero_weights()) == {"decoder.weight", "decoder.bias"}
+    assert torch.equal(decoder.weight, state["weight"])
+    assert torch.equal(decoder.bias, state["bias"])

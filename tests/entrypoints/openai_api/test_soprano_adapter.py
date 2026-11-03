@@ -206,7 +206,25 @@ def test_shared_request_path_preserves_seed_sampling_and_prompt(server):
         params.top_k,
         params.repetition_penalty,
     ) == (44, 8, 0.4, 0.9, 20, 1.1)
-    assert server.engine_client.default_sampling_params_list[0].max_tokens == 512
+    defaults = server.engine_client.default_sampling_params_list[0]
+    assert (
+        defaults.seed,
+        defaults.max_tokens,
+        defaults.temperature,
+        defaults.top_p,
+        defaults.top_k,
+        defaults.repetition_penalty,
+    ) == (None, 512, 0.3, 0.95, 50, 1.2)
+    asyncio.run(server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello.")))
+    next_params = server.engine_client.generate.call_args.kwargs["sampling_params_list"][0]
+    assert (
+        next_params.seed,
+        next_params.max_tokens,
+        next_params.temperature,
+        next_params.top_p,
+        next_params.top_k,
+        next_params.repetition_penalty,
+    ) == (None, 512, 0.3, 0.95, 50, 1.2)
 
 
 def test_shared_encoding_and_error_mapping_leave_next_request_usable(server):

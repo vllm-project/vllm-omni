@@ -35,10 +35,12 @@ class SopranoDecoderForGeneration(nn.Module):
             raise ValueError("Soprano decoder requires dtype=float32")
         self.decoder = SopranoDecoder()
         self._streams: dict[str, DecoderWindow] = {}
+        self._failed_streams: set[str] = set()
 
     def on_requests_finished(self, finished_req_ids: Iterable[str]) -> None:
         """Runner IDs (not batch rows) own state; finish and abort both reclaim it."""
         for request_id in finished_req_ids:
+            self._failed_streams.discard(request_id)
             removed = self._streams.pop(request_id, None)
             logger.debug(
                 "Soprano decoder cleanup req=%s active=%s remaining=%d",
@@ -57,9 +59,8 @@ class SopranoDecoderForGeneration(nn.Module):
         return torch.zeros(input_ids.shape[0], 1, device=input_ids.device, dtype=torch.float32)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # The default loader offers AR safetensors for both stages. None are
-        # decoder parameters; record every ignored AR key with its owner.
-        self.ar_keys_owned_by_stage0 = [name for name, _ in weights]
+        # Stage 0 owns and audits AR safetensors. Do not consume its iterator
+        # merely to record names; this stage loads only the decoder checkpoint.
         cfg = self.vllm_config.model_config
         root = Path(cfg.model)
         if not root.is_dir():
@@ -76,11 +77,7 @@ class SopranoDecoderForGeneration(nn.Module):
         self.decoder.to(device=self.vllm_config.device_config.device, dtype=torch.float32).eval()
         for row in self.checkpoint_key_audit:
             logger.info("Soprano decoder key %s -> %s shape=%s", row["key"], row["destination"], row["shape"])
-        logger.info(
-            "Soprano decoder: %d AR keys owned by stage 0, %d decoder tensors strictly loaded",
-            len(self.ar_keys_owned_by_stage0),
-            len(state),
-        )
+        logger.info("Soprano decoder: %d decoder tensors strictly loaded; AR weights belong to stage 0", len(state))
         return {f"decoder.{name}" for name, _ in self.decoder.named_parameters()}
 
     def get_dummy_runtime_additional_information(self, num_reqs):
@@ -118,34 +115,41 @@ class SopranoDecoderForGeneration(nn.Module):
                     raise ValueError("Soprano stream needs one generation request ID per batch row")
                 request_id = request_ids[row]
                 finished = bool(info.get("meta", {}).get("stream_finished", False))
-                failed = False
+                failed = request_id in self._failed_streams
                 committed = False
                 try:
-                    if error or hidden is None:
-                        raise ValueError(error or "Missing Soprano streaming hidden payload")
-                    chunk_size = int(extra["soprano_chunk_size"])
-                    state = self._streams.setdefault(request_id, DecoderWindow(chunk_size))
-                    if chunk_size != state.chunk_size:
-                        raise ValueError("Soprano chunk_size changed within a synthesis unit")
-                    audio.append(
-                        state.push(self.decoder, hidden.to(device=device, dtype=torch.float32), finished=finished)
-                    )
-                    committed = True
-                    logger.debug(
-                        "Soprano audio delta req=%s samples=%d total_hidden=%d "
-                        "context_rows=%d finished=%s monotonic_ns=%d",
-                        request_id,
-                        audio[-1].numel(),
-                        state.total,
-                        0 if state.hidden is None else state.hidden.shape[0],
-                        finished,
-                        perf_counter_ns(),
-                    )
+                    if failed:
+                        audio.append(torch.empty(0, device=device, dtype=torch.float32))
+                    else:
+                        if error or hidden is None:
+                            raise ValueError(error or "Missing Soprano streaming hidden payload")
+                        chunk_size = int(extra["soprano_chunk_size"])
+                        state = self._streams.setdefault(request_id, DecoderWindow(chunk_size))
+                        if chunk_size != state.chunk_size:
+                            raise ValueError("Soprano chunk_size changed within a synthesis unit")
+                        audio.append(
+                            state.push(self.decoder, hidden.to(device=device, dtype=torch.float32), finished=finished)
+                        )
+                        committed = True
+                        logger.debug(
+                            "Soprano audio delta req=%s samples=%d total_hidden=%d "
+                            "context_rows=%d finished=%s monotonic_ns=%d",
+                            request_id,
+                            audio[-1].numel(),
+                            state.total,
+                            0 if state.hidden is None else state.hidden.shape[0],
+                            finished,
+                            perf_counter_ns(),
+                        )
                 except (ValueError, KeyError) as exc:
                     logger.error("Soprano stream req=%s: %s", request_id, exc)
                     audio.append(torch.empty(0, device=device, dtype=torch.float32))
                     failed = True
                 finally:
+                    if not committed:
+                        # Late chunks must not restart a failed synthesis unit.
+                        # The runner's finish/abort callback owns this tombstone.
+                        self._failed_streams.add(request_id)
                     if finished or not committed:
                         self._streams.pop(request_id, None)
                         logger.debug(
