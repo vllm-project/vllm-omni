@@ -419,7 +419,7 @@ steps:
             pytest -sv
             tests/e2e/offline_inference/test_nucleus_image_expansion.py
             tests/e2e/online_serving/test_nucleus_image_expansion.py
-            -m "slow and diffusion and H100 and cards_2"
+            -m "slow and diffusion and cuda and cards_2"
             --run-level "full_model"
         mirror_hardwares: h100_2
 

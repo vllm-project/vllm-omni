@@ -30,6 +30,8 @@ pytestmark = [
 ]
 
 
+# SKU marks select CI pools; they do not restrict the GPU model at runtime.
+# Other compatible CUDA hosts can run this test with at least two GPUs.
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 def test_nucleus_image_text_to_image(offline_client: OfflineOmniClient) -> None:
     request_config = {
