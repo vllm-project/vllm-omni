@@ -116,6 +116,13 @@ declared lost.
 **Rule:** Repeated shutdown or cleanup signals MUST NOT leak stage clients,
 process managers, or membership registrations.
 
+AR stage deployments may set `engine_extras.shutdown_timeout` to a nonnegative
+grace period in seconds. The stage client uses it when shutdown has no explicit
+timeout; an explicit caller timeout takes precedence, including zero. With no
+stage override, a positive upstream shutdown timeout is honored, otherwise the
+upstream process manager retains its default grace period. The timeout bounds
+process cleanup; it does not change request draining or admission policy.
+
 ## Invariant namespace
 
 `STAGE-INV` reserves `001-099` for placement and ownership, `100-199` for
