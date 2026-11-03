@@ -76,6 +76,40 @@ def _narrow(state, *, fake_cuda=False):
     )
 
 
+def test_cpu_device_always_runs_eager_without_capture():
+    """Non-CUDA devices never touch the graph machinery.
+
+    The K-step escape switches are gone, so ``device.type != "cuda"`` is
+    the only remaining way off the graph path. Pin that both run_model and
+    run_fused take it: the forward itself runs, nothing is captured or
+    replayed, and eager_calls counts every step.
+    """
+    state = _State()  # cpu tensors
+    step = _narrow(state)
+    assert step.inputs_embeds.device.type == "cpu"
+
+    calls = []
+    out = step.run_model(lambda: (calls.append(1), state.embeds.clone())[1])
+    assert step.eager_calls == 1
+    assert step.captures == 0 and step.replays == 0
+    assert torch.equal(out, state.embeds)
+    assert len(calls) == 1
+
+    snapped = []
+    out = step.run_fused(
+        lambda: (calls.append(1), state.embeds.clone())[1],
+        state_key="t",
+        snapshot=lambda: (snapped.append(1), {})[1],
+        restore=lambda saved: None,
+    )
+    assert step.eager_calls == 2
+    assert step.captures == 0 and step.replays == 0
+    assert step.graphs == {}
+    assert not snapped  # the eager branch never snapshots
+    assert torch.equal(out, state.embeds)
+    assert len(calls) == 2
+
+
 class _FakeCUDA:
     def __init__(self, monkeypatch, forward, failure):
         self.failure = failure

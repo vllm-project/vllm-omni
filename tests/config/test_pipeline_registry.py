@@ -31,6 +31,7 @@ def test_minicpmo_kstep_is_on_by_default():
     """
     from pathlib import Path
 
+    repo_root = Path(__file__).resolve().parents[2]
     config = resolve_deploy_yaml("vllm_omni/deploy/minicpmo_4_5.yaml")
     cuda = {s["stage_id"]: s for s in config["platforms"]["cuda"]["stages"]}
     extra = config["connectors"]["connector_of_shared_memory"]["extra"]
@@ -41,7 +42,10 @@ def test_minicpmo_kstep_is_on_by_default():
     assert extra["cfm_cross_bucket_merge"] is True
 
     # The knobs are in the default deploy; do not reintroduce an overlay.
-    assert not Path("vllm_omni/deploy/minicpmo_4_5_kstep.yaml").exists()
+    # Anchor at the repo root, not the CWD: from any other directory the
+    # relative Path(...).exists() below is vacuously true and the guard
+    # would pass with the overlay back in place.
+    assert not (repo_root / "vllm_omni/deploy/minicpmo_4_5_kstep.yaml").exists()
 
 
 @pytest.mark.parametrize("topology,ports", [("eg", [50081]), ("egd", [50091, 50092])])

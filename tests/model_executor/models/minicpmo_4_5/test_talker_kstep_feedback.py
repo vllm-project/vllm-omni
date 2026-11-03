@@ -47,6 +47,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _TURN_END_QUIET_STOP_FRAMES,
     MiniCPMO45OmniTTSForConditionalGeneration,
     _codec_int_param,
+    _KStepPendingRow,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     codec_sample_result,
@@ -1500,6 +1501,48 @@ def test_frame_loop_repetition_stop_surfaces_as_stop_row():
     assert int(model.batch_stop_logits[0].argmax()) == 1
 
 
+def test_mid_block_stop_keeps_late_frames_as_stop_rows():
+    """A stop mid-block keeps every later frame in the block a stop row.
+
+    Review follow-up (PR #9733): in an 8-frame block a repetition stop on
+    frame 3 leaves frames 4-8 on the finished early-exit. Each of those
+    frames must still pack its own row as a stop -- no audio delta, the stop
+    slot winning the batch logits, and the terminal flag high on every frame
+    the finished request still occupies.
+    """
+    model = _make_talker(k_step_frames=8, scripted_samples=[42] * 16)
+    state = {
+        "step": 0,
+        "codes": torch.tensor([10, 11]),
+        "codec_full_ids": [10, 11],
+        "codec_repetition_detection": SimpleNamespace(min_pattern_size=1, max_pattern_size=1, min_count=2),
+    }
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+
+    frames: list = []
+    deltas: list[int] = []
+    stops: list[int] = []
+    for _ in range(8):
+        out = _frame_call(model, hidden)
+        frames.append(out)
+        audio = out.multimodal_outputs["codes"]["audio"][0]
+        deltas.append(audio.numel())
+        logits = model.batch_stop_logits
+        stops.append(int(logits[0].argmax()) if logits is not None and logits.shape[0] else -1)
+
+    # Frame 1 warms the window: one sample is not yet a repetition.
+    assert deltas[0] == 1 and stops[0] == 0
+    # Frame 2 detects the repeating tail: audio and stop in the same step.
+    assert deltas[1] == 1 and stops[1] == 1
+    # Frames 3-8 run the finished early-exit: silent rows, stop id, and the
+    # merged terminal flag high every time.
+    assert deltas[2:] == [0] * 6
+    assert stops[2:] == [1] * 6
+    assert all(bool(out.multimodal_outputs["meta"]["finished"][0]) for out in frames[2:])
+    assert state["finished"] is True
+
+
 def test_stop_id_finishes_request_through_device_state_greedy():
     """A codec stop id finishes the request via the device state alone.
 
@@ -1846,7 +1889,19 @@ def test_kstep_flush_discards_stale_request(replaced):
     model._request_audio_states["r1"] = {} if replaced else old_state
     model._deferred_cleanup_ids = set() if replaced else {"r1"}
     model._kstep_pending_packed = [
-        (torch.tensor([42, 0, 1]), "r1", old_state, None, None, 0, None, None, 0, None, None)
+        _KStepPendingRow(
+            packed=torch.tensor([42, 0, 1]),
+            request_id="r1",
+            state=old_state,
+            info=None,
+            deltas=None,
+            delta_slot=0,
+            stop_rows=None,
+            terminal_flags=None,
+            stop_slot=0,
+            row_stop=None,
+            flag_true=None,
+        )
     ]
     model.flush_kstep_pending()
     assert model._request_codec_history == {}
