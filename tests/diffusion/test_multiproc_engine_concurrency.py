@@ -9,6 +9,7 @@ import threading
 import time
 import weakref
 from collections import OrderedDict
+from multiprocessing.process import BaseProcess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -709,7 +710,7 @@ class TestConcurrentCollectiveRpc:
         a_enqueued, b_complete = _inject_interleave(executor)
         wt = _start_worker(req_q, res_q, count=2)
 
-        results: dict[str, object] = {}
+        results: dict[str, DiffusionOutput] = {}
 
         def _a():
             results["A"] = engine.collective_rpc(
@@ -750,7 +751,7 @@ class TestConcurrentRequestExecutionAndCollectiveRpc:
         a_enqueued, b_complete = _inject_interleave(executor)
         wt = _start_worker(req_q, res_q, count=2)
 
-        results: dict[str, object] = {}
+        results: dict[str, DiffusionOutput] = {}
 
         def _a():  # request execution path
             results["A"] = engine.add_req_and_wait_for_response(_mock_request("A"))
@@ -1498,7 +1499,8 @@ class TestStageDiffusionClientErrorPropagation:
 
 
 class TestExecutorShutdownCleaner:
-    def test_worker_joins_share_one_global_deadline(self, monkeypatch):
+    @pytest.mark.parametrize("shutdown_grace_s", [None, 60.0])
+    def test_worker_joins_share_one_global_deadline(self, monkeypatch, shutdown_grace_s):
         from vllm_omni.diffusion.executor import multiproc_executor as executor_module
 
         class FakeProcess:
@@ -1520,16 +1522,18 @@ class TestExecutorShutdownCleaner:
             def terminate(self):
                 self.terminated = True
 
-        monotonic = Mock(side_effect=[100.0, 100.0, 110.0, 120.0, 120.0, 124.0])
+        grace = 15.0 if shutdown_grace_s is None else shutdown_grace_s
+        terminate_start = 100.0 + grace + 5.0
+        monotonic = Mock(side_effect=[100.0, 100.0, 110.0, terminate_start, terminate_start, terminate_start + 4.0])
         monkeypatch.setattr(executor_module, "time", SimpleNamespace(monotonic=monotonic))
         first = FakeProcess("worker-0")
         second = FakeProcess("worker-1")
-        cleaner = executor_module._ExecutorShutdownCleaner(processes=[first, second])
+        cleaner = executor_module._ExecutorShutdownCleaner(processes=[first, second], shutdown_grace_s=shutdown_grace_s)
 
         cleaner()
 
-        assert first.join_timeouts == [15.0, 5.0]
-        assert second.join_timeouts == [5.0, 1.0]
+        assert first.join_timeouts == [grace, 5.0]
+        assert second.join_timeouts == [grace - 10.0, 1.0]
         assert first.terminated and second.terminated
         assert not first.is_alive() and not second.is_alive()
 
@@ -1673,7 +1677,7 @@ def _poll_flag(get_flag, *, timeout=5.0, interval=0.05) -> bool:
     return False
 
 
-def _make_short_lived_process() -> mp.Process:
+def _make_short_lived_process() -> BaseProcess:
     """Spawn a real subprocess that exits immediately.
 
     The process must be started with ``"fork"`` (or the platform default)

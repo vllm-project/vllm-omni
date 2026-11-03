@@ -328,6 +328,13 @@ failure callbacks; ordinary request errors stay per-request.
 5. applies rank-aware reply rules so only expected ranks respond; and
 6. monitors worker process sentinels and fails the executor if a worker dies.
 
+Shutdown allows a 60-second graceful worker-exit phase on NPU and 15 seconds
+elsewhere, followed by bounded 5-second terminate and kill phases. Each phase
+shares one deadline across workers and returns early when all have exited.
+The enclosing [engine shutdown](../engine_orchestration.md) must allow that
+cleanup to finish; a completed Python shutdown callback alone does not prove
+that device-runtime finalization or process exit has completed.
+
 In request mode on this backend, each async output produces two correlated
 messages keyed by `async_output_id`:
 

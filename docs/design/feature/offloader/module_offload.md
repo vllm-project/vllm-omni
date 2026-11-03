@@ -46,6 +46,11 @@ contract:
   setup; and
 - disabling removes all model-local offload hooks or contexts.
 
+Preparation that reads component buffers before its first `forward` must also
+enter the component's residency context. MiniMax-H3 enters that context before
+denoise-time RoPE table preparation. On context exit, explicit selection still
+controls offloading: an unselected DiT remains device resident.
+
 The delegation is currently duck typed. If another independent implementation
 is added, formalize the enable/disable pair as a protocol rather than expanding
 attribute-name heuristics.

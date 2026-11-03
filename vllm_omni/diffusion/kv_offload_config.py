@@ -13,6 +13,7 @@ class ReferenceKVConfig:
     mode: str
     kv_refresh_interval: int = 2
     kv_host_quantization: str = "none"
+    kv_cache_residency: str = "host"
 
 
 def parse_reference_kv_config(value: dict[str, Any] | None) -> ReferenceKVConfig | None:
@@ -20,7 +21,7 @@ def parse_reference_kv_config(value: dict[str, Any] | None) -> ReferenceKVConfig
         return None
     if not isinstance(value, dict):
         raise ValueError("kv_offload_config must be a JSON object")
-    allowed = {"mode", "kv_refresh_interval", "kv_host_quantization"}
+    allowed = {"mode", "kv_refresh_interval", "kv_host_quantization", "kv_cache_residency"}
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"unknown kv_offload_config keys: {sorted(unknown)}")
@@ -33,4 +34,9 @@ def parse_reference_kv_config(value: dict[str, Any] | None) -> ReferenceKVConfig
     quantization = value.get("kv_host_quantization", "none")
     if quantization not in ("none", "fp8", "int8"):
         raise ValueError("kv_host_quantization must be none, fp8, or int8")
-    return ReferenceKVConfig(mode, interval, quantization)
+    residency = value.get("kv_cache_residency", "host")
+    if residency not in ("host", "device"):
+        raise ValueError("kv_cache_residency must be host or device")
+    if residency == "device" and quantization != "none":
+        raise ValueError("device-resident reference KV requires kv_host_quantization=none")
+    return ReferenceKVConfig(mode, interval, quantization, residency)

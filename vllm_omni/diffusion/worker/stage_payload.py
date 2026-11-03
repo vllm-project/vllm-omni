@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from abc import abstractmethod
 from typing import Any
 
 import torch
@@ -31,9 +32,14 @@ class DiffusionStagePayloadMixin(OmniConnectorModelRunnerMixin):
 
     od_config: OmniDiffusionConfig
     device: torch.device
-    _target_device: torch.device | None
 
     _STAGE_PAYLOAD_HANDLE_KEY = "_stage_payload_transfer"
+
+    @property
+    @abstractmethod
+    def _target_device(self) -> torch.device | None:
+        """Device selected by the runner for incoming payload tensors."""
+        raise NotImplementedError
 
     def _stage_payload_broadcast_groups(self) -> tuple[Any, ...]:
         from vllm_omni.diffusion.distributed.parallel_state import get_fs_group, get_hsdp_replicate_group

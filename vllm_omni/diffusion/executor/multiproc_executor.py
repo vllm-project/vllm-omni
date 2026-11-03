@@ -36,6 +36,7 @@ from vllm_omni.diffusion.offloader.config import (
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
 from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -46,6 +47,8 @@ logger = init_logger(__name__)
 _DEQUEUE_TIMEOUT_S = 5.0
 _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 600.0))
 _WORKER_SHUTDOWN_GRACE_S = 15.0
+# CANN finalization continues after the Python worker shutdown callback returns.
+_NPU_WORKER_SHUTDOWN_GRACE_S = 60.0
 _WORKER_TERMINATE_GRACE_S = 5.0
 _WORKER_KILL_GRACE_S = 5.0
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
@@ -110,6 +113,7 @@ class _ExecutorShutdownCleaner:
     broadcast_mq: MessageQueue | None = None
     num_workers: int = 0
     processes: list[mp.Process] | None = None
+    shutdown_grace_s: float | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __call__(self) -> None:
@@ -137,7 +141,10 @@ class _ExecutorShutdownCleaner:
         if self.processes:
             alive = [proc for proc in self.processes if proc.is_alive()]
             for action, grace in (
-                (None, _WORKER_SHUTDOWN_GRACE_S),
+                (
+                    None,
+                    _WORKER_SHUTDOWN_GRACE_S if self.shutdown_grace_s is None else self.shutdown_grace_s,
+                ),
                 ("terminate", _WORKER_TERMINATE_GRACE_S),
                 ("kill", _WORKER_KILL_GRACE_S),
             ):
@@ -197,6 +204,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             broadcast_mq=self._broadcast_mq,
             num_workers=num_workers,
             processes=self._processes,
+            shutdown_grace_s=_NPU_WORKER_SHUTDOWN_GRACE_S if current_omni_platform.is_npu() else None,
         )
         self._shutdown_cleaner: _ExecutorShutdownCleaner | None = shutdown_cleaner
         self._finalizer = weakref.finalize(self, shutdown_cleaner)
@@ -716,7 +724,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         if isinstance(result, AsyncDiffusionOutput) and result.kind == AsyncOutputKind.COMPUTE_DONE:
             # Propagate async_output_id to per-request RunnerOutputs so the
             # engine waits in step_streaming() instead of blocking here.
-            batch_id = result.async_output_id
+            batch_id = cast(str, result.async_output_id)
             per_req_map: dict[str, str] = {}
             runner_outputs: list[RunnerOutput] = []
             for new_req in scheduler_output.scheduled_new_reqs:
@@ -1063,7 +1071,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if exc is not None:
                 delivered = try_set_exception(pending, exc)
             else:
-                delivered = try_set_result(pending, result)
+                delivered = try_set_result(pending, cast(DiffusionOutput, result))
             if not delivered:
                 self._remember_dropped(async_output_id)
         else:
@@ -1232,9 +1240,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 for fut in self._rpc_futures.values():
                     if not fut.done():
                         try_set_exception(fut, RuntimeError("Executor shut down"))
-                for fut in self._output_futures.values():
-                    if not fut.done():
-                        try_set_exception(fut, RuntimeError("Executor shut down"))
+                for output_future in self._output_futures.values():
+                    if not output_future.done():
+                        try_set_exception(output_future, RuntimeError("Executor shut down"))
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()

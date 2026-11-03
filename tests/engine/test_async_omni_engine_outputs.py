@@ -113,7 +113,7 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
 
 
 def test_output_remains_on_shared_output_path(mocker: MockerFixture):
-    raw_queue = queue.Queue()
+    raw_queue: queue.Queue[OutputMessage] = queue.Queue()
     raw_queue.put_nowait(
         OutputMessage(
             request_id="shared-path-request",
@@ -142,7 +142,7 @@ def test_collective_rpc_preserves_request_queue_backpressure(mocker: MockerFixtu
     request_q = SignallingQueue()
     request_q.put("queue-is-full")
     request_q.put_attempted.clear()
-    rpc_q = queue.Queue()
+    rpc_q: queue.Queue[CollectiveRPCResultMessage] = queue.Queue()
     engine = object.__new__(AsyncOmniEngine)
     engine.request_queue = SimpleNamespace(sync_q=request_q)
     engine.rpc_output_queue = SimpleNamespace(sync_q=rpc_q)
@@ -194,7 +194,13 @@ def test_shutdown_does_not_race_runtime_cleanup_with_live_orchestrator(mocker: M
     engine._runtime.shutdown.assert_not_called()
 
 
-def test_shutdown_releases_runtime_after_orchestrator_stops(mocker: MockerFixture):
+@pytest.mark.parametrize("is_npu, cleanup_seconds, join_budget", [(False, 25, 30), (True, 70, 90)])
+def test_shutdown_releases_runtime_after_orchestrator_stops(
+    mocker: MockerFixture, is_npu: bool, cleanup_seconds: int, join_budget: int
+):
+    platform = mocker.patch("vllm_omni.engine.omni_engine_base.current_omni_platform", create=True)
+    platform.is_npu.return_value = is_npu
+    deferred_thread = mocker.patch("vllm_omni.engine.omni_engine_base.threading.Thread")
     engine = object.__new__(AsyncOmniEngine)
     engine._shutdown_called = False
     engine._weak_finalizer = None
@@ -203,13 +209,21 @@ def test_shutdown_releases_runtime_after_orchestrator_stops(mocker: MockerFixtur
     engine.rpc_output_queue = mocker.MagicMock()
     engine._correlated_rpc_client = mocker.MagicMock()
     engine.orchestrator_thread = mocker.MagicMock()
-    engine.orchestrator_thread.is_alive.side_effect = [True, False]
+    engine.orchestrator_thread.is_alive.return_value = True
+
+    def join(*, timeout):
+        # NPU cleanup can consume the 60-second worker grace plus escalation.
+        if timeout >= cleanup_seconds:
+            engine.orchestrator_thread.is_alive.return_value = False
+
+    engine.orchestrator_thread.join.side_effect = join
     engine._runtime = mocker.MagicMock()
 
     engine.shutdown()
 
-    engine.orchestrator_thread.join.assert_called_once()
+    engine.orchestrator_thread.join.assert_called_once_with(timeout=join_budget)
     engine._runtime.shutdown.assert_called_once_with()
+    deferred_thread.assert_not_called()
 
 
 def test_shutdown_defers_runtime_release_until_live_orchestrator_stops(mocker: MockerFixture):
