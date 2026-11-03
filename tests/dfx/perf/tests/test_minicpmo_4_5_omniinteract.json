@@ -52,6 +52,11 @@
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
+        "extra_body": {
+          "sliding_window_mode": "basic",
+          "basic_window_high_tokens": 7000,
+          "basic_window_low_tokens": 5000
+        },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
       },
       {
@@ -74,6 +79,11 @@
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
+        "extra_body": {
+          "sliding_window_mode": "basic",
+          "basic_window_high_tokens": 7000,
+          "basic_window_low_tokens": 5000
+        },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
       },
       {
@@ -96,6 +106,11 @@
         "omniinteract_max_video_duration_s": 600,
         "omniinteract_evaluate": true,
         "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
+        "extra_body": {
+          "sliding_window_mode": "basic",
+          "basic_window_high_tokens": 7000,
+          "basic_window_low_tokens": 5000
+        },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
       }
     ]

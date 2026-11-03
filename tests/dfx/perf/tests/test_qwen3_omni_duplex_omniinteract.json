@@ -1,0 +1,103 @@
+[
+  {
+    "test_name": "test_qwen3_omni_duplex_omniinteract",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"]
+          },
+          "num_cards": 3
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/qwen3_omni_duplex.yaml"
+      ]
+    },
+    "judge_server_params": {
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "use_omni": false,
+      "cuda_visible_devices": "2",
+      "extra_cli_args": [
+        "--served-model-name",
+        "Qwen2.5-7B-Instruct"
+      ]
+    },
+    "omniinteract_aggregate_min_ia_qtf1": 0.3,
+    "benchmark_params": [
+      {
+        "dataset_name": "omniinteract",
+        "dataset_path": "lucky-lance/OmniInteract@e195f75fe2666fcc5fe74f537ae49ca143a79969",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          4
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "num_warmups": 1,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "omniinteract_subsets": "1q1a_math",
+        "omniinteract_turn_detection": "server_vad",
+        "omniinteract_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
+        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract_qwen3_omni/1q1a_math",
+        "omniinteract_max_video_duration_s": 600,
+        "omniinteract_evaluate": true,
+        "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+      },
+      {
+        "dataset_name": "omniinteract",
+        "dataset_path": "lucky-lance/OmniInteract@e195f75fe2666fcc5fe74f537ae49ca143a79969",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          4
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "num_warmups": 0,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "omniinteract_subsets": "1q1a",
+        "omniinteract_require_response": true,
+        "omniinteract_turn_detection": "server_vad",
+        "omniinteract_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
+        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract_qwen3_omni/1q1a",
+        "omniinteract_max_video_duration_s": 600,
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+      },
+      {
+        "dataset_name": "omniinteract",
+        "dataset_path": "lucky-lance/OmniInteract@e195f75fe2666fcc5fe74f537ae49ca143a79969",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          2
+        ],
+        "max_concurrency": [
+          1
+        ],
+        "num_warmups": 0,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "omniinteract_subsets": "1qna",
+        "omniinteract_require_response": true,
+        "omniinteract_turn_detection": "server_vad",
+        "omniinteract_instructions": "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks.",
+        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract_qwen3_omni/1qna",
+        "omniinteract_max_video_duration_s": 600,
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+      }
+    ]
+  }
+]

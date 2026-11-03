@@ -62,6 +62,27 @@ def _aliased_modules() -> tuple[nn.Module, nn.Module]:
     return left, right
 
 
+@pytest.mark.parametrize("inference_parameter", [False, True])
+def test_inference_staging_preserves_parameter_version_tracking(patched_runtime, mocker, inference_parameter):
+    with torch.inference_mode(inference_parameter):
+        module = nn.Linear(4, 2)
+    with torch.inference_mode():
+        stager = PinnedModuleStager(
+            module, torch.device("cpu"), pin_memory=False, cache_retention=mocker.Mock(spec=BoundedAllocatorCache)
+        )
+        for transition in (stager.load, stager.offload):
+            transition()
+            assert module.weight.is_inference() == inference_parameter
+            assert torch.isfinite(module(torch.ones(1, 4))).all()
+        if inference_parameter:
+            with pytest.raises(RuntimeError, match="version counter"):
+                _ = module.weight._version
+        else:
+            version = module.weight._version
+            module.weight.add_(1)
+            assert module.weight._version == version + 1
+
+
 def test_module_group_preserves_parameter_and_buffer_storage_aliases(patched_runtime, mocker):
     left, right = _aliased_modules()
     expected_left_weight = left.weight.detach().clone()
@@ -228,3 +249,87 @@ def test_allocator_cache_releases_when_telemetry_is_unavailable(monkeypatch, pat
 
     assert retention.release_if_needed()
     empty_cache.assert_called_once_with()
+
+
+@pytest.fixture
+def npu_allocator_runtime(mocker):
+    device = mocker.Mock(spec=torch.device)
+    device.type = "npu"
+    device_module = mocker.Mock(spec=["memory_reserved", "memory_allocated"])
+    device_module.memory_reserved.return_value = 20
+    device_module.memory_allocated.return_value = 10
+    get_device_module = mocker.patch.object(torch, "get_device_module", return_value=device_module)
+    get_device_memory = mocker.patch.object(
+        residency_module.current_omni_platform, "get_device_memory", return_value=(80, 100)
+    )
+    generic_reserved = mocker.patch.object(torch.accelerator, "memory_reserved")
+    generic_allocated = mocker.patch.object(torch.accelerator, "memory_allocated")
+    return (
+        BoundedAllocatorCache(device),
+        device_module,
+        get_device_module,
+        get_device_memory,
+        (generic_reserved, generic_allocated),
+    )
+
+
+@pytest.mark.parametrize(
+    ("reserved", "allocated", "free", "expected_release"),
+    [
+        (20, 10, 80, False),
+        (35, 10, 5, False),
+        (36, 10, 80, True),
+        (20, 10, 4, True),
+    ],
+)
+def test_npu_allocator_cache_uses_registered_device_telemetry(
+    patched_runtime, npu_allocator_runtime, reserved, allocated, free, expected_release
+):
+    empty_cache, _ = patched_runtime
+    retention, device_module, get_device_module, get_device_memory, generic_telemetry = npu_allocator_runtime
+    device_module.memory_reserved.return_value = reserved
+    device_module.memory_allocated.return_value = allocated
+    get_device_memory.return_value = (free, 100)
+
+    assert retention.release_if_needed() is expected_release
+
+    get_device_module.assert_called_once_with(retention.device)
+    device_module.memory_reserved.assert_called_once_with(retention.device)
+    device_module.memory_allocated.assert_called_once_with(retention.device)
+    get_device_memory.assert_called_once_with(retention.device)
+    assert empty_cache.call_count == int(expected_release)
+    for query in generic_telemetry:
+        query.assert_not_called()
+
+
+@pytest.mark.parametrize("unavailable_api", ["memory_reserved", "memory_allocated"])
+def test_npu_allocator_cache_releases_when_registered_telemetry_is_unavailable(
+    patched_runtime, npu_allocator_runtime, unavailable_api
+):
+    empty_cache, _ = patched_runtime
+    retention, device_module, get_device_module, get_device_memory, generic_telemetry = npu_allocator_runtime
+    getattr(device_module, unavailable_api).side_effect = NotImplementedError("NPU telemetry unavailable")
+
+    assert retention.release_if_needed()
+
+    get_device_module.assert_called_once_with(retention.device)
+    getattr(device_module, unavailable_api).assert_called_once_with(retention.device)
+    get_device_memory.assert_not_called()
+    empty_cache.assert_called_once_with()
+    for query in generic_telemetry:
+        query.assert_not_called()
+
+
+def test_npu_allocator_cache_forced_release_does_not_query_telemetry(patched_runtime, npu_allocator_runtime):
+    empty_cache, _ = patched_runtime
+    retention, device_module, get_device_module, get_device_memory, generic_telemetry = npu_allocator_runtime
+
+    assert retention.release_if_needed(force=True)
+
+    get_device_module.assert_not_called()
+    device_module.memory_reserved.assert_not_called()
+    device_module.memory_allocated.assert_not_called()
+    get_device_memory.assert_not_called()
+    empty_cache.assert_called_once_with()
+    for query in generic_telemetry:
+        query.assert_not_called()

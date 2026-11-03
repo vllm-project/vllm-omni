@@ -18,6 +18,9 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
+    MossAudioTokenizerModel as MossAudioTokenizerV2Model,
+)
 from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
 
 logger = init_logger(__name__)
@@ -48,8 +51,8 @@ class NPUGraphStreamingDecoderWrapper:
     Delegates capture/replay to :class:`NPUExactGraphRunner`.  Bucket selection
     (batch + frame padding) mirrors the CUDA wrapper so
     ``_MossCodecStreamSession.step`` can use either interchangeably.  Codec
-    state is updated in-place during replay via ``state_slot_ids``; scratch
-    slots isolate padding rows.
+    state is updated in-place during replay via ``state_slot_ids``. V2 padding
+    rows preserve one shared slot; V1 keeps independent scratch slots.
 
     Fatal NPUGraph failures propagate as ``RuntimeError`` (eager fallback is
     unsafe after corrupt capture state); restart with ``enforce_eager: true``
@@ -71,6 +74,7 @@ class NPUGraphStreamingDecoderWrapper:
         self.batch_sizes = sorted({int(size) for size in batch_sizes if 0 < int(size) <= state_capacity})
         self.frame_sizes = sorted({int(size) for size in frame_sizes if int(size) > 0})
         self.num_quantizers = int(num_quantizers)
+        self._shared_kv = isinstance(codec, MossAudioTokenizerV2Model)
 
         # vllm_config is accepted for interface parity but unused; graph
         # capture is gated by enforce_eager on Stage 1.
@@ -92,7 +96,14 @@ class NPUGraphStreamingDecoderWrapper:
 
     @property
     def scratch_capacity(self) -> int:
+        if self._shared_kv:
+            return 1
         return max(self.batch_sizes, default=0)
+
+    def _padding_slots(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        if self._shared_kv:
+            return torch.full((batch_size,), self.state_capacity, dtype=torch.long, device=device)
+        return self.state_capacity + torch.arange(batch_size, dtype=torch.long, device=device)
 
     @torch.no_grad()
     def warmup(self, device: torch.device) -> None:
@@ -131,10 +142,10 @@ class NPUGraphStreamingDecoderWrapper:
 
     @torch.no_grad()
     def _warmup_bucket(self, batch_size: int, frame_size: int, device: torch.device) -> None:
-        """Trigger first-run capture for one (B,T) bucket using scratch slots.
+        """Trigger first-run capture for one (B,T) bucket using padding slots.
 
-        Feeds scratch slot ids + ``valid_rows=False`` so capture-side state
-        writes land in scratch slots, then resets them.
+        ``valid_rows=False`` preserves V2's shared padding state. Reset the
+        padding offsets after capture (one slot for V2, independent slots for V1).
         """
         assert self._graph_runner is not None
         codes = torch.zeros(
@@ -145,7 +156,7 @@ class NPUGraphStreamingDecoderWrapper:
             device=device,
         )
         lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
-        scratch_slots = self.state_capacity + torch.arange(batch_size, dtype=torch.long, device=device)
+        scratch_slots = self._padding_slots(batch_size, device)
         valid_rows = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         self._graph_runner.run(
@@ -154,7 +165,7 @@ class NPUGraphStreamingDecoderWrapper:
             (batch_size, frame_size),
             lambda c, lengths, s, v: self.codec.decode_streaming_tensors(c, lengths, s, v),
         )
-        self.codec.reset_decoder_state_slots(scratch_slots)
+        self.codec.reset_decoder_state_slots(scratch_slots[:1] if self._shared_kv else scratch_slots)
 
     def _select_batch_size(self, actual_batch_size: int) -> int | None:
         return next((size for size in self.batch_sizes if size >= actual_batch_size), None)
@@ -191,7 +202,7 @@ class NPUGraphStreamingDecoderWrapper:
             return None
 
         device = codes.device
-        # Padding rows use scratch slots + valid_rows=False to isolate state.
+        # V2 padding rows preserve one shared slot; V1 uses independent slots.
         padded_codes = torch.zeros(
             self.num_quantizers,
             batch_size,
@@ -202,7 +213,7 @@ class NPUGraphStreamingDecoderWrapper:
         padded_codes[:, :actual_batch_size, :frame_size].copy_(codes)
         lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
         lengths[:actual_batch_size].fill_(int(frame_size))
-        padded_slots = self.state_capacity + torch.arange(batch_size, dtype=torch.long, device=device)
+        padded_slots = self._padding_slots(batch_size, device)
         padded_slots[:actual_batch_size].copy_(state_slot_ids)
         valid_rows = torch.zeros(batch_size, dtype=torch.bool, device=device)
         valid_rows[:actual_batch_size].fill_(True)

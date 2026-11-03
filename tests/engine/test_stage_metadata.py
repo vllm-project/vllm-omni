@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import copy
 import operator
+from dataclasses import replace
 
 import pytest
 from vllm.sampling_params import SamplingParams
@@ -33,7 +37,7 @@ def _metadata_inputs() -> tuple[PipelineConfig, DeployConfig]:
                 execution_type=StageExecutionType.LLM_AR,
                 owns_tokenizer=True,
                 requires_multimodal_data=True,
-                engine_output_type="token_ids",
+                engine_output_type="text",
                 custom_process_input_func="operator.add",
                 prompt_expand_func="operator.mul",
             ),
@@ -42,7 +46,7 @@ def _metadata_inputs() -> tuple[PipelineConfig, DeployConfig]:
                 model_stage="talker",
                 execution_type=StageExecutionType.LLM_GENERATION,
                 input_sources=(0,),
-                engine_output_type="audio_tokens",
+                engine_output_type="latent",
                 custom_process_input_func="operator.sub",
                 sync_process_input_func="operator.floordiv",
             ),
@@ -158,6 +162,26 @@ def test_extract_stage_metadata_preserves_legacy_one_argument_api():
     assert metadata.stage_id == 0
     assert metadata.model_stage == "thinker"
     assert metadata.custom_process_input_func is operator.add
+
+
+@pytest.mark.parametrize("engine_output_type", [None, "", "latent", "token_ids", "text+token_ids", "text+audio"])
+def test_extract_stage_metadata_preserves_declared_engine_output_type(engine_output_type):
+    pipeline, deploy = _metadata_inputs()
+    pipeline = replace(
+        pipeline,
+        stages=(replace(pipeline.stages[0], engine_output_type=engine_output_type), *pipeline.stages[1:]),
+    )
+    omni_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=copy.deepcopy(deploy))
+    legacy_config = merge_pipeline_deploy(pipeline, deploy)[0].to_omegaconf()
+
+    # An explicit empty value must reach the output processor, where it is
+    # rejected during startup, instead of silently becoming the None default.
+    assert legacy_config.engine_args.get("engine_output_type") == engine_output_type
+    assert extract_legacy_stage_metadata(legacy_config).engine_output_type == engine_output_type
+    assert (
+        extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(0)).engine_output_type
+        == engine_output_type
+    )
 
 
 def test_extract_stage_metadata_defaults_missing_engine_input_source():

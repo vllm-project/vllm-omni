@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 MagCache backend implementation.
@@ -72,6 +72,19 @@ class MagCacheBackend(CacheBackend):
         """
         transformer = pipeline.transformer
         transformer_type = transformer.__class__.__name__
+
+        if transformer_type == "Kandinsky6Transformer3DModel":
+            from vllm_omni.diffusion.models.kandinsky6.cache_accel import attach_mag_cache
+
+            attach_mag_cache(
+                transformer,
+                threshold=self.config.mag_threshold,
+                max_skip_steps=self.config.mag_max_skip_steps,
+                retention_ratio=self.config.mag_retention_ratio,
+            )
+            self._registered = True
+            logger.info("MagCache: Kandinsky 6 step-cache attached (visual/audio velocity reuse)")
+            return
 
         num_inference_steps = self.config.num_inference_steps or 28
 

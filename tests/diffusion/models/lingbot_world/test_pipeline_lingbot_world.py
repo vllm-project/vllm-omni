@@ -20,6 +20,7 @@ from torch import nn
 import vllm_omni.diffusion.models.lingbot_world.dmd_block as lingbot_dmd_block
 import vllm_omni.diffusion.models.lingbot_world.pipeline as lingbot_pipeline
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
+from vllm_omni.diffusion.attention.conditioning import ConditioningKVScope, TensorConditioningKVStorage
 from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession
 from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
 from vllm_omni.diffusion.models.lingbot_world.actions import (
@@ -98,6 +99,8 @@ class _FakeScheduler:
 
 
 class _FakeTransformerFactory:
+    last_call: tuple[object, object, str]
+
     @classmethod
     def from_config(cls, config, *, quant_config=None, prefix=""):
         cls.last_call = (config, quant_config, prefix)
@@ -111,6 +114,16 @@ class _Cache:
             SimpleNamespace(key=torch.zeros(shape), value=torch.zeros(shape)) for _ in range(num_layers)
         ]
         self.cross_attention = [None] * num_layers
+
+
+class _StubCrossAttention(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.num_local_heads = 2
+        self.head_dim = 4
+        self.k = nn.Identity()
+        self.v = nn.Identity()
+        self.norm_k = nn.Identity()
 
 
 class _RecordingTransformer(nn.Module):
@@ -130,10 +143,11 @@ class _RecordingTransformer(nn.Module):
             sink_size=3,
         )
         self.blocks = nn.ModuleList([nn.Identity(), nn.Identity()])
+        self.text_embedding = nn.Identity()
         for block in self.blocks:
             # The spec reads head geometry from both attentions; cross-attention keeps every local head.
             block.self_attn = SimpleNamespace(num_sp_heads=2)
-            block.cross_attn = SimpleNamespace(num_local_heads=2)
+            block.cross_attn = _StubCrossAttention()
         self.calls: list[dict] = []
         self.cache_allocations: list[dict] = []
         self.raise_on_call = raise_on_call
@@ -332,7 +346,7 @@ class _SamplingParams:
         )
         self.output_type = output_type
         self.max_sequence_length = max_sequence_length
-        self.extra_args = {"action_path": "."} if include_action else {}
+        self.extra_args: dict[str, object] = {"action_path": "."} if include_action else {}
         self.extra_args["_lingbot_camera_trajectory"] = _CameraTrajectory(
             poses=torch.eye(4).repeat(32, 1, 1),
             intrinsics=torch.tensor([[100.0, 100.0, 8.0, 8.0]]).repeat(32, 1),
@@ -488,13 +502,14 @@ def _od_config(**overrides):
 def _prompt(*, action_path: str | None = None, images=None):
     if images is None:
         images = Image.new("RGB", (16, 16), color=(255, 128, 0))
+    additional_information: dict[str, str] = {}
     prompt = {
         "prompt": "move through the room",
         "multi_modal_data": {"image": images},
-        "additional_information": {},
+        "additional_information": additional_information,
     }
     if action_path is not None:
-        prompt["additional_information"]["action_path"] = action_path
+        additional_information["action_path"] = action_path
     return prompt
 
 
@@ -612,7 +627,12 @@ def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_pat
         intrinsics=torch.ones(9, 4),
     )
     load_calls = []
-    module.load_camera_trajectory = lambda action: load_calls.append(action) or trajectory
+
+    def load_trajectory(action):
+        load_calls.append(action)
+        return trajectory
+
+    module.load_camera_trajectory = load_trajectory
 
     preprocess = module.get_lingbot_world_pre_process_func(
         _od_config(model_config={"lingbot_action_root": str(action_root)})
@@ -1003,15 +1023,36 @@ def test_forward_propagates_pipeline_profiler_stage_durations() -> None:
     assert output.stage_durations == pipeline.stage_durations
 
 
-def test_pipeline_weight_loader_preserves_component_parameter_prefixes() -> None:
+@pytest.mark.parametrize("leased_post_attention", [False, True])
+def test_pipeline_weight_loader_preserves_component_parameter_prefixes(
+    monkeypatch: pytest.MonkeyPatch, leased_post_attention: bool
+) -> None:
+    from vllm_omni.diffusion.models.lingbot_world import leased_post_attention as leased_module
+
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
+    pipeline._lingbot_leased_post_attention = leased_post_attention
+    encoded = _counting_text_encoder(pipeline)
+    pipeline.encode_prompt("move through the room", max_sequence_length=512, dtype=torch.float32)
+    installs: list[tuple[nn.Module, bool]] = []
+
+    def install(transformer: nn.Module, *, enabled: bool) -> None:
+        assert pipeline.transformer.loaded_weights == [("blocks.0.weight", weight)]
+        assert pipeline._conditioning_projection_revision == 1
+        assert not pipeline._prompt_embeds_cache
+        installs.append((transformer, enabled))
+
+    monkeypatch.setattr(leased_module, "install", install)
     weight = torch.randn(2, 2)
 
     loaded = pipeline.load_weights([("transformer.blocks.0.weight", weight)])
 
     assert loaded == {"transformer.blocks.0.weight"}
     assert pipeline.transformer.loaded_weights == [("blocks.0.weight", weight)]
+    assert pipeline._conditioning_projection_revision == 1
+    assert installs == ([(pipeline.transformer, True)] if leased_post_attention else [])
+    pipeline.encode_prompt("move through the room", max_sequence_length=512, dtype=torch.float32)
+    assert encoded == ["move through the room", "move through the room"]
 
 
 def test_request_requires_runner_provided_generator() -> None:
@@ -1205,7 +1246,12 @@ def test_action_path_resolves_from_sampling_extra_args(tmp_path: Path) -> None:
     original_prompt = prompt.copy()
     trajectory = _CameraTrajectory(torch.eye(4).repeat(9, 1, 1), torch.ones(9, 4))
     resolved_actions = []
-    module.load_camera_trajectory = lambda action: resolved_actions.append(action) or trajectory
+
+    def load_trajectory(action):
+        resolved_actions.append(action)
+        return trajectory
+
+    module.load_camera_trajectory = load_trajectory
 
     request = _preprocess_request(
         module,
@@ -1271,9 +1317,12 @@ def test_online_action_path_uses_environment_root_fallback(monkeypatch, tmp_path
     action_dir.mkdir(parents=True)
     monkeypatch.setenv("VLLM_OMNI_LINGBOT_ACTION_ROOT", str(root))
     resolved_actions = []
-    module.load_camera_trajectory = lambda action: (
-        resolved_actions.append(action) or _CameraTrajectory(torch.eye(4).repeat(9, 1, 1), torch.ones(9, 4))
-    )
+
+    def load_trajectory(action):
+        resolved_actions.append(action)
+        return _CameraTrajectory(torch.eye(4).repeat(9, 1, 1), torch.ones(9, 4))
+
+    module.load_camera_trajectory = load_trajectory
 
     request = _preprocess_request(
         module,
@@ -1369,7 +1418,8 @@ def test_request_validation_accepts_frames_beyond_previous_limit() -> None:
         (_SamplingParams(height=480, width=848), "pixel area|480.*832"),
         (_SamplingParams(max_sequence_length=511), "max_sequence_length.*512"),
         (_SamplingParams(max_sequence_length=513), "max_sequence_length.*512"),
-        (_SamplingParams(max_sequence_length=512.0), "max_sequence_length.*512"),
+        # Deliberately pass an invalid type to exercise runtime validation.
+        (_SamplingParams(max_sequence_length=512.0), "max_sequence_length.*512"),  # type: ignore[arg-type]
     ],
 )
 def test_resource_limits_reject_oversize_before_any_component_call(sampling, message: str) -> None:
@@ -1682,7 +1732,7 @@ def test_encode_prompt_zeroes_padded_umt5_states_to_exactly_512_tokens() -> None
     torch.testing.assert_close(encoded[:, 3:], torch.zeros_like(encoded[:, 3:]))
 
 
-def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumulated_latents() -> None:
+def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumulated_latents(monkeypatch) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
@@ -1694,7 +1744,7 @@ def test_multi_chunk_generation_uses_one_request_local_cache_and_decodes_accumul
         allocations.append((kwargs, weakref.ref(cache)))
         return cache
 
-    transformer.allocate_cache = allocate
+    monkeypatch.setattr(transformer, "allocate_cache", allocate)
     sampling = _SamplingParams(num_frames=21, output_type="np")
 
     result = pipeline(_request(sampling=sampling))
@@ -1767,11 +1817,13 @@ def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
     pipeline._ar_width = 16
     pipeline._ar_diffusion_kv_state = object()
     cross_calls = []
+    condition_revisions = []
     generated = []
 
-    def ar_text_caches(prompt_embeds, *, invalidate):
+    def ar_text_caches(prompt_embeds, *, invalidate, condition_revision):
         del prompt_embeds
         cross_calls.append(invalidate)
+        condition_revisions.append(condition_revision)
         return [SimpleNamespace()]
 
     def generate_block(**kwargs):
@@ -1812,6 +1864,10 @@ def test_typed_ticks_generate_one_global_block_and_return_standard_metadata(
     )
     assert torch.count_nonzero(generated[1]["condition"][:, 4:]) > 0
     assert cross_calls == [False, True]
+    assert condition_revisions == [
+        ("move through the room", 512, "torch.float32"),
+        ("enter the snowy valley", 512, "torch.float32"),
+    ]
     assert first.output["payload"]["latents"].shape == (1, 16, 3, 2, 2)
     assert second.output["metadata"]["ar_diffusion"] == {
         "session_id": "world-1",
@@ -2044,7 +2100,7 @@ def test_condition_continues_real_causal_vae_beyond_initial_horizon(
     with torch.inference_mode():
         expected = pipeline._prepare_condition(inputs, dtype=torch.float32)
     module_cache = pipeline.vae._enc_feat_map
-    seen = []
+    seen: list[torch.Tensor] = []
 
     def check(condition):
         index = len(seen)
@@ -2176,8 +2232,8 @@ def test_condition_encoder_interleaving_retry_and_reset(monkeypatch: pytest.Monk
             inputs = pipeline._parse_request(_request(prompt=prompt, sampling=_SamplingParams(num_frames=45)))
             expected[name] = pipeline._prepare_condition(inputs, dtype=torch.float32)
     assert not torch.equal(expected["a"], expected["b"])
-    active = None
-    failure = None
+    active: str | None = None
+    failure: str | None = None
     original_encoder = pipeline.vae.encoder.forward
 
     def encoder(*args, **kwargs):
@@ -2188,6 +2244,7 @@ def test_condition_encoder_interleaving_retry_and_reset(monkeypatch: pytest.Monk
 
     def generate_block(**kwargs):
         index = kwargs["start_frame"]
+        assert active is not None
         torch.testing.assert_close(kwargs["condition"], expected[active][:, :, index : index + 3], rtol=1e-6, atol=1e-6)
         if failure == "dit":
             raise RuntimeError("injected DiT failure")
@@ -2267,7 +2324,7 @@ def test_stateful_condition_rejects_tiled_encoder(monkeypatch: pytest.MonkeyPatc
     assert all(s.encoder_cache is None and s.pending_encoder_cache is None for s in pipeline._ar_sessions.values())
 
 
-def test_request_cache_is_released_before_vae_decode() -> None:
+def test_request_cache_is_released_before_vae_decode(monkeypatch) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer()
     pipeline = _pipeline(module, transformer=transformer)
@@ -2279,7 +2336,7 @@ def test_request_cache_is_released_before_vae_decode() -> None:
         cache_refs.append(weakref.ref(cache))
         return cache
 
-    transformer.allocate_cache = allocate
+    monkeypatch.setattr(transformer, "allocate_cache", allocate)
 
     def assert_cache_released() -> None:
         gc.collect()
@@ -2314,7 +2371,7 @@ def test_129_frame_request_generates_eleven_complete_latent_blocks() -> None:
     assert [call["start_frame"] for call in transformer.calls[::5]] == list(range(0, 33, 3))
 
 
-def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
+def test_request_cache_becomes_unreachable_after_transformer_error(monkeypatch) -> None:
     module = _load_pipeline_module()
     transformer = _RecordingTransformer(raise_on_call=2)
     pipeline = _pipeline(module, transformer=transformer)
@@ -2326,7 +2383,7 @@ def test_request_cache_becomes_unreachable_after_transformer_error() -> None:
         cache_refs.append(weakref.ref(cache))
         return cache
 
-    transformer.allocate_cache = allocate
+    monkeypatch.setattr(transformer, "allocate_cache", allocate)
 
     with pytest.raises(RuntimeError, match="forced transformer failure") as exc_info:
         pipeline(_request())
@@ -2345,6 +2402,9 @@ class _FakeARState:
     def __init__(self, session_id: str = "req-1") -> None:
         self.session_id = session_id
         self.commits: list[str] = []
+        # Keep video paging stubbed, but exercise real conditioning validity and storage.
+        self.kv_cache = TensorConditioningKVStorage(device=torch.device("cpu"), dtype=torch.float32, num_layers=2)
+        self.conditioning_kv = ConditioningKVScope(self.kv_cache, session_id, num_layers=2)
 
     def get_kv_caches(self, branch, *, seq_len, commit_current):
         del branch, seq_len, commit_current
@@ -2354,16 +2414,7 @@ class _FakeARState:
         self.commits.append(branch)
 
     def clear_cross_attention(self):
-        return None
-
-    def is_cross_attention_populated(self, branch, name):
-        del branch, name
-        return True
-
-    def get_cross_attention_kv(self, branch, name):
-        del branch, name
-        zeros = torch.zeros(1, 1, 2, 4)
-        return [{"k": zeros, "v": zeros} for _ in range(2)]
+        self.conditioning_kv.invalidate()
 
 
 def _empty_action_script(num_chunks: int):
@@ -3114,10 +3165,12 @@ def test_realtime_ticks_reuse_the_encode_and_still_invalidate_on_a_prompt_change
     pipeline._ar_diffusion_kv_state = object()
     encoded = _counting_text_encoder(pipeline)
     invalidations: list[bool] = []
+    condition_revisions = []
 
-    def ar_text_caches(prompt_embeds, *, invalidate):
+    def ar_text_caches(prompt_embeds, *, invalidate, condition_revision):
         del prompt_embeds
         invalidations.append(invalidate)
+        condition_revisions.append(condition_revision)
         return [SimpleNamespace()]
 
     monkeypatch.setattr(pipeline, "_ar_text_caches", ar_text_caches)
@@ -3141,6 +3194,9 @@ def test_realtime_ticks_reuse_the_encode_and_still_invalidate_on_a_prompt_change
     assert encoded == ["move through the room", "enter the snowy valley"]
     # A new prompt must still drop the cross-attention K/V built from the old one.
     assert invalidations == [False, False, False, True]
+    assert condition_revisions == [("move through the room", 512, "torch.float32")] * 3 + [
+        ("enter the snowy valley", 512, "torch.float32")
+    ]
 
 
 def test_stepwise_requests_with_the_same_prompt_share_one_encode() -> None:
@@ -3164,10 +3220,12 @@ def test_session_text_caches_publish_key_only_after_a_successful_build() -> None
     pipeline = _pipeline(module)
     state = module._LingBotARSessionState()
     invalidations: list[bool] = []
+    condition_revisions = []
     fail_next = {"raise": False}
 
-    def fake_text_caches(prompt_embeds, *, invalidate):
+    def fake_text_caches(prompt_embeds, *, invalidate, condition_revision):
         invalidations.append(invalidate)
+        condition_revisions.append(condition_revision)
         if fail_next["raise"]:
             fail_next["raise"] = False
             raise RuntimeError("injected failure inside _ar_text_caches")
@@ -3200,6 +3258,14 @@ def test_session_text_caches_publish_key_only_after_a_successful_build() -> None
     caches("A", length=256)
     caches("A", e=embeds.to(torch.bfloat16))
     assert invalidations[-2:] == [True, True]
+    assert condition_revisions == [
+        ("A", 512, "torch.float32"),
+        ("A", 512, "torch.float32"),
+        ("B", 512, "torch.float32"),
+        ("A", 512, "torch.float32"),
+        ("A", 256, "torch.float32"),
+        ("A", 512, "torch.bfloat16"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -3303,7 +3369,7 @@ def test_the_text_cache_is_sized_by_cross_attention_heads_not_the_self_attention
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
     pipeline.transformer.blocks[0].self_attn = SimpleNamespace(num_sp_heads=1)
-    pipeline.transformer.blocks[0].cross_attn = SimpleNamespace(num_local_heads=4)
+    pipeline.transformer.blocks[0].cross_attn.num_local_heads = 4
 
     spec = pipeline.ar_diffusion_kv_cache_spec()
 

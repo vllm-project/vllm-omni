@@ -179,7 +179,7 @@ class TestMetricKeys:
         assert ".cancel(" not in abort_source
 
         proc_source = _read_source(_STAGE_PROC_PATH)
-        run_loop_source = _get_function_source(proc_source, "StageDiffusionProc", "run_loop")
+        run_loop_source = _get_function_source(proc_source, "StageDiffusionProc", "_run_loop")
         abort_branch = run_loop_source[run_loop_source.index('elif msg_type == "abort":') :]
         abort_branch = abort_branch[: abort_branch.index('elif msg_type == "collective_rpc":')]
         assert ".cancel(" not in abort_branch

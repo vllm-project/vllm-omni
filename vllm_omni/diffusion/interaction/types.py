@@ -20,6 +20,9 @@ InteractionPayload = Mapping[str, object]
 # Prompt specialization narrows this to ``"target"`` only.
 InteractionMode = Literal["target", "velocity"]
 
+# Include coalesced event IDs: acknowledgements also occupy pending memory.
+MAX_PENDING_INTERACTION_EVENTS = 256
+
 
 def synchronized_monotonic_time(stamp: float | None = None) -> float:
     """Return a monotonic timestamp shared across DiT ranks.
@@ -70,6 +73,31 @@ class ChunkMediaSpec:
     @property
     def duration_s(self) -> float:
         return float(self.num_media_frames) / float(self.fps)
+
+
+@dataclass(frozen=True)
+class InteractionBoundaryContext:
+    """Engine-clock boundary and the previous chunk's observation window."""
+
+    boundary_at: float
+    window_opened_at: float | None = None
+    window_end_at: float | None = None
+
+    def __post_init__(self) -> None:
+        values = (self.boundary_at, self.window_opened_at, self.window_end_at)
+        if any(
+            value is not None
+            and (
+                isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+            )
+            for value in values
+        ):
+            raise ValueError("interaction boundary timestamps must be finite and non-negative")
+        if (self.window_opened_at is None) != (self.window_end_at is None):
+            raise ValueError("interaction window requires both endpoints")
+        if self.window_opened_at is not None and self.window_end_at is not None:
+            if not self.window_opened_at < self.window_end_at <= self.boundary_at:
+                raise ValueError("interaction window must precede the resume boundary")
 
 
 @dataclass(kw_only=True)
@@ -136,13 +164,17 @@ class InteractionChunkMetadata:
     started_event_ids: list[str] = field(default_factory=list)
     active_event_ids: list[str] = field(default_factory=list)
     completed_event_ids: list[str] = field(default_factory=list)
+    coalesced_event_ids: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, list[str]]:
-        return {
+        metadata = {
             "started_event_ids": list(self.started_event_ids),
             "active_event_ids": list(self.active_event_ids),
             "completed_event_ids": list(self.completed_event_ids),
         }
+        if self.coalesced_event_ids:
+            metadata["coalesced_event_ids"] = list(self.coalesced_event_ids)
+        return metadata
 
 
 def merge_interaction_metadata(
@@ -152,9 +184,11 @@ def merge_interaction_metadata(
     started: list[str] = []
     active: list[str] = []
     completed: list[str] = []
+    coalesced: list[str] = []
     seen_started: set[str] = set()
     seen_active: set[str] = set()
     seen_completed: set[str] = set()
+    seen_coalesced: set[str] = set()
     for meta in metas:
         for event_id in meta.started_event_ids:
             if event_id not in seen_started:
@@ -168,8 +202,13 @@ def merge_interaction_metadata(
             if event_id not in seen_completed:
                 seen_completed.add(event_id)
                 completed.append(event_id)
+        for event_id in meta.coalesced_event_ids:
+            if event_id not in seen_coalesced:
+                seen_coalesced.add(event_id)
+                coalesced.append(event_id)
     return InteractionChunkMetadata(
         started_event_ids=started,
         active_event_ids=active,
         completed_event_ids=completed,
+        coalesced_event_ids=coalesced,
     )

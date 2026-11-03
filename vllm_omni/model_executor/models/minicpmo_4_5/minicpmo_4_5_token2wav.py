@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 Token2wav adapter over in-tree ``StepAudio2Token2WavCore``.
 
 ``minicpmo_4_5_omni_tts`` historically depended on the external
@@ -64,6 +64,7 @@ class MiniCPMO45Token2wav:
         float16: bool = False,
         n_timesteps: int = 10,
         device: str | torch.device | None = None,
+        drop_upstream_chunk_att_buffers: bool = False,
     ):
         self.float16 = float16
         self.n_timesteps = n_timesteps
@@ -73,6 +74,7 @@ class MiniCPMO45Token2wav:
             float16=float16,
             device=self.device,
             n_timesteps=n_timesteps,
+            drop_upstream_chunk_att_buffers=drop_upstream_chunk_att_buffers,
         )
         # Eager-load so construction failures surface at init time (same as
         # the external Token2wav package), not on the first request.
@@ -120,9 +122,23 @@ class MiniCPMO45Token2wav:
         """Delegate prompt feature extraction to the wrapped core."""
         return self._core._prepare_prompt(prompt_wav)
 
-    def enable_trt_spk_embedding(self) -> None:
+    def enable_trt_spk_embedding(self, *, cpu_reference: bool = False) -> None:
         """Run the campplus speaker-embedding model on TensorRT."""
-        self._core.enable_trt_spk_embedding()
+        self._core.enable_trt_spk_embedding(cpu_reference=cpu_reference)
+
+    def enable_device_spk_embedding(self, *, use_trt: bool = True) -> None:
+        """Run CAM++ on device, optionally without TensorRT on CUDA."""
+        self._core.enable_device_spk_embedding(use_trt=use_trt)
+
+    def enable_speaker_cuda_graph(self, vllm_config) -> None:
+        """Replay the current Torch speaker forward without changing its math."""
+        from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_torch import CampplusTorch
+        from vllm_omni.model_executor.models.minicpmo_4_5.speaker_cuda_graph import SpeakerCudaGraph
+
+        speaker = self._core._spk_model
+        if not isinstance(speaker, CampplusTorch) or speaker.device.type != "cuda":
+            raise ValueError("Speaker CUDA graphs require the CUDA Torch speaker model")
+        self._core._spk_model = SpeakerCudaGraph(speaker, vllm_config)
 
     def __call__(self, generated_speech_tokens, prompt_wav) -> bytes:
         """One-shot tokens → 24 kHz WAV bytes."""

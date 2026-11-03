@@ -125,9 +125,10 @@ def test_sleep_client_error_does_not_mark_stages(sleep_capable_engine, mocker):
     app = _make_app(sleep_capable_engine)
     client = TestClient(app)
 
-    with pytest.raises(ValueError, match="unknown stage id 9"):
-        client.post("/v1/omni/sleep", json={"stage_ids": [9], "level": 1})
+    response = client.post("/v1/omni/sleep", json={"stage_ids": [9], "level": 1})
 
+    assert response.status_code == 400
+    assert "unknown stage id 9" in response.json()["detail"]
     assert app.state.sleeping_stages == set()
 
 
@@ -213,6 +214,19 @@ def test_wakeup_failure_returns_error_and_keeps_sleeping_set(sleep_capable_engin
     assert app.state.sleeping_stages == {0}
 
 
+def test_wakeup_client_error_returns_400_and_keeps_sleeping_set(sleep_capable_engine, mocker):
+    sleep_capable_engine.wake_up = mocker.AsyncMock(side_effect=ValueError("unknown stage id 9"))
+    app = _make_app(sleep_capable_engine)
+    app.state.sleeping_stages = {0, 9}
+    client = TestClient(app)
+
+    response = client.post("/v1/omni/wakeup", json={"stage_ids": [9]})
+
+    assert response.status_code == 400
+    assert "unknown stage id 9" in response.json()["detail"]
+    assert app.state.sleeping_stages == {0, 9}
+
+
 def test_wakeup_engine_not_support(sleep_incapable_engine):
     app = _make_app(sleep_incapable_engine)
     app.state.sleeping_stages = {0}
@@ -275,6 +289,7 @@ def test_sleep_then_wakeup_roundtrip(sleep_capable_engine):
 @pytest.fixture
 def pure_diffusion_engine(mocker):
     engine = mocker.MagicMock()
+    engine.config_path = None
     engine.stage_configs = [{"stage_type": "diffusion"}]
     engine.sleep = mocker.AsyncMock(return_value=[FakeAck(stage_id=0)])
     engine.wake_up = mocker.AsyncMock(return_value=[FakeAck(stage_id=0)])
@@ -300,6 +315,7 @@ def pure_diffusion_app(pure_diffusion_engine, mocker):
         disable_log_stats=True,
         max_log_len=0,
         enable_server_load_tracking=False,
+        enable_force_include_usage=False,
     )
 
     app = FastAPI()

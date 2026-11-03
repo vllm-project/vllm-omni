@@ -8,11 +8,8 @@ from collections import OrderedDict
 import numpy as np
 import pytest
 
-from vllm_omni.entrypoints.openai.serving_speech import (
-    _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES,
-    _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES,
-    OmniOpenAIServingSpeech,
-)
+from vllm_omni.config.speech_cache import SpeechCacheConfig
+from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -24,10 +21,9 @@ def cache():
     server.model_config = None
     server._ref_audio_resolve_cache = OrderedDict()
     server._ref_audio_resolve_cache_bytes = 0
-    server._ref_audio_resolve_cache_max_entries = _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES
-    server._ref_audio_resolve_cache_max_bytes = _REF_AUDIO_RESOLVE_CACHE_MAX_BYTES
-    server._ref_audio_model_artifact_ready = set()
-    server._request_ref_audio_artifact_keys = {}
+    config = SpeechCacheConfig()
+    server._ref_audio_resolve_cache_max_entries = config.resolve_max_entries
+    server._ref_audio_resolve_cache_max_bytes = config.resolve_max_bytes
     return server
 
 
@@ -36,8 +32,8 @@ def _put(cache, key, samples, artifact=None):
 
 
 def test_compact_storage_and_default_capacity(cache):
-    assert cache._ref_audio_resolve_cache_max_entries == 1024
-    assert cache._ref_audio_resolve_cache_max_bytes == 512 * 1024 * 1024
+    assert cache._ref_audio_resolve_cache_max_entries == 2048
+    assert cache._ref_audio_resolve_cache_max_bytes == 4 * 1024**3
     _put(cache, "a", [0.0, 0.25, -0.5, 1.0])
     value = cache._ref_audio_resolve_cache["a"]
     assert value[0].dtype == np.float32
@@ -59,14 +55,12 @@ def test_cached_float32_roundtrip_and_mutation_isolation(cache):
     assert second == expected
 
 
-def test_entry_eviction_invalidates_artifact_readiness(cache):
+def test_entry_eviction_is_lru(cache):
     cache._ref_audio_resolve_cache_max_entries = 2
     _put(cache, "a", [0.0])
-    cache._ref_audio_model_artifact_ready.add(("a", False))
     _put(cache, "b", [0.0])
     _put(cache, "c", [0.0])
     assert list(cache._ref_audio_resolve_cache) == ["b", "c"]
-    assert ("a", False) not in cache._ref_audio_model_artifact_ready
 
 
 def test_byte_budget_evicts_and_rejects_oversized_entries(cache):
@@ -79,13 +73,13 @@ def test_byte_budget_evicts_and_rejects_oversized_entries(cache):
     assert "too-large" not in cache._ref_audio_resolve_cache
 
 
-def test_replacement_accounts_bytes_and_preserves_referenced_artifact(cache):
+def test_replacement_accounts_bytes(cache):
     _put(cache, "a", [0.0] * 3, "same")
     _put(cache, "alias", [0.0] * 2, "same")
-    cache._ref_audio_model_artifact_ready.add(("same", False))
     _put(cache, "a", [1.0] * 4, "new")
     assert cache._ref_audio_resolve_cache_bytes == 24
-    assert ("same", False) in cache._ref_audio_model_artifact_ready
+    assert cache._get_resolved_ref_audio_artifact_key("a") == "new"
+    assert cache._get_resolved_ref_audio_artifact_key("alias") == "same"
 
 
 def test_pool_accepts_666_references(cache):

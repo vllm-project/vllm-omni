@@ -29,7 +29,6 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
-    BaseDummyInputsBuilder,
     BaseProcessingInfo,
     ProcessorInputs,
     PromptReplacement,
@@ -44,7 +43,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
+from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import (
     NO_INTERLEAVE_NEXT_TOKEN_ID,
@@ -224,7 +223,7 @@ class MiMoAudioLLMProcessingInfo(
         return {"audio": 1}
 
 
-class MiMoAudioLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiMoAudioLLMProcessingInfo]):
+class MiMoAudioLLMDummyInputsBuilder(OmniDummyInputsBuilder[MiMoAudioLLMProcessingInfo]):
     _processor_inputs_cache: LRUCache = LRUCache(capacity=1024)
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
@@ -372,7 +371,7 @@ class MiMoAudioLLMMultiModalProcessor(OmniMultiModalProcessor[MiMoAudioLLMProces
 
         # Text-only input not supported in composite processor
         if not mm_data.get("audio", []):
-            prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
+            prompt_ids = self._postprocess_prompt(prompt_ids)
 
             return BatchFeature(dict(input_ids=[prompt_ids]), tensor_type="pt")
 
@@ -741,30 +740,6 @@ class MiMoAudioForConditionalGeneration(
             )
 
             loaded_weights.update(token2wav_loaded)
-
-    @staticmethod
-    def insert_between(input_ids: torch.Tensor, group_size: int, value: int = -100):
-        if group_size < 0:
-            raise ValueError("group_size must be non-negative")
-
-        if not isinstance(input_ids, torch.Tensor):
-            input_ids = torch.tensor(input_ids)
-        if input_ids.dim() != 1:
-            raise ValueError("input_ids must be 1-D tensor or list")
-
-        L = input_ids.numel()
-        if group_size == 0 or L == 0:
-            return input_ids.clone()
-
-        new_len = L * (group_size + 1)
-        # Create output tensor filled with value, dtype & device consistent with input_ids
-        out = input_ids.new_full((new_len,), value)
-
-        # Place original elements at the first position of each block: 0, group_size+1, 2*(group_size+1), ...
-        positions = torch.arange(L, dtype=torch.long, device=input_ids.device) * (group_size + 1)
-        out[positions] = input_ids
-
-        return out
 
     def forward(
         self,

@@ -18,6 +18,7 @@ from unittest import mock
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.backends import rainfusion_attn
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.attention.backends.rainfusion_attn import (
@@ -28,7 +29,7 @@ from vllm_omni.diffusion.attention.backends.rainfusion_attn import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.npu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
 
 PREFIX_ROWS = 710  # 14 text rows + 696 audio rows
 ALIGNED_GRID = (62, 24, 40)  # 1280x768 -> 59520 video rows, 465 blocks
@@ -341,3 +342,25 @@ def test_precision_non_bf16_passes_gate_when_supported():
             # The gate must pass; the fake mindiesd returns None so no crash.
             out = impl._forward_sparse_npu(q, q, q, plan)
             assert out is None
+
+
+def test_mix_with_single_video_span_reaches_mindiesd(monkeypatch):
+    """H3 publishes video_spans even for one target; mix must reach RFv3."""
+    calls = []
+
+    def sparse_attention(query, key, value, *, precision, video_spans, sparse_type, **kwargs):
+        calls.append((precision, video_spans, sparse_type))
+        return query
+
+    mindiesd = types.ModuleType("mindiesd")
+    mindiesd.sparse_attention = sparse_attention
+    monkeypatch.setitem(sys.modules, "mindiesd", mindiesd)
+    monkeypatch.setattr(rainfusion_attn, "_mindiesd_supports_precision", lambda: True)
+    impl = make_impl(precision="mix")
+    q = torch.zeros(1, 8, 4, 128, dtype=torch.bfloat16)
+    spans = [{"start": 0, "latent_shape": [2, 2, 2]}]
+    plan = RainFusionPlan(used_len=8, video_spans=spans)
+
+    impl._forward_sparse_npu(q, q, q, plan)
+
+    assert calls == [("mix", spans, "rf_v3")]

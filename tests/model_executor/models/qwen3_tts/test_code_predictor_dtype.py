@@ -92,6 +92,7 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     return {
         "vllm_omni": mocker.MagicMock(),
         "vllm_omni.platforms": platforms_mock,
+        "vllm_omni.utils.torch_compile": mocker.MagicMock(),
         "vllm.logger": logger_mock,
         "vllm.config": mocker.MagicMock(),
         "vllm.config.vllm": vllm_config_mod,
@@ -349,6 +350,7 @@ class TestCodePredictorDtypeAlignment:
         _, _, code_predictor_wrapper, _, _ = loaded_target_classes
         cp_config, talker_config = _make_tiny_config(loaded_target_classes)
         vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+        vllm_config.additional_config = {"code_predictor_kv_cache": True}
 
         predictor = code_predictor_wrapper(
             vllm_config=vllm_config,
@@ -361,8 +363,10 @@ class TestCodePredictorDtypeAlignment:
         # Ensure NPU path is not taken on non-NPU hardware
         common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
         mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+        mocker.patch.object(common_mod.current_omni_platform, "is_cuda", return_value=False)
         predictor._setup_compile()
         assert predictor._model_dtype == torch.float16
+        assert not predictor._kv_cache_enabled
 
     def test_setup_compile_uses_eager_on_xpu(self, mocker: MockerFixture, loaded_target_classes) -> None:
         """XPU should avoid the torch.compile path used by CUDA."""
@@ -377,6 +381,7 @@ class TestCodePredictorDtypeAlignment:
         )
 
         common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_cuda", return_value=False)
         mocker.patch.object(common_mod.current_omni_platform, "supports_torch_inductor", return_value=True)
         mocker.patch.object(common_mod.current_omni_platform, "is_xpu", return_value=True)
         compile_mock = mocker.patch.object(common_mod.torch, "compile")
@@ -385,6 +390,7 @@ class TestCodePredictorDtypeAlignment:
 
         compile_mock.assert_not_called()
         assert predictor._compiled_model_fwd == predictor.model.forward
+        assert not predictor._kv_cache_enabled
 
     def test_forward_with_mismatched_input_dtype(self, mocker: MockerFixture, loaded_target_classes) -> None:
         """forward() should not crash when inputs are float32 but model is float16."""
@@ -569,6 +575,27 @@ class TestCodePredictorPerRowGenerators:
             )
 
 
+@pytest.mark.parametrize("fused_requested", [False, True])
+@pytest.mark.parametrize("invalid_input", ["uniforms", "generators"])
+def test_sampling_contract_rejected_before_dispatch(mocker, loaded_target_classes, fused_requested, invalid_input):
+    predictor, talker_config = TestCodePredictorPerRowGenerators()._make_predictor(mocker, loaded_target_classes)
+    predictor._fused_requested = fused_requested
+    predictor._fused = mocker.Mock()
+    setup = mocker.patch.object(predictor, "_setup_compile")
+    uniforms = torch.full((2, 3, 1 if invalid_input == "uniforms" else 64), 0.5)
+    generators = [torch.Generator()] if invalid_input == "generators" else None
+    with pytest.raises(ValueError, match="sample_uniforms must have shape|one entry per row"):
+        predictor(
+            torch.zeros(2, dtype=torch.long),
+            torch.randn(2, talker_config.hidden_size),
+            torch.randn(2, talker_config.hidden_size),
+            sample_uniforms=uniforms,
+            generators=generators,
+        )
+    setup.assert_not_called()
+    predictor._fused.assert_not_called()
+
+
 class TestCodePredictorModelDtype:
     """Test the inner model forward with different dtypes."""
 
@@ -663,6 +690,8 @@ class TestCodePredictorGraphReplay:
 
         predictor = object.__new__(code_predictor_wrapper)
         torch.nn.Module.__init__(predictor)
+        predictor._fused_requested = False
+        predictor._fused = None
         predictor._num_groups = 3
         predictor._model_dtype = torch.float32
         predictor._setup_compile = mocker.Mock()
@@ -1432,3 +1461,101 @@ def test_shared_predictor_ignores_tts_fast_path_options(mocker, loaded_target_cl
     expected = (logits.float() - torch.log(-torch.log(uniforms))).argmax(-1, keepdim=True)
     actual = predictor._sample_per_call(logits, 1.0, 0, None, uniforms)
     torch.testing.assert_close(actual, expected)
+
+
+def test_tts_cached_predictor_keeps_its_own_step_dispatch(mocker: MockerFixture, loaded_target_classes) -> None:
+    """The TTS cache must not enter Omni's uninitialized incremental loop."""
+    _, _, wrapper, _, _ = loaded_target_classes
+    common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    mocker.patch.object(common_mod.current_omni_platform, "is_cuda", return_value=True)
+    mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+    mocker.patch.object(wrapper, "_stage_connector_extra_config", return_value={"code_predictor_kv_cache": True})
+    cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+    predictor = wrapper(vllm_config=_make_vllm_config(mocker), config=cp_config, talker_config=talker_config)
+    assert predictor._kv_requested
+    predictor._model_dtype = torch.float32
+    predictor._codec_embeds_list = list(predictor.model.codec_embedding)
+    predictor._bucket_sizes = [1]
+    mocker.patch.object(predictor, "_setup_compile")
+    step = mocker.patch.object(predictor, "_predict_step_logits", return_value=torch.ones(1, cp_config.vocab_size))
+    codes = predictor(torch.zeros(1, dtype=torch.long), torch.zeros(1, 32), torch.zeros(1, 32), do_sample=False)
+    assert step.call_count == cp_config.num_code_groups - 1
+    assert codes.shape == (1, cp_config.num_code_groups)
+    assert predictor._kv_buf is None
+
+
+@torch.inference_mode()
+def test_eager_cache_reuses_positions_and_resets_frames(mocker, loaded_target_classes):
+    """The portable cache must survive batch changes without retaining prior frames."""
+    common = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    mocker.patch.object(common.current_omni_platform, "is_cuda", return_value=False)
+    cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+    predictor_class = loaded_target_classes[2]
+    cached_config = _make_vllm_config(mocker)
+    cached_config.additional_config = {"code_predictor_kv_cache": True}
+    reference_config = _make_vllm_config(mocker)
+    reference_config.additional_config = {"code_predictor_kv_cache": False}
+    torch.manual_seed(171)
+    cached = predictor_class(vllm_config=cached_config, config=cp_config, talker_config=talker_config).eval()
+    reference = predictor_class(vllm_config=reference_config, config=cp_config, talker_config=talker_config).eval()
+    reference.load_state_dict(cached.state_dict())
+    lengths = []
+    handle = cached.model.layers[0].self_attn.qkv_proj.register_forward_pre_hook(
+        lambda _, args: lengths.append(args[0].shape[1])
+    )
+    for batch in (1, 4, 8, 1):
+        inputs = (
+            torch.randint(cp_config.vocab_size, (batch, 1)),
+            torch.randn(batch, 1, cp_config.hidden_size),
+            torch.randn(batch, 1, cp_config.hidden_size),
+        )
+        if cached._kv_buf is not None:
+            cached._kv_buf.fill_(torch.nan)
+        lengths.clear()
+        actual = cached(*inputs, do_sample=False)
+        expected = reference(*inputs, do_sample=False)
+        assert not reference._kv_cache_enabled
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert lengths == [2, 1, 1]
+    handle.remove()
+
+
+@pytest.mark.parametrize(
+    ("platform", "option", "graphs", "cached", "capture"),
+    [
+        ("cuda", None, True, False, "cuda"),
+        ("cuda", True, True, True, None),
+        ("npu", True, True, False, "npu"),
+        ("npu", None, False, False, None),
+        ("mps", None, False, True, None),
+        ("mps", False, False, False, None),
+    ],
+)
+def test_eager_kv_preserves_graph_paths(mocker, loaded_target_classes, platform, option, graphs, cached, capture):
+    common = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    mocker.patch.object(common.current_omni_platform, "is_cuda", return_value=platform == "cuda")
+    mocker.patch.object(common.current_omni_platform, "is_npu", return_value=platform == "npu")
+    mocker.patch.object(common.current_omni_platform, "supports_torch_inductor", return_value=platform == "cuda")
+    cp_config, _ = _make_tiny_config(loaded_target_classes)
+    config = _make_vllm_config(mocker)
+    config.additional_config = {} if option is None else {"code_predictor_kv_cache": option}
+    predictor = common.CodePredictorWrapper(
+        vllm_config=config,
+        cp_config=cp_config,
+        wrapper_config=common.CodePredictorWrapperConfig(use_cuda_graphs=graphs),
+    ).to(torch.bfloat16)
+    if platform == "mps":
+        weight = mocker.Mock(dtype=torch.bfloat16, device=torch.device("mps"))
+        mocker.patch.object(predictor.model, "parameters", side_effect=lambda: iter([weight]))
+        mocker.patch.object(predictor, "_ensure_kv_steps")
+    mocker.patch.object(predictor, "_warmup_buckets")
+    cuda = mocker.patch.object(predictor, "_capture_cuda_graphs")
+    npu = mocker.patch.object(predictor, "_capture_npu_graphs")
+    compile_model = mocker.patch.object(common.torch, "compile", side_effect=lambda fn, **kwargs: fn)
+
+    predictor._setup_compile()
+
+    assert predictor._kv_cache_enabled is cached
+    assert cuda.called is (capture == "cuda")
+    assert npu.called is (capture == "npu")
+    assert compile_model.called is (platform == "cuda")

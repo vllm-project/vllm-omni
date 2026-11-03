@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Single-GPU (uniproc) diffusion executor: selection and RPC behaviour."""
 
@@ -10,9 +10,14 @@ import pytest
 import torch
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
+from vllm_omni.errors import OmniClientError
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -260,3 +265,100 @@ def test_shutdown_is_idempotent_and_closes_executor(executor, monkeypatch):
     empty_cache.assert_called_once_with()
     with pytest.raises(RuntimeError, match="closed"):
         exec_.collective_rpc("some_method", unique_reply_rank=0)
+
+
+def _single_request_wave(request_id: str = "req-1"):
+    return SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                request_id=request_id,
+                req=SimpleNamespace(request_id=request_id),
+                diffusion_kv_metadata=None,
+            )
+        ],
+        kv_prefetch_job=None,
+    )
+
+
+def test_execute_request_keeps_client_error_status(executor, monkeypatch):
+    """A pipeline's OmniClientError must keep its 4xx status on a single GPU.
+
+    The worker runs inline, so the exception reaches execute_request directly.
+    Flattening it to DiffusionOutput(error=str(exc)) made the engine rebuild a
+    RuntimeError and the API answer HTTP 500 for a request validation error.
+    """
+    from vllm_omni.errors import OmniClientError
+
+    exec_, worker = executor
+    worker.execute_method.side_effect = OmniClientError("clip exceeds the frame budget", status_code=422)
+    monkeypatch.setattr(exec_, "_device_is_usable", lambda: True)
+
+    batch = exec_.execute_request(_single_request_wave())
+
+    (runner_output,) = batch.runner_outputs
+    assert runner_output.finished is True
+    assert runner_output.result.error == "clip exceeds the frame budget"
+    assert runner_output.result.error_status_code == 422
+    assert runner_output.result.error_type == "BadRequestError"
+    assert exec_.is_dead is False
+
+
+def test_execute_request_server_error_has_no_client_status(executor, monkeypatch):
+    exec_, worker = executor
+    worker.execute_method.side_effect = RuntimeError("CUDA out of memory")
+    monkeypatch.setattr(exec_, "_device_is_usable", lambda: True)
+
+    batch = exec_.execute_request(_single_request_wave())
+
+    (runner_output,) = batch.runner_outputs
+    assert runner_output.result.error == "CUDA out of memory"
+    assert runner_output.result.error_status_code is None
+    assert runner_output.result.error_type is None
+
+
+@pytest.mark.parametrize(
+    "error,expected_status,expected_type",
+    [
+        (OmniClientError("invalid schedule"), 400, "BadRequestError"),
+        (OmniClientError("rejected", status_code=422, error_type="ScheduleError"), 422, "ScheduleError"),
+        (RuntimeError("worker failed"), None, None),
+        (ValueError("ordinary value error"), None, None),
+    ],
+)
+def test_execute_request_keeps_error_metadata_and_next_request(
+    executor, monkeypatch, error, expected_status, expected_type
+):
+    exec_, worker = executor
+    monkeypatch.setattr(exec_, "_device_is_usable", lambda: True)
+    good = DiffusionOutput(output="ok")
+    worker.execute_method.side_effect = [error, good]
+    scheduler_output = DiffusionSchedulerOutput(
+        step_id=0,
+        scheduled_new_reqs=[
+            NewRequestData(
+                request_id=name,
+                req=OmniDiffusionRequest(
+                    request_id=name,
+                    prompt={"prompt": "a test"},
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
+                ),
+            )
+            for name in ("bad", "good")
+        ],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set(),
+        num_running_reqs=2,
+        num_waiting_reqs=0,
+    )
+
+    result = exec_.execute_request(scheduler_output)
+
+    bad, healthy = result.runner_outputs
+    assert bad.request_id == "bad"
+    assert bad.finished is True
+    assert bad.result.error == str(error)
+    assert bad.result.error_status_code == expected_status
+    assert bad.result.error_type == expected_type
+    assert healthy.request_id == "good"
+    assert healthy.result is good
+    assert exec_.is_dead is False

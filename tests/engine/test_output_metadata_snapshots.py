@@ -141,3 +141,21 @@ def test_non_snapshot_tensors_still_accumulate_and_empty_merge_keeps_identity():
     merged.consolidate_tensors(OutputModality.AUDIO)
     torch.testing.assert_close(merged["latent"], torch.tensor([1.0, 3.0]))
     torch.testing.assert_close(merged["audio"], torch.tensor([2.0, 4.0]))
+
+
+@pytest.mark.parametrize("kind", [RequestOutputKind.FINAL_ONLY, RequestOutputKind.CUMULATIVE])
+def test_minicpmo_finished_snapshot_preserves_all_codec_frames(kind):
+    """Sync Talker output must keep all codec deltas and the final stop flag."""
+    state = _state(kind)
+    for index in range(3):
+        state.add_multimodal_tensor(
+            {"codes.audio": torch.tensor([10 + index]), "meta.finished": torch.tensor(index == 2)},
+            "latent",
+        )
+    output = state.make_request_output([], None, FinishReason.STOP, None)
+    assert output is not None and not isinstance(output, PoolingRequestOutput)
+    payload = output.outputs[0].multimodal_output
+    assert isinstance(payload["meta"]["finished"], torch.Tensor)
+    assert payload["meta"]["finished"].ndim == 0
+    assert payload["meta"]["finished"].item() is True
+    torch.testing.assert_close(payload["codes"]["audio"], torch.tensor([10, 11, 12]))

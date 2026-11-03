@@ -2,6 +2,10 @@
 
 You may find information about contributing to vLLM-Omni on [Contributing](https://vllm-omni.readthedocs.io/en/latest/contributing/).
 
+Maintainer triage and merge operations are described in the [PR merge loop](docs/contributing/ci/pr_merge_loop.md).
+
+Before code changes or PR submission, check [review and issue lessons](docs/contributing/ci/lessons.md) and apply the entries relevant to your change, verifying their evidence against the current revision.
+
 AI-assisted contributions must follow the [AI Usage Policy](docs/contributing/README.md#ai-usage-policy), including disclosure, human review, and validation requirements.
 
 Local `pre-commit` gates (SPDX, forbidden imports, `torch.cuda`, shellcheck,
@@ -10,6 +14,6 @@ how to extend allowlists) are documented in the
 [Linting](https://vllm-omni.readthedocs.io/en/latest/contributing/#linting)
 section of that guide.
 
-Before submitting a PR, run the [precheck-pr skill](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-check against project conventions.
+Before implementing a contribution, complete the human [contributor intent gate](.claude/skills/precheck-pr/SKILL.md#contributor-intent-gate). Before submitting a PR, run the [precheck-pr skill](.claude/skills/precheck-pr/SKILL.md) with the code agent for a self-check against project conventions.
 
 vLLM-Omni limits contributors without write access to **5 open PRs**; see the [Pull Request Limit](docs/contributing/README.md#pull-request-limit) section of the contributing guide.
