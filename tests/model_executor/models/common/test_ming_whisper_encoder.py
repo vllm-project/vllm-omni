@@ -115,6 +115,14 @@ def test_packed_attention_falls_back_without_a_varlen_callable(monkeypatch: pyte
 
     tokens = 6
     cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32)
-    output = attn(torch.randn(tokens, 32, dtype=torch.bfloat16), cu_seqlens=cu_seqlens)
+    x = torch.randn(tokens, 32, dtype=torch.bfloat16)
+
+    output = attn(x, cu_seqlens=cu_seqlens)
 
     assert output.shape == (tokens, 32)
+
+    # The fallback has to compute the right attention, not merely run. One
+    # packed sequence of ``tokens`` frames is a plain self-attention over
+    # them, so the dense implementation is an independent reference for it.
+    reference = attn._forward_dense(x.float().unsqueeze(0)).squeeze(0)
+    torch.testing.assert_close(output.float(), reference, rtol=5e-2, atol=5e-2)
