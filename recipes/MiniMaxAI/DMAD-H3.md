@@ -83,7 +83,7 @@ Offline step execution must explicitly specify the selected adapter's count.
 
 ## 2K output and boundaries
 
-The [Pika recipe's community latent upscaler](../Pika-Labs/Pika-H3-Flex.md#optional-2k-output)
+The [Pika recipe's community latent upscaler](Pika-H3-Flex.md#optional-2k-output)
 can also run after DMAD denoising. Configure `latent_upscaler_path` on the
 server, then add `"latent_upscale":{"width":2560,"height":1440}` to the
 request's `extra_params`. Preserve DMAD's audio shift of 2. The upscaler

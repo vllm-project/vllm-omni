@@ -1848,7 +1848,7 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
 
 ## Latent super-resolution
 
-The [Pika H3 Flex recipe](../Pika-Labs/Pika-H3-Flex.md) uses H3's native
+The [Pika H3 Flex recipe](Pika-H3-Flex.md) uses H3's native
 pipeline with the published six-step Pika adapters. It also describes optional
 2K latent upscaling and CUDA audio/video decode overlap.
 
@@ -2060,7 +2060,7 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
 
 ## Additional resources
 
-- [DMAD four/eight-step T2VA adapters](../ZhengmingYu/DMAD-H3.md)
+- [DMAD four/eight-step T2VA adapters](DMAD-H3.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
 - [Diffusion parallelism](../../docs/user_guide/diffusion/parallelism/overview.md)

@@ -74,7 +74,7 @@ curl --fail-with-body --max-time 1800 http://127.0.0.1:8000/v1/videos/sync \
 Against an FL2VA server, use `task=t2va` without a reference and include
 `"aspect_ratio":"16:9"` in `extra_params`, or use `task=fl2va` with H3's
 existing keyframe inputs. See the
-[H3 conditioning API](../MiniMaxAI/MiniMax-H3.md) for first/last frames and
+[H3 conditioning API](MiniMax-H3.md) for first/last frames and
 multimodal references. A five-second request produces 124 frames at 24 fps,
 with 32 kHz stereo audio.
 
