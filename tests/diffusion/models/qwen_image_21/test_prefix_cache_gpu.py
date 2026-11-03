@@ -119,7 +119,7 @@ def test_partial_prefix_hits_match_cache_off(monkeypatch, tmp_path):
                 )
                 # Bitwise equality is recorded where observed; other CUDA
                 # kernels must still meet this explicit image-level tolerance.
-                assert mse == 0 or psnr >= 40, metrics[-1]
+                assert mse == 0 or (psnr is not None and psnr >= 40), metrics[-1]
         finally:
             omni.close()
             del omni

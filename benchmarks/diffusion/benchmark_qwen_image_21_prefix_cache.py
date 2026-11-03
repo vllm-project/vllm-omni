@@ -12,12 +12,38 @@ because only the stable Step-0 prefix is retained.
 import argparse
 import hashlib
 import json
+import os
 import statistics
+import subprocess
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+
+def observe_decode_graph_replays():
+    # Spawned Workers import this module too. Observe the real replay path
+    # rather than inferring graph use from a requested configuration flag.
+    from vllm_omni.diffusion.models.qwen_image_21.decode_graph import (
+        QwenImage21DecodeGraphManager,
+    )
+
+    original = QwenImage21DecodeGraphManager.try_decode
+
+    def observed(manager, *args, **kwargs):
+        result = original(manager, *args, **kwargs)
+        directory = os.environ.get("QWEN_IMAGE21_BENCH_TRACE_DIR")
+        if result is not None and directory and not getattr(manager, "_benchmark_replay_observed", False):
+            (Path(directory) / f"graph-replay-{os.getpid()}.json").write_text('{"replayed": true}\n')
+            manager._benchmark_replay_observed = True
+        return result
+
+    QwenImage21DecodeGraphManager.try_decode = observed
+
+
+observe_decode_graph_replays()
 
 
 def reference(seed):
@@ -44,11 +70,12 @@ def main():
     parser.add_argument("--kv-cache-gib", type=float, default=14)
     parser.add_argument("--references", type=int, default=2)
     parser.add_argument("--cfg", type=float, default=4)
-    parser.add_argument("--capacity-probes", type=int, default=8)
+    parser.add_argument("--capacity-probes", type=int, default=32)
     args = parser.parse_args()
     if args.references < 2:
         parser.error("At least two references are required for the partial-hit workload")
     args.output.mkdir(parents=True, exist_ok=False)
+    os.environ["QWEN_IMAGE21_BENCH_TRACE_DIR"] = str(args.output.resolve())
     config = dict(
         model=args.model,
         enforce_eager=False,
@@ -60,9 +87,18 @@ def main():
         additional_config={"diffusion_kv_profile_max_sequence_length": 512},
     )
     if args.mode != "dense":
-        config.update(diffusion_kv_max_rows_per_request=2, kv_cache_memory_bytes=int(args.kv_cache_gib * 1024**3))
+        config.update(
+            diffusion_kv_max_rows_per_request=2,
+            kv_cache_memory_bytes=int(args.kv_cache_gib * 1024**3),
+        )
     if args.layout == "hsdp8":
-        config.update(num_gpus=8, use_hsdp=True, hsdp_shard_size=8, hsdp_replicate_size=1, ulysses_degree=8)
+        config.update(
+            num_gpus=8,
+            use_hsdp=True,
+            hsdp_shard_size=8,
+            hsdp_replicate_size=1,
+            ulysses_degree=8,
+        )
     observation = {}
     original = DiffusionKVCacheManager.reserve_request
 
@@ -87,6 +123,29 @@ def main():
         "gpu": torch.cuda.get_device_name(),
         "samples": [],
     }
+    record["commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    from vllm.third_party import pynvml
+
+    pynvml.nvmlInit()
+    visible = os.environ.get(
+        "CUDA_VISIBLE_DEVICES",
+        ",".join(str(i) for i in range(torch.accelerator.device_count())),
+    )
+    handles = [
+        pynvml.nvmlDeviceGetHandleByIndex(int(device)) if device.isdigit() else pynvml.nvmlDeviceGetHandleByUUID(device)
+        for device in visible.split(",")
+    ]
+    peak_memory = [0] * len(handles)
+    stop_monitor = threading.Event()
+
+    def monitor_memory():
+        while not stop_monitor.is_set():
+            for index, handle in enumerate(handles):
+                peak_memory[index] = max(peak_memory[index], pynvml.nvmlDeviceGetMemoryInfo(handle).used)
+            stop_monitor.wait(0.2)
+
+    monitor = threading.Thread(target=monitor_memory, daemon=True)
+    monitor.start()
     (args.output / "configuration.json").write_text(json.dumps(record, indent=2) + "\n")
     omni = None
 
@@ -123,7 +182,7 @@ def main():
                 seed = 10000 + case_idx * 10000 + iteration * (args.references + 1)
                 images = [reference(seed + i) for i in range(args.references)]
                 if case != "cold":
-                    generate(images)
+                    generate(images, steps=2)
                     if case == "partial":
                         images[-1] = reference(seed + args.references)
                 elapsed, array = generate(images)
@@ -179,10 +238,15 @@ def main():
                 "retained_full_prefixes": sum(retained),
                 "retained_by_probe": retained,
             }
+        record["decode_graph_replay_observed"] = bool(list(args.output.glob("graph-replay-*.json")))
+        record["peak_gpu_memory_bytes"] = peak_memory.copy()
         (args.output / "summary.json").write_text(json.dumps(record, indent=2) + "\n")
     finally:
         if omni is not None:
             omni.close()
+        stop_monitor.set()
+        monitor.join()
+        pynvml.nvmlShutdown()
         DiffusionKVCacheManager.reserve_request = original
 
 
