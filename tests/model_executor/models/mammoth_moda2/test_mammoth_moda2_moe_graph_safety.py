@@ -108,26 +108,34 @@ def test_ar_wrappers_keep_raw_input_tokens() -> None:
     """The runner decides whether to drop input_ids from the top-level module."""
     assert m.MammothModa2ARForConditionalGeneration.requires_raw_input_tokens is True
     assert m.MammothModa2Qwen3ARForConditionalGeneration.requires_raw_input_tokens is True
-    # Qwen3 LM inherits forward/mask derivation from the Qwen2 MoE host, so the
-    # same requires_raw_input_tokens path feeds gen_token_mask under capture.
+    # Qwen3 LM must keep the Qwen2 MoE host's forward / embedding paths so
+    # requires_raw_input_tokens still feeds gen_token_mask under capture.
     assert issubclass(m.MammothModa2Qwen3ForCausalLM, m.MammothModa2Qwen2ForCausalLM)
+    assert m.MammothModa2Qwen3ForCausalLM.forward is m.MammothModa2Qwen2ForCausalLM.forward
+    assert (
+        m.MammothModa2Qwen3ForCausalLM.get_input_embeddings
+        is m.MammothModa2Qwen2ForCausalLM.get_input_embeddings
+    )
 
 
 def test_empty_intermediate_tensors_seed_gen_token_mask() -> None:
-    """PP ranks replay through IntermediateTensors; the empty factory must seed the mask key."""
-    from vllm.sequence import IntermediateTensors
-
+    """PP empty-tensor factory must seed gen_token_mask (not a hand-built dict)."""
     batch_size, hidden = 3, 8
-    tensors = IntermediateTensors(
-        {
-            "hidden_states": torch.zeros((batch_size, hidden)),
-            "residual": torch.zeros((batch_size, hidden)),
-            "gen_token_mask": torch.zeros((batch_size,), dtype=torch.bool),
-        }
+    # Bind the same factory the LM installs in __init__, then call it the way
+    # the runner / PP path does (batch_size, dtype, device).
+    lm = m.MammothModa2Qwen2ForCausalLM.__new__(m.MammothModa2Qwen2ForCausalLM)
+    lm.make_empty_intermediate_tensors = (
+        lambda batch_size, dtype, device: m.make_empty_intermediate_tensors_with_gen_mask(
+            batch_size, hidden, dtype, device
+        )
     )
+
+    tensors = lm.make_empty_intermediate_tensors(batch_size, torch.float32, torch.device("cpu"))
     assert "gen_token_mask" in tensors.tensors
     assert tensors.tensors["gen_token_mask"].dtype == torch.bool
     assert tuple(tensors.tensors["gen_token_mask"].shape) == (batch_size,)
+    assert tuple(tensors.tensors["hidden_states"].shape) == (batch_size, hidden)
+    assert tuple(tensors.tensors["residual"].shape) == (batch_size, hidden)
 
 
 def test_is_graph_capturing_warns_once_without_backend_probe(

@@ -184,6 +184,27 @@ def _moe_blend(
     return merged
 
 
+def make_empty_intermediate_tensors_with_gen_mask(
+    batch_size: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> IntermediateTensors:
+    """Empty PP intermediate tensors, including a seeded ``gen_token_mask``.
+
+    Rank > 0 always needs the key during capture/replay; the first rank
+    overwrites it with the real mask derived from ``input_ids`` when
+    ``requires_raw_input_tokens`` holds.
+    """
+    return IntermediateTensors(
+        {
+            "hidden_states": torch.zeros((batch_size, hidden_size), dtype=dtype, device=device),
+            "residual": torch.zeros((batch_size, hidden_size), dtype=dtype, device=device),
+            "gen_token_mask": torch.zeros((batch_size,), dtype=torch.bool, device=device),
+        }
+    )
+
+
 def moe_forward(
     hidden_states: torch.Tensor,
     und_expert: Callable[[torch.Tensor], torch.Tensor],
@@ -495,20 +516,15 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             prefix=f"{prefix}.layers",
         )
 
+        hidden_size = config.hidden_size
+
         def _make_empty_intermediate_tensors(
             batch_size: int,
             dtype: torch.dtype,
             device: torch.device,
         ) -> IntermediateTensors:
-            # Seed gen_token_mask so PP rank > 0 always has the key during
-            # capture/replay; the first rank overwrites it with the real mask
-            # derived from input_ids when requires_raw_input_tokens holds.
-            return IntermediateTensors(
-                {
-                    "hidden_states": torch.zeros((batch_size, config.hidden_size), dtype=dtype, device=device),
-                    "residual": torch.zeros((batch_size, config.hidden_size), dtype=dtype, device=device),
-                    "gen_token_mask": torch.zeros((batch_size,), dtype=torch.bool, device=device),
-                }
+            return make_empty_intermediate_tensors_with_gen_mask(
+                batch_size, hidden_size, dtype, device
             )
 
         self.make_empty_intermediate_tensors = _make_empty_intermediate_tensors
