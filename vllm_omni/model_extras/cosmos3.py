@@ -35,6 +35,7 @@ COSMOS3_EXTRA_BODY_PARAMS = frozenset(
         "resolution",
         "image_size",
         "use_state",
+        "format_prompt_as_json",
         "observation",
         "robot_obs",
         "deterministic_seed",

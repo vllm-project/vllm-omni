@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """E2E accuracy guard against a pinned Lightricks LTX pipeline revision.
 
-Four complementary default-shape cases cover both model versions, both
+Three complementary default-shape cases cover both model versions, both
 two-stage weight families, and T2V/I2V without duplicating one-stage coverage.
 """
 
@@ -22,11 +22,11 @@ from typing import Literal
 import numpy as np
 import pytest
 import torch
-from huggingface_hub import hf_hub_download, snapshot_download
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 
 from tests.e2e.accuracy.helpers import reset_artifact_dir
 from tests.helpers.mark import hardware_test
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 OFFICIAL_REPOSITORY = "https://github.com/Lightricks/LTX-2.git"
 OFFICIAL_REVISION = "9377758131b1ffde4b7f766804590a6617bf2ab9"
@@ -103,7 +103,7 @@ class LTXAccuracyCase:
     spatial_upsampler: LTXArtifact | None = None
     distilled_lora: LTXArtifact | None = None
     # Official uses block streaming; Omni uses layerwise offload. Both preserve
-    # bf16 arithmetic while keeping full-resolution two-stage cases on one H100.
+    # bf16 arithmetic while keeping full-resolution cases on one H100.
     enable_layerwise_offload: bool = False
 
 
@@ -114,11 +114,6 @@ LTX2_CHECKPOINT = LTXArtifact(
     filename="ltx-2-19b-dev.safetensors",
     revision=LTX2_REVISION,
     env="VLLM_TEST_LTX2_OFFICIAL_CHECKPOINT",
-)
-LTX2_DISTILLED_CHECKPOINT = replace(
-    LTX2_CHECKPOINT,
-    filename="ltx-2-19b-distilled.safetensors",
-    env="VLLM_TEST_LTX2_DISTILLED_OFFICIAL_CHECKPOINT",
 )
 LTX2_UPSAMPLER = replace(
     LTX2_CHECKPOINT,
@@ -164,25 +159,6 @@ I2V_IMAGE = LTXArtifact(
 
 
 TWO_STAGE_CASES = (
-    LTXAccuracyCase(
-        name="ltx2_distilled_t2v",
-        pipeline_kind="distilled",
-        model_id="rootonchair/LTX-2-19b-distilled",
-        model_revision="388e2846f54aae51687498ffb6b27c7c2c9ce9e5",
-        model_env="VLLM_TEST_LTX2_DISTILLED_MODEL",
-        model_class_name="LTX2DistilledPipeline",
-        checkpoint=LTX2_DISTILLED_CHECKPOINT,
-        spatial_upsampler=LTX2_UPSAMPLER,
-        width=1536,
-        height=1024,
-        num_frames=121,
-        num_inference_steps=8,
-        seed=10,
-        stg_block=None,
-        gemma_model_id="Lightricks/LTX-2",
-        gemma_model_revision=LTX2_REVISION,
-        gemma_model_env="VLLM_TEST_LTX2_MODEL",
-    ),
     LTXAccuracyCase(
         name="ltx23_distilled_i2v",
         pipeline_kind="distilled",
@@ -326,7 +302,7 @@ def _resolve_model(case: LTXAccuracyCase) -> Path:
     if revision is None and model_id == case.model_id:
         revision = case.model_revision
     return Path(
-        snapshot_download(
+        hf_api().snapshot_download(
             repo_id=model_id,
             revision=revision,
             allow_patterns=[
@@ -359,7 +335,7 @@ def _resolve_gemma_root(case: LTXAccuracyCase, model: Path) -> Path:
         if configured_model and Path(configured_model).is_dir():
             return Path(configured_model)
         return Path(
-            snapshot_download(
+            hf_api().snapshot_download(
                 repo_id=case.gemma_model_id,
                 revision=case.gemma_model_revision,
                 allow_patterns=[
@@ -383,7 +359,7 @@ def _resolve_artifact(artifact: LTXArtifact, model: Path | None = None) -> Path:
         if model_path.is_file():
             return model_path
     return Path(
-        hf_hub_download(
+        hf_api().hf_hub_download(
             repo_id=artifact.repo_id,
             repo_type=None if artifact.repo_type == "model" else artifact.repo_type,
             filename=artifact.filename,

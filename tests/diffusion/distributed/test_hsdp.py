@@ -3,20 +3,24 @@
 """Unit tests for HSDP (Hybrid Sharded Data Parallel) configuration and utilities."""
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DeviceMesh, DTensor
+from vllm.utils.network_utils import get_file_store_init_method
 
-from tests.helpers.runtime import get_distributed_init_method
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.distributed import hsdp as hsdp_module
 from vllm_omni.diffusion.distributed.hsdp import (
     HSDPInferenceConfig,
     _unshardable_parameters,
     shard_model,
 )
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.parallel, pytest.mark.cpu, pytest.mark.core_model]
 
@@ -42,7 +46,7 @@ def cpu_process_group():
         yield
         return
 
-    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_distributed_init_method())
+    dist.init_process_group("gloo", rank=0, world_size=1, init_method=get_file_store_init_method())
     try:
         yield
     finally:
@@ -71,6 +75,52 @@ def test_hsdp_keeps_packed_and_scalar_parameters_local(cpu_process_group):
     assert model.block.input_global_scale is input_global_scale
     assert not isinstance(model.block.packed_weight, DTensor)
     assert not isinstance(model.block.input_global_scale, DTensor)
+
+
+def test_hsdp_resolves_nested_ignored_module_and_preserves_mixed_dtypes(
+    cpu_process_group,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class Group:
+        world_size = 1
+        rank_in_group = 0
+        device_group = dist.group.WORLD
+
+    class MixedDtypeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.Module()
+            self.layers.sharded = nn.Linear(2, 2, dtype=torch.bfloat16)
+            self.layers.ignored = nn.Linear(2, 2, dtype=torch.float32)
+            self._hsdp_shard_conditions = [lambda name, _module: name == "layers.sharded"]
+            self._hsdp_ignored_modules = ["layers.ignored"]
+            self._hsdp_preserve_parameter_dtypes = True
+
+    group = Group()
+    monkeypatch.setattr(hsdp_module, "get_world_group", lambda: group)
+    monkeypatch.setattr(
+        hsdp_module,
+        "_create_hsdp_mesh",
+        lambda **_kwargs: DeviceMesh("cpu", [0]),
+    )
+
+    model = MixedDtypeModel()
+    ignored_weight = model.layers.ignored.weight
+    hsdp_module.apply_hsdp_to_model(
+        model,
+        HSDPInferenceConfig(
+            enabled=True,
+            hsdp_shard_size=1,
+            param_dtype=torch.float16,
+        ),
+        target_device=torch.device("cpu"),
+    )
+
+    assert model.layers.ignored.weight is ignored_weight
+    assert not isinstance(model.layers.ignored.weight, DTensor)
+    assert model.layers.ignored.weight.dtype == torch.float32
+    assert isinstance(model.layers.sharded.weight, DTensor)
+    assert model.layers.sharded.weight.dtype == torch.bfloat16
 
 
 class TestHSDPInferenceConfig:
@@ -291,3 +341,92 @@ class TestHSDPShardConditions:
                 matched.append(name)
         assert "blocks.0" in matched
         assert "blocks.1" in matched
+
+
+def test_pre_sharded_to_empty_materializes_fsdp_internal_storage(cpu_process_group):
+    with torch.device("meta"):
+        model = nn.Module()
+        model.transformer = nn.Sequential(nn.Linear(2, 2, bias=False))
+    model.transformer.register_buffer("scratch", torch.tensor([3.0]), persistent=False)
+    shard_model(
+        model.transformer,
+        mesh=DeviceMesh("cpu", [0]),
+        hsdp_shard_conditions=[lambda name, _module: name == "0"],
+    )
+
+    load_plan = SimpleNamespace(
+        roots=[SimpleNamespace(name="transformer", module=model.transformer)],
+        groups=[SimpleNamespace(module=model.transformer[0])],
+        binding_names=frozenset({"transformer.0.weight"}),
+    )
+    sharded_weight = model.transformer[0].weight
+
+    DiffusersPipelineLoader._materialize_pre_sharded_hsdp_state(model, load_plan, torch.device("cpu"))
+
+    fsdp_param = fully_shard.state(model.transformer[0])._fsdp_param_group.fsdp_params[0]
+    assert model.transformer[0].weight is sharded_weight
+    assert model.transformer[0].weight.to_local().device.type == "cpu"
+    assert fsdp_param._sharded_param_data.device.type == "cpu"
+    assert (
+        fsdp_param._sharded_param_data.untyped_storage().data_ptr()
+        == model.transformer[0].weight.to_local().untyped_storage().data_ptr()
+    )
+    assert torch.equal(model.transformer.scratch, torch.tensor([3.0]))
+
+
+def test_pre_sharded_load_restores_checkpoint_values(cpu_process_group, tmp_path, monkeypatch):
+    from safetensors.torch import save_file
+    from vllm.config.load import LoadConfig
+
+    from vllm_omni.diffusion.distributed import hsdp as hsdp_module
+    from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
+
+    class Transformer(nn.Module):
+        _hsdp_shard_conditions = [lambda name, module: name == "block"]
+        _hsdp_ignored_modules = ["time_embedder"]
+
+        def __init__(self):
+            super().__init__()
+            self.block = nn.Linear(3, 4, bias=False)
+            self.time_embedder = nn.Linear(2, 2, bias=False, dtype=torch.bfloat16)
+            self.root_weight = nn.Parameter(torch.zeros(2))
+            self.register_buffer("scratch", torch.tensor([7.0]), persistent=False)
+            release_module_parameters_to_meta(self.block)
+
+        def post_load_weights(self):
+            self.time_embedder.to(torch.float32)
+
+    model = nn.Module()
+    model.transformer = Transformer()
+    model.vae = nn.Linear(2, 2)
+    tensors = {
+        "block.weight": torch.arange(12, dtype=torch.float32).reshape(4, 3),
+        "root_weight": torch.tensor([2.0, 3.0]),
+        "time_embedder.weight": torch.arange(4, dtype=torch.bfloat16).reshape(2, 2),
+    }
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    model.weights_sources = [DiffusersPipelineLoader.ComponentSource(str(tmp_path), None, None, "transformer.", False)]
+    config = SimpleNamespace(
+        dtype=torch.float32,
+        quantization_config=None,
+        lora_path=None,
+        hsdp_weight_load_strategy="pre_sharded",
+        num_weight_load_threads=1,
+        parallel_config=SimpleNamespace(use_hsdp=True, hsdp_replicate_size=1, hsdp_shard_size=1),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), config)
+    monkeypatch.setattr(loader, "_init_from_load_format", lambda *args, **kwargs: model)
+    monkeypatch.setattr(hsdp_module, "get_world_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
+    monkeypatch.setattr(hsdp_module, "current_omni_platform", SimpleNamespace(device_type="cpu"))
+    loaded = loader._load_model_with_hsdp(torch.device("cpu"))
+    assert loaded is model
+    for name, expected in tensors.items():
+        actual = dict(model.transformer.named_parameters())[name]
+        if name.startswith("time_embedder."):
+            assert not isinstance(actual, DTensor)
+            assert actual.dtype == torch.float32
+            torch.testing.assert_close(actual, expected.float())
+        else:
+            assert isinstance(actual, DTensor)
+            torch.testing.assert_close(actual.to_local(), expected)
+    torch.testing.assert_close(model.transformer.scratch, torch.tensor([7.0]))

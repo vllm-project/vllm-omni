@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import base64
 from pathlib import Path
 
@@ -19,8 +22,7 @@ def _events(events: list[dict[str, object]], response_id: str, kind: str) -> lis
 async def run_server_vad_interrupt(args) -> dict[str, object]:
     initial = read_pcm16_wav(Path(args.input_wav))
     interrupt = read_pcm16_wav(Path(args.interrupt_wav))[: PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * 47 // 10]
-    session_id = f"server-vad-hard-interrupt-{id(args)}"
-    client = RealtimeDuplexClient(build_realtime_url(args.url, args.model, autostart=False, session_id=session_id))
+    client = RealtimeDuplexClient(build_realtime_url(args.url, args.model, autostart=False))
 
     async def until(predicate, label: str) -> None:
         await wait_for(predicate, timeout_s=args.timeout_s, label=label)
@@ -30,7 +32,6 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
         await client.configure(
             args.model,
             ref_audio="data:audio/wav;base64," + base64.b64encode(Path(args.ref_audio).read_bytes()).decode(),
-            session_id=session_id,
             turn_detection={"type": "server_vad", "interrupt_response": True},
             timeout_s=args.timeout_s,
         )
@@ -41,7 +42,10 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
             next(e for e in client.events.events if e.get("type") == "response.created")
         )
         assert target_id
-        await until(lambda: _events(client.events.events, target_id, "response.audio.delta"), "response.audio.delta")
+        await until(
+            lambda: _events(client.events.events, target_id, "response.output_audio.delta"),
+            "response.output_audio.delta",
+        )
         cursor = len(client.events.events)
         await client.stream_pcm16(interrupt + bytes(16_000 * 2 * 800 // 1000), chunk_ms=args.chunk_ms, realtime=True)
         await until(lambda: _events(client.events.events, target_id, "response.done"), "cancelled response.done")
@@ -64,10 +68,11 @@ async def run_server_vad_interrupt(args) -> dict[str, object]:
     terminal = done[0] if len(done) == 1 else None
     trailing = events[events.index(terminal) + 1 :] if terminal is not None else events
     stale = any(
-        e.get("type") == "response.audio.delta" and RealtimeEventCollector.response_id(e) == target_id for e in trailing
+        e.get("type") == "response.output_audio.delta" and RealtimeEventCollector.response_id(e) == target_id
+        for e in trailing
     )
     followup_audio = any(
-        e.get("type") == "response.audio.delta" and RealtimeEventCollector.response_id(e) != target_id
+        e.get("type") == "response.output_audio.delta" and RealtimeEventCollector.response_id(e) != target_id
         for e in events[cursor:]
     )
     ok = (

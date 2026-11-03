@@ -18,6 +18,8 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import wrap_methods_by_paths
+
 from . import ltx2_latents as latent_ops
 from .ltx2_guidance import euler_step_from_velocity
 
@@ -127,6 +129,19 @@ class LTXTextConditioningMixin:
     """Shared Gemma encoding and text connector orchestration."""
 
     connector_batches_cfg = False
+
+    def _run_text_connectors(
+        self,
+        prompt_embeds: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        *,
+        padding_side: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.connectors(
+            prompt_embeds,
+            prompt_attention_mask,
+            padding_side=padding_side,
+        )
 
     def _get_gemma_prompt_embeds(
         self,
@@ -339,7 +354,7 @@ class LTXTextConditioningMixin:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
 
-        video_context, audio_context, attention_mask = self.connectors(
+        video_context, audio_context, attention_mask = self._run_text_connectors(
             prompt_embeds,
             prompt_attention_mask,
             padding_side=padding_side,
@@ -360,7 +375,7 @@ class LTXTextConditioningMixin:
             negative_attention_mask = attention_mask[:split_batch]
             positive_attention_mask = attention_mask[split_batch:]
         elif self.do_classifier_free_guidance:
-            negative_video_context, negative_audio_context, negative_attention_mask = self.connectors(
+            negative_video_context, negative_audio_context, negative_attention_mask = self._run_text_connectors(
                 negative_prompt_embeds,
                 negative_prompt_attention_mask,
                 padding_side=padding_side,
@@ -392,6 +407,8 @@ class LTXI2VConditioningMixin:
             vae_scale_factor=self.vae_spatial_compression_ratio,
             resample="bilinear",
         )
+        if getattr(self, "enable_diffusion_pipeline_profiler", False):
+            wrap_methods_by_paths(self, ["video_processor.postprocess_video"])
 
     @staticmethod
     def _resolve_single_prompt_image(raw_image: Any) -> Any:

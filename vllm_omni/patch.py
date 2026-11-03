@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# mypy: disable-error-code="attr-defined"
+
+import importlib
 import logging
 import os
 import sys
@@ -6,6 +11,7 @@ from functools import cached_property
 import torch
 from aenum import extend_enum
 from vllm.config import ModelConfig as _OriginalModelConfig
+from vllm.config import VllmConfig as _OriginalVllmConfig
 from vllm.inputs import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
@@ -19,11 +25,33 @@ from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
 
 import vllm_omni.logger  # noqa: F401
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.inputs.audio import apply_soundfile_first_audio_decode_patch
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
 
 _PATCH_LOGGER = logging.getLogger("vllm_omni.patch")
+
+# Decoder rounding is visible to audio encoders and can change mixed-media
+# answers. Preserve Omni's existing default while retaining explicit choices.
+apply_soundfile_first_audio_decode_patch()
+
+# Omni's deploy config selects a runner per stage. vLLM 0.31's config property
+# otherwise defaults to v2 independently of the runner selected by our workers,
+# making shared consumers such as InputProcessor choose the wrong API.
+_runner_property = _OriginalVllmConfig.use_v2_model_runner
+if not getattr(_runner_property.fget, "_omni_stage_runner", False):
+
+    def _patched_use_v2_model_runner(self, _upstream=_runner_property.fget):
+        # Lazy import keeps the package's patch/config initialization acyclic.
+        from vllm_omni.config.model import OmniModelConfig
+
+        if isinstance(self.model_config, OmniModelConfig):
+            return self.model_config.use_v2_model_runner
+        return _upstream(self)
+
+    setattr(_patched_use_v2_model_runner, "_omni_stage_runner", True)
+    _OriginalVllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
 
 # =============================================================================
 # Patch ModelConfig.is_mm_prefix_lm to support omni-specific models
@@ -94,20 +122,35 @@ assert _installed is _patched_cp, (
 # inference bug. Newly calibrated, clean checkpoints pay no runtime cost
 # (the clamp is a no-op when no NaN bytes are present).
 #
-# SCOPE: ModelOptNvFp4LinearMethod (W4A4 NVFP4 Linear) only. NvFp4FusedMoE /
-# NvFp4W4A16 / CompressedTensors / Quark NVFP4 paths are not covered.
+# SCOPE: the W4A4 NVFP4 linear PWAL only. NvFp4FusedMoE / NvFp4W4A16 /
+# CompressedTensors / Quark NVFP4 paths are not covered.
 #
-# SELF-EXTINGUISH: `_already_patched_upstream` heuristically detects when
-# vLLM's own PWAL contains an in-place `masked_fill_` against `weight_scale`
-# / `isnan` — the structure the upstream fix is expected to take when it is
-# filed (planned as a follow-up PR after this one merges). Once vllm-omni's
-# vllm pin moves to a release with that upstream fix, the override is
-# skipped at import and this block can be deleted. NOTE: the heuristic only
-# matches "vLLM PWAL clamps NaN in-place with `masked_fill_`"; if the
-# upstream fix lands as `nan_to_num_` or as a clamp before the FP32→FP8
-# cast, the check won't fire and this override stays active. The override
-# is idempotent so the overlap is a warning log, not a correctness issue —
-# but the heuristic should be revisited when the upstream PR is filed.
+# SELF-EXTINGUISH (structural): vLLM #49381 redesigned the ModelOpt linear
+# methods around one generic `ModelOptLinearMethod` built by
+# `build_linear_method()`, and removed the per-format classes
+# (`ModelOptNvFp4LinearMethod`, `ModelOptFp8LinearMethod`, ...) together with
+# the `LinearMethodCls` attributes they were reached through. This block
+# therefore resolves its target dynamically and self-extinguishes when only
+# the generic class exists, because that PWAL now REJECTS any NaN
+# weight_scale (#52501: `KNvfp4Static` creates `weight_scale` as
+# `torch.full(shape, nan)` and raises "... was never loaded (still NaN)" on
+# any surviving NaN). A NaN byte in weight_scale can come from that
+# unloaded-scale sentinel or from ModelOpt 0.44's FP32→FP8 E4M3 cast
+# overflow, and the two are byte-identical; a fused projection's
+# weight_scale is also written slice-by-slice by the weight loader, so
+# "some values are finite" does not prove the tensor was fully loaded.
+# Clamping would silently serve a partially loaded model, so the override is
+# retired there instead — a corrupt checkpoint gets a loud load-time
+# RuntimeError instead of the `!!!!` decode-time collapse.
+#
+# SELF-EXTINGUISH (heuristic, legacy pins only): `_already_patched_upstream`
+# heuristically detects when vLLM's own PWAL contains an in-place
+# `masked_fill_` against `weight_scale` / `isnan` — the structure the
+# upstream fix was expected to take. NOTE: the heuristic only matches
+# "vLLM PWAL clamps NaN in-place with `masked_fill_`"; if an upstream fix
+# lands as `nan_to_num_` or as a clamp before the FP32→FP8 cast, the check
+# won't fire and this override stays active. The override is idempotent so
+# the overlap is a warning log, not a correctness issue.
 #
 # ORDERING: the clamp must run BEFORE the original PWAL. The non-Blackwell
 # Marlin fallback (sm_<100) casts weight_scale FP8 -> bf16/fp16 and permutes
@@ -179,34 +222,77 @@ def _clamp_nvfp4_weight_scale_nans(layer) -> int:
 
 # Module-level defaults so downstream code (and tests) can import these names
 # without guarding for the import-failure / escape-hatch branches below.
-# `_already_patched_upstream` = upstream PWAL contains its own NaN clamp.
+# `_already_patched_upstream` = upstream's own PWAL already handles NaN
+#                               weight_scale by itself (its own clamp, or — on
+#                               the redesigned ModelOpt path — a hard
+#                               rejection), so we deliberately install nothing.
 # `_clamp_installed`         = our wrapper was installed on the upstream class.
 # These are independent: the env-var escape hatch and the import-failure path
-# both leave the wrapper uninstalled WITHOUT upstream being patched, so the
+# both leave the wrapper uninstalled WITHOUT upstream handling the case, so the
 # right check for "we own NaN-clamp behavior" is `_clamp_installed`.
 _already_patched_upstream = False
 _clamp_installed = False
+
+# Resolve the clamp target dynamically. A literal
+# `from ...modelopt import ModelOptNvFp4LinearMethod` is not an option any more:
+# the class was removed upstream (#49381), so the import is both a hard
+# ImportError and a static-check failure, and dynamic resolution is also what
+# lets us tell "no target" apart from "target replaced by the generic method".
+_MODELOPT_MODULE = "vllm.model_executor.layers.quantization.modelopt"
+_LEGACY_NVFP4_LINEAR_METHOD = "ModelOptNvFp4LinearMethod"
+_GENERIC_LINEAR_METHOD = "ModelOptLinearMethod"
 
 try:
     # Escape hatch — set VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP=1 to skip installing
     # the patch (e.g. to confirm a `!!!!` failure is the NaN-byte case).
     # The escape-hatch deliberately raises ImportError so the not-installed
-    # warning below logs through the same path a real ImportError would.
+    # warning below logs through the same path a real ImportError would, and it
+    # short-circuits BEFORE any upstream probing so both module flags stay
+    # False on this path.
     # Use the repo-wide bool-env idiom so values like `0`, `false`, `no`,
     # `off` correctly mean "do not skip" rather than tripping naive
     # truthiness on the non-empty string.
     if os.environ.get("VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP", "").lower() in ("1", "true", "yes", "on"):
         raise ImportError("VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP is set; skipping NaN-clamp install")
-    from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptNvFp4LinearMethod as _OriginalModelOptNvFp4LinearMethod,
-    )
+    _modelopt = importlib.import_module(_MODELOPT_MODULE)
+    _legacy_nvfp4_linear_method = getattr(_modelopt, _LEGACY_NVFP4_LINEAR_METHOD, None)
+    _generic_linear_method = getattr(_modelopt, _GENERIC_LINEAR_METHOD, None)
 except ImportError as _nan_clamp_import_err:
     _PATCH_LOGGER.warning(
         "NVFP4 weight_scale NaN-clamp patch could NOT install: %s. NVFP4 W4A4 "
         "checkpoints with NaN bytes in per-block weight_scale will serve `!!!!`.",
         _nan_clamp_import_err,
     )
+    _legacy_nvfp4_linear_method = None
+    _generic_linear_method = None
 else:
+    if _legacy_nvfp4_linear_method is None and _generic_linear_method is not None:
+        # Redesigned upstream (#49381): only the generic ModelOptLinearMethod
+        # exists, and its PWAL rejects any NaN weight_scale (#52501). Retire the
+        # override rather than mask that check — see the SELF-EXTINGUISH
+        # (structural) note above for why the two NaN origins cannot be told
+        # apart. `_already_patched_upstream` records that upstream handles the
+        # case itself, so an absent `_clamp_installed` is the expected state.
+        _already_patched_upstream = True
+        _PATCH_LOGGER.info(
+            "NVFP4 W4A4 weight_scale NaN-clamp: skipped — upstream serves ModelOpt "
+            "linears through the generic %s and rejects any NaN weight_scale "
+            "(unloaded-scale sentinel), so a load-time error replaces the "
+            "`!!!!` decode-time collapse.",
+            _GENERIC_LINEAR_METHOD,
+        )
+    elif _legacy_nvfp4_linear_method is None:
+        # Unrecognised pin: neither the legacy per-format class nor the generic
+        # replacement is present. Nothing to install and nothing to assume.
+        _PATCH_LOGGER.warning(
+            "NVFP4 weight_scale NaN-clamp patch could NOT install: neither %s nor %s is present in %s.",
+            _LEGACY_NVFP4_LINEAR_METHOD,
+            _GENERIC_LINEAR_METHOD,
+            _MODELOPT_MODULE,
+        )
+
+if _legacy_nvfp4_linear_method is not None:
+    _OriginalModelOptNvFp4LinearMethod = _legacy_nvfp4_linear_method
     _current_nvfp4_pwal = _OriginalModelOptNvFp4LinearMethod.process_weights_after_loading
     # Reload idempotency: on a module reload (importlib.reload in a test, or a
     # second import path) the class attribute already holds OUR wrapper, so
@@ -236,7 +322,7 @@ else:
 
     # Sentinel so a later reload of this module recovers the genuine upstream
     # method above instead of wrapping this wrapper (see reload-idempotency note).
-    _patched_nvfp4_pwal._vllm_omni_wrapped_pwal = _original_nvfp4_pwal
+    setattr(_patched_nvfp4_pwal, "_vllm_omni_wrapped_pwal", _original_nvfp4_pwal)
 
     if not _already_patched_upstream:
         _OriginalModelOptNvFp4LinearMethod.process_weights_after_loading = _patched_nvfp4_pwal
@@ -299,19 +385,19 @@ for module_name, module in list(sys.modules.items()):
     if "vllm" not in module_name:
         continue
     if hasattr(module, "EngineCoreOutput") and module.EngineCoreOutput == _OriginalEngineCoreOutput:
-        module.EngineCoreOutput = OmniEngineCoreOutput
+        setattr(module, "EngineCoreOutput", OmniEngineCoreOutput)
     if hasattr(module, "EngineCoreOutputs") and module.EngineCoreOutputs == _OriginalEngineCoreOutputs:
-        module.EngineCoreOutputs = OmniEngineCoreOutputs
+        setattr(module, "EngineCoreOutputs", OmniEngineCoreOutputs)
     if hasattr(module, "TokensPrompt") and module.TokensPrompt == _OriginalTokensPrompt:
-        module.TokensPrompt = OmniTokensPrompt
+        setattr(module, "TokensPrompt", OmniTokensPrompt)
     if hasattr(module, "MRotaryEmbedding") and module.MRotaryEmbedding == _OriginalMRotaryEmbedding:
-        module.MRotaryEmbedding = OmniMRotaryEmbedding
+        setattr(module, "MRotaryEmbedding", OmniMRotaryEmbedding)
     if hasattr(module, "Request") and module.Request == _OriginalRequest:
-        module.Request = OmniRequest
+        setattr(module, "Request", OmniRequest)
     if hasattr(module, "StreamingUpdate") and module.StreamingUpdate == _OriginalStreamingUpdate:
-        module.StreamingUpdate = OmniStreamingUpdate
+        setattr(module, "StreamingUpdate", OmniStreamingUpdate)
     if hasattr(module, "EngineCoreRequest") and module.EngineCoreRequest == _OriginalEngineCoreRequest:
-        module.EngineCoreRequest = OmniEngineCoreRequest
+        setattr(module, "EngineCoreRequest", OmniEngineCoreRequest)
 
 
 # Patch: add qwen3_omni_moe to vllm's chat template fallback registry.
@@ -328,8 +414,8 @@ def _patch_chat_template_registry():
         )
 
         if "qwen3_omni_moe" not in _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK:
-            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = (
-                lambda _: CHAT_TEMPLATES_DIR / "template_chatml.jinja"
+            _MODEL_TYPE_TO_CHAT_TEMPLATE_FALLBACK["qwen3_omni_moe"] = lambda _: (
+                CHAT_TEMPLATES_DIR / "template_chatml.jinja"
             )
     except ImportError:
         pass
@@ -400,7 +486,7 @@ def _patch_flashinfer_fp8_scaled_mm_output_shape():
             out = out.view(*output_shape)
         return out
 
-    _patched_apply_scaled_mm._omni_output_shape_patched = True
+    setattr(_patched_apply_scaled_mm, "_omni_output_shape_patched", True)
     FlashInferFP8ScaledMMLinearKernel.apply_scaled_mm = _patched_apply_scaled_mm
 
 
@@ -498,7 +584,7 @@ def _patch_inductor_factorable_divisibility():
             return True
         return _provably_factorable_multiple(numerator, denominator)
 
-    statically_known_multiple_of._vllm_omni_factorable_divisibility = True
+    setattr(statically_known_multiple_of, "_vllm_omni_factorable_divisibility", True)
     SizeVarAllocator.statically_known_multiple_of = statically_known_multiple_of
     _PATCH_LOGGER.info("inductor factorable-divisibility patch: installed.")
 
@@ -507,67 +593,231 @@ _patch_inductor_factorable_divisibility()
 
 
 # =============================================================================
-# Patch CuMemAllocator._python_free_callback to fix CUDA double-free on shutdown
+# Patch CuMemAllocator free path so releasing a MemPool frees all its memory
 # =============================================================================
-# WHY: CuMemAllocator._python_free_callback guards the asleep-entry double-free
-# skip with ``if data.is_asleep and current_platform.is_rocm():`` — only ROCm
-# gets the safe empty-handle return.  On CUDA, the callback falls through and
-# returns the original handle, causing cuMemRelease on already-freed memory
-# (CUDA_ERROR_INVALID_VALUE) during EngineCore subprocess atexit cleanup.
+# WHY: Inline diffusion engines release their CuMem ``MemPool`` in-process at
+# shutdown, and torch then raw-frees every cached block through the C
+# extension's ``my_free``, which calls ``_python_free_callback`` for a handle
+# to unmap. Two kinds of block have no usable handle there (#8016):
 #
-# This happens because ``sleep()`` calls ``unmap_and_release()`` on ALL
-# platforms, then sets ``is_asleep = True``.  When the atexit handler
-# (``_shutdown_singleton`` -> ``release_pools()`` -> GC) triggers the free
-# callback, the asleep entries must return an empty chunk list so the C
-# extension skips ``cuMemRelease`` — exactly the same logic already used by
-# the ROCm guard.
+# * Blocks swept by ``use_memory_pool()`` on exit: it pops idle segments from
+#   ``pointer_to_data`` and unmaps them, but torch's MemPool still caches them
+#   and frees them again later, so the upstream callback raises ``KeyError``.
+# * Asleep blocks: ``sleep()`` already unmapped them. Upstream only guards
+#   ROCm, whose ``my_free`` accepts an empty chunk list; on CUDA ``my_free``
+#   parses the handle as ``KKKK`` and always unmaps.
 #
-# The fix removes the ``current_platform.is_rocm()`` condition so the guard
-# applies to CUDA (and any future platform that implements cumem).
+# On CUDA any failure in ``my_free`` returns without unmapping and leaves a
+# Python exception and a sticky CUDA error behind, so every later free in the
+# same ``emptyCache`` pops its entry but never releases the physical memory.
+# One stale block thus leaked the whole transformer (~4 GiB) on shutdown.
 #
-# FRAGILITY: Relies on ``_python_free_callback`` being a regular method
-# (not a slot or C extension).  If CuMemAllocator is rewritten in C/Cython,
-# this monkey-patch will silently become a no-op.
+# FIX: remember handles swept by ``use_memory_pool()``; when torch frees a
+# swept or asleep block, re-back it with fresh physical memory on CUDA so
+# ``my_free`` can unmap, release, and free the address normally (ROCm keeps
+# its empty-chunk-list path).
+#
+# FRAGILITY: Relies on ``_python_free_callback`` being a regular method and on
+# ``use_memory_pool()`` resolving ``unmap_and_release`` from the module globals.
+def _cumem_platform_is_rocm() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_rocm()
+
+
+def release_cumem_allocations_for_shutdown(allocator) -> int:
+    """Retire every allocation still tracked by an inline worker.
+
+    ``CuMemAllocator.release_pools()`` only drops the Python MemPool and
+    pluggable-allocator wrappers. Tensors retained outside the model runner
+    can therefore keep entries in ``pointer_to_data`` after an inline engine
+    shuts down, which prevents the next sleep-enabled engine from starting in
+    the same process.
+
+    The caller must first stop worker activity and synchronize the device.
+    Mapped allocations are unmapped here; already-asleep allocations were
+    unmapped by ``sleep()``. Both are removed from the live-usage registry and
+    retained as swept handles so the later MemPool/tensor free callback can
+    finish releasing their virtual addresses safely.
+    """
+    from vllm.device_allocator import cumem as cumem_module
+
+    swept_handles = allocator.__dict__.setdefault("_omni_swept_handles", {})
+    retired_bytes = 0
+    for ptr, data in list(allocator.pointer_to_data.items()):
+        if not data.is_asleep:
+            # Keep the entry visible until the physical unmap succeeds. If it
+            # fails, get_current_usage() must continue to report the leak.
+            cumem_module.unmap_and_release(data.handle)
+        data.cpu_backup_tensor = None
+        removed = allocator.pointer_to_data.pop(ptr, None)
+        if removed is not data:
+            raise RuntimeError(f"CuMem allocation {ptr} changed during shutdown")
+        swept_handles[ptr] = data.handle
+        retired_bytes += data.handle[1]
+    return retired_bytes
+
+
 def _patch_cumem_free_callback_cuda() -> None:
     try:
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import cumem as cumem_module
+        from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+
+        if not cumem_available:
+            return
     except ImportError:
         _PATCH_LOGGER.debug("[cumem-cuda] CuMemAllocator not available; skipping patch")
         return
 
-    _original_free_callback = CuMemAllocator._python_free_callback
-
-    if getattr(_original_free_callback, "_omni_cumem_cuda_patched", False):
+    if getattr(CuMemAllocator._python_free_callback, "_omni_cumem_cuda_patched", False):
         return
 
-    # The upstream bug: `_python_free_callback` only skips the double-free
-    # for ROCm (line ~206).  We wrap the method to extend the guard to all
-    # platforms.
+    original_unmap_and_release = cumem_module.unmap_and_release
+
+    def _tracking_unmap_and_release(allocation_handle) -> None:
+        original_unmap_and_release(allocation_handle)
+        allocator = CuMemAllocator.instance
+        # sleep()/discard() keep their entries; only the use_memory_pool()
+        # sweep unmaps a block that is no longer tracked.
+        if allocator is not None and allocation_handle[2] not in allocator.pointer_to_data:
+            allocator.__dict__.setdefault("_omni_swept_handles", {})[allocation_handle[2]] = allocation_handle
+
+    def _releasable_handle(allocation_handle) -> tuple:
+        """Return a handle for a block whose physical memory is already released."""
+        if _cumem_platform_is_rocm():
+            device, size, d_mem, _ = allocation_handle
+            return (device, size, d_mem, [])
+        cumem_module.create_and_map(allocation_handle)
+        return allocation_handle
+
+    def _patched_free_callback(self, ptr: int) -> tuple:
+        data = self.pointer_to_data.pop(ptr, None)
+        if data is None:
+            swept = self.__dict__.get("_omni_swept_handles", {}).pop(ptr, None)
+            if swept is None:
+                raise KeyError(ptr)
+            return _releasable_handle(swept)
+        if data.cpu_backup_tensor is not None:
+            data.cpu_backup_tensor = None
+        if data.is_asleep:
+            return _releasable_handle(data.handle)
+        # Drain pending kernels before the C extension's cuMemUnmap.
+        torch.accelerator.synchronize(data.handle[0])
+        return data.handle
+
+    setattr(_patched_free_callback, "_omni_cumem_cuda_patched", True)
+    CuMemAllocator._python_free_callback = _patched_free_callback
+    cumem_module.unmap_and_release = _tracking_unmap_and_release
+    _PATCH_LOGGER.info("[cumem-cuda] CuMemAllocator free path patched: swept and asleep blocks are released safely.")
+
+
+def _patch_xpumem_free_callback_xpu() -> None:
+    try:
+        from vllm.device_allocator.xpumem import XpuMemAllocator, xpumem_available
+    except ImportError:
+        _PATCH_LOGGER.debug("[xpumem] XpuMemAllocator not available; skipping patch")
+        return
+
+    if not xpumem_available:
+        return
+
+    if getattr(XpuMemAllocator._python_free_callback, "_omni_xpumem_xpu_patched", False):
+        return
+
     def _patched_free_callback(self, ptr: int) -> tuple:
         data = self.pointer_to_data.pop(ptr)
         if data.cpu_backup_tensor is not None:
             data.cpu_backup_tensor = None
         if data.is_asleep:
-            # sleep() already called unmap_and_release() on this allocation.
-            # Return an empty chunk list so the C extension skips
-            # cuMemRelease, avoiding a double-free.  Same logic as the
-            # existing ROCm guard, but applied to all platforms.
             device, size, d_mem, _ = data.handle
             result = (device, size, d_mem, [])
             _PATCH_LOGGER.debug(
-                "[cumem-cuda] Free callback: asleep entry %s -> empty handle",
+                "[xpumem] Free callback: asleep entry %s -> empty handle",
                 ptr,
             )
             return result
-        # Drain pending kernels before the C extension's cuMemUnmap.
+        # Drain pending kernels before the C extension unmaps.
         torch.accelerator.synchronize(data.handle[0])
         return data.handle
 
-    _patched_free_callback._omni_cumem_cuda_patched = True
-    CuMemAllocator._python_free_callback = _patched_free_callback
-    _PATCH_LOGGER.info(
-        "[cumem-cuda] CuMemAllocator._python_free_callback patched: asleep guard extended to all platforms."
-    )
+    setattr(_patched_free_callback, "_omni_xpumem_xpu_patched", True)
+    XpuMemAllocator._python_free_callback = _patched_free_callback
+    _PATCH_LOGGER.info("[xpumem] XpuMemAllocator._python_free_callback patched: asleep guard enabled for XPU.")
 
 
 _patch_cumem_free_callback_cuda()
+_patch_xpumem_free_callback_xpu()
+
+
+def _patch_batched_seeded_random_sample() -> None:
+    """Draw per-request seeded sampling noise in one launch.
+
+    vLLM's ``random_sample`` calls ``exponential_(generator=...)`` once per
+    seeded request and step. The replacement reproduces those draws bit for
+    bit (values and generator states) with one kernel; unsupported cases keep
+    the original loop.
+    """
+    try:
+        import inspect
+
+        from vllm.v1.sample.ops import topk_topp_sampler as sampler_ops
+    except ImportError:
+        return
+    original = getattr(sampler_ops, "random_sample", None)
+    if original is None or getattr(original, "_omni_batched_seeded", False):
+        return
+    if list(inspect.signature(original).parameters) != ["probs", "generators", "use_fp64_gumbel"] or not all(
+        hasattr(sampler_ops, name) for name in ("empty_exponential_noise_like", "sample_with_exponential_noise")
+    ):
+        _PATCH_LOGGER.debug("[seeded-sampling] random_sample signature changed; batching disabled")
+        return
+
+    def random_sample(
+        probs: torch.Tensor,
+        generators: dict[int, torch.Generator],
+        use_fp64_gumbel: bool = False,
+    ) -> torch.Tensor:
+        q = sampler_ops.empty_exponential_noise_like(probs, use_fp64_gumbel)
+        if len(generators) != probs.shape[0]:
+            q.exponential_()
+        if generators:
+            from vllm_omni.utils.seeded_exponential import (
+                batched_seeded_exponential_supported,
+                fill_exponential_rows,
+            )
+
+            if batched_seeded_exponential_supported(q, generators):
+                fill_exponential_rows(q, list(generators.values()), list(generators))
+            else:
+                for i, generator in generators.items():
+                    q[i].exponential_(generator=generator)
+        return sampler_ops.sample_with_exponential_noise(probs, q)
+
+    random_sample._omni_batched_seeded = True  # type: ignore[attr-defined]
+    random_sample.__wrapped__ = original  # type: ignore[attr-defined]
+    sampler_ops.random_sample = random_sample
+
+
+_patch_batched_seeded_random_sample()
+
+
+def _patch_mrv2_stop_token_capacity() -> None:
+    """Let Model Runner V2 enforce ``min_tokens`` over large stop sets.
+
+    MRV2 keeps each request's stop token ids for ``min_tokens`` masking in a
+    fixed-width GPU table capped at 128 ids and rejects larger sets. Speech
+    LMs stop on every special id past the codebook (CosyVoice3: 200). The
+    masking kernel sizes its block from the table widths, which other tables
+    already raise to 1024, so widening this one only grows a small buffer.
+    """
+    try:
+        from vllm.v1.worker.gpu.sample import logit_bias
+    except ImportError:
+        return
+    logit_bias.MAX_NUM_STOP_TOKEN_IDS = max(
+        logit_bias.MAX_NUM_STOP_TOKEN_IDS,
+        logit_bias.MAX_NUM_ALLOWED_TOKEN_IDS,
+    )
+
+
+_patch_mrv2_stop_token_capacity()

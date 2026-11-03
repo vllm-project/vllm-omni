@@ -262,12 +262,11 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
         "audio": 1,
     }[modality]
     mm_data_items.__getitem__ = MagicMock(side_effect=lambda modality: [f"{modality}-0"])
+    mm_data_items.values = MagicMock(return_value=[])
 
     inputs = MagicMock()
     inputs.mm_data_items = mm_data_items
     inputs.hf_processor_mm_kwargs = {"use_audio_in_video": True}
-    inputs.tokenization_kwargs = {}
-    inputs.prompt = [1, 2, 3]
     inputs.get_mm_hashes = MagicMock(return_value={"video": ["v0"], "audio": ["a0"]})
 
     timing_ctx = MagicMock()
@@ -277,6 +276,7 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     cache = MagicMock()
     # Video miss, audio hit under pair-aware keys — expansion must force audio.
     cache.is_cached.side_effect = lambda keys: [False] if keys[0].startswith("v") else [True]
+    inputs.cache = cache
 
     captured = {}
 
@@ -307,22 +307,23 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     )
     fake_self._paired_cache_keys = Qwen2_5OmniThinkerMultiModalProcessor._paired_cache_keys
     fake_self.info.parse_mm_data = MagicMock(return_value=SimpleNamespace(name="missing"))
-    fake_self._apply_hf_processor_main = MagicMock(return_value=([9], {"video_grid_thw": object()}, False))
+    fake_self._apply_hf_processor_main = MagicMock(return_value={"video_grid_thw": object()})
     fake_self._get_mm_fields_config = MagicMock(return_value={})
     fake_self._get_mm_prompt_updates = MagicMock(return_value={"video": [[object()]], "audio": [[object()]]})
     fake_self._merge_mm_kwargs = capture_merge
+    fake_self._postprocess_prompt = lambda prompt: prompt
+    inputs.prompt = [0, 1, 2]
 
     with patch(
         "vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.MultiModalKwargsItems.from_hf_inputs",
         return_value={"video": [object()], "audio": [object()]},
     ):
-        prompt_ids, mm_info, _ = Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
+        mm_info = Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
             fake_self,
             inputs,
             timing_ctx,
         )
 
-    assert prompt_ids == [9]
     # Both modalities were reprocessed as one unit after pair-miss expansion.
     assert fake_self.info.parse_mm_data.call_args.args[0] == {
         "video": ["video-0"],
@@ -552,24 +553,6 @@ def test_qwen2_5_prompt_updates_validate_mask_against_request_video_count():
         )
 
 
-def test_qwen2_5_mm_only_dummy_counts_subtract_only_videos_using_audio():
-    captured_counts = {}
-    fake_self = SimpleNamespace(
-        dummy_inputs=SimpleNamespace(get_dummy_text=lambda counts: captured_counts.update(counts) or "dummy"),
-        _apply_hf_processor_text_mm=lambda **_kwargs: ([], {}, False),
-    )
-    mm_items = SimpleNamespace(get_all_counts=lambda: {"video": 2, "audio": 1})
-
-    Qwen2_5OmniThinkerMultiModalProcessor._apply_hf_processor_mm_only(
-        fake_self,
-        mm_items,
-        {"use_audio_in_video": [True, False]},
-        {},
-    )
-
-    assert captured_counts == {"video": 2, "audio": 0}
-
-
 def test_get_video_use_audio_in_video_falls_back_to_prompt_updates_for_cache_hits():
     fake_self = _fake_processor()
     update_with_audio = SimpleNamespace(content=SimpleNamespace(full=[VIDEO_TOKEN_ID, AUDIO_TOKEN_ID]))
@@ -585,7 +568,7 @@ def test_get_video_use_audio_in_video_falls_back_to_prompt_updates_for_cache_hit
 
 
 def test_derive_audio_from_video_placeholders_only_pairs_true_videos():
-    fake_self = _fake_processor()
+    fake_self = _fake_qwen2_prompt_processor()
     video_placeholders = [
         PlaceholderFeaturesInfo(
             modality="video",
@@ -622,11 +605,56 @@ def test_derive_audio_from_video_placeholders_only_pairs_true_videos():
     assert result["video"][1].is_embed.tolist() == [True, True]
 
 
+def _interleaved_video_placeholder() -> PlaceholderFeaturesInfo:
+    return PlaceholderFeaturesInfo(
+        modality="video",
+        item_idx=0,
+        start_idx=1,
+        tokens=[AUDIO_BOS_TOKEN_ID, VIDEO_TOKEN_ID, AUDIO_TOKEN_ID, AUDIO_EOS_TOKEN_ID],
+        is_embed=torch.tensor([False, True, False, False]),
+    )
+
+
+def test_reject_audio_tokens_outside_videos_accepts_interleaved_audio():
+    prompt_ids = [0, AUDIO_BOS_TOKEN_ID, VIDEO_TOKEN_ID, AUDIO_TOKEN_ID, AUDIO_EOS_TOKEN_ID, 0]
+
+    Qwen2_5OmniThinkerMultiModalProcessor._reject_audio_tokens_outside_videos(
+        _fake_qwen2_prompt_processor(),
+        prompt_ids,
+        {"video": [_interleaved_video_placeholder()]},
+    )
+
+
+def test_reject_audio_tokens_outside_videos_rejects_standalone_audio_placeholder():
+    # A separate <|AUDIO|> after the video is left unexpanded when
+    # use_audio_in_video=True and has no audio features behind it.
+    prompt_ids = [0, AUDIO_BOS_TOKEN_ID, VIDEO_TOKEN_ID, AUDIO_TOKEN_ID, AUDIO_EOS_TOKEN_ID, AUDIO_TOKEN_ID, 0]
+
+    with pytest.raises(ValueError, match="remove the separate <\\|AUDIO\\|> placeholder"):
+        Qwen2_5OmniThinkerMultiModalProcessor._reject_audio_tokens_outside_videos(
+            _fake_qwen2_prompt_processor(),
+            prompt_ids,
+            {"video": [_interleaved_video_placeholder()]},
+        )
+
+
 def test_qwen3_processor_inherits_vllm_omni_per_video_helpers():
+    from vllm.model_executor.models.qwen3_omni_moe_thinker import (
+        Qwen3OmniMoeThinkerMultiModalProcessor as UpstreamQwen3Processor,
+    )
+
     assert issubclass(
         Qwen3OmniMoeThinkerMultiModalProcessor,
         Qwen2_5OmniThinkerMultiModalProcessor,
     )
+    # Keep Qwen3's native HF preprocessing while inheriting Omni pair handling.
+    assert Qwen3OmniMoeThinkerMultiModalProcessor._get_hf_mm_inputs is UpstreamQwen3Processor._get_hf_mm_inputs
+    assert (
+        Qwen3OmniMoeThinkerMultiModalProcessor._get_audio_in_video_pairs
+        is Qwen2_5OmniThinkerMultiModalProcessor._get_audio_in_video_pairs
+    )
+    mro = Qwen3OmniMoeThinkerMultiModalProcessor.__mro__
+    assert mro.index(Qwen2_5OmniThinkerMultiModalProcessor) < mro.index(UpstreamQwen3Processor)
 
 
 def test_qwen3_prompt_updates_prefer_hf_second_per_grid_ts_from_outputs():

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Generate an improved nightly HTML performance dashboard without modifying the
 existing generator.
@@ -256,6 +259,7 @@ def _sort_omni_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         key=lambda r: (
             r.get("model_id") or "",
             r.get("test_name") or "",
+            r.get("name") or "",
             r.get("dataset_name") or "",
             r.get("max_concurrency") or 0,
             r.get("num_prompts") or 0,
@@ -1236,7 +1240,7 @@ function initSection(prefix, columns, data, numericCols, groups) {{
   const extraKey = prefix === "diff" ? "" : "tokenizer_id";
   const metaKeys = prefix === "diff"
     ? ["test_name"]
-    : ["test_name", "max_concurrency", "num_prompts"];
+    : ["test_name", "name", "max_concurrency", "num_prompts"];
   const configFields = prefix === "diff"
     ? ["test_name", "model", "endpoint", "dataset"]
     : [
@@ -1245,13 +1249,14 @@ function initSection(prefix, columns, data, numericCols, groups) {{
         "model_id",
         "tokenizer_id",
         "test_name",
+        "name",
         "dataset_name",
         "max_concurrency",
         "num_prompts",
       ];
   const labelFields = prefix === "diff"
     ? ["test_name", "dataset"]
-    : ["test_name", "dataset_name"];
+    : ["test_name", "name", "dataset_name"];
   const latestMetric = prefix === "diff" ? "throughput_qps" : "output_throughput";
   const secondaryMetric = prefix === "diff" ? "latency_mean" : "mean_e2el_ms";
   const modelList = document.getElementById(`${{prefix}}-model-list`);
@@ -1650,7 +1655,7 @@ window.addEventListener("load", () => {{
                 '<div class="section-subtitle">Chat/audio benchmark history with '
                 "trend charts grouped by throughput, latency, and audio metrics."
                 '</div></div><div class="section-pills"><div class="pill"><strong>'
-                "Grouping</strong> test_name + dataset + concurrency + prompts</div>"
+                "Grouping</strong> test_name + name + dataset + concurrency + prompts</div>"
                 '<div class="pill"><strong>Snapshots</strong> single-point series '
                 "stay readable</div></div></div>"
             ),

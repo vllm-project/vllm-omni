@@ -23,7 +23,11 @@ from vllm.transformers_utils.config import get_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context_denoise_step_idx,
+)
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
@@ -103,6 +107,10 @@ def to_device(data, device):
         return [to_device(x, device) for x in data]
     else:
         return data
+
+
+def get_hunyuan_image_3_prefix_cache_func(od_config: OmniDiffusionConfig):
+    return request_layout_utils.prepare_hunyuan_prefix_cache
 
 
 def _to_pil_image(image: Any) -> PILImage.Image:
@@ -338,6 +346,9 @@ class HunyuanImage3Pipeline(
     supports_step_execution: ClassVar[bool] = True
     supports_request_batch = False
     support_image_input = True
+    # The warmup request's blank image routes this AR+diffusion model down its
+    # image-edit path, where the token block cannot match the latent patch grid.
+    dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = ["vision_model"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -364,6 +375,8 @@ class HunyuanImage3Pipeline(
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
         self.hf_config = get_config(od_config.model, trust_remote_code=True)
+        self.hf_config.cfg_distilled = _config_flag(self.hf_config, "cfg_distilled")
+        self.hf_config.use_meanflow = _config_flag(self.hf_config, "use_meanflow")
         super().__init__(self.hf_config)
         # update diffusion config
         self.generation_config = GenerationConfig.from_pretrained(od_config.model)
@@ -427,6 +440,38 @@ class HunyuanImage3Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
         )
 
+    def _get_diffusion_lora_name_aliases(self, full_module_name: str) -> list[str]:
+        """Map LoRA wrapper names to the PEFT adapter namespace.
+
+        ``self.transformer`` aliases ``self.model``, so the generic diffusion
+        LoRA manager registers the DiT layers under ``transformer.layers.*``.
+        PEFT adapters store the same weights under the ``model.layers.*``
+        namespace (matching the HF checkpoint), so expose the alias to let both
+        names resolve to the same adapter tensors.
+        """
+        if full_module_name.startswith("transformer."):
+            return [f"model.{full_module_name[len('transformer.') :]}"]
+        return []
+
+    def _deinterleave_fused_qkv_lora_b(self, lora_b: torch.Tensor) -> torch.Tensor | None:
+        """Re-order a fused ``qkv_proj`` LoRA-B from the checkpoint's
+        GQA-interleaved layout (per-KV-head ``[Q-group, K, V]``) into the block
+        layout ``[all Q, all K, all V]`` expected by the QKV output slices.
+
+        Reuses the exact same split as the base-weight loader
+        (``HunyuanImage3Model._split_qkv_weight``) so the LoRA deltas land on
+        the same output rows as the checkpoint weights. Returns ``None`` if the
+        HI3 fused-QKV layout cannot be established, in which case the caller
+        must fail closed rather than apply the rows to the wrong slices.
+        """
+        split_qkv = getattr(self.transformer, "_split_qkv_weight", None)
+        if not callable(split_qkv):
+            return None
+        try:
+            return split_qkv(lora_b)
+        except (RuntimeError, ValueError):
+            return None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes = ["lm_head."] if self.hf_config.tie_word_embeddings else []
         # List of unexpected keywords in weight names
@@ -454,11 +499,10 @@ class HunyuanImage3Pipeline(
 
         # Note: guidance_emb and timestep_r_emb are no longer skipped
         # to support HunyuanImage-3.0-Distil and MeanFlow distilled models
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=skip_prefixes,
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
-        return loader.load_weights(weights)
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed
@@ -1280,7 +1324,9 @@ class HunyuanImage3Pipeline(
 
         # 4. Encode conditional images
         # Skip encoding if AR KV reuse is enabled
-        has_ar_kv = kwargs.get("ar_kv_data")
+        has_ar_kv = kwargs.get("ar_kv_data") or request_layout_utils.native_kv_covers_cond_images(
+            output, kwargs.get("kv_computed_tokens", ())
+        )
         if batch_cond_image_info is not None and len(batch_cond_image_info[0]) > 0 and not has_ar_kv:
             cond_vae_images, cond_timestep, cond_vit_images = self._encode_cond_image(
                 batch_cond_image_info, cfg_factor[mode], generator=generator
@@ -1402,6 +1448,13 @@ class HunyuanImage3Pipeline(
         )
         full_attn_spans: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
         for i in range(bsz):
+            for reference_slice in tokenizer_output.joint_image_slices[i]:
+                logger.debug(
+                    "Hunyuan reference span: sequence_id=%d start=%d end=%d",
+                    i,
+                    int(reference_slice.start or 0),
+                    int(reference_slice.stop or seq_len),
+                )
             for j, image_slice in enumerate(batch_image_slices[i]):
                 attention_mask[i, image_slice, image_slice] = True
                 start = image_slice.start if image_slice.start is not None else 0
@@ -1413,6 +1466,69 @@ class HunyuanImage3Pipeline(
         attention_mask = attention_mask.unsqueeze(1)
         model_kwargs["full_attn_spans"] = full_attn_spans
         return attention_mask
+
+    @staticmethod
+    def _slice_cached_prefix_inputs(
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        custom_pos_emb: tuple[torch.Tensor, ...] | None,
+        image_mask: torch.Tensor | None,
+        gen_timestep_scatter_index: torch.Tensor | None,
+        query_lens: list[int] | None,
+        seq_lens: list[int] | None,
+        cached_prefix_len: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        tuple[torch.Tensor, ...],
+        torch.Tensor,
+        torch.Tensor,
+        list[int],
+        int,
+    ]:
+        """Remove a cached first-step prefix while preserving full KV lengths."""
+
+        seq_len = int(inputs_embeds.shape[1])
+        if (
+            query_lens is None
+            or seq_lens is None
+            or len(query_lens) != inputs_embeds.shape[0]
+            or len(seq_lens) != len(query_lens)
+        ):
+            raise ValueError("Hunyuan paged prefix execution requires one query/sequence length per row")
+        if any(query_len != seq_len for query_len in query_lens) or any(
+            logical_len != seq_len for logical_len in seq_lens
+        ):
+            raise ValueError(
+                "Hunyuan paged prefix slicing requires an untrimmed first-step tensor: "
+                f"query_lens={query_lens}, tensor_len={seq_len}"
+            )
+        if not 0 < cached_prefix_len < seq_len:
+            raise ValueError(
+                "Hunyuan cached prefix must leave a non-empty first-step suffix: "
+                f"cached={cached_prefix_len}, seq_len={seq_len}"
+            )
+        if (
+            attention_mask is None
+            or position_ids is None
+            or custom_pos_emb is None
+            or image_mask is None
+            or gen_timestep_scatter_index is None
+        ):
+            raise ValueError("Hunyuan paged prefix slicing is missing first-step layout tensors")
+
+        return (
+            inputs_embeds[:, cached_prefix_len:],
+            attention_mask[:, :, cached_prefix_len:, :],
+            position_ids[:, cached_prefix_len:],
+            tuple(pos[:, cached_prefix_len:] for pos in custom_pos_emb),
+            image_mask[:, cached_prefix_len:],
+            gen_timestep_scatter_index - cached_prefix_len,
+            [query_len - cached_prefix_len for query_len in query_lens],
+            seq_len - cached_prefix_len,
+        )
 
     def prepare_inputs_for_generation(
         self,
@@ -1741,6 +1857,40 @@ class HunyuanImage3Pipeline(
         assert inputs_embeds is not None
         bsz, seq_len, n_embd = inputs_embeds.shape
 
+        paged_kv_cached_prefix_len = 0
+        if first_step and self._uses_scheduler_paged_kv():
+            if not is_forward_context_available():
+                raise RuntimeError("Hunyuan paged prefix execution requires an Omni ForwardContext")
+            paged_kv_cached_prefix_len = int(get_forward_context().paged_kv_cached_prefix_len)
+        if paged_kv_cached_prefix_len:
+            if ar_kv_reuse_len:
+                raise ValueError("Hunyuan cannot combine imported AR KV and Scheduler prefix-cache hits")
+            (
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                custom_pos_emb,
+                image_mask,
+                gen_timestep_scatter_index,
+                query_lens,
+                seq_len,
+            ) = self._slice_cached_prefix_inputs(
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                custom_pos_emb,
+                image_mask,
+                gen_timestep_scatter_index,
+                query_lens,
+                seq_lens,
+                paged_kv_cached_prefix_len,
+            )
+            logger.debug(
+                "Hunyuan prefix slice: cached_prefix_len=%d query_len=%d",
+                paged_kv_cached_prefix_len,
+                seq_len,
+            )
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         from vllm.forward_context import set_forward_context
 
@@ -1764,6 +1914,7 @@ class HunyuanImage3Pipeline(
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 ar_kv_reuse_len=ar_kv_reuse_len,
+                paged_kv_cached_prefix_len=paged_kv_cached_prefix_len,
                 full_attn_spans=full_attn_spans,
             )
         hidden_states = outputs[0]
@@ -1892,6 +2043,7 @@ class HunyuanImage3Pipeline(
         pipe._guidance_scale = guidance_scale
         pipe._guidance_rescale = getattr(sampling, "guidance_rescale", 0.0)
 
+        ar_kv_kwargs = self._extract_ar_kv_from_sampling(sampling)
         model_kwargs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
@@ -1904,8 +2056,10 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
             prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(state),
+            kv_computed_tokens=state.extra.get("kv_computed_tokens", ()),
+            **ar_kv_kwargs,
         )
-        model_kwargs.update(self._extract_ar_kv_from_sampling(sampling))
+        model_kwargs.update(ar_kv_kwargs)
         model_kwargs["use_cache"] = False
 
         input_ids = model_kwargs.pop("input_ids")
@@ -2335,6 +2489,7 @@ class HunyuanImage3Pipeline(
             batch_cond_image_info=batch_cond_image_info,
             bot_task=tokenizer_bot_task,
             prepared_layout=request_layout_utils.get_hunyuan_prepared_layout(req.requests[0]),
+            kv_computed_tokens=getattr(req.requests[0], "kv_computed_tokens", ()),
             **ar_kv_kwargs,
         )
 

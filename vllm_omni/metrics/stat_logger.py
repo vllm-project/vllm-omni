@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """OmniPrometheusStatLogger — wrap upstream PrometheusStatLogger.
 
 Rewrites the upstream ``engine`` single-label scheme into a ``stage`` +
@@ -20,12 +23,19 @@ Contents:
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Gauge, Histogram
+from threading import Lock
+from weakref import WeakKeyDictionary
+
+from prometheus_client import REGISTRY, CollectorRegistry, Counter, Gauge, Histogram
+from prometheus_client.metrics import MetricWrapperBase
 from vllm.config import VllmConfig
-from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorProm
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorProm, KVConnectorPromMetrics
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.perf import PerfMetricsProm
 from vllm.v1.spec_decode.metrics import SpecDecodingProm
+
+from vllm_omni.metrics import definitions as defs
+from vllm_omni.outputs import StagePostWarmupMemoryStats
 
 # Process-wide translation table written by OmniPrometheusStatLogger at init.
 # Keys are flat engine_idx values (as upstream PrometheusStatLogger sees them);
@@ -36,6 +46,37 @@ from vllm.v1.spec_decode.metrics import SpecDecodingProm
 # StatLogger that owns them. vLLM runs a single Orchestrator/StatLogger per
 # process, so a module global is safe; tests isolate by .clear()ing first.
 _ENGINE_INDEX_MAP: dict[int, tuple[str, str]] = {}
+_STAGE_POST_WARMUP_MEMORY_FAMILIES: WeakKeyDictionary[CollectorRegistry, tuple[Gauge, Gauge]] = WeakKeyDictionary()
+_STAGE_POST_WARMUP_MEMORY_FAMILIES_LOCK = Lock()
+
+
+def _get_stage_post_warmup_memory_families(registry: CollectorRegistry) -> tuple[Gauge, Gauge]:
+    with _STAGE_POST_WARMUP_MEMORY_FAMILIES_LOCK:
+        families = _STAGE_POST_WARMUP_MEMORY_FAMILIES.get(registry)
+        if families is None:
+            labels = list(defs.STAGE_LABELS)
+            families = (
+                Gauge(
+                    defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES,
+                    "Rank-0 worker process PyTorch allocator bytes allocated on its device "
+                    "after decoder graph warmup during model loading, before KV-cache allocation "
+                    "and later graph captures.",
+                    labelnames=labels,
+                    multiprocess_mode="mostrecent",
+                    registry=registry,
+                ),
+                Gauge(
+                    defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES,
+                    "Rank-0 worker process PyTorch allocator bytes reserved on its device "
+                    "after decoder graph warmup during model loading, before KV-cache allocation "
+                    "and later graph captures.",
+                    labelnames=labels,
+                    multiprocess_mode="mostrecent",
+                    registry=registry,
+                ),
+            )
+            _STAGE_POST_WARMUP_MEMORY_FAMILIES[registry] = families
+        return families
 
 
 def _rewrite_labelnames(labelnames):
@@ -73,7 +114,7 @@ def _engine_to_stage_replica(engine_value) -> tuple[str, str]:
     return _ENGINE_INDEX_MAP[key]
 
 
-class _RelabelMixin:
+class _RelabelMixin(MetricWrapperBase):
     """Mixin: rewrite ``labelnames`` at family creation and ``.labels()`` calls.
 
     Handles all four upstream forms encountered in
@@ -88,6 +129,8 @@ class _RelabelMixin:
     Drops into upstream's ``_gauge_cls`` / ``_counter_cls`` / ``_histogram_cls``
     class slots.
     """
+
+    _omni_parent: MetricWrapperBase
 
     def __init__(self, *args, **kwargs):
         # Remember where `engine` sat in the original labelnames so positional
@@ -120,7 +163,9 @@ class _RelabelMixin:
                 #     len(args) is short by 1 — splice (stage, replica)
                 #     in place of the engine value at engine_label_index.
                 if len(args) == len(self._labelnames):
-                    return super().labels(*args, **kwargs)
+                    child = super().labels(*args, **kwargs)
+                    child._omni_parent = self
+                    return child
                 idx = self._engine_label_index
                 if idx < len(args):
                     stage, replica = _engine_to_stage_replica(args[idx])
@@ -129,7 +174,39 @@ class _RelabelMixin:
                 stage, replica = _engine_to_stage_replica(kwargs.pop("engine"))
                 kwargs["stage"] = stage
                 kwargs["replica"] = replica
-        return super().labels(*args, **kwargs)
+        child = super().labels(*args, **kwargs)
+        child._omni_parent = self
+        return child
+
+
+def _extend_metric_maps(value: object, engine_idx: int, stage: str, replica: str) -> None:
+    """Bind new children in upstream's per-engine metric tables.
+
+    Nested tables keep extra labels such as finish reason or token source.
+    Reuse their existing family rather than rebuilding collectors, which
+    would unregister metrics and reset counters for the running replicas.
+    """
+    if isinstance(value, dict):
+        template = next(iter(value.values()), None)
+        if isinstance(template, _RelabelMixin) and "stage" in template._labelnames:
+            labels = dict(zip(template._labelnames, template._labelvalues))
+            labels.update(stage=stage, replica=replica)
+            value[engine_idx] = template._omni_parent.labels(**labels)
+        elif isinstance(template, list) and template and all(isinstance(item, _RelabelMixin) for item in template):
+            value[engine_idx] = [
+                item._omni_parent.labels(
+                    **(dict(zip(item._labelnames, item._labelvalues)) | {"stage": stage, "replica": replica})
+                )
+                for item in template
+            ]
+        else:
+            for child in value.values():
+                _extend_metric_maps(child, engine_idx, stage, replica)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            _extend_metric_maps(child, engine_idx, stage, replica)
+    elif isinstance(value, (PerfMetricsProm, SpecDecodingProm, KVConnectorProm, KVConnectorPromMetrics)):
+        _extend_metric_maps(vars(value), engine_idx, stage, replica)
 
 
 class _RelabelGauge(_RelabelMixin, Gauge):
@@ -188,8 +265,8 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
 
     The orchestrator builds ``stage_replica_map`` from the static stage_pools
     config; flat engine_idx values map 1:1 to (stage_name, replica_id) tuples.
-    Dynamic add/remove of replicas at runtime is intentionally not supported —
-    the map is built once at construction and never mutated afterward.
+    New replicas are registered before their first statistics are recorded.
+    Indices and counters are retained across detach/rejoin of the same replica.
     """
 
     # Inject our wrapper metric classes into upstream's class-level slots so
@@ -217,9 +294,35 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
         # orchestrator restart) starts from a clean slate.
         _ENGINE_INDEX_MAP.clear()
         _ENGINE_INDEX_MAP.update(stage_replica_map)
-        super().__init__(
-            vllm_config=vllm_config,
-            engine_indexes=list(stage_replica_map.keys()),
+        self.vllm_config = vllm_config
+        self.engine_indexes = list(stage_replica_map)
+        self._omni_per_engine_labelvalues: dict[int, list[object]] = {}
+        # A head can start without local replicas. Initialize collectors on
+        # its first join so every per-engine table has a binding template.
+        if stage_replica_map:
+            super().__init__(vllm_config=vllm_config, engine_indexes=self.engine_indexes)
+        self._init_stage_post_warmup_memory_families()
+
+    def register_replica(self, engine_idx: int, stage: str, replica: str) -> None:
+        """Register a replica without resetting existing metric series."""
+        pair = (stage, replica)
+        if engine_idx in self._stage_replica_map:
+            if self._stage_replica_map[engine_idx] != pair:
+                raise ValueError(f"Engine index {engine_idx} already belongs to another replica")
+            return
+        self._stage_replica_map[engine_idx] = pair
+        _ENGINE_INDEX_MAP[engine_idx] = pair
+        if not self.engine_indexes:
+            super().__init__(vllm_config=self.vllm_config, engine_indexes=[engine_idx])
+            return
+        _extend_metric_maps(vars(self), engine_idx, stage, replica)
+        self.per_engine_labelvalues[engine_idx] = [self.vllm_config.model_config.served_model_name, stage, replica]
+        self.engine_indexes.append(engine_idx)
+        self.gauge_engine_sleep_state["awake"][engine_idx].set(1)
+
+    def _init_stage_post_warmup_memory_families(self, registry: CollectorRegistry = REGISTRY) -> None:
+        self._stage_post_warmup_memory_allocated_family, self._stage_post_warmup_memory_reserved_family = (
+            _get_stage_post_warmup_memory_families(registry)
         )
 
     @property
@@ -241,3 +344,22 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
             stage, replica = self._stage_replica_map[idx]
             rewritten[idx] = [model_name, stage, replica]
         self._omni_per_engine_labelvalues = rewritten
+
+    def record_stage_post_warmup_memory(
+        self,
+        stats: StagePostWarmupMemoryStats,
+        *,
+        engine_idx: int,
+    ) -> None:
+        model_name, stage, replica = self.per_engine_labelvalues[engine_idx]
+        labels = (model_name, stage, replica)
+        self._stage_post_warmup_memory_allocated_family.labels(*labels).set(stats.allocated_bytes)
+        self._stage_post_warmup_memory_reserved_family.labels(*labels).set(stats.reserved_bytes)
+
+    def remove_stage_post_warmup_memory(self, *, engine_idx: int) -> None:
+        """Remove a detached replica's snapshot while retaining its metric slot."""
+        labels = self.per_engine_labelvalues.get(engine_idx)
+        if labels is None:
+            return
+        self._stage_post_warmup_memory_allocated_family.remove(*labels)
+        self._stage_post_warmup_memory_reserved_family.remove(*labels)

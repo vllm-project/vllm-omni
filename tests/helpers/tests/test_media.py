@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import sys
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import nullcontext
+from multiprocessing.context import BaseContext
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +14,14 @@ import soundfile as sf
 from tests.helpers import media
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_preprocess_text_normalizes_spoken_kilohertz():
+    expected = "This response should be encoded as eight kilohertz audio."
+    transcript = "This response should be encoded as 8 kHz audio."
+
+    assert media.preprocess_text(expected) == media.preprocess_text(transcript)
+    assert media.cosine_similarity_text(expected, transcript) == pytest.approx(1.0)
 
 
 def _stub_transcribe(monkeypatch) -> dict:
@@ -61,12 +70,13 @@ class _FakeExecutor:
 
     def __init__(self, outcomes=()):
         self._outcomes = list(outcomes)
+        self.init_kwargs: dict[str, object] = {}
         self.submitted: list[tuple] = []
         self.shutdown_calls = 0
 
     def submit(self, fn, *args):
         self.submitted.append((fn, args))
-        outcome = self._outcomes.pop(0) if self._outcomes else "London"
+        outcome = self._outcomes.pop(0) if self._outcomes else ("London", "cpu")
 
         def _result():
             if isinstance(outcome, BaseException):
@@ -100,9 +110,51 @@ def _reset_transcriber_singletons():
     """The worker and its model cache are module-level state; do not leak them across tests."""
     media.release_audio_transcriber()
     media._WHISPER_MODELS.clear()
+    media._WHISPER_LOADED_DEVICE = None
+    media._TRANSCRIBER_RESERVED_GIB = 0.0
     yield
     media.release_audio_transcriber()
     media._WHISPER_MODELS.clear()
+    media._WHISPER_LOADED_DEVICE = None
+    media._TRANSCRIBER_RESERVED_GIB = 0.0
+
+
+@pytest.mark.parametrize(
+    ("free_memory_by_device", "expected_device", "expected_probe_order"),
+    [
+        ([media._MIN_FREE_VRAM], "cuda:0", [0]),
+        ([media._MIN_FREE_VRAM] * 3, "cuda:2", [2]),
+        ([8 * 1024**3, 20 * 1024**3, 24 * 1024**3], "cuda:2", [2]),
+        ([media._MIN_FREE_VRAM - 1], "cpu", [0]),
+        ([20 * 1024**3, 8 * 1024**3], "cuda:0", [1, 0]),
+        ([8 * 1024**3, 12 * 1024**3], "cpu", [1, 0]),
+    ],
+)
+def test_select_whisper_device_by_available_memory(
+    monkeypatch, free_memory_by_device, expected_device, expected_probe_order
+):
+    probed_devices = []
+
+    def get_free_memory(device):
+        index = int(device.rsplit(":", 1)[1])
+        probed_devices.append(index)
+        return free_memory_by_device[index]
+
+    platform = SimpleNamespace(
+        is_available=lambda: True,
+        get_device_count=lambda: len(free_memory_by_device),
+        get_torch_device=lambda index: f"cuda:{index}",
+        get_free_memory=get_free_memory,
+        set_device=lambda device: None,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.platforms",
+        SimpleNamespace(current_omni_platform=platform),
+    )
+
+    assert media._select_whisper_device() == expected_device
+    assert probed_devices == expected_probe_order
 
 
 def test_bytes_entrypoint_forwards_language_to_subprocess(monkeypatch, tmp_path):
@@ -139,7 +191,9 @@ def test_parent_reuses_one_spawned_worker_across_calls(monkeypatch):
     assert len(created) == 1
     assert len(created[0].submitted) == 2
     assert created[0].init_kwargs["max_workers"] == 1
-    assert created[0].init_kwargs["mp_context"].get_start_method() == "spawn"
+    mp_context = created[0].init_kwargs["mp_context"]
+    assert isinstance(mp_context, BaseContext)
+    assert mp_context.get_start_method() == "spawn"
 
 
 def test_release_forces_a_new_process_pool(monkeypatch):
@@ -186,7 +240,10 @@ def test_worker_loads_each_model_size_once(monkeypatch):
 
 @pytest.mark.parametrize(
     ("second_outcome", "recovers"),
-    [(["London"], True), ([BrokenProcessPool("second")], False)],
+    [
+        ([("London", "cpu")], True),
+        ([BrokenProcessPool("second")], False),
+    ],
 )
 def test_broken_pool_is_discarded_and_retried_once(monkeypatch, second_outcome, recovers):
     """A dead worker is discarded and the call retried exactly once.
@@ -236,3 +293,103 @@ def test_transcription_failure_propagates_and_discards_the_worker(monkeypatch, e
 
     assert media.convert_audio_file_to_text("/tmp/b.wav") == "London"
     assert len(created) == 2  # a fresh worker for the next call
+
+
+def test_whisper_resident_vram_is_zero_until_a_gpu_result(monkeypatch):
+    """CPU fallback and in-flight loads must not hide engine leaks on the last GPU."""
+    assert media.whisper_resident_vram_gib() == 0.0
+    assert media.whisper_resident_device_index() is None
+
+    created = _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cpu")],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+
+    assert created[0].submitted
+    assert media.whisper_resident_vram_gib() == 0.0
+    assert media.whisper_resident_device_index() is None
+
+
+def test_whisper_resident_vram_tracks_gpu_device_after_success(monkeypatch):
+    _patch_executors(
+        monkeypatch,
+        outcomes_per_executor=([("London", "cuda:1", 2.5), ("Paris", "cuda:1", 9.6)],),
+    )
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+    assert media.whisper_resident_device_index() == 1
+    assert media.whisper_resident_vram_gib() == pytest.approx(2.5)
+
+    media.convert_audio_file_to_text("/tmp/b.wav", "large-v3")
+    assert media.whisper_resident_device_index() == 1
+    assert media.whisper_resident_vram_gib() == pytest.approx(9.6)
+
+    media.release_audio_transcriber()
+    assert media.whisper_resident_vram_gib() == 0.0
+    assert media.whisper_resident_device_index() is None
+
+
+def test_whisper_unmeasured_gpu_result_credits_zero(monkeypatch):
+    """A GPU device without a reserved reading must not invent a size-table credit."""
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0")],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "not-a-whisper-size")
+    assert media.whisper_resident_device_index() == 0
+    assert media.whisper_resident_vram_gib() == 0.0
+
+
+def test_whisper_resident_vram_uses_child_reserved(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 1.0)],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+    assert media.whisper_resident_vram_gib() == pytest.approx(1.0)
+
+
+def test_whisper_resident_vram_does_not_cap_measured_reserved(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 20.0)],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "small")
+    assert media.whisper_resident_vram_gib() == pytest.approx(20.0)
+
+
+def test_whisper_unknown_size_uses_measured_reserved(monkeypatch):
+    _patch_executors(monkeypatch, outcomes_per_executor=([("London", "cuda:0", 3.0)],))
+    media.convert_audio_file_to_text("/tmp/a.wav", "not-a-whisper-size")
+    assert media.whisper_resident_vram_gib() == pytest.approx(3.0)
+
+
+def test_later_whisper_sizes_reuse_the_first_selected_device(monkeypatch):
+    selected: list[str] = []
+
+    def fake_model(_size, device=None):
+        return SimpleNamespace(transcribe=lambda *_a, **_k: {"text": "x"})
+
+    def select_device() -> str:
+        selected.append("cuda:1")
+        return "cuda:1"
+
+    monkeypatch.setattr(media, "_select_whisper_device", select_device)
+    monkeypatch.setitem(sys.modules, "whisper", SimpleNamespace(load_model=fake_model))
+    monkeypatch.setattr(media, "_serialize_whisper_model_download", lambda model_size: nullcontext())
+
+    text, device, _reserved = media._whisper_transcribe_in_current_process("/tmp/a.wav", "small")
+    assert (text, device) == ("x", "cuda:1")
+    media._whisper_transcribe_in_current_process("/tmp/b.wav", "large-v3")
+    assert selected == ["cuda:1"]
+    assert media._WHISPER_LOADED_DEVICE == "cuda:1"
+
+
+def test_cleanup_whisper_allowance_is_zero_on_cpu(monkeypatch):
+    from tests.helpers import clean
+
+    monkeypatch.setattr(media, "whisper_resident_vram_gib", lambda: 11.0)
+    monkeypatch.setattr(media, "whisper_resident_device_index", lambda: None)
+    assert clean._whisper_vram_allowance() == (0.0, None)
+
+
+def test_cleanup_whisper_allowance_maps_logical_gpu(monkeypatch):
+    from tests.helpers import clean
+
+    monkeypatch.setattr(media, "whisper_resident_vram_gib", lambda: 2.5)
+    monkeypatch.setattr(media, "whisper_resident_device_index", lambda: 1)
+    monkeypatch.setattr(clean, "get_physical_device_indices", lambda devices: [7] if devices == [1] else [])
+    assert clean._whisper_vram_allowance() == (2.5, 7)
+
+
+def test_whisper_has_no_size_table():
+    assert not hasattr(media, "_WHISPER_VRAM_GIB")
+    assert not hasattr(media, "_WHISPER_VRAM_GIB_DEFAULT")

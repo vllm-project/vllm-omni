@@ -17,28 +17,36 @@ import json
 import math
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+from vllm_omni.clients.duplex import (  # noqa: E402
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
-    RealtimeDuplexClient,
-    RealtimeEventCollector,
-    build_realtime_url,
+    AudioFormat,
+    DuplexClient,
+    DuplexClientBase,
+    DuplexClientError,
+    DuplexSessionClosedError,
+    EventCollector,
+    acknowledge_collected_playback,
     read_pcm16_wav,
-    wait_for,
+    wait_for_condition,
     write_pcm16_wav,
 )
-from vllm_omni.experimental.fullduplex.client import chunk_period_ms as _chunk_period_ms  # noqa: E402
-from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+from vllm_omni.clients.duplex import chunk_period_ms as _chunk_period_ms  # noqa: E402
+from vllm_omni.clients.duplex import (  # noqa: E402
     has_residual_model_unit as _has_residual_model_unit,
 )
-from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+from vllm_omni.clients.duplex import (  # noqa: E402
     reference_audio_data_url as _ref_audio_data_url,
+)
+from vllm_omni.clients.minicpmo_4_5 import (  # noqa: E402
+    create_duplex_session_config,
 )
 from vllm_omni.experimental.fullduplex.video_stacking import (  # noqa: E402
     concat_frames_b64,
@@ -60,14 +68,14 @@ class _StreamingOutputWriter:
     def handle(self, event: dict[str, object]) -> None:
         event_type = event.get("type")
         if event_type in {
-            "response.audio_transcript.delta",
+            "response.output_audio_transcript.delta",
             "response.output_text.delta",
         }:
             delta = event.get("delta")
             if isinstance(delta, str) and delta:
                 print(delta, end="", file=sys.stderr, flush=True)
             return
-        if event_type != "response.audio.delta":
+        if event_type != "response.output_audio.delta":
             return
 
         delta = event.get("delta") or event.get("audio")
@@ -96,7 +104,26 @@ class _StreamingOutputWriter:
         )
 
 
-class _StreamingEventCollector(RealtimeEventCollector):
+class _TimedInputClient(DuplexClient):
+    """Record the transmitted media clock without retaining audio payloads."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.input_timeline: list[dict[str, float]] = []
+
+    async def send(self, event: dict[str, object]) -> str:
+        event_id = await super().send(event)
+        if event.get("type") == "input_audio_buffer.append" and "audio_end_ms" in event:
+            self.input_timeline.append(
+                {
+                    "sent_at_s": time.monotonic(),
+                    "audio_end_s": float(event["audio_end_ms"]) / 1000.0,
+                }
+            )
+        return event_id
+
+
+class _StreamingEventCollector(EventCollector):
     def __init__(self, writer: _StreamingOutputWriter) -> None:
         super().__init__()
         self._writer = writer
@@ -104,6 +131,27 @@ class _StreamingEventCollector(RealtimeEventCollector):
     def add(self, event: dict[str, object], *, received_at_s: float | None = None) -> None:
         super().add(event, received_at_s=received_at_s)
         self._writer.handle(self.events[-1])
+
+    async def consume(self, client: DuplexClientBase) -> None:
+        """Collect events and, like the web client, ack each reply once it has fully played.
+
+        This offline client plays everything it receives, so a finished reply's
+        whole audio counts as played.
+        """
+        try:
+            async for event in client.events():
+                self.add(event.raw)
+                response_id = self.response_id(event.raw)
+                if event.raw.get("type") != "response.done" or not response_id:
+                    continue
+                pcm16 = self.audio_bytes(response_id)
+                if not pcm16:
+                    continue
+                played_ms = AudioFormat("pcm16", self.output_sample_rate_hz).duration_ms(len(pcm16))
+                with suppress(DuplexClientError):
+                    await client.ack_playback(played_ms, response_id=response_id, item_id=f"item_{response_id}")
+        except DuplexSessionClosedError:
+            pass
 
 
 def _input_committed_index(
@@ -155,7 +203,7 @@ def _response_in_progress(events: list[dict[str, object]]) -> bool:
     )
 
 
-async def _commit_input_after_playback_checkpoint(client: RealtimeDuplexClient) -> float:
+async def _commit_input_after_playback_checkpoint(client: DuplexClient, collector: EventCollector) -> float:
     """Commit input only after preserving already-played assistant history.
 
     Native duplex can finish several responses while the user is still
@@ -166,7 +214,7 @@ async def _commit_input_after_playback_checkpoint(client: RealtimeDuplexClient) 
     original history position.  A second acknowledgement after the commit can
     then safely advance response-local playback that drained in the meantime.
     """
-    await client.acknowledge_playback()
+    await acknowledge_collected_playback(client, collector)
     commit_sent_at_s = time.monotonic()
     await client.commit()
     return commit_sent_at_s
@@ -180,6 +228,13 @@ def _event_count_after(
     if index is None:
         return 0
     return sum(event.get("type") == event_type for event in events[index + 1 :])
+
+
+def _video_has_audio(video_path: Path) -> bool:
+    import av
+
+    with av.open(str(video_path)) as container:
+        return bool(container.streams.audio)
 
 
 def _probe_video_frames_and_fps(video_path: Path) -> tuple[int, float]:
@@ -370,13 +425,25 @@ def _extract_video_input(
     caller already has ``--input-wav``, extract frames against that WAV
     duration instead so a silent clip cannot fail ``load_audio``.
     """
+    num_frames, frame_rate = _probe_video_frames_and_fps(video_path)
+    video_duration_s = num_frames / frame_rate
     audio_path = _extract_video_soundtrack(video_path, work_dir)
+    # Match official get_audio_segments(adjust_length=True): the video
+    # timeline determines the number of one-second audio units. Decoders
+    # can retain AAC padding (e.g. 180.032 s for a 180 s video); treating it
+    # as real input creates an extra, frame-less unit on the final commit.
+    unit_count = max(1, int(math.ceil(video_duration_s - 1e-9)))
+    target_bytes = unit_count * PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
+    pcm = read_pcm16_wav(audio_path)
+    aligned_pcm = pcm[:target_bytes].ljust(target_bytes, b"\0")
+    if aligned_pcm != pcm:
+        write_pcm16_wav(audio_path, aligned_pcm, sample_rate_hz=PCM16_SAMPLE_RATE)
     frames_b64, stacked_b64 = _extract_video_frames(
         video_path,
         work_dir,
         fps=fps,
         max_side=max_side,
-        duration_s=_pcm16_wav_duration_s(audio_path),
+        duration_s=video_duration_s,
         stack_frames=stack_frames,
     )
     return audio_path, frames_b64, stacked_b64
@@ -390,7 +457,7 @@ def _resolve_duplex_av_inputs(
     fps: float,
     max_side: int,
     stack_frames: int = 1,
-) -> tuple[str, list[str], list[str | None]]:
+) -> tuple[str | None, list[str], list[str | None]]:
     """Return ``(wav_path, frames_b64, stacked_b64)``. External WAV wins over video audio."""
     if input_video:
         video_path = Path(input_video)
@@ -404,6 +471,17 @@ def _resolve_duplex_av_inputs(
                 stack_frames=stack_frames,
             )
             return input_wav, frames, stacked
+        if not _video_has_audio(video_path):
+            frame_count, frame_rate = _probe_video_frames_and_fps(video_path)
+            frames, stacked = _extract_video_frames(
+                video_path,
+                work_dir,
+                fps=fps,
+                max_side=max_side,
+                stack_frames=stack_frames,
+                duration_s=frame_count / frame_rate,
+            )
+            return None, frames, stacked
         extracted_wav, frames, stacked = _extract_video_input(
             video_path,
             work_dir,
@@ -430,91 +508,152 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         stack_frames=args.stack_frames,
     )
 
-    input_pcm16 = read_pcm16_wav(Path(input_wav))
-    if not input_pcm16:
+    input_pcm16 = read_pcm16_wav(Path(input_wav)) if input_wav is not None else b""
+    if input_wav is not None and not input_pcm16:
         raise ValueError("input WAV has no audio")
 
-    url = build_realtime_url(
+    collector = _StreamingEventCollector(stream_writer)
+    client = _TimedInputClient(
         args.url,
-        args.model,
-        autostart=False if args.ref_audio else None,
-        session_id=args.session_id,
-    )
-    client = RealtimeDuplexClient(url)
-    client.events = _StreamingEventCollector(stream_writer)
-    async with client:
-        await client.configure(
-            args.model,
+        model=args.model,
+        config=create_duplex_session_config(
             ref_audio=_ref_audio_data_url(args.ref_audio),
-            session_id=args.session_id,
             temperature=args.temperature,
-            timeout_s=args.timeout_s,
-        )
-        stream_event_cursor = len(client.events.events)
-        frames_sent = await client.stream_pcm16(
-            input_pcm16,
-            chunk_ms=args.chunk_ms,
-            realtime=not args.no_realtime_pacing,
-            video_frames=video_frames,
-            stacked_video_frames=stacked_video_frames,
-        )
-        commit_event_cursor = len(client.events.events)
-        stream_decision = _latest_model_decision(client.events.events, stream_event_cursor)
+            instructions=args.instructions,
+            extra_body={
+                "sliding_window_mode": args.sliding_window_mode,
+                "basic_window_high_tokens": args.basic_window_high_tokens,
+                "basic_window_low_tokens": args.basic_window_low_tokens,
+                "context_max_units": args.context_max_units,
+                "context_previous_max_tokens": args.context_previous_max_tokens,
+            },
+        ),
+        reconnect=None,
+        heartbeat_interval_s=None,
+        handshake_timeout_s=args.timeout_s,
+    )
+    async with client:
+        consume_task = asyncio.create_task(collector.consume(client))
+        # The handshake consumed session.created before the collector
+        # subscribed; seed it so counts and capability lookups still work.
+        collector.add({"type": "session.created", "session": client.session_info})
+        stream_event_cursor = len(collector.events)
+        input_stream_started_at_s = time.monotonic()
+        if input_wav is None:
+            frames_sent = 0
+            frame_period_s = 1.0 / max(args.video_fps, 1e-6)
+            for i, frame in enumerate(video_frames):
+                frames = [frame]
+                if i < len(stacked_video_frames) and stacked_video_frames[i] is not None:
+                    frames.append(stacked_video_frames[i])
+                await client.send({"type": "input_audio_buffer.append", "video_frames": frames})
+                frames_sent += 1
+                if not args.no_realtime_pacing:
+                    # Same media clock as stream_pcm: a sleep of one frame period
+                    # after each send would accumulate send overhead.
+                    delay_s = input_stream_started_at_s + frames_sent * frame_period_s - time.monotonic()
+                    await asyncio.sleep(max(0.0, delay_s))
+        else:
+            frames_sent = await client.stream_pcm(
+                input_pcm16,
+                chunk_ms=args.chunk_ms,
+                realtime=not args.no_realtime_pacing,
+                video_frames=video_frames,
+                stacked_video_frames=stacked_video_frames,
+            )
+        # Let the model answer the final utterance while holding the last frame.
+        # A commit alone does not supply more model time to native duplex.
+        tail_frames_sent = 0
+        if args.tail_silence_s > 0:
+            tail_pcm = bytes(round(args.tail_silence_s * PCM16_SAMPLE_RATE) * PCM16_BYTES_PER_SAMPLE)
+            # PCM still buffered on the server keeps its media clock: a fresh
+            # stream would attach the held frame one second into the tail,
+            # after the unit that contains the end of the utterance closed.
+            # A clip with no audio has no buffered PCM, so the tail holds the
+            # last frame on its own clock.
+            tail_timeline = (
+                {
+                    "video_frames": video_frames,
+                    "stacked_video_frames": stacked_video_frames,
+                    "media_origin_ms": client.config.input_audio.duration_ms(len(input_pcm16)),
+                    "unit_index": frames_sent,
+                }
+                if input_pcm16
+                else {
+                    "video_frames": video_frames[-1:],
+                    "stacked_video_frames": stacked_video_frames[-1:],
+                }
+            )
+            tail_frames_sent = await client.stream_pcm(
+                tail_pcm,
+                chunk_ms=args.chunk_ms,
+                realtime=not args.no_realtime_pacing,
+                **tail_timeline,
+            )
+            input_pcm16 += tail_pcm
+        commit_event_cursor = len(collector.events)
+        stream_decision = _latest_model_decision(collector.events, stream_event_cursor)
         input_has_residual_model_unit = _has_residual_model_unit(
             input_pcm16,
-            chunk_period_ms=_chunk_period_ms(client.events.events),
+            chunk_period_ms=_chunk_period_ms(collector.events),
         )
         wait_for_post_commit_decision = False
-        commit_sent_at_s = await _commit_input_after_playback_checkpoint(client)
+        commit_sent_at_s = await _commit_input_after_playback_checkpoint(client, collector)
         wait_error: str | None = None
         committed_index: int | None = None
         post_commit_decision: str | None = None
         try:
-            await wait_for(
-                lambda: _input_committed_index(client.events.events, commit_event_cursor) is not None,
+            await wait_for_condition(
+                lambda: _input_committed_index(collector.events, commit_event_cursor) is not None,
                 timeout_s=args.timeout_s,
                 label="input_audio_buffer.committed",
             )
-            committed_index = _input_committed_index(client.events.events, commit_event_cursor)
-            stream_decision = _latest_model_decision(client.events.events[: committed_index + 1], stream_event_cursor)
+            committed_index = _input_committed_index(collector.events, commit_event_cursor)
+            stream_decision = _latest_model_decision(collector.events[: committed_index + 1], stream_event_cursor)
             wait_for_post_commit_decision = input_has_residual_model_unit or _response_in_progress(
-                client.events.events[: committed_index + 1]
+                collector.events[: committed_index + 1]
             )
             if wait_for_post_commit_decision:
-                await wait_for(
-                    lambda: _post_commit_model_decision(client.events.events, committed_index) is not None,
+                await wait_for_condition(
+                    lambda: _post_commit_model_decision(collector.events, committed_index) is not None,
                     timeout_s=args.timeout_s,
                     label="post-commit model decision or response drain",
                 )
-                post_commit_decision = _post_commit_model_decision(client.events.events, committed_index)
+                post_commit_decision = _post_commit_model_decision(collector.events, committed_index)
         except TimeoutError as exc:
             wait_error = str(exc)
-        await client.acknowledge_playback()
+        await acknowledge_collected_playback(client, collector)
         close_error: str | None = None
+        await client.close(timeout_s=args.timeout_s)
+        # close() returns when the client's reader observed session.closed;
+        # the collector is a separate subscriber task, so wait for it to
+        # drain before checking, or a normal close reads as a failure.
         try:
-            await client.close_session(timeout_s=args.timeout_s)
-        except TimeoutError as exc:
-            close_error = str(exc)
+            await asyncio.wait_for(consume_task, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            consume_task.cancel()
+        if collector.count("session.closed") == 0:
+            close_error = "Timed out waiting for session.closed"
 
-        audio = client.events.audio_bytes()
-        first_text_at_s = client.events.first_received_at(
-            "response.audio_transcript.delta",
+        audio = collector.audio_bytes()
+        first_text_at_s = collector.first_received_at(
+            "response.output_audio_transcript.delta",
             "response.output_text.delta",
             after_s=commit_sent_at_s,
         )
-        first_audio_at_s = client.events.first_received_at(
-            "response.audio.delta",
+        first_audio_at_s = collector.first_received_at(
+            "response.output_audio.delta",
             after_s=commit_sent_at_s,
         )
-        response_created_at_s = client.events.first_received_at(
+        response_created_at_s = collector.first_received_at(
             "response.created",
             after_s=commit_sent_at_s,
         )
-        response_done_at_s = client.events.first_received_at(
+        response_done_at_s = collector.first_received_at(
             "response.done",
             after_s=commit_sent_at_s,
         )
-        audio_duration_s = len(audio) / (client.events.output_sample_rate_hz * 2)
+        audio_duration_s = len(audio) / (collector.output_sample_rate_hz * 2)
         response_generation_s = (
             response_done_at_s - response_created_at_s
             if response_done_at_s is not None and response_created_at_s is not None
@@ -522,70 +661,83 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         )
         transcript_deltas = [
             str(event.get("delta", ""))
-            for event in client.events.events
+            for event in collector.events
             if event.get("type")
             in {
-                "response.audio_transcript.delta",
+                "response.output_audio_transcript.delta",
                 "response.output_text.delta",
             }
         ]
-        response_id = client.events.response_ids[0] if client.events.response_ids else None
-        timing = client.events.timing_summary(
+        response_id = collector.response_ids[0] if collector.response_ids else None
+        timing = collector.timing_summary(
             after_s=commit_sent_at_s,
             input_committed_at_s=commit_sent_at_s,
             response_id=response_id,
         )
-        errors = client.events.errors()
+        errors = collector.errors()
         if wait_error:
             errors.append({"type": "client.timeout", "message": wait_error})
         if close_error:
             errors.append({"type": "client.timeout", "message": close_error})
         model_decision = post_commit_decision or stream_decision
         (output_dir / "events.jsonl").write_text(
-            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in client.events.events),
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in collector.events),
             encoding="utf-8",
         )
+        (output_dir / "input_timeline.json").write_text(json.dumps(client.input_timeline, indent=2), encoding="utf-8")
         (output_dir / "output.pcm").write_bytes(audio)
         if audio:
             write_pcm16_wav(
                 output_dir / "output.wav",
                 audio,
-                sample_rate_hz=client.events.output_sample_rate_hz,
+                sample_rate_hz=collector.output_sample_rate_hz,
             )
 
         result = {
+            "validation_scope": "transport_and_lifecycle_only",
             "ok": (
-                client.events.count("session.created") > 0
-                and client.events.count("session.closed") > 0
+                collector.count("session.created") > 0
+                and collector.count("session.closed") > 0
                 and not errors
                 and model_decision is not None
                 and (bool(audio) or not args.require_audio)
             ),
             "model_decision": model_decision,
+            "input_stream_started_at_s": input_stream_started_at_s,
+            "realtime_pacing": not args.no_realtime_pacing,
+            "sampling_temperature": args.temperature,
+            "sliding_window_mode": args.sliding_window_mode,
+            "basic_window_high_tokens": args.basic_window_high_tokens,
+            "basic_window_low_tokens": args.basic_window_low_tokens,
+            "context_max_units": args.context_max_units,
+            "context_previous_max_tokens": args.context_previous_max_tokens,
+            "tail_silence_s": args.tail_silence_s,
+            "tail_video_frames_sent": tail_frames_sent,
             "post_commit": {
                 "input_committed_event_index": committed_index,
                 "decision": post_commit_decision,
                 "decision_required": wait_for_post_commit_decision,
                 "input_had_residual_model_unit": input_has_residual_model_unit,
                 "response_listen_count": _event_count_after(
-                    client.events.events,
+                    collector.events,
                     "response.listen",
                     committed_index,
                 ),
                 "response_done_count": _event_count_after(
-                    client.events.events,
+                    collector.events,
                     "response.done",
                     committed_index,
                 ),
             },
             "input_video": args.input_video,
+            "input_wav": args.input_wav,
             "video_frames_extracted": len(video_frames),
             "video_frames_sent": frames_sent,
             "video_stacked_frames_extracted": sum(frame is not None for frame in stacked_video_frames),
             "audio_bytes": len(audio),
             "audio_chunk_count": len(stream_writer.audio_chunk_paths),
             "audio_chunk_files": [str(path) for path in stream_writer.audio_chunk_paths],
-            "output_sample_rate_hz": client.events.output_sample_rate_hz,
+            "output_sample_rate_hz": collector.output_sample_rate_hz,
             "latency": {
                 "ttft_ms": (
                     round((first_text_at_s - commit_sent_at_s) * 1000, 2) if first_text_at_s is not None else None
@@ -611,7 +763,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 "measurement_origin": "input_audio_buffer.commit send",
             },
             "timing": timing,
-            "response_ids": client.events.response_ids,
+            "response_ids": collector.response_ids,
             "transcript": "".join(transcript_deltas),
             "errors": errors,
             "output_dir": str(output_dir),
@@ -627,7 +779,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://localhost:8099/v1/realtime?duplex=1")
     parser.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
-    parser.add_argument("--session-id")
     parser.add_argument(
         "--input-wav",
         help="Mono 16 kHz PCM16 clip to stream. Optional when --input-video carries the audio track.",
@@ -672,15 +823,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ref-audio",
-        required=True,
         help=(
-            "Reference WAV for the MiniCPM-o duplex assistant voice. "
-            "This demo matches the official flow by always providing a reference audio clip."
+            "Optional reference WAV for the MiniCPM-o duplex assistant voice. "
+            "The server defaults to the model-bundled assets/HT_ref_audio.wav."
         ),
     )
     parser.add_argument("--output-dir", default="/tmp/minicpmo_realtime_duplex_demo")
     parser.add_argument("--chunk-ms", type=int, default=200)
     parser.add_argument("--timeout-s", type=float, default=60.0)
+    parser.add_argument(
+        "--instructions",
+        help="Session system prompt. Omit to use the model's Streaming Omni Conversation default.",
+    )
     parser.add_argument(
         "--temperature",
         type=float,
@@ -688,8 +842,26 @@ def parse_args() -> argparse.Namespace:
         help="Stage 0 sampling temperature; omit to preserve the model default.",
     )
     parser.add_argument("--no-realtime-pacing", action="store_true")
+    parser.add_argument("--sliding-window-mode", choices=("off", "basic", "context"), default="off")
+    parser.add_argument("--basic-window-high-tokens", type=int, default=8000)
+    parser.add_argument("--basic-window-low-tokens", type=int, default=6000)
+    parser.add_argument("--context-max-units", type=int, default=24)
+    parser.add_argument("--context-previous-max-tokens", type=int, default=500)
+    parser.add_argument(
+        "--tail-silence-s",
+        type=int,
+        default=0,
+        help="Additional silent seconds holding the last frame to allow the final answer to finish.",
+    )
     parser.add_argument("--require-audio", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.tail_silence_s < 0:
+        parser.error("--tail-silence-s must be nonnegative")
+    if not 0 < args.basic_window_low_tokens < args.basic_window_high_tokens:
+        parser.error("window watermarks must satisfy 0 < low < high")
+    if args.context_max_units <= 0 or args.context_previous_max_tokens <= 0:
+        parser.error("context window limits must be positive")
+    return args
 
 
 def main() -> None:

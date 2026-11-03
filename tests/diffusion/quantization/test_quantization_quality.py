@@ -70,7 +70,7 @@ class QualityTestConfig:
     id: str  # pytest ID, e.g. "fp8_z_image"
     task: str  # "t2i" or "t2v"
     prompt: str  # generation prompt
-    max_lpips: float  # fail threshold — higher = more lenient
+    max_lpips: float | dict[str, float]  # threshold, or {"H100": 0.15, "B200": 0.17}
     model: str | None = None  # HF model name
     quantization: str | dict[str, object] | None = None  # quantization method/config, e.g. "fp8"
     baseline_model: str | None = None  # explicit BF16/local baseline path
@@ -80,11 +80,11 @@ class QualityTestConfig:
     num_inference_steps: int = 20  # keep low for CI speed
     num_frames: int = 5  # only for t2v
     seed: int = 42
-    gpu: str = "H100"  # minimum GPU requirement
     negative_prompt: str | None = ""
     guidance_scale: float | None = None
     sigmas: list[float] | None = None
     enable_cpu_offload: bool = False
+    diffusion_attention_backend: str | None = None
 
     def baseline_ref(self) -> str:
         return self.baseline_model or self.model or ""
@@ -190,7 +190,7 @@ QUALITY_CONFIGS = [
         quantization={"text_encoder": "fp8", "transformer": None, "vae": None},
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        max_lpips=0.15,
+        max_lpips={"H100": 0.15, "B200": 0.17},
         num_inference_steps=10,
         enable_cpu_offload=True,
         height=1024,
@@ -205,6 +205,21 @@ QUALITY_CONFIGS = [
         max_lpips=0.35,
         seed=142,
         num_inference_steps=20,
+    ),
+    QualityTestConfig(
+        id="fp8_sensenova_u1",
+        model=os.environ.get("SENSENOVA_U1_MODEL_PATH", "SenseNova/SenseNova-U1.5-8B-MoT"),
+        quantization="fp8",
+        task="t2i",
+        prompt="Close portrait of an elderly woman by a farmhouse window, warm natural light.",
+        # Repository image-gate default, not a SenseNova-calibrated threshold.
+        max_lpips=0.15,
+        height=1024,
+        width=1024,
+        num_inference_steps=50,
+        seed=42,
+        negative_prompt=None,
+        diffusion_attention_backend="TORCH_SDPA",
     ),
     QualityTestConfig(
         id="fp8_ltx2",
@@ -276,6 +291,15 @@ def _maybe_save_output(output_dir: Path | None, config: QualityTestConfig, label
 # ---------------------------------------------------------------------------
 
 
+def _build_omni_kwargs(config: QualityTestConfig, model: str) -> dict:
+    kwargs = {"model": model, "enforce_eager": True}
+    if config.enable_cpu_offload:
+        kwargs["enable_cpu_offload"] = True
+    if config.diffusion_attention_backend is not None:
+        kwargs["diffusion_attention_backend"] = config.diffusion_attention_backend
+    return kwargs
+
+
 def _generate_image(omni, config: QualityTestConfig):
     """Generate a single image, return (PIL.Image, peak_mem_gib)."""
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -294,6 +318,7 @@ def _generate_image(omni, config: QualityTestConfig):
         OmniDiffusionSamplingParams(
             height=config.height,
             width=config.width,
+            seed=config.seed,
             generator=generator,
             num_inference_steps=config.num_inference_steps,
             guidance_scale=config.guidance_scale,
@@ -528,12 +553,14 @@ def test_ltx_quality_gate_uses_official_eager_defaults(monkeypatch):
     assert captured.sampling.guidance_scale is None
 
 
-_marks = hardware_marks(res={"cuda": "H100"})
+_marks = hardware_marks(res={"cuda": ["H100", "B200"]})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None
 
 
 def _quality_param(c: QualityTestConfig):
     marks = list(_marks)
+    if c.id == "fp8_sensenova_u1":
+        marks = hardware_marks(res={"cuda": "H200"})
     if c.id == "fp8_qwen_image":
         marks.append(
             pytest.mark.skip(reason="Qwen-Image FP8 quality gate temporarily disabled (see CI / issue tracker).")
@@ -549,6 +576,7 @@ def _quality_param(c: QualityTestConfig):
 )
 def test_quantization_quality(config: QualityTestConfig):
     """Validate that quantized output stays within LPIPS threshold of BF16."""
+    from tests.e2e.accuracy.helpers import resolve_device_threshold
     from vllm_omni.entrypoints.omni import Omni
 
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
@@ -560,9 +588,7 @@ def test_quantization_quality(config: QualityTestConfig):
     # to 0.1291 that way in build 2954). Mirrors
     # vllm_omni/quantization/tools/compare_diffusion_trajectory_similarity.py.
     # --- BF16 baseline ---
-    bl_kwargs: dict = {"model": config.baseline_ref(), "enforce_eager": True}
-    if config.enable_cpu_offload:
-        bl_kwargs["enable_cpu_offload"] = True
+    bl_kwargs = _build_omni_kwargs(config, config.baseline_ref())
     omni_bl = Omni(**bl_kwargs)
     baseline_out, bl_mem = generate_fn(omni_bl, config)
     omni_bl.shutdown()
@@ -572,9 +598,7 @@ def test_quantization_quality(config: QualityTestConfig):
 
     # --- Quantized ---
     quantization = config.quantization_ref()
-    qt_kwargs: dict = {"model": config.quantized_ref(), "enforce_eager": True}
-    if config.enable_cpu_offload:
-        qt_kwargs["enable_cpu_offload"] = True
+    qt_kwargs = _build_omni_kwargs(config, config.quantized_ref())
     if quantization is None:
         omni_qt = Omni(**qt_kwargs)
     else:
@@ -588,8 +612,9 @@ def test_quantization_quality(config: QualityTestConfig):
     # --- Similarity metrics ---
     lpips_score = _compute_lpips(baseline_out, quant_out, config.task)
     psnr_score, mae_score = _compute_psnr_and_mae(baseline_out, quant_out, config.task)
-    assert lpips_score <= config.max_lpips, (
-        f"LPIPS {lpips_score:.4f} exceeds threshold {config.max_lpips} "
+    gpu_key, max_lpips = resolve_device_threshold(config.max_lpips, label=f"{config.id} max_lpips")
+    assert lpips_score <= max_lpips, (
+        f"LPIPS {lpips_score:.4f} exceeds threshold {max_lpips} ({gpu_key}) "
         f"for {config.quantization_ref() or 'pre-quantized checkpoint'} on {config.quantized_ref()}"
     )
 
@@ -601,12 +626,12 @@ def test_quantization_quality(config: QualityTestConfig):
     print(f"  Baseline:      {config.baseline_ref()}")
     print(f"  Quantized:     {config.quantized_ref()}")
     print(f"  Method:        {config.quantization_ref() or 'pre-quantized checkpoint'}")
-    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {config.max_lpips})")
+    print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {max_lpips}, gpu: {gpu_key})")
     print(f"  PSNR:          {psnr_score:.4f} dB  (higher is better)")
     print(f"  MAE:           {mae_score:.6f}  (lower is better)")
     print(f"  BF16 memory:   {bl_mem:.2f} GiB")
     print(f"  Quant memory:  {qt_mem:.2f} GiB  ({mem_reduction:.0f}% reduction)")
-    print(f"  Result:        {'PASS' if lpips_score <= config.max_lpips else 'FAIL'}")
+    print(f"  Result:        {'PASS' if lpips_score <= max_lpips else 'FAIL'}")
     print(f"{'=' * 60}\n")
 
     assert np.isfinite(psnr_score) or np.isinf(psnr_score), f"PSNR is invalid for {config.id}: {psnr_score}"

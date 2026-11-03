@@ -155,9 +155,10 @@ class TestPipelineArgumentsHandling:
         )
         return adapter
 
-    def test_explicit_unbound_backend_is_rejected(self):
+    @pytest.mark.parametrize("backend", ["CUDNN_ATTN", "FLASHINFER_ATTN", "TRTLLM_ATTN", "SPARGE_ATTN"])
+    def test_explicit_unbound_backend_is_rejected(self, backend):
         calls: list[str] = []
-        adapter = self._make_adapter("CUDNN_ATTN", calls.append)
+        adapter = self._make_adapter(backend, calls.append)
 
         with pytest.raises(ValueError, match="do not provide a binding"):
             adapter._set_attention_backend()
@@ -224,6 +225,7 @@ class TestPipelineArgumentsHandling:
     @pytest.mark.parametrize(
         "feature_id",
         [
+            "compact_offload",
             "cfg_parallel",
             "tensor_parallel",
             "ulysses",
@@ -235,7 +237,11 @@ class TestPipelineArgumentsHandling:
         ],
     )
     def test_adapter_guard_unsupported_feature(self, feature_id):
-        if feature_id == "cfg_parallel":
+        if feature_id == "compact_offload":
+            od_config = _make_od_config(
+                diffusion_offload_config={"mode": "module", "components": ["dit"]},
+            )
+        elif feature_id == "cfg_parallel":
             od_config = _make_od_config(
                 parallel_config=DiffusionParallelConfig(cfg_parallel_size=2, sequence_parallel_size=1),
                 cache_backend="none",
