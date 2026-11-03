@@ -35,7 +35,7 @@ from starlette.datastructures import State
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
-from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
+from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata, validate_cache_salt
 from vllm.entrypoints.launchers.cli_args import make_arg_parser
 from vllm.entrypoints.launchers.launcher import serve_http
 from vllm.entrypoints.launchers.utils.server_utils import get_uvicorn_log_config
@@ -79,6 +79,7 @@ from vllm.entrypoints.speech_to_text.transcription.serving import (
 from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import configure_logging_from_args, init_logger
 from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -2506,6 +2507,16 @@ async def edit_images(
 
     # 1. get engine and model
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
+    # FastAPI normalizes an empty optional Form string to None. Reject the
+    # explicit empty salt before it silently enters the unsalted cache domain.
+    if cache_salt is None and (await raw_request.form()).get("cache_salt") == "":
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value, detail="cache_salt must be non-empty when provided"
+        )
+    try:
+        validate_cache_salt(cache_salt)
+    except VLLMValidationError as exc:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model == "auto":
         model = None

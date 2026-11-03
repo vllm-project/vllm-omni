@@ -685,6 +685,23 @@ def test_image_endpoints_forward_cache_salt(request, client_fixture):
     assert client.app.state.engine_client.captured_prompt["cache_salt"] == "tenant-b"
 
 
+@pytest.mark.parametrize("client_fixture", ["test_client", "async_omni_test_client"])
+@pytest.mark.parametrize("salt", ["", "tenant/invalid", "a" * 129])
+def test_image_endpoints_reject_invalid_cache_salt(request, client_fixture, salt):
+    client = request.getfixturevalue(client_fixture)
+    response = client.post("/v1/images/generations", json={"prompt": "a cat", "cache_salt": salt, "size": "64x64"})
+    assert response.status_code == 422
+
+    image = io.BytesIO()
+    Image.new("RGB", (64, 64), color="blue").save(image, format="PNG")
+    response = client.post(
+        "/v1/images/edits",
+        data={"prompt": "a cat", "cache_salt": salt, "size": "64x64"},
+        files={"image": ("reference.png", image.getvalue(), "image/png")},
+    )
+    assert response.status_code == 400
+
+
 def test_generate_single_image(test_client):
     """Test generating a single image"""
     # Single-stage path should not require openai_serving_chat.

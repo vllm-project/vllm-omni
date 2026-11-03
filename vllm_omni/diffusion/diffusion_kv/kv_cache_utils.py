@@ -93,6 +93,8 @@ def get_cache_namespace(
         raise ValueError("Model cache namespace must be non-empty")
     if cache_salt is not None and not isinstance(cache_salt, str):
         raise TypeError("cache_salt must be a string or None")
+    if cache_salt == "":
+        raise ValueError("cache_salt must be non-empty when provided")
     lora = sampling.lora_request
     adapter = None if lora is None else (lora.lora_int_id, float(sampling.lora_scale))
     identity: tuple[object, ...] = ("diffusion-prefix-identity-v2", model_namespace, adapter)

@@ -82,6 +82,8 @@ def test_cache_salt_isolates_the_entire_prefix_namespace():
     assert first != get_cache_namespace("qwen-image-21", sampling)
     with pytest.raises(TypeError, match="cache_salt"):
         get_cache_namespace("qwen-image-21", sampling, cache_salt=123)
+    with pytest.raises(ValueError, match="non-empty"):
+        get_cache_namespace("qwen-image-21", sampling, cache_salt="")
 
 
 @pytest.mark.parametrize(("adapter_id", "scale"), [(None, 1.0), (2, 0.5), (1, 1.0)])
