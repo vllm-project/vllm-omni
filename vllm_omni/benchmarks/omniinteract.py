@@ -19,11 +19,12 @@ import subprocess
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urljoin, urlsplit
+from uuid import uuid4
 
 import pybase64 as base64
 
@@ -499,19 +500,46 @@ def _error_code(event: dict[str, object]) -> str | None:
     return code if isinstance(code, str) else None
 
 
+def _error_related_ids(event: dict[str, object]) -> tuple[str, ...]:
+    ids: list[str] = []
+    for key in ("related_event_id", "event_id"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            ids.append(value)
+    error = event.get("error")
+    if isinstance(error, dict):
+        for key in ("event_id", "related_event_id"):
+            value = error.get(key)
+            if isinstance(value, str) and value:
+                ids.append(value)
+    return tuple(ids)
+
+
+def _correlates_to_request(event: dict[str, object], request_event_ids: Collection[str]) -> bool:
+    return any(event_id in request_event_ids for event_id in _error_related_ids(event))
+
+
 def _raise_if_session_terminated(
     collector: EventCollector,
     from_index: int,
     *,
     explicit_close_from: int | None = None,
     warnings: list[str] | None = None,
+    tolerated_related_event_ids: Collection[str] = (),
 ) -> None:
     errors = collector.errors()
-    fatal = [event for event in errors if _error_code(event) not in _TOLERATED_ERROR_CODES]
+    fatal = [
+        event
+        for event in errors
+        if _error_code(event) not in _TOLERATED_ERROR_CODES
+        and not _correlates_to_request(event, tolerated_related_event_ids)
+    ]
     if fatal:
         raise RuntimeError(str(fatal[-1]))
     if warnings is not None:
         for event in errors:
+            if _correlates_to_request(event, tolerated_related_event_ids):
+                continue
             warning = f"tolerated in-flight server rejection: {_error_code(event)}"
             if warning not in warnings:
                 warnings.append(warning)
@@ -1068,8 +1096,13 @@ class _RealtimeSession:
             raise ConnectionError("Realtime session failed") from error
         raise ConnectionError("Realtime session closed before the requested event arrived")
 
-    async def get_session_stats(self, *, timeout_s: float = 5.0) -> dict[str, object]:
-        return await self._client.get_session_stats(timeout_s=timeout_s)
+    async def get_session_stats(
+        self,
+        *,
+        timeout_s: float = 5.0,
+        event_id: str | None = None,
+    ) -> dict[str, object]:
+        return await self._client.get_session_stats(timeout_s=timeout_s, event_id=event_id)
 
     async def close_session(self, *, timeout_s: float = 20.0) -> None:
         await self._client.close(timeout_s=timeout_s)
@@ -1263,11 +1296,13 @@ async def run_omniinteract_case(
                 await playback.acknowledge(client, playback.end_s)
                 _raise_if_session_terminated(client.events, session_from, warnings=playback.warnings)
                 session_stats: dict[str, object] | None = None
+                stats_event_id: str | None = None
                 if _session_capabilities(client).get("supports_session_stats") is True:
                     from vllm_omni.clients.duplex import DuplexClientError
 
+                    stats_event_id = f"evt_{uuid4().hex}"
                     try:
-                        fetched = await client.get_session_stats(timeout_s=5.0)
+                        fetched = await client.get_session_stats(timeout_s=5.0, event_id=stats_event_id)
                     except (asyncio.TimeoutError, DuplexClientError) as exc:
                         logger.warning("OmniInteract session stats unavailable: %s", exc)
                     else:
@@ -1283,6 +1318,7 @@ async def run_omniinteract_case(
                 session_from,
                 explicit_close_from=close_from,
                 warnings=playback.warnings,
+                tolerated_related_event_ids=() if stats_event_id is None else (stats_event_id,),
             )
             result.latency_s = time.monotonic() - started_at
             result.input_audio_chunks, result.input_video_frames = chunks, frame_count

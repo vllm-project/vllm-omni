@@ -246,6 +246,19 @@ async def test_realtime_client_get_session_stats_times_out():
 
 
 @pytest.mark.asyncio
+async def test_realtime_client_get_session_stats_send_times_out():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            await asyncio.Event().wait()
+
+    client = Client("ws://unused")
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError, match="sending session.stats"):
+        await client.get_session_stats(timeout_s=0.05)
+    assert asyncio.get_running_loop().time() - started < 1.0
+
+
+@pytest.mark.asyncio
 async def test_realtime_client_configure_sends_seed_tts_text_condition():
     class Client(RealtimeDuplexClient):
         def __init__(self):

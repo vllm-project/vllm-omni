@@ -256,30 +256,45 @@ class RealtimeDuplexClient:
         except ConnectionClosed:
             return
 
-    async def get_session_stats(self, *, timeout_s: float = 10.0) -> dict[str, object]:
+    async def get_session_stats(
+        self,
+        *,
+        timeout_s: float = 10.0,
+        event_id: str | None = None,
+    ) -> dict[str, object]:
         """Fetch the server's per-turn stage work and audio (``session.stats``, RFC #8325)."""
-        event_id = f"evt_{uuid4().hex}"
+        request_id = event_id or f"evt_{uuid4().hex}"
         from_index = len(self.events.events)
-        await self.send({"type": "session.stats.get", "event_id": event_id})
+        deadline = time.monotonic() + timeout_s
+        try:
+            await asyncio.wait_for(
+                self.send({"type": "session.stats.get", "event_id": request_id}),
+                timeout=timeout_s,
+            )
+        except TimeoutError as exc:
+            raise TimeoutError("Timed out sending session.stats.get") from exc
 
         def arrived() -> bool:
             for event in self.events.events[from_index:]:
-                if event.get("type") == "session.stats" and event.get("request_event_id") == event_id:
+                if event.get("type") == "session.stats" and event.get("request_event_id") == request_id:
                     return True
                 if event.get("type") == "error" and (
-                    event.get("event_id") == event_id or event.get("related_event_id") == event_id
+                    event.get("event_id") == request_id or event.get("related_event_id") == request_id
                 ):
                     return True
             self.raise_if_reader_stopped()
             return False
 
-        await wait_for(arrived, timeout_s=timeout_s, label="session.stats")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timed out sending session.stats.get")
+        await wait_for(arrived, timeout_s=remaining, label="session.stats")
         for event in self.events.events[from_index:]:
-            if event.get("type") == "session.stats" and event.get("request_event_id") == event_id:
+            if event.get("type") == "session.stats" and event.get("request_event_id") == request_id:
                 stats = event.get("stats")
                 return stats if isinstance(stats, dict) else {}
             if event.get("type") == "error" and (
-                event.get("event_id") == event_id or event.get("related_event_id") == event_id
+                event.get("event_id") == request_id or event.get("related_event_id") == request_id
             ):
                 raise ConnectionError(_session_stats_error_message(event))
         return {}
