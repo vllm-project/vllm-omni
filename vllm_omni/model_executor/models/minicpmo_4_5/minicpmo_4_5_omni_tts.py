@@ -199,6 +199,8 @@ class _KStepPendingRow(NamedTuple):
     stop_slot: int
     row_stop: torch.Tensor
     flag_true: torch.Tensor
+
+
 #: Bits of the per-codec-id class table (``_codec_classes``).
 _CODEC_CLASS_SILENT = 1
 _CODEC_CLASS_QUIET = 2
@@ -2924,9 +2926,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codec_state.release(request_id)
         pending = getattr(self, "_kstep_pending_packed", None)
         if pending:
-            self._kstep_pending_packed = [
-                item for item in pending if item.request_id not in self._deferred_cleanup_ids
-            ]
+            self._kstep_pending_packed = [item for item in pending if item.request_id not in self._deferred_cleanup_ids]
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(
