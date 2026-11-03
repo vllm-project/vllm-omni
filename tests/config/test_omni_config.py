@@ -1119,6 +1119,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "runtime_config",
         "parallel_config",
         "compilation_config",
+        "kernel_config",
         "profiler_config",
         "quantization_config",
         # Stage-level speculative_config is passed straight through to the
@@ -2633,3 +2634,34 @@ def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
     assert structured.model_config.recompute_preemption == expected
     if execution_type is not StageExecutionType.LLM_AR:
         assert "recompute_preemption" not in legacy.yaml_engine_args
+
+
+def test_kernel_config_mapping_has_a_typed_owner_and_projects_to_engine_args():
+    from vllm.config import KernelConfig
+
+    from vllm_omni.engine.stage_init_utils import _project_omni_stage_engine_args
+
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    deploy = DeployConfig(
+        stages=[
+            StageDeployConfig(
+                stage_id=0,
+                engine_extras={"kernel_config": {"ir_op_priority": {"rms_norm": ["vllm_c", "native"]}}},
+            )
+        ]
+    )
+    stage_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+
+    assert isinstance(stage_config.kernel_config, KernelConfig)
+    assert stage_config.kernel_config.ir_op_priority.rms_norm == ["vllm_c", "native"]
+    projected = _project_omni_stage_engine_args(stage_config)
+    assert projected["kernel_config"] == stage_config.kernel_config
+    assert projected["kernel_config"] is not stage_config.kernel_config
+
+
+def test_kernel_config_mapping_rejects_unknown_upstream_fields():
+    with pytest.raises(ValidationError):
+        VllmOmniARStageConfig(
+            stage_pipeline_config=_resolve_pipeline_or_skip("qwen3_tts").stages[0],
+            kernel_config={"unknown_kernel_option": True},
+        )
