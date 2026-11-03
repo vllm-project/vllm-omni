@@ -1017,6 +1017,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # rows, never its sample. The placeholder belongs to the last
                 # step in flight, so release it once nothing is in flight.
                 generated_token_ids = []
+                if request.num_in_flight_tokens < 0:
+                    logger.warning(
+                        "MiniCPM-o request %s: negative in-flight token count %d",
+                        request.request_id,
+                        request.num_in_flight_tokens,
+                    )
                 if request.num_in_flight_tokens <= 0:
                     request.num_output_placeholders = 0
 
@@ -2117,8 +2123,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not request.is_finished() and (
             request.num_computed_tokens < request.num_tokens or request.num_in_flight_tokens > 0
         ):
-            # A recompute after preemption has not returned the final token;
-            # the terminal forward itself is always scheduled alone.
+            # A recompute has not returned the final token. Outputs arrive in
+            # schedule order and _hold_minicpmo45_terminal_steps books nothing
+            # after the step that reaches it, so that step's output comes last.
             return False
         self._minicpmo45_terminal_rows.pop(request.request_id, None)
         if request.is_finished():

@@ -129,3 +129,21 @@ def test_overlapping_recompute_chunks_after_preemption(monkeypatch):
     assert request.output_token_ids == [11, 12]
     assert request.num_output_placeholders == 0
     assert request.request_id not in scheduler._minicpmo45_terminal_rows
+
+
+def test_negative_in_flight_count_is_logged(monkeypatch):
+    scheduler, request, _ = _cancellable(monkeypatch)
+    scheduler._free_request_blocks = lambda req: None
+    scheduler._inflight_prefills = set()
+    scheduler.log_stats = False
+    warnings = []
+    monkeypatch.setattr(ar_sched_mod.logger, "warning", lambda *args, **kwargs: warnings.append(args))
+    _step(scheduler, request, [], [12])
+    _book_terminal_forward(scheduler, request)
+    # An accounting bug elsewhere leaves the counter one short.
+    request.num_in_flight_tokens -= 1
+
+    _deliver(scheduler, request, 1, [999], _rows([12], 3))
+    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert request.num_output_placeholders == 0
+    assert [w[1] for w in warnings if "negative" in w[0]] == [request.request_id]
