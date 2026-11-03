@@ -726,6 +726,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # The table is built for ``max_num_batched_tokens`` worth of rows
             # and its last entry carries forward; clamp so a batch larger than
             # the table cannot index past it.
+            assert dynamic_lookup is not None  # narrowed by dynamic_cuda
             batch_index = min(len(num_scheduled_tokens), len(dynamic_lookup) - 1)
             target = int(dynamic_lookup[batch_index])
             max_drafts = int(getattr(self, "num_spec_tokens", 0) or 0)

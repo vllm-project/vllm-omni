@@ -89,17 +89,27 @@ def test_cpu_device_always_runs_eager_without_capture():
     assert step.inputs_embeds.device.type == "cpu"
 
     calls = []
-    out = step.run_model(lambda: (calls.append(1), state.embeds.clone())[1])
+
+    def forward_once():
+        calls.append(1)
+        return state.embeds.clone()
+
+    out = step.run_model(forward_once)
     assert step.eager_calls == 1
     assert step.captures == 0 and step.replays == 0
     assert torch.equal(out, state.embeds)
     assert len(calls) == 1
 
     snapped = []
+
+    def snapshot_once():
+        snapped.append(1)
+        return {}
+
     out = step.run_fused(
-        lambda: (calls.append(1), state.embeds.clone())[1],
+        forward_once,
         state_key="t",
-        snapshot=lambda: (snapped.append(1), {})[1],
+        snapshot=snapshot_once,
         restore=lambda saved: None,
     )
     assert step.eager_calls == 2
