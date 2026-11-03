@@ -534,6 +534,8 @@ source_file_dependencies:
     - tests/worker_v2/
 
   tts_qwen3_tts_function:
+    - .buildkite/amd/scripts/run-rocm-full-model-nightly.sh
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
     - *qwen3_tts
     - tests/e2e/features/prefill_phase/
     - tests/e2e/offline_inference/test_qwen3_tts_base.py
