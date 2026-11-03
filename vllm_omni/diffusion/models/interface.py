@@ -14,6 +14,8 @@ from typing import (
     runtime_checkable,
 )
 
+from vllm_omni.config.stage_config import DiffusionStage, DiffusionStageRole, resolve_diffusion_stage_role
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -170,28 +172,34 @@ def supports_step_execution(pipeline: object) -> bool:
 
 # --- Generic role-based component loading for diffusion disaggregation ---------
 
-# Which component groups (as declared by ``SupportsComponentDiscovery``) each
-# diffusion stage role needs to load. ``encoder`` = text/image encoders,
-# ``dit`` = denoising transformer(s), ``vae`` = VAE. A stage skips loading every
-# group not listed for its role, which is what frees memory on disaggregated
-# workers (e.g. an ENCODE stage drops the DiT + VAE). This mapping is
-# model-agnostic: any pipeline that implements ``SupportsComponentDiscovery``
-# becomes role-splittable without model-specific ``if`` branches.
-_ROLE_COMPONENT_GROUPS: dict[str, frozenset[str]] = {
-    "full": frozenset({"encoder", "dit", "vae"}),
-    "encode": frozenset({"encoder"}),
-    "denoise": frozenset({"dit"}),
-    "denoise_decode": frozenset({"dit", "vae"}),
-    "decode": frozenset({"vae"}),
+# These are the canonical component declarations from SupportsComponentDiscovery;
+# stage roles only select among them and do not maintain a second module list.
+_COMPONENT_MODULE_ATTRIBUTES: dict[str, str] = {
+    "encoder": "_encoder_modules",
+    "dit": "_dit_modules",
+    "vae": "_vae_modules",
+}
+
+_STAGE_COMPONENT_ATTRIBUTES: dict[DiffusionStage, str] = {
+    DiffusionStage.ENCODE: "_encoder_modules",
+    DiffusionStage.DENOISE: "_dit_modules",
+    DiffusionStage.DECODE: "_vae_modules",
 }
 
 
-def stage_component_groups(role: str) -> frozenset[str]:
+def stage_component_attributes(role: DiffusionStageRole | str) -> frozenset[str]:
+    """Return ``SupportsComponentDiscovery`` attributes required by a role."""
+    resolved_role = resolve_diffusion_stage_role(role)
+    return frozenset(_STAGE_COMPONENT_ATTRIBUTES[stage] for stage in resolved_role.stages)
+
+
+def stage_component_groups(role: DiffusionStageRole | str) -> frozenset[str]:
     """Return the component groups (``encoder``/``dit``/``vae``) a role loads."""
-    return _ROLE_COMPONENT_GROUPS.get(role, _ROLE_COMPONENT_GROUPS["full"])
+    attributes = stage_component_attributes(role)
+    return frozenset(group for group, attribute in _COMPONENT_MODULE_ATTRIBUTES.items() if attribute in attributes)
 
 
-def role_loads_component(role: str, group: Literal["encoder", "dit", "vae"]) -> bool:
+def role_loads_component(role: DiffusionStageRole | str, group: Literal["encoder", "dit", "vae"]) -> bool:
     """Whether a diffusion stage ``role`` should load the given component group.
 
     Use inside a pipeline ``__init__`` to decide, model-agnostically, whether to
@@ -202,7 +210,7 @@ def role_loads_component(role: str, group: Literal["encoder", "dit", "vae"]) -> 
         if role_loads_component(role, "vae"):
             self.vae = ...
     """
-    return group in stage_component_groups(role)
+    return _COMPONENT_MODULE_ATTRIBUTES[group] in stage_component_attributes(role)
 
 
 @runtime_checkable

@@ -29,6 +29,15 @@ class DistributedAutoencoderKLQwenImage21(AutoencoderKLQwenImage21, DistributedV
         model.init_distributed()
         return model
 
+    def retain_stage_components(self, *, encode: bool) -> None:
+        """Keep the VAE half needed by this stage before device placement."""
+        removed = "decoder" if encode else "encoder"
+        projection = "post_quant_conv" if encode else "quant_conv"
+        setattr(self, removed, None)
+        setattr(self, projection, None)
+        self._cached_conv_counts[removed] = 0
+        self.clear_cache()
+
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         # mostly copy from AutoencoderKLQwenImage21.tiled_decode
         _, _, num_frames, height, width = z.shape

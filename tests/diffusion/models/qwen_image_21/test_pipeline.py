@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from PIL import Image
 from torch import nn
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -16,6 +17,9 @@ from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
     QwenImage21Pipeline,
     get_qwen_image_21_post_process_func,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -28,6 +32,85 @@ def _toy_pipeline() -> QwenImage21Pipeline:
     pipeline.vae_scale_factor = 16
     pipeline.latent_channels = 4
     return pipeline
+
+
+@pytest.mark.parametrize("image_count", [0, 1, 2])
+@pytest.mark.parametrize("use_cfg", [False, True])
+@pytest.mark.parametrize("num_outputs", [1, 2])
+def test_encode_batch_preserves_encoder_batch_and_request_conditioning(mocker, image_count, use_cfg, num_outputs):
+    pipeline = _toy_pipeline()
+    pipeline.device = torch.device("cpu")
+    pipeline._max_length = 4096
+    sizes = [(32, 32), (64, 32)][:image_count]
+    requests = []
+    for index, name in enumerate(("first", "second")):
+        requests.append(
+            OmniDiffusionRequest(
+                request_id=name,
+                prompt={
+                    "prompt": name,
+                    "negative_prompt": f"negative-{name}" if use_cfg else None,
+                    "additional_information": {
+                        "prompt_image": [Image.new("RGB", size) for size in sizes],
+                        "vae_images": [
+                            torch.full((1, 4, 1, height // 16, width // 16), float(10 * index + slot))
+                            for slot, (width, height) in enumerate(sizes)
+                        ],
+                        "input_image_sizes": sizes,
+                    },
+                },
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=64,
+                    width=96,
+                    true_cfg_scale=3.0 if use_cfg else 1.0,
+                    num_outputs_per_prompt=num_outputs,
+                    generator=[torch.Generator().manual_seed(index + n) for n in range(num_outputs)],
+                ),
+            )
+        )
+
+    def encode_prompt(*, prompt, images_per_prompt, **kwargs):
+        # A singleton encoder call would change both batching and row identity.
+        assert prompt in (["first", "second"], ["negative-first", "negative-second"])
+        if image_count:
+            assert [len(images) for images in images_per_prompt] == [image_count, image_count]
+        else:
+            assert images_per_prompt is None
+        embeds = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+        mask = torch.tensor([[1, 1, 0], [1, 1, 1]])
+        image_mask = torch.tensor([[True, False, False], [False, True, False]])
+        return embeds, mask, image_mask
+
+    encoder = mocker.patch.object(pipeline, "encode_prompt", side_effect=encode_prompt)
+    outputs = pipeline.encode_batch(DiffusionRequestBatch(requests=requests))
+
+    assert encoder.call_count == (2 if use_cfg else 1)
+    assert len(outputs) == 2
+    for index, output in enumerate(outputs):
+        payload = output.custom_output
+        conditioning = pipeline._stage_conditioning(payload)
+        assert conditioning["prompt_embeds"].shape == (1, 3, 4)
+        torch.testing.assert_close(
+            conditioning["prompt_embeds"], torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)[index : index + 1]
+        )
+        assert conditioning["prompt_embeds_mask"].tolist() == ([[1, 1, 0]] if index == 0 else [[1, 1, 1]])
+        assert conditioning["image_pad_mask"].tolist() == (
+            [[True, False, False]] if index == 0 else [[False, True, False]]
+        )
+        if use_cfg:
+            torch.testing.assert_close(conditioning["negative_prompt_embeds"], conditioning["prompt_embeds"])
+            assert conditioning["negative_prompt_embeds_mask"].tolist() == conditioning["prompt_embeds_mask"].tolist()
+            assert conditioning["negative_image_pad_mask"].tolist() == conditioning["image_pad_mask"].tolist()
+        else:
+            assert conditioning["negative_prompt_embeds"] is None
+        if image_count:
+            for slot, (width, height) in enumerate(sizes):
+                image = conditioning["image_latents"][slot]
+                assert image.shape == (1, 4, 1, height // 16, width // 16)
+                assert torch.all(image == 10 * index + slot)
+        else:
+            assert conditioning["image_latents"] is None
+        assert payload["qwen_image_21_metadata"] == {"height": 64, "width": 96, "input_image_sizes": sizes}
 
 
 # ---------------------------------------------------------------------------

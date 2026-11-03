@@ -372,6 +372,68 @@ class TestBatchSplitDelivery:
         assert executor._batch_split_map == {}
         assert executor._completed_outputs == {}
 
+    def test_output_ready_during_unpack_is_split_after_map_registration(self, mocker):
+        """The pump must re-check the split map after SHM unpack.
+
+        ``execute_batch`` can register the map while the result pump is
+        unpacking the worker's batch output. The old ordering claimed the map
+        first, then cached the whole batch and left every per-request waiter
+        pending.
+        """
+        executor = _make_executor()
+        req_ids = ["r0", "r1"]
+        batch_id = "batch-unpack-race"
+        outputs = {rid: DiffusionOutput(output=f"img-{rid}") for rid in req_ids}
+        ready = AsyncDiffusionOutput(
+            kind=AsyncOutputKind.OUTPUT_READY,
+            async_output_id=batch_id,
+            output=_FakeBatchOutput(outputs),
+        )
+        unpack_started = threading.Event()
+        release_unpack = threading.Event()
+
+        def blocked_unpack(_output):
+            unpack_started.set()
+            assert release_unpack.wait(timeout=2.0)
+
+        mocker.patch(
+            "vllm_omni.diffusion.executor.multiproc_executor.unpack_diffusion_output_shm",
+            side_effect=blocked_unpack,
+        )
+        messages = queue.Queue()
+
+        def dequeue(timeout=None):
+            try:
+                return messages.get(timeout=timeout)
+            except queue.Empty as exc:
+                raise TimeoutError from exc
+
+        executor._result_mq.dequeue = dequeue
+        pump = threading.Thread(target=executor._result_pump, args=(executor._result_mq,), daemon=True)
+        pump.start()
+        messages.put(ready)
+        assert unpack_started.wait(timeout=1.0)
+
+        executor.od_config.parallel_config.data_parallel_size = 1
+        executor.od_config.enable_distributed_layerwise_offload = False
+        executor._ensure_open = lambda: None
+        executor.collective_rpc = lambda *args, **kwargs: AsyncDiffusionOutput(
+            kind=AsyncOutputKind.COMPUTE_DONE,
+            rpc_id="1",
+            async_output_id=batch_id,
+        )
+        executor.execute_batch(_make_scheduler_output(req_ids))
+        release_unpack.set()
+        try:
+            for rid in req_ids:
+                fut = executor.wait_output_ready(f"{batch_id}/{rid}")
+                assert fut.result(timeout=1.0) is outputs[rid]
+        finally:
+            executor._pump_stop.set()
+            pump.join(timeout=2.0)
+        assert executor._batch_split_map == {}
+        assert executor._completed_outputs == {}
+
     def test_engine_waiter_before_output_is_resolved(self):
         """Consumers already blocked in wait_output_ready must be woken."""
         executor = _make_executor()

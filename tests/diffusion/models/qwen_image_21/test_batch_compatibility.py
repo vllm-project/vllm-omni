@@ -138,6 +138,19 @@ def test_preprocess_normalizes_tuple_images_like_a_list(preprocess):
     assert len(info["input_image_sizes"]) == 1
 
 
+def test_preprocess_accepts_multistage_single_image_alias(preprocess):
+    request = make_request("img2img", [])
+    image = Image.new("RGB", (64, 64), "red")
+    request.prompt["multi_modal_data"] = {"img2img": image}
+
+    processed = preprocess(request)
+
+    info = processed.prompt["additional_information"]
+    assert len(info["prompt_image"]) == 1
+    assert len(info["vae_images"]) == 1
+    assert len(info["input_image_sizes"]) == 1
+
+
 def test_preprocess_rejects_more_images_than_the_model_supports(preprocess):
     from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
         MAX_QWEN_IMAGE_21_INPUT_IMAGES,

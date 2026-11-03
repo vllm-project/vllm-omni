@@ -199,6 +199,30 @@ Start the server:
 vllm serve Qwen/Qwen-Image-2.1 --omni --port 8091
 ```
 
+### Separate encoder, generator, and decoder workers
+
+The opt-in deployment files select two or three diffusion workers:
+
+| Deployment | Workers | Components |
+| --- | --- | --- |
+| `vllm_omni/deploy/qwen_image_21_eg.yaml` | 2 | Qwen3-VL + VAE encoder → DiT + VAE decoder |
+| `vllm_omni/deploy/qwen_image_21_egd.yaml` | 3 | Qwen3-VL + VAE encoder → DiT → VAE decoder |
+
+```bash
+vllm serve Qwen/Qwen-Image-2.1 --omni \
+  --deploy-config vllm_omni/deploy/qwen_image_21_eg.yaml --port 8091
+```
+
+The encoder emits prompt embeddings, attention/image masks, and normalized
+condition-image latents. The generator consumes these values and samples the
+target noise using the request's seed and sampling schedule. Geometry remains
+inline for downstream scheduling; tensors use the shared-memory connector.
+The generator's step mode reuses the existing per-request scheduler and prefix
+KV cache. Encoder and decoder workers execute once per request in either mode.
+
+These deployment paths have not yet been validated with model weights on
+accelerator hardware.
+
 To enable the step-wise runtime:
 
 ```bash
@@ -282,6 +306,17 @@ For image-conditioned generation, pass condition images through the
 OpenAI-compatible multimodal endpoint (`/v1/chat/completions` with
 `image_url` content parts, or `/v1/images/edits`), same as
 [`Qwen-Image-Edit.md`](./Qwen-Image-Edit.md).
+
+The Qwen-Image 2.1 preprocessor accepts condition images under either
+`multi_modal_data["image"]` or `multi_modal_data["img2img"]`. The latter is
+the single-reference form used by the multistage OpenAI image-edit path;
+both forms must produce the same VLM and VAE conditioning before stage handoff.
+
+An ENCODE operation encodes compatible requests together using the native
+batch conditioning path, then splits embeddings, masks and each condition-image
+latent into one payload per request. Sequence padding is retained in those
+payloads. BF16 encoding can depend on batch shape, so output comparisons should
+use the same encoder batches as the full pipeline.
 
 ## Parameters
 
