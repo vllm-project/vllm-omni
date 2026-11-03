@@ -617,19 +617,35 @@ def _segment_mean_flat(query, key, value, cu_seqlens):
     return out
 
 
+class _MaskCapableBackend:
+    """Backend stand-in advertising dense-mask support."""
+
+    @classmethod
+    def supports_attention_mask(cls, attention_spec=None):
+        return True
+
+
 class _PackedAttentionStub:
     """Attention stand-in exposing the ``forward_packed`` entry point.
 
     ``varlen`` applies the per-document semantics directly (the single-kernel
     route); ``bucketed`` delegates to the production dense fallback so the
-    model's packing works unchanged on backends without packed varlen support.
+    model's packing works unchanged on backends without packed varlen support;
+    ``masked`` advertises a mask-capable dense backend, which the packed entry
+    point fuses by image length behind a text-padding mask.
     """
 
     def __init__(self, mode: str):
-        assert mode in ("varlen", "bucketed")
+        assert mode in ("varlen", "bucketed", "masked")
         self.mode = mode
         self.calls: list[dict] = []
         self.dense_shapes: list[tuple] = []
+        self.dense_calls: list[dict] = []
+        # Mirrors ``Attention.attn_backend``: only the masked stand-in has a
+        # backend that can consume a dense mask; ``None`` keeps the bucketed
+        # path even though this stub exposes ``forward``.
+        self.attn_backend = _MaskCapableBackend if mode == "masked" else None
+        self.attn_spec = None
 
     def __call__(self, query, key, value, attn_metadata):
         # Mirror the metadata-keyed dispatch at the top of ``Attention.forward``
@@ -638,6 +654,36 @@ class _PackedAttentionStub:
         if attn_metadata.extra.get(MIXFUSION_PLAN_KEY) is not None:
             return run_mixfusion_packed_attention(self, query, key, value, attn_metadata)
         raise AssertionError("stub reached without a mixfusion plan")
+
+    def supports_multi_doc_packed_varlen(self, kv_cache_dtype=None):
+        return self.mode == "varlen"
+
+    def forward(self, query, key, value, attn_metadata):
+        """Dense forward used by the masked grouping path.
+
+        Same per-document semantics as ``_segment_mean_flat``; the mask is
+        applied to the K/V mean so padded tokens cannot influence real rows.
+        """
+        mask = attn_metadata.attn_mask
+        self.dense_calls.append(
+            {
+                "query": query,
+                "key": key,
+                "value": value,
+                "mask": mask,
+                "shape": tuple(query.shape),
+            }
+        )
+        self.dense_shapes.append(tuple(query.shape))
+        if mask is None:
+            return query + key.mean(dim=1, keepdim=True) + value.mean(dim=1, keepdim=True)
+        weights = mask.to(query.dtype)[:, :, None, None]
+        denominator = weights.sum(dim=1, keepdim=True)
+        return (
+            query
+            + (key * weights).sum(dim=1, keepdim=True) / denominator
+            + (value * weights).sum(dim=1, keepdim=True) / denominator
+        )
 
     def forward_packed(self, query, key, value, *, cu_seqlens, max_seqlen):
         self.calls.append(
@@ -834,3 +880,91 @@ def test_forward_mixfusion_bucketed_fallback_matches_the_varlen_result():
 
     _assert_rope_matches_eager_dtype_contract(rope)
     _assert_output_shapes(img_out, txt_out)
+
+
+# Three requests share one image shape (two chunks) but differ in text length.
+# A mask-capable dense backend must fuse them into one masked forward instead
+# of one forward per distinct packed length.
+THREE_TXT_LENS = [3, 5, 2]
+THREE_TEXT_PADDED = 5
+THREE_CHUNK_SIZE = 4
+THREE_CHUNKS_PER_REQUEST = 2
+THREE_CHUNK_RANGES = [(0, 2), (2, 4), (4, 6)]
+THREE_NUM_CHUNKS = 6
+
+
+def _mixfusion_inputs_three():
+    gen = torch.Generator().manual_seed(2027)
+    image_chunks = torch.randn(THREE_NUM_CHUNKS, THREE_CHUNK_SIZE, QKV_DIM, generator=gen).to(torch.bfloat16)
+    encoder_hidden_states = torch.randn(3, THREE_TEXT_PADDED, QKV_DIM, generator=gen).to(torch.bfloat16)
+    image_freq_chunks = torch.randn(THREE_NUM_CHUNKS, THREE_CHUNK_SIZE, ROT_DIM, generator=gen, dtype=torch.complex64)
+    text_freqs = torch.randn(3, THREE_TEXT_PADDED, ROT_DIM, generator=gen, dtype=torch.complex64)
+    chunk_to_request = torch.tensor([0, 0, 1, 1, 2, 2])
+    return image_chunks, encoder_hidden_states, image_freq_chunks, text_freqs, chunk_to_request
+
+
+def _forward_three(module):
+    image_chunks, encoder_hidden_states, image_freq_chunks, text_freqs, chunk_to_request = _mixfusion_inputs_three()
+    layout = _attention_layout()
+    plan = build_execution_plan(
+        layout=layout,
+        chunk_size=THREE_CHUNK_SIZE,
+        request_chunk_ranges=THREE_CHUNK_RANGES,
+        image_row_counts=[1, 1, 1],
+        request_stream_lens={
+            "text": THREE_TXT_LENS,
+            "image": [THREE_CHUNKS_PER_REQUEST * THREE_CHUNK_SIZE] * 3,
+        },
+        stream_padded_lens={"text": THREE_TEXT_PADDED},
+        chunk_to_request=chunk_to_request,
+        device=image_chunks.device,
+    )
+    with override_forward_context(ForwardContext(mixfusion_step=MixFusionStep(plan=plan, layout=layout))):
+        return module.forward(
+            hidden_states=image_chunks,
+            encoder_hidden_states=encoder_hidden_states,
+            vid_freqs=image_freq_chunks,
+            txt_freqs=text_freqs,
+        )
+
+
+def test_mask_capable_dense_backend_fuses_one_forward_per_image_length():
+    varlen_attn = _PackedAttentionStub(mode="varlen")
+    varlen_img_out, varlen_txt_out = _forward_three(_mixfusion_module(attn=varlen_attn, rope=_CapturingRope()))
+
+    attn = _PackedAttentionStub(mode="masked")
+    img_out, txt_out = _forward_three(_mixfusion_module(attn=attn, rope=_CapturingRope()))
+
+    # The masked route owns the whole packing: no forward_packed fallback, and
+    # all three requests share one dense forward because their image streams
+    # have the same length.
+    assert attn.calls == []
+    assert len(attn.dense_calls) == 1
+    call = attn.dense_calls[0]
+    image_tokens = THREE_CHUNKS_PER_REQUEST * THREE_CHUNK_SIZE
+    assert call["shape"] == (3, THREE_TEXT_PADDED + image_tokens, HEADS, HEAD_DIM)
+
+    # One [group, L] Boolean mask per dense call: True on each request's real
+    # text tokens and its whole image stream, False on text padding.
+    mask = call["mask"]
+    assert mask is not None and mask.dtype == torch.bool
+    for row, text_len in enumerate(THREE_TXT_LENS):
+        expected = torch.cat(
+            [
+                torch.ones(text_len, dtype=torch.bool),
+                torch.zeros(THREE_TEXT_PADDED - text_len, dtype=torch.bool),
+                torch.ones(image_tokens, dtype=torch.bool),
+            ]
+        )
+        assert torch.equal(mask[row], expected)
+
+    # Padded tokens never reach a real row's K/V reduction, so the fused result
+    # matches the per-document varlen result, and padded text rows stay zeroed.
+    # The reduction order differs (masked sum over the padded row vs. per-
+    # document mean), so bf16 rounding allows small tolerances; an unmasked
+    # padding leak would scale the K/V mean by the real/padded ratio and fail
+    # far outside them.
+    torch.testing.assert_close(txt_out, varlen_txt_out, atol=1e-2, rtol=2e-2)
+    torch.testing.assert_close(img_out, varlen_img_out, atol=1e-2, rtol=2e-2)
+    for row, text_len in enumerate(THREE_TXT_LENS):
+        assert torch.all(txt_out[row, text_len:] == 0)
