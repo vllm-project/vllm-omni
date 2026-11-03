@@ -54,11 +54,12 @@ class _Capability:
         return nullcontext()
 
 
-def _runner(mocker, *, execute=None) -> ARDiffusionModelRunner:
+def _runner(mocker, *, execute=None, retention_enabled=True) -> ARDiffusionModelRunner:
     runner = object.__new__(ARDiffusionModelRunner)
     runner.noisy_kv_cache = object()
     runner._ar_diffusion_cell_capability = _Capability()
     runner._noisy_sessions = NoisyKVSessionRegistry(capacity=1)
+    runner._noisy_session_retention_enabled = retention_enabled
     runner._perf_e2e_times = []
     ctx = SimpleNamespace(inflight=[], pending=[])
     mocker.patch.object(ARDiffusionModelRunner, "_make_chunk_context", return_value=ctx)
@@ -577,3 +578,30 @@ def test_the_offset_advances_per_chunk_and_stops_at_the_last_finished_one():
 
     # The finished chunk stays committed; the failed one does not.
     assert failing.committed_chunks == 1
+
+
+def test_noisy_lifecycle_rpc_reset_and_close_the_registry_session(mocker):
+    """Worker reset/close must reach the Noisy registry, not only the paged KV."""
+    runner = _runner(mocker)
+    session, generation = runner._noisy_sessions.admit("s1")
+    session.commit_chunks(2, generation=generation)
+
+    runner.reset_session("s1")
+
+    assert runner._noisy_sessions.get("s1") is session
+    assert session.state is NoisySessionState.ACTIVE
+    assert session.committed_chunks == 0
+
+    runner.close_session("s1")
+
+    assert runner._noisy_sessions.get("s1") is None
+
+
+def test_explicit_noisy_session_requires_retention_reservation(mocker):
+    """Retention is opt-in: an unconfigured deployment refuses session requests."""
+    runner = _runner(mocker, retention_enabled=False, execute=lambda *_a, **_k: DiffusionOutput(output=None))
+
+    with pytest.raises(RuntimeError, match="enable_session_retention"):
+        runner.execute_model(_request())
+
+    assert len(runner._noisy_sessions) == 0

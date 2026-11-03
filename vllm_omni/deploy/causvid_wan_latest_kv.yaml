@@ -36,3 +36,4 @@ stages:
         step_replicas: 4
         max_batch_size: 1
         max_history_chunks: 6
+        enable_session_retention: true

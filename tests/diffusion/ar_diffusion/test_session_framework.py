@@ -160,8 +160,9 @@ def _runner(mocker) -> ARDiffusionModelRunner:
     runner.noisy_kv_cache = object()
     runner._ar_diffusion_cell_capability = _Capability()
     runner._noisy_sessions = NoisyKVSessionRegistry(capacity=1)
-    runner._perf_e2e_times = []
+    runner._noisy_session_retention_enabled = True
     runner._session_router = None
+    runner._perf_e2e_times = []
     runner._replica_id = 0
     runner._capacity_ledger = None
     runner._session_reservation_versions = 0

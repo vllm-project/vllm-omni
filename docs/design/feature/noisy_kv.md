@@ -308,6 +308,10 @@ request. The retention window is still a worker-side quota sized at startup; the
 ledger above is the admission-side counterpart and does not yet feed the pool
 size. Batch unification, wiring the router into the engine's stage-pool replica
 selection, and cross-layout history conversion remain open.
+**Retention reservation is opt-in.** `ar_diffusion_stage_config.enable_session_retention` defaults to `false`, so a deployment that never sends a `session_id` keeps the original live-window startup budget. Enabling it reserves one registry session's history window in addition to the live request window; explicit session requests are rejected when the flag is off rather than silently running without continuation capacity. The CausVid Self-Forcing and Latest-KV recipes enable it.
+
+**Lifecycle RPCs cover the cell path.** Worker reset/close calls release the Noisy registry's session-owned versions before resetting or dropping model-owned state, as well as releasing the optional router/ledger reservation.
+
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.

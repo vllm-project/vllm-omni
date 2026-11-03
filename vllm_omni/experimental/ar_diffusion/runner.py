@@ -135,6 +135,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # request at a time, and the registry refuses a session whose request
         # failed until it is reset.
         self._noisy_sessions = NoisyKVSessionRegistry(capacity=1)
+        self._noisy_session_retention_enabled = False
         # Framework seams from the roadmap: which replica owns a session (2.1)
         # and what capacity the scheduler reserved for it (2.3). Both are
         # opt-in, so a single-replica deployment without a ledger behaves
@@ -231,6 +232,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         avail = self._available_memory_bytes() if available_bytes is None else available_bytes
         layer_offset = int(getattr(getattr(self.pipeline, "transformer", None), "start_layer", 0) or 0)
         blocks_per_rank = max(1, int(spec.num_layers))
+        self._noisy_session_retention_enabled = bool(stage_cfg.get("enable_session_retention", False))
         self.noisy_kv_cache = NoisyKVCache(
             spec,
             dtype=self.od_config.dtype,
@@ -242,9 +244,13 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             available_bytes=avail,
             layer_offset=layer_offset,
             blocks_per_rank=blocks_per_rank,
-            # Sessions keep their retained window resident while the next request
-            # runs, so that quota is reserved on top of the live one.
-            session_retention_chunks=self._noisy_sessions.capacity * spec.history_versions,
+            # Session history coexists with the live request window only when the
+            # deployment explicitly enables cross-request retention.
+            session_retention_chunks=(
+                self._noisy_sessions.capacity * spec.history_versions
+                if bool(stage_cfg.get("enable_session_retention", False))
+                else 0
+            ),
         )
         # The registry knows session identities; the pool owns their slots, so
         # dropping a session has to go through the cache to hand them back.
@@ -441,10 +447,18 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
 
     def reset_session(self, session_id: str) -> None:
         """Release KV and notify the pipeline to reset model-owned state."""
+        if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
+            self._noisy_sessions.reset(session_id)
+            self._release_session_reservation(session_id)
+            return
         self._release_session(session_id, reset_model=True, reason="reset")
 
     def close_session(self, session_id: str) -> None:
         """Release KV and notify the pipeline to drop model-owned state."""
+        if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
+            self._noisy_sessions.close(session_id)
+            self._release_session_reservation(session_id)
+            return
         self._release_session(session_id, reset_model=False, reason="close")
 
     def _get_or_create_session(self, session_id: str) -> ARDiffusionKVState:
@@ -584,6 +598,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             # missing id because the paged path has always run that way, so
             # binding it here would let independent requests inherit KV.
             explicit_session = tick is not None or bool(extra_args.get("session_id"))
+            if explicit_session and not getattr(self, "_noisy_session_retention_enabled", False):
+                raise RuntimeError(
+                    "Noisy KV session retention is disabled; set "
+                    "ar_diffusion_stage_config.enable_session_retention=true to use session_id"
+                )
             session = None
             if explicit_session:
                 if reset:
