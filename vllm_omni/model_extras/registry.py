@@ -347,6 +347,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_body_params": QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
         "image_to_image_prompt_builder": build_qwen_image_21_image_to_image_prompt,
     },
+    "Flux3Pipeline": {
+        "extra_body_params": frozenset({"flow_shift"}),
+        "image_to_image_prompt_builder": default_image_to_image_prompt,
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
+    },
 }
 _EXTRA_SPECS["MingImageLayeredDiffusionPipeline"] = _EXTRA_SPECS["MingImageDiffusionPipeline"]
 

@@ -427,6 +427,74 @@ steps:
             VLLM_OMNI_DEVICE_POSTPROCESS_MODEL=Wan-AI/Wan2.2-TI2V-5B-Diffusers \
               pytest -s -v tests/e2e/offline_inference/test_device_postprocess_equivalence.py -m "full_model and H100 and B200 and cuda and cards_1" --run-level "full_model"
 
+      - label: ":full_moon: Diffusion Image · Flux3 Single-GPU Function Test"
+        source_file_dependencies: diffusion_flux3_function
+        timeout_in_minutes: 90
+        commands:
+          - FLUX3_MODEL_PATH=PLACEHOLDER_MODEL_PATH pytest -s -v tests/e2e/online_serving/test_flux3_expansion.py -k "cpu_offload or cache_dit" -m "full_model and diffusion" --run-level "full_model"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 1
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: model-cache
+                        mountPath: /mnt/model-cache
+                    env:
+                      - name: VLLM_WORKER_MULTIPROC_METHOD
+                        value: spawn
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: model-cache
+                    hostPath:
+                      path: /mnt/model-cache
+                      type: DirectoryOrCreate
+
+      - label: ":full_moon: Diffusion Image · Flux3 Multi-GPU Function Test"
+        source_file_dependencies: diffusion_flux3_function
+        timeout_in_minutes: 90
+        commands:
+          - FLUX3_MODEL_PATH=PLACEHOLDER_MODEL_PATH pytest -s -v tests/e2e/online_serving/test_flux3_expansion.py -k "cfg_parallel or tp_2 or hsdp" -m "full_model and diffusion" --run-level "full_model"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: model-cache
+                        mountPath: /mnt/model-cache
+                    env:
+                      - name: VLLM_WORKER_MULTIPROC_METHOD
+                        value: spawn
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: model-cache
+                    hostPath:
+                      path: /mnt/model-cache
+                      type: DirectoryOrCreate
+
       - label: ":full_moon: Diffusion X2V · Wan2.2 Accuracy Test"
         source_file_dependencies: diffusion_wan22_accuracy
         timeout_in_minutes: 180
