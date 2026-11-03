@@ -607,6 +607,11 @@ class CausVidWanPipeline(nn.Module):
             # Protect only the post-request keep set. Prior sources still needed mid-request
             # are covered by plan last-use and are reclaimed after their last consume.
             retain = clean_history_cells(schedule, num_blocks=num_blocks) if persist else set()
+            if ctx.batch is not None:
+                ctx.batch.set_strategy_payload(
+                    kv_id,
+                    {"cell_plan": plan, "chunk_tokens": chunk_tokens, "num_denoise_steps": denoise},
+                )
             ctx.enqueue(kv_id, plan, chunk_tokens=chunk_tokens, retain=retain)
 
             prompt = self._prompt_text(item.prompt)

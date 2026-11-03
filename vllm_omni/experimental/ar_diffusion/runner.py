@@ -19,6 +19,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, KVPrefetchJob
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
+from vllm_omni.experimental.ar_diffusion.batch import ARDiffusionBatch
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
     SupportsARDiffusionCellPipeline,
@@ -497,7 +498,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         NoisyKVState(self.noisy_kv_cache).release_session(kv_id)
         logger.debug("AR-Diffusion released noisy KV id=%s", kv_id)
 
-    def _make_chunk_context(self):
+    def _make_chunk_context(self, *, batch: ARDiffusionBatch | None = None):
         from vllm_omni.experimental.ar_diffusion.cell_executor import (
             ARDiffusionCellContext,
             CellRunSpec,
@@ -520,6 +521,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 pp_group=pp_group,
             ),
             kv=NoisyKVState(self.noisy_kv_cache),
+            batch=batch,
         )
 
     def execute_model(
@@ -533,7 +535,10 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             kv_id, persist, reset, close_session = self._noisy_kv_id(req)
             if reset:
                 self.release_noisy_kv(kv_id)
-            ctx = self._make_chunk_context()
+            # One envelope per call is the single source of truth for what this
+            # call owns and produced, for both strategies.
+            batch = ARDiffusionBatch.for_noisy([kv_id], session_ids=[kv_id if persist else None])
+            ctx = self._make_chunk_context(batch=batch)
             try:
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     output = super().execute_model(
@@ -583,14 +588,18 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
             # Fail-closed only for this wave's pool keys — never wipe unrelated sessions.
             batch_kv_ids: list[str] = []
+            batch_sessions: list[str | None] = []
             for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
                 req = getattr(new_req, "req", None)
                 if req is None:
                     continue
-                kv_id, _persist, _reset, _close = self._noisy_kv_id(req)
+                kv_id, persist, _reset, _close = self._noisy_kv_id(req)
                 if kv_id:
                     batch_kv_ids.append(kv_id)
-            ctx = self._make_chunk_context()
+                    batch_sessions.append(kv_id if persist else None)
+            # A batch wave owns the records it schedules; the envelope says so.
+            batch = ARDiffusionBatch.for_noisy(batch_kv_ids, session_ids=batch_sessions) if batch_kv_ids else None
+            ctx = self._make_chunk_context(batch=batch)
             try:
                 with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
                     return super().execute_model_batch(scheduler_output, od_config)

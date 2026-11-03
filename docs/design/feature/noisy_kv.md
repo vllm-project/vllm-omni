@@ -192,6 +192,10 @@ Implemented in `experimental/ar_diffusion/kv_cache/noisy.py`.
 Per-tick KV traffic ≈ history depth × one block × tokens × heads × dim per
 remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`.
 
+**Execution envelope.** The data-layer boundary is split into `Session` and `ARDiffusionBatch`. A session owns cross-request state such as retained KV, conditioning, and the streaming decoder; an `ARDiffusionBatch` owns one execution envelope: request identity, session metadata, strategy payload, ownership, cleanup, and output attribution.
+
+`ARDiffusionBatch` is not a promise that every strategy supports the same tensor batching. Paged execution may carry several request records for continuous batching. On the cell path a request-mode call carries one record and a batch wave carries the records that wave owns; `CellPlan`, `chunk_tokens`, and cell-task grouping stay internal to the Noisy strategy, so `max_batch_size` remains cell geometry rather than request-batch cardinality. `DiffusionRequestBatch` is not the Noisy contract, and paged<->Noisy KV conversion is not required.
+
 ### Same-Step with a first-chunk clean sink
 
 `Ordering.SAME_STEP` uses a first-chunk clean sink for multi-chunk requests.
