@@ -54,9 +54,9 @@ def get_prompt():
     return "Analyse the audio, image or video provided"
 
 
-@pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_analyse_text_input(omni_server, openai_client):
@@ -74,9 +74,9 @@ def test_analyse_text_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_analyse_prompt_without_attached_media(omni_server, openai_client):
@@ -94,9 +94,9 @@ def test_analyse_prompt_without_attached_media(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_analyse_audio_input(omni_server, openai_client):
@@ -118,8 +118,8 @@ def test_analyse_audio_input(omni_server, openai_client):
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_analyse_long_audio_input(omni_server, openai_client):
@@ -140,9 +140,9 @@ def test_analyse_long_audio_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_analyse_image_input(omni_server, openai_client):
@@ -164,8 +164,8 @@ def test_analyse_image_input(omni_server, openai_client):
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_analyse_large_image_input(omni_server, openai_client):
@@ -188,9 +188,9 @@ def test_analyse_large_image_input(omni_server, openai_client):
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_analyse_video_input(omni_server, openai_client):
@@ -214,8 +214,8 @@ def test_analyse_video_input(omni_server, openai_client):
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_analyse_long_video_input(omni_server, openai_client):
@@ -237,8 +237,8 @@ def test_analyse_long_video_input(omni_server, openai_client):
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.omni
+@pytest.mark.slow
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_analyse_video_with_audio_input(omni_server, openai_client):
