@@ -31,6 +31,19 @@ reference media is still encoded locally.
 
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
+## Optional LiteVAE video decoder
+
+To use the standard non-INT8 H3 Lite decoder, add:
+
+```bash
+--additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
+```
+
+LiteVAE changes the video decoder while preserving the video encoder and audio
+VAE. Omit `video_vae_decoder` when selecting LiteVAE. See the
+[LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for checkpoint
+requirements, decoder selection, and quality review.
+
 ## Prerequisites
 
 The checkpoint requires Hugging Face access approval. Authenticate once;
@@ -1616,6 +1629,13 @@ differ from each other.
 
 The four-step adapter recipe has moved to the [FastH3 section](../FastVideo/README.md):
 [FastH3](../FastVideo/FastH3.md).
+
+### Open-H3-Regenerate-2K
+
+[Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
+re-renders a 768P draft from this model at 2560x1440 in three steps. It is a
+load-time adapter served as its own deployment; see
+[Open-H3-Regenerate-2K — H200](../Efficient-Large-Model/Open-H3-Regenerate-2K-H200.md).
 
 ### FastH3 8-Step V2 full checkpoint
 
