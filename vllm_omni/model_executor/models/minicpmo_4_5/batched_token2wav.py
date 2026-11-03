@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -649,10 +650,18 @@ class BatchedToken2Wav(nn.Module):
         if int(mel.shape[2]) == 0:
             # No frames, no samples: HiFT itself cannot run on an empty mel.
             return empty_hift_outputs(mel)
-        self._solve_stats.record("hift", batch=int(mel.shape[0]), frames=int(mel.shape[2]))
+        started = time.perf_counter()
         if self.hift_graph_wrapper is None:
-            return self.hift.inference(mel, source_cache)
-        return self.hift_graph_wrapper.replay(mel, source_cache)
+            result = self.hift.inference(mel, source_cache)
+        else:
+            result = self.hift_graph_wrapper.replay(mel, source_cache)
+        self._solve_stats.record(
+            "hift",
+            batch=int(mel.shape[0]),
+            frames=int(mel.shape[2]),
+            duration=time.perf_counter() - started,
+        )
+        return result
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -1377,6 +1386,10 @@ class BatchedToken2Wav(nn.Module):
         cache in the same form, already trimmed by ``att_keep``; the eager
         path returns it stacked and untrimmed (ragged: per request, untrimmed).
         """
+        # The solve's true wall time, start to finish across every return:
+        # the duty figure must count work actually spent inside the solve,
+        # not the telescoping gap to the next record.
+        solve_started = time.perf_counter() if self._solve_stats.enabled else 0.0
         if self._cfm_only_float16:
             mu, speakers, cond = mu.half(), speakers.half(), cond.half()
         decoder = self.flow.decoder
@@ -1410,7 +1423,6 @@ class BatchedToken2Wav(nn.Module):
             )
             or (self._cfm_graph_wrapper is None and self._cfm_graph_enabled)
         )
-        self._solve_stats.record("cfm", batch=batch_size, frames=mel_frames, ragged=valid_lengths is not None)
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,
             offset=offset,
@@ -1488,6 +1500,14 @@ class BatchedToken2Wav(nn.Module):
                 prompt_lengths=prompt_lengths,
             )
             if whole_euler_result is not None:
+                if self._solve_stats.enabled:
+                    self._solve_stats.record(
+                        "cfm",
+                        batch=batch_size,
+                        frames=mel_frames,
+                        ragged=valid_lengths is not None,
+                        duration=time.perf_counter() - solve_started,
+                    )
                 return whole_euler_result
             self._watchdog.phase(
                 "cfm/eager_fallback",
@@ -1595,6 +1615,14 @@ class BatchedToken2Wav(nn.Module):
                     # the valid one, in step with the mask built above.
                     next_att_cache[step][..., mel_frames : mel_frames + pad_frames, :] = 0.0
                 del step_att
+        if self._solve_stats.enabled:
+            self._solve_stats.record(
+                "cfm",
+                batch=batch_size,
+                frames=mel_frames,
+                ragged=valid_lengths is not None,
+                duration=time.perf_counter() - solve_started,
+            )
         if pad_frames:
             x = x[:, :, :mel_frames]
         if ragged_att_cache is not None:

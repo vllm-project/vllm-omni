@@ -37,7 +37,7 @@ class Code2WavSolveStats:
 
     Every ``record`` call is one solve. The window is flushed every
     ``flush_every`` solves: it reports the frame / batch histograms and the
-    fraction of wall time spent between consecutive solves (``duty``). A duty
+    fraction of wall time actually spent inside the solves (``duty``). A duty
     close to 100% means stage-2 work is back to back, i.e. it is the stage that
     bounds throughput; a low duty means it is waiting on its upstream.
     """
@@ -61,18 +61,30 @@ class Code2WavSolveStats:
     def enabled(self) -> bool:
         return self._enabled
 
-    def record(self, kind: str, *, batch: int, frames: int, ragged: bool = False) -> None:
-        """Count one solve of ``kind`` covering ``frames`` frames per row."""
+    def record(
+        self, kind: str, *, batch: int, frames: int, ragged: bool = False, duration: float | None = None
+    ) -> None:
+        """Count one solve of ``kind`` covering ``frames`` frames per row.
+
+        ``duration`` is the solve's measured wall time (start/stop around the
+        CFM/HiFT call). It is what makes ``duty`` a real occupancy figure:
+        accumulating the inter-record gaps instead telescopes every solve
+        into the next one, so ``busy`` always equals ``wall`` and duty reads
+        a flat 100% however idle stage 2 is. Without a duration the gap is
+        the only signal available and the old, overstated behaviour applies.
+        """
         if not self._enabled:
             return
         now = time.perf_counter()
         if self._last_ts is not None:
-            # Gap between consecutive solves: the window "busy" time. It
-            # overstates stage-2 work by the solve latency itself, which is
-            # what makes duty a usable saturation indicator, not a profile.
-            self._window_busy += now - self._last_ts
+            if duration is not None:
+                self._window_busy += duration
+            else:
+                self._window_busy += now - self._last_ts
         else:
             self._window_start = now
+            if duration is not None:
+                self._window_busy += duration
         self._last_ts = now
         self._solves += 1
         self._frames[(kind, int(frames))] += 1
@@ -87,7 +99,11 @@ class Code2WavSolveStats:
         """Emit the current window and start a new one."""
         if not self._enabled or not self._pending:
             return
-        wall = (self._last_ts - self._window_start) if self._window_start and self._last_ts else 0.0
+        wall = (
+            (self._last_ts - self._window_start)
+            if self._window_start is not None and self._last_ts is not None
+            else 0.0
+        )
         parts = []
         for kind in sorted({key[0] for key in self._frames}):
             frames = sorted((f, n) for (k, f), n in self._frames.items() if k == kind)
