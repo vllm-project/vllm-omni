@@ -26,7 +26,9 @@ From the repository root, in an installed vLLM-Omni Ascend environment:
 ```bash
 vllm serve LiquidAI/LFM3-Omni-2B --omni --trust-remote-code \
   --revision 21d75123f86c1f7ffb4bef1ea202710c4e7ebe67 \
-  --deploy-config vllm_omni/deploy/lfm3_omni.yaml --port 8091
+  --deploy-config vllm_omni/deploy/lfm3_omni.yaml \
+  --hf-overrides '{"lfm3_depth_graph":true,"lfm3_vectorized_greedy":true}' \
+  --port 8091
 ```
 
 For text output, including image/audio/video understanding, select
@@ -63,7 +65,10 @@ generation must end in `<|audio_start|>` or `<|mixed_start|>`, respectively.
 - `hf_overrides.lfm3_depth_graph=true` enables fixed-shape NPU graph replay of
   the depth decoder. Sampling and the per-request random generator remain
   outside capture. Benchmark after warmup and compare generated codes before
-  interpreting latency differences.
+  interpreting latency differences. The command above enables it together with
+  `lfm3_vectorized_greedy`, which groups the greedy codebook selection. Both
+  switches default to false when omitted; stochastic sampling preserves its
+  original scalar random-draw order.
 - Audio sampling defaults to temperature 0.4, repetition penalty 1.2, and a
   64-frame repetition window. `SamplingParams.extra_args` accepts
   `audio_temperature`, `audio_top_k`, `audio_repetition_penalty`, and
@@ -83,6 +88,16 @@ valid audio codes, decoded sample count, and waveform error separately. The
 internal audio-EOS placeholder is a scheduler step and is not a valid codec
 frame. An interleaved text-end marker starts the remaining audio tail; it must
 not terminate the full two-stage pipeline.
+
+On the pinned checkpoint and environment above, six fixed understanding cases
+(text, arithmetic, a prompt longer than the sliding window, image, audio, and
+video) matched generated text token IDs. Greedy TTS (46 frames), seeded
+temperature-0.4 TTS (42 frames), and greedy interleaved generation (63 frames)
+matched every code across all 12 codebooks. The optimized full greedy waveform
+was bitwise equal to the reference's 88,320 float samples. Nine online requests
+at concurrency 1, 2, and 4 matched the four-frame streaming reference within one
+PCM16 quantization unit, with normal worker shutdown. These fixed cases are
+regression evidence, not a broad quality benchmark.
 
 For performance measurements, reserve the NPU, warm both stages, and run paired
 baseline/optimized measurements on the same card at each reported concurrency.
