@@ -28,6 +28,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import MimiConfig, MimiModel
+from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.integrations import use_kernel_forward_from_hub
@@ -173,6 +174,17 @@ class Qwen3TTSTokenizerV2DecoderPreTrainedModel(PreTrainedModel):
     _can_compile_fullgraph = False
     _supports_attention_backend = True
 
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, Qwen3TTSTokenizerV2DecoderRotatoryEmbedding):
+            # HF replaces non-persistent buffers when loading from meta. This
+            # custom RoPE class is not handled by its generic initializer.
+            inv_freq, module.attention_scaling = module.rope_init_fn(module.config, device=module.inv_freq.device)
+            init.copy_(module.inv_freq, inv_freq)
+            init.copy_(module.original_inv_freq, inv_freq)
+        else:
+            super()._init_weights(module)
+
 
 class Qwen3TTSTokenizerV2CausalConvNet(nn.Module):
     def __init__(
@@ -298,7 +310,9 @@ class Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(nn.Module):
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        # An unregistered alias would still point to the old meta tensor after
+        # from_pretrained materializes inv_freq on the target device.
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
 
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
