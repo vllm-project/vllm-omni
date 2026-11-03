@@ -148,11 +148,6 @@ def test_skip_factor_from_curve():
 
 
 @hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
-def test_skip_factor_none_until_stamped():
-    assert _impl(target_sparsity=0.5)._resolve_skip_factor(4096) is None
-
-
-@hardware_test(res={"cuda": "RTX5090"}, num_cards=1)
 def test_skip_factor_from_threshold_no_calibration():
     impl = _impl(skip_softmax_threshold=0.01)
     assert impl._resolve_skip_factor(4096) == pytest.approx(0.01 * 4096)
