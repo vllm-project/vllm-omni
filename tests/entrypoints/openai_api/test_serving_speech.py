@@ -6029,6 +6029,104 @@ class TestTTSAsyncOffloading:
         next_params = qwen3_tts_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
         assert next_params[0].temperature == 0.9
 
+    @pytest.mark.parametrize(
+        "temperature,extra_params,expected",
+        [
+            (0.2, None, 0.2),
+            (0.0, None, 0.0),
+            (0.2, {"temperature": 0.8, "top_p": 0.95}, 0.2),
+            (0.0, {"temperature": 0.8}, 0.0),
+            (None, {"temperature": 0.8}, 0.8),
+            (None, None, 0.9),
+        ],
+    )
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_breeze_temperature_reaches_model_metadata(
+        self, qwen3_tts_server, mocker: MockerFixture, temperature, extra_params, expected, stream
+    ):
+        from vllm_omni.entrypoints.openai.tts_adapters.breeze_tts_2 import BreezeTTS2Adapter
+
+        server = qwen3_tts_server
+        defaults = [SamplingParams(temperature=0.9, top_k=50), SamplingParams(temperature=0.7)]
+        server.engine_client.default_sampling_params_list = defaults
+        server.engine_client.model_config.max_model_len = 4096
+        adapter = BreezeTTS2Adapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+        adapter.tokenizer = mocker.Mock()
+        adapter.tokenizer.encode.return_value = [1, 2, 3]
+        adapter._build_async = mocker.AsyncMock(side_effect=adapter._build_prompt)
+        server._tts_model_type = adapter.name
+        server._adapter = adapter
+        request = OpenAICreateSpeechRequest(
+            input="hello", temperature=temperature, extra_params=extra_params, stream=stream, response_format="pcm"
+        )
+        original_request = request.model_dump()
+
+        asyncio.run(server._prepare_speech_generation(request))
+
+        generated = server.engine_client.generate.call_args.kwargs
+        metadata = generated["prompt"]["additional_information"]["breeze_sampling"]
+        assert metadata["temperature"] == expected
+        assert metadata["top_p"] == (extra_params or {}).get("top_p", 1.0)
+        assert generated["sampling_params_list"][0].temperature == expected
+        assert generated["sampling_params_list"][1].temperature == 0.7
+        assert request.model_dump() == original_request
+        assert defaults[0].temperature == 0.9
+        assert defaults[0].extra_args is None
+
+        asyncio.run(server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
+        subsequent = server.engine_client.generate.call_args.kwargs
+        assert subsequent["prompt"]["additional_information"]["breeze_sampling"]["temperature"] == 0.9
+
+    @pytest.mark.parametrize(
+        "temperature,extra_params,expected",
+        [
+            (0.2, None, 0.2),
+            (0.0, None, 0.0),
+            (0.2, {"temperature": 0.8}, 0.2),
+            (0.0, {"temperature": 0.8}, 0.0),
+            (None, {"temperature": 0.8}, 0.8),
+            (None, None, None),
+        ],
+    )
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_ming3_temperature_reaches_model_metadata(
+        self, qwen3_tts_server, mocker: MockerFixture, temperature, extra_params, expected, stream
+    ):
+        from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
+        from vllm_omni.model_executor.models.ming3_tts.constants import KEY_TEMPERATURE
+
+        server = qwen3_tts_server
+        defaults = [SamplingParams(temperature=0.9), SamplingParams(temperature=0.7)]
+        server.engine_client.default_sampling_params_list = defaults
+        server.engine_client.model_config.hf_config.tts_config = {}
+        adapter = Ming3TTSAdapter(SpeechServingContext(server=server, engine_client=server.engine_client))
+        adapter.validate = mocker.Mock(return_value=None)
+        # Isolate text/audio conditioning while exercising the real metadata overrides.
+        adapter.build = mocker.AsyncMock(
+            side_effect=lambda *args: PreparedRequest(prompt={"additional_information": {}}, model_type=adapter.name)
+        )
+        server._tts_model_type = adapter.name
+        server._adapter = adapter
+        request = OpenAICreateSpeechRequest(
+            input="hello", temperature=temperature, extra_params=extra_params, stream=stream, response_format="pcm"
+        )
+        original_request = request.model_dump()
+
+        asyncio.run(server._prepare_speech_generation(request))
+
+        generated = server.engine_client.generate.call_args.kwargs
+        info = generated["prompt"]["additional_information"]
+        assert info.get(KEY_TEMPERATURE) == expected
+        assert generated["sampling_params_list"][0].temperature == (0.9 if expected is None else expected)
+        assert generated["sampling_params_list"][1].temperature == 0.7
+        assert request.model_dump() == original_request
+        assert defaults[0].temperature == 0.9
+        assert defaults[0].extra_args is None
+
+        asyncio.run(server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
+        subsequent = server.engine_client.generate.call_args.kwargs
+        assert KEY_TEMPERATURE not in subsequent["prompt"]["additional_information"]
+
     def test_prepare_speech_generation_rejects_temperature_when_adapter_unsupported(
         self, qwen3_tts_server, mocker: MockerFixture
     ):
@@ -6058,6 +6156,9 @@ class TestTTSAsyncOffloading:
             "moss_tts",
             "moss_tts_nano",
             "higgs_audio_v2",
+            "gepard",
+            "yue2",
+            "ming3_audio_tts",
         ],
     )
     def test_adapters_without_stage0_temperature_declare_unsupported(self, name):
@@ -6067,6 +6168,29 @@ class TestTTSAsyncOffloading:
         assert TTSModelAdapter.supports_temperature is True
         adapter_cls = resolve_adapter(name)
         assert adapter_cls is not None and adapter_cls.supports_temperature is False
+
+    @pytest.mark.parametrize("name", ["gepard", "yue2", "ming3_audio_tts"])
+    @pytest.mark.parametrize("temperature", [0.0, 0.2])
+    def test_fixed_sampling_adapters_reject_temperature_before_build(
+        self, qwen3_tts_server, mocker: MockerFixture, name, temperature
+    ):
+        from vllm_omni.entrypoints.openai.tts_adapters import resolve_adapter
+
+        adapter_cls = resolve_adapter(name)
+        assert adapter_cls is not None
+        adapter = adapter_cls(SpeechServingContext(server=qwen3_tts_server))
+        adapter.validate = mocker.Mock()
+        adapter.build = mocker.AsyncMock()
+        qwen3_tts_server._tts_model_type = name
+        qwen3_tts_server._adapter = adapter
+        request = OpenAICreateSpeechRequest(input="hello", temperature=temperature)
+
+        with pytest.raises(ValueError, match=f"Model '{name}' does not support 'temperature'"):
+            asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        adapter.validate.assert_not_called()
+        adapter.build.assert_not_called()
+        qwen3_tts_server.engine_client.generate.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_diffusion_speech_rejects_temperature(self, mocker: MockerFixture):

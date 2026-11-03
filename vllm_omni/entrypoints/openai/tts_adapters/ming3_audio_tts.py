@@ -28,6 +28,8 @@ class Ming3AudioTTSAdapter(ARTTSAdapter):
     # IP names are caption controls; clone references arrive with each request.
     stage_keys = frozenset({"ming3_tts"})
     name = "ming3_audio_tts"
+    # The model metadata fixes temperature at 0.0 rather than using stage sampling.
+    supports_temperature = False
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate Ming3 Audio standalone-talker request parameters."""

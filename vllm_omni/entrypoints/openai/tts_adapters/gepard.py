@@ -50,6 +50,8 @@ _UNSUPPORTED_OPTIONAL_FIELDS: tuple[tuple[str, str], ...] = (
 @register_tts_adapter
 class GepardAdapter(ARTTSAdapter):
     name = "gepard"
+    # Sampling is fixed inside the model, independent of stage SamplingParams.
+    supports_temperature = False
     stage_keys = frozenset({"gepard"})
     model_archs = frozenset({"GepardTalkerForConditionalGeneration"})
 
@@ -59,8 +61,8 @@ class GepardAdapter(ARTTSAdapter):
         self._gepard_config: GepardConfig | None = None
         self._build_prompt_async = make_async(self._build_prompt, executor=getattr(ctx.server, "_tts_executor", None))
 
-    def _load_supported_speakers(self) -> set[str]:
-        return {_DEFAULT_VOICE}
+    def _load_supported_speakers(self) -> list[str]:
+        return [_DEFAULT_VOICE]
 
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         if not request.input or not request.input.strip():

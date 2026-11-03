@@ -72,6 +72,8 @@ class Yue2Adapter(ARTTSAdapter):
     """Lyrics plus a style caption in, one 48 kHz stereo song out."""
 
     name = "yue2"
+    # Semantic sampling uses the checkpoint's fixed SEMANTIC_SAMPLING preset.
+    supports_temperature = False
     stage_keys = frozenset({"yue2"})
     model_archs = frozenset({"Yue2ForCausalLM"})
     max_new_tokens_min = int(SEMANTIC_SAMPLING["min_tokens"])
