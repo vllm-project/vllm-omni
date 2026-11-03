@@ -1848,10 +1848,6 @@ vllm serve "${MODEL_ROOT}/FL2VA" \
 
 ## Latent super-resolution
 
-The [Pika H3 Flex recipe](Pika-H3-Flex.md) uses H3's native
-pipeline with the published six-step Pika adapters. It also describes optional
-2K latent upscaling and CUDA audio/video decode overlap.
-
 H3's video VAE is a ~5B-parameter model, so the usual way to raise output
 resolution -- decode, upscale in pixel space, re-encode -- pays for that VAE
 twice. The community
@@ -2060,6 +2056,7 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
 
 ## Additional resources
 
+- [Pika H3 Flex six-step FL2VA / Ref2VA adapters](Pika-H3-Flex.md)
 - [DMAD four/eight-step T2VA adapters](DMAD-H3.md)
 - [Supported models](../../docs/models/supported_models.md)
 - [Video API](../../docs/serving/videos_api.md)
