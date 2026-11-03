@@ -350,9 +350,16 @@ def test_incremental_request_audio_matches_full_decode(mode):
     caches: dict[str, Any] = {"prefix_frames": prefix_frames}
 
     with torch.no_grad():
-        first = decoder(codes[..., : prefix_frames + 1], caches=caches)
-        second = decoder(suffix_codes[..., 1:26], caches=caches)
-        third = decoder(suffix_codes[..., 26:51], caches=caches)
+        audio_chunks = []
+        for chunk in (codes[..., : prefix_frames + 1], suffix_codes[..., 1:26], suffix_codes[..., 26:51]):
+            audio_chunks.append(decoder(chunk, caches=caches))
+            # The suffix shortcut relies on matching caches after initialization
+            # and every update, for both reference and prefixless requests.
+            ref_hidden = caches["ref_hidden"]
+            suffix_quantized = caches["suffix_quantized"]
+            assert ref_hidden.dtype == suffix_quantized.dtype
+            assert ref_hidden.device == suffix_quantized.device
+        first, second, third = audio_chunks
         incremental = torch.cat(
             [first[..., -decoder.total_upsample :], second, third],
             dim=-1,
@@ -1262,10 +1269,19 @@ def test_stateful_eager_partial_final_chunk_is_right_trimmed():
     torch.testing.assert_close(batched[1], per_request[1][0], atol=1e-5, rtol=1e-4)
 
 
-@pytest.mark.parametrize("ref_frames", [0, 1, 72])
-@pytest.mark.parametrize("old_frames", [0, 1, 2, 25, 72])
-@pytest.mark.parametrize("batch_size", [1, 4])
-def test_suffix_pre_conv_context_avoids_full_history_cat(monkeypatch, ref_frames, old_frames, batch_size):
+@pytest.mark.parametrize(
+    "ref_frames,old_frames,batch_size,dtype,noncontiguous",
+    [
+        (ref_frames, old_frames, batch_size, torch.float32, False)
+        for ref_frames in [0, 1, 72]
+        for old_frames in [0, 1, 2, 25, 72]
+        for batch_size in [1, 4]
+    ]
+    + [pytest.param(1, 25, 1, torch.bfloat16, True, id="strided-bf16")],
+)
+def test_suffix_pre_conv_context_avoids_full_history_cat(
+    monkeypatch, ref_frames, old_frames, batch_size, dtype, noncontiguous
+):
     """Exercise the real suffix method through its first convolution input.
 
     The sentinel stops before the transformer/vocoder: existing integration
@@ -1273,14 +1289,19 @@ def test_suffix_pre_conv_context_avoids_full_history_cat(monkeypatch, ref_frames
     so the previous implementation fails on the fast-path cases.
     """
     channels = 4
+    stride = 2 if noncontiguous else 1
 
     def history(frames, offset):
-        values = torch.arange(batch_size * channels * frames, dtype=torch.float32)
-        return values.reshape(batch_size, channels, frames) + offset
+        values = torch.arange(batch_size * channels * frames * stride, dtype=torch.float32)
+        return (values.reshape(batch_size, channels, frames * stride) + offset).to(dtype)[..., ::stride]
 
     ref_hidden = history(ref_frames, 0)
     old_quantized = history(old_frames, 100)
     new_quantized = history(3, 200)
+    if noncontiguous:
+        assert not ref_hidden.is_contiguous()
+        assert not old_quantized.is_contiguous()
+        assert not new_quantized.is_contiguous()
     ref_before = ref_hidden.clone()
     old_before = old_quantized.clone()
     expected_context = torch.cat([ref_hidden, old_quantized], dim=-1)[:, :, -_CONV_CONTEXT_FRAME:]
@@ -1319,6 +1340,8 @@ def test_suffix_pre_conv_context_avoids_full_history_cat(monkeypatch, ref_frames
         )
 
     assert len(captured) == 1
+    assert captured[0].dtype == dtype
+    assert captured[0].device == old_quantized.device
     torch.testing.assert_close(captured[0], expected, rtol=0, atol=0)
     torch.testing.assert_close(ref_hidden, ref_before, rtol=0, atol=0)
     torch.testing.assert_close(old_quantized, old_before, rtol=0, atol=0)
