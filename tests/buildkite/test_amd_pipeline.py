@@ -292,7 +292,15 @@ def _find_model_executor_cpu_shard_step(pipeline_path: Path) -> dict:
         for step in steps:
             commands = step.get("commands", [])
             if any(
-                split(command)[:3] == ["pytest", "-sv", "tests/model_executor"]
+                split(command)[:6]
+                == [
+                    "python",
+                    "-u",
+                    ".buildkite/amd/scripts/run_cpu_suite.py",
+                    "model-executor",
+                    "-sv",
+                    "tests/model_executor",
+                ]
                 and "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in split(command)
                 for command in commands
             ):
@@ -401,7 +409,9 @@ def test_omni_processor_full_matrix_moves_to_nightly_with_blocking_rocm_smoke() 
         model_executor_step = next(
             step for step in steps if step.get("label", "").startswith("Simple · Model Executor Test")
         )
-        pytest_command = next(command for command in model_executor_step["commands"] if "pytest" in command)
+        pytest_command = next(
+            command for command in model_executor_step["commands"] if "tests/model_executor" in command
+        )
         assert "core_model and cpu and not omni" in pytest_command
 
     assert smoke_definitions[0] == smoke_definitions[1]
@@ -455,7 +465,15 @@ def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress
     argv = split(pytest_command)
 
     assert step["parallelism"] == 3
-    assert argv[:3] == ["pytest", "-sv", "tests/model_executor"]
+    assert argv[:6] == [
+        "python",
+        "-u",
+        ".buildkite/amd/scripts/run_cpu_suite.py",
+        "model-executor",
+        "-sv",
+        "tests/model_executor",
+    ]
+    assert step["artifact_paths"] == ["artifacts/amd-cpu-suites/**/*"]
     assert argv[argv.index("-m") + 1] == MODEL_EXECUTOR_CPU_MARKERS
     assert all(not arg.startswith("--ignore") for arg in argv)
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
