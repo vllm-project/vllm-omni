@@ -1,9 +1,11 @@
 # Same CUDA 13 base as the pinned SGLang-Omni docker/Dockerfile.
-ARG SGLANG_BASE_IMAGE=lmsysorg/sglang@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469
+ARG SGLANG_BASE_IMAGE=lmsysorg/sglang@sha256:5fc09edb6a0bb1d5b6992b543723c66d08f86d7a507e951e87e0d05db4ac766e
 FROM ${SGLANG_BASE_IMAGE}
 
 ARG APP_DIR=/opt/vllm-omni
-ARG SGLANG_OMNI_COMMIT=22d4ace88f9547777b819a69d7691204bb9ce847
+ARG SGLANG_OMNI_COMMIT=137eaa97b7ba426b13aa8837d37c5ba4e0a0daba
+# Match the pinned backend's CUDA transport prerequisites.
+ARG UCX_COMMIT=d8e50df6651b9ea5b76f23aee0aefbf053a4137a
 # Match docker/Dockerfile.ci and the shared GPU runtime check.
 ARG VLLM_PRECOMPILED_WHEEL_COMMIT=5df63a7203cdb9328d824a27b682e77c7b9928be
 ARG VLLM_VERSION=0.32.0
@@ -19,11 +21,25 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends espeak-ng ffmpeg git jq sox libsox-fmt-all && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN uv pip install --python /opt/sglang/bin/python3 --prerelease=allow \
+RUN git clone --filter=blob:none https://github.com/openucx/ucx.git /tmp/ucx && \
+    git -C /tmp/ucx checkout "${UCX_COMMIT}" && \
+    cd /tmp/ucx && ./autogen.sh && \
+    ./contrib/configure-release-mt --enable-shared --disable-static --disable-doxygen-doc \
+      --enable-optimizations --enable-cma --enable-devel-headers \
+      --with-cuda=/usr/local/cuda --with-verbs --with-dm --prefix=/usr/local && \
+    make -j"$(nproc)" && make install-strip && ldconfig && rm -rf /tmp/ucx
+
+# uv does not inherit tool.uv overrides from a Git dependency. Apply the pinned
+# backend's CUDA protobuf override explicitly, as its own Dockerfile does.
+# Keep the matching FlashInfer AOT providers from the base image together.
+RUN printf '%s\n' 'protobuf>=6.31.1,<7.0.0' > /tmp/sglang-overrides.txt && \
+    uv pip install --python /opt/sglang/bin/python3 --no-build-isolation --prerelease=allow \
+      --overrides /tmp/sglang-overrides.txt \
       "sglang-omni @ git+https://github.com/sgl-project/sglang-omni.git@${SGLANG_OMNI_COMMIT}" \
       "pytest>=8" && \
     uv pip install --python /opt/sglang/bin/python3 --no-deps "qwen-tts==0.1.1" && \
-    uv pip uninstall --python /opt/sglang/bin/python3 flashinfer-cubin flashinfer-jit-cache && \
+    uv pip install --python /opt/sglang/bin/python3 --no-deps --reinstall "flashinfer-python==0.7.1" && \
+    rm /tmp/sglang-overrides.txt && \
     uv venv --python /opt/sglang/bin/python3 "${VLLM_OMNI_VENV}" && \
     VLLM_OMNI_TARGET_DEVICE=cuda uv pip install --python "${VLLM_OMNI_VENV}/bin/python" \
       "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \

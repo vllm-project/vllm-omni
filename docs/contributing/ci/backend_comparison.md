@@ -123,15 +123,22 @@ GPU 0 and Talker/Code2Wav on GPU 1, with first/steady/context codec windows
 4/25/25. Read those files for the full configuration and memory budgets.
 
 `docker/Dockerfile.other` pins SGLang-Omni to
-`22d4ace88f9547777b819a69d7691204bb9ce847` and applies
+`137eaa97b7ba426b13aa8837d37c5ba4e0a0daba` (2026-11-03 main) and applies
 `docker/patches/sglang-omni-ignore-eos.patch`. A schedule repeats this fixed
 backend version. Updating its pin or patch requires a reviewed code change.
 
-As of 2026-10-23, that pin is from 2026-10-14; SGLang-Omni `main` is at
-`ca9e8789fcd84ed6f7272276cb99447eec751787` (2026-10-22). Refresh and validate the
-pin and ignore-EOS patch before the first scheduled GPU acceptance run. Using
-`HEAD` in the schedule follows the comparison branch and does not track
-SGLang-Omni `main` automatically.
+The runner baseline is vLLM-Omni main
+`2031d5c8d603ec4bd1e4c7471a746d1916843c4c` (2026-11-03), with its vLLM 0.32.0
+wheel pin. The server's separate environment uses SGLang 0.5.22, Torch 2.14.1
+and Transformers 5.19.0 as required by the pinned SGLang-Omni revision.
+Its image follows that revision's base-image digest, UCX commit and protobuf
+override, and preserves the matching FlashInfer 0.7.1 AOT packages. The image
+build runs CPU checks for ignore-EOS propagation and the two-GPU deployment
+configuration; it does not load model weights or run inference.
+
+Using `HEAD` in the schedule follows the comparison branch and does not track
+either upstream main automatically. Refresh both revisions before a future
+weekly run when current-version measurements are needed.
 
 For vLLM-Omni, select the existing
 `nightly-omni-performance-async-chunk` H100 job's **audio** result from

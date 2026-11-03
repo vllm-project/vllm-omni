@@ -1,4 +1,4 @@
-Comparison-image patch for SGLang-Omni 22d4ace88f9547777b819a69d7691204bb9ce847.
+Comparison-image patch for SGLang-Omni 137eaa97b7ba426b13aa8837d37c5ba4e0a0daba.
 Forward ignore_eos from Chat Completions to the Qwen3-Omni Thinker sampler.
 The Talker retains its normal EOS handling.
 

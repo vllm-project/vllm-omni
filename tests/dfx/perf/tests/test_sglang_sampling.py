@@ -2,12 +2,35 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU contract checks for the comparison image's patched SGLang environment."""
 
+from pathlib import Path
+
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # The benchmark client environment deliberately does not install SGLang.
 pytest.importorskip("sglang_omni")
+
+
+def test_comparison_deployment_resolves_with_installed_sglang() -> None:
+    from sglang_omni.config import build_stage_placement_plan
+    from sglang_omni.config.manager import ConfigManager
+    from sglang_omni.config.runtime import resolve_stage_typed_kwargs
+
+    config_path = Path(__file__).parents[1] / "deploy" / "sgl_qwen3_omni.yaml"
+    config = ConfigManager.from_file(str(config_path)).config
+    plan = build_stage_placement_plan(config)
+    assert set(plan.gpus) == {0, 1}
+    assert plan.stages["thinker"].gpu_ids == (0,)
+    assert plan.stages["talker_ar"].gpu_ids == (1,)
+    assert plan.stages["code2wav"].gpu_ids == (1,)
+    talker = resolve_stage_typed_kwargs(config.stage_named("talker_ar"))
+    code2wav = resolve_stage_typed_kwargs(config.stage_named("code2wav"))
+    assert talker["codec_coalesce_first_frames"] == 4
+    assert talker["codec_coalesce_frames"] == 25
+    assert code2wav["initial_codec_chunk_frames"] == 4
+    assert code2wav["stream_chunk_size"] == 25
+    assert code2wav["left_context_size"] == 25
 
 
 @pytest.mark.parametrize("ignore_eos", [None, False, True])
