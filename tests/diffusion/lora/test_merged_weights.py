@@ -115,6 +115,15 @@ def test_copy_failure_restores_every_previously_written_weight(monkeypatch):
         torch.testing.assert_close(layer.base_layer.weight, value, rtol=0, atol=0)
 
 
+def test_rollback_snapshot_is_a_host_copy():
+    layer = _layer(torch.float32)
+    weight = layer.base_layer.weight
+    snapshot = MergedLinearWeights._rollback_snapshot(weight)
+    assert snapshot.device.type == "cpu"
+    assert snapshot.data_ptr() != weight.data_ptr()
+    torch.testing.assert_close(snapshot, weight, rtol=0, atol=0)
+
+
 def test_dense_base_refresh_rebuilds_bank():
     layer = _layer()
     bank = MergedLinearWeights()

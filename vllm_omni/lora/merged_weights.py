@@ -36,6 +36,11 @@ class MergedLinearWeights:
         self._weights: dict[str, torch.Tensor] = {}
         self._base: dict[str, torch.Tensor] = {}
 
+    @staticmethod
+    def _rollback_snapshot(weight: torch.Tensor) -> torch.Tensor:
+        """Keep rollback copies in host memory instead of duplicating HBM."""
+        return weight.detach().to(device="cpu", copy=True)
+
     @torch.no_grad()
     def prepare(self, modules: dict[str, nn.Module]) -> dict[str, torch.Tensor]:
         """Compute a complete policy without changing live weights.
@@ -95,7 +100,7 @@ class MergedLinearWeights:
         previous: dict[str, torch.Tensor] = {}
         error = None
         try:
-            previous = {name: self._weights[name].detach().clone() for name in prepared}
+            previous = {name: self._rollback_snapshot(self._weights[name]) for name in prepared}
         except Exception as exc:
             error = exc
         check_merge_error(error, group)

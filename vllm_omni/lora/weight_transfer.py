@@ -9,7 +9,7 @@ import torch
 from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
 from vllm.distributed.weight_transfer.ipc_engine import IPCWeightTransferEngine, IPCWeightTransferUpdateInfo
 
-from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.lora.manager import LoRAManager
 from vllm_omni.lora.merged_weights import check_merge_error
 from vllm_omni.lora.request import TensorLoRARequest
 
@@ -49,7 +49,7 @@ class MergedLoRAIPCWeightTransferEngine(IPCWeightTransferEngine):
     update_info_cls = MergedLoRAIPCUpdateInfo
     supports_draft_weight_update = False
     model: torch.nn.Module
-    lora_manager: DiffusionLoRAManager
+    lora_manager: LoRAManager
     cpu_group: torch.distributed.ProcessGroup | None = None
 
     def start_weight_update(self) -> None:
