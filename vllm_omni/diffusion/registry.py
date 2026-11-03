@@ -757,47 +757,67 @@ def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
     plan or adapter exists: its serial fallback still has to run, because the
     dense path cannot accept list latents.
 
+    The server-level ``enable_mixfusion`` flag only supplies the request-level
+    default. A request may opt in by itself whenever the pipeline declares
+    ``supports_mixfusion``, which makes the scheduler relax the shape key and
+    turns ``InputBatch.latents`` into a list. The driver (and the inert hooks)
+    therefore have to be mounted for every capable pipeline, regardless of the
+    server flag.
+
     Args:
         model: The pipeline model (e.g., QwenImagePipeline).
         od_config: The OmniDiffusion configuration.
     """
 
-    if not getattr(od_config, "enable_mixfusion", False):
+    server_enabled = bool(getattr(od_config, "enable_mixfusion", False))
+    try:
+        pipeline_supports = supports_mixfusion(od_config)
+    except Exception:
+        logger.debug("Could not resolve the pipeline's MixFusion capability", exc_info=True)
+        pipeline_supports = False
+    if not (server_enabled or pipeline_supports):
         return
 
     try:
-        parallel_config = od_config.parallel_config
-        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
-            # Packed batching splits and stacks the image stream itself; SP
-            # would shard rows a second time.
-            logger.warning_once("MixFusion requires sequence parallelism disabled; MixFusion hooks not applied.")
-            return
-
         # Prefer the pipeline's declared DiT components so custom component
         # names receive the same hooks as conventional transformer names.
         pipeline = model
         transformer_attrs = getattr(model, "_dit_modules", None)
         if not transformer_attrs:
             transformer_attrs = ("transformer", "transformer_2", "dit", "unet")
-        applied_count = 0
-        first_transformer = None
-        driver = None
-
+        transformers = []
+        search_root = model
         for attr in transformer_attrs:
-            if not hasattr(model, attr):
+            if not hasattr(search_root, attr):
                 # Some pipelines have recursive
                 # modules that have the transformer
-                module = find_module_with_attr(model, attr)
+                module = find_module_with_attr(search_root, attr)
                 if module is None:
                     continue
-                model = module
+                search_root = module
 
-            transformer = getattr(model, attr)
+            transformer = getattr(search_root, attr)
             if transformer is None:
                 continue
-            if first_transformer is None:
-                first_transformer = transformer
+            transformers.append((attr, transformer))
 
+        if not transformers:
+            return
+        first_transformer = transformers[0][1]
+
+        parallel_config = od_config.parallel_config
+        if parallel_config is not None and parallel_config.sequence_parallel_size > 1:
+            # Packed batching splits and stacks the image stream itself; SP
+            # would shard rows a second time. Requests can still opt in and
+            # produce ragged latents, so keep a fallback driver mounted.
+            logger.warning_once("MixFusion requires sequence parallelism disabled; MixFusion hooks not applied.")
+            pipeline.mixfusion_driver = MixFusionDriver(pipeline, first_transformer, None)
+            return
+
+        applied_count = 0
+        driver = None
+
+        for attr, transformer in transformers:
             plan = getattr(transformer, "_mixfusion_plan", None)
             adapter = getattr(transformer, "mixfusion_adapter", None)
 
@@ -827,7 +847,7 @@ def _apply_mixfusion_if_enabled(model, od_config: OmniDiffusionConfig) -> None:
             apply_mixfusion(transformer, plan)
             applied_count += 1
 
-        if driver is None and first_transformer is not None:
+        if driver is None:
             # No adapter anywhere: still mount the driver so ragged batches use
             # its serial fallback instead of reaching the dense path with list
             # latents.
