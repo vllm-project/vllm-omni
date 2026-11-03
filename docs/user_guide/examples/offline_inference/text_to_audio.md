@@ -7,7 +7,7 @@ The `stabilityai/stable-audio-open-1.0` pipeline generates audio from text promp
 `stabilityai/stable-audio-3-medium` (`StableAudio3Pipeline`) is the recommended
 successor: a 1.4B DiT that generates stereo 44.1 kHz audio up to 380 s. It is gated
 the same way; prepare it with
-`examples/offline_inference/stable_audio_3/download_stable_audio_3.py` (which also
+`tools/download_stable_audio_3.py` (which also
 writes the `model_index.json` / `transformer/config.json` the engine needs), then
 point `--model` at the prepared directory.
 

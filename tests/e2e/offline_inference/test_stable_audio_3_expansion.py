@@ -7,7 +7,7 @@ This file mirrors tests/e2e/offline_inference/test_stable_audio_expansion.py for
 
 The DiT + SAME autoencoder are ported (see vllm_omni/diffusion/models/stable_audio_3/).
 Point ``STABLE_AUDIO_3_TEST_MODEL`` at a directory prepared by
-``examples/offline_inference/stable_audio_3/download_stable_audio_3.py`` (which writes
+``tools/download_stable_audio_3.py`` (which writes
 the ``model_index.json`` / ``transformer/config.json`` the engine needs); it defaults
 to the bare HF repo id otherwise.
 """

@@ -49,15 +49,15 @@ flowchart TD
 download via the helper script, which fetches the weights and writes both files:
 
 ```bash
-python download_stable_audio_3.py --output-dir ./stable-audio-3-medium
+python tools/download_stable_audio_3.py --output-dir ./stable-audio-3-medium
 ```
 
 ## Run
 
-Point the shared `text_to_audio.py` driver at the prepared local directory:
+Point the shared `text_to_audio.py` driver at the prepared local directory (from the repository root):
 
 ```bash
-python ../text_to_audio/text_to_audio.py \
+python examples/offline_inference/text_to_audio/text_to_audio.py \
     --model ./stable-audio-3-medium \
     --prompt "An ambient drone evolving slowly with shimmering overtones" \
     --audio-length 120.0 \

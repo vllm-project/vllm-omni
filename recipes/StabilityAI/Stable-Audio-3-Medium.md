@@ -51,7 +51,7 @@ discovery, so prepare a local directory with the helper script (it fetches the
 weights and writes both files):
 
 ```bash
-python examples/offline_inference/stable_audio_3/download_stable_audio_3.py \
+python tools/download_stable_audio_3.py \
     --output-dir ./stable-audio-3-medium
 ```
 

@@ -59,7 +59,7 @@ def main(output_dir: str, token: str | None) -> None:
 
     print(
         f"\nDone. Run inference with:\n"
-        f"  python ../text_to_audio/text_to_audio.py --model {output_dir} "
+        f"  python examples/offline_inference/text_to_audio/text_to_audio.py --model {output_dir} "
         f'--prompt "An ambient drone with shimmering overtones" --audio-length 30.0'
     )
 
