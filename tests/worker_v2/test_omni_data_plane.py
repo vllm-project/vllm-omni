@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 
@@ -735,11 +735,12 @@ def test_native_publication_retains_queued_mixed_batch(plane, monkeypatch, publi
     plane._can_send = True
     plane._full_payload_replace_keys_cached = frozenset()
     entered, release = threading.Event(), threading.Event()
+    gate_result: Future[bool] = Future()
     complete_outputs = plane.complete_outputs
 
     def delayed_complete(**kwargs):
         entered.set()
-        assert release.wait(timeout=5)
+        gate_result.set_result(release.wait(timeout=5))
         return complete_outputs(**kwargs)
 
     monkeypatch.setattr(plane, "complete_outputs", delayed_complete)
@@ -776,6 +777,9 @@ def test_native_publication_retains_queued_mixed_batch(plane, monkeypatch, publi
         assert entered.wait(timeout=5)
         # Publication has returned before transport consumes the payload. Only
         # the model output's aliases are cleared; the queued batch owns its data.
+        assert not gate_result.done(), "Consumer gate completed before publication returned"
+        # The recording send_chunks fake runs inside complete_outputs, which
+        # has not been called yet because it is behind the release event.
         assert not plane.record.batches
         assert result.inter_stage_outputs is None and result.pooler_output is None
         assert result.req_ids == req_ids and result.sampled_token_ids == tokens
@@ -785,6 +789,7 @@ def test_native_publication_retains_queued_mixed_batch(plane, monkeypatch, publi
             worker.close()
 
     plane.drain_outputs()
+    assert gate_result.result(), "Consumer timed out waiting for the publication check"
     plane.request_terminal(set(req_ids))
     delivered = {
         request.req_id: (request, payload)
