@@ -27,9 +27,10 @@ Component layout (mirrors upstream factory.py's assembly):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any, ClassVar
 
 import torch
@@ -87,6 +88,26 @@ def get_stable_audio_3_post_process_func(od_config: OmniDiffusionConfig):
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def seeded_global_rng(generator: torch.Generator | None, device: torch.device) -> Iterator[None]:
+    """Seed the global RNG from ``generator`` for the block, then restore it.
+
+    The SAME decoder samples noise while decoding (mask noise on the tokens it
+    upsamples, the bottleneck's noise regularization) from the global RNG, as
+    upstream does under a global seed. Seeding it from the request generator
+    makes a seeded request decode the same audio without leaving the process
+    RNG state changed.
+    """
+    if generator is None:
+        yield
+        return
+    seed = int(torch.randint(2**62, (1,), generator=generator, device=generator.device))
+    devices = [] if device.type == "cpu" else [device]
+    with torch.random.fork_rng(devices=devices, device_type=device.type if devices else "cuda"):
+        torch.manual_seed(seed)
+        yield
 
 
 class StableAudio3Pipeline(
@@ -445,7 +466,8 @@ class StableAudio3Pipeline(
         # The DiT runs in the engine compute dtype (e.g. bf16) but the SAME
         # autoencoder runs in fp32; cast latents to the VAE dtype before decode.
         vae_dtype = next(self.pretransform.parameters()).dtype
-        audio = self.pretransform.decode(latents.to(vae_dtype))
+        with seeded_global_rng(generator, latents.device):
+            audio = self.pretransform.decode(latents.to(vae_dtype))
 
         # --- 10. Trim + wrap ---------------------------------------------
         target_samples = int(duration * self.sample_rate)
