@@ -145,6 +145,10 @@ _MODEL_COEFFICIENTS = {
     # negative CFG calls paired within their own branch (10,640 consecutive-step
     # pairs), 4th-order np.polyfit (Pearson r = 0.87, R^2 = 0.80).
     # Not calibrated on stable-diffusion-3.5-large, which shares this class name.
+    # Fitted on x (relative L1 change of the modulated input) from 0.012 to 0.203;
+    # 99% of the pairs are below 0.19, and the largest come from the last step at
+    # 28 steps. The polynomial peaks near x = 0.18 and crosses zero near x = 0.244,
+    # so it is not reliable above about 0.2.
     "SD3Transformer2DModel": [
         -2.574165934925785e03,
         7.589663246807888e02,
