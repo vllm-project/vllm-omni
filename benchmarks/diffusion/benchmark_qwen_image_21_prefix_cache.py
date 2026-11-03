@@ -5,8 +5,9 @@
 
 Run each mode in a fresh process. Dense keeps its default decode graphs;
 timing includes completed image generation but excludes engine construction.
-Partial/full preparation requests are untimed. Capacity probes use two steps
-because only the stable Step-0 prefix is retained.
+Partial/full preparation requests are untimed. Preparations and capacity
+probes request two steps; a checkpoint's fixed sigma grid can override this.
+Only the stable Step-0 prefix is retained.
 """
 
 import argparse
@@ -153,7 +154,7 @@ def main():
     (args.output / "configuration.json").write_text(json.dumps(record, indent=2) + "\n")
     omni = None
 
-    def generate(images, *, steps=None):
+    def generate(images, *, steps=None, cache_salt=None):
         observation.clear()
         params = OmniDiffusionSamplingParams(
             height=args.size,
@@ -169,6 +170,7 @@ def main():
                 {
                     "prompt": "Combine the reference images into a watercolor painting.",
                     "negative_prompt": "blurry, low quality",
+                    "cache_salt": cache_salt,
                     "multi_modal_data": {"image": [image.copy() for image in images]},
                 },
                 params,
@@ -189,7 +191,9 @@ def main():
                     generate(images, steps=2)
                     if case == "partial":
                         images[-1] = reference(seed + args.references)
-                elapsed, array = generate(images)
+                # Different images still share the constant text preamble.
+                # Isolate cold trials so even that header cannot hit.
+                elapsed, array = generate(images, cache_salt=f"benchmark-cold-{seed}" if case == "cold" else None)
                 sample = {
                     "case": case,
                     "warmup": iteration < args.warmup,
