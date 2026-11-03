@@ -41,6 +41,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
 from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
     parse_bool_flag as _bool_flag,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     HISTORY_WINDOW,
     TalkerCodecDeviceState,
@@ -1085,6 +1086,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
+            hidden_states = unpack_handoff_tensor(hidden_states)
             # Cross-process stage transport serializes CPU tensors as lists.
             # Normalize both local tensor handoffs and transported payloads
             # before validating/building the Talker condition.
@@ -2040,7 +2042,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # runner neutralizes vLLM's MinTokensLogitsProcessor), so the request
         # floor must reach it. What is read here is the *resolved* request
         # parameter, not the raw caller object: the serving layer merges the
-        # deploy defaults into it first (serving_chat._apply_request_overrides)
+        # deploy defaults into it first (serving_chat._merge_llm_sampling_params)
         # and the offline entrypoint substitutes the stage defaults when the
         # caller passes no params at all (omni_base.resolve_sampling_params_list),
         # so the deployment minimum arrives as a positive ``min_tokens``.

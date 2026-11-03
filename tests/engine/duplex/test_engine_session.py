@@ -474,12 +474,74 @@ def test_truncate_history_item_uses_response_alignment_marks():
     item_id = f"item_{response_id}"
     session.register_history_item(item_id, committed)
 
+    revision = session.history_revision
     assert session.truncate_history_item(item_id, audio_end_ms=1_000) is True
+    assert session.history_revision > revision
 
     assert session.history[-1] == {"role": "assistant", "content": "hello"}
     assert session.history_item_ids[item_id] == {"role": "assistant", "content": "hello"}
+    revision = session.history_revision
     assert session.delete_history_item(item_id) is True
+    assert session.history_revision > revision
     assert session.history == ()
+
+
+def test_settings_revision_preserves_runtime_generation_and_rolls_back():
+    session = _session()
+    previous = session.config
+    revision = session.config_revision
+    generation = session.config_generation
+    session.replace_runtime_config({"internal_chunk": "next"})
+    assert session.config_revision == revision
+    assert session.config_generation == generation + 1
+    session.replace_config(DuplexSessionConfig(instructions="New instructions"))
+    assert session.config_revision == revision + 1
+    assert session.config_generation == generation + 2
+    session.restore_config(previous)
+    assert session.config is previous
+    assert session.config_revision == revision
+    assert session.config_generation == generation + 1
+
+
+def test_history_revision_tracks_append_and_same_length_edit():
+    session = _session()
+    revision = session.history_revision
+    message = {"role": "user", "content": "first"}
+    session.append_history_message(message)
+    assert session.history_revision > revision
+    session.register_history_item("input-1", message)
+    revision = session.history_revision
+    session.register_history_item("input-1", {"role": "user", "content": "other"})
+    assert session.history_revision > revision
+    assert session.history == ({"role": "user", "content": "other"},)
+
+
+def test_history_snapshot_aligns_item_identity_across_late_playback_materialization():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first = {"role": "user", "content": "same question"}
+    session.append_history_message(first)
+    session.register_history_item("q1", first)
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.reserve_history_item(item_id)
+    session.append_assistant_text("played answer")
+    session.mark_audio_sent(duration_ms=1_000, text_chars=13)
+    assert session.end_response(commit_text=True) is None
+    second = {"role": "user", "content": "same question"}
+    session.append_history_message(second)
+    session.register_history_item("q2", second)
+    session.append_history_message({"role": "user", "content": "anonymous"})
+    messages, item_ids = session.history_snapshot()
+    assert messages == session.history
+    assert item_ids == ("q1", "q2", None)
+
+    apply_playback_ack(session, {"response_id": response_id, "played_ms": 1_000})
+    messages, item_ids = session.history_snapshot()
+    assert messages == session.history
+    assert item_ids == ("q1", item_id, "q2", None)
+    assert messages[1]["content"] == "played answer"
+    assert session.delete_history_item(item_id)
+    assert session.history_snapshot()[1] == ("q1", "q2", None)
 
 
 @pytest.mark.parametrize("response_ended", [False, True])
@@ -519,8 +581,11 @@ def test_input_transcription_is_idempotent_and_does_not_restore_edited_items(edi
         session.register_history_item("spoken-input", replacement.message)
         assert session.input_audio_part("spoken-input") == audio_part
         assert session.input_audio_part("spoken-input") is not audio_part
+    revision = session.history_revision
     assert session.update_input_transcript("spoken-input", "Watch the pot.", audio_part=audio_part) is (edit is None)
+    assert session.history_revision == revision + int(edit is None)
     assert not session.update_input_transcript("spoken-input", "Watch the pot.", audio_part=audio_part)
+    assert session.history_revision == revision + int(edit is None)
     if edit is None:
         assert session.history[0]["content"][0]["transcript"] == "Watch the pot."
     elif edit == "replace":
@@ -639,7 +704,7 @@ def test_commit_append_rejects_stale_reservation():
         session.prepare_append(DuplexFence("sid-other", epoch=0, turn_id=0))
 
 
-def test_cancel_fence_releases_stage_requests_and_advances_identity():
+def test_prepare_cancel_fence_retains_stage_requests_until_release():
     session = _session("sid-cancel")
     cancelled = session.fence
     session.reserve_stage_request(0, "req-a", fence=cancelled)
@@ -648,16 +713,20 @@ def test_cancel_fence_releases_stage_requests_and_advances_identity():
     assert session.stage_request_submitted(0, "req-a") is False
     next_fence = DuplexFence("sid-cancel", epoch=1, turn_id=0)
 
-    stale = session.cancel_fence(cancelled, next_fence)
+    stale = session.prepare_cancel_fence(cancelled, next_fence)
 
     assert stale == ["req-a", "req-b"]
-    assert session.resource_request_ids() == []
+    assert session.resource_request_ids() == ["req-a", "req-b"]
     assert session.accepted_fence == next_fence
 
+    # Stage cleanup succeeds before the caller releases its resource records.
+    session.release_fence(cancelled)
+    assert session.resource_request_ids() == []
+
     with pytest.raises(DuplexFenceMismatchError):
-        session.cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
+        session.prepare_cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
     with pytest.raises(DuplexFenceMismatchError):
-        session.cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
+        session.prepare_cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
 
 
 def test_request_resource_keys_are_stage_id_and_request_id():
@@ -702,6 +771,7 @@ def test_as_public_dict_exposes_identity_capabilities_and_playback():
     assert payload["id"] == "duplex-public"
     assert payload["model"] == "m"
     assert payload["voice"] == "alloy"
+    assert payload["watermarking"] is True
     assert payload["state"] == "open"
     assert payload["turn_state"] == "assistant_playing"
     assert payload["epoch"] == 0
@@ -784,6 +854,20 @@ def test_from_realtime_uses_served_model_when_payload_has_none():
     assert config.model == "served-model"
     assert config.response_format == "pcm"
     assert config.idle_timeout_s == 300.0
+
+
+def test_realtime_session_watermarking_opt_out():
+    config = DuplexSessionConfig.from_realtime({"watermarking": False})
+    assert config.watermarking is False
+    assert config.normalized().watermarking is False
+
+    # Watermarking is fixed at open; updates may repeat or omit it, but not change it
+    config.apply_realtime_update({})
+    config.apply_realtime_update({"watermarking": False})
+    assert config.watermarking is False
+    with pytest.raises(DuplexConfigError, match="cannot change watermarking") as exc_info:
+        config.apply_realtime_update({"watermarking": True})
+    assert exc_info.value.code == "watermarking_update_unsupported"
 
 
 def test_from_realtime_ignores_client_chosen_session_ids():

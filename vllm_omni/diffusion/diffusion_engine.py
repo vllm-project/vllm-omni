@@ -67,8 +67,14 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import BaseScheduler, RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionRequestStatus, DiffusionSchedulerOutput
+from vllm_omni.diffusion.utils.pipeline_utils import (
+    pipeline_supports,
+    resolve_custom_pipeline_cls,
+    supports_pre_tokenized_prompt_ids,
+)
+from vllm_omni.diffusion.utils.prompt_utils import pre_tokenized_prompt_keys
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
-from vllm_omni.errors import client_error_from_metadata, is_client_error_status
+from vllm_omni.errors import OmniClientError, client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics.utils import (
     diffusion_scheduler_waiting_metrics,
@@ -147,38 +153,8 @@ def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
     )
 
 
-def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) -> type | None:
-    if not custom_pipeline_args or "pipeline_class" not in custom_pipeline_args:
-        return None
-
-    pipeline_cls = custom_pipeline_args["pipeline_class"]
-
-    if isinstance(pipeline_cls, type):
-        return pipeline_cls
-    if isinstance(pipeline_cls, str):
-        try:
-            return resolve_obj_by_qualname(pipeline_cls)
-        except (AttributeError, ImportError, ValueError) as exc:
-            raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
-    raise TypeError(
-        f"custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
-        f"got {type(pipeline_cls).__name__}"
-    )
-
-
 def supports_request_batch(od_config: OmniDiffusionConfig) -> bool:
-    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
-    if model_cls is not None:
-        return bool(getattr(model_cls, "supports_request_batch", False))
-
-    if uses_diffusers_adapter(od_config):
-        model_cls = DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
-        return bool(getattr(model_cls, "supports_request_batch", False))
-
-    model_cls = DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
-    if model_cls is None:
-        return False
-    return bool(getattr(model_cls, "supports_request_batch", False))
+    return pipeline_supports(od_config, "supports_request_batch")
 
 
 def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
@@ -190,7 +166,7 @@ def _max_num_seqs(od_config: OmniDiffusionConfig) -> int:
 
 def supports_request_cancellation(od_config: OmniDiffusionConfig) -> bool:
     """Whether the local pipeline checks cooperative cancellation boundaries."""
-    model_cls = _resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
+    model_cls = resolve_custom_pipeline_cls(getattr(od_config, "custom_pipeline_args", None))
     if model_cls is None:
         name = (
             "DiffusersAdapterPipeline"
@@ -322,6 +298,9 @@ class DiffusionEngine:
                 from the resolved execution mode.
         """
         self.od_config = od_config
+        # Whether admitted requests may carry OmniCustomPrompt.prompt_ids. Read
+        # once from the pipeline class so admission does not touch the registry.
+        self._supports_pre_tokenized_prompt_ids: bool | None = supports_pre_tokenized_prompt_ids(od_config)
         # Set after the paged-KV profile request has gone through model-owned
         # preprocessing. Real requests are admitted only within this measured
         # activation envelope: (max execution sequences, max seq_len,
@@ -801,6 +780,11 @@ class DiffusionEngine:
             except Exception as exc:
                 self._fail_engine(exc)
                 return
+            finally:
+                # Streams/async workers own delivered outputs. Keeping this
+                # local would also retain the previous video during execute_fn
+                # on the next iteration. Do not mutate the shared result.
+                del runner_output
 
             if not sched_output.scheduled_request_ids and self.scheduler._kv_draining_requests:
                 # Only exceptional in-flight receives need idle polling. New
@@ -1396,6 +1380,7 @@ class DiffusionEngine:
     def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         """Run model-owned preprocessing once, before entering Engine locks."""
 
+        self._validate_pre_tokenized_prompt(request)
         pre_process_func = getattr(self, "pre_process_func", None)
         if pre_process_func is not None:
             request = pre_process_func(request)
@@ -1407,6 +1392,29 @@ class DiffusionEngine:
         if self._prefix_cache_enabled() and prefix_cache_func is not None and request.diffusion_kv_requests:
             prefix_cache_func(request)
         return request
+
+    def _validate_pre_tokenized_prompt(self, request: OmniDiffusionRequest) -> None:
+        """Reject caller-tokenized ids that this pipeline would silently ignore (#7855).
+
+        Only pipelines declaring ``supports_pre_tokenized_prompt_ids = True``
+        read ``OmniCustomPrompt.prompt_ids``; everywhere else the request would
+        be accepted and generate from an empty or text-only condition. Failing
+        at admission turns that silent success into an HTTP 400. ``None`` means
+        the capability is unknown (undeclared custom pipeline) and is not checked.
+        """
+
+        supported = getattr(self, "_supports_pre_tokenized_prompt_ids", None)
+        if supported is None or supported:
+            return
+        populated = pre_tokenized_prompt_keys(request.prompt)
+        if populated:
+            model_name = getattr(self.od_config, "model_class_name", None) or "This diffusion pipeline"
+            raise OmniClientError(
+                f"{model_name} does not support pre-tokenized prompt ids; "
+                f"request {request.request_id!r} sets {', '.join(populated)}. "
+                "Pass text through `prompt`, or use a pipeline that declares "
+                "supports_pre_tokenized_prompt_ids = True."
+            )
 
     def _validate_diffusion_kv_profile_limits(self, request: OmniDiffusionRequest) -> None:
         """Keep admitted paged-KV requests within the profiled activation shape."""

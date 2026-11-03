@@ -420,6 +420,35 @@ def test_native_local_model_root_keeps_partition_layout(tmp_path):
     assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
 
 
+def test_native_local_model_root_with_modular_index_keeps_partition_layout(tmp_path):
+    # The official MiniMaxAI/MiniMax-H3 repository ships modular_model_index.json at its root.
+    root = tmp_path / "MiniMax-H3"
+    (root / "FL2VA" / "text_encoder").mkdir(parents=True)
+    (root / "FL2VA" / "text_encoder" / "config.json").write_text("{}", encoding="utf-8")
+    (root / "FL2VA" / "model_index.json").write_text("{}", encoding="utf-8")
+    (root / "Ref2VA").mkdir()
+    (root / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
+        encoding="utf-8",
+    )
+
+    assert is_minimax_h3_modular(str(root)) is False
+    assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
+    assert resolve_minimax_h3_diffusion_model_path(str(root), None, "fl2va") == str(root / "FL2VA")
+
+
+def test_empty_partition_dirs_do_not_override_modular_marker(tmp_path):
+    root = tmp_path / "FastH3"
+    (root / "FL2VA").mkdir(parents=True)
+    (root / "Ref2VA").mkdir()
+    (root / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
+        encoding="utf-8",
+    )
+
+    assert is_minimax_h3_modular(str(root)) is True
+
+
 def test_diffusion_resolver_returns_local_modular_root_without_partition_files(tmp_path):
     root = tmp_path / "FastH3"
     root.mkdir()
@@ -669,6 +698,73 @@ def test_native_load_weights_keeps_grouped_qkv_and_gate_first_layouts():
     torch.testing.assert_close(model.blocks[0].attn.qkv_proj.weight, expected_qkv)
     torch.testing.assert_close(model.blocks[0].mlp.fc1.weight, fc1)
     assert torch.equal(model.rope.inv_freq, torch.zeros(2))
+
+
+def test_native_load_weights_reorders_grouped_qkv_scales():
+    model, _, _ = _load_fixture(diffusers_weights=False)
+    qkv = model.blocks[0].attn.qkv_proj
+    qkv.weight_scale = nn.Parameter(torch.zeros(12, 2), requires_grad=False)
+
+    def scale_loader(param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str | None = None) -> None:
+        assert shard_id is None
+        param.data.copy_(loaded_weight)
+
+    qkv.weight_scale.weight_loader = scale_loader
+    grouped_scale = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+    loaded = model.load_weights([("blocks.0.attn.qkv_proj.weight_scale", grouped_scale)])
+
+    expected = torch.cat(
+        (
+            grouped_scale[:2],
+            grouped_scale[6:8],
+            grouped_scale[2:4],
+            grouped_scale[8:10],
+            grouped_scale[4:6],
+            grouped_scale[10:],
+        )
+    )
+    assert loaded == {"blocks.0.attn.qkv_proj.weight_scale"}
+    torch.testing.assert_close(qkv.weight_scale, expected)
+
+
+def test_native_load_weights_passes_through_per_tensor_qkv_scale():
+    model, _, _ = _load_fixture(diffusers_weights=False)
+    qkv = model.blocks[0].attn.qkv_proj
+    qkv.weight_scale = nn.Parameter(torch.zeros(1), requires_grad=False)
+    calls = []
+
+    def scale_loader(param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str | None = None) -> None:
+        assert shard_id is None
+        calls.append(loaded_weight.clone())
+        param.data.copy_(loaded_weight.reshape_as(param))
+
+    qkv.weight_scale.weight_loader = scale_loader
+    scale = torch.tensor(0.5)
+    loaded = model.load_weights([("blocks.0.attn.qkv_proj.weight_scale", scale)])
+
+    assert loaded == {"blocks.0.attn.qkv_proj.weight_scale"}
+    assert len(calls) == 1
+    torch.testing.assert_close(qkv.weight_scale, torch.tensor([0.5]))
+
+
+def test_native_load_weights_passes_through_per_tensor_fc1_scale():
+    model, _, _ = _load_fixture(diffusers_weights=False)
+    fc1 = model.blocks[0].mlp.fc1
+    fc1.weight_scale = nn.Parameter(torch.zeros(1), requires_grad=False)
+    calls = []
+
+    def scale_loader(param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int | None = None) -> None:
+        assert shard_id is None
+        calls.append(loaded_weight.clone())
+        param.data.copy_(loaded_weight.reshape_as(param))
+
+    fc1.weight_scale.weight_loader = scale_loader
+    scale = torch.tensor(0.25)
+    loaded = model.load_weights([("blocks.0.mlp.fc1.weight_scale", scale)])
+
+    assert loaded == {"blocks.0.mlp.fc1.weight_scale"}
+    assert len(calls) == 1
+    torch.testing.assert_close(fc1.weight_scale, torch.tensor([0.25]))
 
 
 def test_diffusers_load_weights_rejects_unknown_name():

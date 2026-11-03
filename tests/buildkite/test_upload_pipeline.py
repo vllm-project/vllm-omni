@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
+import ast
 import copy
+import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -490,53 +494,47 @@ def _iter_steps(doc: dict):
 
 
 @pytest.mark.parametrize(
-    "pipeline_path,legacy_keys,seed_tts_key",
+    "pipeline_path,legacy_keys",
     [
         (
             NIGHTLY_YAML,
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
-            "nightly-omni-performance-qwen3-seed-tts",
         ),
         (
             Path(".buildkite/cuda/test-weekly.yml"),
             {"weekly-omni-performance-vllm-text", "weekly-omni-performance-multi-replicas"},
-            None,
         ),
         (
             Path(".buildkite/npu/test-npu-nightly.yml"),
             {"nightly-omni-performance-no-async-chunk", "nightly-omni-performance-async-chunk"},
-            None,
         ),
     ],
 )
 @pytest.mark.parametrize(
-    "changed_file,select_legacy,select_seed_tts",
+    "changed_file,select_legacy",
     [
-        ("tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json", False, True),
-        ("vllm_omni/benchmarks/realtime_seed_tts.py", False, True),
-        ("vllm_omni/benchmarks/patch/patch.py", False, True),
-        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False, True),
-        ("vllm_omni/clients/duplex.py", False, True),
-        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False, True),
-        ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True, False),
-        ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True, False),
-        ("tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json", True, False),
-        ("tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json", True, False),
-        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True, True),
-        ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True, True),
-        ("tests/dfx/perf/scripts/run_benchmark.py", True, True),
+        ("vllm_omni/benchmarks/realtime_seed_tts.py", False),
+        ("vllm_omni/benchmarks/patch/patch.py", False),
+        ("vllm_omni/benchmarks/data_modules/seed_tts_dataset.py", False),
+        ("vllm_omni/clients/duplex.py", False),
+        ("vllm_omni/deploy/qwen3_omni_duplex.yaml", False),
+        ("tests/dfx/perf/tests/test_qwen3_omni_no_async_chunk.json", True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json", True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json", True),
+        ("tests/dfx/perf/tests/test_qwen3_omni_multi_replicas.json", True),
+        ("vllm_omni/model_executor/models/qwen3_omni/qwen3_omni.py", True),
+        ("vllm_omni/model_executor/models/common/qwen3_code_predictor.py", True),
+        ("tests/dfx/perf/scripts/run_benchmark.py", True),
     ],
 )
 def test_qwen3_perf_pipeline_selection(
     monkeypatch: pytest.MonkeyPatch,
     pipeline_path: Path,
     legacy_keys: set[str],
-    seed_tts_key: str | None,
     changed_file: str,
     select_legacy: bool,
-    select_seed_tts: bool,
 ) -> None:
-    """Isolate Seed-TTS inputs across real CUDA/NPU pipelines, retaining shared model inputs."""
+    """Keep realtime-only inputs from selecting legacy CUDA/NPU perf jobs."""
     monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
     _load_source_file_dependencies.cache_clear()
     doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
@@ -545,11 +543,8 @@ def test_qwen3_perf_pipeline_selection(
 
     # Compare the dependency-filtered Qwen perf jobs. The weekly random job has
     # no source dependencies and remains unconditional under source filtering.
-    tracked_keys = legacy_keys | ({seed_tts_key} if seed_tts_key else set())
     expected_keys = set(legacy_keys) if select_legacy else set()
-    if select_seed_tts and seed_tts_key:
-        expected_keys.add(seed_tts_key)
-    assert surviving_keys & tracked_keys == expected_keys
+    assert surviving_keys & legacy_keys == expected_keys
 
 
 def test_amd_wan22_merge_jobs_have_independent_cold_start_budgets() -> None:
@@ -647,6 +642,8 @@ def test_pipeline_source_file_dependency_keys_are_registered() -> None:
         | _pipeline_dep_keys(Path(".buildkite/cuda/test-merge.yml"))
         | _pipeline_dep_keys(Path(".buildkite/cuda/test-nightly.yml"))
         | _pipeline_dep_keys(Path(".buildkite/cuda/test-weekly.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/amd/test-amd-nightly.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/amd/test-amd-weekly.yml"))
         | _pipeline_dep_keys(Path(".buildkite/npu/test-npu-nightly.yml"))
     )
     missing = used - set(registry)
@@ -668,6 +665,90 @@ def test_source_file_dependencies_key_expands_from_registry() -> None:
         ["vllm_omni/diffusion/models/qwen_image/transformer.py"],
     )
     assert "Diffusion · Qwen Image Test" not in _surviving_labels(doc, ["vllm_omni/unrelated.py"])
+
+
+@pytest.mark.parametrize("pipeline", ["test-ready.yml", "test-merge.yml", "test-nightly.yml"])
+def test_sensenova_accuracy_is_not_in_daily_pipelines(pipeline: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(".buildkite/cuda") / pipeline
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=None, pipeline_path=path)
+    assert not any("SenseNova-U1" in step.get("label", "") for step in _iter_steps(rendered))
+
+
+@pytest.mark.parametrize("mode", ["text2img", "img2img"])
+def test_sensenova_accuracy_uses_weekly_mark(mode: str) -> None:
+    path = Path(f"tests/e2e/offline_inference/test_sensenova_u1_{mode}_expansion.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    case = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == f"test_sensenova_u1_{mode}_pixel_accuracy"
+    )
+    marks = {ast.unparse(mark) for mark in case.decorator_list}
+    assert "pytest.mark.slow" in marks
+    assert not marks & {"pytest.mark.core_model", "pytest.mark.advanced_model", "pytest.mark.full_model"}
+
+
+@pytest.mark.parametrize(
+    ("smoke_exit", "text2img_exit", "img2img_exit", "expected_exit"),
+    [(0, 0, 0, 0), (17, 0, 0, 17), (0, 23, 0, 23), (0, 0, 31, 31), (17, 23, 31, 17)],
+)
+def test_sensenova_weekly_runs_each_accuracy_case_once_and_preserves_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    smoke_exit: int,
+    text2img_exit: int,
+    img2img_exit: int,
+    expected_exit: int,
+) -> None:
+    monkeypatch.delenv("MIRROR_HW", raising=False)
+    path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=None, pipeline_path=path, e2e_only=True)
+    group = next(step for step in rendered["steps"] if "E2E" in step.get("group", ""))
+    assert group["if"] == 'build.env("NON_CRITICAL") == "1"'
+    steps = [step for step in _iter_steps(rendered) if "SenseNova-U1" in step.get("label", "")]
+    assert len(steps) == 1
+    step = steps[0]
+    assert step["artifact_paths"] == ["sensenova-accuracy/**/*"]
+    calls_path = tmp_path / "pytest-calls.jsonl"
+    # Run the actual weekly shell command with a lightweight pytest executable:
+    # this checks failure propagation without importing vLLM or requiring a GPU.
+    (tmp_path / "pytest").write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['PYTEST_CALLS'], 'a') as output:\n"
+        "    output.write(json.dumps({'args': sys.argv[1:], 'artifacts': os.environ.get('SENSENOVA_U1_ARTIFACT_DIR')}) + '\\n')\n"
+        "args = ' '.join(sys.argv[1:])\n"
+        "case = 'TEXT2IMG' if 'text2img_pixel_accuracy' in args else 'IMG2IMG' if 'img2img_pixel_accuracy' in args else 'SMOKE'\n"
+        "sys.exit(int(os.environ['EXIT_' + case]))\n"
+    )
+    (tmp_path / "pytest").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("PYTEST_CALLS", str(calls_path))
+    monkeypatch.setenv("BUILDKITE_COMMIT", "test-head")
+    for case, status in (("SMOKE", smoke_exit), ("TEXT2IMG", text2img_exit), ("IMG2IMG", img2img_exit)):
+        monkeypatch.setenv(f"EXIT_{case}", str(status))
+    # Hardware expansion prepends GPU runtime checks. Exercise the workload
+    # script itself here; Buildkite unescapes $$ before the agent executes it.
+    source_step = next(source for source in _iter_steps(doc) if source.get("label") == step["label"])
+    command = "\n".join(source_step["commands"]).replace("$$", "$")
+    result = subprocess.run(["bash", "-e", "-c", command], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == expected_exit, result.stderr
+    calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+    assert len(calls) == 3
+    assert all(call["artifacts"] == "sensenova-accuracy" for call in calls)
+    smoke_args = calls[0]["args"]
+    assert smoke_args[smoke_args.index("-k") + 1] == "not pixel_accuracy"
+    for call, mode in zip(calls[1:], ("text2img", "img2img")):
+        args = call["args"]
+        assert args[1] == (
+            f"tests/e2e/offline_inference/test_sensenova_u1_{mode}_expansion.py"
+            f"::test_sensenova_u1_{mode}_pixel_accuracy"
+        )
+        assert args[args.index("-m") + 1] == "slow and diffusion and cuda and H100 and cards_1"
+        assert args[args.index("--run-level") + 1] == "full_model"
 
 
 def test_registry_lists_pytest_targets() -> None:

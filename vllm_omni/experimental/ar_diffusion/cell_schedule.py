@@ -2,19 +2,35 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pure-function cell timetable, Latest-KV visibility, and transfer plan.
 
-No torch. ``S ∈ {1, T+1}``. Schedule/KV unit is cell ``(chunk, step, block)``.
+No torch. ``D`` = noisy denoise steps. Schedule/KV unit is cell ``(chunk, step,
+block)``; the clean step at step ``D`` is an ordering property, independent of
+``H`` (Self-Forcing and Latest-KV always run it; Same-Step runs a
+first-chunk-only clean sink). Weight
+split: PP layer-groups ``G``, each coarse ``(c, s)`` expands to local blocks;
+``world = S·G``.
 
-* Weight split: PP layer-groups ``G``; each coarse ``(c,s)`` expands to local blocks.
-* ``S = 1``: layer PP. ``S = T+1``: one replica per denoise/clean step.
-* ``SELF_FORCING``: one chunk in flight (Self-Forcing / clean history);
-  ``LATEST_KV``: diagonal Latest-KV (may P2P KV across stages);
-  ``SAME_STEP``: same diagonal topology, matching-step history only — always
-  local to the consumer rank, so no KV transfers.
+Deployment paths (schedule ↔ topology pairs; clean is derived):
+
+| Ordering       | ``S``     | clean          | ``H``       | topology / deploy |
+| -------------- | --------- | -------------- | ----------- | ----------------- |
+| self_forcing   | ``1``     | on             | any         | layer PP × ``G``; ``causvid_wan_self_forcing.yaml`` |
+| latest_kv      | ``D+1``   | on             | any         | P2P-KV diagonal + clean; ``causvid_wan_latest_kv.yaml`` |
+| same_step      | ``D``     | chunk-0 sink  | any         | vertical with a chunk-0 clean sink |
+
+Rejected fast in ``CellSchedule.__post_init__``:
+
+* ``self_forcing`` with ``S > 1`` (Self-Forcing is single-replica layer PP;
+  vertical step replicas are the Latest-KV / Same-Step topology).
+* ``latest_kv`` with ``S != D+1`` (Latest-KV is the vertical clean topology;
+  ``S=1`` layer PP is ``self_forcing``, ``same_step`` uses a first-chunk sink).
+* ``same_step`` with ``S != D`` (sink reuses the last replica; ``S=1`` only when ``D=1``).
+* ``S`` outside ``{1, D, D+1}``. ``H`` is free (any ``≥ 0`` window on any
+  topology — it is independent of both the ordering and the clean step).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import lru_cache
 
@@ -26,6 +42,11 @@ class Ordering(str, Enum):
     SELF_FORCING = "self_forcing"
     LATEST_KV = "latest_kv"
     SAME_STEP = "same_step"
+
+
+def cfg_step_replicas(cfg: dict) -> int:
+    """Read ``step_replicas`` from ``ar_diffusion_stage_config``."""
+    return int(cfg.get("step_replicas", 1) or 1)
 
 
 @dataclass(frozen=True)
@@ -53,13 +74,13 @@ class RequestKVTransfer:
 class CellSchedule:
     chunks: int
     num_denoise_steps: int
-    stages: int
+    step_replicas: int
     layer_groups: int
     ordering: Ordering
     kv_history_chunks: int
     #: Total DiT blocks. Default ``layer_groups`` ⇒ one block per group (K=1).
     blocks: int | None = None
-    #: Contiguous blocks per rank in a stage. Default ``1``.
+    #: Blocks per rank in a replica (default ``1``).
     blocks_per_rank: int | None = None
 
     def __post_init__(self) -> None:
@@ -71,11 +92,30 @@ class CellSchedule:
             raise ValueError(f"layer_groups must be positive, got {self.layer_groups}")
         if self.kv_history_chunks < 0:
             raise ValueError(f"kv_history_chunks must be non-negative, got {self.kv_history_chunks}")
-        t_plus_1 = self.num_denoise_steps + 1
-        if self.stages not in (1, t_plus_1):
-            raise ValueError(f"stages must be 1 or num_denoise_steps+1 ({t_plus_1}), got {self.stages}")
-        if self.stages > 1 and self.kv_history_chunks < 1:
-            raise ValueError("vertical slice (S > 1) requires kv_history_chunks > 0")
+        d = self.num_denoise_steps
+        d_plus_1 = d + 1
+        if self.step_replicas not in (1, d, d_plus_1):
+            raise ValueError(
+                f"step_replicas must be 1, num_denoise_steps ({d}), or D+1 ({d_plus_1}), got {self.step_replicas}"
+            )
+        if self.ordering is Ordering.SELF_FORCING and self.step_replicas > 1:
+            # Self-Forcing is single-replica (layer PP); vertical step replicas
+            # are the Latest-KV / Same-Step (diagonal) topology. Reject up
+            # front so the error names the ordering, not a flag.
+            raise ValueError(
+                f"self_forcing requires step_replicas=1 (layer PP), got {self.step_replicas}; "
+                "vertical replicas use latest_kv or same_step"
+            )
+        if self.ordering is Ordering.LATEST_KV and self.step_replicas != d_plus_1:
+            # Latest-KV is the vertical clean-history topology (S=D+1);
+            # S=1 layer PP is self_forcing, same_step uses a first-chunk sink.
+            raise ValueError(
+                f"latest_kv requires step_replicas=D+1 ({d_plus_1}) for clean history, got {self.step_replicas}"
+            )
+        if self.ordering is Ordering.SAME_STEP and self.step_replicas != d:
+            # Same-Step uses S=D and reuses its final replica for the sink.
+            # Reject up front so the error names the ordering.
+            raise ValueError(f"same_step requires step_replicas=D ({d}) for the vertical, got {self.step_replicas}")
         blocks = self.layer_groups if self.blocks is None else self.blocks
         k = 1 if self.blocks_per_rank is None else self.blocks_per_rank
         if blocks < 1:
@@ -94,6 +134,11 @@ class CellSchedule:
     def num_blocks(self) -> int:
         assert self.blocks is not None
         return self.blocks
+
+    @property
+    def num_schedule_steps(self) -> int:
+        """Step-ID bound; with a Same-Step sink, only chunk 0 uses step ``D``."""
+        return self.num_denoise_steps + int(self.ordering is not Ordering.SAME_STEP or self.chunks > 1)
 
 
 @dataclass(frozen=True)
@@ -125,7 +170,7 @@ class CellPlan:
         self._wait_ready = wait_ready
         self.num_slots = len(slots)
         self.num_ticks = self.num_slots
-        self.world = schedule.stages * schedule.layer_groups
+        self.world = schedule.step_replicas * schedule.layer_groups
 
     def task(self, slot: int, rank: int) -> Cell | None:
         if slot < 0 or slot >= self.num_slots:
@@ -156,8 +201,10 @@ class CellPlan:
         return self._wait_ready.get(rank, {}).get(slot, frozenset())
 
 
-def stage_of(step: int, schedule: CellSchedule) -> int:
-    return 0 if schedule.stages == 1 else step
+def replica_of(step: int, schedule: CellSchedule) -> int:
+    if schedule.ordering is Ordering.SAME_STEP and step == schedule.num_denoise_steps:
+        step -= 1
+    return 0 if schedule.step_replicas == 1 else step
 
 
 @lru_cache(maxsize=128)
@@ -181,9 +228,9 @@ def group_of_block(block: int, schedule: CellSchedule) -> int:
 
 
 def rank_of(step: int, layer_group: int, schedule: CellSchedule) -> int:
-    if schedule.stages == 1:
+    if schedule.step_replicas == 1:
         return layer_group
-    return step * schedule.layer_groups + layer_group
+    return replica_of(step, schedule) * schedule.layer_groups + layer_group
 
 
 def rank_of_block(step: int, block: int, schedule: CellSchedule) -> int:
@@ -212,7 +259,7 @@ def _is_diagonal(ordering: Ordering) -> bool:
 
 
 def _s1_jobs(schedule: CellSchedule) -> list[tuple[int, int]]:
-    steps = schedule.num_denoise_steps + (1 if schedule.kv_history_chunks > 0 else 0)
+    steps = schedule.num_denoise_steps if schedule.ordering is Ordering.SAME_STEP else schedule.num_schedule_steps
     chunks = schedule.chunks
     if schedule.ordering is Ordering.SELF_FORCING:
         return [(chunk, step) for chunk in range(chunks) for step in range(steps)]
@@ -256,7 +303,7 @@ def _plan_s1_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int] | Non
 def _plan_vertical_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
     """Diagonal (vertical) placement at layer-group granularity (before block expand)."""
     n = schedule.chunks
-    s = schedule.stages
+    s = schedule.step_replicas
     g = schedule.layer_groups
     world = s * g
     num_slots = n + world - 1
@@ -268,26 +315,6 @@ def _plan_vertical_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int]
             if 0 <= chunk < n:
                 row[rank] = (chunk, rank // g)
         slots.append(tuple(row))
-    return tuple(slots)
-
-
-def _plan_vertical_serial_coarse(schedule: CellSchedule) -> tuple[tuple[tuple[int, int] | None, ...], ...]:
-    unit = _plan_vertical_coarse(
-        CellSchedule(
-            chunks=1,
-            num_denoise_steps=schedule.num_denoise_steps,
-            stages=schedule.stages,
-            layer_groups=schedule.layer_groups,
-            ordering=Ordering.LATEST_KV,
-            kv_history_chunks=schedule.kv_history_chunks,
-            blocks=schedule.num_blocks,
-            blocks_per_rank=schedule.blocks_per_rank,
-        )
-    )
-    slots: list[tuple[tuple[int, int] | None, ...]] = []
-    for chunk in range(schedule.chunks):
-        for row in unit:
-            slots.append(tuple((chunk, task[1]) if task is not None else None for task in row))
     return tuple(slots)
 
 
@@ -307,7 +334,7 @@ def _expand_to_cells(
                     fine.append(None)
                     continue
                 chunk, step = task
-                g = rank if schedule.stages == 1 else rank % g_size
+                g = rank if schedule.step_replicas == 1 else rank % g_size
                 start, end = _block_range(schedule.num_blocks, g, g_size)
                 if k < end - start:
                     fine.append((chunk, step, start + k))
@@ -336,13 +363,18 @@ def _history_step(
 ) -> int | None:
     """Pick history step for ``prev`` at ``task``'s block, or ``None`` if unread."""
     _chunk, step, block = task
-    t_clean = schedule.num_denoise_steps
+    if schedule.ordering is Ordering.SAME_STEP and prev == 0:
+        return schedule.num_denoise_steps
     if schedule.ordering is Ordering.SAME_STEP:
         # Matching step only; producer shares the consumer rank (no KV P2P).
         if completions.get((prev, step, block), 10**9) < tick:
             return step
         return None
-    candidates = [s_prime for s_prime in range(t_clean + 1) if completions.get((prev, s_prime, block), 10**9) < tick]
+    candidates = [
+        s_prime
+        for s_prime in range(schedule.num_schedule_steps)
+        if completions.get((prev, s_prime, block), 10**9) < tick
+    ]
     if not candidates:
         return None
     # Latest-KV (and Self-Forcing serial, which only exposes clean by then).
@@ -358,7 +390,7 @@ def _sources_and_transfers(
     sources: dict[tuple[int, Cell], tuple[KVSource, ...]] = {}
     transfer_acc: dict[int, list[KVTransfer]] = {}
     seen: set[tuple[Cell, int]] = set()
-    if h < 1:
+    if h < 1 and schedule.ordering is not Ordering.SAME_STEP:
         return sources, {}
 
     for t, row in enumerate(slots):
@@ -367,7 +399,10 @@ def _sources_and_transfers(
                 continue
             chunk, _step, block = task
             found: list[KVSource] = []
-            for prev in range(max(0, chunk - h), chunk):
+            history = list(range(max(0, chunk - h), chunk))
+            if schedule.ordering is Ordering.SAME_STEP and chunk > 0 and 0 not in history:
+                history.insert(0, 0)
+            for prev in history:
                 s_star = _history_step(schedule, task, prev, completions, t)
                 if s_star is None:
                     continue
@@ -403,9 +438,12 @@ def next_consumed(
     rank: int,
 ) -> set[Cell]:
     upcoming = _slot_or_empty(slots, slot + 1)
-    if rank >= len(upcoming) or upcoming[rank] is None:
+    if rank >= len(upcoming):
         return set()
-    return {src.version for src in sources.get((rank, upcoming[rank]), ())}
+    task = upcoming[rank]
+    if task is None:
+        return set()
+    return {src.version for src in sources.get((rank, task), ())}
 
 
 def _slot_or_empty(
@@ -423,7 +461,7 @@ def _last_use(
     transfers: dict[int, tuple[KVTransfer, ...]],
     schedule: CellSchedule,
 ) -> dict[int, dict[Cell, int]]:
-    world = schedule.stages * schedule.layer_groups
+    world = schedule.step_replicas * schedule.layer_groups
     last: dict[int, dict[Cell, int]] = {rank: {} for rank in range(world)}
     for t, row in enumerate(slots):
         for rank, task in enumerate(row):
@@ -440,11 +478,10 @@ def _last_use(
 
 def _assert_invariants(plan: CellPlan) -> None:
     schedule = plan.schedule
-    h = schedule.kv_history_chunks
     for t in range(plan.num_slots):
         for rank in range(plan.world):
             task = plan.task(t, rank)
-            if task is None or h < 1:
+            if task is None:
                 continue
             for src in plan.sources(task, rank):
                 p = plan.completion_tick(src.version)
@@ -464,20 +501,42 @@ def _assert_invariants(plan: CellPlan) -> None:
             posted.add(key)
 
 
-def build_cell_plan(schedule: CellSchedule) -> CellPlan:
-    if schedule.stages == 1:
+def _cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
+    if schedule.ordering is Ordering.SAME_STEP:
+        head = _base_cell_slots(replace(schedule, chunks=1))
+        if schedule.chunks == 1:
+            return head
+        # One clean pass, on the final noisy replica; never allocate a clean
+        # replica or run clean forwards for subsequent chunks.
+        clean = []
+        for block in range(schedule.num_blocks):
+            row: list[Cell | None] = [None] * (schedule.step_replicas * schedule.layer_groups)
+            row[rank_of_block(schedule.num_denoise_steps, block, schedule)] = (0, schedule.num_denoise_steps, block)
+            clean.append(tuple(row))
+        tail = _base_cell_slots(replace(schedule, chunks=schedule.chunks - 1))
+        shifted = tuple(
+            tuple(None if cell is None else (cell[0] + 1, cell[1], cell[2]) for cell in row) for row in tail
+        )
+        return (*head, *clean, *shifted)
+    return _base_cell_slots(schedule)
+
+
+def _base_cell_slots(schedule: CellSchedule) -> tuple[tuple[Cell | None, ...], ...]:
+    if schedule.step_replicas == 1:
         coarse = _plan_s1_coarse(schedule)
-    elif schedule.ordering is Ordering.SELF_FORCING:
-        coarse = _plan_vertical_serial_coarse(schedule)
     elif _is_diagonal(schedule.ordering):
         coarse = _plan_vertical_coarse(schedule)
     else:
         raise ValueError(f"unsupported ordering {schedule.ordering}")
-    slots = _expand_to_cells(coarse, schedule)
+    return _expand_to_cells(coarse, schedule)
+
+
+def build_cell_plan(schedule: CellSchedule) -> CellPlan:
+    slots = _cell_slots(schedule)
     completions = _completions(slots)
     sources, transfers = _sources_and_transfers(slots, completions, schedule)
     last_use = _last_use(slots, sources, transfers, schedule)
-    world = schedule.stages * schedule.layer_groups
+    world = schedule.step_replicas * schedule.layer_groups
     # Await remote KV at the tick before first consumption — not only when the
     # transfer lands in the same slot as next-tick consume (cell expand breaks that).
     wait_ready: dict[int, dict[int, frozenset[Cell]]] = {rank: {} for rank in range(world)}

@@ -285,6 +285,117 @@ stops retaining output PCM for calibration. Broader language, boundary and
 sustained-load validation is still needed before enabling either strategy by
 default.
 
+## JoyAI visual and conversation memory
+
+JoyAI keeps three levels of visual memory: accepted observation frames, summaries
+of consecutive frame chunks, and longer-term summaries of those chunks. It uses
+the deployed JoyAI VLM stage for both summarization levels. Auxiliary requests
+finish at that stage and keep their outputs private to the session.
+
+The visual policy follows the experimental JoyAI serving profile: up to 100
+frames per chunk, five chunk summaries per long-term block, and the latest 15
+long-term blocks. Both summary levels allow up to 4,000 generated tokens. Frames
+are normalized to RGB with an area of at most 262,144 pixels. Every frame in a
+selected chunk participates in summarization. When the deployed context or image
+limit requires it, the plugin closes a shorter consecutive chunk and leaves the
+remaining frames for the next chunk. Chunk indices and session-relative time
+ranges preserve their order. These times record server acceptance of observations.
+
+The VLM stage's `limit_mm_per_prompt.image` is the per-request image ceiling for
+both interaction and summarization. For example, setting it to 32 in the stage's
+`engine_args` closes chunks at 32 frames or earlier when the context budget is
+reached. With a ceiling of 100 or higher, the 100-frame working-chunk policy is
+the count limit; context and retained-byte budgets can still close chunks earlier.
+
+Opening a JoyAI session validates the VLM stage's memory budget. The image ceiling
+must be at least one, and `max_model_len` must fit both a single-image summary and
+the compression of two 4,000-token summaries with up to 4,000 output tokens, plus
+prompt overhead. A smaller context that can serve ordinary interaction requests
+may therefore be rejected. Retrying a failed or cancelled initialization does not
+bypass these checks. An image ceiling of zero is rejected before processor loading.
+Context-budget errors are cached for the deployed stage so repeated session opens
+fail fast; transient loading failures and cancelled initialization remain retryable.
+
+Only a successful, source-valid summary retires its input frames or summaries.
+The pending-frame buffer retains at most 200 frames and 32 MiB of losslessly
+encoded PNG data per session. Prompt-preparation workers decode selected frames for inference.
+The session limit bounds this retained frame storage across sessions (for example,
+256 MiB at eight sessions), separately from temporary model-input allocations.
+Encoded storage reaching half its budget schedules an earlier frame summary.
+Reaching a retention limit returns a recoverable capacity
+error; the client can retry after summarization progresses. Visual failures retry
+after 1, 5, and 30 seconds, then once every 60 seconds while retaining their source.
+Failures are logged on the server; successful retries let camera-only sessions
+resume memory processing. Public responses continue independently.
+Observation-only camera commits can queue alongside summarization. An admissible
+user turn preempts it after prompt preparation, so interactive work takes priority
+even with one stage slot. A rejected observation leaves the in-flight summary
+running to release capacity for a retry.
+
+Recent raw frames and chunk summaries provide the observation context. Frames
+retain their timestamps and silent actions in observation order. Accepted memory
+is prepended to the first user message, following the experimental working-chunk
+format; played answers come from the shared Session conversation history. Closing
+a working chunk moves its committed question/answer references into the archived
+Q&A prefix and starts a fresh interactive view. The old encoded frames remain
+available privately for consolidation and retries until a valid summary succeeds.
+While consolidation is pending, prompts use the new working chunk, previously
+accepted summaries, and the archived Q&A. The latest user instruction stays active
+for subsequent observations.
+When context is tight, older Q&A and derived summaries yield space to that
+instruction and the current observation. Omitting a summary rebudgets the recent
+Q&A against the freed space; the accepted summary remains available in memory.
+The model keeps bounded item identities and timestamps for this ordering; playback
+corrections and deletions apply to the text resolved for every new prompt. A current
+user query also includes long-term visual memory, subject to the deployed context
+budget. Conversation image edits revoke derived visual memory. Summaries
+are lossy; same-stage summarization quality should be validated for the application.
+
+Speech turns use the same bounded recent-text selection and accepted text/visual
+summaries. The ASR stage supplies the new query before the JoyAI stage performs
+the final token-budget check. The initial standing instruction stays outside
+evictable history; older turns and derived memory yield space to that instruction
+and the transcribed query. As with text input, budgeting removes older history,
+then the text summary, then visual summary blocks oldest-first, and rebudgets
+recent history against the remaining space.
+
+### Committed conversation text
+
+The JoyAI duplex plugin preserves at least eight recent text messages and consolidates
+older committed conversation into one summary of at most 512 generated tokens.
+Camera-only commits with no text do not count toward that recent-message window.
+Each consolidation handles at most eight more text messages, advancing past
+textless camera observations and older text-bearing silent turns in the history, and uses JoyAI's own
+deployed stage, with a separate request that ends before speech synthesis.
+Chunk and context-budget boundaries keep each question with its recorded answer.
+An exchange that exceeds the compression prompt budget is processed in bounded
+text excerpts. A private summary of at most 512 tokens carries progress between
+excerpts; the public summary and coverage advance together after the full
+exchange has been processed. Source edits invalidate this intermediate progress.
+There is at most one such request per session and no queue of older snapshots.
+The previous summary remains available if consolidation fails or times out.
+A failed attempt may retry after committed history or session context changes,
+but unchanged heartbeats do not trigger immediate retries.
+The normal prompt keeps at most sixteen unsummarized text messages (the recent
+eight plus one summary chunk), subject to the model context budget. The complete
+backlog remains in the session ledger for successive summary requests to process.
+
+Standing instructions and the current user query remain explicit in the normal
+interaction prompt. Summary input contains committed conversation text, not
+unplayed generated speech or retained image/audio payloads. With JoyAI's current
+all-sync audio output, the assistant transcript becomes eligible only after the
+complete audio has been acknowledged. Playback corrections and conversation
+edits invalidate summaries derived from the changed text; newer appended turns
+can coexist with consolidation of an unchanged older prefix.
+
+The text summary and model-input context are bounded; the underlying Session
+conversation ledger retains its source items. Visual facts can also enter the
+separate three-level visual memory described above. Text consolidation runs during
+idle time; frequent interactions can delay it.
+If instructions and the current observation exhaust the context budget, derived
+memory is omitted. Pending delegated tool calls require the shared tool lifecycle
+adapter and are not synthesized by memory consolidation.
+
 ## Quick Start
 
 ### Start the Server
@@ -316,6 +427,60 @@ set `session_mode: turn` in a deploy configuration derived from the model's
 profile. This selects `AsyncOmni` and the ordinary API initialization instead
 of the duplex handler. See [Full Duplex](full_duplex_api.md#enable-full-duplex)
 for the command and configuration requirements.
+
+#### Compare MiniCPM-o attention backends
+
+The default `minicpmo_4_5.yaml` selects Triton attention for the CUDA Thinker
+(stage 0). The Talker's backend selection and graph settings are unchanged.
+The vision tower defaults to reference attention for CUDA BF16 duplex sessions to
+preserve long-video scene recognition. Turn-mode and non-CUDA vision use
+SDPA by default; explicit engine or vision overrides still win. The turn-mode
+profile also inherits the CUDA Thinker's Triton backend from the base
+deployment. NPU backend selection is unchanged.
+
+The reference vision path fuses scaling and softmax for unmasked CUDA BF16
+inputs, preserving BF16 score/probability rounding and FP32 accumulation.
+Encoder CUDA graphs remain enabled. This avoids the full FP32 probability
+buffer used by eager attention, but still materializes attention scores and
+can reduce vision throughput compared with SDPA at larger image batches.
+An explicit `vision_config._attn_implementation="sdpa"` keeps the SDPA path.
+
+With reference vision attention, `vision_fused_layers: true` does not enable
+fused encoder layers: `supports_fused_layers()` excludes this attention backend.
+This also applies to the `minicpmo_4_5_duplex_h200.yaml` profile. Packed encoding,
+vision CUDA graphs and the fused scaled softmax remain enabled in that profile.
+Selecting SDPA explicitly allows fused encoder layers, but can change BF16 vision
+outputs and requires rechecking long-video recognition for the workload.
+
+To compare vLLM's automatic Thinker backend selection, save the following as
+`minicpmo_thinker_auto.yaml`, replacing the base path with your checkout:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/minicpmo_4_5.yaml
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        attention_backend: null
+```
+
+Pass `--deploy-config minicpmo_thinker_auto.yaml` to the server command above.
+A server-wide `--attention-backend` override also affects the Talker, so it is
+a different experiment. Check each stage's startup log for the actual backend
+and graph mode.
+
+For a quality comparison, keep the source and model revisions, reference audio,
+input audio/video, frame rate, pacing, window settings and sampling parameters
+the same. Compare several matched seeds and repeat sessions after a fresh server
+start. Evaluate replies against the scene and question timestamps: a later
+answer can describe a scene that changed while the model was responding.
+
+A changed sampled transcript alone does not establish an attention-backend
+defect or a general quality improvement. Validate graph-enabled serving
+separately from eager serving, and record the topology actually tested.
+Successful `response.done` events establish protocol completion, not correct
+recognition or complete sentences. This overlay is a comparison tool, not a
+confirmed fix for recognition errors or post-commit drain timeouts.
 
 ### Multiple Frontends
 
@@ -1001,6 +1166,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | --- | --- | --- |
 | `session.update` | 2 | Open handshake on first send (creates the session); later sends reconfigure it. OpenAI name; `session` object carries vLLM-Omni keys (`ref_audio`, `overlap_policy`, `playback_commit_policy`, `extra_body`, ...). |
 | `session.heartbeat` | 3 | Keepalive; refreshes the engine session lease. |
+| `session.stats.get` | 3 | Ask for the session's server-side stage work and audio by turn (no fields; returns every retained turn, up to the last 256); answered with `session.stats`. Needs `capabilities.supports_session_stats` (deploy `duplex_session.collect_stats: true`, single-host deployments only), otherwise `error` `session_stats_disabled`. |
 | `session.event_ack` | 3 | Acknowledges received server events by `server_event_seq`; trims the resume replay journal. |
 | `session.close` | 3 | Graceful close; answered with `session.closed`. |
 | `session.resume` | 3 | Re-attach a live session on a new socket (`session_id`, `resume_token`, `last_received_server_event_seq`). |
@@ -1028,6 +1194,7 @@ formats (`pcm16`, `pcm_s16le`, `s16le`, `pcm_f32le`, `g711_ulaw`,
 | `session.created` | 2 | Session opened. OpenAI name; adds `attachment_generation`, `resume_token` and vLLM-Omni keys inside `session` (`id` is the server-allocated session id, `epoch`, `turn_id`, `playback`, `capabilities`, ...). |
 | `session.updated` | 2 | Echo of the effective session config after every `session.update` (same extended `session` object). |
 | `session.heartbeat_ack` | 3 | Reply to `session.heartbeat`. |
+| `session.stats` | 3 | Reply to `session.stats.get`: `request_event_id` and a raw `stats` document (per turn: `status`, `final`, `late_spans`, chunks with `submitted_ns`, `done_ns`, `complete` and per-stage `[start_ns, duration_ns]` spans, plus the turn's audio pieces; times relative to the session open). Not journaled, so never replayed on resume. |
 | `session.closed` | 3 | Last event on the socket, emitted once the engine released the session; `reason` ∈ `client_close`, `disconnect`, `timeout`, `transport_error`, `shutdown`, `output_backpressure`, `close_details_exceed_output_limit`, ... |
 | `session.resumed` | 3 | Resume accepted; carries the new `attachment_generation` and rotated `resume_token`; journaled events are replayed after it. |
 | `session.replaced` | 3 | Sent to the superseded socket when another socket resumes the session. |
@@ -1176,6 +1343,39 @@ additionally carries `"server_event_seq": <int>` (omitted below for brevity).
 
 ```json
 {"type": "session.heartbeat_ack", "session_id": "duplex-5f2a…"}
+```
+
+`C→S session.stats.get` / `S→C session.stats`
+
+Clients derive per-turn busy RTF (union of all stage spans / emitted audio) and
+stall ratio from the raw document with
+`vllm_omni.benchmarks.duplex_session_metrics.session_stats_turn_metrics`; a turn
+counts only once the server marks it `final` (RFC #8325): the model turn completed,
+every response bound to it ended (a draining TTS response included) and every
+chunk was handled. A cancelled turn (barge-in, session close) never becomes final,
+and spans that arrive after a turn is final are counted in `late_spans` instead of
+changing it. A chunk's `done_ns` is the end of its last stage span: the wait for
+the next input is not engine time. Given the snapshot's `stages`, the helper also
+withholds numbers for a turn that emitted audio but has no spans from some stage
+(`missing_stage_ids`); this is the case for Code2Wav under the MRv2 model runner,
+whose native data plane does not carry the chunk id yet. The server still answers
+while the session closes. Times are comparable only when every stage runs on the API server's
+host.
+
+```json
+{"type": "session.stats.get", "event_id": "evt_42"}
+```
+
+```json
+{"type": "session.stats", "session_id": "duplex-5f2a…", "request_event_id": "evt_42",
+ "stats": {"schema_version": 1, "clock": {"source": "CLOCK_MONOTONIC", "unit": "ns", "origin": "session_opened"},
+  "stages": [{"stage_id": 0, "name": "thinker"}, {"stage_id": 1, "name": "talker"}, {"stage_id": 2, "name": "code2wav"}],
+  "turns": [{"epoch": 0, "turn_id": 0, "status": "done", "final": true, "late_spans": 0, "response_ids": ["resp-…"],
+   "chunks": [{"seq": 1, "turn_seq": 1, "submitted_ns": 4000312000, "done_ns": 4291000000,
+    "complete": true, "truncated": false,
+    "stage_work": [{"stage_id": 0, "spans": [[4001100000, 48000000]]}]}],
+   "audio": [{"response_id": "resp-…", "emitted_ns": 4215000000, "duration_ms": 520.0}]}],
+  "dropped_turns": 0, "dropped_spans": 0}}
 ```
 
 `C→S session.event_ack`

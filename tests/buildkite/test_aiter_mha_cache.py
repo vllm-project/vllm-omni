@@ -10,6 +10,7 @@ import json
 import shutil
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -255,31 +256,64 @@ def test_same_pr_artifact_cannot_cross_head_base_or_pr_identity(tmp_path: Path) 
     )
 
 
-def test_main_artifact_requires_the_exact_trusted_commit(tmp_path: Path) -> None:
+def test_main_artifact_accepts_exact_trusted_or_abi_compatible_commit(tmp_path: Path) -> None:
     identity = _identity()
     job_dir = tmp_path / "job"
     job_dir.mkdir()
     _write_module(job_dir / cache.module_filename(), b"main-module")
-    main_env = _env(
+    trusted = "7" * 40
+    recent = "a" * 40
+    exact_env = _env(
         BUILDKITE_BUILD_ID="build-main",
         BUILDKITE_BUILD_NUMBER="13999",
-        BUILDKITE_COMMIT=BASE,
+        BUILDKITE_COMMIT=trusted,
         BUILDKITE_BRANCH="main",
         BUILDKITE_PULL_REQUEST="false",
-        VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT="7" * 40,
+        VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT="9" * 40,
     )
-    provenance = cache.provenance_from_env(identity, main_env, checkout=BASE)
-    assert provenance is not None
-    published = cache.stage_publication(job_dir, tmp_path / "stage", identity, provenance)
-    assert published is not None
-    source = cache.BuildSource("build-main", 13999, BASE, "main", "", False)
+    exact_provenance = cache.provenance_from_env(identity, exact_env, checkout=trusted)
+    assert exact_provenance is not None
+    exact_published = cache.stage_publication(job_dir, tmp_path / "exact", identity, exact_provenance)
+    assert exact_published is not None
+    exact_source = cache.BuildSource("build-main", 13999, trusted, "main", "", False)
+    consumer = _env(VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT=trusted)
 
-    assert cache.provenance_matches_source(published, source, identity, _env())
+    assert cache.provenance_matches_source(exact_published, exact_source, identity, consumer)
+
+    recent_env = _env(
+        BUILDKITE_BUILD_ID="build-recent",
+        BUILDKITE_BUILD_NUMBER="14010",
+        BUILDKITE_COMMIT=recent,
+        BUILDKITE_BRANCH="main",
+        BUILDKITE_PULL_REQUEST="false",
+        VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT="9" * 40,
+    )
+    recent_provenance = cache.provenance_from_env(identity, recent_env, checkout=recent)
+    assert recent_provenance is not None
+    _write_module(job_dir / cache.module_filename(), b"recent-module")
+    recent_published = cache.stage_publication(job_dir, tmp_path / "recent", identity, recent_provenance)
+    assert recent_published is not None
+    recent_source = cache.BuildSource("build-recent", 14010, recent, "main", "", False)
+    incompatible_identity = {**identity, "python_cache_tag": "cpython-313"}
+
+    # ABI identity is the compatibility gate; the Omni merge-base need not match.
+    assert cache.provenance_matches_source(recent_published, recent_source, identity, consumer)
+    assert not cache.publication_matches(
+        recent_published,
+        incompatible_identity,
+        ldd_ok=lambda _path: True,
+    )
     assert not cache.provenance_matches_source(
-        published,
-        source,
+        recent_published,
+        recent_source,
         identity,
-        _env(VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT="8" * 40),
+        _env(VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT="not-a-sha"),
+    )
+    assert not cache.provenance_matches_source(
+        recent_published,
+        cache.BuildSource("build-pr", 14011, recent, "main", "99", False),
+        identity,
+        consumer,
     )
 
 
@@ -350,11 +384,17 @@ def test_release_line_candidate_sources_query_release_line_then_main() -> None:
         fetch=fetch,
     )
 
-    def _index(branch: str, commit: str) -> int:
+    def _exact_index(branch: str, commit: str) -> int:
         needle_branch = f"branch={branch.replace('/', '%2F')}"
         return next(i for i, url in enumerate(requested) if needle_branch in url and f"commit={commit}" in url)
 
-    assert _index("release/v0.30.0", trusted) < _index("main", trusted)
+    def _recent_index(branch: str) -> int:
+        needle_branch = f"branch={branch.replace('/', '%2F')}"
+        return next(i for i, url in enumerate(requested) if needle_branch in url and "commit=" not in url)
+
+    assert _exact_index("release/v0.30.0", trusted) < _exact_index("main", trusted)
+    assert _exact_index("main", trusted) < _recent_index("release/v0.30.0")
+    assert _recent_index("release/v0.30.0") < _recent_index("main")
 
 
 def test_release_line_pull_request_trusts_only_main() -> None:
@@ -376,7 +416,11 @@ def test_release_line_pull_request_trusts_only_main() -> None:
     )
 
     assert any("branch=main" in url and f"commit={trusted}" in url for url in requested)
+    assert any("branch=main" in url and "commit=" not in url for url in requested)
+    # Same-PR exact-checkout may still query the release-line head branch;
+    # trusted and recent fallbacks must not.
     assert not any("branch=release%2Fv0.30.0" in url and f"commit={trusted}" in url for url in requested)
+    assert not any("branch=release%2Fv0.30.0" in url and "commit=" not in url for url in requested)
 
 
 def test_discovery_uses_server_metadata_and_excludes_the_current_build() -> None:
@@ -413,6 +457,201 @@ def test_discovery_uses_server_metadata_and_excludes_the_current_build() -> None
             True,
         )
     ]
+
+
+def _publisher_job(**updates: object) -> dict[str, object]:
+    job: dict[str, object] = {
+        "id": "job-fa",
+        "type": "script",
+        "step_key": "amd-fa-aiter",
+        "state": "finished",
+        "exit_status": 0,
+        "passed": True,
+        "soft_failed": False,
+        "retried_at": None,
+    }
+    job.update(updates)
+    return job
+
+
+def _same_build_fetch(
+    jobs: dict[str, object],
+    *,
+    details: dict | None = None,
+    listing: str | None = None,
+):
+    requested: list[str] = []
+    build_details = details if details is not None else _details(build_id="current", number=14001)
+    build_listing = listing
+    if build_listing is None:
+        build_listing = (
+            '<a href="/vllm/vllm-omni-amd-ci/builds/14001">current</a>'
+            '<a href="/vllm/vllm-omni-amd-ci/builds/14000">previous</a>'
+        )
+
+    def fetch(url: str) -> str:
+        requested.append(url)
+        if url.endswith("/14001/data/jobs"):
+            return json.dumps(jobs)
+        if url.endswith("/14001.json"):
+            return json.dumps(build_details)
+        if url.endswith("/14000.json"):
+            return json.dumps(_details())
+        if "?" in url:
+            return build_listing
+        return ""
+
+    return requested, fetch
+
+
+def test_candidate_sources_ignore_the_current_build_without_an_explicit_publisher() -> None:
+    requested, fetch = _same_build_fetch({"has_next_page": False, "records": [_publisher_job()]})
+
+    sources = cache.candidate_sources(
+        _env(BUILDKITE_BUILD_ID="current", BUILDKITE_BUILD_NUMBER="14001"),
+        fetch=fetch,
+    )
+
+    assert [source.build_id for source in sources] == ["build-pr-8848"]
+    assert all(not source.job_id for source in sources)
+    assert not any(url.endswith("/data/jobs") for url in requested)
+
+
+def test_verified_same_build_publisher_is_tried_before_older_builds() -> None:
+    requested, fetch = _same_build_fetch({"has_next_page": False, "records": [_publisher_job()]})
+
+    sources = cache.candidate_sources(
+        _env(
+            BUILDKITE_BUILD_ID="current",
+            BUILDKITE_BUILD_NUMBER="14001",
+            VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP="amd-fa-aiter",
+        ),
+        fetch=fetch,
+    )
+
+    assert sources[0] == cache.BuildSource(
+        "current",
+        14001,
+        HEAD,
+        "haic0:ci/amd-aiter-mha-cache",
+        "8848",
+        True,
+        "job-fa",
+    )
+    assert [source.build_id for source in sources] == ["current", "build-pr-8848"]
+    assert any(url.endswith("/14001/data/jobs") for url in requested)
+
+
+@pytest.mark.parametrize(
+    "jobs",
+    [
+        {"has_next_page": False, "records": [_publisher_job(state="running", exit_status=None, passed=False)]},
+        {"has_next_page": False, "records": [_publisher_job(exit_status=1, passed=False)]},
+        {"has_next_page": False, "records": [_publisher_job(soft_failed=True, passed=True, exit_status=1)]},
+        {"has_next_page": False, "records": [_publisher_job(step_key="amd-build")]},
+        {"has_next_page": False, "records": [_publisher_job(), _publisher_job(id="job-fa-retry")]},
+        {"has_next_page": False, "records": [_publisher_job(retried_at="2026-10-26T00:00:00Z")]},
+        {"has_next_page": True, "records": [_publisher_job()]},
+        {"records": [_publisher_job()]},
+    ],
+)
+def test_same_build_publisher_is_ignored_unless_one_job_passed(jobs: dict[str, object]) -> None:
+    _requested, fetch = _same_build_fetch(jobs)
+
+    sources = cache.candidate_sources(
+        _env(
+            BUILDKITE_BUILD_ID="current",
+            BUILDKITE_BUILD_NUMBER="14001",
+            VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP="amd-fa-aiter",
+        ),
+        fetch=fetch,
+    )
+
+    assert [source.build_id for source in sources] == ["build-pr-8848"]
+
+
+def test_same_build_source_rejects_a_forged_build_identity() -> None:
+    forged = _details(build_id="current", number=14001)
+    forged["project"]["provider"]["url"] = "https://github.com/example/vllm-omni"
+    _requested, fetch = _same_build_fetch(
+        {"has_next_page": False, "records": [_publisher_job()]},
+        details=forged,
+    )
+
+    sources = cache.candidate_sources(
+        _env(
+            BUILDKITE_BUILD_ID="current",
+            BUILDKITE_BUILD_NUMBER="14001",
+            VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP="amd-fa-aiter",
+        ),
+        fetch=fetch,
+    )
+
+    assert [source.build_id for source in sources] == ["build-pr-8848"]
+
+
+def test_discover_recent_branch_sources_skips_prs_and_current_build() -> None:
+    recent = "a" * 40
+    listing = (
+        '<a href="/vllm/vllm-omni-amd-ci/builds/14021">current</a>'
+        '<a href="/vllm/vllm-omni-amd-ci/builds/14020">pr</a>'
+        '<a href="/vllm/vllm-omni-amd-ci/builds/14019">main</a>'
+    )
+
+    def fetch(url: str) -> str:
+        if "?" in url:
+            assert "branch=main" in url
+            assert "commit=" not in url
+            return listing
+        if url.endswith("/14021.json"):
+            return json.dumps(_details(build_id="current", number=14021, commit=recent, branch="main", pull_request=""))
+        if url.endswith("/14020.json"):
+            return json.dumps(
+                _details(build_id="build-pr", number=14020, commit=HEAD, branch="main", pull_request="99")
+            )
+        if url.endswith("/14019.json"):
+            return json.dumps(
+                _details(build_id="build-main", number=14019, commit=recent, branch="main", pull_request="")
+            )
+        raise AssertionError(url)
+
+    sources = cache.discover_recent_branch_sources(
+        branch="main",
+        current_build_id="current",
+        fetch=fetch,
+    )
+
+    assert sources == [cache.BuildSource("build-main", 14019, recent, "main", "", False)]
+
+
+def test_query_failure_does_not_log_request_url_or_parent_commit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    marker = "a" * 40
+    secret = "secret-token"
+    branch = f"main-{secret}"
+
+    def fetch(url: str) -> str:
+        raise urllib.error.URLError(f"http://user:{secret}@{url}")
+
+    recent = cache.discover_recent_branch_sources(
+        branch=branch,
+        current_build_id="current",
+        fetch=fetch,
+    )
+    sources = cache.candidate_sources(
+        _env(VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT=marker),
+        fetch=fetch,
+    )
+
+    assert recent == []
+    assert sources == []
+    captured = capsys.readouterr()
+    assert marker not in captured.err
+    assert secret not in captured.err
+    assert "http://" not in captured.err
+    assert "could not query exact Buildkite artifact candidates" in captured.err
+    assert "could not query recent trusted-branch Buildkite builds" in captured.err
 
 
 def test_candidate_sources_queries_the_pr_head_not_the_test_merge_commit() -> None:
@@ -494,6 +733,76 @@ def test_download_restores_only_the_verified_build_artifact(tmp_path: Path) -> N
     assert (restored / cache.module_filename()).read_bytes().startswith(b"compiled-module")
 
 
+def test_same_build_download_requires_the_publisher_job(tmp_path: Path) -> None:
+    identity = _identity()
+    compiled = tmp_path / "compiled"
+    compiled.mkdir()
+    _write_module(compiled / cache.module_filename(), b"same-build-module")
+    source_root = tmp_path / "source"
+    provenance = _provenance(
+        identity,
+        BUILDKITE_BUILD_ID="current",
+        BUILDKITE_BUILD_NUMBER="14001",
+        BUILDKITE_JOB_ID="job-fa",
+    )
+    assert cache.stage_publication(compiled, source_root, identity, provenance) is not None
+    commands: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        destination = Path(command[4])
+        shutil.copytree(source_root / cache.CACHE_DIRNAME, destination / cache.CACHE_DIRNAME)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    consumer = _env(BUILDKITE_BUILD_ID="current", BUILDKITE_BUILD_NUMBER="14001")
+    publisher = cache.BuildSource(
+        "current",
+        14001,
+        HEAD,
+        "haic0:ci/amd-aiter-mha-cache",
+        "8848",
+        True,
+        "job-fa",
+    )
+    restored = tmp_path / "restored"
+    restored.mkdir()
+
+    assert cache.download_from_source(
+        publisher,
+        restored,
+        identity,
+        consumer,
+        runner=runner,
+        current_checkout=CHECKOUT,
+        ldd_ok=lambda _path: True,
+    )
+    assert commands[0][-4:] == ["--build", "current", "--step", "job-fa"]
+    assert (restored / cache.module_filename()).read_bytes().startswith(b"same-build-module")
+
+    other_job = cache.BuildSource(
+        "current",
+        14001,
+        HEAD,
+        "haic0:ci/amd-aiter-mha-cache",
+        "8848",
+        True,
+        "job-other",
+    )
+    rejected = tmp_path / "rejected"
+    rejected.mkdir()
+    assert not cache.download_from_source(
+        other_job,
+        rejected,
+        identity,
+        consumer,
+        runner=runner,
+        current_checkout=CHECKOUT,
+        ldd_ok=lambda _path: True,
+    )
+    assert commands[1][-2:] == ["--step", "job-other"]
+    assert not (rejected / cache.module_filename()).exists()
+
+
 def test_upload_targets_only_the_current_build_scoped_artifact(tmp_path: Path) -> None:
     calls: list[tuple[list[str], Path]] = []
 
@@ -505,7 +814,7 @@ def test_upload_targets_only_the_current_build_scoped_artifact(tmp_path: Path) -
     command, cwd = calls[0]
     assert command[:3] == ["buildkite-agent", "artifact", "upload"]
     assert command[3] == f"{cache.artifact_prefix(_identity()).as_posix()}/*"
-    assert "--job" not in command
+    assert "--step" not in command
     assert "--build" not in command
     assert cwd == tmp_path
 
