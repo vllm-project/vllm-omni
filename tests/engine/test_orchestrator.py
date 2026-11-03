@@ -28,7 +28,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreReques
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
-from tests.helpers.stage_metadata import stage_metadata_for_client
+from tests.helpers.stage_metadata import make_stage_metadata, stage_metadata_for_client
 from vllm_omni.data_entry_keys import returns_stage_payload
 from vllm_omni.distributed.omni_coordinator import (
     ReplicaInfo,
@@ -59,6 +59,7 @@ from vllm_omni.engine.orchestrator import (
     _build_terminal_empty_output,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.errors import OmniClientError
@@ -469,6 +470,7 @@ def _build_harness(
     async_chunk: bool = False,
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
+    stage_metadata: list[StageMetadata] | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
@@ -502,7 +504,8 @@ def _build_harness(
                 output_async_queue=output_queue.async_q,
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
-                stage_metadata=[
+                stage_metadata=stage_metadata
+                or [
                     stage_metadata_for_client(stage_id, pool.stage_client) for stage_id, pool in enumerate(stage_pools)
                 ],
                 async_chunk=async_chunk,
@@ -850,6 +853,43 @@ async def test_run_chain_yields_at_each_stage_until_final_output(orchestrator_fa
         assert msg.engine_outputs.outputs[0].token_ids == list(_STAGE2_OUTPUT_TOKEN_IDS)
         assert msg.finished is True
         assert _CALL3_REQUEST_ID not in request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_run_yields_to_stage_without_replicas(orchestrator_factory) -> None:
+    """Ensure a run call yields the next stage input when that stage has no replicas here."""
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_processor = FakeOutputProcessor(request_outputs=_finished_outputs(_CALL1_REQUEST_ID))
+    (stage0_pool,) = _build_stage_pools([[stage0]], output_processors=[stage0_processor])
+    # Stage 1 runs on another server, so its pool has no clients.
+    stage1_pool = StagePool(
+        1,
+        clients=[],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    assert not stage1_pool.live_replica_ids()
+    stage1_metadata = make_stage_metadata(
+        stage_id=1,
+        final_output=True,
+        custom_process_input_func=lambda *_args, **_kwargs: [{"prompt_token_ids": list(_STAGE1_INPUT_TOKEN_IDS)}],
+    )
+    orchestrator_fixture = orchestrator_factory(
+        [],
+        stage_pools=[stage0_pool, stage1_pool],
+        stage_metadata=[stage_metadata_for_client(0, stage0), stage1_metadata],
+    )
+
+    try:
+        await _enqueue_run_request(orchestrator_fixture)
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-raw", 1.0))
+
+        msg = _get_messages_until_response(orchestrator_fixture)[-1]
+        assert isinstance(msg, NextStageInputMessage)
+        assert msg.receiver_stage_id == 1
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
 
