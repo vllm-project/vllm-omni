@@ -1360,6 +1360,7 @@ class MiniMaxH3Pipeline(
                 load_model=rank < text_encoder_tp_size,
                 encoder_group=self.text_encoder_group,
                 quant_config=_resolve_minimax_h3_text_encoder_quant_config(od_config.quantization_config),
+                reference_numerics=(od_config.additional_config or {}).get("minimax_h3_reference_numerics", False),
             )
             if rank < text_encoder_tp_size:
                 self.weights_sources.append(
@@ -1401,6 +1402,7 @@ class MiniMaxH3Pipeline(
                     else None,
                 ),
                 lightvae_decoder_path=lightvae_decoder_path,
+                reference_numerics=(od_config.additional_config or {}).get("minimax_h3_reference_numerics", False),
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),
@@ -2391,8 +2393,14 @@ class MiniMaxH3Pipeline(
         latent_h: int,
         latent_w: int,
         audio_t: int,
+        renoise_spec: PikaSpec | DmadSpec | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Select the target rows and unpack them back into VAE latents."""
+        if isinstance(renoise_spec, DmadSpec):
+            # The released DMAD pipeline stores BF16 latents before the FP32
+            # decoders. Preserve that rounding before normalization and upscale.
+            video_rows = video_rows.bfloat16().float()
+            audio_rows = audio_rows.bfloat16().float()
         target_video = video_rows[branch.update_mask_dev]
         video_latent = minimax_h3_unpatchify_video_tokens(
             target_video,
@@ -2542,6 +2550,7 @@ class MiniMaxH3Pipeline(
             latent_h=latent_h,
             latent_w=latent_w,
             audio_t=audio_t,
+            renoise_spec=renoise_spec,
         )
 
     def decode_to_mp4(
@@ -2622,7 +2631,7 @@ class MiniMaxH3Pipeline(
                 with current_omni_platform.create_autocast_context(
                     device_type=self.device.type,
                     dtype=self.video_vae.decode_dtype,
-                    enabled=True,
+                    enabled=self.video_vae.decode_dtype != torch.float32,
                 ):
                     videos = decode_chunks_to_mp4(
                         self.video_vae, video_latent, session=session, frame_counts=frame_counts
@@ -2691,7 +2700,7 @@ class MiniMaxH3Pipeline(
                         with current_omni_platform.create_autocast_context(
                             device_type=self.device.type,
                             dtype=self.video_vae.decode_dtype,
-                            enabled=True,
+                            enabled=self.video_vae.decode_dtype != torch.float32,
                         ):
                             video = self.video_vae.decode_latent(video_latent)
                     finally:
@@ -2703,7 +2712,7 @@ class MiniMaxH3Pipeline(
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=self.video_vae.decode_dtype,
-                enabled=True,
+                enabled=self.video_vae.decode_dtype != torch.float32,
             ):
                 video = self.video_vae.decode_latent(video_latent)
         video = video[..., :height, :width].contiguous()
@@ -4547,6 +4556,7 @@ class MiniMaxH3Pipeline(
             latent_h=shape["latent_h"],
             latent_w=shape["latent_w"],
             audio_t=shape["audio_t"],
+            renoise_spec=shape.get("renoise_spec"),
         )
         continuation = shape.get("latent_continuation")
         prefix = None if continuation is None else _device_prefix(continuation, self.device)

@@ -5,6 +5,8 @@ MiniMax-H3 partition. Pika uses six transformer forwards with fresh noise betwee
 steps, rather than H3's ordinary Euler update. Video and stereo audio are sampled
 together. The integration uses H3's existing LoRA manager and serving APIs.
 
+For official numerical comparison, start with the [reference configuration](#compare-with-official-numerical-results) and [complex people / 2K examples](#complex-people-examples-and-numerical-evidence).
+
 ## Download (optional)
 
 Serving `Pika-Labs/Pika-H3-Flex` resolves the matching adapter and original
@@ -86,6 +88,35 @@ request-owned device generators and the official external latent layouts.
 Both ordinary and step execution retain that state, including packed batching.
 Offline step-execution callers must explicitly set `num_inference_steps=6`.
 
+### Compare with official numerical results
+
+The four-GPU configuration above uses optimized BF16 arithmetic and cuDNN
+attention. For comparison with the official T2VA pipeline, use the following
+single-GPU configuration with the original unquantized FL2VA base:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 VLLM_WORKER_MULTIPROC_METHOD=spawn OMP_NUM_THREADS=8 \
+VLLM_OMNI_VAE_LEGACY_TEMPORAL=1 VLLM_OMNI_VIDEO_SYNC_TIMEOUT=14400 \
+vllm serve /models/MiniMax-H3/FL2VA --omni --trust-remote-code \
+  --task-type fl2va --num-gpus 1 --tensor-parallel-size 1 \
+  --text-encoder-tp-size 1 --usp 1 --ring 1 \
+  --vae-patch-parallel-size 1 --vae-parallel-mode tile --vae-use-tiling \
+  --enforce-eager --diffusion-attention-backend TORCH_SDPA \
+  --diffusion-offload-config '{"mode":"layer","components":["text_encoder"]}' \
+  --lora-path /models/Pika-H3-Flex/fl2va --lora-scale 1 \
+  --additional-config '{"minimax_h3_reference_numerics":true}' \
+  --host 127.0.0.1 --port 8000
+```
+
+Select the adapter in each request as described below. This mode preserves
+the official BF16 rounding in text normalization, DiT normalization,
+modulation, SwiGLU and LoRA accumulation. It selects PyTorch Flash SDPA and
+keeps the original video decoder in FP32. It requires eager execution,
+unquantized TP=SP=1 and no approximate cache backend. Text-encoder CPU
+offload reduces residency; it still needs a large GPU and sufficient host RAM.
+It is a comparison configuration, with different performance from the
+four-GPU optimized configuration.
+
 ### Request-switchable adapters on an ordinary H3 server
 
 To retain the original H3 model and switch adapters per request, replace the
@@ -162,14 +193,15 @@ timeline guides and locked driving audio are outside the released Pika contract.
 ## Validation
 
 Validated against upstream `7afd00e982dfa93c365eee5475a5707904b181e6`
-with vLLM 0.32.0, PyTorch 2.13.0+cu132 and Transformers 5.14.1. Real-weight
+with vLLM 0.32.0, PyTorch 2.13.0+cu132 and Transformers 5.14.1. Optimized functional
 serving used four SM120 CUDA GPUs, TP4, dense BF16 and the pinned adapters
-above. The FL2VA base was converted from the original Diffusers tensors to
+above. The independent official comparison below used one SM120 GPU with
+`minimax_h3_reference_numerics=true`, unquantized TP=SP=1 and eager execution. The FL2VA base was converted from the original Diffusers tensors to
 the native H3 layout using the existing weight-mapping helpers; Ref2VA used
 the original native partition.
 
-- H3 CPU regression: 1236 passed, 2 skipped. The optional FP8 quality module
-  was excluded because its `torchmetrics` dependency was unavailable.
+- H3, LoRA and SDPA CPU regression after the numerical fixes: 1322 passed,
+  2 skipped, 59 deselected. CUDA SDPA/compile checks: 101 passed.
 - Pika and decode-overlap coverage: 33 passed, including the CUDA stream test.
   These tests overlap the CPU total; the counts are not additive.
 - The published reference sampler and this implementation produced identical
@@ -188,10 +220,68 @@ the original native partition.
   the pinned adapter cache and an explicit local original-H3 base override;
   cold network downloading of the base was not exercised. The two outputs
   again had identical decoded audio. Request adapter overrides were rejected.
-- A separate real-weight DiT diagnostic replayed six reference trajectory
-  inputs with synthetic first-frame conditioning. It found numerical
-  differences, so full-model numerical parity is **not established**. The
-  exact synthetic-velocity sampler checks above do not cover those differences.
+- Independent official and native HTTP runs now cover three complex adult
+  scenes with the FL2VA adapter: a watchmaker's tool handoff, three chefs
+  working through occlusion and steam, and three full-body dancers crossing
+  paths. Each uses seed 42, six steps, 832x480 and 124 frames. Text embeddings,
+  all 18 video/audio denoising outputs, final latents and pre-AAC waveforms
+  match exactly in reference mode. This comparison uses the native text
+  encoder, sampler, DiT and VAE; it does not inject official intermediate
+  tensors into the service.
+
+### Complex people examples and numerical evidence
+
+The comparison videos place the official output on the left and native
+vLLM-Omni on the right. Exact prompts, request payloads, source revisions,
+per-step metrics and reproduction scripts are included in the
+[validation bundle](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-people-validation.tar.gz).
+
+| Scene | Official / native comparison | Native 2K output |
+| --- | --- | --- |
+| Watch repair: three adults, overlapping hands and tool handoff | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-workshop-comparison.mp4) | [2560x1440 video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-workshop-2k.mp4) |
+| Kitchen: three chefs, bowl handoff, steam and camera movement | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-kitchen-comparison.mp4) | — |
+| Dance: three adults, full bodies, turns and crossing paths | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-people-dance-comparison.mp4) | — |
+
+Across the eight native-resolution Pika/DMAD comparisons, pre-encoding RGB
+values differ by at most 1/255, with minimum PSNR 99.18 dB.
+Audio waveforms match exactly. RGB comparison is before H.264 compression;
+the two MP4 encoders need not produce identical bytes. The 2K case preserves
+the corresponding native-resolution latent and waveform, then applies the
+community upscaler; there is no official local Pika 2K target for pixel parity.
+See the [metrics](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-people-comparison.json) and
+[reproduction guide](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-people-README.txt).
+
+To reproduce the watch-repair prompt against the reference-mode FL2VA
+server above, download the retained prompts and submit the same parameters
+(requires `curl` and `jq`):
+
+```bash
+curl --fail -L -o h3-people-prompts.json \
+  https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/h3-people-prompts.json
+curl --fail http://127.0.0.1:8000/v1/videos/sync \
+  --form-string "prompt=$(jq -r .workshop h3-people-prompts.json)" \
+  -F 'seconds=5' -F 'size=832x480' -F 'fps=24' -F 'seed=42' \
+  -F 'num_inference_steps=6' \
+  -F 'lora={"name":"pika","path":"/models/Pika-H3-Flex/fl2va","scale":1}' \
+  -F 'extra_params={"task":"t2va","aspect_ratio":"16:9","flow_shift":12,"audio_flow_shift":3}' \
+  --output pika-people-workshop.mp4
+```
+
+Select `.kitchen` or `.dance` for the other prompts. For 2K, configure the
+server's community upscaler and add `latent_upscale` as described above.
+
+The earlier image-conditioned examples are also available:
+[FL2VA 2K](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-fl2va-2k.mp4),
+[Ref2VA image 2K](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-ref2va-image-2k.mp4), and
+[Ref2VA mixed-reference 2K](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/pika-ref2va-mixed-2k.mp4).
+Their full original request payloads were not retained. These historical
+functional samples do not establish Ref2VA numerical parity.
+
+Reference-mode results do not qualify the optimized cuDNN/fused-operator
+configuration for bitwise equivalence or establish a perceptual-quality
+score. Other hardware, Ref2VA, quantization and distributed execution need
+separate numerical qualification. Tracing overhead makes these accuracy
+runs unsuitable as latency benchmarks.
 
 Run the small contract tests from the repository root with the checkout's
 normal development dependencies installed. The CPU cases need no model
@@ -199,6 +289,7 @@ weights; the CUDA decode test needs one GPU:
 
 ```bash
 pytest -q tests/diffusion/models/minimax_h3/test_pika_h3.py \
+  tests/diffusion/models/minimax_h3/test_minimax_h3_reference_numerics.py \
   tests/diffusion/models/minimax_h3/test_minimax_h3_decode_overlap.py \
   -m 'core_model and cpu' --run-level core_model
 pytest -q tests/diffusion/models/minimax_h3/test_minimax_h3_decode_overlap.py \

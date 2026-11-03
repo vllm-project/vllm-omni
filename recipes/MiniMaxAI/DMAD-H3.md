@@ -14,6 +14,8 @@ artifact's metadata, validates rank/alpha 128 and all 624 factors, and checks
 complete binding to the 312 target modules. This recipe uses the official
 Diffusers-layout exports; the `_comfyui` exports use a different packed format.
 
+For official numerical comparison, use the [reference configuration](Pika-H3-Flex.md#compare-with-official-numerical-results). The [validation section](#tests) includes complex people and 2K videos for the released adapters.
+
 ## Download
 
 ```bash
@@ -52,6 +54,15 @@ vllm serve /models/MiniMax-H3/FL2VA --omni --trust-remote-code \
 ```
 
 ## Generate and switch variants
+
+For numerical comparison with the official pipeline, use the
+[single-GPU reference-numerics configuration](Pika-H3-Flex.md#compare-with-official-numerical-results),
+replacing its `--lora-path` with the selected DMAD checkpoint. Keep
+`minimax_h3_reference_numerics=true`, `TORCH_SDPA`, eager execution, and
+unquantized TP=SP=1. The reference mode preserves BF16 intermediate rounding
+and the FP32 video decoder; the optimized four-GPU command above has a
+different numerical and performance profile. DMAD latents are rounded to
+BF16 before FP32 decoder normalization, matching the released pipeline.
 
 The startup option preloads an adapter; select it explicitly in each request.
 Paths refer to files accessible to the server. Four forwards means
@@ -108,9 +119,26 @@ mismatched step count, audio shift, or latent refinement returned HTTP 400.
 
 The published DMAD rollout and this sampler also produced identical video
 and audio rows for four/eight steps on CPU and CUDA when fed fixed synthetic
-velocities. This checks the sampler and RNG order, not full-model numerical
-parity or perceptual quality. The real-weight runs are functional checks;
-they do not establish a universal latency or memory requirement.
+velocities. Independent official/native HTTP comparisons additionally cover
+all three released adapters in reference mode: the four-step LoRA-critic on
+all three complex people scenes, four-step full-critic in the kitchen, and
+eight-step full-critic in the dance studio. Text embeddings, every video/audio
+denoising step, final latents after the official BF16 cast, and pre-AAC
+waveforms match exactly. The [shared numerical report](Pika-H3-Flex.md#complex-people-examples-and-numerical-evidence)
+documents RGB tolerances, hardware and scope.
+
+| Adapter and scene | Official / native comparison | Native 2K output |
+| --- | --- | --- |
+| 4-step LoRA-critic: watch repair | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/dmad-people-workshop-comparison.mp4) | — |
+| 4-step LoRA-critic: three chefs | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/dmad-people-kitchen-comparison.mp4) | [2560x1440 video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/dmad-people-kitchen-2k.mp4) |
+| 4-step LoRA-critic: three dancers | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/dmad-people-dance-comparison.mp4) | — |
+| 4-step full-critic: three chefs | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/dmad4full-people-kitchen-comparison.mp4) | — |
+| 8-step full-critic: three dancers | [Video](https://github.com/lishunyang12/vllm-omni/releases/download/h3-pika-dmad-validation-20261103/dmad8full-people-dance-comparison.mp4) | — |
+
+These checks establish the stated numerical bounds for the recorded inputs
+and configuration; they do not establish a universal latency, memory or
+perceptual-quality claim. The community upscaler has no official DMAD 2K
+pixel target. Full prompts and requests are retained in the validation bundle.
 
 The contract tests need the checkout's development dependencies and no model
 weights. They cover artifact validation, noise-stream order, request isolation,

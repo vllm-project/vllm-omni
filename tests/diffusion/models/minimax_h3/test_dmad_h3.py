@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """DMAD artifact identity, CPU noise order, and full/step execution parity."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
@@ -20,6 +22,24 @@ from .test_minimax_h3_lora import _TINY_TARGET_DIMS, _write_tiny_turbo
 from .test_minimax_h3_step_execution import _make_branch, _make_state, _SegmentMeanModel, _step_pipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize("steps", [4, 8])
+def test_dmad_rounds_latents_before_fp32_decoder_normalization(steps):
+    generator = torch.Generator().manual_seed(12)
+    video = torch.randn(8, 96, generator=generator)
+    audio = torch.randn(16, 32, generator=generator)
+    branch = SimpleNamespace(
+        update_mask_dev=torch.ones(8, dtype=torch.bool),
+        audio_update_mask_dev=torch.ones(16, dtype=torch.bool),
+    )
+    kwargs = dict(latent_t=2, latent_h=4, latent_w=4, audio_t=8)
+    original = MiniMaxH3Pipeline._unpack_denoised_rows(None, branch, video, audio, **kwargs)
+    actual = MiniMaxH3Pipeline._unpack_denoised_rows(None, branch, video, audio, renoise_spec=DmadSpec(steps), **kwargs)
+    for value, source in zip(actual, original):
+        assert value.dtype == torch.float32
+        assert not torch.equal(value, source)
+        torch.testing.assert_close(value, source.bfloat16().float(), atol=0, rtol=0)
 
 
 def _metadata(steps):

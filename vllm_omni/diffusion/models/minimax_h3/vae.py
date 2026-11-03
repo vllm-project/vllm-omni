@@ -123,7 +123,10 @@ def _load_remote_component(
     # builds constants with ops that have no accelerator kernel (BigVGAN's
     # anti-aliasing filters call torch.kaiser_window). Callers place the module
     # explicitly right after this returns, so nothing depends on the context.
-    with torch.device("cpu"):
+    # The pipeline loader may set BF16 as the default dtype. The checkpoint
+    # constructs modules then copies FP32 weights into them; casting afterwards
+    # cannot recover weights or anti-aliasing buffers already rounded to BF16.
+    with set_default_torch_dtype(torch.float32), torch.device("cpu"):
         return component_cls.from_pretrained(component_path)
 
 
@@ -346,6 +349,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
         lightvae_decoder_path: str | None = None,
+        reference_numerics: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -355,6 +359,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
         if lightvae_decoder_path is not None and decoder_source is not None:
             raise ValueError("lightvae_decoder_path cannot be combined with video_vae_decoder")
+        if reference_numerics:
+            if lightvae_decoder_path is not None or decoder_source is not None:
+                raise ValueError("H3 reference numerics requires the original FP32 video decoder")
+            self.decode_dtype = torch.float32
         from .vae_nvfp4 import (
             install_nvfp4_video_decoder,
             released_decoder_pixels,
@@ -397,7 +405,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.decode_dtype = torch.bfloat16
             self.remote.to(device=initial_device)
         decoder = getattr(self.remote.model, "decoder", None)
-        if decoder is not None and decoder_path is None:
+        if decoder is not None and decoder_path is None and not reference_numerics:
             install_h3_vae_optimizations(
                 decoder,
                 device=device,

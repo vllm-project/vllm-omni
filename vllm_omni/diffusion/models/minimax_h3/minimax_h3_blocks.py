@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -28,7 +29,7 @@ from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.activation import SiluAndMul
-from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import _apply_rope_table, fused_qk_norm_rope
 from vllm_omni.diffusion.layers.indexed_modulation import (
     indexed_gate,
     indexed_gate_rms_norm_scale_shift,
@@ -39,6 +40,7 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.offloader.module_residency import BoundedAllocatorCache, PinnedModuleStager
 
 from .adaln_cache import MiniMaxH3RuntimeAdalnCache
+from .numerics import MiniMaxH3RMSNorm, reference_gate, reference_scale_shift
 from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
@@ -146,10 +148,11 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm
     # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
     # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
     # reduction, matching that accumulation semantic.
-    return RMSNorm(size, eps=eps, dtype=dtype)
+    return MiniMaxH3RMSNorm(size, eps=eps, dtype=dtype)
 
 
 class MiniMaxH3Attention(nn.Module):
+    reference_numerics: bool = False
     # Full sparse checkpoints pin a ratio; legacy adapters use backend top-k.
     vsa_sparsity: float | None = None
     vsa_tile_size: int = 64
@@ -401,12 +404,15 @@ class MiniMaxH3Attention(nn.Module):
             extra=extra,
             video_layout=video_layout,
         )
-        return self.attention(
-            q.unsqueeze(0),
-            k.unsqueeze(0),
-            v.unsqueeze(0),
-            metadata,
-        ).squeeze(0)
+        # The released reference uses PyTorch Flash SDPA. Pin that kernel in
+        # reference mode rather than letting SDPA choose cuDNN on another GPU.
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION) if self.reference_numerics else nullcontext():
+            return self.attention(
+                q.unsqueeze(0),
+                k.unsqueeze(0),
+                v.unsqueeze(0),
+                metadata,
+            ).squeeze(0)
 
     def _project_qkv(
         self, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
@@ -427,6 +433,9 @@ class MiniMaxH3Attention(nn.Module):
         if rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        elif self.reference_numerics:
+            q = _apply_rope_table(self.q_norm(q), rope_table, self.rot_dim)
+            k = _apply_rope_table(self.k_norm(k), rope_table, self.rot_dim)
         else:
             q, k = fused_qk_norm_rope(
                 q,
@@ -518,6 +527,8 @@ class MiniMaxH3Attention(nn.Module):
 
 
 class MiniMaxH3MLP(nn.Module):
+    reference_numerics: bool = False
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -550,7 +561,11 @@ class MiniMaxH3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         hidden, _ = self.fc1(x)
-        hidden = self.act_fn(hidden)
+        if self.reference_numerics:
+            gate, up = hidden.chunk(2, dim=-1)
+            hidden = nn.functional.silu(gate) * up
+        else:
+            hidden = self.act_fn(hidden)
         out, _ = self.fc2(hidden)
         return out
 
@@ -685,6 +700,8 @@ class MiniMaxH3AdalnProj(nn.Module):
 
 
 class MiniMaxH3DiTBlock(nn.Module):
+    reference_numerics: bool = False
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -759,14 +776,17 @@ class MiniMaxH3DiTBlock(nn.Module):
         ) = self.adaln_proj(t_emb)
 
         residual = x
-        h = rms_norm_indexed_scale_shift(
-            x,
-            self.norm1.weight,
-            shift_msa,
-            scale_msa,
-            combined_indices,
-            self.norm1.variance_epsilon,
-        )
+        if self.reference_numerics:
+            h = reference_scale_shift(self.norm1(x), shift_msa, scale_msa, combined_indices)
+        else:
+            h = rms_norm_indexed_scale_shift(
+                x,
+                self.norm1.weight,
+                shift_msa,
+                scale_msa,
+                combined_indices,
+                self.norm1.variance_epsilon,
+            )
         h = self.attn(
             h,
             rope_table=rope_table,
@@ -782,16 +802,21 @@ class MiniMaxH3DiTBlock(nn.Module):
             reference_kv_compact=reference_kv_compact,
             vdn_window=vdn_window,
         )
-        x, h = indexed_gate_rms_norm_scale_shift(
-            residual,
-            gate_msa,
-            h,
-            self.norm2.weight,
-            shift_mlp,
-            scale_mlp,
-            combined_indices,
-            self.norm2.variance_epsilon,
-        )
+        if self.reference_numerics:
+            x = reference_gate(residual, gate_msa, h, combined_indices)
+            h = reference_scale_shift(self.norm2(x), shift_mlp, scale_mlp, combined_indices)
+        else:
+            x, h = indexed_gate_rms_norm_scale_shift(
+                residual,
+                gate_msa,
+                h,
+                self.norm2.weight,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                self.norm2.variance_epsilon,
+            )
         residual = x
         h = self.mlp(h)
-        return indexed_gate(residual, gate_mlp, h, combined_indices)
+        gate_fn = reference_gate if self.reference_numerics else indexed_gate
+        return gate_fn(residual, gate_mlp, h, combined_indices)

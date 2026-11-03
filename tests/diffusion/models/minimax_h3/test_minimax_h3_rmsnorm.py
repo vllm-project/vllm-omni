@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +15,35 @@ from vllm_omni.diffusion.models.minimax_h3.encoder import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def test_qwen_reference_rmsnorm_rounds_before_gamma() -> None:
+    norm = MiniMaxH3Qwen3VLRMSNorm(hidden_size=8, dtype=torch.bfloat16)
+    norm.reference_numerics = True
+    generator = torch.Generator().manual_seed(45)
+    norm.weight.data.copy_(torch.randn(8, generator=generator))
+    x = torch.randn(11, 8, generator=generator).bfloat16()
+    normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+    expected = normalized.bfloat16() * norm.weight
+    fused = (normalized * norm.weight.float()).bfloat16()
+    assert not torch.equal(expected, fused)
+    torch.testing.assert_close(norm(x), expected, atol=0, rtol=0)
+    output, residual = norm(x / 2, x / 2)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    torch.testing.assert_close(residual, x, atol=0, rtol=0)
+
+
+def test_dit_reference_rmsnorm_keeps_checkpoint_keys_and_torch_rounding() -> None:
+    from vllm_omni.diffusion.models.minimax_h3.numerics import MiniMaxH3RMSNorm
+
+    norm = MiniMaxH3RMSNorm(8, eps=1e-5, dtype=torch.bfloat16)
+    norm.reference_numerics = True
+    generator = torch.Generator().manual_seed(45)
+    norm.weight.data.copy_(torch.randn(8, generator=generator))
+    x = torch.randn(11, 8, generator=generator).bfloat16()
+    expected = nn.functional.rms_norm(x, (8,), norm.weight, 1e-5)
+    assert set(norm.state_dict()) == {"weight"}
+    torch.testing.assert_close(norm(x), expected, atol=0, rtol=0)
 
 
 def test_qwen3_vl_rmsnorm_uses_common_fused_rmsnorm_contract() -> None:

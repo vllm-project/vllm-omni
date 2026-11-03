@@ -56,6 +56,7 @@ from .minimax_h3_blocks import (
     _norm,
     _ring_sequence_parallel_is_active,
 )
+from .numerics import MiniMaxH3RMSNorm, reference_scale_shift
 from .vdnh3 import VDNConfig
 
 if TYPE_CHECKING:
@@ -521,6 +522,8 @@ class MiniMaxH3TokenRefiner(nn.Module):
 
 
 class MiniMaxH3FinalLayer(nn.Module):
+    reference_numerics: bool = False
+
     def __init__(
         self,
         arch: MiniMaxH3DiTArchConfig,
@@ -584,7 +587,8 @@ class MiniMaxH3FinalLayer(nn.Module):
         """
         shift, scale = self.adaln_proj(t_emb)
         h = self.norm(x)
-        h = indexed_scale_shift_(h, shift, scale, inverse_indices)
+        scale_shift = reference_scale_shift if self.reference_numerics else indexed_scale_shift_
+        h = scale_shift(h, shift, scale, inverse_indices)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
         if self.pdd_steps is not None:
@@ -867,6 +871,35 @@ class MiniMaxH3DiTModel(nn.Module):
             adaln_cache=self.adaln_cache,
         )
         self._mark_missing_params_required()
+        reference_numerics = (getattr(od_config, "additional_config", None) or {}).get(
+            "minimax_h3_reference_numerics", False
+        )
+        if type(reference_numerics) is not bool:
+            raise ValueError("minimax_h3_reference_numerics must be a boolean")
+        if reference_numerics:
+            if (
+                quant_config is not None
+                or get_tensor_model_parallel_world_size() != 1
+                or ulysses_degree != 1
+                or self.parallel_config.ring_degree != 1
+                or self.parallel_config.allgather_degree != 1
+                or self.controlnet is not None
+            ):
+                raise ValueError("H3 reference numerics requires unquantized TP=SP=1 without ControlNet")
+            if not od_config.enforce_eager or od_config.cache_backend not in (None, "none"):
+                raise ValueError("H3 reference numerics requires enforce_eager=True and no approximate cache backend")
+            for module in self.modules():
+                if isinstance(module, MiniMaxH3Attention) and module.attention.attn_backend.get_name() != "SDPA":
+                    raise ValueError("H3 reference numerics requires the TORCH_SDPA attention backend")
+                if isinstance(
+                    module,
+                    (MiniMaxH3RMSNorm, MiniMaxH3Attention, MiniMaxH3MLP, MiniMaxH3DiTBlock, MiniMaxH3FinalLayer),
+                ):
+                    module.reference_numerics = True
+                if isinstance(module, (ColumnParallelLinear, RowParallelLinear)):
+                    # LoRA wrappers delegate this policy to their base layer.
+                    # PEFT rounds the expand GEMM before adding the base output.
+                    module.diffusion_lora_fuse_addmm = False
 
     def enable_vsa_gates(
         self,
