@@ -170,6 +170,18 @@ def test_repeated_invocations_do_not_overwrite_artifacts(suite: Path) -> None:
     assert read_json(second_dir, "selection.json")["selected"] == ["test_sample.py::test_second"]
 
 
+def test_sessionfinish_persists_artifacts_before_pytest_unconfigure_exit(suite: Path) -> None:
+    (suite / "conftest.py").write_text(
+        "def pytest_unconfigure(config):\n    raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    result, directory = run_suite(suite, "def test_ok(): pass\n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert read_json(directory, "summary.json")["pytest_exit_code"] == 0
+    assert read_json(directory, "summary.json")["counts"]["passed"] == 1
+    assert "thread_environment" in read_json(directory, "cpu-after.json")
+
+
 def test_artifact_directory_failure_stops_before_execution(suite: Path) -> None:
     (suite / "artifacts").write_text("not a directory", encoding="utf-8")
     (suite / "test_sample.py").write_text("raise AssertionError('must not collect')", encoding="utf-8")

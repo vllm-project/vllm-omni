@@ -64,6 +64,7 @@ class CpuSuiteArtifacts:
         self.collection_seconds: float | None = None
         self.collection_finished = False
         self.artifact_errors: set[str] = set()
+        self.finished_status: int | None = None
 
     def write(self, name: str, data: object, *, append: bool = False) -> None:
         # Diagnostic failures must not replace a nonzero pytest result.
@@ -161,7 +162,15 @@ class CpuSuiteArtifacts:
             wasxfail=getattr(report, "wasxfail", None),
         )
 
+    @pytest.hookimpl(hookwrapper=True, tryfirst=True)
+    def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> Generator[None, None, None]:
+        """Persist final artifacts before later pytest teardown can exit."""
+        yield
+        session.exitstatus = self.finish(int(session.exitstatus))
+
     def finish(self, status: int) -> int:
+        if self.finished_status is not None:
+            return self.finished_status
         try:
             root = ET.parse(self.directory / "pytest.xml").getroot()
             if root.tag not in ("testsuites", "testsuite"):
@@ -204,7 +213,8 @@ class CpuSuiteArtifacts:
                 "artifact_errors": sorted(self.artifact_errors),
             },
         )
-        return status or int(bool(self.artifact_errors))
+        self.finished_status = status or int(bool(self.artifact_errors))
+        return self.finished_status
 
 
 def main() -> int:
