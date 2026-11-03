@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from typing import Any
 
@@ -41,7 +41,7 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
 
         # Split z into overlapping tiles and decode them separately.
         # The tiles have an overlap to avoid seams between tiles.
-        tiletask_list = []
+        tiletask_list: list[TileTask] = []
         for i in range(0, height, tile_latent_stride_height):
             for j in range(0, width, tile_latent_stride_width):
                 time_list = []
@@ -137,7 +137,7 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
 
         temporal_compression = 2 ** sum(bool(t) for t in self.config.temperal_downsample)
 
-        tiletask_list = []
+        tiletask_list: list[TileTask] = []
         for i in range(0, height, self.tile_sample_stride_height):
             for j in range(0, width, self.tile_sample_stride_width):
                 time_list = []

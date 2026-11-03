@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Unit tests for DistributedAutoencoderKLQwenImage encode parallel (CPU-only)."""
+
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -267,7 +269,7 @@ class TestTiledEncodeDispatch:
         seen = {}
 
         class FakeExecutor:
-            def execute(self, tensor, operator, broadcast_result=True):
+            def execute(self, tensor, operator, broadcast_result=False):
                 seen["tensor"] = tensor
                 seen["operator"] = operator
                 seen["broadcast_result"] = broadcast_result
@@ -309,7 +311,7 @@ class TestTiledDecodeDispatch:
         seen = {}
 
         class FakeExecutor:
-            def execute(self, tensor, operator, broadcast_result=True):
+            def execute(self, tensor, operator, broadcast_result=False):
                 seen["tensor"] = tensor
                 seen["operator"] = operator
                 seen["broadcast_result"] = broadcast_result
@@ -328,6 +330,7 @@ class TestTiledDecodeDispatch:
         assert seen["tensor"] is z
         assert seen["broadcast_result"] is True
         assert seen["operator"].split.__name__ == "tile_split"
+        assert seen["operator"].exec.__name__ == "tile_exec"
         assert seen["operator"].merge.__name__ == "tile_merge"
 
 
@@ -351,6 +354,9 @@ class _SingleRankExecutor:
         executor.parallel_mode = "tile"
         executor.gather_tensors = lambda tensor: [tensor]
         executor._sync_final_result = lambda result, *_args, **_kwargs: result
+        # The error-agreement phases all-reduce a status flag over the CPU group;
+        # with a single rank and no process group they are a no-op.
+        executor._sync_errors = nullcontext
 
         def _local_padding_shape(local_results, output_ndim, device):  # noqa: ARG001
             dims = [0] * output_ndim
@@ -401,6 +407,55 @@ class TestRealVaeExecutorPath:
             distributed = vae.tiled_encode(x)
 
         assert distributed.shape == reference.shape
+        torch.testing.assert_close(distributed, reference, rtol=0, atol=0)
+
+    def test_distributed_tiled_encode_matches_sequential_multi_frame(self):
+        """Multi-frame parity with the parent: temporal chunking and the cross-chunk causal cache.
+
+        ``temperal_downsample=[False, True, True]`` is the real checkpoint's layout: the
+        config-derived chunk size ``2 ** sum(temperal_downsample) == 4`` equals the value
+        diffusers' ``tiled_encode`` hardcodes, so five frames encode as a leading frame plus
+        one chunk of four, and the second chunk reads the causal feature cache written by
+        the first. The single-frame case above cannot fail on either of those paths.
+        """
+        from diffusers.models.autoencoders import AutoencoderKLQwenImage
+
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import (
+            DistributedAutoencoderKLQwenImage,
+        )
+
+        torch.manual_seed(0)
+        vae = DistributedAutoencoderKLQwenImage(
+            base_dim=8,
+            z_dim=4,
+            dim_mult=[1, 1, 1, 1],
+            num_res_blocks=1,
+            attn_scales=[],
+            temperal_downsample=[False, True, True],
+            latents_mean=[0.0] * 4,
+            latents_std=[1.0] * 4,
+        )
+        vae.eval()
+        vae.distributed_executor = _SingleRankExecutor()
+        # spatial compression 8: 16/8 tiles on a 32x32 input give a 4x4 grid of 2x2 latent tiles
+        vae.enable_tiling(
+            tile_sample_min_height=16,
+            tile_sample_min_width=16,
+            tile_sample_stride_height=8,
+            tile_sample_stride_width=8,
+        )
+        vae.is_distributed_enabled = lambda: True
+
+        torch.manual_seed(1)
+        x = torch.randn(1, 3, 5, 32, 32)
+        tiletask_list, _ = vae.encode_tile_split(x)
+        assert len(tiletask_list[0].tensor) == 2, "expected a leading frame plus one chunk of four"
+        with torch.no_grad():
+            reference = AutoencoderKLQwenImage.tiled_encode(vae, x)
+            distributed = vae.tiled_encode(x)
+
+        assert distributed.shape == reference.shape
+        assert distributed.shape[2] == 2
         torch.testing.assert_close(distributed, reference, rtol=0, atol=0)
 
 

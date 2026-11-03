@@ -492,7 +492,7 @@ def parse_args() -> argparse.Namespace:
         "--vae-patch-parallel-size",
         type=int,
         default=1,
-        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
+        help="Number of GPUs used for VAE patch/tile parallelism (encode and decode).",
     )
     parser.add_argument(
         "--use-hsdp",
@@ -611,6 +611,7 @@ def main():
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
         enable_cpu_offload=args.enable_cpu_offload,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
@@ -644,7 +645,7 @@ def main():
     else:
         print(f"  Input image size: {input_image.size}")
     print(
-        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}, enable_expert_parallel: {args.enable_expert_parallel}"
+        f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel: {args.enable_expert_parallel}"
     )
     print(f"{'=' * 60}\n")
 
