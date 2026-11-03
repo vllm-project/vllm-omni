@@ -188,6 +188,14 @@ from .packed_tokens import (
     minimax_h3_unpatchify_video_tokens,
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
+from .regenerate import (
+    REGENERATE_DEFAULT_UPSCALE,
+    REGENERATE_SUPPORTED_TASKS,
+    REGENERATE_VIDEO_SHIFT,
+    MiniMaxH3RegenerateAdapter,
+    regenerate_schedule,
+    resolve_regenerate_adapter,
+)
 from .sampling import create_h3_sample_solver, normalize_h3_sampler
 from .scheduling_minimax_h3_euler_ancestral import (
     minimax_h3_rf_v_to_x0,
@@ -756,6 +764,8 @@ class MiniMaxH3Pipeline(
     # Set from --lora-path when it names a VDN-H3 checkpoint directory.
     _vdn: VDNCheckpoint | None = None
     _fasth3_checkpoint: FastH3CheckpointSpec | None = None
+    # Set from --lora-path when it names an Open-H3-Regenerate release.
+    _regenerate: MiniMaxH3RegenerateAdapter | None = None
 
     def _load_diffusion_lora_adapter(
         self,
@@ -1191,7 +1201,15 @@ class MiniMaxH3Pipeline(
             self._vdn.check_serving_contract(partition=self.partition, od_config=od_config)
             # The hybrid modules must exist before the branch tensors stream in.
             self.transformer.enable_vdn(self._vdn.config)
-        self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer) if self._vdn is None else None
+        if self._vdn is None and not modular:
+            self._regenerate = resolve_regenerate_adapter(od_config, self.transformer)
+        if self._regenerate is not None:
+            self._regenerate.check_serving_contract(partition=self.partition, od_config=od_config)
+        self._fasth3 = (
+            resolve_fasth3_fusion(od_config, self.transformer)
+            if self._vdn is None and self._regenerate is None
+            else None
+        )
         if self._fasth3 is not None and self._fasth3.requires_vsa:
             # The artifact assigns a compression gate per DiT block, so those
             # modules have to exist before load_weights streams them in. Only
@@ -1212,7 +1230,10 @@ class MiniMaxH3Pipeline(
             "minimax_h3_adaln_cache_path",
             expected_partition,
             self._fasth3.source if self._fasth3 is not None else None,
-            eligible=transformer_quant_config is None and not modular and self._vdn is None,
+            eligible=transformer_quant_config is None
+            and not modular
+            and self._vdn is None
+            and self._regenerate is None,
         )
         if ref2va_model_path is not None:
             self._configure_adaln_sidecar(
@@ -1328,6 +1349,7 @@ class MiniMaxH3Pipeline(
             od_config,
             device=self.device,
             latent_stats=_upscaler_latent_stats,
+            default_path=self._regenerate.upscaler_path if self._regenerate is not None else None,
         )
 
         self._dlo_component_cache = None
@@ -1379,6 +1401,8 @@ class MiniMaxH3Pipeline(
             stream = ((name[len(prefix) :], tensor) for name, tensor in grouped_weights)
             if prefix == "transformer." and self._vdn is not None:
                 stream = self._vdn.apply(stream)
+            if prefix == "transformer." and self._regenerate is not None:
+                stream = self._regenerate.apply(stream)
             if prefix == "transformer." and self._fasth3 is not None:
                 # Fuse before the model shards anything, which is also the only
                 # point where the checkpoint's fused QKV/MLP layouts are intact.
@@ -1408,6 +1432,8 @@ class MiniMaxH3Pipeline(
             # load_weights only warns on a parameter the model does not have, so
             # close the adapter against what the DiT actually consumed.
             self._fasth3.validate_fully_applied(transformer_loaded)
+        if self._regenerate is not None:
+            self._regenerate.validate_fully_applied(transformer_loaded)
         if self._fasth3_checkpoint is not None:
             parameter_names = set(dict(self.transformer.named_parameters()))
             required_gates = set()
@@ -1423,7 +1449,7 @@ class MiniMaxH3Pipeline(
     @property
     def lora_is_fused(self) -> bool:
         """True when --lora-path was consumed as a load-time weight fusion."""
-        return self._fasth3 is not None or self._vdn is not None
+        return self._fasth3 is not None or self._vdn is not None or self._regenerate is not None
 
     def _configure_adaln_sidecar(
         self,
@@ -3171,6 +3197,12 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(
                 f"MiniMax H3 encoder task {conditioning.task!r} does not match diffusion request {requested_task!r}"
             )
+        if self._regenerate is not None or extra.get("regenerate", False):
+            if continuation is not None:
+                raise OmniClientError("Open-H3-Regenerate does not support latent-tail continuation")
+            if control is not None:
+                raise OmniClientError("Open-H3-Regenerate does not take control inputs")
+            return self._prepare_regenerate_inputs(conditioning, sampling)
         turbo_spec = self._active_turbo_spec(sampling)
         has_native_lora = self._has_active_native_lora(sampling)
         task = self._resolve_task(
@@ -3483,6 +3515,172 @@ class MiniMaxH3Pipeline(
             **latent_edit,
         }
 
+    def _regenerate_silence_rows(self, num_frames: int, audio_t: int) -> torch.Tensor:
+        """Encoded stereo silence, the audio the release's refiner conditions on.
+
+        The last encoding is reused only for the same clip length; it is kept on
+        the CPU in FP32, and callers place it where they need it.
+        """
+        key = (num_frames, audio_t)
+        cached = getattr(self, "_regenerate_silence", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        samples = round(num_frames / MINIMAX_H3_FPS * MINIMAX_H3_AUDIO_SAMPLE_RATE)
+        with self._component_on_device(self.audio_vae):
+            rows, encoded_t = self.audio_vae.encode_waveform(torch.zeros(2, samples), MINIMAX_H3_AUDIO_SAMPLE_RATE)
+        if encoded_t != audio_t:
+            raise RuntimeError(f"encoded silence has {encoded_t} audio latents, the canvas {audio_t}")
+        self._regenerate_silence = (key, rows.to(device="cpu", dtype=torch.float32))
+        return self._regenerate_silence[1]
+
+    def _prepare_regenerate_inputs(
+        self,
+        conditioning: MiniMaxH3EncoderConditioning,
+        sampling: Any,
+    ) -> dict[str, Any]:
+        """Turn an encoded draft into an Open-H3-Regenerate refine pass.
+
+        The draft arrives as latent-edit source rows under an all-keep mask (see
+        ``prepare_encoder_inputs``) and skips the first denoise pass: it is
+        upscaled and refined directly. The refiner conditions on encoded
+        silence, as the release does; the output keeps the draft's own audio
+        when it has a track.
+        """
+        extra = sampling.extra_args or {}
+        if self._regenerate is None:
+            raise OmniClientError(
+                "regenerate needs a server started with --lora-path pointing at an Open-H3-Regenerate release"
+            )
+        if extra.get("regenerate") is not True:
+            raise OmniClientError(
+                "this server regenerates drafts only; send the draft as source_video with regenerate=true "
+                "(extra_params over HTTP)"
+            )
+        if getattr(self.od_config, "step_execution", False):
+            raise OmniClientError("Open-H3-Regenerate does not support step execution")
+        if resolve_continuation_request(extra) is not None:
+            raise OmniClientError("Open-H3-Regenerate does not support continue_from")
+        if extra.get(LATENT_CACHE_KEY) is not None:
+            # The 2K output leaves the base canvas a later continue_from would need.
+            raise OmniClientError("Open-H3-Regenerate outputs are not cached for continue_from; drop latent_cache_key")
+        if not self.load_vae_encoder:
+            raise OmniClientError("Open-H3-Regenerate needs a local VAE encoder")
+        num_steps = self._regenerate.check_request(sampling)
+        if conditioning.task not in REGENERATE_SUPPORTED_TASKS:
+            raise OmniClientError(f"Open-H3-Regenerate refines T2VA drafts, got task={conditioning.task!r}")
+        source = conditioning.video_edit_clean_rows
+        if source is None or conditioning.video_edit_mask is None or bool(conditioning.video_edit_mask.any()):
+            raise OmniClientError("Open-H3-Regenerate needs the draft as source_video and no video_noise_mask")
+        if conditioning.audio_edit_mask is not None and bool(conditioning.audio_edit_mask.any()):
+            raise OmniClientError("Open-H3-Regenerate does not take an audio_noise_mask")
+        if (
+            conditioning.visual_condition is not None
+            or conditioning.audio_condition is not None
+            or conditioning.ref_blocks
+            or conditioning.guide_blocks
+        ):
+            raise OmniClientError("Open-H3-Regenerate takes a prompt and the draft only")
+
+        latent_t, latent_h, latent_w = conditioning.latent_t, conditioning.height // 16, conditioning.width // 16
+        video_latent = minimax_h3_unpatchify_video_tokens(
+            source.to(device=self.device, dtype=torch.float32),
+            latent_shape=(latent_t, latent_h // 2, latent_w // 2, 24),
+            patch_size=(1, 2, 2),
+        )
+        silence = self._regenerate_silence_rows(conditioning.num_frames, conditioning.audio_t)
+        audio_latent = minimax_h3_unpack_audio_tokens(silence, audio_t=2 * conditioning.audio_t, audio_channel=2)
+        draft_audio = conditioning.audio_edit_clean_rows
+        if draft_audio is not None:
+            draft_audio = minimax_h3_unpack_audio_tokens(
+                draft_audio.float(), audio_t=2 * conditioning.audio_t, audio_channel=2
+            )
+        upscale_extra = (
+            extra if extra.get("latent_upscale") is not None else {"latent_upscale": REGENERATE_DEFAULT_UPSCALE}
+        )
+        target = self._resolve_latent_upscale(upscale_extra, latent_h=latent_h, latent_w=latent_w)
+        if target is not None and (target.latent_height % 2 or target.latent_width % 2):
+            # Regenerate always refines the upscaled draft, which patchifies 2x2.
+            raise OmniClientError(
+                "Open-H3-Regenerate refines the upscaled draft, so latent_upscale must give a latent height and "
+                "width divisible by 2 (32 pixels); use align=32 or a compatible target size"
+            )
+        self._validate_refine_token_budget(
+            task=conditioning.task,
+            target=target,
+            latent_t=latent_t,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            audio_t=conditioning.audio_t,
+            text_len=int(conditioning.hidden_states.shape[0]),
+            keyframe_count=0,
+            ref_blocks=None,
+        )
+        quality_plan = self._quality_policy.resolve(
+            quality=sampling.quality,
+            num_inference_steps=num_steps,
+            extra_args=extra,
+        )
+        if quality_plan.cache_dit is not None:
+            raise OmniClientError("Open-H3-Regenerate requires uncached denoising; set quality=lossless")
+        cache_backend = str(getattr(self.od_config, "cache_backend", None) or "none").lower()
+        if cache_backend not in ("none", "cache_dit"):
+            raise OmniClientError(f"Open-H3-Regenerate does not support --cache-backend {cache_backend}")
+        self._cache_dit_runtime.prepare(None)
+        self._prepare_adaln_adapter(sampling)
+        return {
+            "continuation": None,
+            "regenerate_source": (video_latent, audio_latent),
+            "regenerate_output_audio": draft_audio,
+            "task": conditioning.task,
+            "latent_upscale": target,
+            "latent_refine": MiniMaxH3LatentRefineSpec(strength=1.0),
+            "keyframe_images": [],
+            "height": conditioning.height,
+            "width": conditioning.width,
+            "num_frames": conditioning.num_frames,
+            "latent_t": latent_t,
+            "latent_h": latent_h,
+            "latent_w": latent_w,
+            "audio_t": conditioning.audio_t,
+            "text_embeddings": conditioning.hidden_states.to(device=self.device, dtype=torch.bfloat16),
+            "text_tags": conditioning.token_tags.to(device=self.device, dtype=torch.long),
+            "visual_condition": None,
+            "visual_condition_shape": None,
+            "audio_condition": None,
+            "ref_audio_t": None,
+            "ref_blocks": None,
+            "visual_condition_shapes": None,
+            "audio_condition_lengths": None,
+            "locked_audio_rows": silence.to(device=self.device),
+            "keyframe_frame_indices": None,
+            "guide_blocks": None,
+            "pad_seq_len": None,
+            "seed": int(sampling.seed if sampling.seed is not None else 42),
+            "sampler": "euler",
+            "num_steps": num_steps,
+            "video_shift": REGENERATE_VIDEO_SHIFT,
+            "audio_shift": self.default_audio_shift,
+            "base_schedule": regenerate_schedule(num_steps).base_schedule,
+            "num_outputs": _resolve_minimax_h3_num_outputs(sampling.num_outputs_per_prompt),
+            "preencode_mp4": bool(extra.get("preencode_mp4", False)),
+            "preencode_batch_frames": (
+                normalize_preencode_batch_frames(extra.get("preencode_batch_frames", 17))
+                if extra.get("preencode_mp4", False)
+                else 17
+            ),
+            "video_codec_options": normalize_video_codec_options(
+                extra.get("video_codec_options", {"preset": "ultrafast", "threads": "0"})
+                if extra.get("preencode_mp4", False)
+                else None
+            ),
+            "video_edit_clean_rows": None,
+            "video_edit_mask_rows": None,
+            "video_edit_restore_mask_rows": None,
+            "audio_edit_clean_rows": None,
+            "audio_edit_mask_rows": None,
+            "audio_edit_restore_mask_rows": None,
+        }
+
     def _resolve_latent_continuation(
         self,
         extra: Mapping[str, Any],
@@ -3644,10 +3842,18 @@ class MiniMaxH3Pipeline(
         # Each seed appends one count on the output owner and none on peers;
         # decode_to_mp4 rejects multiple MP4 outputs for a single seed.
         frame_counts = []
+        regenerate_source = context.get("regenerate_source")
+        if regenerate_source is not None and upscale_target is not None:
+            # The draft is the same for every seed and the upscale deterministic:
+            # upscale it once; only the refine pass below depends on the seed.
+            regenerate_source = (self._upscaled_latent(regenerate_source[0], upscale_target), regenerate_source[1])
         for output_index, output_seed in enumerate(_minimax_h3_output_seeds(context["seed"], num_outputs)):
             check_request_cancellation()
             output_kwargs = {**denoise_kwargs, "seed": output_seed}
-            if context.get("continuation") is None and prefix is None:
+            if regenerate_source is not None:
+                # Open-H3-Regenerate starts from the encoded draft, not noise.
+                video_latent, audio_latent = regenerate_source
+            elif context.get("continuation") is None and prefix is None:
                 video_latent, audio_latent = self.diffuse(
                     **output_kwargs,
                     request_context=context,
@@ -3673,7 +3879,7 @@ class MiniMaxH3Pipeline(
             cache_clip = output_index == 0 and context.get("latent_cache_key") is not None
             if cache_clip and upscale_target is not None:
                 self._cache_clip_latents(context, video_latent, audio_latent)
-            if upscale_target is not None:
+            if upscale_target is not None and regenerate_source is None:
                 video_latent = self._upscaled_latent(video_latent, upscale_target)
             if latent_refine is not None:
                 video_latent, audio_latent = self._refined_latents(
@@ -3684,6 +3890,8 @@ class MiniMaxH3Pipeline(
                 )
             if cache_clip and upscale_target is None:
                 self._cache_clip_latents(context, video_latent, audio_latent)
+            if context.get("regenerate_output_audio") is not None:
+                audio_latent = context["regenerate_output_audio"]
             if not self.load_vae_decoder:
                 videos.append(video_latent)
                 audios.append(audio_latent)
