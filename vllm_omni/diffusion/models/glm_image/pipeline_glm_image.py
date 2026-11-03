@@ -193,6 +193,10 @@ def retrieve_timesteps(
                 f" timestep or sigma schedules. Please check whether you are using the correct scheduler."
             )
         scheduler.set_timesteps(timesteps=timesteps, sigmas=sigmas, device=device, **kwargs)
+        # GLM-Image conditions the DiT on the *unshifted* timesteps while integrating with the
+        # resolution-shifted sigmas. FlowMatchEulerDiscreteScheduler.set_timesteps (diffusers >= 0.40)
+        # overwrites provided timesteps with `sigmas * num_train_timesteps`, so restore them here.
+        scheduler.timesteps = torch.as_tensor(timesteps, dtype=torch.float32, device=scheduler.timesteps.device)
         timesteps = scheduler.timesteps
         num_inference_steps = len(timesteps)
     elif timesteps is not None:
@@ -733,7 +737,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsCompon
         )
         width = ar_width or req.sampling_params.width or img_width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = req.sampling_params.num_inference_steps or 50
-        guidance_scale = req.sampling_params.guidance_scale or 1.5
+        guidance_scale = req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else 1.5
 
         # Ensure dimensions are multiples of vae_scale_factor * patch_size
         multiple_of = self.vae_scale_factor * self._patch_size

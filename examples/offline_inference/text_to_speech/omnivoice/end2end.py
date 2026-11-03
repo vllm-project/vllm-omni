@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """End-to-end OmniVoice TTS inference via vLLM-Omni.
 
 Supports:
 - Auto voice mode: text only → generated speech
 - Voice cloning mode: text + reference audio → cloned voice speech
+- Automatic reference transcription: reference audio without reference text
 
 Usage:
     # Auto voice
@@ -13,6 +14,11 @@ Usage:
     # Voice cloning
     python end2end.py --model k2-fsa/OmniVoice --text "Hello" \
         --ref-audio ref.wav --ref-text "reference transcription"
+
+    # Automatic reference transcription (lazy by default; set
+    # load_asr_on_startup: true to preload Whisper at worker startup)
+    python end2end.py --model k2-fsa/OmniVoice --text "hello" \
+        --ref-audio trump_ref.wav
 """
 
 import argparse
@@ -23,6 +29,7 @@ import soundfile as sf
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.models.omnivoice.prompt_utils import prepare_instruct, validate_instruction
 
 
 def run_e2e():
@@ -34,7 +41,7 @@ def run_e2e():
         help="Model name or path (HuggingFace or local)",
     )
     parser.add_argument(
-        "--stage-config",
+        "--deploy-config",
         type=str,
         default="vllm_omni/deploy/omnivoice.yaml",
     )
@@ -87,14 +94,14 @@ def run_e2e():
     )
     args = parser.parse_args()
 
-    if not os.path.exists(args.stage_config):
-        raise FileNotFoundError(f"Stage config not found: {args.stage_config}")
+    if not os.path.exists(args.deploy_config):
+        raise FileNotFoundError(f"Deploy config not found: {args.deploy_config}")
 
     print(f"Initializing OmniVoice with model={args.model}")
 
     omni = Omni(
         model=args.model,
-        stage_configs_path=args.stage_config,
+        deploy_config=args.deploy_config,
         log_stats=True,
     )
 
@@ -112,13 +119,17 @@ def run_e2e():
 
         audio_signal, sr = load_audio(args.ref_audio, sr=None)
         multi_modal_data["audio"] = (audio_signal.astype(np.float32), sr)
-        mm_processor_kwargs["ref_text"] = args.ref_text or ""
+        if args.ref_text is not None:
+            mm_processor_kwargs["ref_text"] = args.ref_text
         mm_processor_kwargs["sample_rate"] = sr
 
     if args.lang:
         mm_processor_kwargs["lang"] = args.lang
     if args.instruct:
-        mm_processor_kwargs["instruct"] = args.instruct
+        instruction_validation_error = validate_instruction(args.instruct)
+        if instruction_validation_error is not None:
+            raise ValueError(instruction_validation_error)
+        mm_processor_kwargs["instruct"] = prepare_instruct(args.instruct)
 
     prompts = {"prompt": args.text}
     if multi_modal_data:
@@ -126,7 +137,7 @@ def run_e2e():
     if mm_processor_kwargs:
         prompts["mm_processor_kwargs"] = mm_processor_kwargs
 
-    sampling_params_list = [OmniDiffusionSamplingParams(extra_args={"seed": args.seed})]
+    sampling_params_list = [OmniDiffusionSamplingParams(seed=args.seed)]
 
     print(f"Generating speech for: {args.text}")
 
@@ -135,7 +146,7 @@ def run_e2e():
     print(f"Received {len(outputs)} outputs.")
     for i, output in enumerate(outputs):
         try:
-            ro = output.request_output
+            ro = output
             if ro is None:
                 print("No request_output found.")
                 continue

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Copyright 2025 Black Forest Labs and The HuggingFace Team. All rights reserved.
 #
@@ -36,12 +36,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_flux2 import DistributedAutoencoderKLFlux2
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
+    _use_local_single_stream_tp,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -247,8 +249,13 @@ class Flux2KleinPipeline(
             subfolder="tokenizer",
             local_files_only=local_files_only,
         )
+        vae_class = (
+            DistributedAutoencoderKLFlux2
+            if od_config.parallel_config.vae_parallel_mode == "batch"
+            else AutoencoderKLFlux2
+        )
         self.vae = from_pretrained_with_prefetch(
-            AutoencoderKLFlux2.from_pretrained,
+            vae_class.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=flux2_subfolders,
@@ -256,7 +263,11 @@ class Flux2KleinPipeline(
         ).to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
-        self.transformer = Flux2Transformer2DModel(quant_config=od_config.quantization_config, **transformer_kwargs)
+        self.transformer = Flux2Transformer2DModel(
+            quant_config=od_config.quantization_config,
+            local_tp=_use_local_single_stream_tp(od_config),
+            **transformer_kwargs,
+        )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16
@@ -270,6 +281,15 @@ class Flux2KleinPipeline(
         )
         self.tokenizer_max_length = 512
         self.default_sample_size = 128
+
+        # text_encoder_out_layers is hardcoded to (9, 18, 27) in Diffusers,
+        # but this won't necessarily work for all text encoders. We allow
+        # setting the text_encoder_out_layers in the config to allow
+        # custom text encoders
+        if hasattr(self.text_encoder.config, "text_encoder_out_layers"):
+            self.text_encoder_out_layers = self.text_encoder.config.text_encoder_out_layers
+        else:
+            self.text_encoder_out_layers = (9, 18, 27)
 
         self._guidance_scale = None
         self._attention_kwargs = None
@@ -293,10 +313,10 @@ class Flux2KleinPipeline(
         text_encoder: Qwen3ForCausalLM,
         tokenizer: Qwen2TokenizerFast,
         prompt: str | list[str],
+        hidden_states_layers: tuple[int, ...],
         dtype: torch.dtype | None = None,
         device: torch.device | None = None,
         max_sequence_length: int = 512,
-        hidden_states_layers: list[int] = (9, 18, 27),
     ):
         dtype = text_encoder.dtype if dtype is None else dtype
         device = text_encoder.device if device is None else device
@@ -513,7 +533,6 @@ class Flux2KleinPipeline(
         num_images_per_prompt: int = 1,
         prompt_embeds: torch.Tensor | None = None,
         max_sequence_length: int = 512,
-        text_encoder_out_layers: tuple[int, ...] = (9, 18, 27),
     ):
         device = device or self._execution_device
 
@@ -527,9 +546,9 @@ class Flux2KleinPipeline(
                 text_encoder=self.text_encoder,
                 tokenizer=self.tokenizer,
                 prompt=prompt,
+                hidden_states_layers=self.text_encoder_out_layers,
                 device=device,
                 max_sequence_length=max_sequence_length,
-                hidden_states_layers=text_encoder_out_layers,
             )
 
         batch_size, seq_len, _ = prompt_embeds.shape
@@ -795,9 +814,6 @@ class Flux2KleinPipeline(
         latents = req.sampling_params.latents
         strength = req.sampling_params.strength if req.sampling_params.strength is not None else 1.0
 
-        text_encoder_out_layers: tuple[int, ...] = req.sampling_params.extra_args.get(
-            "text_encoder_out_layers", (9, 18, 27)
-        )
         padding_mask_crop: int | None = req.sampling_params.extra_args.get("padding_mask_crop")
         attention_kwargs: dict[str, Any] | None = None
         callback_on_step_end: Callable[[int, int, dict], None] | None = None
@@ -833,7 +849,6 @@ class Flux2KleinPipeline(
             device=device,
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
-            text_encoder_out_layers=text_encoder_out_layers,
         )
 
         if self.do_classifier_free_guidance:
@@ -846,7 +861,6 @@ class Flux2KleinPipeline(
                 device=device,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
-                text_encoder_out_layers=text_encoder_out_layers,
             )
 
         # 4. process images
@@ -1017,10 +1031,8 @@ class Flux2KleinPipeline(
 
             if reference_image_latents is not None:
                 latent_model_input = torch.cat([latents, reference_image_latents], dim=1)
-                latent_image_ids = latent_ids
             elif image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
-                latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
             positive_kwargs = {
                 "hidden_states": latent_model_input,

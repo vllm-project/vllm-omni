@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import base64
@@ -13,11 +16,11 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from PIL import Image
 
 from tests.e2e.accuracy.helpers import assert_image_sequence_similarity, model_output_dir
-from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
 
 
 MODEL_ID = "Qwen/Qwen-Image-Layered"
@@ -93,7 +96,7 @@ def _run_vllm_omni_qwen_image_layered(*, model: str, input_image: Image.Image, o
 
 
 def _run_diffusers_qwen_image_layered(*, model: str, input_image: Image.Image, output_dir: Path) -> list[Image.Image]:
-    run_pre_test_cleanup()
+    cleanup_test_environment()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -126,7 +129,7 @@ def _run_diffusers_qwen_image_layered(*, model: str, input_image: Image.Image, o
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup()
+        cleanup_test_environment()
 
 
 @pytest.mark.benchmark

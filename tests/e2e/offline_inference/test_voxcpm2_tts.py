@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """E2E test for VoxCPM2 native AR offline inference."""
 
 import os
@@ -10,12 +13,12 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 
-VOXCPM2_MODEL = "openbmb/VoxCPM2"
+VOXCPM2_MODEL = os.environ.get("VOXCPM2_MODEL", "openbmb/VoxCPM2")
 DEPLOY_CONFIG = get_deploy_config_path("voxcpm2.yaml")
 SAMPLE_RATE = 48000
 
-# (model, stage_config_path) — see ``omni_runner`` in tests.helpers.fixtures.runtime
-_OMNI_RUNNER_PARAM = (VOXCPM2_MODEL, DEPLOY_CONFIG)
+# VoxCPM2 ships a custom tokenizer, so remote code must be explicitly enabled.
+_OMNI_RUNNER_PARAM = (VOXCPM2_MODEL, DEPLOY_CONFIG, {"trust_remote_code": True})
 
 pytestmark = pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
 
@@ -39,10 +42,9 @@ def _extract_audio(multimodal_output: dict) -> torch.Tensor:
     return audio
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 def test_voxcpm2_zero_shot_001(omni_runner: OmniRunner) -> None:
     """Test zero-shot TTS produces valid audio output."""
     outputs = omni_runner.omni.generate([{"prompt": "Hello, this is a test."}])
@@ -53,10 +55,9 @@ def test_voxcpm2_zero_shot_001(omni_runner: OmniRunner) -> None:
     assert 0.5 < duration_s < 30.0, f"Audio duration out of range: {duration_s:.2f}s"
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 def test_voxcpm2_voice_clone_002(omni_runner: OmniRunner) -> None:
     """Test voice cloning with a reference audio file.
 
@@ -95,10 +96,9 @@ def test_voxcpm2_voice_clone_002(omni_runner: OmniRunner) -> None:
     assert 0.5 < duration_s < 30.0, f"Audio duration out of range: {duration_s:.2f}s"
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.tts
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "npu": "A2"}, num_cards=1)
 def test_voxcpm2_prefill_decode_mixed_batch_003(omni_runner: OmniRunner) -> None:
     """Regression: prefill+decode mixed batch must not crash (PR #2903)."""
     long_prompt = (

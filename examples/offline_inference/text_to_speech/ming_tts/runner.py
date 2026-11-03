@@ -140,7 +140,6 @@ def build_engine_kwargs(args, stats_log_file: str | None) -> dict:
         "stage_init_timeout": args.stage_init_timeout,
         "init_timeout": args.init_timeout,
         "batch_timeout": args.batch_timeout,
-        "shm_threshold_bytes": args.shm_threshold_bytes,
         "worker_backend": args.worker_backend,
     }
     if stats_log_file is not None:

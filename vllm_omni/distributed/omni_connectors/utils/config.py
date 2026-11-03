@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,8 +13,50 @@ TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
         "MooncakeTransferEngineConnector",
         "MoriTransferEngineConnector",
         "YuanrongTransferEngineConnector",
+        "NixlConnector",
     }
 )
+
+# Connector `extra` keys that are unique per launch (see `load_omni_transfer_config`),
+# but don't affect the model graph, and are therefore excluded from the compile cache key.
+PER_LAUNCH_EXTRA_KEYS = frozenset({"wakeup_scope"})
+
+
+def connector_hash_factors(connector_config: dict[str, Any]) -> dict[str, Any]:
+    """Filters the entries of a serialized connector dict to get the config to be used for the
+    compile cache key (i.e., everything except PER_LAUNCH_EXTRA_KEYS)."""
+    factors = {key: value for key, value in connector_config.items() if key not in PER_LAUNCH_EXTRA_KEYS}
+    if isinstance(factors.get("extra"), dict):
+        factors["extra"] = connector_hash_factors(factors["extra"])
+    return factors
+
+
+def get_stage_connector_role(model_config: Any) -> str | None:
+    """Return the configured stage connector direction, if explicit."""
+    connector_config = getattr(model_config, "stage_connector_config", None)
+    if isinstance(connector_config, dict):
+        extra = connector_config.get("extra")
+    else:
+        extra = getattr(connector_config, "extra", None)
+    if isinstance(extra, dict):
+        role = extra.get("role")
+        return role if isinstance(role, str) else None
+    return None
+
+
+def stage_receives_chunks(model_config: Any) -> bool:
+    """Whether connector chunks, rather than the orchestrator, feed a stage."""
+    return bool(getattr(model_config, "async_chunk", True)) and get_stage_connector_role(model_config) != "sender"
+
+
+def stage_sends_async_output(model_config: Any) -> bool:
+    """Whether async output should be partitioned for connector transport."""
+    role = get_stage_connector_role(model_config)
+    if role is not None:
+        return role == "sender"
+    # Preserve legacy partitioning while keeping stage-0 orchestrator bridges
+    # on the normal RequestOutput path.
+    return getattr(model_config, "stage_id", None) != 0
 
 
 @dataclass

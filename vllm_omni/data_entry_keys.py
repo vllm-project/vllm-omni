@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Structured payload types for inter-stage communication.
 
 Categories under ``OmniPayload``:
@@ -12,11 +12,27 @@ Categories under ``OmniPayload``:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import msgspec
 import numpy as np
 import torch
+
+# Internal output routing markers shared by first-frame producers and orchestration.
+FIRST_AUDIO_KEY = "_omni_first_audio"
+FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
+
+REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
+# Routing tag: the stage returns its full payload on its output instead of sending it to the
+# next stage. Set on run requests whose next stage takes a full payload.
+RETURN_STAGE_PAYLOAD_KEY = "omni_return_stage_payload"
+TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
+# Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry
+# an async-chunk placeholder's prewarm payload. Values stay top-level tensors or
+# scalars (a dict holding a tensor would come back as a list); the receiving
+# scheduler pops these keys before the request reaches the model.
+ASYNC_CHUNK_PREWARM_NS = "_async_chunk_prewarm"
 
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
@@ -30,9 +46,16 @@ class HiddenStates(TypedDict, total=False):
 
 
 class Embeddings(TypedDict, total=False):
+    prepared_prefill: torch.Tensor
     prefill: torch.Tensor
     decode: torch.Tensor
+    # [1, H] embedding of the token sampled by a row's final prefill step (MRv2 producers).
+    sampled: torch.Tensor
+    decode_token_start: int
+    decode_token_end: int
     cached_decode: torch.Tensor
+    cached_decode_token_start: int
+    cached_decode_token_end: int
     tts_bos: torch.Tensor
     tts_eos: torch.Tensor
     tts_pad: torch.Tensor
@@ -50,23 +73,39 @@ class Codes(TypedDict, total=False):
 
 
 class Ids(TypedDict, total=False):
+    prepared_prefill: torch.Tensor
     all: list[int]
     prompt: list[int]
     output: list[int]
     speech_token: list[int]
     prior_image: list[int]
+    streaming_prompt_previous_codes: list[int]
 
 
 class OmniPayloadMeta(TypedDict, total=False):
     finished: torch.Tensor
     is_segment_finished: torch.Tensor
     stream_finished: torch.Tensor
+    request_id: str
+    chunk_seq: int
+    cache_epoch: int
+    codec_chunk_frames: int
+    codec_left_context_frames: int
+    code_flat_numel: int
+    last_chunk: bool
     req_id: list[str]
     left_context_size: int
     right_holdback_size: int
     override_keys: list[tuple[str, str]]
     num_processed_tokens: int
+    resumable: bool
     next_stage_prompt_len: int
+    next_stage_generation_tokens: int
+    replace_streaming_prompt: bool
+    next_stage_prompt_ids: list[int]
+    streaming_prompt_recompute: bool
+    streaming_condition_seq: int
+    replace_runtime_additional_information: bool
     ar_width: int
     eol_token_id: int
     visual_token_start_id: int
@@ -77,11 +116,24 @@ class OmniPayloadMeta(TypedDict, total=False):
     width: int
     decode_flag: bool
     codec_streaming: bool
+    first_audio: bool | torch.Tensor
+    codec_frame_valid: bool | torch.Tensor
     ref_code_len: int
     ref_context_size: int
     ref_context_request_id: str
     ref_context_included: bool
     talker_prefill_offset: int
+    # embed.prefill also holds the accept-layer hidden state at multimodal
+    # placeholder rows, so no hidden_states.output is sent (Qwen3-Omni chunk 0).
+    prefill_holds_accept_hidden: bool
+    omni_final_stage_id: int
+    # Per-request audio seed. Stages that draw their own noise (flow-matching
+    # / diffusion decoders) need the producing stage's seed to stay
+    # reproducible, and the producing stage's SamplingParams do not travel
+    # with the payload.
+    audio_seed: int
+    token_role_ids: torch.Tensor
+    minimax_h3_prepared_reference_videos: str
 
 
 class OmniPayload(TypedDict, total=False):
@@ -97,12 +149,15 @@ class OmniPayload(TypedDict, total=False):
     speaker: Any
     language: Any
     request_id: str
+    additional_information: dict[str, Any]
 
 
 # ── msgspec.Struct mirror of the TypedDicts (runtime-validated) ──
 
 
-class _StructBase(msgspec.Struct, omit_defaults=True, kw_only=True, forbid_unknown_fields=True):
+class _StructBase(  # type: ignore[call-arg]
+    msgspec.Struct, omit_defaults=True, kw_only=True, forbid_unknown_fields=True
+):
     pass
 
 
@@ -121,6 +176,8 @@ class EmbeddingsStruct(_StructBase):
     decode_token_start: int | None = None
     decode_token_end: int | None = None
     cached_decode: torch.Tensor | None = None
+    cached_decode_token_start: int | None = None
+    cached_decode_token_end: int | None = None
     tts_bos: torch.Tensor | None = None
     tts_eos: torch.Tensor | None = None
     tts_pad: torch.Tensor | None = None
@@ -144,18 +201,31 @@ class IdsStruct(_StructBase):
     output: list[int] | None = None
     speech_token: list[int] | None = None
     prior_image: list[int] | None = None
+    streaming_prompt_previous_codes: list[int] | None = None
 
 
 class MetaStruct(_StructBase):
     finished: torch.Tensor | None = None
     is_segment_finished: torch.Tensor | None = None
     stream_finished: torch.Tensor | None = None
+    request_id: str | None = None
+    chunk_seq: int | None = None
+    cache_epoch: int | None = None
+    last_chunk: bool | None = None
     req_id: list[str] | None = None
     left_context_size: int | None = None
     right_holdback_size: int | None = None
     override_keys: list[tuple[str, str]] | None = None
     num_processed_tokens: int | None = None
+    # The model runner sets this when a streaming request is resumed.
+    resumable: bool | None = None
     next_stage_prompt_len: int | None = None
+    next_stage_generation_tokens: int | None = None
+    replace_streaming_prompt: bool | None = None
+    next_stage_prompt_ids: list[int] | None = None
+    streaming_prompt_recompute: bool | None = None
+    streaming_condition_seq: int | None = None
+    replace_runtime_additional_information: bool | None = None
     ar_width: int | None = None
     eol_token_id: int | None = None
     visual_token_start_id: int | None = None
@@ -166,15 +236,36 @@ class MetaStruct(_StructBase):
     width: int | None = None
     decode_flag: bool | None = None
     codec_streaming: bool | None = None
+    first_audio: torch.Tensor | None = None
+    codec_frame_valid: torch.Tensor | None = None
     ref_code_len: int | None = None
+    # Expected FINAL length of a growing async-chunk sequence, when the
+    # producer knows it up front (e.g. a frame-locked AR stage whose
+    # max_tokens is exact). Lets consumers size fixed-capacity state (such as
+    # a CUDA-graph StaticCache bucket) optimally instead of assuming the
+    # worst case.
+    expected_total_tokens: int | None = None
     ref_context_size: int | None = None
     ref_context_request_id: str | None = None
     ref_context_included: bool | None = None
     talker_prefill_offset: int | None = None
+    prefill_holds_accept_hidden: bool | None = None
     codec_chunk_frames: int | None = None
     codec_left_context_frames: int | None = None
     code_flat_numel: int | None = None
     omni_final_stage_id: int | None = None
+    audio_seed: int | None = None
+    token_role_ids: torch.Tensor | None = None
+    minimax_h3_prepared_reference_videos: str | None = None
+    # Assistant text-token count the request's prompt has reached when this
+    # payload was produced: a running count over the request's text ids, which
+    # covers every segment a resumable request has been fed so far.  A consumer
+    # derives one segment's n_k as the increase between consecutive segment
+    # boundaries; the value itself is not segment-local.
+    request_text_tokens: int | None = None
+    # Duplex session stats (RFC #8325): [epoch, seq] of the chunk the sending
+    # request worked on, stamped by the chunk transfer adapter.
+    duplex_perf_chunk: list[int] | None = None
 
 
 class OmniPayloadStruct(_StructBase):
@@ -191,6 +282,7 @@ class OmniPayloadStruct(_StructBase):
     speaker: list[str] | str | None = None
     language: list[str] | str | None = None
     request_id: str | None = None
+    additional_information: dict[str, Any] | None = None
     past_key_values: list[int] | None = None
     kv_metadata: dict[str, Any] | None = None
 
@@ -288,7 +380,7 @@ def _dtype_to_name(dtype: torch.dtype) -> str:
 _NESTED_KEYS = frozenset({"hidden_states", "embed", "ids", "codes", "meta"})
 
 
-def flatten_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def flatten_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Flatten a nested ``OmniPayload`` to dotted keys.
 
     Nested sub-dicts under ``_NESTED_KEYS`` are expanded:
@@ -339,17 +431,25 @@ def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
 
     t_cpu = t.detach().to("cpu").contiguous()
     return AdditionalInformationEntry(
-        tensor_data=t_cpu.numpy().tobytes(),
+        tensor_data=t_cpu.flatten().view(torch.uint8).numpy().tobytes(),
         tensor_shape=list(t_cpu.shape),
         tensor_dtype=_dtype_to_name(t_cpu.dtype),
     )
 
 
 def _deserialize_tensor(entry: AdditionalInformationEntry) -> torch.Tensor:
-    dt = np.dtype(entry.tensor_dtype or "float32")
-    arr = np.frombuffer(entry.tensor_data, dtype=dt)  # type: ignore[arg-type]
-    arr = arr.reshape(entry.tensor_shape)
-    return torch.from_numpy(arr.copy())
+    dtype_name = entry.tensor_dtype or "float32"
+    dtype = getattr(torch, dtype_name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"Unsupported tensor dtype: {dtype_name}")
+
+    if entry.tensor_shape is None:
+        raise ValueError("Tensor shape is required")
+    if not entry.tensor_data:
+        return torch.empty(0, dtype=dtype).reshape(entry.tensor_shape)
+
+    data = torch.frombuffer(bytearray(entry.tensor_data), dtype=torch.uint8)
+    return data.view(dtype).reshape(entry.tensor_shape)
 
 
 def serialize_payload(
@@ -398,3 +498,18 @@ def deserialize_payload(
             flat[key] = entry.scalar_data
 
     return unflatten_payload(flat)  # type: ignore[return-value]
+
+
+def returns_stage_payload(tags: Mapping[str, object] | AdditionalInformationPayload | None) -> bool:
+    """Return whether a request's routing tags ask its stage to return its full payload.
+
+    NOTE: Currently we support reading the serialized or deserialized format for compatibility
+    with both model runner v1 & v2.
+    """
+    if tags is None:
+        return False
+    if isinstance(tags, Mapping):
+        return bool(tags.get(RETURN_STAGE_PAYLOAD_KEY))
+    # Serialized tags: read the one scalar without decoding the payload's tensors.
+    entry = tags.entries.get(RETURN_STAGE_PAYLOAD_KEY)
+    return entry is not None and bool(entry.scalar_data)

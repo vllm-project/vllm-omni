@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -20,7 +20,6 @@ from .audio_prep import (
     _find_speaker_placeholder_positions,
     _initial_history,
     _take_scalar,
-    coerce_speaker_embeddings,
 )
 from .config_ming_tts import (
     AUDIO_START_TOKEN_ID,
@@ -33,13 +32,13 @@ from .config_ming_tts import (
     KEY_NEXT_EMBEDS,
     KEY_REQUEST_ID,
     KEY_SIGMA,
-    KEY_SPEAKER_EMBEDDING,
+    KEY_STOP_REASON,
     KEY_TEMPERATURE,
     KEY_TEXT_MODE,
     MingTTSConfig,
 )
-from .patch_emission import MING_STOP_REASON_KEY
 from .prompt_encoder import _resolve_prompt_latents
+from .speaker_extractor import _resolve_speaker_embeddings
 
 
 class _ModelSampleAdapter(nn.Module):
@@ -52,6 +51,8 @@ class _ModelSampleAdapter(nn.Module):
 
 
 class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin):
+    requires_request_sample_eligibility = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         del prefix
@@ -64,8 +65,12 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         self.requires_raw_input_tokens = False
         self.model_stage = vllm_config.model_config.model_stage
         self._prompt_encoder = None
+        self._speaker_extractor = None
 
         if self.model_stage == "llm":
+            from vllm_omni.utils.speaker_cache import get_speaker_cache
+
+            self._speaker_cache = get_speaker_cache()
             self.model = init_vllm_registered_model(vllm_config=vllm_config, architectures=["MingLLMModel"])
             self.has_preprocess = True
             self.has_postprocess = True
@@ -111,9 +116,9 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             loaded = self.model.load_weights(llm_weights)
             return {f"model.{name}" for name in loaded}
 
-        audio_weights = [(k, v) for k, v in weights if k.startswith("audio.")]
+        audio_weights = [(k, v) for k, v in weights if k.startswith("audio.decoder.")]
         if not audio_weights:
-            raise RuntimeError("Ming Stage-1 received no loadable checkpoint weights. Expected prefix: audio.*")
+            raise RuntimeError("Ming Stage-1 received no loadable checkpoint weights. Expected prefix: audio.decoder.*")
         loaded = self.model.load_weights(audio_weights)
         return {f"model.{name}" for name in loaded}
 
@@ -135,7 +140,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             return {}
         req_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
         pending = self.model.pop_postprocess_update(req_id)
-        if not pending or not isinstance(pending.get("ming_latent_patch"), torch.Tensor):
+        if not pending or not isinstance(pending.get(self.model.latent_patch_key), torch.Tensor):
             return {}
 
         update = {
@@ -143,12 +148,12 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             KEY_NEXT_EMBEDS: pending[KEY_NEXT_EMBEDS].detach().to("cpu").contiguous(),
             KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0)) + 1,
         }
-        stop_prob = _take_scalar(pending.get("ming_stop_prob"), 0)
+        stop_prob = _take_scalar(pending.get(self.model.stop_probability_key), 0)
         if stop_prob is not None:
             update[KEY_LAST_STOP_PROB] = stop_prob
-        stop_reason = pending.get(MING_STOP_REASON_KEY)
+        stop_reason = pending.get(KEY_STOP_REASON)
         if isinstance(stop_reason, str):
-            update[MING_STOP_REASON_KEY] = stop_reason
+            update[KEY_STOP_REASON] = stop_reason
         if isinstance(req_id, str):
             update[KEY_REQUEST_ID] = req_id
         return update
@@ -163,7 +168,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
                 return input_ids[:-1], input_embeds[:-1], update
             return input_ids, input_embeds, update
 
-        update: dict[str, Any] = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
+        update = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
         prompt_latents = _resolve_prompt_latents(self, info_dict)
         history = _initial_history(
             prompt_latents["frames"] if prompt_latents is not None else None,
@@ -174,13 +179,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         )
         update[KEY_LATENT_HISTORY] = history.detach().to("cpu").contiguous()
 
-        speaker_embedding = info_dict.get(KEY_SPEAKER_EMBEDDING, info_dict.get("speaker_embedding"))
-        speaker_embeddings = None
-        if speaker_embedding is not None:
-            speaker_embeddings = coerce_speaker_embeddings(
-                speaker_embedding,
-                use_zero_spk_emb=bool(info_dict.get("use_zero_spk_emb", False)),
-            )
+        speaker_embeddings = _resolve_speaker_embeddings(self, info_dict)
         if speaker_embeddings is not None and len(speaker_embeddings) > 0:
             speaker_slots = _find_speaker_placeholder_positions(input_ids, self.ming_config)
             if len(speaker_slots) < len(speaker_embeddings):
@@ -216,7 +215,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
                 update[KEY_REQUEST_ID] = request_id
             return input_ids, input_embeds, update
 
-        update: dict[str, Any] = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
+        update = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
         history = info_dict.get(KEY_LATENT_HISTORY)
         if isinstance(history, torch.Tensor):
             update[KEY_LATENT_HISTORY] = history.detach().to("cpu").contiguous()

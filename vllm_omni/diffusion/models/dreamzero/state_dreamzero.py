@@ -134,6 +134,18 @@ class DreamZeroState:
         self.vae_encoder_out: torch.Tensor | None = None
         self.vae_pending_body_frames: torch.Tensor | None = None
 
+    # How many latent frames of encoder output this state retains. ``None``
+    # means "everything", which is what this path has always done -- the
+    # accumulated output is cleared only by a session reset, so it grows for as
+    # long as the session lives. The manager-backed adapter bounds it instead.
+    vae_encoder_window: int | None = None
+
+    def append_vae_encoder_chunk(self, encoder_chunk: torch.Tensor) -> None:
+        """Append one encoded chunk to the accumulated encoder output."""
+        if self.vae_encoder_out is None:
+            raise RuntimeError("VAE encoder stream is not seeded; call reset_vae_encoder_stream first.")
+        self.vae_encoder_out = torch.cat([self.vae_encoder_out, encoder_chunk], dim=2)
+
     def reset_inference_state(self) -> None:
         """Reset KV/frame state after local attention rolls without dropping video latents."""
         self.reset(clear_video_latents=False)

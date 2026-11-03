@@ -1,0 +1,28 @@
+# Single-Hopper streaming throughput profile: AR32 / codec32, Flow10.
+# Automatically selected on Hopper devices with at least 140 GiB (H200)
+# when nvidia-cuda-mps-control is available on PATH.
+# Standard sampling is configured below; request stream=true for first audio.
+# F0 and HiFT stay FP32; only deterministic HiFT decode is graphed.
+# HiFT graphs capture on the third use of each exact shape, adding latency then.
+# The codec graph pool is not capped by gpu_memory_utilization; leave memory headroom.
+base_config: cosyvoice3_packed_streaming.yaml
+stages:
+  - stage_id: 0
+    max_num_seqs: 32
+    hf_overrides:
+      cosyvoice3_sampling_mode: standard
+    default_sampling_params:
+      max_tokens: 2048
+      repetition_penalty: 1.21
+      temperature: 0.7
+      top_k: 20
+      top_p: 0.8
+  - stage_id: 1
+    max_num_seqs: 32
+    env:
+      COSYVOICE3_TRT: "0"
+      COSYVOICE3_BATCH_FLOW: "1"
+      COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS: "0"
+      COSYVOICE3_PACKED_STREAMING: "1"
+      COSYVOICE3_CACHED_ISTFT: "1"
+      COSYVOICE3_HIFT_GRAPH: "1"

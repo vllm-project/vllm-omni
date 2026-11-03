@@ -57,15 +57,27 @@ class CfgCompanionTracker:
         """Stash companion engine output for the parent to bundle at forward time."""
         self._companion_outputs[companion_id] = output
 
-    def pop_companion_outputs(self, parent_id: str) -> list[Any]:
-        """Pop companion outputs (role-registration order) for bundling into set_engine_outputs."""
+    def get_companion_outputs(self, parent_id: str) -> list[Any]:
+        """Return companion outputs (role-registration order) for bundling.
+
+        Non-destructive: outputs stay stashed until ``cleanup_parent`` so a
+        re-submission of the same parent (e.g. a streaming terminal update)
+        bundles the complete set again instead of an empty one.
+        """
         role_map = self._companion_map.get(parent_id, {})
         outputs = []
         for cid in role_map.values():
-            out = self._companion_outputs.pop(cid, None)
+            out = self._companion_outputs.get(cid)
             if out is not None:
                 outputs.append(out)
         return outputs
+
+    def is_companion_done(self, companion_id: str) -> bool:
+        """True once this companion's processed output was stashed and marked done."""
+        parent_id = self._companion_to_parent.get(companion_id)
+        if parent_id is None:
+            return False
+        return companion_id in self._done.get(parent_id, set())
 
     def on_companion_completed(self, companion_id: str) -> str | None:
         """Mark done. Returns parent_id only if parent is pending and all companions finished."""
@@ -83,10 +95,14 @@ class CfgCompanionTracker:
         return None
 
     def defer_parent(self, parent_id: str, engine_outputs: Any, stage_id: int) -> None:
-        """Hold parent result while waiting for companions to finish."""
-        # TODO: Add timeout/error recovery when the orchestrator grows a
-        # companion-failure path. Today deferred parents are released only when
-        # companions finish or the external layer aborts the request.
+        """Hold parent result while waiting for companions to finish.
+
+        Deferred parents are released when their companions' processed outputs
+        arrive, and failed by the orchestrator when a companion errors or is
+        aborted. TODO: a deadline for deferred parents and detection of a
+        companion replica dying silently (no error output, no abort) still
+        need a liveness owner in the orchestrator loop.
+        """
         self._pending_parents[parent_id] = {
             "engine_outputs": engine_outputs,
             "stage_id": stage_id,

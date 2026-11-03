@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 E2E online serving tests for Ming-flash-omni-2.0 model (Thinker stage).
 Tests multimodal understanding via OpenAI-compatible API.
@@ -20,7 +20,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-pytestmark = [pytest.mark.omni, pytest.mark.full_model]
+pytestmark = [pytest.mark.omni, pytest.mark.slow]
 
 _SKIP_NEED_4_H100_NOT_CI = pytest.mark.skip(
     reason="Requires 4x H100 GPUs; skipped in CI for now.",
@@ -70,7 +70,7 @@ def get_max_batch_size(size_type="few"):
 @_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_text_001(omni_server, openai_client) -> None:
+def test_text_to_text_001(omni_server, online_client) -> None:
     """
     Input Modal: text
     Output Modal: text
@@ -90,13 +90,13 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_text_to_text_stream_001(omni_server, openai_client) -> None:
+def test_text_to_text_stream_001(omni_server, online_client) -> None:
     """
     Input Modal: text
     Output Modal: text
@@ -116,13 +116,13 @@ def test_text_to_text_stream_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+    online_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_image_to_text_001(omni_server, openai_client) -> None:
+def test_image_to_text_001(omni_server, online_client) -> None:
     """
     Input Modal: image + text
     Output Modal: text
@@ -143,13 +143,13 @@ def test_image_to_text_001(omni_server, openai_client) -> None:
         "modalities": ["text"],
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_audio_to_text_001(omni_server, openai_client) -> None:
+def test_audio_to_text_001(omni_server, online_client) -> None:
     """
     Input Modal: audio + text
     Output Modal: text
@@ -170,13 +170,13 @@ def test_audio_to_text_001(omni_server, openai_client) -> None:
         "modalities": ["text"],
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_video_to_text_001(omni_server, openai_client) -> None:
+def test_video_to_text_001(omni_server, online_client) -> None:
     """
     Input Modal: video + text
     Output Modal: text
@@ -197,13 +197,13 @@ def test_video_to_text_001(omni_server, openai_client) -> None:
         "modalities": ["text"],
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)
 
 
 @_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_mix_to_text_001(omni_server, openai_client) -> None:
+def test_mix_to_text_001(omni_server, online_client) -> None:
     """
     Input Modal: text + audio + image + video
     Output Modal: text
@@ -228,4 +228,4 @@ def test_mix_to_text_001(omni_server, openai_client) -> None:
         "modalities": ["text"],
     }
 
-    openai_client.send_omni_request(request_config)
+    online_client.send_omni_request(request_config)

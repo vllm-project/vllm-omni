@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """HunyuanImage3 pipeline topology."""
 
 from vllm_omni.config.stage_config import (
@@ -18,6 +18,7 @@ _HUNYUAN_IMAGE3_INPUT_PROCESSOR = "vllm_omni.model_executor.stage_input_processo
 
 HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
     model_type="hunyuan_image_3_moe",
+    default_deploy_config_name="hunyuan_image_3_moe.yaml",
     model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
     hf_architectures=_HUNYUAN_IMAGE3_HF_ARCHS,
     stages=(
@@ -28,7 +29,7 @@ HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=True,
             final_output_type="text",
-            owns_tokenizer=False,
+            owns_tokenizer=True,
             requires_multimodal_data=True,
             model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
             engine_output_type="latent",
@@ -50,6 +51,7 @@ HUNYUAN_IMAGE3_PIPELINE = PipelineConfig(
 
 HUNYUAN_IMAGE3_AR_PIPELINE = PipelineConfig(
     model_type="hunyuan_image3_ar",
+    default_deploy_config_name="hunyuan_image3_ar.yaml",
     model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
     hf_architectures=(),
     stages=(
@@ -71,6 +73,7 @@ HUNYUAN_IMAGE3_AR_PIPELINE = PipelineConfig(
 
 HUNYUAN_IMAGE3_DIT_PIPELINE = PipelineConfig(
     model_type="hunyuan_image3_dit",
+    default_deploy_config_name="hunyuan_image3_dit.yaml",
     model_arch=_HUNYUAN_IMAGE3_MODEL_ARCH,
     hf_architectures=(),
     stages=(

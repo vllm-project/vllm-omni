@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Prompt builder for higgs-audio v3 TTS.
 
 Prompt formats:
@@ -10,7 +10,9 @@ Prompt formats:
   Voice clone (with ref text):
     <|tts|> <|ref_text|> {ref text tokens} <|ref_audio|> [-100]×N <|text|> {text tokens} <|audio|>
 
--100 placeholders are replaced at prefill time with fused multi-codebook
+``build_prompt`` uses -100 as a model-local sentinel. Before engine submission,
+the tokenizer adapter replaces those sentinels with a valid token ID and records
+their positions. The talker uses the positions to inject fused multi-codebook
 embeddings of the delay-pattern-encoded reference audio codes.
 """
 
@@ -96,6 +98,23 @@ class HiggsAudioV3TokenizerAdapter:
     @property
     def tokenizer(self) -> Any:
         return self._tok
+
+    def prepare_prompt_for_engine(self, prompt_ids: list[int]) -> tuple[list[int], torch.Tensor]:
+        """Replace reference-audio sentinels before vLLM token validation.
+
+        The returned positions retain the model-specific placeholder semantics
+        while every submitted token ID belongs to this tokenizer's vocabulary.
+        """
+        placeholder_positions = torch.tensor(
+            [index for index, token_id in enumerate(prompt_ids) if token_id == AUDIO_PLACEHOLDER_ID],
+            dtype=torch.long,
+        )
+        # The embedding at every marked position is replaced before the
+        # transformer layers run. Use <|tts|> as the valid filler so the
+        # placeholders cannot be mistaken for <|audio|> continuation tokens by
+        # the model's sampler state machine.
+        engine_prompt_ids = [self.tts_id if token_id == AUDIO_PLACEHOLDER_ID else token_id for token_id in prompt_ids]
+        return engine_prompt_ids, placeholder_positions
 
     def build_prompt(
         self,

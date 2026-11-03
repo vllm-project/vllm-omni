@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adapted from:
 # https://huggingface.co/openbmb/MiniCPM-o-4_5/blob/main/modeling_minicpmo.py
 #
@@ -17,12 +17,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+import itertools
 import math
 import os
 import warnings
-from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Annotated, Any, Literal, TypeAlias
 
@@ -54,6 +55,8 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
 from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ModelOutput
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.whisper.modeling_whisper import ACT2FN
+
+from vllm_omni.model_executor.models.minicpmo_4_5.encoder_graph import make_encoder_graph
 
 try:
     from transformers.models.whisper.modeling_whisper import WHISPER_ATTENTION_CLASSES
@@ -128,12 +131,27 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 
 
-def encode_tokens(tokenizer, prompt: str) -> list[int]:
-    """Tokenize ``prompt`` without adding special tokens."""
+# vllm.transformers_utils.tokenizer no longer exists in upstream vLLM;
+# _encode_tokens uses tokenizer.encode() as the only code path.
+def _encode_tokens(tokenizer: Any, prompt: str) -> list[int]:
     return tokenizer.encode(prompt, add_special_tokens=False)
 
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+
+from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder as streaming_audio
+from vllm_omni.model_executor.models.minicpmo_4_5 import streaming_audio_encoder_graph as streaming_audio_graph
+from vllm_omni.model_executor.models.minicpmo_4_5.vision_fused import (
+    VisionGraphEncoder,
+    encode_packed_fused,
+    supports_fused_layers,
+)
+from vllm_omni.model_executor.models.model_local_kv import (
+    ModelLocalKVScope,
+    ModelLocalKVSpec,
+    RowDriver,
+    spec_from_hf_config,
+)
 
 logger = init_logger(__name__)
 hf_logger = logging.get_logger(__name__)
@@ -299,6 +317,10 @@ class ConditionalChatTTSConfig(PretrainedConfig):
         self.top_p = top_p
         self.top_k = top_k
         self.repetition_penalty = repetition_penalty
+        # Talker stage is a single-vocab codec LM: vLLM's Sampler and
+        # embed_tokens both address this table, not the Thinker text vocab.
+        self.vocab_size = int(num_audio_tokens)
+        self.eos_token_id = int(num_audio_tokens) - 1
 
 
 class MiniCPMOConfig(Qwen2Config):
@@ -328,7 +350,7 @@ class MiniCPMOConfig(Qwen2Config):
         tts_config=None,
         use_image_id=True,
         vision_batch_size=16,
-        audio_pool_step=2,
+        audio_pool_step=5,
         audio_chunk_length=1.0,
         stream_input=False,
         init_vision=True,
@@ -760,12 +782,20 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
         )
 
 
-AutoImageProcessor.register("MiniCPMVImageProcessor", MiniCPMVImageProcessor)
+# transformers >= 5.x requires the config *class* (not a string) as the
+# first arg to AutoImageProcessor.register — it does `key.__module__`
+# internally. Passing "MiniCPMVImageProcessor" raises:
+#   AttributeError: 'str' object has no attribute '__module__'
+# See also processing_gr00t_n1d7.py for the same transformers API change.
+AutoImageProcessor.register(MiniCPMOConfig, MiniCPMVImageProcessor, exist_ok=True)
 
 
 # ============== SigLIP Vision Transformer Classes ==============
+FlashAttentionUnpaddingMetadata: TypeAlias = tuple[torch.Tensor, torch.Tensor, int]
+
+
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
-def _get_unpad_data(attention_mask):
+def _get_unpad_data(attention_mask: torch.Tensor) -> FlashAttentionUnpaddingMetadata:
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = seqlens_in_batch.max().item()
@@ -930,6 +960,86 @@ class SiglipVisionEmbeddings(nn.Module):
         self.num_patches = self.num_patches_per_side**2
         self.num_positions = self.num_patches
         self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
+        # (h, w, device) -> position ids of that patch grid, see layout_position_ids.
+        self._layout_position_ids: dict[tuple[int, int, str], torch.Tensor] = {}
+
+    def _create_grid_position_ids(
+        self,
+        patch_grid_height: int,
+        patch_grid_width: int,
+        boundaries: torch.Tensor,
+    ) -> torch.Tensor:
+        fractional_coords_h = torch.arange(
+            0,
+            1 - 1e-6,
+            1 / patch_grid_height,
+            device=boundaries.device,
+        )
+        fractional_coords_w = torch.arange(
+            0,
+            1 - 1e-6,
+            1 / patch_grid_width,
+            device=boundaries.device,
+        )
+        bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
+        bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
+        return (bucket_coords_h[:, None] * self.num_patches_per_side + bucket_coords_w).flatten()
+
+    def _create_position_ids(
+        self,
+        patch_attention_mask: torch.BoolTensor,
+        tgt_sizes: torch.IntTensor | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        batch_size = patch_attention_mask.size(0)
+        flat_patch_attention_mask = patch_attention_mask.reshape(batch_size, -1).to(device="cpu")
+
+        if tgt_sizes is None:
+            # As in the legacy path, infer rectangular grid sizes from a (B, H, W) mask.
+            target_sizes = torch.stack(
+                (
+                    patch_attention_mask[:, :, 0].sum(dim=1),
+                    patch_attention_mask[:, 0, :].sum(dim=1),
+                ),
+                dim=1,
+            )
+        else:
+            target_sizes = tgt_sizes
+
+        # Group construction on the host preserves the legacy floating-point
+        # mapping and is faster than device-side construction for vision grids.
+        target_sizes_list = target_sizes.detach().to(device="cpu").tolist()
+        position_ids = torch.zeros(flat_patch_attention_mask.shape, dtype=torch.long)
+        boundaries = torch.arange(
+            1 / self.num_patches_per_side,
+            1.0,
+            1 / self.num_patches_per_side,
+        )
+        grid_position_ids: dict[tuple[int, int], torch.Tensor] = {}
+
+        for batch_idx, (patch_grid_height, patch_grid_width) in enumerate(target_sizes_list):
+            grid_shape = (int(patch_grid_height), int(patch_grid_width))
+            grid_ids = grid_position_ids.get(grid_shape)
+            if grid_ids is None:
+                grid_ids = self._create_grid_position_ids(*grid_shape, boundaries)
+                grid_position_ids[grid_shape] = grid_ids
+
+            position_ids[batch_idx, flat_patch_attention_mask[batch_idx]] = grid_ids
+
+        return position_ids.to(device=device)
+
+    def layout_position_ids(self, patch_grid_height: int, patch_grid_width: int, device: torch.device) -> torch.Tensor:
+        """Position ids of one ``(h, w)`` patch grid on ``device``: ``_create_position_ids``'s, cached."""
+        cache = self._layout_position_ids
+        key = (int(patch_grid_height), int(patch_grid_width), str(device))
+        ids = cache.get(key)
+        if ids is None:
+            if len(cache) >= 1024:
+                cache.clear()
+            boundaries = torch.arange(1 / self.num_patches_per_side, 1.0, 1 / self.num_patches_per_side)
+            ids = self._create_grid_position_ids(key[0], key[1], boundaries).to(device=device)
+            cache[key] = ids
+        return ids
 
     def forward(
         self,
@@ -937,40 +1047,14 @@ class SiglipVisionEmbeddings(nn.Module):
         patch_attention_mask: torch.BoolTensor,
         tgt_sizes: torch.IntTensor | None = None,
     ) -> torch.Tensor:
-        batch_size = pixel_values.size(0)
-
         patch_embeds = self.patch_embedding(pixel_values)
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
 
-        max_im_h, max_im_w = pixel_values.size(2), pixel_values.size(3)
-        max_nb_patches_h, max_nb_patches_w = max_im_h // self.patch_size, max_im_w // self.patch_size
-        boundaries = torch.arange(1 / self.num_patches_per_side, 1.0, 1 / self.num_patches_per_side)
-        position_ids = torch.full(
-            size=(
-                batch_size,
-                max_nb_patches_h * max_nb_patches_w,
-            ),
-            fill_value=0,
+        position_ids = self._create_position_ids(
+            patch_attention_mask,
+            tgt_sizes,
+            device=self.position_embedding.weight.device,
         )
-
-        for batch_idx, p_attn_mask in enumerate(patch_attention_mask):
-            if tgt_sizes is not None:
-                nb_patches_h = tgt_sizes[batch_idx][0]
-                nb_patches_w = tgt_sizes[batch_idx][1]
-            else:
-                nb_patches_h = p_attn_mask[:, 0].sum()
-                nb_patches_w = p_attn_mask[0].sum()
-
-            fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / nb_patches_h)
-            fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / nb_patches_w)
-
-            bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
-            bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
-
-            pos_ids = (bucket_coords_h[:, None] * self.num_patches_per_side + bucket_coords_w).flatten()
-            position_ids[batch_idx][p_attn_mask.view(-1).cpu()] = pos_ids
-
-        position_ids = position_ids.to(self.position_embedding.weight.device)
 
         embeddings = embeddings + self.position_embedding(position_ids)
         return embeddings
@@ -1018,7 +1102,7 @@ class SiglipAttention(nn.Module):
         value_states = value_states.view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         k_v_seq_len = key_states.shape[-2]
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
 
         if attn_weights.size() != (batch_size, self.num_heads, q_len, k_v_seq_len):
             raise ValueError(
@@ -1031,10 +1115,8 @@ class SiglipAttention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(batch_size, 1, q_len, k_v_seq_len)}, but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = self._normalize_attention_weights(attn_weights, attention_mask)
         attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
@@ -1050,6 +1132,72 @@ class SiglipAttention(nn.Module):
         attn_output = self.out_proj(attn_output)
 
         return attn_output, attn_weights
+
+    def _normalize_attention_weights(
+        self, scores: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if (
+            scores.is_cuda
+            and torch.version.hip is None
+            and scores.dtype == torch.bfloat16
+            and scores.is_contiguous()
+            and 0 < scores.shape[-1] <= 2048
+            and attention_mask is None
+            and not self.training
+            and not scores.requires_grad
+        ):
+            from .ops.scaled_softmax import scaled_softmax
+
+            return scaled_softmax(scores, self.scale)
+        dtype = scores.dtype
+        scores = scores * self.scale
+        if attention_mask is not None:
+            scores = scores + attention_mask
+        return nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(dtype)
+
+    def _attend_unpadded(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        """Attention over ``(n, L, heads, head_dim)`` items with no padding; same layout out."""
+        query, key, value = (x.transpose(1, 2) for x in (query, key, value))
+        attn_weights = self._normalize_attention_weights(torch.matmul(query, key.transpose(2, 3)))
+        return torch.matmul(attn_weights, value).transpose(1, 2)
+
+    def forward_packed(self, hidden_states: torch.Tensor, seq_groups: Sequence[tuple[int, int, int]]) -> torch.Tensor:
+        """Self-attention over packed ``(tokens, embed)`` items, one mask-free call per ``seq_groups`` run.
+
+        ``seq_groups`` holds contiguous ``(start_token, num_items, seq_len)`` runs of unpadded items.
+        """
+        states = [projection(hidden_states) for projection in (self.q_proj, self.k_proj, self.v_proj)]
+        attn_output = torch.empty_like(states[0])
+        for start, num_items, seq_len in seq_groups:
+            end, shape = start + num_items * seq_len, (num_items, seq_len, self.num_heads, self.head_dim)
+            attn_output[start:end].view(shape).copy_(self._attend_unpadded(*(x[start:end].view(shape) for x in states)))
+        return self.out_proj(attn_output)
+
+
+class SiglipSdpaAttention(SiglipAttention):
+    """SigLIP attention through ``F.scaled_dot_product_attention`` (adapted from vllm-omni#5385)."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        output_attentions: bool | None = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if output_attentions:
+            return super().forward(hidden_states, attention_mask=attention_mask, output_attentions=output_attentions)
+        batch_size, q_len, _ = hidden_states.size()
+        shape = (batch_size, q_len, self.num_heads, self.head_dim)
+        states = [projection(hidden_states).view(shape) for projection in (self.q_proj, self.k_proj, self.v_proj)]
+        attn_output = self._attend_unpadded(*states, attn_mask=attention_mask)
+        return self.out_proj(attn_output.reshape(batch_size, q_len, self.embed_dim)), None
+
+    def _attend_unpadded(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attn_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        query, key, value = (x.transpose(1, 2) for x in (query, key, value))
+        return F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0, scale=self.scale
+        ).transpose(1, 2)
 
 
 class SiglipFlashAttention2(SiglipAttention):
@@ -1071,6 +1219,7 @@ class SiglipFlashAttention2(SiglipAttention):
         past_key_value: tuple[torch.Tensor] | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         output_attentions = False
@@ -1133,7 +1282,13 @@ class SiglipFlashAttention2(SiglipAttention):
             value_states = value_states.to(target_dtype)
 
         attn_output = self._flash_attention_forward(
-            query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            dropout=dropout_rate,
+            unpadding_metadata=unpadding_metadata,
         )
 
         attn_output = attn_output.reshape(bsz, q_len, self.embed_dim).contiguous()
@@ -1145,7 +1300,15 @@ class SiglipFlashAttention2(SiglipAttention):
         return attn_output, attn_weights
 
     def _flash_attention_forward(
-        self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        query_length,
+        dropout=0.0,
+        softmax_scale=None,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
     ):
         """
         Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
@@ -1173,7 +1336,12 @@ class SiglipFlashAttention2(SiglipAttention):
         if attention_mask is not None:
             batch_size = query_states.shape[0]
             query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                query_length,
+                unpadding_metadata=unpadding_metadata,
             )
 
             cu_seqlens_q, cu_seqlens_k = cu_seq_lens
@@ -1200,8 +1368,18 @@ class SiglipFlashAttention2(SiglipAttention):
 
         return attn_output
 
-    def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
-        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
+    def _upad_input(
+        self,
+        query_layer,
+        key_layer,
+        value_layer,
+        attention_mask,
+        query_length,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
+    ):
+        if unpadding_metadata is None:
+            unpadding_metadata = _get_unpad_data(attention_mask)
+        indices_k, cu_seqlens_k, max_seqlen_in_batch_k = unpadding_metadata
         batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
 
         key_layer = index_first_axis(
@@ -1238,6 +1416,10 @@ class SiglipFlashAttention2(SiglipAttention):
             (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
         )
 
+    def _attend_unpadded(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        # Flash attention consumes the (n, L, heads, head_dim) layout directly.
+        return self._flash_attention_forward(query, key, value, None, query.shape[1])
+
 
 # Copied from transformers.models.clip.modeling_clip.CLIPMLP with CLIP->Siglip
 class SiglipMLP(nn.Module):
@@ -1261,7 +1443,8 @@ class SiglipEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.hidden_size
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
-        self.self_attn = SiglipAttention(config) if not self._use_flash_attention_2 else SiglipFlashAttention2(config)
+        attention_classes = {"flash_attention_2": SiglipFlashAttention2, "sdpa": SiglipSdpaAttention}
+        self.self_attn = attention_classes.get(config._attn_implementation, SiglipAttention)(config)
         self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = SiglipMLP(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
@@ -1271,6 +1454,7 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         output_attentions: bool | None = False,
+        unpadding_metadata: FlashAttentionUnpaddingMetadata | None = None,
     ) -> tuple[torch.FloatTensor]:
         """
         Args:
@@ -1285,11 +1469,19 @@ class SiglipEncoderLayer(nn.Module):
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-        )
+        if self._use_flash_attention_2:
+            hidden_states, attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                unpadding_metadata=unpadding_metadata,
+            )
+        else:
+            hidden_states, attn_weights = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+            )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -1303,6 +1495,15 @@ class SiglipEncoderLayer(nn.Module):
             outputs += (attn_weights,)
 
         return outputs
+
+    def forward_packed(self, hidden_states: torch.Tensor, seq_groups: Sequence[tuple[int, int, int]]) -> torch.Tensor:
+        """``forward`` over packed ``(tokens, embed)`` items; see ``SiglipAttention.forward_packed``."""
+        residual = hidden_states
+        hidden_states = self.self_attn.forward_packed(self.layer_norm1(hidden_states), seq_groups)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.mlp(self.layer_norm2(hidden_states))
+        return residual + hidden_states
 
 
 class SiglipPreTrainedModel(PreTrainedModel):
@@ -1390,6 +1591,7 @@ class SiglipEncoder(nn.Module):
         self.config = config
         self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
 
     # Ignore copy
     def forward(
@@ -1430,6 +1632,9 @@ class SiglipEncoder(nn.Module):
         all_attentions = () if output_attentions else None
 
         hidden_states = inputs_embeds
+        unpadding_metadata = (
+            _get_unpad_data(attention_mask) if self._use_flash_attention_2 and attention_mask is not None else None
+        )
         for encoder_layer in self.layers:
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
@@ -1439,12 +1644,14 @@ class SiglipEncoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     output_attentions,
+                    unpadding_metadata,
                 )
             else:
                 layer_outputs = encoder_layer(
                     hidden_states,
                     attention_mask,
                     output_attentions=output_attentions,
+                    unpadding_metadata=unpadding_metadata,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1464,8 +1671,14 @@ class SiglipEncoder(nn.Module):
 class SiglipVisionTransformer(SiglipPreTrainedModel):
     config_class = SiglipVisionConfig
     main_input_name = "pixel_values"
+    # Transformers 5 spells the flash flag ``_supports_flash_attn``; SDPA is the
+    # default vision kernel (see MiniCPMO45OmniLLMForConditionalGeneration).
+    _supports_flash_attn = True
     _supports_flash_attn_2 = True
+    _supports_sdpa = True
     _no_split_modules = []
+    # ``forward_packed`` through ``vision_fused.encode_packed_fused``; set by the model.
+    fused_layers = False
 
     def __init__(self, config: SiglipVisionConfig):
         super().__init__(config)
@@ -1476,12 +1689,25 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
         self.encoder = SiglipEncoder(config)
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
+        self._encoder_graph = None
 
         # Initialize weights and apply final processing
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embeddings.patch_embedding
+
+    def _encode_last_hidden_state(
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        output = self.encoder(
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        return self.post_layernorm(output.last_hidden_state)
 
     @add_start_docstrings_to_model_forward(SIGLIP_VISION_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=BaseModelOutputWithPooling, config_class=SiglipVisionConfig)
@@ -1532,6 +1758,21 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
                 else patch_attention_mask
             )
 
+        # Position/mask construction above performs host decisions. Capture
+        # only the transformer stack; padded FlashAttention unpadding also
+        # reads dynamic lengths on the host and remains eager.
+        if (
+            self._encoder_graph is not None
+            and not self.training
+            and not output_attentions
+            and not output_hidden_states
+            and not (self._use_flash_attention_2 and attention_mask is not None)
+        ):
+            last_hidden_state = self._encoder_graph(hidden_states, attention_mask)
+            if not return_dict:
+                return (last_hidden_state, None)
+            return BaseModelOutputWithPooling(last_hidden_state=last_hidden_state)
+
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             attention_mask=attention_mask,
@@ -1552,6 +1793,35 @@ class SiglipVisionTransformer(SiglipPreTrainedModel):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+
+    def forward_packed(self, pixel_values: torch.Tensor, layouts: Sequence[tuple[int, int, int]]) -> torch.Tensor:
+        """The padded ``forward`` per item, without padding, over items packed along the patch axis.
+
+        ``pixel_values`` is ``(1, C, patch, tokens * patch)``, every item's strip in order (the stride-``patch``
+        embedding cuts at item boundaries); ``layouts`` lists ``(h, w, count)`` runs. Returns ``(tokens, embed)``.
+        """
+        embeddings = self.embeddings
+        device = embeddings.position_embedding.weight.device
+        position_ids = [
+            embeddings.layout_position_ids(height, width, device).repeat(count) for height, width, count in layouts
+        ]
+        position_ids = position_ids[0] if len(position_ids) == 1 else torch.cat(position_ids)
+        patch_embeds = embeddings.patch_embedding(pixel_values).flatten(2).transpose(1, 2)[0]
+        hidden_states = patch_embeds + embeddings.position_embedding(position_ids)
+
+        seq_groups: list[tuple[int, int, int]] = []
+        start = 0
+        # Adjacent equal-length grids share one attention call.
+        for seq_len, runs in itertools.groupby(layouts, key=lambda layout: layout[0] * layout[1]):
+            count = sum(run[2] for run in runs)
+            seq_groups.append((start, count, seq_len))
+            start += count * seq_len
+
+        if self.fused_layers and hidden_states.is_cuda and supports_fused_layers(self):
+            return encode_packed_fused(self, hidden_states, seq_groups)
+        for encoder_layer in self.encoder.layers:
+            hidden_states = encoder_layer.forward_packed(hidden_states, seq_groups)
+        return self.post_layernorm(hidden_states)
 
 
 # ============== Resampler Classes ==============
@@ -1738,6 +2008,154 @@ class Resampler(nn.Module):
 
     def _repeat(self, query, N: int):
         return query.unsqueeze(1).repeat(1, N, 1)
+
+    def supports_packed(self) -> bool:
+        attn = self.attn
+        plain = not attn.batch_first and attn._qkv_same_embed_dim and attn.in_proj_weight is not None
+        return plain and attn.bias_k is None and attn.bias_v is None and not attn.add_zero_attn
+
+    def forward_packed(self, x: torch.Tensor, layouts: Sequence[tuple[int, int, int]]) -> torch.Tensor:
+        """``forward`` without key padding for packed ``(tokens, kv_dim)`` features; returns ``(B, Q, D)``.
+
+        Each ``(h, w, count)`` run of equal grids attends in one mask-free call (host ints: no device sync).
+        """
+        max_h = max(height for height, _, _ in layouts)
+        max_w = max(width for _, width, _ in layouts)
+        if max_h > self.max_size[0] or max_w > self.max_size[1]:
+            self.max_size = [max(max_h, self.max_size[0]), max(max_w, self.max_size[1])]
+            self._set_2d_pos_cache(self.max_size, x.device)
+        if self.pos_embed.device != x.device:
+            self.pos_embed = self.pos_embed.to(x.device)
+
+        x = self.ln_kv(self.kv_proj(x))
+        key_input = torch.empty_like(x)
+        start = 0
+        for height, width, count in layouts:
+            end = start + count * height * width
+            pos_embed = self.pos_embed[:height, :width, :].reshape(height * width, -1).to(x.dtype)
+            shape = (count, height * width, -1)
+            torch.add(x[start:end].view(shape), pos_embed, out=key_input[start:end].view(shape))
+            start = end
+
+        attn = self.attn
+        num_heads, head_dim = attn.num_heads, self.embed_dim // attn.num_heads
+        w_q, w_k, w_v = attn.in_proj_weight.chunk(3)
+        b_q, b_k, b_v = attn.in_proj_bias.chunk(3) if attn.in_proj_bias is not None else (None, None, None)
+        query = F.linear(self.ln_q(self.query), w_q, b_q)
+        keys = F.linear(key_input, w_k, b_k)
+        values = F.linear(x, w_v, b_v)
+        num_queries = query.shape[0]
+        query_heads = query.view(num_queries, num_heads, head_dim).transpose(0, 1)
+        eager = getattr(self, "attn_implementation", "sdpa") == "eager"
+
+        outputs: list[torch.Tensor] = []
+        start = 0
+        for height, width, count in layouts:
+            seq_len = height * width
+            end = start + count * seq_len
+            shape = (count, seq_len, num_heads, head_dim)
+            key_heads, value_heads = (t[start:end].view(shape).transpose(1, 2) for t in (keys, values))
+            q = query_heads.unsqueeze(0).expand(count, -1, -1, -1).contiguous()
+            if eager:
+                # Mirrors nn.MultiheadAttention's need_weights path used by ``forward``.
+                weights = torch.matmul(q / math.sqrt(head_dim), key_heads.transpose(-2, -1))
+                out = torch.matmul(F.softmax(weights, dim=-1), value_heads)
+            else:
+                out = F.scaled_dot_product_attention(q, key_heads, value_heads)
+            outputs.append(out.transpose(1, 2).reshape(count, num_queries, self.embed_dim))
+            start = end
+
+        out = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+        out = self.ln_post(attn.out_proj(out))
+        return out @ self.proj
+
+
+def _vision_encode_paths(config: Any, *, encoder_graphs: bool) -> tuple[bool, bool]:
+    """``(vision_packed_encode, vision_cuda_graph)`` from the HF config.
+
+    The packed path (_encode_vision_packed, vision_fused.py) serves the opt-in
+    ``vision_fused_layers`` and ``vision_cuda_graph``; otherwise the padded
+    batch runs and replays the SigLIP graph of ``vpm._encoder_graph``.
+    ``encoder_graphs`` (``encoder_cuda_graph`` and not ``--enforce-eager``)
+    gates the packed graphs too. ``vision_packed_encode`` overrides the path,
+    e.g. to measure packed eager encoding.
+    """
+    graph = bool(getattr(config, "vision_cuda_graph", False)) and encoder_graphs
+    packed = getattr(config, "vision_packed_encode", None)
+    if packed is None:
+        return bool(getattr(config, "vision_fused_layers", False)) or graph, graph
+    return bool(packed), graph and bool(packed)
+
+
+def _packed_vision_layouts(
+    pixel_values: Sequence[torch.Tensor],
+    tgt_sizes: torch.Tensor | Sequence[Sequence[int]],
+    patch_size: int,
+) -> list[tuple[int, int]] | None:
+    """Host ``(h, w)`` patch grid per slice, or ``None`` on a mismatch; the packed path's only sync."""
+    sizes = tgt_sizes.tolist() if isinstance(tgt_sizes, torch.Tensor) else [list(size) for size in tgt_sizes]
+    if len(sizes) != len(pixel_values) or not sizes:
+        return None
+    layouts: list[tuple[int, int]] = []
+    for pixels, size in zip(pixel_values, sizes):
+        if len(size) != 2:
+            return None
+        height, width = int(size[0]), int(size[1])
+        if (
+            min(height, width) <= 0
+            or pixels.ndim != 3
+            or pixels.shape[-2:] != (patch_size, height * width * patch_size)
+        ):
+            return None
+        layouts.append((height, width))
+    return layouts
+
+
+def _plan_packed_vision_chunks(
+    layouts: Sequence[tuple[int, int]], max_items: int
+) -> list[tuple[list[int], list[tuple[int, int, int]]]]:
+    """Per ``max_items``-slice chunk, its slice indices and ``(h, w, count)`` runs, equal grids adjacent.
+
+    Sorting by ``h * w`` first also puts equal sequence lengths together, sharing an attention call.
+    """
+    order = sorted(range(len(layouts)), key=lambda i: (layouts[i][0] * layouts[i][1], layouts[i]))
+    chunks: list[tuple[list[int], list[tuple[int, int, int]]]] = []
+    for begin in range(0, len(order), max(1, max_items)):
+        indices = order[begin : begin + max(1, max_items)]
+        grids = itertools.groupby(layouts[index] for index in indices)
+        chunks.append((indices, [(height, width, len(list(run))) for (height, width), run in grids]))
+    return chunks
+
+
+def _encode_vision_packed(
+    vpm: "SiglipVisionTransformer",
+    resampler: Resampler,
+    pixel_values: Sequence[torch.Tensor],
+    layouts: Sequence[tuple[int, int]],
+    max_items: int,
+    graph_encoder: VisionGraphEncoder | None = None,
+) -> torch.Tensor:
+    """SigLIP + resampler over unpadded slices packed by grid; ``(num_slices, query_num, embed)`` in input order.
+
+    No slice is padded, so its output does not depend on the others; single-grid chunks replay graphs.
+    """
+    weight = vpm.embeddings.patch_embedding.weight
+    outputs: list[torch.Tensor] = []
+    packed_order: list[int] = []
+    for indices, runs in _plan_packed_vision_chunks(layouts, max_items):
+        parts = [pixel_values[index] for index in indices]
+        pixels = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+        pixels = pixels.to(device=weight.device, dtype=weight.dtype).unsqueeze(0)
+        out = graph_encoder.encode(pixels, *runs[0]) if graph_encoder is not None and len(runs) == 1 else None
+        if out is None:
+            out = resampler.forward_packed(vpm.forward_packed(pixels, runs), runs)
+        outputs.append(out)
+        packed_order.extend(indices)
+    out = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+    if packed_order != list(range(len(packed_order))):
+        inverse = torch.tensor(packed_order, dtype=torch.long).argsort()
+        out = out.index_select(0, inverse.to(device=out.device, non_blocking=True))
+    return out
 
 
 class MultiheadAttention(nn.MultiheadAttention):
@@ -2412,6 +2830,17 @@ def _in_projection(
     return linear(q, w_q, b_q), linear(k, w_k, b_k), linear(v, w_v, b_v)
 
 
+def _get_audio_cache_length(past_key_values: Any) -> int:
+    cache = getattr(past_key_values, "self_attention_cache", past_key_values)
+    get_seq_length = getattr(cache, "get_seq_length", None)
+    if callable(get_seq_length):
+        try:
+            return int(get_seq_length())
+        except TypeError:
+            return int(get_seq_length(0))
+    return int(cache[0][0].shape[2])
+
+
 # Copied from transformers.models.whisper.modeling_whisper.WhisperEncoderLayer and add use_cache for streaming inference
 class MiniCPMWhisperEncoderLayer(nn.Module):
     def __init__(self, config: WhisperConfig, layer_idx: int = None):
@@ -2423,6 +2852,10 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
             dropout=config.attention_dropout,
             config=config,
             layer_idx=layer_idx,
+        )
+        attention_parameters = inspect.signature(self.self_attn.forward).parameters
+        self._past_key_values_kwarg = (
+            "past_key_values" if "past_key_values" in attention_parameters else "past_key_value"
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
@@ -2461,16 +2894,18 @@ class MiniCPMWhisperEncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        attn_out = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            output_attentions=output_attentions,
-            past_key_value=past_key_values,
-        )
+        attention_kwargs = {
+            "hidden_states": hidden_states,
+            "attention_mask": attention_mask,
+            "layer_head_mask": layer_head_mask,
+            "output_attentions": output_attentions,
+            self._past_key_values_kwarg: past_key_values,
+        }
+        attn_out = self.self_attn(**attention_kwargs)
         hidden_states = attn_out[0]
         attn_weights = attn_out[1] if len(attn_out) > 1 else None
-        past_key_values = attn_out[2] if len(attn_out) > 2 else None
+        if len(attn_out) > 2:
+            past_key_values = attn_out[2]
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
 
@@ -2507,6 +2942,80 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
             [MiniCPMWhisperEncoderLayer(config, layer_idx=i) for i in range(config.encoder_layers)]
         )
 
+    def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
+        """Declare the streaming encoder's self-attention cache.
+
+        Bounded by learned position embeddings, not by ``max_model_len``: the
+        cache cannot outgrow ``embed_positions``, and past that point the
+        forward pass repeats the last position rather than extending.
+
+        Whisper is encoder-only self-attention here, so kv-heads equal
+        attention heads. Layer count is read off the built ``self.layers``
+        rather than the config, so a partially built encoder reports what it
+        actually has.
+
+        Declared per session, not per sequence. Each streaming session state
+        owns its own ``audio_past_key_values`` and the encoder runs at batch
+        size one, so ``max_num_seqs`` is the wrong number here.
+
+        One session is the unit rather than the configured cap, because the cap
+        is not visible from the model and the setting that carries it cannot
+        distinguish "duplex off" from "one session" -- so a cap-scaled figure
+        would report a cache that a non-duplex deployment never allocates. An
+        earlier revision grew a capacity driver and an engine-side field to
+        carry that number for this one declarer; the arithmetic is a
+        multiplication the reader can do when they need the ceiling.
+        """
+        return [
+            spec_from_hf_config(
+                self.config,
+                name="whisper_encoder_self_attn",
+                dtype=self.conv1.weight.dtype,
+                layers=len(self.layers),
+                kv_heads=self.config.encoder_attention_heads,
+                head_dim=self.config.d_model // self.config.encoder_attention_heads,
+                physical_capacity_positions=int(self.embed_positions.weight.shape[0]),
+                capacity_source="embed_positions rows (max_source_positions)",
+                scope=ModelLocalKVScope.SESSION,
+                rows=RowDriver.FIXED,
+                rows_fixed=1,
+                rows_reason="one EncoderDecoderCache per streaming session, encoder runs at batch size 1",
+                allocation_note=(
+                    "only allocated on the streaming path, where use_cache is set; scales with the "
+                    "configured duplex session cap"
+                ),
+            )
+        ]
+
+    def embed_mel_features(self, input_features: torch.Tensor) -> torch.Tensor:
+        """Eager conv stem plus positional embedding.
+
+        ``Conv1d`` lowers to an aclop ``Conv2D`` on Ascend, so it cannot sit
+        inside an NPUGraph. This is the non-streaming path: no CNN padding
+        and no KV cache.
+        """
+        input_features = input_features.to(dtype=self.conv1.weight.dtype, device=self.conv1.weight.device)
+        inputs_embeds = nn.functional.gelu(self.conv1(input_features))
+        inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
+        inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        embed_pos = self.embed_positions.weight[: inputs_embeds.shape[1], :]
+        hidden_states = inputs_embeds + embed_pos
+        return nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+
+    def encode_hidden_states(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+        """Whisper encoder layers and final norm, without KV cache or attentions."""
+        for encoder_layer in self.layers:
+            layer_outputs = encoder_layer(
+                hidden_states,
+                attention_mask,
+                layer_head_mask=None,
+                output_attentions=False,
+                past_key_values=None,
+                use_cache=False,
+            )
+            hidden_states = layer_outputs[0]
+        return self.layer_norm(hidden_states)
+
     def forward(
         self,
         input_features,
@@ -2517,7 +3026,11 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         return_dict=None,
         past_key_values: EncoderDecoderCache | None = None,
         use_cache: bool | None = None,
-    ) -> BaseModelOutputWithPast | tuple:
+        use_extra_context: bool | None = False,
+        prefix_extra_frames: int | None = 1,
+        suffix_extra_frames: int | None = 1,
+        cnn_min_length: int | None = None,
+    ) -> BaseModelOutputWithPast | tuple[Any, ...]:
         r"""
         Forward pass of the Whisper encoder.
 
@@ -2628,8 +3141,36 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         # Ignore copy
         input_features = input_features.to(dtype=self.conv1.weight.dtype, device=self.conv1.weight.device)
 
+        original_length = input_features.shape[2]
+        padded_for_cnn = False
+        if cnn_min_length is not None and original_length < cnn_min_length:
+            padded_features = torch.zeros(
+                input_features.shape[0],
+                input_features.shape[1],
+                cnn_min_length,
+                dtype=input_features.dtype,
+                device=input_features.device,
+            )
+            padded_features[:, :, :original_length] = input_features
+            input_features = padded_features
+            padded_for_cnn = True
+
         inputs_embeds = nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
+
+        if padded_for_cnn:
+            actual_cnn_output_length = (original_length + 1) // 2
+            inputs_embeds = inputs_embeds[:, :, :actual_cnn_output_length]
+
+        if use_extra_context:
+            prefix_extra_frames = int(prefix_extra_frames or 0)
+            suffix_extra_frames = int(suffix_extra_frames or 0)
+            prefix_to_remove = (prefix_extra_frames + 1) // 2 if prefix_extra_frames > 0 else 0
+            suffix_to_remove = (suffix_extra_frames + 1) // 2 if suffix_extra_frames > 0 else 0
+            if prefix_to_remove > 0:
+                inputs_embeds = inputs_embeds[:, :, prefix_to_remove:]
+            if 0 < suffix_to_remove < inputs_embeds.shape[2]:
+                inputs_embeds = inputs_embeds[:, :, :-suffix_to_remove]
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
 
@@ -2644,7 +3185,7 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
                 past_key_values = EncoderDecoderCache(past_key_values, DynamicCache())
             else:
                 pass
-            past_key_values_length = past_key_values.self_attention_cache.get_usable_length(inputs_embeds.shape[1])
+            past_key_values_length = _get_audio_cache_length(past_key_values)
             if inputs_embeds.shape[1] + past_key_values_length > embed_pos.shape[0]:
                 logger.warning("seems the audio is longer than 30s. repeating the last part of the audio")
                 embed_pos_front = embed_pos[past_key_values_length:, :]
@@ -2834,6 +3375,9 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     ) -> str:
         hf_processor = self.get_hf_processor()
 
+        # Keep prompt placeholders aligned with the encoder's checkpoint config.
+        hf_processor.pool_step = self.get_default_audio_pool_step()
+
         return hf_processor.get_audio_placeholder(
             audio_lens,
             chunk_input=chunk_input,
@@ -2841,7 +3385,7 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         )
 
     def get_default_audio_pool_step(self) -> int:
-        return getattr(self.get_hf_config(), "audio_pool_step", 2)
+        return getattr(self.get_hf_config(), "audio_pool_step", 5)
 
     def get_default_audio_sampling_rate(self) -> int:
         return 16000
@@ -3160,16 +3704,40 @@ class MiniCPMOAudioEmbeddingItems(DictEmbeddingItems):
     ) -> None:
         super().__init__(
             data,
-            modality="image",
+            modality="audio",
             required_fields={"audio_embeds"},
             fields_factory=fields_factory,
         )
 
 
 def _minicpmo_field_config(hf_inputs: Mapping[str, torch.Tensor]):
+    audio_features = hf_inputs.get("audio_features")
+    audio_feature_lens = hf_inputs.get("audio_feature_lens")
+    audio_features_cfg = MultiModalFieldConfig.batched("audio")
+
+    if audio_features is not None and audio_feature_lens is not None:
+        num_features = len(audio_features)
+        num_audios = len(audio_feature_lens)
+
+        if num_features > num_audios:
+            chunks_per_audio = [lens.numel() if isinstance(lens, torch.Tensor) else 1 for lens in audio_feature_lens]
+            if sum(chunks_per_audio) != num_features:
+                chunks_per_audio = [
+                    max(int((lens != 0).sum()), 1) if isinstance(lens, torch.Tensor) else 1
+                    for lens in audio_feature_lens
+                ]
+
+            slice_idxs = [0]
+            for num_chunks in chunks_per_audio:
+                slice_idxs.append(slice_idxs[-1] + num_chunks)
+            audio_features_cfg = MultiModalFieldConfig.flat(
+                "audio",
+                [slice(slice_idxs[i], slice_idxs[i + 1]) for i in range(len(chunks_per_audio))],
+            )
+
     return dict(
         **_minicpmv_field_config(hf_inputs),
-        audio_features=MultiModalFieldConfig.batched("audio"),
+        audio_features=audio_features_cfg,
         audio_feature_lens=MultiModalFieldConfig.batched("audio"),
         audio_embeds=MultiModalFieldConfig.batched("audio"),
     )
@@ -3229,89 +3797,70 @@ class MiniCPMOMultiModalDataParser(MultiModalDataParser):
 class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45OmniLLMProcessingInfo]):
     """Multimodal processor for MiniCPM-o thinker stage."""
 
-    def _apply_hf_processor_main(
-        self,
-        prompt: str | list[int],
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-        *,
-        enable_hf_prompt_update: bool,
-    ) -> tuple[list[int], BatchFeature, bool]:
-        """
-        MiniCPM-O reimplements this to avoid calling HF processor with text-only
-        when enable_hf_prompt_update=False. The MiniCPM processor asserts
-        len(image_tags) == len(image_sizes) and fails if given placeholder text
-        without corresponding image data (e.g. during profiling/cache-miss path).
-        """
-        use_tts = hf_processor_mm_kwargs.get("use_tts", False)
-        hf_processor_mm_kwargs = {k: v for k, v in hf_processor_mm_kwargs.items() if k != "use_tts"}
-        if isinstance(prompt, str):
-            if use_tts:
-                prompt = prompt + self._TTS_SUFFIX
-            if enable_hf_prompt_update:
-                return self._apply_hf_processor_text_mm(
-                    prompt_text=prompt,
-                    mm_items=mm_items,
-                    hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-                    tokenization_kwargs=tokenization_kwargs,
-                )
-            tokenizer = self.info.get_tokenizer()
-            prompt_ids = encode_tokens(tokenizer, prompt)
-        else:
-            prompt_ids = self._apply_hf_processor_tokens_only(prompt)
-            if use_tts:
-                tokenizer = self.info.get_tokenizer()
-                tts_ids = tokenizer.convert_tokens_to_ids(["<|spk_bos|>", "<|spk|>", "<|spk_eos|>", "<|tts_bos|>"])
-                prompt_ids = list(prompt_ids) + tts_ids
-
-        mm_processed_data = self._apply_hf_processor_mm_only(
-            mm_items=mm_items,
-            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
-            tokenization_kwargs=tokenization_kwargs,
-        )
-
-        return prompt_ids, mm_processed_data, False
-
     _TTS_SUFFIX = "<|spk_bos|><|spk|><|spk_eos|><|tts_bos|>"
 
-    def _call_hf_processor(
+    def apply(self, inputs, timing_ctx):
+        hf_processor_mm_kwargs = inputs.hf_processor_mm_kwargs
+        if hf_processor_mm_kwargs.get("use_tts", False):
+            tokenizer = self.info.get_tokenizer()
+            tts_ids = tokenizer.convert_tokens_to_ids(["<|spk_bos|>", "<|spk|>", "<|spk_eos|>", "<|tts_bos|>"])
+            inputs = replace(
+                inputs,
+                prompt=[*inputs.prompt, *tts_ids],
+                hf_processor_mm_kwargs={
+                    key: value for key, value in hf_processor_mm_kwargs.items() if key != "use_tts"
+                },
+            )
+        return super().apply(inputs, timing_ctx)
+
+    def _apply_hf_processor_main(
         self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
     ) -> BatchFeature:
+        """
+        Process each modality independently because the MiniCPM processor
+        asserts that image tags and image sizes have matching lengths.
+        """
+        valid_mm_items = mm_items.select({key for key, count in mm_items.get_all_counts().items() if count > 0})
+        mm_data: dict[str, object] = {}
+        passthrough_data: dict[str, object] = {}
+        for items in valid_mm_items.values():
+            if not items:
+                continue
+            mm_data.update(items.get_processor_data())
+            passthrough_data.update(items.get_passthrough_data())
+
         tokenizer = self.info.get_tokenizer()
-
-        use_tts = mm_kwargs.get("use_tts", False)
-        mm_kwargs = {k: v for k, v in mm_kwargs.items() if k != "use_tts"}
-        if use_tts:
-            prompt = prompt + self._TTS_SUFFIX
-
-        input_ids = torch.tensor([tokenizer.encode(prompt, **tok_kwargs)])
-        mm_inputs = self.process_mm_inputs(mm_data, mm_kwargs, tok_kwargs)
-
-        return BatchFeature(
+        prompt_text = self.dummy_inputs.get_dummy_text(mm_items.get_all_counts())
+        input_ids = torch.tensor([tokenizer.encode(prompt_text)])
+        mm_inputs = self.process_mm_inputs(mm_data, hf_kwargs)
+        processed_data = BatchFeature(
             {
                 "input_ids": input_ids,
                 **mm_inputs,
             }
         )
+        processed_data.update(passthrough_data)
+        return processed_data
 
-    def _hf_processor_applies_updates(
+    def get_image_prompt_texts(
         self,
-        prompt_text: str,
-        mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-        tokenization_kwargs: Mapping[str, object],
-    ) -> bool:
-        return False
-
-    def get_image_prompt_texts(self, image_size: ImageSize, image_idx: int = 0) -> str:
+        image_size: ImageSize,
+        image_idx: int = 0,
+        max_slice_nums: int | None = None,
+        use_image_id: bool | None = None,
+    ) -> str:
+        # ``process_images`` forwards ``mm_processor_kwargs`` to the pixel path, so the
+        # placeholder grid must honor the same ``max_slice_nums``; otherwise a request that
+        # sets it (e.g. interleaved omni frames with max_slice_nums=1) produces fewer image
+        # features than placeholder ``<unk>`` slots. ``use_image_id`` is likewise per-request
+        # so callers can match MiniCPM-o's omni path, which emits no ``<image_id>`` prefix.
         return self.info.get_slice_image_placeholder(
             image_size,
             image_idx=image_idx,
+            max_slice_nums=max_slice_nums,
+            **({} if use_image_id is None else {"use_image_id": use_image_id}),
         )
 
     def get_video_prompt_texts(self, image_size: ImageSize, num_frames: int) -> str:
@@ -3341,7 +3890,6 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         self,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> Mapping[str, NestedTensors]:
         if (audios := mm_data.get("audios")) is None:
             return {}
@@ -3353,19 +3901,24 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         if isinstance(parsed_audios, MiniCPMOAudioEmbeddingItems):
             audio_inputs = {}
         else:
-            audio_inputs = self._base_call_hf_processor(
+            audio_inputs = self._call_hf_processor_on_prompts(
                 prompts=[self.info.audio_pattern] * len(parsed_audios),
                 mm_data={"audios": [[audio] for audio in parsed_audios]},
                 mm_kwargs={**mm_kwargs, "chunk_input": True},
-                tok_kwargs=tok_kwargs,
                 out_keys={"audio_features", "audio_feature_lens"},
             )
 
+            flat_feature_lens: list[int] = []
+            for lens in audio_inputs["audio_feature_lens"]:
+                if isinstance(lens, torch.Tensor):
+                    flat_feature_lens.extend(lens.flatten().tolist())
+                else:
+                    flat_feature_lens.append(int(lens))
             unpadded_audio_features = [
                 feat[:, :feature_len]
                 for feat, feature_len in zip(
                     audio_inputs["audio_features"],
-                    audio_inputs["audio_feature_lens"],
+                    flat_feature_lens,
                 )
             ]
             audio_inputs["audio_features"] = unpadded_audio_features
@@ -3376,7 +3929,6 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         self,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> Mapping[str, NestedTensors]:
         if (images := mm_data.get("images")) is None:
             return {}
@@ -3388,11 +3940,10 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         if isinstance(parsed_images, MiniCPMVImageEmbeddingItems):
             image_inputs = {}
         else:
-            image_inputs = self._base_call_hf_processor(
+            image_inputs = self._call_hf_processor_on_prompts(
                 prompts=[self.info.image_pattern] * len(parsed_images),
                 mm_data={"images": [[image] for image in parsed_images]},
                 mm_kwargs=mm_kwargs,
-                tok_kwargs=tok_kwargs,
                 out_keys={"pixel_values", "image_sizes", "tgt_sizes"},
             )
         return image_inputs
@@ -3401,7 +3952,6 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         self,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> Mapping[str, NestedTensors]:
         if (videos := mm_data.get("videos")) is None:
             return {}
@@ -3413,14 +3963,13 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         if isinstance(parsed_videos, MiniCPMVVideoEmbeddingItems):
             video_inputs = {}
         else:
-            video_inputs = self._base_call_hf_processor(
+            video_inputs = self._call_hf_processor_on_prompts(
                 prompts=[self.info.image_pattern * len(video) for video in parsed_videos],
                 mm_data={"images": list(parsed_videos)},
                 mm_kwargs={
                     **mm_kwargs,
                     "max_slice_nums": self.info.get_video_max_slice_num(),
                 },
-                tok_kwargs=tok_kwargs,
                 out_keys={"pixel_values", "image_sizes", "tgt_sizes"},
             )
 
@@ -3432,48 +3981,30 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
         self,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> Mapping[str, NestedTensors]:
         return {
-            **self.process_images(mm_data, mm_kwargs, tok_kwargs),
-            **self.process_videos(mm_data, mm_kwargs, tok_kwargs),
-            **self.process_audios(mm_data, mm_kwargs, tok_kwargs),
+            **self.process_images(mm_data, mm_kwargs),
+            **self.process_videos(mm_data, mm_kwargs),
+            **self.process_audios(mm_data, mm_kwargs),
         }
 
-    def _base_call_hf_processor(
+    def _call_hf_processor_on_prompts(
         self,
         prompts: list[str],
         mm_data: Mapping[str, Sequence[object]],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
         *,
         out_keys: set[str],
     ) -> dict[str, NestedTensors]:
-        mm_kwargs = {k: v for k, v in mm_kwargs.items() if k != "use_tts"}
-        # This processor supports zipping prompt and mm_data together
-        if self.info.get_model_version() in {(2, 6), (4, 0), (4, 5)}:
-            inputs = super()._call_hf_processor(
-                prompt=prompts,  # type: ignore
-                mm_data=mm_data,
-                mm_kwargs=mm_kwargs,
-                tok_kwargs=tok_kwargs,
-            )
-        else:
-            inputs = defaultdict[str, list[torch.Tensor]](list)
+        from vllm.model_executor.models.minicpmv import MiniCPMVMultiModalProcessor
 
-            for i, prompt in enumerate(prompts):
-                inputs_one = super()._call_hf_processor(
-                    prompt=prompt,
-                    mm_data={k: v[i] for k, v in mm_data.items()},
-                    mm_kwargs=mm_kwargs,
-                    tok_kwargs=tok_kwargs,
-                )
-
-                for k, v in inputs_one.items():
-                    assert len(v) == 1, (k, len(v))
-                    inputs[k].append(v[0])
-
-        return {k: inputs[k] for k in out_keys}
+        return MiniCPMVMultiModalProcessor._call_hf_processor_on_prompts(
+            self,
+            prompts,
+            mm_data,
+            {key: value for key, value in mm_kwargs.items() if key != "use_tts"},
+            out_keys=out_keys,
+        )
 
     def _get_prompt_updates(
         self,
@@ -3495,14 +4026,32 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
                 additional_placeholders.append((modality, sub_pattern))
         placeholders += additional_placeholders
 
+        # vLLM 0.29 removed PromptUpdateDetails.select_text: prompt updates are
+        # token oriented now, so encode the replacement text and select the unk
+        # placeholder positions by token id instead of by text.
+        unk_token_id = tokenizer.convert_tokens_to_ids("<unk>")
+
+        def _select_unk_positions(text: str) -> PromptUpdateDetails:
+            return PromptUpdateDetails.select_token_id(
+                tokenizer.encode(text, add_special_tokens=False),
+                unk_token_id,
+            )
+
+        image_max_slice_nums = hf_processor_mm_kwargs.get("max_slice_nums")
+        image_use_image_id = hf_processor_mm_kwargs.get("use_image_id")
+
         def get_image_replacement(item_idx: int):
             images = mm_items.get_items("image", (MiniCPMVImageEmbeddingItems, ImageProcessorItems))
 
             image_size = images.get_image_size(item_idx)
 
-            return PromptUpdateDetails.select_text(
-                self.get_image_prompt_texts(image_size, item_idx),
-                "<unk>",
+            return _select_unk_positions(
+                self.get_image_prompt_texts(
+                    image_size,
+                    item_idx,
+                    max_slice_nums=None if image_max_slice_nums is None else int(image_max_slice_nums),  # type: ignore[arg-type]
+                    use_image_id=None if image_use_image_id is None else bool(image_use_image_id),
+                )
             )
 
         def get_video_replacement(item_idx: int):
@@ -3511,17 +4060,18 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             frame_size = videos.get_frame_size(item_idx)
             num_frames = videos.get_num_frames(item_idx)
 
-            return PromptUpdateDetails.select_text(
-                self.get_video_prompt_texts(frame_size, num_frames),
-                "<unk>",
-            )
+            return _select_unk_positions(self.get_video_prompt_texts(frame_size, num_frames))
 
         get_replacement = {
             "image": get_image_replacement,
             "video": get_video_replacement,
         }
         base_updates = [
-            PromptReplacement(modality=modality, target=pattern, replacement=get_replacement[modality])
+            PromptReplacement(
+                modality=modality,
+                target=tokenizer.encode(pattern, add_special_tokens=False),
+                replacement=get_replacement[modality],
+            )
             for modality, pattern in placeholders
         ]
 
@@ -3532,20 +4082,21 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
 
             if isinstance(audios, MiniCPMOAudioEmbeddingItems):
                 single_audio_embeds = audios.get(item_idx)["audio_embeds"]
-                audio_len = self.info.get_audio_len_by_num_chunks(sum(map(len, single_audio_embeds)))
+                # One item is ``(s, h)``, so its leading dim is the audio embedding count.
+                audio_len = self.info.get_audio_len_by_num_chunks(len(single_audio_embeds))
             else:
                 audio_len = audios.get_audio_length(item_idx)
 
-            return PromptUpdateDetails.select_text(
-                self.get_audio_prompt_texts(audio_len),
-                "<unk>",
-            )
+            return _select_unk_positions(self.get_audio_prompt_texts(audio_len))
 
         return [
             *base_updates,
             PromptReplacement(
                 modality="audio",
-                target=audio_placeholder,
+                target=tokenizer.encode(
+                    audio_placeholder,
+                    add_special_tokens=False,
+                ),
                 replacement=get_audio_replacement,
             ),
         ]
@@ -3595,11 +4146,17 @@ class MiniCPMOAudioFeatureInputs(TensorSchema):
 
     audio_feature_lens: Annotated[
         torch.Tensor | list[torch.Tensor],
-        TensorShape("bn", "s"),
+        TensorShape("bn", "s", dynamic_dims={"s"}),
     ]
     """
     This should be feature length of each audio slice,
     which equals to `audio_features.shape[-1]`
+
+    Each audio in the batch may be split into a different number of slices
+    (e.g. audio >30s splits into multiple slices while shorter audio doesn't),
+    so `s` must be dynamic: batching audios with different slice counts is a
+    normal, valid input and is already handled below via `hstack` + per-audio
+    iteration, not a schema violation.
     """
 
 
@@ -3696,12 +4253,19 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        from vllm_omni.platforms import current_omni_platform
+
         config: MiniCPMOConfig = vllm_config.model_config.hf_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
         self.config = config
-        self.multimodal_config = multimodal_config
-
+        # Duplex session cap of this deployment; sizes the audio-encoder graph
+        # grid when ``duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions``.
+        self._duplex_max_sessions = int(getattr(vllm_config.model_config, "duplex_max_sessions", 1) or 1)
+        self._enforce_eager = bool(vllm_config.model_config.enforce_eager)
+        # The packed vision path still needs the CUDA graph opt-out after
+        # encoder construction moved into the shared CUDA/NPU factory.
+        encoder_graphs = bool(getattr(config, "encoder_cuda_graph", True)) and not self._enforce_eager
         # Initialize image processor
         self.image_processor = MiniCPMVImageProcessor(
             max_slice_nums=config.slice_config.max_slice_nums,
@@ -3714,12 +4278,27 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # Initialize vision encoder (SigLIP)
         if multimodal_config.get_limit_per_prompt("image"):
             # Set attention implementation
-            if hasattr(vllm_config, "model_config") and hasattr(vllm_config.model_config, "_attn_implementation"):
+            # Match the reference vision attention for CUDA duplex: SDPA can
+            # change the generated scene descriptions over a long AV session.
+            # Keep explicit engine/vision overrides and turn/NPU defaults.
+            if getattr(getattr(vllm_config, "model_config", None), "_attn_implementation", None) is not None:
                 config.vision_config._attn_implementation = vllm_config.model_config._attn_implementation
             else:
-                config.vision_config._attn_implementation = "eager"
+                vision_implementation = getattr(config.vision_config, "_attn_implementation", None)
+                cuda_duplex = (
+                    current_omni_platform.is_cuda()
+                    and getattr(vllm_config.model_config, "dtype", None) == torch.bfloat16
+                    and getattr(vllm_config.model_config, "session_mode", "turn") == "duplex"
+                )
+                config.vision_config._attn_implementation = vision_implementation or (
+                    "eager" if cuda_duplex else "sdpa"
+                )
+            if config.vision_config._attn_implementation == "flash_attention_2" and not is_flash_attn_2_available():
+                logger.warning("flash_attention_2 requested for the MiniCPM-o vision tower but unavailable; using sdpa")
+                config.vision_config._attn_implementation = "sdpa"
 
             self.vpm = SiglipVisionTransformer(config.vision_config)
+            self.vpm._encoder_graph = make_encoder_graph(self.vpm._encode_last_hidden_state, vllm_config)
             # Drop last layer if configured
             if config.drop_vision_last_layer:
                 self.vpm.encoder.layers = self.vpm.encoder.layers[:-1]
@@ -3740,8 +4319,18 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         else:
             text_config = Qwen2Config.from_dict(config_dict)
             llm_arch = "Qwen2ForCausalLM"
+        from vllm_omni.model_executor.models.minicpmo_4_5.duplex.compat import (
+            patch_minicpmo_remote_config,
+        )
+
+        patch_minicpmo_remote_config(text_config)
+        text_vllm_config = (
+            vllm_config.with_hf_config(text_config)
+            if callable(getattr(vllm_config, "with_hf_config", None))
+            else vllm_config
+        )
         self.llm = init_vllm_registered_model(
-            vllm_config=vllm_config,
+            vllm_config=text_vllm_config,
             prefix=maybe_prefix(prefix, "llm"),
             hf_config=text_config,
             architectures=[llm_arch],
@@ -3759,8 +4348,13 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 kv_dim=vision_dim,  # Vision encoder dimension
                 adaptive=True,  # Enable adaptive resampling
             )
+            self.resampler.attn_implementation = config.vision_config._attn_implementation
         else:
             self.resampler = None
+        if self.vpm is not None:
+            self.vpm.fused_layers = bool(getattr(config, "vision_fused_layers", False))
+        self.vision_packed_encode, self.vision_cuda_graph = _vision_encode_paths(config, encoder_graphs=encoder_graphs)
+        self._vision_graph_encoder: VisionGraphEncoder | None = None
 
         # Initialize audio encoder (APM) and audio projection
         if getattr(config, "init_audio", True) and hasattr(config, "audio_config") and config.audio_config is not None:
@@ -3769,12 +4363,20 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             self.audio_avg_pooler = nn.AvgPool1d(config.audio_pool_step, stride=config.audio_pool_step)
             self.audio_projection_layer = MultiModalProjector(in_dim=audio_output_dim, out_dim=embed_dim)
             self.audio_encoder_layer = -1
+            self.audio_past_key_values = None
         else:
             self.apm = None
             self.audio_avg_pooler = None
             self.audio_projection_layer = None
             self.audio_encoder_layer = None
+            self.audio_past_key_values = None
 
+        # Ascend Conv1d must stay outside NPUGraph; CUDA retains the full
+        # stateless encoder/projection/pooling capture merged in #8332.
+        audio_forward = (
+            self._encode_audio_transformer if current_omni_platform.is_npu() else self._encode_audio_features
+        )
+        self._audio_encoder_graph = make_encoder_graph(audio_forward, vllm_config)
         self.mm_token_ids = set[int]()
         self.make_empty_intermediate_tensors = self.llm.make_empty_intermediate_tensors
 
@@ -4032,12 +4634,27 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         pixel_values = data["pixel_values"]
         tgt_sizes = data["tgt_sizes"]
 
+        vpm = self.vpm
+        packed = getattr(self, "vision_packed_encode", False) and hasattr(vpm, "forward_packed")
+        if packed and hasattr(self.resampler, "forward_packed") and self.resampler.supports_packed():
+            layouts = _packed_vision_layouts(pixel_values, tgt_sizes, vpm.embeddings.patch_size)
+            if layouts is not None:
+                graph_encoder = None
+                if getattr(self, "vision_cuda_graph", False) and pixel_values[0].is_cuda:
+                    if self._vision_graph_encoder is None:
+                        self._vision_graph_encoder = VisionGraphEncoder(vpm, self.resampler)
+                    graph_encoder = self._vision_graph_encoder
+                max_items = max(1, int(self.config.vision_batch_size))
+                return _encode_vision_packed(vpm, self.resampler, pixel_values, layouts, max_items, graph_encoder)
+
         B = len(pixel_values)
         P = pixel_values[0].shape[-2]
         L = max(item.shape[-1] for item in pixel_values)
         device = pixel_values[0].device
         dtype = pixel_values[0].dtype
 
+        # VPM batching bounds encoder activations below, while this padding
+        # buffer intentionally remains sized for the full input batch.
         all_pixel_values = torch.zeros((B, 3, P, L), dtype=dtype, device=device)
         for i, pixel_values_item in enumerate(pixel_values):
             L_item = pixel_values_item.shape[-1]
@@ -4051,16 +4668,29 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         for i, num_patches_item in enumerate(num_patches):
             patch_attn_mask[i, :num_patches_item] = True
 
-        vision_embedding = self.vpm(
-            all_pixel_values,
-            patch_attention_mask=patch_attn_mask.unsqueeze(1),
-            tgt_sizes=tgt_sizes,
-        )
+        patch_attn_mask = patch_attn_mask.unsqueeze(1)
 
-        if not isinstance(vision_embedding, torch.Tensor):
-            vision_embedding = vision_embedding.last_hidden_state
+        def encode_vision(start: int, end: int) -> torch.Tensor:
+            chunk_tgt_sizes = tgt_sizes[start:end]
+            vision_embedding = self.vpm(
+                all_pixel_values[start:end],
+                patch_attention_mask=patch_attn_mask[start:end],
+                tgt_sizes=chunk_tgt_sizes,
+            )
 
-        return self.resampler(vision_embedding, tgt_sizes)
+            if not isinstance(vision_embedding, torch.Tensor):
+                vision_embedding = vision_embedding.last_hidden_state
+
+            return vision_embedding
+
+        vision_batch_size = max(1, int(self.config.vision_batch_size))
+        if B <= vision_batch_size:
+            return self.resampler(encode_vision(0, B), tgt_sizes)
+
+        vision_embeddings = [
+            encode_vision(start, min(start + vision_batch_size, B)) for start in range(0, B, vision_batch_size)
+        ]
+        return self.resampler(torch.cat(vision_embeddings, dim=0), tgt_sizes)
 
     def _process_vision_input(
         self,
@@ -4097,15 +4727,21 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             torch.Tensor: mask
 
         """
-        ret = torch.zeros(size, size, device=device, dtype=torch.bool)
-        for i in range(size):
-            if num_left_chunks < 0:
-                start = 0
-            else:
-                start = max((i // chunk_size - num_left_chunks) * chunk_size, 0)
-            ending = min((i // chunk_size + 1) * chunk_size + num_lookhead, size)
-            ret[i, start:ending] = True
-        return ret
+        indices = torch.arange(size, device=device)
+        chunk_index = indices // chunk_size
+        chunk_end = torch.clamp(
+            (chunk_index + 1) * chunk_size + num_lookhead,
+            max=size,
+        )
+
+        mask = indices.unsqueeze(0) < chunk_end.unsqueeze(1)
+        if num_left_chunks >= 0:
+            chunk_start = torch.clamp(
+                (chunk_index - num_left_chunks) * chunk_size,
+                min=0,
+            )
+            mask.logical_and_(indices.unsqueeze(0) >= chunk_start.unsqueeze(1))
+        return mask
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         input_lengths_after_cnn = (input_lengths - 1) // 2 + 1
@@ -4177,18 +4813,26 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             audio_attention_mask_ = torch.logical_or(audio_attention_mask_, torch.logical_not(chunk_mask))
 
         audio_attention_mask[audio_attention_mask_] = float("-inf")
-        audio_states = self.apm(wavforms, attention_mask=audio_attention_mask, output_hidden_states=True).hidden_states[
-            self.audio_encoder_layer
-        ]
-        audio_embeds = self.audio_projection_layer(audio_states)
-
-        audio_embeds = audio_embeds.transpose(1, 2)
-        audio_embeds = self.audio_avg_pooler(audio_embeds)
-        audio_embeds = audio_embeds.transpose(1, 2)
+        graph = getattr(self, "_audio_encoder_graph", None)
+        if (
+            graph is not None
+            and not self.training
+            and self.audio_encoder_layer == -1
+            # Whisper's FP16 overflow guard reads tensor booleans on the host.
+            and self.apm.conv1.weight.dtype != torch.float16
+        ):
+            if wavforms.device.type == "npu":
+                # Ascend Conv1d remains eager; graph only the transformer stack.
+                hidden_states = graph(self.apm.embed_mel_features(wavforms), audio_attention_mask)
+                audio_embeds = self._project_pooled_audio(hidden_states)
+            else:
+                audio_embeds = graph(wavforms, audio_attention_mask)
+        else:
+            audio_embeds = self._encode_audio_features(wavforms, audio_attention_mask)
 
         _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
-
-        num_audio_tokens = feature_lens_after_pooling
+        # One host read of every length instead of an implicit .item() per slice bound.
+        num_audio_tokens = feature_lens_after_pooling.tolist()
 
         final_audio_embeds = list[torch.Tensor]()
         idx = 0
@@ -4201,6 +4845,220 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
             final_audio_embeds.append(torch.cat(target_audio_embeds_lst))
 
         return final_audio_embeds
+
+    def _encode_audio_transformer(
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        return self.apm.encode_hidden_states(hidden_states, attention_mask)
+
+    def _project_pooled_audio(self, audio_states: torch.Tensor) -> torch.Tensor:
+        audio_embeds = self.audio_projection_layer(audio_states)
+        audio_embeds = audio_embeds.transpose(1, 2)
+        audio_embeds = self.audio_avg_pooler(audio_embeds)
+        return audio_embeds.transpose(1, 2)
+
+    def _encode_audio_features(self, wavforms: torch.Tensor, audio_attention_mask: torch.Tensor) -> torch.Tensor:
+        """Stateless audio encoder, projection and pooling (no streaming KV)."""
+        selects_final_layer = self.audio_encoder_layer == -1
+        audio_outputs = self.apm(
+            wavforms,
+            attention_mask=audio_attention_mask,
+            output_hidden_states=not selects_final_layer,
+        )
+        if selects_final_layer:
+            audio_states = audio_outputs.last_hidden_state
+        else:
+            # Whisper follows the Hugging Face hidden-state ordering: the
+            # embedding output, followed by each encoder layer output.
+            assert audio_outputs.hidden_states is not None
+            audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
+        audio_embeds = self.audio_projection_layer(audio_states)
+
+        audio_embeds = audio_embeds.transpose(1, 2)
+        audio_embeds = self.audio_avg_pooler(audio_embeds)
+        audio_embeds = audio_embeds.transpose(1, 2)
+
+        return audio_embeds
+
+    def get_audio_embedding_streaming(
+        self,
+        data: MiniCPMOAudioFeatureInputs,
+        use_extra_context: bool = False,
+        prefix_extra_frames: int = 1,
+        suffix_extra_frames: int = 1,
+        cnn_min_length: int | None = None,
+    ) -> list[list[torch.Tensor]]:
+        if self.apm is None or self.audio_projection_layer is None or self.audio_avg_pooler is None:
+            return []
+
+        wavforms = data["audio_features"]
+        audio_feature_lens_raw = data["audio_feature_lens"]
+        if isinstance(wavforms, list):
+            if not wavforms:
+                return []
+            batch_size = len(wavforms)
+            channels = wavforms[0].shape[-2]
+            max_len = max(item.shape[-1] for item in wavforms)
+            wavforms_tensor = torch.zeros(
+                (batch_size, channels, max_len),
+                dtype=wavforms[0].dtype,
+                device=wavforms[0].device,
+            )
+            for idx, item in enumerate(wavforms):
+                wavforms_tensor[idx, ..., : item.shape[-1]] = item
+            wavforms = wavforms_tensor
+        if isinstance(audio_feature_lens_raw, torch.Tensor):
+            audio_feature_lens_raw = audio_feature_lens_raw.unbind(0)
+        if wavforms.shape[0] == 0:
+            return []
+        audio_feature_lens = torch.hstack(audio_feature_lens_raw)
+        batch_size, _, max_mel_seq_len = wavforms.shape
+        assert batch_size == 1
+
+        current_seq_len = (max_mel_seq_len - 1) // 2 + 1
+        if use_extra_context:
+            prefix_to_remove = (int(prefix_extra_frames) + 1) // 2 if prefix_extra_frames > 0 else 0
+            suffix_to_remove = (int(suffix_extra_frames) + 1) // 2 if suffix_extra_frames > 0 else 0
+            current_seq_len = current_seq_len - prefix_to_remove - suffix_to_remove
+        if current_seq_len <= 0:
+            return []
+
+        if self.audio_past_key_values is not None:
+            cache_length = _get_audio_cache_length(self.audio_past_key_values)
+            apm_max_len = self.apm.embed_positions.weight.shape[0]
+            if cache_length + current_seq_len >= apm_max_len:
+                logger.warning(
+                    "audio_past_key_values length %s exceeds %s, reset.",
+                    cache_length + current_seq_len,
+                    apm_max_len,
+                )
+                self.audio_past_key_values = None
+
+        past_len = 0
+        if self.audio_past_key_values is not None:
+            past_len = _get_audio_cache_length(self.audio_past_key_values)
+        total_seq_len = past_len + current_seq_len
+        audio_attention_mask = torch.zeros(
+            (batch_size, 1, current_seq_len, total_seq_len),
+            dtype=self.apm.conv1.weight.dtype,
+            device=wavforms.device,
+        )
+
+        # As in get_audio_embedding: every layer's output only to pick the last one keeps 25 activations alive.
+        selects_final_layer = self.audio_encoder_layer == -1
+        audio_outputs = self.apm(
+            wavforms,
+            past_key_values=self.audio_past_key_values,
+            use_cache=True,
+            output_hidden_states=not selects_final_layer,
+            attention_mask=audio_attention_mask,
+            use_extra_context=use_extra_context,
+            prefix_extra_frames=prefix_extra_frames,
+            suffix_extra_frames=suffix_extra_frames,
+            cnn_min_length=cnn_min_length,
+        )
+        if selects_final_layer:
+            audio_states = audio_outputs.last_hidden_state
+        else:
+            audio_states = audio_outputs.hidden_states[self.audio_encoder_layer]
+        self.audio_past_key_values = audio_outputs.past_key_values
+
+        audio_embeds = self.audio_projection_layer(audio_states)
+        audio_embeds = audio_embeds.transpose(1, 2)
+        audio_embeds = self.audio_avg_pooler(audio_embeds)
+        audio_embeds = audio_embeds.transpose(1, 2)
+
+        _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
+        # One host read of the lengths instead of a device sync per slice bound.
+        pooled_lens = feature_lens_after_pooling.tolist()
+        final_audio_embeds: list[list[torch.Tensor]] = []
+        idx = 0
+        for i in range(len(audio_feature_lens_raw)):
+            target_audio_embeds = []
+            for _ in range(len(audio_feature_lens_raw[i])):
+                target_audio_embeds.append(audio_embeds[idx, : pooled_lens[idx], :])
+                idx += 1
+            final_audio_embeds.append(target_audio_embeds)
+        return final_audio_embeds
+
+    def supports_streaming_audio_batch(self) -> bool:
+        """Whether ``get_audio_embedding_streaming_batch`` can serve this encoder."""
+        if self.apm is None or self.audio_projection_layer is None or self.audio_avg_pooler is None:
+            return False
+        requested = getattr(self.config, "duplex_audio_encoder_batching", None)
+        if requested is not None and not bool(requested):
+            return False
+        reason = streaming_audio.streaming_batch_unsupported_reason(
+            self.apm, audio_encoder_layer=self.audio_encoder_layer
+        )
+        if reason is not None:
+            logger.info("MiniCPM-o streaming audio encoder stays per-session: %s", reason)
+            return False
+        return requested is not None or self.apm.conv1.weight.device.type in ("cuda", "cpu")
+
+    def build_streaming_audio_graph_encoder(self, *, unit_frames: int) -> bool:
+        """Capture CUDA graphs of the streaming encoder's steady unit. Failures stay eager."""
+        self._duplex_audio_cuda_graph_encoder = None
+        config = self.config
+        enabled = bool(getattr(config, "duplex_audio_encoder_cuda_graph", True)) and not self._enforce_eager
+        if not self.supports_streaming_audio_batch() or not enabled:
+            return False
+        if self.apm.conv1.weight.device.type != "cuda":
+            logger.info("MiniCPM-o streaming audio encoder CUDA graph needs a CUDA device; staying eager")
+            return False
+        batch_sizes = getattr(config, "duplex_audio_encoder_cuda_graph_batch_sizes", None)
+        if getattr(config, "duplex_audio_encoder_cuda_graph_batch_sizes_from_sessions", False) is True:
+            # Overrides the explicit list: the grid follows duplex max_sessions.
+            batch_sizes = streaming_audio_graph.batch_sizes_for_sessions(getattr(self, "_duplex_max_sessions", 1))
+        allocated = torch.accelerator.memory_allocated(self.apm.conv1.weight.device)
+        try:
+            wrapper = streaming_audio_graph.StreamingAudioGraphEncoder(
+                self.apm,
+                self.audio_projection_layer,
+                self.audio_avg_pooler,
+                unit_frames=int(unit_frames),
+                pool_step=int(config.audio_pool_step),
+                batch_sizes=batch_sizes,
+                cache_buckets=getattr(config, "duplex_audio_encoder_cuda_graph_cache_buckets", None),
+                page_positions=self._duplex_audio_kv_page_positions(),
+                pinned_h2d=getattr(config, "duplex_audio_encoder_pinned_h2d", False) is True,
+            )
+            wrapper.capture()
+        except Exception:
+            logger.exception("MiniCPM-o streaming audio encoder CUDA graph capture failed; staying eager")
+            return False
+        self._duplex_audio_cuda_graph_encoder = wrapper
+        logger.info(
+            "Captured MiniCPM-o streaming audio encoder CUDA graphs: unit_frames=%d batch_sizes=%s "
+            "cache_buckets=%s pinned_h2d=%s, took %.2f GiB",
+            unit_frames,
+            wrapper.batch_sizes,
+            wrapper.cache_buckets,
+            wrapper.pinned_h2d,
+            (torch.accelerator.memory_allocated(self.apm.conv1.weight.device) - allocated) / (1 << 30),
+        )
+        return True
+
+    def get_audio_embedding_streaming_batch(
+        self,
+        chunks: Sequence[Any],
+    ) -> tuple[list[torch.Tensor | None], list[Any]]:
+        """Batched ``get_audio_embedding_streaming`` (embeddings, updated caches); graphs take steady rows."""
+        graph = getattr(self, "_duplex_audio_cuda_graph_encoder", None)
+        if graph is not None:
+            return graph.encode(chunks)
+        return streaming_audio.encode_streaming_audio_batch(
+            self.apm,
+            self.audio_projection_layer,
+            self.audio_avg_pooler,
+            chunks,
+            pool_step=int(self.config.audio_pool_step),
+            page_positions=self._duplex_audio_kv_page_positions(),
+        )
+
+    def _duplex_audio_kv_page_positions(self) -> int:
+        page_positions = getattr(self.config, "duplex_audio_kv_page_positions", None)
+        return int(page_positions or streaming_audio.DEFAULT_KV_PAGE_POSITIONS)
 
     def _process_audio_input(
         self,
@@ -4235,6 +5093,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
                 multimodal_embeddings += tuple(audio_embeddings)
         return multimodal_embeddings
 
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
+        return self.get_multimodal_embeddings(**kwargs)
+
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -4262,9 +5124,6 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        """Forward pass through thinker model."""
-        text_inputs_embeds = None
-
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -4272,22 +5131,12 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         elif inputs_embeds is None:
             multimodal_embeddings = self.get_multimodal_embeddings(**kwargs)
             inputs_embeds = self.get_input_embeddings(input_ids, multimodal_embeddings)
-            text_inputs_embeds = self.get_input_embeddings(
-                input_ids,
-                (
-                    [(torch.zeros_like(embeddings), "image") for embeddings in multimodal_embeddings]
-                    if multimodal_embeddings is not None
-                    else None
-                ),
-            )
             input_ids = None
-        else:
-            text_inputs_embeds = inputs_embeds
 
         # Forward through language model
         hidden_states = self.llm.model(input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds)
 
-        return text_inputs_embeds, hidden_states.unsqueeze(0) if hidden_states.ndim == 2 else hidden_states
+        return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         """Compute logits from hidden states."""

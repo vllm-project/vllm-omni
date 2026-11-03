@@ -23,6 +23,7 @@ from diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers, Sch
 from diffusers.utils import deprecate
 
 from vllm_omni.diffusion.models.schedulers.base import BaseScheduler
+from vllm_omni.diffusion.utils.flow_matching import safe_linalg_solve
 
 
 class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
@@ -208,11 +209,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
 
         self.num_inference_steps = len(timesteps)
 
-        # Reset state
-        self.model_outputs = [None] * self.config.solver_order
-        self.timestep_list = [None] * self.config.solver_order
-        self.lower_order_nums = 0
-        self.last_sample = None
+        self.clear_history()
 
         if self.solver_p:
             self.solver_p.set_timesteps(self.num_inference_steps, device=device)
@@ -220,6 +217,17 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         self._step_index = None
         self._begin_index = None
         self.sigmas = self.sigmas.to("cpu")
+
+    def clear_history(self) -> None:
+        """Release samples after a run; call set_timesteps before starting another.
+
+        This is only for completed or abandoned runs, never between steps of
+        an active multistep solve. The schedule and progress remain available.
+        """
+        self.model_outputs = [None] * self.config.solver_order
+        self.timestep_list = [None] * self.config.solver_order
+        self.lower_order_nums = 0
+        self.last_sample = None
 
     def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:
         """
@@ -431,7 +439,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
                 rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
             else:
                 assert isinstance(R, torch.Tensor)
-                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
+                rhos_p = safe_linalg_solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
         else:
             D1s = None
 
@@ -565,7 +573,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            rhos_c = safe_linalg_solve(R, b).to(device).to(x.dtype)
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0

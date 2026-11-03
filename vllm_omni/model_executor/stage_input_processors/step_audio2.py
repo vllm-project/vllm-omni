@@ -7,6 +7,7 @@ import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
@@ -35,14 +36,14 @@ def _ensure_list(x):
 
 def thinker2token2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    multimodal_output: dict[str, Any] | None,
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     """
     Async chunk processor: stream audio tokens from Thinker to Token2Wav.
 
-    Unlike Qwen3-Omni which passes hidden states via pooling_output,
+    Unlike Qwen3-Omni which passes hidden states via multimodal_output,
     Step Audio2 generates audio tokens as part of the LLM autoregressive
     output (token IDs >= audio_start). This processor extracts those audio
     tokens from the running token stream and sends them in chunks.
@@ -62,14 +63,13 @@ def thinker2token2wav_async_chunk(
     Args:
         transfer_manager: OmniChunkTransferAdapter instance (has
             ``code_prompt_token_ids`` defaultdict for state tracking).
-        pooling_output: Pooler output dict (unused — audio tokens are in
+        multimodal_output: Multimodal output dict (unused — audio tokens are in
             the token ID stream, not in hidden states).
         request: Current engine request with access to all_token_ids.
         is_finished: Whether the upstream request has finished generating.
 
     Returns:
-        dict with framework-compatible fields, or None if the chunk is
-        not yet ready.
+        Structured connector payload, or None if the chunk is not yet ready.
     """
     audio_start = DEFAULT_TOKEN_CONFIG.audio_start
     audio_eos = DEFAULT_TOKEN_CONFIG.audio_eos
@@ -100,18 +100,22 @@ def thinker2token2wav_async_chunk(
         # Last chunk: send all remaining tokens
         if available <= 0:
             # No audio tokens at all (text-only response) — send EOF marker
-            return {
-                "code_predictor_codes": [],
-                "left_context_size": 1,  # 1 = last chunk
-                "finished": torch.tensor(True, dtype=torch.bool),
-            }
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(
+                    left_context_size=1,  # 1 = last chunk
+                    finished=torch.tensor(True, dtype=torch.bool),
+                ),
+            )
         remaining_tokens = audio_tokens[consumed:]
         transfer_manager.code_prompt_token_ids[request_id].extend(remaining_tokens)
-        return {
-            "code_predictor_codes": remaining_tokens,
-            "left_context_size": 1,  # 1 = last chunk
-            "finished": torch.tensor(True, dtype=torch.bool),
-        }
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor(remaining_tokens, dtype=torch.long)),
+            meta=MetaStruct(
+                left_context_size=1,  # 1 = last chunk
+                finished=torch.tensor(True, dtype=torch.bool),
+            ),
+        )
     else:
         # Non-last chunk: need chunk_size + pre_lookahead_len tokens
         required = chunk_size + pre_lookahead_len
@@ -120,11 +124,13 @@ def thinker2token2wav_async_chunk(
         chunk_tokens = audio_tokens[consumed : consumed + required]
         # Only consume chunk_size tokens; the lookahead portion is re-used
         transfer_manager.code_prompt_token_ids[request_id].extend(audio_tokens[consumed : consumed + chunk_size])
-        return {
-            "code_predictor_codes": chunk_tokens,
-            "left_context_size": 0,  # 0 = not last chunk
-            "finished": torch.tensor(False, dtype=torch.bool),
-        }
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor(chunk_tokens, dtype=torch.long)),
+            meta=MetaStruct(
+                left_context_size=0,  # 0 = not last chunk
+                finished=torch.tensor(False, dtype=torch.bool),
+            ),
+        )
 
 
 def thinker2token2wav(

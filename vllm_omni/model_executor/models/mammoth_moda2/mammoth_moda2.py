@@ -1,15 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Iterable, Mapping
 from itertools import islice
 from typing import Any
 
 import torch
 from torch import nn
-from transformers import Qwen2Config
+from transformers import Qwen2Config, Qwen3VLProcessor
 from transformers.models.qwen2_5_vl.processing_qwen2_5_vl import Qwen2_5_VLProcessor
-from vllm.config import CacheConfig, VllmConfig
+from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -30,8 +36,17 @@ from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLProcessingInfo,
 )
 from vllm.model_executor.models.qwen2_vl import Qwen2VLMultiModalDataParser
+from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer, Qwen3MLP
+from vllm.model_executor.models.qwen3_vl import (
+    Qwen3VLDummyInputsBuilder,
+    Qwen3VLForConditionalGeneration,
+    Qwen3VLMultiModalProcessor,
+    Qwen3VLProcessingInfo,
+)
 from vllm.model_executor.models.utils import (
+    AutoWeightsLoader,
     PPMissingLayer,
+    StageMissingLayer,
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
@@ -41,14 +56,27 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import (
-    is_interleaved,
     patch_rope_parameters,
     set_default_rope_theta,
 )
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
+from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, is_interleaved
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
+
+logger = init_logger(__name__)
+
+
+def _runtime_meta(runtime_info: dict[str, Any]) -> dict[str, Any]:
+    """Accept both legacy flat metadata and the canonical nested payload."""
+    meta = runtime_info.get("meta")
+    return meta if isinstance(meta, dict) else runtime_info
+
+
+def _first_int(value: Any) -> int:
+    if isinstance(value, (list, tuple)):
+        value = value[0]
+    return int(value)
 
 
 def moe_enable(moe_type, layer_type, layer_idx) -> bool:
@@ -291,6 +319,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         self.gen_vocab_size = int(getattr(config, "gen_vocab_size", 0) or 0)
 
         self.base_vocab_size = int(self.gen_vocab_start_index) if self.extra_gen_vocab else int(config.vocab_size)
+        self.org_base_vocab_size = int(getattr(config, "base_vocab_size", self.base_vocab_size))
         # The configuration level (hf_text_config.vocab_size) has been extended to base+gen
         # by the upstream config class. Use config.vocab_size as the total vocab size.
         self.total_vocab_size = int(getattr(config, "vocab_size", self.base_vocab_size))
@@ -299,6 +328,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             self.embed_tokens = VocabParallelEmbedding(
                 self.base_vocab_size,
                 config.hidden_size,
+                org_num_embeddings=self.org_base_vocab_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.embed_tokens",
             )
@@ -322,6 +352,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             self.lm_head = ParallelLMHead(
                 self.base_vocab_size,
                 config.hidden_size,
+                org_num_embeddings=self.org_base_vocab_size,
                 quant_config=quant_config,
                 prefix=f"{prefix}.lm_head",
             )
@@ -425,6 +456,7 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        deepstack_input_embeds: IntermediateTensors | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -446,8 +478,17 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             residual = intermediate_tensors["residual"]
             gen_token_mask = intermediate_tensors.tensors.get("gen_token_mask")
 
-        for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(positions, hidden_states, residual, gen_token_mask)
+            # The vision encoder's deepstack_visual_indexes select which vision
+            # layers produce these features. The resulting tensors are keyed
+            # 0..N-1 and, as in Qwen3-Omni, are injected into the first N
+            # language-model layers.
+            if deepstack_input_embeds is not None and idx < len(deepstack_input_embeds):
+                hidden_states = hidden_states + deepstack_input_embeds[f"deepstack_input_embeds_{idx}"]
 
         if not get_pp_group().is_last_rank:
             tensors = {"hidden_states": hidden_states, "residual": residual}
@@ -532,12 +573,202 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
         return loaded_params
 
 
+class Mammoth3DecoderLayer(Qwen3DecoderLayer):
+    """Qwen3 decoder layer with MammothModa2's generation MLP expert."""
+
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, cache_config, quant_config, prefix)
+        self.moe_enable = moe_enable(config.moe_type, "ffn", layer_idx)
+        self.gen_mlp = (
+            Qwen3MLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gen_mlp",
+            )
+            if self.moe_enable
+            else None
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        gen_token_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = moe_forward(
+            hidden_states,
+            self.mlp,
+            self.gen_mlp,
+            gen_token_mask if self.moe_enable else None,
+        )
+        return hidden_states, residual
+
+
+class MammothModa2Qwen3ForCausalLM(MammothModa2Qwen2ForCausalLM):
+    """MammothModa2 generation-aware language model using Qwen3 attention."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(
+            vllm_config=vllm_config,
+            prefix=prefix,
+            decoder_layer_type=Mammoth3DecoderLayer,
+        )
+
+
+def _drop_parent_language_model(model: nn.Module, prefix: str) -> None:
+    """Unregister and release the language model built by the Qwen-VL parent ``__init__``.
+
+    The parent builds a stock Qwen LM whose attention layers register in the static
+    forward context as ``{prefix}.language_model.model.layers.*``. MammothModa2 replaces
+    it with its own LM (``{prefix}.language_model.layers.*``); without this, both sets of
+    layers are counted when the KV cache is sized and each gets its own KV blocks.
+    """
+    old = model.language_model
+    if isinstance(old, StageMissingLayer):  # mm_encoder_only
+        old = old.__dict__["module"]
+    ctx = get_current_vllm_config().compilation_config.static_forward_context
+    owned = set(old.modules())
+    dropped = [name for name, layer in ctx.items() if layer in owned]
+    for name in dropped:
+        del ctx[name]
+    stale = [name for name in ctx if name.startswith(maybe_prefix(prefix, "language_model."))]
+    # A later pipeline rank may hold none of the parent's layers, so only the first
+    # rank has to find some; no rank may leave any behind.
+    pp_group = get_pp_group()
+    must_drop = pp_group.world_size == 1 or pp_group.is_first_rank
+    if (must_drop and not dropped) or stale:
+        raise RuntimeError(
+            f"Unexpected attention registry for the parent language model (dropped {len(dropped)}, left {stale}); "
+            "check the Qwen-VL __init__."
+        )
+    # With torch.compile, the compile wrapper's bytecode hook would keep the module alive.
+    for module in owned:
+        if isinstance(module, TorchCompileWithNoGuardsWrapper):
+            module.cleanup()
+    logger.debug("Dropped %d attention layers of the parent language model.", len(dropped))
+    del model.language_model, old, owned
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+
+class _MammothModa2T2ITokenConstraints:
+    """Refresh t2i AR-grid constraints on every runner step, including graph replay.
+
+    CUDA-graph FULL replay skips Python ``forward``, which previously cached
+    ``runtime_additional_information``. ``compute_logits`` still runs in Python,
+    so the runner calls ``update_decode_step_metadata`` before each step with
+    the current ``generated_len``. Without that refresh, column_id stays frozen
+    (or the cache stays None after dummy capture) and greedy decode can emit
+    EOS before the visual grid is complete (#7318).
+
+    Any model that stashes per-step metadata in Python ``forward`` and reads it
+    from ``compute_logits`` must set ``supports_omni_decode_step_metadata`` so
+    the runner refreshes that cache outside capture; otherwise FULL replay
+    reintroduces the same stale-cache bug.
+
+    Only the v1 runner (``vllm_omni/worker/gpu_model_runner.py``) calls this
+    hook. A runner that does not call it leaves the cache at whatever Python
+    ``forward`` last wrote, which is the pre-fix behavior.
+    """
+
+    supports_omni_decode_step_metadata = True
+
+    def _cache_runtime_additional_information(self, runtime_infos: Any) -> None:
+        self._last_runtime_additional_information = runtime_infos if isinstance(runtime_infos, list) else None
+
+    def update_decode_step_metadata(self, **kwargs: Any) -> None:
+        # The runner emits both keys today with the same payload
+        # (gpu_model_runner._build_model_kwargs_extra); only the canonical one
+        # is read here so the contract stays single-sourced.
+        if "runtime_additional_information" in kwargs:
+            self._cache_runtime_additional_information(kwargs["runtime_additional_information"])
+
+    def _apply_t2i_token_constraints(self, logits: torch.Tensor) -> torch.Tensor:
+        """Applies per-request token constraints.
+
+        - For T2I requests: constrain AR grid tokens (force EOL at row end and
+          restrict intra-row sampling to visual token range).
+        - For non-T2I (text/understanding/chat) requests: disallow sampling
+          from the extra generation vocabulary (image tokens) to prevent
+          accidentally emitting visual-token sequences.
+        """
+        if logits is None or not isinstance(logits, torch.Tensor):
+            return logits
+
+        runtime_infos = self._last_runtime_additional_information
+
+        if not runtime_infos:
+            # Dummy/profile runs and CUDA-graph capture have no per-request info.
+            return logits
+
+        neg_inf = -float("inf")
+        num_reqs = int(logits.shape[0])
+        for i in range(num_reqs):
+            if i >= len(runtime_infos):
+                continue
+            runtime_info = runtime_infos[i] if isinstance(runtime_infos[i], dict) else {}
+            meta = _runtime_meta(runtime_info)
+            omni_task = meta.get("omni_task")
+            if not isinstance(omni_task, list) or not omni_task or omni_task[0] != "t2i":
+                # Text/understanding/chat: forbid sampling from the extra gen vocab.
+                logits[i, self.language_model.base_vocab_size :] = neg_inf
+                continue
+
+            ar_width = _first_int(meta["ar_width"])
+            eol_token_id = _first_int(meta["eol_token_id"])
+            visual_start = _first_int(meta["visual_token_start_id"])
+            visual_end = _first_int(meta["visual_token_end_id"])
+            if "generated_len" not in runtime_info:
+                # Missing length is not column 0. Leave this row unconstrained
+                # rather than applying the wrong visual/EOL mask. Live decode
+                # always stamps it, so reaching this branch means the refresh
+                # regressed; warn once so it is visible at the default log level.
+                logger.warning_once(
+                    "MammothModa2 t2i row has no generated_len; leaving it "
+                    "unconstrained. Check the update_decode_step_metadata refresh."
+                )
+                continue
+            generated_len = int(runtime_info["generated_len"])
+
+            row = logits[i]
+            column_id = generated_len % (ar_width + 1)
+            if column_id == ar_width:
+                # End-of-row token: only allow eol.
+                eol_logit = row[eol_token_id].clone()
+                row.fill_(neg_inf)
+                row[eol_token_id] = eol_logit
+            else:
+                # Intra-row tokens: only allow visual tokens (explicitly forbid eol).
+                row[:visual_start] = neg_inf
+                row[visual_end + 1 :] = neg_inf
+                row[eol_token_id] = neg_inf
+
+        return logits
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     MammothModa2ARMultiModalProcessor,
     info=MammothModa2ARProcessingInfo,
     dummy_inputs=MammothModa2ARDummyInputsBuilder,
 )
-class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
+class MammothModa2ARForConditionalGeneration(_MammothModa2T2ITokenConstraints, Qwen2_5_VLForConditionalGeneration):
     """Replaces the language backbone with MoE within the Qwen2_5_VLForConditionalGeneration multi-modal framework."""
 
     have_multimodal_outputs = True
@@ -565,6 +796,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         ar_vllm_config = vllm_config.with_hf_config(ar_hf_config, architectures=vllm_config.model_config.architectures)
         # Initialize multi-modal components like the vision tower first.
         super().__init__(vllm_config=ar_vllm_config, prefix=prefix)
+        _drop_parent_language_model(self, prefix)
         # Replace with the custom MoE language model.
         lm_hf_config = getattr(
             ar_vllm_config.model_config.hf_config, "text_config", ar_vllm_config.model_config.hf_config
@@ -578,59 +810,9 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
         # -------- t2i (AR grid) token constraints --------
-        # Constraint logic depends on per-step sampling_metadata + runtime_additional_information.
-        # These are passed by the vllm-omni runner via kwargs, so caching them in the model is sufficient.
+        # Refreshed by update_decode_step_metadata on every runner step so CUDA
+        # graph FULL replay (which skips Python forward) still sees generated_len.
         self._last_runtime_additional_information: list[dict[str, Any]] | None = None
-
-    def _apply_t2i_token_constraints(self, logits: torch.Tensor) -> torch.Tensor:
-        """Applies per-request token constraints.
-
-        - For T2I requests: constrain AR grid tokens (force EOL at row end and
-          restrict intra-row sampling to visual token range).
-        - For non-T2I (text/understanding/chat) requests: disallow sampling
-          from the extra generation vocabulary (image tokens) to prevent
-          accidentally emitting visual-token sequences.
-        """
-        if logits is None or not isinstance(logits, torch.Tensor):
-            return logits
-
-        runtime_infos = self._last_runtime_additional_information
-
-        if runtime_infos is None:
-            # There is no runtime info in dummy/profile run
-            return logits
-
-        neg_inf = -float("inf")
-        num_reqs = int(logits.shape[0])
-        for i in range(num_reqs):
-            runtime_info = runtime_infos[i] if isinstance(runtime_infos[i], dict) else {}
-            meta = runtime_info.get("meta", {})
-            omni_task = meta.get("omni_task")
-            if not isinstance(omni_task, list) or not omni_task or omni_task[0] != "t2i":
-                # Text/understanding/chat: forbid sampling from the extra gen vocab.
-                logits[i, self.language_model.base_vocab_size :] = neg_inf
-                continue
-
-            ar_width = meta["ar_width"][0]
-            eol_token_id = meta["eol_token_id"][0]
-            visual_start = meta["visual_token_start_id"][0]
-            visual_end = meta["visual_token_end_id"][0]
-            generated_len = runtime_info["generated_len"]
-
-            row = logits[i]
-            column_id = generated_len % (ar_width + 1)
-            if column_id == ar_width:
-                # End-of-row token: only allow eol.
-                eol_logit = row[eol_token_id].clone()
-                row.fill_(neg_inf)
-                row[eol_token_id] = eol_logit
-            else:
-                # Intra-row tokens: only allow visual tokens (explicitly forbid eol).
-                row[:visual_start] = neg_inf
-                row[visual_end + 1 :] = neg_inf
-                row[eol_token_id] = neg_inf
-
-        return logits
 
     def forward(
         self,
@@ -640,11 +822,11 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ):
-        # vllm-omni runner passes sampling_metadata and runtime_additional_information
-        # in each forward step. compute_logits is called immediately after
-        # forward, so caching here enables step-by-step dynamic token constraints.
-        runtime_infos = kwargs.get("runtime_additional_information")
-        self._last_runtime_additional_information = runtime_infos if isinstance(runtime_infos, list) else None
+        # Eager path: cache from forward kwargs when present. CUDA-graph FULL
+        # replay skips this method; do not clear a cache the runner just
+        # refreshed via update_decode_step_metadata.
+        if "runtime_additional_information" in kwargs:
+            self._cache_runtime_additional_information(kwargs["runtime_additional_information"])
         hidden_states = super().forward(
             input_ids=input_ids,
             positions=positions,
@@ -673,13 +855,91 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
             intermediate_tensors=out_intermediate_tensors,
         )
 
-    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput):
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, *args, **kwargs):
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
+        self.update_decode_step_metadata(**kwargs)
         logits = super().compute_logits(hidden_states)
         if isinstance(logits, torch.Tensor):
             logits = self._apply_t2i_token_constraints(logits)
         return logits
+
+
+class MammothModa2Qwen3ProcessingInfo(Qwen3VLProcessingInfo):
+    """Qwen3-VL processing using MammothModa2's nested AR configuration."""
+
+    def get_hf_config(self):
+        mammoth_cfg: Mammothmoda2Config = self.ctx.get_hf_config(Mammothmoda2Config)
+        return mammoth_cfg.llm_config
+
+    def get_hf_processor(self, **kwargs: object) -> Qwen3VLProcessor:
+        # The MammothModa2 repository does not ship tokenizer_config.json, so
+        # AutoProcessor otherwise resolves only the image processor and leaves
+        # Qwen3-VL's image placeholder undefined.
+        return self.ctx.get_hf_processor(
+            Qwen3VLProcessor,
+            use_fast=kwargs.pop("use_fast", True),
+            **kwargs,
+        )
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"image": None}
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    Qwen3VLMultiModalProcessor,
+    info=MammothModa2Qwen3ProcessingInfo,
+    dummy_inputs=Qwen3VLDummyInputsBuilder,
+)
+class MammothModa2Qwen3ARForConditionalGeneration(_MammothModa2T2ITokenConstraints, Qwen3VLForConditionalGeneration):
+    """MammothModa2-Dev Qwen3-VL stage for understanding and generation."""
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "llm_model.model.visual.": "visual.",
+            "llm_model.lm_head.": "language_model.lm_head.",
+            "llm_model.model.language_model.gen_embed_tokens.": "language_model.gen_embed_tokens.",
+            "llm_model.model.language_model.": "language_model.",
+            "llm_model.gen_head.": "language_model.gen_head.",
+            "gen_image_condition_refiner.": None,
+            "gen_transformer.": None,
+            "gen_vae.": None,
+            "gen_tokenizer.": None,
+        }
+    )
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        mammoth_cfg = vllm_config.model_config.hf_config
+        ar_hf_config = getattr(mammoth_cfg, "llm_config", mammoth_cfg)
+        ar_vllm_config = vllm_config.with_hf_config(
+            ar_hf_config,
+            architectures=vllm_config.model_config.architectures,
+        )
+        super().__init__(vllm_config=ar_vllm_config, prefix=prefix)
+        _drop_parent_language_model(self, prefix)
+        text_config = ar_hf_config.text_config
+        self.language_model = MammothModa2Qwen3ForCausalLM(
+            vllm_config=ar_vllm_config.with_hf_config(text_config),
+            prefix=maybe_prefix(prefix, "language_model"),
+        )
+        self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+        self._last_runtime_additional_information: list[dict[str, Any]] | None = None
+
+    def forward(self, *args, **kwargs):
+        if "runtime_additional_information" in kwargs:
+            self._cache_runtime_additional_information(kwargs["runtime_additional_information"])
+        return super().forward(*args, **kwargs)
+
+    def compute_logits(self, hidden_states: torch.Tensor, *args, **kwargs):
+        self.update_decode_step_metadata(**kwargs)
+        logits = super().compute_logits(hidden_states)
+        if isinstance(logits, torch.Tensor):
+            return self._apply_t2i_token_constraints(logits)
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -716,9 +976,16 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "ar"),
                 hf_config=cfg.llm_config if hasattr(cfg, "llm_config") else cfg.text_config,
-                architectures=["MammothModa2ARForConditionalGeneration"],
+                architectures=[
+                    "MammothModa2Qwen3ARForConditionalGeneration"
+                    if getattr(cfg.llm_config, "model_type", "") == "mammothmoda2_qwen3_vl"
+                    else "MammothModa2ARForConditionalGeneration"
+                ],
             )
             self.model = self.ar
+            # Runner reads this on the top-level module to opt into the
+            # per-step metadata refresh. See AR subclasses.
+            self.supports_omni_decode_step_metadata = True
         elif self.model_stage == "dit":
             self.dit = init_vllm_registered_model(
                 vllm_config=vllm_config,
@@ -749,6 +1016,26 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         if hasattr(self.model, "get_language_model"):
             return self.model.get_language_model()
         return self.model
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings=None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if isinstance(self.model, MammothModa2Qwen3ARForConditionalGeneration):
+            return self.model.embed_input_ids(
+                input_ids,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
+        return SupportsMultiModal.embed_input_ids(
+            self,
+            input_ids,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
 
     def get_multimodal_embeddings(self, **kwargs: object):
         # Backward compatibility: route through embed_multimodal.
@@ -789,11 +1076,17 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             out = out[0]
         return OmniOutput(text_hidden_states=out, multimodal_outputs={}, intermediate_tensors=None)
 
+    def update_decode_step_metadata(self, **kwargs: Any) -> None:
+        inner = getattr(self, "model", None)
+        update = getattr(inner, "update_decode_step_metadata", None)
+        if callable(update):
+            update(**kwargs)
+
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, *args, **kwargs):
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         if hasattr(self.model, "compute_logits"):
-            return self.model.compute_logits(hidden_states)
+            return self.model.compute_logits(hidden_states, *args, **kwargs)
         return None
 
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Step-Audio2 serving adapter."""
 
 from typing import TYPE_CHECKING
@@ -23,11 +24,24 @@ class StepAudio2Adapter(ARTTSAdapter):
     name = "step_audio2"
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
-        # Dispatcher routes to the step_audio2 case (non-empty input check).
-        return self.ctx.server._validate_tts_request(request)
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        return None
 
     async def build(
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
-        prompt = self.ctx.server._build_step_audio2_prompt(request)
+        """Build a chat prompt ending at ``<tts_start>``.
+
+        The assistant turn deliberately omits ``<|im_end|>`` so the thinker
+        continues by generating audio tokens.
+        """
+        system_prompt = request.instructions or "You are a voice assistant. Read the text aloud."
+        prompt = {
+            "prompt": (
+                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                f"<|im_start|>user\n{request.input}<|im_end|>\n"
+                "<|im_start|>assistant\n<tts_start>"
+            )
+        }
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="step_audio2")

@@ -1,22 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 
 from vllm_omni.metrics import OrchestratorAggregator
 
 
 class ClientRequestState:
-    """Tracks the state of an individual request in the orchestrator."""
+    """Tracks one entrypoint request and its output queue."""
 
     def __init__(
         self,
         request_id: str,
         external_request_id: str | None = None,
         queue: asyncio.Queue | None = None,
+        final_stage_id: int | None = None,
     ):
         self.request_id = request_id
         self.external_request_id = external_request_id
         self.stage_id: int | None = None
+        self.final_stage_id: int | None = final_stage_id
         self.queue = queue if queue is not None else asyncio.Queue()
         self.metrics: OrchestratorAggregator | None = None
+        self.input_stream_task: asyncio.Task | None = None
+        # Request-scoped idempotency guard for Prometheus failure counters.
+        self.failure_recorded = False
         # Wall-clock time at which the user's request arrived in the engine
         # entrypoint. Set in async_omni.generate() before the orchestrator
         # accepts the request. Used as the t0 anchor for audio_ttfp.
@@ -37,3 +45,9 @@ class ClientRequestState:
         # without re-querying stage_pools.
         self.audio_emit_stage_id: int | None = None
         self.audio_emit_replica_id: int | None = None
+        # De-dup set for metric messages: OmniBase populates this in
+        # ``_handle_output_message`` / ``_process_single_result`` so the same
+        # ``id(msg)`` isn't counted twice into per-request metrics. Kept on
+        # the request state (not a class-level dict) so it is released with
+        # the state — see #6462 / #6561.
+        self.consumed_metric_message_ids: set[int] = set()

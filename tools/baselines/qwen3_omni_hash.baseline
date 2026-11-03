@@ -1,0 +1,48 @@
+{
+  "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+  "commit": "24eb4ab89cc2ad3f8cdd83f57b66ce7786a0d65c",
+  "env": {
+    "driver": "570.133.20",
+    "cuda": "13.0",
+    "torch": "2.11.0+cu130",
+    "gpu": "NVIDIA L20X"
+  },
+  "results": [
+    {
+      "prompt_id": 0,
+      "async_mode": false,
+      "text_sha": "e4bf6ed906c0dada879874a9cc09f9ba3a4399149262a831a01fd53e6a8fd043",
+      "wav_sha": "20a203a149005f948afd485bbea780fa06c109f3689ebb6b3110f51b3237bd35"
+    },
+    {
+      "prompt_id": 1,
+      "async_mode": false,
+      "text_sha": "2e8a6b141a9747bd68aadc2931f278b89712ad7ad7ae12b25b39e193b241bf68",
+      "wav_sha": "1839a759bb5d8671b6352b2e3110dab5edfa718e38ff073d379176201f1eac8c"
+    },
+    {
+      "prompt_id": 2,
+      "async_mode": false,
+      "text_sha": "e0aa5a513a5162024f35afee3830aeb67f2e378381726adb9d3a66b984aa652d",
+      "wav_sha": "74338df3e8357bc9d0c05bf141b63c45251b12807de34495097edb07fc7b19f8"
+    },
+    {
+      "prompt_id": 0,
+      "async_mode": true,
+      "text_sha": "e4bf6ed906c0dada879874a9cc09f9ba3a4399149262a831a01fd53e6a8fd043",
+      "wav_sha": "e09f862f54b553cc7c64e1631b821a768167768812b3f2cd3d0c69d0da991ee7"
+    },
+    {
+      "prompt_id": 1,
+      "async_mode": true,
+      "text_sha": "2e8a6b141a9747bd68aadc2931f278b89712ad7ad7ae12b25b39e193b241bf68",
+      "wav_sha": "9115d481f62a4b771c4c3d8b89d5c5a01149f002096289ab1da3f034fa388a2b"
+    },
+    {
+      "prompt_id": 2,
+      "async_mode": true,
+      "text_sha": "e0aa5a513a5162024f35afee3830aeb67f2e378381726adb9d3a66b984aa652d",
+      "wav_sha": "6a5985c9d4ca1596518c291228cd29239e76fcaf310c1cdb5921276b7efce801"
+    }
+  ]
+}

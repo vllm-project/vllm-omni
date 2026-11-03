@@ -24,10 +24,19 @@ from safetensors.torch import save_file
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer, OmniServerParams
+from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
+
+# ROCm's default FLASH_ATTN diffusion backend resolves to AITER. On a cold CI
+# worker, JIT-building its MHA kernel can take longer than the server readiness
+# timeout. This test validates LoRA switching rather than attention-backend or
+# compiled-execution performance, so use the eager SDPA path on ROCm only.
+ROCM_SERVER_ARGS = (
+    ["--enforce-eager", "--diffusion-attention-backend", "TORCH_SDPA"] if current_omni_platform.is_rocm() else []
+)
 
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
@@ -42,7 +51,14 @@ server_params = [
             server_args=[
                 "--num-gpus",
                 "1",
+                *ROCM_SERVER_ARGS,
             ],
+            # A cold-cache Z-Image load can take slightly more than the
+            # orchestrator's 900s default on CI (weights alone have been
+            # observed at ~690s and full orchestrator readiness at ~906s).
+            # Match the large-model offline runner's startup allowance without
+            # weakening timeout detection for every online-serving test.
+            init_timeout=1800,
         ),
         id="zimage_turbo_lora",
     ),

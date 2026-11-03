@@ -1,0 +1,19 @@
+# Composable-parallel strategy for Qwen2.5-Omni: tensor-parallel the thinker.
+#
+# Shard the thinker stage across 2 GPUs with tensor parallelism (TP=2). TP routing
+# is fixed (broadcast), so no `routing` / load-balancer policy is involved -- this
+# is the simplest axis and a good starting point for the mental model.
+#
+# The strategy sets tensor_parallel_size=2 on the thinker. Rather than hand-write a
+# bespoke deploy YAML, run on the bundled default deploy config and pass a matching
+# 2-GPU device layout via --stage-overrides (explicit kwargs), so the thinker gets a
+# two-GPU pool while talker + code2wav share a third card. Requires >= 3 GPUs.
+#
+# Usage:
+#   python3 end2end.py --query-type text --num-prompts 6 \
+#       --strategy-config strategy_tp2.yaml \
+#       --stage-overrides '{"0": {"devices": "0,1"}, "1": {"devices": "2"}, "2": {"devices": "2"}}'
+strategies:
+  thinker:
+    - axis: tp
+      size: 2

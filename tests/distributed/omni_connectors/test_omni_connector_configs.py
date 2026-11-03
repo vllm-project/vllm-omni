@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 # Use the new import path for initialization utilities
+from vllm_omni.distributed.omni_connectors.utils.config import (
+    stage_receives_chunks,
+    stage_sends_async_output,
+)
 from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -38,6 +43,26 @@ def get_config_files():
 config_files = get_config_files()
 
 
+@pytest.mark.parametrize(
+    ("role", "stage_id", "receives", "sends"),
+    [
+        ("sender", 0, False, True),
+        ("receiver", 1, True, False),
+        (None, 0, True, False),
+        (None, None, True, True),
+    ],
+)
+def test_stage_chunk_direction_helpers(role, stage_id, receives, sends):
+    extra = {} if role is None else {"role": role}
+    model_config = SimpleNamespace(
+        stage_id=stage_id,
+        stage_connector_config={"extra": extra},
+    )
+
+    assert stage_receives_chunks(model_config) is receives
+    assert stage_sends_async_output(model_config) is sends
+
+
 @pytest.mark.skipif(len(config_files) == 0, reason="No config files found or directory missing")
 @pytest.mark.parametrize("yaml_file", config_files, ids=lambda p: p.name)
 def test_load_qwen_yaml_configs(yaml_file):
@@ -48,7 +73,6 @@ def test_load_qwen_yaml_configs(yaml_file):
     print(f"Testing config load: {yaml_file.name}")
     try:
         # Attempt to load the config
-        # default_shm_threshold doesn't matter much for loading correctness, using default
         config = load_omni_transfer_config(yaml_file)
 
         assert config is not None, "Config should not be None"

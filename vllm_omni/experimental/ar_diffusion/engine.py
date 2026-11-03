@@ -20,8 +20,7 @@ class ARDiffusionEngine(DiffusionEngine):
     (world models, AR-DiT) that materialize persistent attention KV. It reuses
     vLLM's paged KV stack (``KVCacheManager`` / ``BlockPool`` / ``BlockTables``)
     as a library, driven from the engine rather than hand-rolled inside each
-    model. See ``BDE_doc/diffusion_kv_cache_management.md`` for the design and
-    ``BDE_doc/dreamzero_kv_phase1_plan.md`` for the rollout.
+    model.
 
     It is selected per model via ``OmniDiffusionConfig.engine_backend = "ar_diffusion"``
     (resolved by :meth:`DiffusionEngine.make_engine`), so models that do not opt
@@ -32,7 +31,7 @@ class ARDiffusionEngine(DiffusionEngine):
     actual KV *body* is :class:`~vllm_omni.experimental.ar_diffusion.kv_cache.manager.ARDiffusionKVCache`, owned
     by :class:`~vllm_omni.experimental.ar_diffusion.runner.ARDiffusionModelRunner`. ``ARDiffusionEngine`` itself is the
     thin selection / injection seam; it wires the AR-Diffusion executor → worker → runner
-    so DreamZero's rollout runs against the runner-owned KV cache.
+    so capable pipelines run against runner-owned KV session state.
     """
 
     #: Workers of this engine build the AR-Diffusion runner (unless the config

@@ -3,14 +3,17 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.indextts2 import (
     _strip_stop_token,
-    talker2s2mel,
     talker2s2mel_full_payload,
     talker2s2mel_token_only,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 STOP_MEL_TOKEN = 8193
 LATENT_DIM = 16
@@ -108,123 +111,12 @@ def test_strip_stop_token_all_stop():
     assert lat.shape[1] == 0
 
 
-# ── talker2s2mel ──
-
-
-def test_talker2s2mel_basic():
-    mel_codes = torch.tensor([10, 20, 30, STOP_MEL_TOKEN])
-    latent = torch.randn(4, LATENT_DIM)
-    s_ref = torch.randn(1, 128)
-    ref_mel = torch.randn(1, 80, 200)
-    style = torch.randn(1, 256)
-
-    outputs = talker2s2mel(
-        source_outputs=[
-            _make_talker_output(
-                mel_codes=mel_codes,
-                latent=latent,
-                s_ref=s_ref,
-                ref_mel=ref_mel,
-                style=style,
-            )
-        ]
-    )
-
-    assert len(outputs) == 1
-    info = outputs[0]["additional_information"]
-    assert info["mel_codes"].shape == (1, 3)
-    assert info["latent"].shape == (1, 3, LATENT_DIM)
-    assert info["code_lens"].tolist() == [3]
-    assert "S_ref" in info
-    assert "ref_mel" in info
-    assert "style" in info
-    assert outputs[0]["prompt_token_ids"] == [0]
-
-
-def test_talker2s2mel_skips_unfinished():
-    mel_codes = torch.tensor([10, 20])
-    latent = torch.randn(2, LATENT_DIM)
-
-    outputs = talker2s2mel(source_outputs=[_make_talker_output(mel_codes=mel_codes, latent=latent, finished=False)])
-
-    assert len(outputs) == 0
-
-
-def test_talker2s2mel_skips_empty_mel():
-    outputs = talker2s2mel(
-        source_outputs=[
-            _make_talker_output(
-                mel_codes=torch.tensor([]),
-                latent=torch.randn(0, LATENT_DIM),
-            )
-        ]
-    )
-
-    assert len(outputs) == 0
-
-
-def test_talker2s2mel_missing_optional_meta():
-    mel_codes = torch.tensor([10, 20])
-    latent = torch.randn(2, LATENT_DIM)
-
-    outputs = talker2s2mel(source_outputs=[_make_talker_output(mel_codes=mel_codes, latent=latent)])
-
-    assert len(outputs) == 1
-    info = outputs[0]["additional_information"]
-    assert "S_ref" not in info
-    assert "ref_mel" not in info
-    assert "style" not in info
-
-
-def test_talker2s2mel_batch():
-    out0 = _make_talker_output(
-        mel_codes=torch.tensor([1, 2, STOP_MEL_TOKEN]),
-        latent=torch.randn(3, LATENT_DIM),
-        s_ref=torch.randn(1, 64),
-    )
-    out1 = _make_talker_output(
-        mel_codes=torch.tensor([5, 6, 7, 8]),
-        latent=torch.randn(4, LATENT_DIM),
-        ref_mel=torch.randn(1, 80, 100),
-    )
-
-    outputs = talker2s2mel(source_outputs=[out0, out1])
-
-    assert len(outputs) == 2
-    assert outputs[0]["additional_information"]["code_lens"].tolist() == [2]
-    assert outputs[1]["additional_information"]["code_lens"].tolist() == [4]
-
-
-def test_talker2s2mel_tensors_on_cpu():
-    device = torch.device("cpu")
-    mel_codes = torch.tensor([10, 20], device=device)
-    latent = torch.randn(2, LATENT_DIM, device=device)
-    s_ref = torch.randn(1, 64, device=device)
-
-    outputs = talker2s2mel(source_outputs=[_make_talker_output(mel_codes=mel_codes, latent=latent, s_ref=s_ref)])
-
-    info = outputs[0]["additional_information"]
-    assert info["latent"].device.type == "cpu"
-    assert info["mel_codes"].device.type == "cpu"
-    assert info["S_ref"].device.type == "cpu"
-
-
-def test_talker2s2mel_no_multimodal_dict():
-    output = SimpleNamespace(
-        finished=True,
-        outputs=[SimpleNamespace(multimodal_output="not_a_dict")],
-    )
-
-    results = talker2s2mel(source_outputs=[output])
-
-    assert len(results) == 0
-
-
 # ── full-payload connector path ──
 
 
 def _conditioning_tensors():
     return {
+        "use_gpt_latent": True,
         "S_ref": torch.randn(1, 3, LATENT_DIM),
         "ref_mel": torch.randn(1, 80, 5),
         "style": torch.randn(1, 4),
@@ -252,6 +144,8 @@ def test_talker2s2mel_full_payload_flat_keys_builds_s2mel_contract():
         "meta.S_ref": cond["S_ref"],
         "meta.ref_mel": cond["ref_mel"],
         "meta.style": cond["style"],
+        "meta.use_gpt_latent": True,
+        "meta.duration_factor": 0.5,
     }
 
     result = talker2s2mel_full_payload(None, payload, SimpleNamespace(request_id="r-flat"))
@@ -265,6 +159,45 @@ def test_talker2s2mel_full_payload_flat_keys_builds_s2mel_contract():
     assert result["ref_mel"].device.type == "cpu"
     assert result["style"].device.type == "cpu"
     assert result["S_ref"].data_ptr() != cond["S_ref"].data_ptr()
+    assert result["duration_factor"] == 0.5
+
+
+def test_talker2s2mel_full_payload_defaults_missing_duration_factor_to_one():
+    cond = _conditioning_tensors()
+    payload = {
+        "codes.mel": torch.tensor([[10], [20]]),
+        "hidden_states.latent": torch.randn(2, LATENT_DIM),
+        "meta.S_ref": cond["S_ref"],
+        "meta.ref_mel": cond["ref_mel"],
+        "meta.style": cond["style"],
+        "meta.use_gpt_latent": True,
+    }
+
+    result = talker2s2mel_full_payload(None, payload, SimpleNamespace(request_id="r-default-duration"))
+
+    assert result is not None
+    assert result["duration_factor"] == 1.0
+
+
+def test_talker2s2mel_full_payload_preserves_explicit_request_seed():
+    cond = _conditioning_tensors()
+    payload = {
+        "codes.mel": torch.tensor([[10], [20]]),
+        "hidden_states.latent": torch.randn(2, LATENT_DIM),
+        "meta.S_ref": cond["S_ref"],
+        "meta.ref_mel": cond["ref_mel"],
+        "meta.style": cond["style"],
+        "meta.use_gpt_latent": True,
+    }
+    request = SimpleNamespace(
+        request_id="r-seeded",
+        sampling_params=SimpleNamespace(seed=0),
+    )
+
+    result = talker2s2mel_full_payload(None, payload, request)
+
+    assert result is not None
+    assert result["seed"] == 0
 
 
 def test_talker2s2mel_full_payload_nested_fallback_input():
@@ -315,7 +248,7 @@ def test_talker2s2mel_full_payload_trims_stop_token_and_matching_latent():
     assert result["code_lens"].tolist() == [2]
 
 
-def test_talker2s2mel_full_payload_crops_mel_latent_to_common_length():
+def test_talker2s2mel_full_payload_rejects_mel_latent_length_mismatch():
     cond = _conditioning_tensors()
     payload = {
         "codes.mel": torch.tensor([[1], [2], [3], [4]]),
@@ -323,14 +256,44 @@ def test_talker2s2mel_full_payload_crops_mel_latent_to_common_length():
         "meta": cond,
     }
 
-    result = talker2s2mel_full_payload(None, payload, SimpleNamespace(request_id="r-crop"))
+    with pytest.raises(ValueError, match="mel/latent length mismatch"):
+        talker2s2mel_full_payload(None, payload, SimpleNamespace(request_id="r-crop"))
+
+
+def test_talker2s2mel_full_payload_v25_code_only_does_not_invent_latent():
+    cond = _conditioning_tensors()
+    payload = {
+        "meta.use_gpt_latent": False,
+        "meta.S_ref": cond["S_ref"],
+        "meta.ref_mel": cond["ref_mel"],
+        "meta.style": cond["style"],
+    }
+
+    request = SimpleNamespace(
+        request_id="r-v25",
+        output_token_ids=[3, 4, STOP_MEL_TOKEN],
+    )
+    result = talker2s2mel_full_payload(None, payload, request)
 
     assert result is not None
-    assert result["mel_codes"].tolist() == [[1, 2]]
-    assert result["latent"].shape == (1, 2, LATENT_DIM)
+    assert result["mel_codes"].tolist() == [[3, 4]]
     assert result["code_lens"].tolist() == [2]
+    assert result["use_gpt_latent"] is False
+    assert "latent" not in result
 
 
-def test_talker2s2mel_full_payload_missing_required_fields_returns_none():
-    assert talker2s2mel_full_payload(None, {"hidden_states.latent": torch.randn(1, LATENT_DIM)}, None) is None
-    assert talker2s2mel_full_payload(None, {"codes.mel": torch.tensor([[1]])}, None) is None
+def test_talker2s2mel_full_payload_latent_mode_rejects_missing_latent():
+    payload = {
+        "codes.mel": torch.tensor([[3], [4], [STOP_MEL_TOKEN]]),
+        "meta.use_gpt_latent": True,
+    }
+
+    with pytest.raises(ValueError, match="missing hidden_states.latent"):
+        talker2s2mel_full_payload(None, payload, SimpleNamespace(request_id="r-latent"))
+
+
+def test_talker2s2mel_full_payload_missing_required_fields_raises():
+    with pytest.raises(ValueError, match="missing meta.use_gpt_latent"):
+        talker2s2mel_full_payload(None, {"hidden_states.latent": torch.randn(1, LATENT_DIM)}, None)
+    with pytest.raises(ValueError, match="missing meta.use_gpt_latent"):
+        talker2s2mel_full_payload(None, {"codes.mel": torch.tensor([[1]])}, None)

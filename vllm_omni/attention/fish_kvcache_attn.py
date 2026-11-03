@@ -24,6 +24,14 @@ def _triton_backend() -> Any:
 
 
 def is_available() -> bool:
+    # The Fish kvcache fast path is CUDA-only: it depends on FlashAttention's
+    # use_cascade metadata (absent from Ascend's metadata) and a Triton CUDA
+    # kernel. On other platforms report unavailable so the native attention
+    # backend takes over instead of crashing on attn_metadata.use_cascade.
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
     return _triton_backend().is_available()
 
 
@@ -111,6 +119,8 @@ def can_use_fish_kvcache_attn(
 
 
 def _is_cuda_graph_capturing() -> bool:
+    if not torch.cuda.is_available():
+        return False
     return bool(torch.cuda.is_current_stream_capturing())
 
 

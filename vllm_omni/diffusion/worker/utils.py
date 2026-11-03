@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Per-request mutable state for step-wise diffusion execution."""
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -12,6 +13,11 @@ import torch
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
+    from vllm_omni.diffusion.interaction.types import (
+        InteractionBoundaryContext,
+        InteractionChunkMetadata,
+        InteractionSession,
+    )
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -33,7 +39,7 @@ def consume_pipeline_stage_durations(pipeline: Any) -> dict[str, float]:
 
 
 def merge_stage_durations(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     stage_durations: dict[str, float],
 ) -> None:
     if not stage_durations:
@@ -43,7 +49,7 @@ def merge_stage_durations(
 
 
 def attach_stage_durations(
-    state: DiffusionRequestState,
+    state: StepRequestState,
     output: DiffusionOutput,
 ) -> None:
     if state.stage_durations:
@@ -51,7 +57,7 @@ def attach_stage_durations(
 
 
 @dataclass
-class DiffusionRequestState:
+class StepRequestState:
     """Per-request mutable state across all pipeline stages.
 
     Owned by Runner and passed through all step-execution stages:
@@ -77,6 +83,10 @@ class DiffusionRequestState:
     sampling: OmniDiffusionSamplingParams
     prompt: OmniPromptType | None = None
     kv_sender_info: dict | None = None
+    # Opaque model-owned preprocessing result. Scheduler-owned Diffusion KV
+    # request state is removed before this Worker state is built.
+    prepared_layout: Any | None = None
+    external_req_id: str | None = None
 
     # ── Encoded prompts (set once by prepare_encode) ──
     prompt_embeds: torch.Tensor | None = None
@@ -96,6 +106,12 @@ class DiffusionRequestState:
     step_in_chunk: int = 0
     total_chunks: int = 1
     chunk_num_steps: int | None = None
+
+    # ── Optional interaction information in streaming output mode ──
+    interaction_sessions: dict[str, InteractionSession] = field(default_factory=dict)  # Modality -> transition progress
+    interaction_chunk_metadata: InteractionChunkMetadata | None = None  # Acknowledging completion of each interaction
+    pending_chunk_boundary: bool = False
+    interaction_boundary: InteractionBoundaryContext | None = None
 
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
@@ -163,17 +179,26 @@ class DiffusionRequestState:
             return self.denoise_completed
         return self.chunk_index >= self.total_chunks
 
-    @property
-    def new_request(self) -> bool:
-        # TODO: this is only an approximation for current stepwise mode.
-        # A real "new request" signal should eventually come from scheduler/runner state transitions.
-        return self.step_index == 0 or self.timesteps is None
-
 
 class BaseRunnerOutput(ABC):
     @abstractmethod
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         pass
+
+
+@dataclass(frozen=True)
+class StepWait:
+    """Suspend an admitted request until an interaction or a host deadline.
+
+    ``None`` waits indefinitely. The scheduler starts a finite timeout when
+    it receives this output; workers never make independent clock decisions.
+    """
+
+    timeout_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds is not None and (not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0):
+            raise ValueError("StepWait timeout_seconds must be finite and positive, or None")
 
 
 @dataclass
@@ -189,6 +214,10 @@ class RunnerOutput(BaseRunnerOutput):
     step_index: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
+    async_output_id: str | None = None
+    wait_for_interaction: StepWait | None = None
+    streaming_media_duration: float = 0.0
+    streaming_next_media_duration: float = 0.0
 
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         return self if self.request_id == request_id else None

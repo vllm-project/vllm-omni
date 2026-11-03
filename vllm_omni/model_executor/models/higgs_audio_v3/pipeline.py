@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """higgs-audio v3 pipeline: Talker (text -> 8-codebook codec) -> Code2Wav (codec -> 24 kHz PCM).
 
 Two delivery modes are wired here:
@@ -19,11 +19,15 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.outputs.output_modality import TensorAccumulationStrategy, register_key_accumulation_strategy
+
+register_key_accumulation_strategy("codes.audio", TensorAccumulationStrategy.CONCAT_DIM0)
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.higgs_audio_v3"
 
 HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
     model_type="higgs_multimodal_qwen3",
+    default_deploy_config_name="higgs_multimodal_qwen3.yaml",
     model_arch="HiggsAudioV3TalkerForConditionalGeneration",
     hf_architectures=("HiggsMultimodalQwen3ForConditionalGeneration",),
     stages=(
@@ -33,6 +37,8 @@ HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
+            supports_native_mrv2_data_plane=True,
+            custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             engine_output_type="latent",
             # stop_token_ids: the model-owned sampler forces eos at ramp-down
             # completion. Safety stops from the actual V3 checkpoint:
@@ -53,7 +59,9 @@ HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="HiggsAudioV3Code2WavForConditionalGeneration",
-            sync_process_input_func=f"{_PROC}.talker2code2wav",
+            sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
+            supports_native_mrv2_data_plane=True,
+            requires_full_payload_input=True,
             sampling_constraints={"detokenize": True},
         ),
     ),
