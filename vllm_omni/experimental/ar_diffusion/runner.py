@@ -359,6 +359,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     capability.close_ar_diffusion_session(session_id)
             except Exception as exc:  # noqa: BLE001 - preserve all lifecycle cleanup attempts
                 errors.append(exc)
+        # Noisy KV sessions share the same outer session_id; reset/close must drop them too.
+        try:
+            self.release_noisy_kv(session_id)
+        except Exception as exc:  # noqa: BLE001 - preserve all lifecycle cleanup attempts
+            errors.append(exc)
         logger.debug("AR-Diffusion released session=%s reason=%s", session_id, reason)
         if errors:
             if suppress_errors:

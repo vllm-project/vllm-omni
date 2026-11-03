@@ -37,6 +37,9 @@ from functools import lru_cache
 # (chunk, step, block) — schedule task and KV version.
 Cell = tuple[int, int, int]
 
+# Prior-history KV handoffs run in a prep phase before the request's first cell.
+PRIOR_HANDOFF_SLOT = -1
+
 
 class Ordering(str, Enum):
     SELF_FORCING = "self_forcing"
@@ -374,6 +377,26 @@ def _completions(slots: tuple[tuple[Cell | None, ...], ...]) -> dict[Cell, int]:
     return out
 
 
+def expected_prior_cells(schedule: CellSchedule) -> frozenset[Cell]:
+    """Logical prior clean cells implied by ``chunk_base`` / ``H`` / ordering.
+
+    This is independent of which ranks currently hold the versions. Callers that
+    need residency checks must verify owners separately and schedule handoffs.
+    """
+    if schedule.chunk_base <= 0:
+        return frozenset()
+    num_blocks = schedule.num_blocks
+    t_clean = schedule.num_denoise_steps
+    cells: set[Cell] = set()
+    h = schedule.kv_history_chunks
+    if h >= 1:
+        start = max(0, schedule.chunk_base - h)
+        cells |= {(chunk, t_clean, block) for chunk in range(start, schedule.chunk_base) for block in range(num_blocks)}
+    if schedule.ordering is Ordering.SAME_STEP:
+        cells |= {(0, t_clean, block) for block in range(num_blocks)}
+    return frozenset(cells)
+
+
 def _history_step(
     schedule: CellSchedule,
     task: Cell,
@@ -437,12 +460,18 @@ def _sources_and_transfers(
                 version = (prev, s_star, block)
                 owner = rank_of_block(s_star, block, schedule)
                 found.append(KVSource(version=version, owner=owner))
-                if owner != rank and version not in prior:
+                if owner != rank:
                     key = (version, rank)
                     if key not in seen:
                         seen.add(key)
-                        prod = completions[version]
-                        transfer_acc.setdefault(prod, []).append(KVTransfer(version=version, src=owner, dst=rank))
+                        if version in prior:
+                            # Prior lives on owner from an earlier request; prep-phase handoff.
+                            transfer_acc.setdefault(PRIOR_HANDOFF_SLOT, []).append(
+                                KVTransfer(version=version, src=owner, dst=rank)
+                            )
+                        else:
+                            prod = completions[version]
+                            transfer_acc.setdefault(prod, []).append(KVTransfer(version=version, src=owner, dst=rank))
             sources[(rank, task)] = tuple(found)
 
     transfers = {
@@ -501,12 +530,23 @@ def _last_use(
         for xfer in transfers.get(t, ()):
             last[xfer.src][xfer.version] = max(last[xfer.src].get(xfer.version, -1), t)
             last[xfer.dst][xfer.version] = max(last[xfer.dst].get(xfer.version, -1), t)
+    for xfer in transfers.get(PRIOR_HANDOFF_SLOT, ()):
+        last[xfer.src][xfer.version] = max(last[xfer.src].get(xfer.version, -1), PRIOR_HANDOFF_SLOT)
+        last[xfer.dst][xfer.version] = max(last[xfer.dst].get(xfer.version, -1), PRIOR_HANDOFF_SLOT)
     return last
 
 
 def _assert_invariants(plan: CellPlan, prior_history: frozenset[Cell] | None = None) -> None:
     schedule = plan.schedule
     prior = prior_history or frozenset()
+    posted_prior: set[tuple[Cell, int]] = set()
+    for xfer in plan.transfers(PRIOR_HANDOFF_SLOT):
+        if xfer.version not in prior:
+            raise AssertionError(f"I4 violated: non-prior transfer {xfer} at PRIOR_HANDOFF_SLOT")
+        key = (xfer.version, xfer.dst)
+        if key in posted_prior:
+            raise AssertionError(f"I4 violated: duplicate prior handoff {key}")
+        posted_prior.add(key)
     for t in range(plan.num_slots):
         for rank in range(plan.world):
             task = plan.task(t, rank)
@@ -525,6 +565,8 @@ def _assert_invariants(plan: CellPlan, prior_history: frozenset[Cell] | None = N
                     raise AssertionError(f"I10 violated: source block {src.version[2]} != task block {task[2]}")
         posted: set[tuple[Cell, int]] = set()
         for xfer in plan.transfers(t):
+            if xfer.version in prior:
+                raise AssertionError(f"I4 violated: prior handoff {xfer} must use PRIOR_HANDOFF_SLOT, got {t}")
             if plan.completion_tick(xfer.version) != t:
                 raise AssertionError(f"I4 violated: transfer {xfer} not at production tick")
             key = (xfer.version, xfer.dst)
@@ -597,6 +639,7 @@ def build_cell_plan(
                 continue
             for src in sources.get((rank, task), ()):
                 if src.owner == rank or src.version in prior:
+                    # Prior remotes are exchanged in the prep phase before the first cell.
                     continue
                 first_remote_consume[rank].setdefault(src.version, t)
     for rank, version_slots in first_remote_consume.items():

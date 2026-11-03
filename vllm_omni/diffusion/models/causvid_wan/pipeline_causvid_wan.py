@@ -51,12 +51,13 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Ordering,
     build_cell_plan,
     cfg_step_replicas,
+    expected_prior_cells,
+    rank_of_block,
 )
 from vllm_omni.experimental.ar_diffusion.flow_euler import FlowEuler
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     clean_history_cells,
-    prior_history_in_pool,
 )
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
@@ -319,7 +320,7 @@ class CausVidWanPipeline(nn.Module):
         length = int(mask.gt(0).sum().item())
         return torch.cat([hidden[:, :length], hidden.new_zeros(1, max_length - length, hidden.shape[2])], dim=1)
 
-    def _plan_for(self, req: OmniDiffusionRequest, *, chunk_base: int = 0, prior_history=None):
+    def _plan_for(self, req: OmniDiffusionRequest, *, chunk_base: int = 0):
         sp = req.sampling_params
         extra = dict(sp.extra_args or {}) if sp is not None else {}
         if "shift" not in extra:
@@ -396,7 +397,9 @@ class CausVidWanPipeline(nn.Module):
             blocks_per_rank=local_blocks if local_blocks > 0 else None,
             chunk_base=chunk_base,
         )
-        return build_cell_plan(schedule, prior_history=prior_history), extra, denoise
+        # Logical prior (not local residency) drives plan sources + cross-rank handoffs.
+        prior = expected_prior_cells(schedule)
+        return build_cell_plan(schedule, prior_history=prior), extra, denoise
 
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         assert self.vae is not None
@@ -499,6 +502,22 @@ class CausVidWanPipeline(nn.Module):
 
         return _wrapped
 
+    @staticmethod
+    def _noisy_request_lifecycle(
+        req: OmniDiffusionRequest,
+    ) -> tuple[str, bool, bool, bool]:
+        """Return ``(kv_id, persist, reset, close_session)`` — shared by batch and single paths."""
+        req_id = str(getattr(req, "request_id", None) or "")
+        sp = req.sampling_params
+        extra = dict(sp.extra_args or {}) if sp is not None else {}
+        raw_session = extra.get("session_id")
+        explicit_session = raw_session is not None and str(raw_session) != ""
+        reset = bool(extra.get("reset", False))
+        close_session = bool(extra.get("close_session", False))
+        persist = explicit_session and not close_session
+        kv_id = str(raw_session) if explicit_session else req_id
+        return kv_id, persist, reset, close_session
+
     def forward(self, req: OmniDiffusionRequest | DiffusionRequestBatch) -> list[DiffusionOutput]:
         ctx = self._chunk_ctx
         if ctx is None:
@@ -511,29 +530,35 @@ class CausVidWanPipeline(nn.Module):
         outputs: list[DiffusionOutput] = []
         for item in requests:
             req_id = str(getattr(item, "request_id", None) or "")
-            sp = item.sampling_params
-            extra_peek = dict(sp.extra_args or {}) if sp is not None else {}
-            raw_session = extra_peek.get("session_id")
-            persist = raw_session is not None and str(raw_session) != ""
-            # Pool key is the outer session id when present; otherwise the request id.
-            kv_id = str(raw_session) if persist else req_id
+            kv_id, persist, reset, close_session = self._noisy_request_lifecycle(item)
+            del close_session  # encoded in persist; kept for Runner parity
             if not kv_id:
                 raise ValueError("CausVidWan path requires a non-empty request_id or session_id")
+            if reset:
+                ctx.kv.release_session(kv_id)
+            sp = item.sampling_params
+            extra_peek = dict(sp.extra_args or {}) if sp is not None else {}
             chunk_base = int(extra_peek.get("chunk_base", 0) or 0)
             if chunk_base < 0:
                 raise ValueError(f"chunk_base must be non-negative, got {chunk_base}")
-            prior = frozenset()
-            if persist and chunk_base > 0:
-                prior = prior_history_in_pool(ctx.kv.cache, kv_id, chunk_base=chunk_base)
-                if not prior:
-                    raise ValueError(
-                        f"session continuation chunk_base={chunk_base} for {kv_id!r} has no prior "
-                        "history in the Noisy KV pool; restart with chunk_base=0 or fix retain/release"
-                    )
-            plan, extra, denoise = self._plan_for(item, chunk_base=chunk_base, prior_history=prior)
+            plan, extra, denoise = self._plan_for(item, chunk_base=chunk_base)
             schedule = plan.schedule
             if persist:
                 ctx.kv.cache.bind_session_structure(kv_id, schedule.structural_key())
+                # Fail-closed only for cells this rank owns; remotes arrive via prep handoff.
+                logical = expected_prior_cells(schedule)
+                missing_owned = [
+                    cell
+                    for cell in logical
+                    if rank_of_block(cell[1], cell[2], schedule) == pp_rank
+                    and not ctx.kv.cache.pool.has((kv_id, cell[0], cell[1], cell[2]))
+                ]
+                if missing_owned:
+                    raise ValueError(
+                        f"session continuation chunk_base={chunk_base} for {kv_id!r} missing owned "
+                        f"prior cells {sorted(missing_owned)!r} on rank {pp_rank}; "
+                        "restart with chunk_base=0 or fix retain/release"
+                    )
             if not req_id:
                 req_id = kv_id
             shape = tuple(int(x) for x in (extra.get("latent_shape") or _DEFAULT_LATENT_SHAPE))
@@ -550,9 +575,9 @@ class CausVidWanPipeline(nn.Module):
                     f"max_chunk_tokens={spec.max_chunk_tokens}"
                 )
             num_blocks = int(schedule.num_blocks)
-            retain = set(prior)
-            if persist:
-                retain |= clean_history_cells(schedule, num_blocks=num_blocks)
+            # Protect only the post-request keep set. Prior sources still needed mid-request
+            # are covered by plan last-use and are reclaimed after their last consume.
+            retain = clean_history_cells(schedule, num_blocks=num_blocks) if persist else set()
             ctx.enqueue(kv_id, plan, chunk_tokens=chunk_tokens, retain=retain)
 
             prompt = self._prompt_text(item.prompt)
@@ -607,6 +632,9 @@ class CausVidWanPipeline(nn.Module):
                 # Keep only the trailing clean window; outer session owns when to release.
                 kept = clean_history_cells(schedule, num_blocks=num_blocks)
                 ctx.kv.end_request(kv_id, retain=kept)
+            else:
+                # Ephemeral request_id or explicit close_session — same as Runner path.
+                ctx.kv.release_session(kv_id)
             if stream_job is not None:
                 video = stream_job.join()
                 if video is not None:

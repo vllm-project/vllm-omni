@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from vllm_omni.experimental.ar_diffusion.cell_schedule import (
+    PRIOR_HANDOFF_SLOT,
     Cell,
     CellPlan,
     CellSchedule,
@@ -818,6 +819,40 @@ class NoisyKVState:
         )
         self.bytes_sent = self.cache.transport.bytes_sent
         self.bytes_received = self.cache.transport.bytes_received
+        return handles
+
+    def exchange_and_await_prior_handoffs(self, global_slot: int) -> list[Any]:
+        """Exchange prior-history KV for requests whose first cell is ``global_slot``.
+
+        Must run before ``prepare`` of that first cell: the normal per-slot
+        ``exchange`` happens after forward, which is too late for continuation
+        history that is only resident on the owner rank.
+        """
+        transfers: list[RequestKVTransfer] = []
+        wanted: set[VersionKey] = set()
+        for item in self._inflight:
+            if global_slot != item.t0:
+                continue
+            for xfer in item.plan.transfers(PRIOR_HANDOFF_SLOT):
+                transfers.append(RequestKVTransfer(req=item.req, version=xfer.version, src=xfer.src, dst=xfer.dst))
+                if xfer.dst == self._rank:
+                    wanted.add(_version_key(item.req, xfer.version))
+        if not transfers:
+            return []
+        ordered = tuple(sorted(transfers, key=lambda x: (x.src, x.dst, x.req, x.version)))
+        handles = self.cache.transport.exchange(
+            ordered, rank=self._rank, pp_group=self._pp_group, chunk_tokens_by_request=self._chunk_tokens
+        )
+        self.bytes_sent = self.cache.transport.bytes_sent
+        self.bytes_received = self.cache.transport.bytes_received
+        for handle in handles:
+            if handle is not None:
+                handle.wait()
+        if self.uses_comm_stream:
+            self.cache.transport.wait_sends()
+        if wanted:
+            self.cache.transport.await_ready(frozenset(wanted))
+            self.bytes_received = self.cache.transport.bytes_received
         return handles
 
     def evict(self, slot: int) -> None:

@@ -397,6 +397,9 @@ def run_cell_pipeline(
         while (ctx.inflight or ctx.pending) and slot < limit:
             ctx.admit_pending(slot)
             kv.set_inflight(tuple(ctx.inflight))
+            # Prior-history handoffs for requests that start on this global slot must
+            # complete before their first prepare (exchange normally runs after forward).
+            kv.exchange_and_await_prior_handoffs(slot)
             tasks = rank_work(tuple(ctx.inflight), slot, spec.rank)
             _assert_i8(tasks)
             schedule = ctx.inflight[0].plan.schedule if ctx.inflight else None
