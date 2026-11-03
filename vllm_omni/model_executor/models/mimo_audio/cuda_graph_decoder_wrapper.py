@@ -177,6 +177,66 @@ class CUDAGraphMiMoDecoderWrapper:
             expected,
         )
 
+    def extend_capture_sizes(self, sizes: list[int]) -> None:
+        """Capture additional bucket sizes beyond those from warmup().
+
+        Used by the code2wav model to add chunk-derived decode lengths (from the
+        streaming chunk config) after the wrapper was created — e.g. the steady
+        state chunk payload of (chunk + left_context) groups exceeds the largest
+        default bucket (256), silently forcing eager fallbacks every chunk.
+
+        No-op when graphs are disabled or the wrapper was never warmed on CUDA.
+        Idempotent: sizes already captured are skipped.
+        """
+        if not self.enabled or self._device is None or self._device.type != "cuda":
+            return
+
+        new_sizes = sorted({int(s) for s in sizes if int(s) > 0} - set(self.capture_sizes))
+        if not new_sizes:
+            return
+
+        model_dtype = next(self.tokenizer.parameters()).dtype
+        for size in new_sizes:
+            voc_len = self._compute_vocoder_seq_len(size)
+            self.static_vocoder_masks[size] = TransformerVocos.build_vocoder_attn_mask(
+                voc_len,
+                voc_len,
+                tuple(self.tokenizer.config.vocoder_attn_window_size),
+                self._device,
+                model_dtype,
+            )
+            for n_rows in self._capture_code_rows:
+                dummy = torch.zeros(n_rows, size, dtype=torch.long, device=self._device)
+                with torch.no_grad():
+                    _ = self.tokenizer.decode_fixed(dummy, size, vocoder_attn_mask=self.static_vocoder_masks[size])
+        torch.accelerator.synchronize(self._device)
+
+        for size in new_sizes:
+            self.capture_sizes.append(size)
+        self.capture_sizes.sort()
+
+        for n_rows in self._capture_code_rows:
+            for size in new_sizes:
+                try:
+                    self._capture(size, self._device, n_code_rows=n_rows)
+                    logger.info(
+                        "CUDAGraphMiMoDecoderWrapper: captured extended graph code_rows=%d code_len=%d",
+                        n_rows,
+                        size,
+                    )
+                except Exception:
+                    logger.warning(
+                        "CUDAGraphMiMoDecoderWrapper: failed to capture extended graph code_rows=%d code_len=%d",
+                        n_rows,
+                        size,
+                        exc_info=True,
+                    )
+        logger.info(
+            "CUDAGraphMiMoDecoderWrapper: capture sizes now %s (%d graphs)",
+            self.capture_sizes,
+            len(self.graphs),
+        )
+
     def _capture(self, size: int, device: torch.device, n_code_rows: int):
         key = (n_code_rows, size)
         static_codes = torch.zeros(n_code_rows, size, dtype=torch.long, device=device)

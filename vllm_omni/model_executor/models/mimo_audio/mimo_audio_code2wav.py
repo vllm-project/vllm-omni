@@ -384,6 +384,60 @@ def extract_audio_code_tensor(
     return audio_tokens  # [audio_channels, T]
 
 
+def extract_audio_code_tensor_device(
+    flat_codes: torch.Tensor,
+    group_size: int,
+    audio_channels: int,
+    codes: MiMoAudioCodes,
+) -> torch.Tensor | None:
+    """On-device variant of :func:`extract_audio_code_tensor`.
+
+    Same semantics — keep groups whose text slot is ``codes.empty``, stop at the
+    first ``codes.eostm``, drop the trailing partial group — but expressed as
+    tensor ops so codes never leave the accelerator. Avoids the per-request
+    per-chunk D2H + Python loop + H2D round trip of the CPU reference. Works on
+    CPU tensors too (output follows the input device).
+
+    Requires ``codes.empty != codes.eostm`` (distinct tokenizer tokens, always
+    true for the MiMo audio vocab).
+    """
+    group_width = flat_codec_group_element_count(group_size, audio_channels)
+    usable = (flat_codes.numel() // group_width) * group_width
+    if usable == 0:
+        return None
+
+    groups = flat_codes[:usable].reshape(-1, group_size, audio_channels + 1)
+    text = groups[:, 0, 0]
+    # True from the first eostm group onward: reproduces the reference loop's
+    # break-at-first-eostm without a host round trip.
+    blocked = torch.cummax(text == codes.eostm, dim=0).values
+    keep = (text == codes.empty) & ~blocked
+    if not bool(keep.any()):
+        return None
+    audio = groups[keep][:, :, 1:].reshape(-1, audio_channels)
+    return audio.transpose(0, 1).contiguous()  # [audio_channels, T]
+
+
+def codec_graph_capture_frames(
+    chunk_frames: int,
+    left_context_frames: int,
+    group_size: int,
+) -> list[int]:
+    """Exact code-frame bucket sizes derived from the streaming chunk config.
+
+    In async-chunk mode the steady-state payload is (chunk + left_context)
+    talker groups, i.e. (chunk + left_context) * group_size code frames — for
+    the shipped config (30 + 40 groups x 4) that is 280 frames, beyond the
+    CUDA-graph wrapper's largest default bucket (256), which would silently
+    force an eager fallback every steady-state chunk.
+    """
+    frames = {
+        chunk_frames * group_size,
+        (chunk_frames + left_context_frames) * group_size,
+    }
+    return sorted(f for f in frames if f > 0)
+
+
 def _normalize_tokenizer_worker_cache_key(
     device: torch.device | str,
     config_path: str | None,
@@ -538,6 +592,28 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
             )
             raw_left = _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES
         self._codec_left_context_frames = raw_left
+
+        self._extend_codec_graph_buckets()
+
+    def _extend_codec_graph_buckets(self) -> None:
+        """Capture chunk-derived exact bucket sizes on the decoder graph wrapper.
+
+        ``MiMoAudioTokenizerWorker`` creates the wrapper without knowledge of the
+        connector's streaming chunk config, so it only warms the default bucket
+        table. Add the exact steady-state decode lengths here so async-chunk
+        payloads replay a graph instead of silently falling back to eager decode.
+        No-op when graphs are disabled (env gate) or the tokenizer runs on CPU.
+        """
+        wrapper = getattr(self._tokenizer_service, "cuda_graph_wrapper", None)
+        if wrapper is None:
+            return
+        wrapper.extend_capture_sizes(
+            codec_graph_capture_frames(
+                chunk_frames=self._codec_chunk_frames,
+                left_context_frames=self._codec_left_context_frames,
+                group_size=self.streamer_config.group_size,
+            )
+        )
 
     def load_weights(
         self,
@@ -706,7 +782,8 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
 
         Instead of calling _decode_waveform_from_codes per request (which incurs
         4 GPU↔CPU round-trips each), this method:
-          1. Extracts audio_codes for all valid requests on CPU (cheap).
+          1. Extracts audio_codes for all valid requests on-device (no host
+             round trip; see extract_audio_code_tensor_device).
           2. Runs quantizer.decode_vq (embedding lookup) on the tokenizer device.
           3. Packs all hidden-states into one tensor and calls
              decoder(packed_hs, input_lengths) once.
@@ -735,9 +812,8 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
             if self._check_dummy_code_tensor(req_codes):
                 continue
 
-            flat_codes = req_codes.detach().to(torch.long).cpu()
-            audio_codes = extract_audio_code_tensor(
-                flat_codes,
+            audio_codes = extract_audio_code_tensor_device(
+                req_codes.detach().to(torch.long),
                 group_size,
                 audio_channels,
                 self.codes,
@@ -836,9 +912,8 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
             if self._check_dummy_code_tensor(req_codes):
                 continue
 
-            flat_codes = req_codes.detach().to(torch.long).cpu()
-            audio_codes = extract_audio_code_tensor(
-                flat_codes,
+            audio_codes = extract_audio_code_tensor_device(
+                req_codes.detach().to(torch.long),
                 group_size,
                 audio_channels,
                 self.codes,
@@ -968,9 +1043,9 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
                     f"code2wav expects shape [L], [1, L] or [audio_channels+1, T], got {code_tensor.shape}"
                 )
 
-        flat_codes = code_tensor.detach().to(torch.long).cpu()
+        flat_codes = code_tensor.detach().to(torch.long)
 
-        audio_codes = extract_audio_code_tensor(
+        audio_codes = extract_audio_code_tensor_device(
             flat_codes,
             self.streamer_config.group_size,
             self.streamer_config.audio_channels,
