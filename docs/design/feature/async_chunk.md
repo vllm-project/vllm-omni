@@ -365,46 +365,21 @@ including an empty set before input arrives, and be safe during initialization.
 
 ### Code2Wav Batch Configuration
 
-Generation stages receiving async chunks can coalesce ready inputs with the
-following stage `engine_extras.additional_config` settings (legacy connector
-`extra` remains supported and takes precedence per key):
+Generation stages use the same `generation_*` settings, configuration precedence,
+and batch-target/timeout policy described in
+[Coalescing AR Execution Batches](#coalescing-ar-execution-batches). Generation
+counts input-ready requests with no execution in flight. Runner support differs:
 
-```yaml
-generation_min_batch_size: 16
-generation_max_wait_ms: 6
-```
+- **V1:** stateful and stateless TP1/PP1 stages support the `fixed` policy.
+  Readiness is polled on scheduler ticks without blocking or consuming deferred
+  inputs. Async-chunk receivers and orchestrator-fed Stage 0 are supported;
+  other input sources can use the readiness hook described above.
+- **Native MRV2:** requires a stateful TP1/PP1 stage and retains notification-inbox
+  waiting, including the MRV2-only `idle_wait` policy.
 
-Batch waiting is disabled by default. Ready streams execute when the target
-is reached or the wait bound expires. If fewer requests are registered than the
-configured target, inputs execute immediately unless the configuration sets
-`generation_always_wait_target_batch: true` (default: `false`). On either runner,
-this option caps the target at the registered request count and retains the
-same wait bound. First and final chunks share
-the bounded window. The target is a dispatch threshold; token and execution
-budgets may limit the actual batch size.
-
-Native MRV2 retains its existing stateful TP1/PP1 support and notification-inbox
-waiting. V1 async-chunk receivers support TP1/PP1 for stateful and stateless
-stages with `generation_coalescing_policy: fixed` (the default). V1 polls
-readiness on scheduler ticks; it does not block the scheduler thread or consume
-deferred chunks. Its dispatch time includes scheduler tick granularity.
-`generation_coalescing_policy: idle_wait` remains native MRV2-only. V1 also
-supports orchestrator-fed Stage 0, including sender-only stages, using queued
-input readiness as described above. Other plain prompt inputs do not acquire
-V1 batch waiting by default.
-Custom schedulers can override `OmniSchedulerMixin._get_coalescing_ready_request_ids()`
-to supply input-ready IDs for other input sources. The hook
-returns `None` for unsupported input sources and a set (possibly empty) for
-supported sources; execution eligibility remains scheduler-specific. It is
-also queried during coalescing policy initialization. Batch waiting must still
-be enabled through configuration.
-
-V1 input executions that yield `pending_generation` continue without another
-batch wait for that same input. Cancellation, completion, input errors, and
-timeouts continue to be processed during coalescing. Deferred inputs retain
-their payload and readiness; no KV allocation or execution accounting occurs
-for them until scheduling succeeds. `generation_max_regular_batch` still caps
-execution batch size; first-chunk express behavior retains its native scope.
+V1 inputs yielding `pending_generation` continue without another batch wait
+for the same input. `generation_max_regular_batch` caps execution batch size;
+first-chunk express scheduling retains its native MRV2 scope.
 
 For optimal performance with async_chunk, the code2wav stage should be configured with batching:
 
