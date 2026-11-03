@@ -13,6 +13,11 @@ from vllm_omni.diffusion.models.magi2 import attention
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
 from vllm_omni.diffusion.models.magi2.layers.native.attention_ops import torch_varlen_attention_with_sink
 from vllm_omni.diffusion.models.magi2.layers.npu import attention_ops as npu_attention
+from vllm_omni.diffusion.models.magi2.preview_data_proxy import (
+    Magi2DataProxy,
+    Magi2PreviewDataProxyConfig,
+    ModelInput,
+)
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
@@ -24,6 +29,31 @@ def npu_runtime():
     if not torch.npu.is_available():
         pytest.skip("requires an available NPU")
     return torch_npu
+
+
+@hardware_test(res={"npu": "A5"}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires NPU")
+def test_npu_data_proxy_keeps_varlen_bounds_on_cpu(npu_runtime):
+    proxy = Magi2DataProxy(Magi2PreviewDataProxyConfig(time_channel_dim=0))
+    packed = proxy.process_input(
+        ModelInput(
+            x_t=torch.zeros(1, 2, 1, 1, 2, device="npu"),
+            audio_x_t=torch.zeros(1, 1, 2, device="npu"),
+            audio_feat_len=[1],
+            txt_feat=torch.zeros(1, 1, 2, device="npu"),
+            txt_feat_len=[1],
+            t=torch.tensor([0.5], device="npu"),
+        )
+    )
+
+    bounds = packed.varlen_handler.cu_seqlens_q
+    assert bounds is packed.varlen_handler.cu_seqlens_k
+    assert bounds is not None
+    assert bounds.device.type == "cpu"
+    assert bounds.dtype == torch.int32
+    assert packed.token_sequence.device.type == "npu"
+    assert packed.token_sequence.shape[0] == 4
+    assert bounds.tolist() == [0, 4]
 
 
 def _inputs(head_dim=64, kv_heads=2, sink_count=2, *, cu_q=(0, 3, 9), cu_k=(0, 4, 11)):

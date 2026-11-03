@@ -780,6 +780,11 @@ class DiffusionEngine:
             except Exception as exc:
                 self._fail_engine(exc)
                 return
+            finally:
+                # Streams/async workers own delivered outputs. Keeping this
+                # local would also retain the previous video during execute_fn
+                # on the next iteration. Do not mutate the shared result.
+                del runner_output
 
             if not sched_output.scheduled_request_ids and self.scheduler._kv_draining_requests:
                 # Only exceptional in-flight receives need idle polling. New
