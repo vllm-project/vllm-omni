@@ -304,6 +304,7 @@ class _StageEngineValues:
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
     speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
+    weight_transfer_config: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -1289,7 +1290,9 @@ _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
 # stage-1 override block with a startup ValueError ("Stage 1 (llm_ar) has
 # explicit engine argument(s) with no structured config owner"). It joins the
 # two pass-through fields already listed.
-_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset({"compilation_config", "profiler_config", "speculative_config"})
+_DIRECT_VLLM_CONFIG_ENGINE_FIELDS = frozenset(
+    {"compilation_config", "profiler_config", "speculative_config", "weight_transfer_config"}
+)
 _LLM_LOAD_ENGINE_FIELDS = _LOAD_ENGINE_FIELDS | frozenset(_LOAD_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_CACHE_ENGINE_FIELDS = _CACHE_ENGINE_FIELDS | frozenset(_CACHE_CONFIG_ENGINE_FIELD_MAP.values())
 _LLM_SCHEDULER_ENGINE_FIELDS = _SCHEDULER_ENGINE_FIELDS | frozenset(_SCHEDULER_CONFIG_ENGINE_FIELD_MAP.values())
@@ -1658,6 +1661,7 @@ def _stage_engine_values(
         # silently disappears (no error) and speculative decoding loses effect
         # (engine logs show speculative_config=None).
         speculative_config=_copy_value(engine.get("speculative_config")),
+        weight_transfer_config=_copy_value(engine.get("weight_transfer_config")),
     )
 
 
@@ -1727,6 +1731,7 @@ class BaseVllmOmniStageConfig:
     # dict early and break that step with "SpeculativeConfig object has no
     # attribute 'items'". Keep the Mapping shape and let vLLM do the conversion.
     speculative_config: Mapping[str, Any] | None = None
+    weight_transfer_config: Mapping[str, Any] | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1901,6 +1906,7 @@ def _build_common_stage_config_kwargs(
             "profiler_config": _copy_value(engine.profiler_config),
             "speculative_config": _copy_value(engine.speculative_config),
             "quantization_config": _copy_value(quantization_config),
+            "weight_transfer_config": _first_defined(engine.weight_transfer_config, deploy.weight_transfer_config),
         },
         input_proc,
         next_stage_proc,

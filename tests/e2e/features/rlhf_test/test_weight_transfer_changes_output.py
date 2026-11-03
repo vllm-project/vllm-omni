@@ -112,9 +112,11 @@ def _ipc_handle_exporter(request_q, response_q) -> None:
     dtype_names: list[str] = []
     shapes: list[list[int]] = []
     ipc_handles: list[dict[str, tuple]] = []
+    exported_weights: list[torch.Tensor] = []
 
     for name, cpu_tensor in tensors:
         weight = cpu_tensor.to("cuda").contiguous()
+        exported_weights.append(weight)
         names.append(name)
         dtype_names.append(str(weight.dtype).split(".")[-1])
         shapes.append(list(weight.shape))
@@ -128,8 +130,9 @@ def _ipc_handle_exporter(request_q, response_q) -> None:
         ipc_handles=ipc_handles,
     )
     response_q.put(asdict(update_info))
-    # Block until the caller releases us; exiting would free the IPC storages.
+    # Keep every source storage alive until the receiver has imported it.
     request_q.get()
+    del exported_weights
 
 
 def _spawn_ipc_exporter(source_tensors: list[tuple[str, torch.Tensor]]):

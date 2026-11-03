@@ -33,6 +33,37 @@ def test_weight_transfer_config_is_pipeline_wide_field():
     assert "weight_transfer_config" in PIPELINE_WIDE_ENGINE_FIELDS
 
 
+@pytest.mark.parametrize("execution_type_name", ["LLM_AR", "LLM_GENERATION"])
+def test_weight_transfer_config_is_owned_by_llm_stages(execution_type_name):
+    """LLM stage ownership validation must accept vLLM's weight-transfer config."""
+    from vllm_omni.config.omni_config import _validate_stage_engine_override_ownership
+    from vllm_omni.config.stage_config import StageExecutionType
+
+    _validate_stage_engine_override_ownership(
+        0,
+        getattr(StageExecutionType, execution_type_name),
+        {"weight_transfer_config": {"backend": "omni_lora_ipc"}},
+    )
+
+
+def test_weight_transfer_config_reaches_ar_stage_engine_args():
+    """The pipeline-wide setting must reach the LLM worker's VllmConfig."""
+    from transformers import Qwen3OmniMoeConfig
+
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.config.pipeline_registry import resolve_pipeline_config
+    from vllm_omni.config.stage_config import DeployConfig
+    from vllm_omni.engine.stage_init_utils import _project_omni_stage_engine_args
+
+    transfer = {"backend": "omni_lora_ipc"}
+    pipeline = resolve_pipeline_config("qwen3_omni_moe", Qwen3OmniMoeConfig())
+    deploy = DeployConfig(weight_transfer_config=transfer)
+
+    stage = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+    assert stage.weight_transfer_config == transfer
+    assert _project_omni_stage_engine_args(stage)["weight_transfer_config"] == transfer
+
+
 def test_weight_transfer_config_is_deploy_override_key():
     """It must survive build_stage_runtime_overrides' internal-key filter."""
     from vllm_omni.config.stage_config import deploy_runtime_override_keys
