@@ -52,6 +52,10 @@ EXCLUDED_MODELS = [
     "LTX2DistilledPipeline",
     "LTX2T2VDMD2Pipeline",
     "LTX2I2VDMD2Pipeline",
+    # Physis uses full video model checkpoints and has dedicated contract tests.
+    "PhysisH3Pipeline",
+    "PhysisLTXPipeline",
+    "PhysisWanPipeline",
     "MiniMaxH3Pipeline",
     "MiniMaxH3ModularPipeline",
     # Decoder-only stage consumes upstream latents; covered by H3 decoder
