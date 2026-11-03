@@ -18,7 +18,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 )
 def test_other_policy_keys_are_rejected(name):
     with pytest.raises(TypeError, match=name):
-        worldkv.WorldKVConfig.parse({name: 1})
+        worldkv.WorldKVConfig.parse({name: 1}, window_frames=18, sink_frames=9, chunk_frames=3)
 
 
 def test_compression_does_not_implicitly_enable_retrieval():

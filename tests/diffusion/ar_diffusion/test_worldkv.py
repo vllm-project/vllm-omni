@@ -266,10 +266,35 @@ def test_publication_concatenates_only_retained_slices(monkeypatch, start):
     assert result.key.untyped_storage().nbytes() == result.key.numel() * result.key.element_size()
 
 
-def test_empty_policy_disables_all_optional_mechanisms():
-    assert worldkv.WorldKVConfig.parse(None) is None
-    config = worldkv.WorldKVConfig.parse({})
-    assert config == worldkv.WorldKVConfig()
-    assert config.sink_frames == 0
+NATIVE = {"window_frames": 18, "sink_frames": 9, "chunk_frames": 3}
+
+
+def test_empty_policy_disables_all_optional_mechanisms_and_keeps_native_sink():
+    assert worldkv.WorldKVConfig.parse(None, **NATIVE) is None
+    config = worldkv.WorldKVConfig.parse({}, **NATIVE)
+    assert config == worldkv.WorldKVConfig(window_frames=18, sink_frames=9)
     assert config.retrieval_frames == config.bank_bytes == 0
     assert config.world_keep_ratio == 1.0
+    explicit = worldkv.WorldKVConfig.parse({"sink_frames": 3, "retrieval_frames": 9, "bank_bytes": 1}, **NATIVE)
+    assert (explicit.window_frames, explicit.sink_frames) == (18, 3)
+
+
+@pytest.mark.parametrize(
+    "value,match",
+    [
+        # 9 sink + 8 retrieval leaves no room for the 3-frame chunk.
+        ({"retrieval_frames": 8, "bank_bytes": 1}, "complete current chunk"),
+        # A chunk at frames 3..5 would straddle a 4-frame sink.
+        ({"sink_frames": 4, "retrieval_frames": 6, "bank_bytes": 1}, "multiple of the chunk size"),
+        # One chunk compressed at 0.5 needs two frames of budget.
+        ({"sink_frames": 3, "retrieval_frames": 1, "bank_bytes": 1, "world_keep_ratio": 0.5}, "one compressed chunk"),
+    ],
+)
+def test_parse_rejects_chunk_geometry_before_execution(value, match):
+    with pytest.raises(ValueError, match=match):
+        worldkv.WorldKVConfig.parse(value, **NATIVE)
+
+
+def test_sink_alignment_applies_only_to_retrieval():
+    config = worldkv.WorldKVConfig.parse({"sink_frames": 4}, **NATIVE)
+    assert config.sink_frames == 4

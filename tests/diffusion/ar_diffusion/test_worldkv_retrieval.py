@@ -110,6 +110,47 @@ def test_bank_byte_budget_eviction_and_noisy_read_only():
     assert memory.bank_nbytes == 0
 
 
+def test_first_eviction_warns_once_and_counts_evicted_chunks(monkeypatch):
+    sample = state()
+    append(sample, 0)
+    append(sample, 2)
+    memory = state(bank_bytes=sample.bank_nbytes * 2)
+    warnings = []
+    monkeypatch.setattr(worldkv.logger, "warning", lambda *args: warnings.append(args))
+    for start in range(0, 12, 2):
+        append(memory, start)
+    # Chunks 2..10 were banked and only the newest two remain.
+    assert list(memory.bank) == [8, 10]
+    assert memory.evicted_chunks == 3
+    assert len(warnings) == 1
+
+
+def test_host_bank_reservations_admit_and_release_memories(monkeypatch):
+    ledger = worldkv._HostBankLedger()
+    monkeypatch.setattr(worldkv, "_HOST_BANKS", ledger)
+    config = worldkv.WorldKVConfig(
+        window_frames=8, sink_frames=2, retrieval_frames=2, bank_bytes=1 << 20, host_bank_limit_bytes=2 << 20
+    )
+
+    def create():
+        return worldkv.WorldKV(config, num_layers=2, tokens_per_frame=2)
+
+    first, second = create(), create()
+    with pytest.raises(RuntimeError, match="host limit"):
+        create()
+    assert ledger.reserved == 2 << 20
+    first.close()
+    first.close()
+    assert ledger.reserved == 1 << 20
+    third = create()
+    # Request-local caches are dropped without close().
+    del second, third
+    assert ledger.reserved == 0
+    # Memories without retrieval reserve nothing.
+    worldkv.WorldKV(worldkv.WorldKVConfig(window_frames=8, sink_frames=2), num_layers=2, tokens_per_frame=2)
+    assert ledger.reserved == 0
+
+
 def test_oversized_entry_fails_before_allocating_or_publishing(monkeypatch):
     memory = state(bank_bytes=1)
 
@@ -174,6 +215,8 @@ def test_ties_are_deterministic_and_sink_recent_never_retrieved():
         {"retrieval_frames": 3},
         {"sink_frames": 9, "retrieval_frames": 9, "bank_bytes": 100},
         {"bank_bytes": True},
+        {"host_bank_limit_bytes": 1 << 20},
+        {"retrieval_frames": 2, "bank_bytes": 10, "host_bank_limit_bytes": 5},
     ],
 )
 def test_invalid_retrieval_config(config):

@@ -10,11 +10,17 @@ retention is preserved without Deep Forcing rebasing or query-based selection.
 from __future__ import annotations
 
 import math
+import threading
+import weakref
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+import psutil
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -25,6 +31,9 @@ class WorldKVConfig:
     bank_bytes: int = 0
     world_keep_ratio: float = 1.0
     world_score: str = "pairwise_mean"
+    # Process-wide cap on the bank_bytes reserved by live memories; None uses
+    # the host's physical memory.
+    host_bank_limit_bytes: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -52,16 +61,53 @@ class WorldKVConfig:
             raise ValueError("worldkv retrieval requires a positive bank_bytes limit")
         if self.sink_frames + self.retrieval_frames >= self.window_frames:
             raise ValueError("worldkv window must leave room for current frames")
+        limit = self.host_bank_limit_bytes
+        if limit is not None:
+            if type(limit) is not int or limit <= 0:
+                raise ValueError("worldkv.host_bank_limit_bytes must be a positive integer")
+            if not self.retrieval_frames:
+                raise ValueError("worldkv.host_bank_limit_bytes requires retrieval")
+            if limit < self.bank_bytes:
+                raise ValueError("worldkv.host_bank_limit_bytes must be at least bank_bytes")
 
     @classmethod
-    def parse(cls, value: Mapping[str, object] | None) -> WorldKVConfig | None:
+    def parse(
+        cls,
+        value: Mapping[str, object] | None,
+        *,
+        window_frames: int,
+        sink_frames: int,
+        chunk_frames: int,
+    ) -> WorldKVConfig | None:
+        """Parse the model_config mapping against the model's native geometry.
+
+        Omitted window and sink sizes inherit the model's native values, so
+        enabling WorldKV never silently drops the attention sink.
+        """
         if value is None:
             return None
         if not isinstance(value, Mapping):
             raise ValueError("model_config.worldkv must be a mapping")
         # Dataclass construction rejects unknown keys; __post_init__ validates
         # each untyped configuration value before it reaches model execution.
-        return cls(**value)  # type: ignore[arg-type]
+        config = cls(**{"window_frames": window_frames, "sink_frames": sink_frames, **value})  # type: ignore[arg-type]
+        config.validate_chunk_frames(chunk_frames)
+        return config
+
+    def validate_chunk_frames(self, chunk_frames: int) -> None:
+        """Reject chunk geometry that would fail or silently lose history at run time."""
+        if self.sink_frames + self.retrieval_frames + chunk_frames > self.window_frames:
+            raise ValueError("WorldKV must fit sink, retrieval and the complete current chunk")
+        if not self.retrieval_frames:
+            return
+        if self.sink_frames % chunk_frames:
+            # Only chunks starting after the sink are banked, so the non-sink
+            # frames of a chunk straddling the sink could never be retrieved.
+            raise ValueError("worldkv.sink_frames must be a multiple of the chunk size when retrieval is enabled")
+        # Token rounding cannot exceed this frame bound: the budget is a whole
+        # number of frames and the compressed count is rounded up only once.
+        if 1 + (chunk_frames - 1) * self.world_keep_ratio > self.retrieval_frames:
+            raise ValueError("worldkv.retrieval_frames cannot fit one compressed chunk")
 
     def validate_bank_capacity(
         self, layers: int, tokens_per_frame: int, heads: int, dim: int, itemsize: int, chunk_frames: int
@@ -173,6 +219,30 @@ def camera_distances(current: torch.Tensor, candidates: torch.Tensor) -> torch.T
     return translation / translation.max().clamp_min(1e-12) + rotation / rotation.max().clamp_min(1e-12)
 
 
+class _HostBankLedger:
+    """Worst-case CPU bank bytes reserved by all live memories in this process."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reserved = 0
+
+    def reserve(self, nbytes: int, limit: int) -> None:
+        with self._lock:
+            if self.reserved + nbytes > limit:
+                raise RuntimeError(
+                    f"WorldKV bank reservation of {nbytes} bytes exceeds the host limit of {limit} bytes "
+                    f"({self.reserved} bytes already reserved); close idle sessions or lower worldkv.bank_bytes"
+                )
+            self.reserved += nbytes
+
+    def release(self, nbytes: int) -> None:
+        with self._lock:
+            self.reserved -= nbytes
+
+
+_HOST_BANKS = _HostBankLedger()
+
+
 class WorldKV:
     """One request/branch's clean history, published only after all layers succeed.
 
@@ -198,6 +268,13 @@ class WorldKV:
         self._closed = False
         self._pending: dict[int, MemoryRows] = {}
         self._seen: set[int] = set()
+        self.evicted_chunks = 0
+        self._release_bank: weakref.finalize | None = None
+        if config.retrieval_frames:
+            limit = config.host_bank_limit_bytes or psutil.virtual_memory().total
+            _HOST_BANKS.reserve(config.bank_bytes, limit)
+            # Request-local caches are dropped rather than closed.
+            self._release_bank = weakref.finalize(self, _HOST_BANKS.release, config.bank_bytes)
 
     def set_pose(self, pose: torch.Tensor) -> None:
         """Supply a representative absolute C2W pose in the session coordinate frame."""
@@ -263,10 +340,10 @@ class WorldKV:
                 budget -= cost
         return tuple(sorted(selected, key=lambda chunk: chunk.start))
 
-    def _publish_bank(self) -> dict[int, BankChunk]:
+    def _publish_bank(self) -> tuple[dict[int, BankChunk], int]:
         bank = dict(self.bank)
         if not self.config.retrieval_frames or self.next_frame < self.config.sink_frames:
-            return bank
+            return bank, 0
         assert self.pose is not None
         layers = tuple(
             MemoryRows(
@@ -285,10 +362,12 @@ class WorldKV:
         chunk = BankChunk(self.next_frame, self._frames, self.pose.clone(), layers)
         bank[chunk.start] = chunk
         size = sum(entry.nbytes for entry in bank.values())
+        evicted = 0
         while size > self.config.bank_bytes:
             oldest = next(iter(bank))
             size -= bank.pop(oldest).nbytes
-        return bank
+            evicted += 1
+        return bank, evicted
 
     @contextmanager
     def forward(self, start_frame: int, frames: int, *, commit: bool) -> Iterator[None]:
@@ -296,8 +375,7 @@ class WorldKV:
             raise RuntimeError("WorldKV is closed or already in a forward")
         if start_frame != self.next_frame or frames <= 0:
             raise ValueError("WorldKV chunks must be contiguous and nonempty")
-        if frames + self.config.sink_frames + self.config.retrieval_frames > self.config.window_frames:
-            raise ValueError("WorldKV must fit sink and the complete current chunk")
+        self.config.validate_chunk_frames(frames)
         success = False
         if self._retrieval_frames != frames:
             self._clear_retrieval()
@@ -315,13 +393,22 @@ class WorldKV:
                 # Publish CPU rows before consuming pending GPU rows, preserving
                 # rollback: canonical history/bank are assigned only at the end.
                 self._clear_retrieval()
-                bank = self._publish_bank()
+                bank, evicted = self._publish_bank()
                 replacement: list[MemoryRows | None] = [
                     self._retained(i, self._pending.pop(i)) for i in range(self.num_layers)
                 ]
                 self.history, self.bank = replacement, bank
                 self.next_frame += frames
                 self.pose = None
+                if evicted and not self.evicted_chunks:
+                    logger.warning(
+                        "WorldKV bank reached bank_bytes=%d at latent frame %d; the oldest chunks are now "
+                        "evicted and can no longer be retrieved on revisits. Raise worldkv.bank_bytes to "
+                        "cover the full trajectory.",
+                        self.config.bank_bytes,
+                        self.next_frame,
+                    )
+                self.evicted_chunks += evicted
             success = True
         finally:
             self._pending.clear()
@@ -410,3 +497,5 @@ class WorldKV:
         self.pose = None
         self._clear_retrieval()
         self._closed = True
+        if self._release_bank is not None:
+            self._release_bank()
