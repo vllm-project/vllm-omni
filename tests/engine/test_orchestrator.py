@@ -1276,7 +1276,8 @@ async def test_request_watermarking(stage_type: str, watermarking: bool | None) 
         **stage_pool_kwargs,
     )
 
-    await pool.submit_initial("r", SimpleNamespace(sampling_params_list=[params]), request)
+    state = OrchestratorRequestState(request_id="r", sampling_params_list=[params], final_stage_id=0)
+    await pool.submit_initial("r", state, request)
 
     # Call the corresponding stage processor based on the type
     if stage_type == "diffusion":
@@ -1336,9 +1337,11 @@ async def test_strict_watermark_failure_replaces_llm_output_with_error() -> None
     processor = FakeOutputProcessor(request_outputs=[_build_request_output("bad"), _build_request_output("good")])
     processor.request_states = {"bad": object(), "good": object()}
     pool = _audio_stage_pool(_audio_stage_client("llm"), output_processor=processor)
-    params = SimpleNamespace(sampling_params_list=[SamplingParams()])
     for request_id in ("bad", "good"):
-        await pool.submit_initial(request_id, params, SimpleNamespace(request_id=request_id))
+        state = OrchestratorRequestState(
+            request_id=request_id, sampling_params_list=[SamplingParams()], final_stage_id=0
+        )
+        await pool.submit_initial(request_id, state, SimpleNamespace(request_id=request_id))
     raw_outputs = [
         OmniEngineCoreOutput(request_id="bad", new_token_ids=[], multimodal_output={"model_outputs": torch.zeros(8)}),
         OmniEngineCoreOutput(
@@ -3621,7 +3624,7 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
     assert isinstance(error, ErrorMessage)
     assert (error.request_id, error.stage_id, error.error) == ("stuck", stage_id, expected_error)
     assert error.fatal is False
-    cleanup.assert_awaited_once_with(["stuck"], abort=True, release_owners=True)
+    cleanup.assert_awaited_once_with(["stuck"], abort=True, release_owners=True, trace_error="stage_error")
     normal_terminal.assert_not_awaited()
     assert not terminal_request_ids
     assert output_queue.empty()

@@ -49,6 +49,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     enqueue_ts: float
     final_output_stage_ids: list[int] | None = None
     request_artifact_dirs: list[str] | None = None
+    trace_headers: dict[str, str] | None = None
     # Stage ID to provide the output of current request for use in external routing.
     # Only set when that stage has a next stage; otherwise it's a normal request.
     yield_stage_id: int | None = None

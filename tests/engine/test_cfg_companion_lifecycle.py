@@ -123,6 +123,7 @@ def _req_state(final_stage_id: int = 1) -> SimpleNamespace:
         running_counter_registered=False,
         prompt={"prompt": "x"},
         pipeline_timings={},
+        trace=None,
     )
 
 

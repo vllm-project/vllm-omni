@@ -335,7 +335,7 @@ def test_recovered_response_retains_schema_trace_and_old_score_quarantine(
     calls: list[int] = []
 
     class Judge:
-        def content(self, prompt, video_path, *, frames, mode):
+        def content(self, prompt, video_path, *, frames, mode, followup=None):
             calls.append(len(frames))
             if len(frames) > 4:
                 raise _http_error(400, OVERFLOW)
@@ -345,8 +345,105 @@ def test_recovered_response_retains_schema_trace_and_old_score_quarantine(
         eval_mod.evaluate_sample(
             sample, response_path, score_path, Judge(), judge_video_mode="frame-sample", judge_frame_overflow="reduce"
         )
-    assert calls == [16, 8, 4]
+    assert calls == [16, 8, 4, 4]
     assert not score_path.exists()
     assert len(list(score_path.parent.glob(f"{score_path.name}.*.previous"))) == 1
     trace = [json.loads(line) for line in score_path.with_suffix(".judge.jsonl").read_text().splitlines()]
-    assert trace == [{"raw_response": '{"unrelated": 1}'}]
+    assert [line["raw_response"] for line in trace] == ['{"unrelated": 1}'] * 2
+    assert trace[1]["judge_retry"] is True
+    assert "error" in trace[1]
+
+
+@pytest.mark.parametrize("route", ["temporal", "content", "video-fallback"])
+@pytest.mark.parametrize("overflow_on_correction", [False, True])
+def test_frame_reduction_composes_with_format_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, overflow_on_correction: bool
+) -> None:
+    sample, response_path, score_path = _sample_inputs(tmp_path, monkeypatch, with_sentence=route == "temporal")
+    original = [bytes([i]) for i in range(16)]
+    monkeypatch.setattr(eval_mod, "_extract_frames", lambda *args, **kwargs: original)
+    calls = []
+    prose = "The person moves."
+
+    class Judge:
+        def _reply(self, prompt, frames, followup):
+            calls.append((prompt, list(frames), followup))
+            limit = 4 if followup is not None and overflow_on_correction else 8
+            if len(frames) > limit:
+                raise _http_error(400, OVERFLOW)
+            if followup is None:
+                return prose
+            return '{"temporal_score": 1, "is_relevant": 1, "content_score": 1}'
+
+        def temporal(self, prompt, frames, *, followup=None):
+            return self._reply(prompt, frames, followup)
+
+        def content(self, prompt, video_path, *, frames, mode, followup=None):
+            if route == "temporal":
+                return '{"content_score": 1}'
+            if mode == "video_url":
+                raise _http_error(400, "Input length exceeds model's maximum context length")
+            return self._reply(prompt, frames, followup)
+
+    result = eval_mod.evaluate_sample(
+        sample,
+        response_path,
+        score_path,
+        Judge(),
+        judge_video_mode="video_url" if route == "video-fallback" else "frame-sample",
+        judge_frame_overflow="reduce",
+    )
+    expected_counts = [16, 8, 8, 4] if overflow_on_correction else [16, 8, 8]
+    assert [len(frames) for _, frames, _ in calls] == expected_counts
+    for prompt, frames, followup in calls:
+        assert prompt == calls[0][0]
+        assert frames == eval_mod._uniform_subsample(original, len(frames))
+        if followup is not None:
+            assert followup[0] == prose
+            assert "score" in followup[1]
+    assert all(followup is None for _, _, followup in calls[:2])
+    assert all(followup == calls[2][2] for _, _, followup in calls[2:])
+    row = result["temporal"]["sentences"][0] if route == "temporal" else result["content"]
+    assert row["frame_count_initial"] == 16
+    assert row["frame_count"] == expected_counts[-1]
+    assert row["frame_budget_retries"] == (2 if overflow_on_correction else 1)
+    if route == "video-fallback":
+        assert row["judge_input_fallback"] == "frame-sample"
+    trace = [json.loads(line) for line in score_path.with_suffix(".judge.jsonl").read_text().splitlines()]
+    assert trace[0] == {"raw_response": prose}
+    assert trace[1]["judge_retry"] is True
+
+
+def test_video_url_format_correction_is_forwarded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sample, response_path, score_path = _sample_inputs(tmp_path, monkeypatch, with_sentence=False)
+    calls = []
+
+    class Judge:
+        def content(self, prompt, video_path, *, frames, mode, followup=None):
+            calls.append((prompt, frames, mode, followup))
+            return "A person moves." if followup is None else '{"content_score": 1}'
+
+    result = eval_mod.evaluate_sample(sample, response_path, score_path, Judge())
+    assert len(calls) == 2
+    assert calls[0][:3] == calls[1][:3]
+    assert calls[0][1:3] == (None, "video_url")
+    assert calls[1][3][0] == "A person moves."
+    assert result["content"]["content_score"] == 1
+    assert "frame_count" not in result["content"]
+
+
+def test_format_correction_overflow_still_requires_opt_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sample, response_path, score_path = _sample_inputs(tmp_path, monkeypatch, with_sentence=False)
+    counts = []
+
+    class Judge:
+        def content(self, prompt, video_path, *, frames, mode, followup=None):
+            counts.append(len(frames))
+            if followup is not None:
+                raise _http_error(400, OVERFLOW)
+            return "A person moves."
+
+    with pytest.raises(requests.HTTPError):
+        eval_mod.evaluate_sample(sample, response_path, score_path, Judge(), judge_video_mode="frame-sample")
+    assert counts == [16, 16]
+    assert not score_path.exists()

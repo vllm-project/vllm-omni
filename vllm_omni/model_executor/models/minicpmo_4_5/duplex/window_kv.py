@@ -417,14 +417,35 @@ def rotate_keys(keys: torch.Tensor, delta: int, inv_freq: torch.Tensor) -> torch
     return torch.cat([k1 * cos + k2 * sin, k2 * cos - k1 * sin], dim=-1)
 
 
+def flattened_key_cache_view(
+    key: torch.Tensor,
+    block_size: int | None,
+    head_dim: int | None,
+    rotary_dim: int,
+) -> torch.Tensor:
+    """Return a storage-sharing view or reject an unsupported flattened layout."""
+    if head_dim is None or head_dim <= 0 or head_dim != rotary_dim:
+        raise ValueError("flattened key cache requires explicit head_dim and full rotary")
+    if block_size is None or key.shape[1] != block_size or key.shape[2] % head_dim:
+        raise ValueError(f"unsupported flattened key cache shape {tuple(key.shape)}")
+    try:
+        return key.view(key.shape[0], block_size, -1, head_dim)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"cannot view flattened key cache in place: shape={tuple(key.shape)}, "
+            f"stride={key.stride()}, head_dim={head_dim}"
+        ) from exc
+
+
 def rotate_cached_keys(
-    k_pool: torch.Tensor,
+    k_pool: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
     *,
     block_ids: list[int],
     positions: torch.Tensor,
     plan: PositionReanchor,
     inv_freq: torch.Tensor,
     block_size: int | None = None,
+    head_dim: int | None = None,
 ) -> int:
     """Re-RoPE the retained tail where it stands; return the rows touched.
 
@@ -442,6 +463,18 @@ def rotate_cached_keys(
     """
     if positions.numel() == 0:
         return 0
+
+    # Ascend keeps K and V in separate tensors. Operate on the original K
+    # storage only; stacking the pair would rotate a copy and leave KV stale.
+    if isinstance(k_pool, (tuple, list)):
+        if len(k_pool) != 2:
+            raise ValueError("split KV cache must contain exactly K and V")
+        k_pool = k_pool[0]
+
+    # Ascend's standard paged layout can flatten heads into the last axis:
+    # (num_blocks, block_size, num_kv_heads * head_dim).
+    if k_pool.dim() == 3:
+        k_pool = flattened_key_cache_view(k_pool, block_size, head_dim, inv_freq.numel() * 2)
 
     if k_pool.dim() == 5:
         if k_pool.shape[0] == 2:
@@ -905,6 +938,8 @@ class MiniCPMO45DuplexWorkerHelper:
 
             if positions.numel() > 0 and hasattr(runner, "kv_caches") and runner.kv_caches:
                 inv_freq = cls.get_rope_inv_freq(runner)
+                model_config = getattr(runner, "model_config", None)
+                head_dim = model_config.get_head_size() if model_config is not None else None
                 kv_groups = getattr(runner, "kv_cache_group_ids", None)
                 block_size = int(getattr(getattr(runner, "cache_config", None), "block_size", 16) or 16)
                 # Layers share their KV group's table; on MRv2 each lookup is a device read.
@@ -922,6 +957,7 @@ class MiniCPMO45DuplexWorkerHelper:
                         plan=plan,
                         inv_freq=inv_freq,
                         block_size=block_size,
+                        head_dim=head_dim,
                     )
 
             # Evict worker-held unit history so state.window_units remains bounded
