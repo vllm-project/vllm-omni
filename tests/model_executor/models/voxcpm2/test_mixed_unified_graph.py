@@ -118,6 +118,7 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
     model.config = SimpleNamespace(hidden_size=4)
     model._device = torch.device("cuda")
     model._side_dtype = torch.float32
+    model._vae_dtype = torch.float32
     model._feat_dim = model._patch_size = 2
     model._inference_timesteps = 1
     model._cfg_value = model._cfg_cutoff_ratio = 1.0

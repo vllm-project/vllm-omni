@@ -177,6 +177,7 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
+    from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import MIX_MODES, MIX_QUESTION
     from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_MODES, TURN_DETECTION_NONE
 
     group = parser.add_argument_group("Omni-DuplexEval Benchmark Options")
@@ -195,6 +196,12 @@ def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Session system prompt. Defaults to the native-duplex prompt; pass '' to use the server default.",
     )
     group.add_argument("--duplex-eval-fps", type=_positive_finite_float, default=1.0)
+    group.add_argument(
+        "--duplex-eval-mix",
+        choices=MIX_MODES,
+        default=MIX_QUESTION,
+        help="Session audio: 'question' streams only the instruction; 'soundtrack' overlays it on the clip's audio.",
+    )
     group.add_argument(
         "--duplex-eval-response-root",
         type=Path,
@@ -242,6 +249,16 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
             "Total per-request timeout in seconds for benchmark HTTP requests. Timed-out requests are "
             "recorded as failed instead of stalling the run on a hung server. Defaults to 900 when "
             "omitted; set <= 0 to restore the legacy 6 h cap."
+        ),
+    )
+    group.add_argument(
+        "--omni-fail-fast-on-timeout",
+        action="store_true",
+        default=False,
+        help=(
+            "After the first timed-out benchmark request, cancel all remaining queued or in-flight requests. "
+            "Completed outputs and partial result metrics are retained. Supported only with "
+            "--backend openai-chat-omni, --request-rate inf, and non-self-timed workloads."
         ),
     )
 
@@ -530,6 +547,13 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
                 'stage metrics. "tpop" also requests text TPOT/TPOP globally and per stage, and internal '
                 'stream TPOP. "ttfc", "tpoc", and "icl" only affect internal stream stage metrics. '
                 'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun".'
+            )
+        if action.dest == "goodput":
+            action.help = (
+                'Specify service level objectives for goodput as "KEY:VALUE" pairs, where the key is a '
+                'request-level metric name and the value is in milliseconds. Multiple "KEY:VALUE" pairs '
+                "can be provided, separated by spaces, and a request must satisfy every SLO to count toward "
+                'goodput. Allowed metric names are "ttft", "tpot", "e2el", and "audio_ttfp".'
             )
         if action.dest == "random_mm_limit_mm_per_prompt":
             action.help = (

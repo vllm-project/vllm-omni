@@ -172,6 +172,13 @@ Examples:
 - Omni/TTS and OpenAI generation endpoints (`/v1/images/*`, `/v1/videos`): `result_{test_name}_{optional_hw}_{dataset}_....json` under `BENCHMARK_DIR`
 - Remaining diffusion (`run_diffusion_benchmark.py`): one aggregate `diffusion_result_{config_stem}_{optional_hw}_{timestamp}.json` per source JSON file
 
+DFX cases with `duplex_eval_accuracy_config` keep intermediate judge inputs in a
+per-test temporary directory under `duplex_eval_response_root`. Pytest teardown
+removes that directory after evaluation, including failed tests and interrupts;
+performance and accuracy summary JSON files remain available. This also applies
+when running the DFX case locally. Direct `vllm bench serve --omni` runs retain
+their normal output behavior.
+
 #### Local commands
 
 ```bash
