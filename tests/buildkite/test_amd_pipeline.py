@@ -629,6 +629,24 @@ def test_cuda_ready_retains_full_model_executor_coverage() -> None:
     assert "@pytest.mark.slow" not in test_source
 
 
+def test_cuda_ready_engine_entrypoints_diffusion_has_cleanup_headroom() -> None:
+    step = _find_step("Simple · Engine&Entrypoints&Diffusion Test", CUDA_READY_PIPELINE)
+    assert step["timeout_in_minutes"] == 25
+
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+    assert argv == [
+        "pytest",
+        "-sv",
+        "tests/entrypoints",
+        "tests/engine",
+        "tests/diffusion",
+        "--ignore=tests/diffusion/models",
+        "-m",
+        "core_model and cpu",
+    ]
+
+
 def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
     lane_definitions = []
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
