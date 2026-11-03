@@ -1614,6 +1614,9 @@ class CosyVoice3Model(
         # Packed Flow owns the torch estimator; speaker TRT remains independent.
         if cosyvoice3_packed_inference_enabled():
             return
+        # Explicit padded compilation owns this estimator; speaker TRT is independent.
+        if getattr(self.config, "cosyvoice3_compile_dit", False):
+            return
         if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
             return
         onnx_path = self._resolve_flow_estimator_onnx()

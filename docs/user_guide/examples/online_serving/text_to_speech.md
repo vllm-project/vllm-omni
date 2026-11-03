@@ -225,11 +225,15 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 \
 
 This option defaults to `false`, preserves the selected attention backend, and compiles only the padded DiT estimator after loading its weights. CUDA with CUDNN_ATTN, FLASH_ATTN, or TORCH_SDPA is required; CPU and the separately compiled packed Flow profiles reject this option. HiFT and the Talker are unchanged. It is independent of speculative decoding and introduces no environment variable.
 
-Compilation occurs on first use, so warm up representative request batches and mel lengths before measuring serving latency. The default `torch.compile` automatic-dynamic policy can recompile when shapes change; warmup for one shape does not cover every future length. Use `TORCH_LOGS=recompiles` to check recompilation and fallback on the deployment workload, and measure cold-start latency separately. This experimental option is not waveform-equivalent to the eager path: finite-precision changes can affect generated audio, and a small automatic quality screen does not establish equivalence for all inputs. End-to-end throughput and average first-audio latency improved in the measured short-text workload, but tail latency was variable. Validate audio quality and latency for your deployment before enabling it.
+Selecting `cosyvoice3_compile_dit=true` keeps the PyTorch Flow estimator and prevents its lazy replacement by TensorRT, even when `COSYVOICE3_TRT=1` (the default). This precedence affects only the Flow estimator; the independent speaker-embedding TensorRT path retains its existing setting. With compilation disabled, the existing TensorRT selection is unchanged.
+
+Compilation occurs on first use, so warm up representative request batches and mel lengths before measuring serving latency. The default `torch.compile` automatic-dynamic policy can recompile when shapes change; warmup for one shape does not cover every future length. Use `TORCH_LOGS=recompiles` to check recompilation and fallback on the deployment workload, and measure cold-start latency separately. This experimental option is not waveform-equivalent to the eager path: finite-precision changes can affect generated audio, and a small automatic quality screen does not establish equivalence for all inputs. To measure its contribution, compare the same V2 deployment with compilation disabled and enabled; a combined V1-to-V2 deployment result does not isolate this option. Validate audio quality and latency for your deployment before enabling it.
 
 ### Optional DSpark speculative decoding
 
 CosyVoice3 can use vLLM's DSpark drafter on the Talker stage with Model Runner V2 and tensor parallel size 1. This is opt-in and requires a compatible CosyVoice3 DSpark checkpoint; do not configure the drafter on Code2Wav. Convert the checkpoint's unified vocabulary to the speech vocabulary before serving:
+
+The public checkpoint used for validation is [yuekai/cosyvoice3_llm_dspark](https://huggingface.co/yuekai/cosyvoice3_llm_dspark) at revision `0b1b28dbb751bac3b74eea5dcc11e0570c91563b`. Download that revision as `/path/to/dspark-checkpoint`, then use the conversion below; the raw unified-vocabulary checkpoint is not the serving-ready speech-vocabulary directory.
 
 ```bash
 python -m vllm_omni.entrypoints.convert_cosyvoice3_dspark \
