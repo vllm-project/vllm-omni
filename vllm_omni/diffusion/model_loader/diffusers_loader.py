@@ -1405,6 +1405,10 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         # and a swap silently drops the sharing. Skip the modules that own them.
         shared_data_ptrs = {name: params_by_name[name].data_ptr() for name in shared}
         shared_module_names = frozenset(name.rsplit(".", 1)[0] for name in shared)
+        shared_set = set(shared)
+        for full_name in params_by_name:
+            if full_name.rsplit(".", 1)[0] in shared_module_names and full_name not in shared_set:
+                raise ValueError(f"shared-backbone module owns a non-shared param: {full_name}")
 
         # Mark shared params as planned and drop checkpoint keys that feed them.
         # disallow_weights is a backstop that fails loudly if the predicate
