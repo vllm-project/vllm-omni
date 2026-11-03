@@ -132,3 +132,10 @@ def test_decode_capable_roles_may_export_latents_before_decoding(role):
 )
 def test_legacy_role_resolution_is_preserved(stage_role, model_stage, expected):
     assert resolve_diffusion_stage_role(stage_role, model_stage) is expected
+
+
+@pytest.mark.parametrize("operator", [DiffusionStageOperator.STEP_PREPARE, DiffusionStageOperator.STEP_FINALIZE])
+def test_boundary_selector_has_no_concrete_stage_permissions(operator):
+    with pytest.raises(ValueError, match="Resolve boundary selector"):
+        _ = operator.required_stages
+    assert all(operator not in role.allowed_operators for role in DiffusionStageRole)

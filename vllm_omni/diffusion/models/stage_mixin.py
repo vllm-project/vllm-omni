@@ -48,6 +48,14 @@ class DiffusionStageMixin:
 
     def initialize_stage_execution(self, *, step_execution: bool | None = None) -> None:
         """Validate deployment requirements without restricting role permissions."""
+        forward_name = self._stage_operator_methods.get(DiffusionStageOperator.FORWARD)
+        if (
+            forward_name is not None
+            and getattr(getattr(self, forward_name, None), "__func__", None) is DiffusionStageMixin.forward
+        ):
+            raise TypeError(
+                "FORWARD cannot map to DiffusionStageMixin.forward; override it or use default composition."
+            )
         if step_execution is None:
             od_config = getattr(self, "od_config", None)
             step_execution = bool(
@@ -164,6 +172,8 @@ class DiffusionStageMixin:
     def _run_request_operator(
         self, batch: DiffusionRequestBatch, operator: DiffusionStageOperator, **kwargs: Any
     ) -> list[DiffusionOutput]:
+        if not batch.requests:
+            return []
         plan = self._request_operator_plan(operator)
         if plan:
             for op in plan:

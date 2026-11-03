@@ -286,7 +286,9 @@ class DiffusionStageOperator(str, Enum):
 
     @property
     def required_stages(self) -> frozenset[DiffusionStage]:
-        """Return the stage permissions required by this operation."""
+        """Return concrete operation permissions after resolving boundary selectors."""
+        if self.is_boundary_selector:
+            raise ValueError(f"Resolve boundary selector {self.value!r} before checking required stages.")
         return _OPERATOR_REQUIRED_STAGES[self]
 
     @property
@@ -321,12 +323,10 @@ _OPERATOR_REQUIRED_STAGES: dict[DiffusionStageOperator, frozenset[DiffusionStage
     DiffusionStageOperator.DECODE: frozenset({DiffusionStage.DECODE}),
     DiffusionStageOperator.PREPARE_ENCODE: frozenset({DiffusionStage.ENCODE, DiffusionStage.DENOISE}),
     DiffusionStageOperator.PREPARE_DENOISE: frozenset({DiffusionStage.DENOISE}),
-    DiffusionStageOperator.STEP_PREPARE: frozenset({DiffusionStage.DENOISE}),
     DiffusionStageOperator.DENOISE_STEP: frozenset({DiffusionStage.DENOISE}),
     DiffusionStageOperator.STEP_SCHEDULER: frozenset({DiffusionStage.DENOISE}),
     DiffusionStageOperator.STEP_OUTPUT: frozenset({DiffusionStage.DENOISE}),
     DiffusionStageOperator.POST_DECODE: frozenset({DiffusionStage.DECODE}),
-    DiffusionStageOperator.STEP_FINALIZE: frozenset({DiffusionStage.DENOISE}),
 }
 
 

@@ -487,3 +487,22 @@ def test_request_pipeline_does_not_gain_step_support_from_stage_dispatch():
 
     with pytest.raises(TypeError, match="required step-execution methods"):
         pipeline.initialize_stage_execution(step_execution=True)
+
+
+@pytest.mark.parametrize("role", list(DiffusionStageRole))
+def test_empty_stage_request_batch_returns_without_model_calls(role):
+    pipeline = _ComposedRequestPipeline(role)
+    assert pipeline.run_stage(DiffusionRequestBatch(requests=[])) == []
+    assert pipeline.calls == []
+
+
+@pytest.mark.parametrize("method_name", ["forward", "forward_alias"])
+def test_explicit_forward_mapping_rejects_recursive_mixin_entrypoint(method_name):
+    class RecursivePipeline(DiffusionStageMixin):
+        _stage_operator_methods = {DiffusionStageOperator.FORWARD: method_name}
+        forward_alias = DiffusionStageMixin.forward
+
+    pipeline = RecursivePipeline()
+    pipeline.stage_role = DiffusionStageRole.FULL
+    with pytest.raises(TypeError, match="FORWARD cannot map"):
+        pipeline.initialize_stage_execution()
