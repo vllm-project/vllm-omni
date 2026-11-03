@@ -18,6 +18,7 @@ from vllm_omni.diffusion.models.physis.common import (
     validate_physis_parallel_config,
     validate_physis_request,
 )
+from vllm_omni.diffusion.models.taomate_h3.cuda_graph import GraphedForward
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     get_wan22_post_process_func as get_wan22_post_process_func,
 )
@@ -68,6 +69,51 @@ class PhysisStageWanTransformer(StageWanTransformer):
         self._physis_layer = 0
         self._physis_latent = None
         self._physis_rope = {}
+        self._post_self_graphs = {}
+
+    def load_weights(self, weights):
+        for graph in self._post_self_graphs.values():
+            graph.clear()
+        self._post_self_graphs.clear()
+        return super().load_weights(weights)
+
+    def _enable_post_self_graphs(self):
+        owner = self
+
+        def bind(index, original):
+            module = torch.nn.Module()
+            module.forward = original
+
+            def forward(hidden_states, encoder_hidden_states, c_scale_msa, c_shift_msa, c_gate_msa):
+                if owner._physis_chunk == 0:
+                    return original(hidden_states, encoder_hidden_states, c_scale_msa, c_shift_msa, c_gate_msa)
+                graph = owner._post_self_graphs.get(index)
+                if graph is None:
+                    graph = GraphedForward(
+                        module,
+                        device=hidden_states.device,
+                        max_entries=1,
+                        warmup_iters=2,
+                        group=None,
+                        name=f"physis_wan.post_self.{index}",
+                    )
+                    owner._post_self_graphs[index] = graph
+                output = graph(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    c_scale_msa=c_scale_msa,
+                    c_shift_msa=c_shift_msa,
+                    c_gate_msa=c_gate_msa,
+                )
+                if not graph.enabled or graph.eager_calls:
+                    raise RuntimeError("Wan post-self graph capture/replay fell back to eager")
+                return output
+
+            return forward
+
+        for index in range(self.start_layer, self.end_layer):
+            block = self._wan.blocks[index]
+            block._post_self_attention = bind(index, block._post_self_attention)
 
     @staticmethod
     def _use_fp32_modulation(norm):
@@ -175,6 +221,8 @@ class PhysisWanPipeline(CausVidWanPipeline):
             raise ValueError("Physis Wan requires step_replicas=4 and a PP world size divisible by 4 (at least 4 GPUs)")
         super().__init__(od_config=od_config, prefix=prefix)
         self.profile = profile
+        if profile_name == "wan22_5b" and self.transformer.layer_groups == 1:
+            self.transformer._enable_post_self_graphs()
         self.latent_shape = shape
         self.default_chunks = chunks
         self._default_denoise = 4

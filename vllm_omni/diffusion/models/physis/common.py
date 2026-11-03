@@ -93,6 +93,7 @@ def build_physis_cell_plan(
             step_replicas=step_replicas,
             layer_groups=layer_groups,
             ordering=Ordering.SAME_STEP,
+            external_sink=True,
             kv_history_chunks=18,
             blocks=blocks,
             blocks_per_rank=blocks_per_rank,

@@ -169,7 +169,7 @@ class PhysisLTXPipeline(CausVidWanPipeline):
                     attention_mask=tokens.attention_mask,
                     output_hidden_states=True,
                 ).hidden_states
-                stacked = torch.stack(hidden, dim=-1).flatten(2, 3).to(torch.bfloat16)
+                stacked = torch.stack(hidden, dim=0).permute(1, 2, 3, 0).flatten(2, 3).to(torch.bfloat16)
                 video, _, mask = self.connectors(stacked, tokens.attention_mask, padding_side="left")
                 encoded = video[:, mask[0].bool()].float().to(device)
             shape = torch.tensor(encoded.shape, device=device, dtype=torch.long)
