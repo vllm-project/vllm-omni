@@ -130,11 +130,14 @@ class MiniCPMO45DuplexPolicy:
     def audio_token_count(cls, sample_count: int) -> int:
         """Audio embedding count for a clip of ``sample_count`` samples.
 
-        Matches the whole-clip encoder math (hop 160 mel frames -> CNN stride 2
-        -> avg-pool 5) for any multiple of ``SAMPLES_PER_AUDIO_TOKEN``; serving
-        normalizes clips to that boundary before this is used for budgets.
+        The feature extractor's attention mask counts a partial 160-sample
+        frame. The stride-2 CNN rounds up again, then stride-5 pooling rounds
+        down. Keeping these boundaries avoids cropping reference audio just
+        to make the scheduler's token budget exact.
         """
-        return max(0, int(sample_count) // cls.SAMPLES_PER_AUDIO_TOKEN)
+        mel_frames = (max(0, int(sample_count)) + 159) // 160
+        cnn_frames = (mel_frames + 1) // 2
+        return cnn_frames // 5
 
     @staticmethod
     def session_context_texts(

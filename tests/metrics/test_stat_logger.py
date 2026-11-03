@@ -4,18 +4,23 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, Mock
+import multiprocessing
+from contextlib import suppress
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from prometheus_client import REGISTRY, CollectorRegistry, generate_latest
+from prometheus_client import REGISTRY, CollectorRegistry, generate_latest, multiprocess
 from vllm.config import ModelConfig, ObservabilityConfig, SpeculativeConfig, VllmConfig
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.stat_logger import (
     _ENGINE_INDEX_MAP,
     OmniPrometheusStatLogger,
@@ -28,8 +33,101 @@ from vllm_omni.metrics.stat_logger import (
     _RelabelHistogram,
     _rewrite_labelnames,
 )
+from vllm_omni.outputs import StagePostWarmupMemoryStats
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _publish_memory_snapshots(connection):
+    # Spawn imports Prometheus after inheriting PROMETHEUS_MULTIPROC_DIR,
+    # matching API frontend startup. Only publication time is controlled.
+    logger = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+    logger._omni_per_engine_labelvalues = {index: ["m", "1", str(index)] for index in (0, 1)}
+    logger._init_stage_post_warmup_memory_families()
+    while (command := connection.recv()) is not None:
+        engine_idx, allocated, reserved, timestamp = command
+        with patch("prometheus_client.metrics.time.time", return_value=timestamp):
+            logger.record_stage_post_warmup_memory(
+                StagePostWarmupMemoryStats(allocated_bytes=allocated, reserved_bytes=reserved),
+                engine_idx=engine_idx,
+            )
+        connection.send("recorded")
+    connection.close()
+
+
+def test_memory_snapshots_aggregate_shared_frontends(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    context = multiprocessing.get_context("spawn")
+    frontends = []
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry, path=str(tmp_path))
+
+    def start_frontend():
+        parent, child = context.Pipe()
+        process = context.Process(target=_publish_memory_snapshots, args=(child,))
+        process.start()
+        child.close()
+        frontends.append((process, parent))
+        return process, parent
+
+    def publish(frontend, replica, allocated, reserved, timestamp):
+        process, connection = frontend
+        connection.send((replica, allocated, reserved, timestamp))
+        assert connection.poll(45), f"Snapshot writer did not reply (exitcode={process.exitcode})"
+        assert connection.recv() == "recorded"
+
+    def assert_snapshots(expected, families=None):
+        names = (defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES, defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES)
+        families = registry.collect() if families is None else families
+        samples = [sample for family in families for sample in family.samples if sample.name in names]
+        assert len(samples) == 2 * len(expected)
+        for sample in samples:
+            replica = int(sample.labels["replica"])
+            assert sample.labels == {"model_name": "m", "stage": "1", "replica": str(replica)}
+            assert sample.value == expected[replica][names.index(sample.name)]
+
+    try:
+        first, second = start_frontend(), start_frontend()
+        assert first[0].pid != second[0].pid
+        publish(first, 0, 101, 103, 1)
+        publish(second, 0, 101, 103, 2)
+        assert_snapshots({0: (101, 103)})
+
+        # The latest observation may be smaller; neither sum nor max is valid.
+        publish(second, 0, 11, 13, 3)
+        publish(first, 1, 17, 19, 4)
+        assert_snapshots({0: (11, 13), 1: (17, 19)})
+
+        # Collection order must not replace a newer observation with an older one.
+        publish(first, 0, 101, 103, 2)
+        files = sorted(str(path) for path in tmp_path.glob("gauge_*.db"))
+        for order in (files, files[::-1]):
+            assert_snapshots(
+                {0: (11, 13), 1: (17, 19)},
+                multiprocess.MultiProcessCollector.merge(order),
+            )
+
+        # API process exit does not retire the shared GPU worker's snapshot.
+        second[1].send(None)
+        second[0].join(timeout=10)
+        assert second[0].exitcode == 0
+        multiprocess.mark_process_dead(second[0].pid, path=str(tmp_path))
+        assert_snapshots({0: (11, 13), 1: (17, 19)})
+
+        replacement = start_frontend()
+        publish(replacement, 0, 23, 29, 5)
+        assert_snapshots({0: (23, 29), 1: (17, 19)})
+    finally:
+        for process, connection in frontends:
+            if process.is_alive():
+                with suppress(BrokenPipeError):
+                    connection.send(None)
+                process.join(timeout=10)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=10)
+            connection.close()
+            process.close()
 
 
 @pytest.fixture(autouse=True)
@@ -379,6 +477,116 @@ class TestOmniPrometheusStatLogger:
 
         assert dict(_ENGINE_INDEX_MAP) == srm
         assert 99 not in _ENGINE_INDEX_MAP  # old entry was cleared
+
+    def test_record_stage_post_warmup_memory_updates_values(self, registry):
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl._omni_per_engine_labelvalues = {3: ["m", "1", "0"]}
+        sl._init_stage_post_warmup_memory_families(registry)
+
+        sl.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(
+                allocated_bytes=11,
+                reserved_bytes=13,
+            ),
+            engine_idx=3,
+        )
+
+        labels = {"model_name": "m", "stage": "1", "replica": "0"}
+        assert registry.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES, labels) == 11
+        assert registry.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES, labels) == 13
+
+    def test_stage_post_warmup_memory_families_register_only_with_logger(self, registry):
+        metric_name = defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES
+        assert metric_name not in generate_latest(registry).decode()
+
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl._init_stage_post_warmup_memory_families(registry)
+
+        assert f"# HELP {metric_name}" in generate_latest(registry).decode()
+
+    def test_stage_post_warmup_memory_families_reused_on_logger_recreation(self, monkeypatch, registry):
+        init_families = OmniPrometheusStatLogger._init_stage_post_warmup_memory_families
+        monkeypatch.setattr(
+            OmniPrometheusStatLogger,
+            "_init_stage_post_warmup_memory_families",
+            lambda self: init_families(self, registry),
+        )
+
+        def init_upstream(self, vllm_config, engine_indexes):
+            self.per_engine_labelvalues = {idx: ["m", str(idx)] for idx in engine_indexes}
+
+        monkeypatch.setattr(PrometheusStatLogger, "__init__", init_upstream)
+        stage_replica_map = {0: ("1", "0")}
+
+        first = OmniPrometheusStatLogger(SimpleNamespace(), stage_replica_map)
+        second = OmniPrometheusStatLogger(SimpleNamespace(), stage_replica_map)
+
+        assert first._stage_post_warmup_memory_allocated_family is second._stage_post_warmup_memory_allocated_family
+
+    def test_record_stage_post_warmup_memory_preserves_replica_values(self, registry):
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl._omni_per_engine_labelvalues = {
+            0: ["m", "1", "0"],
+            1: ["m", "1", "1"],
+        }
+        sl._init_stage_post_warmup_memory_families(registry)
+
+        sl.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(allocated_bytes=11, reserved_bytes=12),
+            engine_idx=0,
+        )
+        sl.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(allocated_bytes=13, reserved_bytes=14),
+            engine_idx=0,
+        )
+        sl.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(allocated_bytes=17, reserved_bytes=18),
+            engine_idx=1,
+        )
+
+        replica_0 = {"model_name": "m", "stage": "1", "replica": "0"}
+        replica_1 = {"model_name": "m", "stage": "1", "replica": "1"}
+        assert registry.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES, replica_0) == 13
+        assert registry.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES, replica_1) == 17
+
+    def test_remove_stage_post_warmup_memory_preserves_slots_and_other_replicas(self, stats_config):
+        sl = OmniPrometheusStatLogger(stats_config, {0: ("0", "0"), 1: ("0", "1")})
+        iteration = IterationStats()
+        iteration.num_generation_tokens = 7
+        sl.record(None, iteration, engine_idx=0)
+        for engine_idx in (0, 1):
+            sl.record_stage_post_warmup_memory(
+                StagePostWarmupMemoryStats(allocated_bytes=11, reserved_bytes=13),
+                engine_idx=engine_idx,
+            )
+
+        sl.remove_stage_post_warmup_memory(engine_idx=0)
+        sl.remove_stage_post_warmup_memory(engine_idx=0)
+        sl.remove_stage_post_warmup_memory(engine_idx=99)
+
+        removed = {"model_name": "test-model", "stage": "0", "replica": "0"}
+        retained = removed | {"replica": "1"}
+        for metric, value in (
+            (defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES, 11),
+            (defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES, 13),
+        ):
+            assert REGISTRY.get_sample_value(metric, removed) is None
+            assert REGISTRY.get_sample_value(metric, retained) == value
+        assert sl.stage_replica_map == {0: ("0", "0"), 1: ("0", "1")}
+        assert sl.per_engine_labelvalues[0] == ["test-model", "0", "0"]
+        assert REGISTRY.get_sample_value("vllm:generation_tokens_total", removed) == 7
+
+        sl.remove_stage_post_warmup_memory(engine_idx=1)
+        exposition = generate_latest(REGISTRY).decode()
+        assert f"# HELP {defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES}" in exposition
+        assert f"# HELP {defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES}" in exposition
+        sl.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(allocated_bytes=17, reserved_bytes=19),
+            engine_idx=0,
+        )
+        assert REGISTRY.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_ALLOCATED_BYTES, removed) == 17
+        assert REGISTRY.get_sample_value(defs.STAGE_POST_WARMUP_MEMORY_RESERVED_BYTES, removed) == 19
+        sl.remove_stage_post_warmup_memory(engine_idx=0)
 
 
 # ---------------------------------------------------------------------------

@@ -13,12 +13,19 @@ libstdc++, image dependency, AITER core, Torch, and ROCm identity.
 The artifact service, rather than a PR-writable shared filesystem, owns the
 cross-build provenance boundary. A consumer accepts artifacts only from:
 
+* the current build, only when ``VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP`` names a
+  step with exactly one finished script job that exited 0. The download is
+  scoped to that job. Ordinary discovery still ignores the current build, so
+  the publisher cannot restore its own in-progress upload; or
 * an earlier build of the same PR, head commit, merge base, and checkout; or
 * a non-PR Buildkite build of the exact trusted commit on ``main``, or on the
   current release line (``release/vX.Y.Z``) when this build is itself a non-PR
-  release-line push. The release line is tried first so a later push reuses
-  the previous release-line module; ``main`` remains the fallback for the
-  first build after the branch is cut.
+  release-line push; or
+* a recent non-PR build on those trusted branches whose published ABI identity
+  matches this runtime. The ``.so`` is produced by AITER inside the ROCm image,
+  so the identity hash—not the Omni merge-base SHA—is the compatibility gate.
+  Exact trusted-commit sources are tried first; ABI-compatible recent main
+  (or release-line) publishes fill the gap when the merge-base never published.
 
 Every consumer receives a writable job-local copy. Checksums, ``gfx942``
 device code, runtime ABI identity, Buildkite source metadata, and the recorded
@@ -62,6 +69,8 @@ SCHEMA = "3"
 TRUSTED_REPOSITORY = "vllm-project/vllm-omni"
 BUILDKITE_PIPELINE_URL = "https://buildkite.com/vllm/vllm-omni-amd-ci"
 BUILDKITE_PIPELINE_SLUG = "vllm-omni-amd-ci"
+SAME_BUILD_STEP_ENV = "VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP"
+_STEP_KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 KEY_FIELDS = (
     "schema",
     "module",
@@ -110,6 +119,8 @@ class BuildSource:
     branch: str
     pull_request: str
     exact_checkout: bool
+    # Set only for the verified same-build publisher. Empty for historical sources.
+    job_id: str = ""
 
 
 def log(message: str) -> None:
@@ -521,6 +532,18 @@ def _source_from_details(
     return BuildSource(build_id, number, commit, branch, pull_request, exact_checkout)
 
 
+def _build_numbers_from_listing(listing: str) -> list[int]:
+    return list(
+        dict.fromkeys(
+            int(value)
+            for value in re.findall(
+                rf'href="/vllm/{re.escape(BUILDKITE_PIPELINE_SLUG)}/builds/([0-9]+)"',
+                listing,
+            )
+        )
+    )
+
+
 def discover_build_sources(
     *,
     branch: str,
@@ -535,24 +558,16 @@ def discover_build_sources(
     query = urllib.parse.urlencode({"branch": branch, "commit": commit})
     try:
         listing = fetch(f"{BUILDKITE_PIPELINE_URL}/builds?{query}")
-    except (OSError, UnicodeError, ValueError, urllib.error.URLError) as exc:
-        log(f"could not query Buildkite artifacts for {commit[:12]}: {exc}")
+    except (OSError, UnicodeError, ValueError, urllib.error.URLError):
+        # Commit, branch, and exception text can contain sensitive values.
+        log("could not query exact Buildkite artifact candidates")
         return []
-    numbers = list(
-        dict.fromkeys(
-            int(value)
-            for value in re.findall(
-                rf'href="/vllm/{re.escape(BUILDKITE_PIPELINE_SLUG)}/builds/([0-9]+)"',
-                listing,
-            )
-        )
-    )
     sources: list[BuildSource] = []
-    for number in numbers[:10]:
+    for number in _build_numbers_from_listing(listing)[:10]:
         try:
             details = json.loads(fetch(f"{BUILDKITE_PIPELINE_URL}/builds/{number}.json"))
-        except (json.JSONDecodeError, OSError, UnicodeError, ValueError, urllib.error.URLError) as exc:
-            log(f"could not verify Buildkite build #{number}: {exc}")
+        except (json.JSONDecodeError, OSError, UnicodeError, ValueError, urllib.error.URLError):
+            log(f"could not verify Buildkite build #{number}")
             continue
         if not isinstance(details, dict):
             continue
@@ -562,6 +577,53 @@ def discover_build_sources(
             branch=branch,
             pull_request=pull_request,
             exact_checkout=exact_checkout,
+        )
+        if source is not None and source.build_id != current_build_id:
+            sources.append(source)
+    return sources
+
+
+def discover_recent_branch_sources(
+    *,
+    branch: str,
+    current_build_id: str,
+    limit: int = 15,
+    fetch: Callable[[str], str] = _fetch_text,
+) -> list[BuildSource]:
+    """Return recent non-PR builds on ``branch`` for ABI-compatible fallback.
+
+    Used when the exact trusted merge-base never published (common right after
+    an ROCm image ABI change). Callers still verify identity and provenance.
+    """
+    if not branch or limit <= 0:
+        return []
+    query = urllib.parse.urlencode({"branch": branch})
+    try:
+        listing = fetch(f"{BUILDKITE_PIPELINE_URL}/builds?{query}")
+    except (OSError, UnicodeError, ValueError, urllib.error.URLError):
+        # The branch and exception may contain credentials or other secrets.
+        log("could not query recent trusted-branch Buildkite builds")
+        return []
+    sources: list[BuildSource] = []
+    for number in _build_numbers_from_listing(listing)[:limit]:
+        try:
+            details = json.loads(fetch(f"{BUILDKITE_PIPELINE_URL}/builds/{number}.json"))
+        except (json.JSONDecodeError, OSError, UnicodeError, ValueError, urllib.error.URLError):
+            log(f"could not verify recent Buildkite build #{number}")
+            continue
+        if not isinstance(details, dict):
+            continue
+        commit = str(details.get("commit_id") or "")
+        if not _SHA_PATTERN.fullmatch(commit):
+            continue
+        if _pull_request(details.get("pull_request")):
+            continue
+        source = _source_from_details(
+            details,
+            commit=commit,
+            branch=branch,
+            pull_request="",
+            exact_checkout=False,
         )
         if source is not None and source.build_id != current_build_id:
             sources.append(source)
@@ -579,6 +641,89 @@ def _trusted_branches(branch: str, pull_request: str) -> tuple[str, ...]:
     return ("main",)
 
 
+def _passed_publisher_job(records: Any, step_key: str) -> Mapping[str, Any] | None:
+    """Return the one finished publisher job, or nothing when the set is ambiguous."""
+    if not isinstance(records, list):
+        return None
+    matches: list[Mapping[str, Any]] = []
+    for job in records:
+        if not isinstance(job, dict) or job.get("retried_at"):
+            continue
+        job_id = job.get("id")
+        if (
+            job.get("type") == "script"
+            and job.get("step_key") == step_key
+            and job.get("state") == "finished"
+            and job.get("exit_status") == 0
+            and job.get("passed") is True
+            and job.get("soft_failed") is False
+            and isinstance(job_id, str)
+            and job_id
+            and not any(character.isspace() for character in job_id)
+        ):
+            matches.append(job)
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def verified_same_build_source(
+    env: Mapping[str, str],
+    *,
+    fetch: Callable[[str], str] = _fetch_text,
+) -> BuildSource | None:
+    """Return the current build only after its named publisher job exits 0.
+
+    Default discovery excludes ``BUILDKITE_BUILD_ID`` so a job cannot restore
+    an upload from a sibling that is still running. Callers opt in with
+    ``VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP``. A missing, failed, soft-failed,
+    or duplicated publisher leaves the current build excluded.
+    """
+    step_key = env.get(SAME_BUILD_STEP_ENV, "")
+    number = env.get("BUILDKITE_BUILD_NUMBER", "")
+    current_build_id = env.get("BUILDKITE_BUILD_ID", "")
+    if not _STEP_KEY_PATTERN.fullmatch(step_key) or not number.isdigit() or not current_build_id:
+        return None
+    commit = source_commit(env)
+    branch = env.get("BUILDKITE_BRANCH", "")
+    pull_request = env.get("BUILDKITE_PULL_REQUEST", "")
+    if pull_request in ("", "false"):
+        pull_request = ""
+    try:
+        details = json.loads(fetch(f"{BUILDKITE_PIPELINE_URL}/builds/{number}.json"))
+        jobs_payload = json.loads(fetch(f"{BUILDKITE_PIPELINE_URL}/builds/{number}/data/jobs"))
+    except (json.JSONDecodeError, OSError, UnicodeError, ValueError, urllib.error.URLError):
+        log("could not verify the same-build AITER publisher")
+        return None
+    if not isinstance(details, dict) or not isinstance(jobs_payload, dict):
+        return None
+    if jobs_payload.get("has_next_page") is not False:
+        log("same-build job listing was truncated; leaving the current build excluded")
+        return None
+    source = _source_from_details(
+        details,
+        commit=commit,
+        branch=branch,
+        pull_request=pull_request,
+        exact_checkout=True,
+    )
+    if source is None or source.build_id != current_build_id:
+        return None
+    publisher = _passed_publisher_job(jobs_payload.get("records"), step_key)
+    if publisher is None:
+        log("same-build AITER publisher is not one passed job; leaving the current build excluded")
+        return None
+    return BuildSource(
+        source.build_id,
+        source.number,
+        source.commit,
+        source.branch,
+        source.pull_request,
+        True,
+        str(publisher["id"]),
+    )
+
+
 def candidate_sources(
     env: Mapping[str, str] | None = None,
     *,
@@ -591,6 +736,7 @@ def candidate_sources(
     if pull_request in ("", "false"):
         pull_request = ""
     current_build_id = values.get("BUILDKITE_BUILD_ID", "")
+    same_build = verified_same_build_source(values, fetch=fetch)
     sources = discover_build_sources(
         branch=branch,
         commit=commit,
@@ -616,7 +762,23 @@ def candidate_sources(
                     fetch=fetch,
                 )
             )
-    return list({source.build_id: source for source in sources}.values())
+        # After an image ABI bump the merge-base often has no publish yet.
+        # Recent non-PR builds on the trusted branches can still restore a
+        # module whose identity matches this runtime.
+        seen = {source.build_id for source in sources}
+        for trusted_branch in _trusted_branches(branch, pull_request):
+            for source in discover_recent_branch_sources(
+                branch=trusted_branch,
+                current_build_id=current_build_id,
+                fetch=fetch,
+            ):
+                if source.build_id not in seen:
+                    sources.append(source)
+                    seen.add(source.build_id)
+    deduped = list({source.build_id: source for source in sources}.values())
+    if same_build is None:
+        return deduped
+    return [same_build, *[source for source in deduped if source.build_id != same_build.build_id]]
 
 
 def source_commit(env: Mapping[str, str] | None = None) -> str:
@@ -708,6 +870,9 @@ def provenance_matches_source(
     if any(provenance[field] != value for field, value in expected.items()):
         log(f"artifact provenance does not match Buildkite build #{source.number}")
         return False
+    if source.job_id and provenance["job_id"] != source.job_id:
+        log(f"artifact job does not match the verified publisher: build #{source.number}")
+        return False
     if source.exact_checkout:
         current_pull_request = values.get("BUILDKITE_PULL_REQUEST", "")
         if current_pull_request in ("", "false"):
@@ -723,16 +888,21 @@ def provenance_matches_source(
         if provenance["checkout_commit"] != checkout or provenance["trusted_commit"] != trusted:
             log(f"artifact is not from the same checkout/base identity: build #{source.number}")
             return False
-    elif (
-        source.branch
-        not in _trusted_branches(
+    else:
+        # Trusted-branch non-PR producers. Exact trusted-commit sources are
+        # preferred in candidate_sources ordering; ABI-compatible recent
+        # main/release publishes are also accepted because AITER compiles the
+        # module from the image stack, not from the Omni merge-base tree.
+        # publication_matches already verified the runtime identity hash.
+        trusted_branches = _trusted_branches(
             values.get("BUILDKITE_BRANCH", ""),
             values.get("BUILDKITE_PULL_REQUEST", ""),
         )
-        or source.pull_request
-        or source.commit != values.get("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT", "")
-    ):
-        return False
+        trusted = values.get("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT", "")
+        if source.branch not in trusted_branches or source.pull_request:
+            return False
+        if not _SHA_PATTERN.fullmatch(trusted):
+            return False
     return True
 
 
@@ -749,17 +919,21 @@ def download_from_source(
     prefix = artifact_prefix(identity)
     with tempfile.TemporaryDirectory(prefix="vllm-omni-aiter-download-") as temporary:
         root = Path(temporary)
+        command = [
+            "buildkite-agent",
+            "artifact",
+            "download",
+            f"{prefix.as_posix()}/*",
+            str(root),
+            "--build",
+            source.build_id,
+        ]
+        if source.job_id:
+            # Buildkite scopes a download to a job ID through --step.
+            command.extend(["--step", source.job_id])
         try:
             completed = runner(
-                [
-                    "buildkite-agent",
-                    "artifact",
-                    "download",
-                    f"{prefix.as_posix()}/*",
-                    str(root),
-                    "--build",
-                    source.build_id,
-                ],
+                command,
                 check=False,
                 capture_output=True,
                 text=True,

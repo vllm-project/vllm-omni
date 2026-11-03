@@ -53,3 +53,47 @@ def test_mot_rmsnorm_dispatches_on_xpu_without_an_override():
         norm.forward_xpu(x, text_indices, vae_indices),
         norm.forward_native(x, text_indices, vae_indices),
     )
+
+
+def test_external_registration_preserves_constructor_and_builtin_dispatch(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.layers import custom_op
+
+    platform = SimpleNamespace(
+        **{name: lambda: False for name in ("is_rocm", "is_cuda", "is_npu", "is_xpu", "is_musa")},
+        is_out_of_tree=lambda: True,
+    )
+    monkeypatch.setattr(custom_op, "current_omni_platform", platform)
+    monkeypatch.setattr(CustomOp, "_oot_registry", {})
+
+    class WeightedOp(_NativeOnlyOp):
+        def __init__(self, width):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(width))
+
+        def forward_native(self, x):
+            return x * self.weight
+
+    @WeightedOp.register_oot
+    class ExternalOp(WeightedOp):
+        def forward_oot(self, x):
+            return super().forward_native(x) + 1
+
+    external = WeightedOp(3)
+    assert isinstance(external, ExternalOp)
+    weights = torch.arange(3, dtype=torch.float32)
+    external.load_state_dict({"weight": weights}, strict=True)
+    torch.testing.assert_close(external(torch.ones(3)), weights + 1)
+    torch.testing.assert_close(external.forward_native(torch.ones(3)), weights)
+    torch.testing.assert_close(_NativeOnlyOp()(torch.ones(3)), torch.full((3,), 2.0))
+    unrelated = type("WeightedOp", (_NativeOnlyOp,), {})
+    assert type(unrelated()) is unrelated
+    monkeypatch.setattr(platform, "is_out_of_tree", lambda: False)
+    builtin = WeightedOp(3)
+    assert type(builtin) is WeightedOp
+    torch.testing.assert_close(builtin(torch.ones(3)), torch.ones(3))
+    with pytest.raises(ValueError, match="already registered"):
+        WeightedOp.register_oot(ExternalOp)
+    with pytest.raises(TypeError, match="must inherit"):
+        _NativeOnlyOp.register_oot(torch.nn.Linear)

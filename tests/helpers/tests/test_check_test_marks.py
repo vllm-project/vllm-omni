@@ -178,6 +178,52 @@ def test_hardware_contract_preserves_valid_cpu_and_accelerator_selections(source
     assert check_test_marks.hardware_contract_errors(source) == []
 
 
+def test_hardware_contract_rejects_rocm_and_nvidia_only():
+    source = '@pytest.mark.nvidia_only\n@hardware_test(res={"cuda": "L4", "rocm": "MI325"})\ndef test_kernel(): pass'
+    assert check_test_marks.hardware_contract_errors(source) == ["Conflicting rocm/nvidia_only marks"]
+
+
+def test_hardware_contract_keeps_separate_nvidia_and_rocm_params():
+    source = (
+        "@pytest.mark.parametrize(\n"
+        '    "case",\n'
+        "    [pytest.param(1, marks=pytest.mark.nvidia_only),\n"
+        '     pytest.param(2, marks=hardware_marks(res={"rocm": "MI325"}))],\n'
+        ")\ndef test_kernel(case): pass"
+    )
+    assert check_test_marks.hardware_contract_errors(source) == []
+
+
+def test_hardware_contract_combines_class_and_method_parameter_marks():
+    source = (
+        "@pytest.mark.parametrize(\n"
+        '    "backend",\n'
+        '    [pytest.param("rocm", marks=hardware_marks(res={"rocm": "MI325"}))],\n'
+        ")\nclass TestKernel:\n"
+        "    @pytest.mark.parametrize(\n"
+        '        "dependency",\n'
+        '        [pytest.param("nvidia", marks=pytest.mark.nvidia_only)],\n'
+        "    )\n"
+        "    def test_kernel(self, backend, dependency): pass"
+    )
+    assert check_test_marks.hardware_contract_errors(source) == ["Conflicting rocm/nvidia_only marks"]
+
+
+def test_hardware_contract_combines_stacked_parameter_marks():
+    source = (
+        "@pytest.mark.parametrize(\n"
+        '    "backend",\n'
+        '    [pytest.param("rocm", marks=hardware_marks(res={"rocm": "MI325"}))],\n'
+        ")\n"
+        "@pytest.mark.parametrize(\n"
+        '    "dependency",\n'
+        '    [pytest.param("nvidia", marks=pytest.mark.nvidia_only)],\n'
+        ")\n"
+        "def test_kernel(backend, dependency): pass"
+    )
+    assert check_test_marks.hardware_contract_errors(source) == ["Conflicting rocm/nvidia_only marks"]
+
+
 def test_existing_mixed_cpu_cuda_params_remain_per_item():
     source = check_test_marks.read_test_file("tests/model_executor/models/ming_tts/test_fused_istft.py")
     assert source is not None

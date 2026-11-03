@@ -61,6 +61,7 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     sched._free_request_blocks = MagicMock()
     sched.encoder_cache_manager = MagicMock()
     sched._inflight_prefills = set()
+    sched._outputs_awaiting_stage_payload = {}
     return sched
 
 
@@ -303,7 +304,11 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
     )
 
 
-@pytest.mark.parametrize("processor", [None, talker2code2wav_async_chunk], ids=["no_opt_in", "cosyvoice3"])
+@pytest.mark.parametrize(
+    "processor",
+    [None, talker2code2wav_async_chunk, SimpleNamespace(_requires_full_token_history=True)],
+    ids=["no_opt_in", "cosyvoice3", "full_token_history"],
+)
 @pytest.mark.parametrize("new_token_ids", [[], [42]], ids=["no_tokens", "sampled_token"])
 @pytest.mark.parametrize("omit_chunk_transfer", [False, True], ids=["downstream", "stage0_final"])
 def test_running_decode_step_without_inter_stage_payload_does_not_raise(

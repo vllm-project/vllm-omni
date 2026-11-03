@@ -50,6 +50,9 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 logger = init_logger(__name__)
 
 _DEFAULT_CONTROL_TIMEOUT_S = 10.0
+# A cold engine can spend tens of seconds initializing per-session state before
+# the first open lands; control ops on a live session keep the short budget.
+_DEFAULT_OPEN_TIMEOUT_S = 60.0
 
 
 class DuplexSessionHandle:
@@ -375,7 +378,7 @@ class DuplexOmni(AsyncOmni):
         self,
         config: DuplexSessionConfig | Mapping[str, object] | None = None,
         *,
-        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexSessionHandle:
         """Open an engine-resident session and return its handle.
 

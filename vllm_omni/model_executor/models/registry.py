@@ -267,6 +267,17 @@ _OMNI_MODELS = {
         "ming_tts_audio_vae",
         "MingAudioVAEModel",
     ),
+    ## Ming3 audio
+    "BailingMoeV3AudioForConditionalGeneration": (
+        "ming3_audio",
+        "ming3_audio",
+        "BailingMoeV3AudioForConditionalGeneration",
+    ),
+    "BailingTalker2": (
+        "ming_flash_omni",
+        "ming_flash_omni_talker",
+        "MingFlashOmniTalkerForConditionalGeneration",
+    ),
     ## Ming-3.0-TTS
     # Architecture retained in the public HF checkpoint's config.json.
     "LingV3TTSForConditionalGeneration": (
@@ -333,6 +344,12 @@ _OMNI_MODELS = {
         "gepard",
         "gepard_talker",
         "GepardTalkerForConditionalGeneration",
+    ),
+    ## Kokoro-82M (hexgrad)
+    "KokoroForConditionalGeneration": (
+        "kokoro",
+        "modeling_kokoro",
+        "KokoroForConditionalGeneration",
     ),
     ## audio8_tts (Audio8 TTS Preview 0.6B)
     "Audio8TTSSlowARForConditionalGeneration": (

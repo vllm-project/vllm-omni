@@ -156,7 +156,7 @@ def _read_prompt_selection_log(offset: int) -> str:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params + turn_test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
@@ -349,7 +349,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "npu": "A3", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
