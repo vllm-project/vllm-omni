@@ -55,11 +55,12 @@ COVO_AUDIO_PIPELINE = PipelineConfig(
 # ASR / audio-understanding only: fused_thinker_talker (stage 0) without the
 # code2wav waveform stage. Text-only decoding. This is an evaluation topology for
 # the encoder-bucketing benchmarks (single sequence, greedy), so it is NOT
-# registered in the production pipeline_registry; ``benchmarks/encoder_bucketing_wer.py``
-# registers it via ``register_pipeline`` when ``--thinker-only`` is set.
+# registered in the production pipeline_registry and carries no default deploy
+# YAML under vllm_omni/deploy/; ``benchmarks/encoder_bucketing_wer.py`` registers
+# it via ``register_pipeline`` when ``--thinker-only`` is set and passes
+# ``--deploy-config benchmarks/covo_audio_thinker_only.yaml`` explicitly.
 COVO_AUDIO_THINKER_ONLY_PIPELINE = PipelineConfig(
     model_type="covo_audio_thinker_only",
-    default_deploy_config_name="covo_audio_thinker_only.yaml",
     model_arch="CovoAudioForConditionalGeneration",
     stages=(
         StagePipelineConfig(

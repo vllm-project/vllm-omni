@@ -290,6 +290,35 @@ def test_length_returning_encoder_buckets_losslessly(bucket_env):
         assert out_lens[row].item() == solo_len.item()
 
 
+def test_length_returning_encoder_shim_nontuple_falls_back(bucket_env):
+    """A length-carrying ``_aux_spec`` (learned from a ``(features, lengths)``
+    prime call) must not silently slice a bare-tensor shim output: the wrapper
+    disables and returns the eager (original) result instead."""
+    model = LengthReturningToyModel().cuda()
+    assert install_bucketed_encoders(model) == ["encoder"]
+    wrapper = model.encoder.forward
+
+    feats = make_features()
+    lens = torch.tensor(LENGTHS, dtype=torch.long)
+
+    with torch.inference_mode():
+        # Prime call: the real (features, lengths) output teaches _aux_spec.
+        model.embed_multimodal(audio_features=feats, audio_lens=lens)
+        assert wrapper._aux_spec is not None and wrapper._aux_spec[0] == "lengths"
+
+        eager_features, eager_lens = wrapper._original(feats, lens)
+
+        # A shim that returns a bare tensor (not a (features, lengths) tuple),
+        # which the guarded _tensor_forward must reject rather than slice.
+        wrapper._shim = lambda *args, **kwargs: args[0]
+
+        out = model.embed_multimodal(audio_features=feats, audio_lens=lens)
+
+    assert wrapper._disabled is True
+    torch.testing.assert_close(out[0], eager_features, rtol=0, atol=1e-6)
+    torch.testing.assert_close(out[1], eager_lens, rtol=0, atol=1e-6)
+
+
 def test_module_pattern_env_override(bucket_env, monkeypatch):
     """VLLM_OMNI_AUDIO_BUCKET_MODULES selects which module names wrap."""
     monkeypatch.setenv("VLLM_OMNI_AUDIO_BUCKET_MODULES", r"(?:^|\.)my_frontend$")

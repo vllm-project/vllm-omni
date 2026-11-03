@@ -273,6 +273,12 @@ def main(args) -> None:
     print(f"filtered (over/under-generated): off={filtered_off}, on={filtered_on}")
     print(f"clean clips: {len(clean)}")
 
+    if not clean:
+        # Every clip was filtered as over/under-generated; there is nothing to
+        # score, and WER would divide by zero.
+        print("no clean clips; skipping WER")
+        return
+
     for label, hyp in (("off", off), ("on", on)):
         dist = tot = 0
         for idx in clean:
