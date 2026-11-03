@@ -1076,7 +1076,7 @@ class MiniMaxH3Pipeline(
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
-        transformer_override = od_config.model_paths.get("transformer")
+        transformer_override = (getattr(od_config, "model_paths", None) or {}).get("transformer")
         if transformer_override and bool(getattr(self.parallel_config, "use_hsdp", False)):
             raise ValueError("MiniMax-H3 INT8 ConvRot currently supports tensor parallelism, not HSDP/FSDP.")
         model_root = _resolve_minimax_h3_model_root(
@@ -1162,9 +1162,6 @@ class MiniMaxH3Pipeline(
                     "A Comfy MiniMax-H3 transformer override currently supports one partition at a time; "
                     "start FL2VA or Ref2VA instead of combined mode."
                 )
-            if control_path:
-                # ponytail: fail closed; ControlNet + pruned AdaLN-curve INT8 DiT is unvalidated.
-                raise ValueError("A Comfy INT8 ConvRot transformer does not support H3 ControlNet yet.")
             checkpoint_path = resolve_comfy_checkpoint_path(transformer_override)
             transformer_checkpoint = inspect_comfy_checkpoint(
                 checkpoint_path,

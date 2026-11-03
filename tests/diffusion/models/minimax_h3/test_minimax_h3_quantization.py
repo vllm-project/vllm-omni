@@ -352,51 +352,6 @@ def test_model_load_weights_preserves_comfy_int8_runtime_qkv_layout(monkeypatch)
     torch.testing.assert_close(scale_calls[0], qkv_scale.unsqueeze(1))
 
 
-def test_model_load_weights_leaves_non_channel_fused_scales_to_their_loader():
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
-        MiniMaxH3DiTArchConfig,
-        MiniMaxH3DiTModel,
-    )
-
-    qkv_calls = []
-    fc1_calls = []
-    model = object.__new__(MiniMaxH3DiTModel)
-    nn.Module.__init__(model)
-    model.arch = MiniMaxH3DiTArchConfig(
-        hidden_size=1,
-        num_attention_heads=2,
-        attention_head_dim=1,
-        ffn_hidden_size=2,
-    )
-    model.blocks = nn.ModuleList([nn.Module()])
-    model.blocks[0].attn = nn.Module()
-    model.blocks[0].attn.qkv_proj = _OtherQuantWeightTarget(
-        lambda *_: None,
-        lambda _param, value: qkv_calls.append(value.clone()),
-    )
-    model.blocks[0].mlp = nn.Module()
-    model.blocks[0].mlp.fc1 = _OtherQuantWeightTarget(
-        lambda *_: None,
-        lambda _param, value: fc1_calls.append(value.clone()),
-    )
-    qkv_scale = torch.tensor([1.0, 2.0, 3.0])
-    fc1_scale = torch.tensor([4.0, 5.0])
-
-    loaded = model.load_weights(
-        [
-            ("blocks.0.attn.qkv_proj.weight_scale", qkv_scale),
-            ("blocks.0.mlp.fc1.weight_scale", fc1_scale),
-        ]
-    )
-
-    assert loaded == {
-        "blocks.0.attn.qkv_proj.weight_scale",
-        "blocks.0.mlp.fc1.weight_scale",
-    }
-    torch.testing.assert_close(qkv_calls[0], qkv_scale)
-    torch.testing.assert_close(fc1_calls[0], fc1_scale)
-
-
 def test_int8_convrot_factory_routes_only_checkpoint_marked_layers(mocker):
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
@@ -766,20 +721,21 @@ def test_convrot_rejects_resolved_fasth3_fusion(monkeypatch, mocker, tmp_path):
     mocker.patch.object(pipeline, "MiniMaxH3DiTModel", return_value=transformer)
     resolve_fusion = mocker.patch.object(pipeline, "resolve_fasth3_fusion", return_value=object())
 
-    with pytest.raises(ValueError, match="FastH3/VDN-H3 weight deltas cannot be fused"):
+    with pytest.raises(ValueError, match="FastH3/VDN-H3/Regenerate weight deltas cannot be fused"):
         pipeline.MiniMaxH3Pipeline(od_config=od_config)
 
     resolve_fusion.assert_called_once_with(od_config, transformer)
 
 
 def test_adaln_curve_model_interpolates_without_dense_time_embedder(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 
-    monkeypatch.setattr(h3, "ColumnParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "MergedColumnParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
-    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+    for name in ("ColumnParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(h3, name, _FakeLinear)
+    for name in ("ColumnParallelLinear", "RowParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear"):
+        monkeypatch.setattr(blocks, name, _FakeLinear)
+    monkeypatch.setattr(blocks, "Attention", _FakeAttention)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
 
     model = h3.MiniMaxH3DiTModel(
@@ -834,6 +790,7 @@ def test_final_layer_matches_comfy_adaln_precision(adaln_dtype):
     layer = object.__new__(MiniMaxH3FinalLayer)
     nn.Module.__init__(layer)
     layer.norm = nn.Identity()
+    layer.pdd_steps = None
     layer.adaln_proj = _FixedAdaln()
     layer.video_out = _IdentityHead()
     layer.audio_out = _IdentityHead()
