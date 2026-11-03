@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Nucleus-Image text-to-image curl example
 
 curl -X POST http://localhost:8091/v1/images/generations   -H "Content-Type: application/json"   -d '{

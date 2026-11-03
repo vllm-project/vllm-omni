@@ -24,15 +24,15 @@ bash examples/online_serving/nucleus_image/run_server.sh
 
 ```bash
 # Tensor parallelism
-vllm serve NucleusAI/Nucleus-Image --omni --port 8091   --tensor-parallel-size <tp_size>
+vllm serve NucleusAI/Nucleus-Image --omni --port 8091 --tensor-parallel-size 2
 
 # Ulysses sequence parallelism
-vllm serve NucleusAI/Nucleus-Image --omni --port 8091   --usp <ulysses_degree>
+vllm serve NucleusAI/Nucleus-Image --omni --port 8091 --ulysses-degree 2
 
 # Ring sequence parallelism
-vllm serve NucleusAI/Nucleus-Image --omni --port 8091   --ring <ring_degree>
+vllm serve NucleusAI/Nucleus-Image --omni --port 8091 --ring-degree 2
 
-# Optional FP8 example
+# Optional partial FP8 example (routed expert weights remain in checkpoint precision)
 vllm serve NucleusAI/Nucleus-Image --omni --port 8091   --quantization fp8
 ```
 
@@ -60,7 +60,7 @@ curl -X POST http://localhost:8091/v1/images/generations   -H "Content-Type: app
 ### Method 2: Using Python Client
 
 ```bash
-python examples/online_serving/nucleus_image/openai_chat_client.py   --prompt "A weathered lighthouse on a rocky coastline at golden hour."   --output nucleus_output.png
+python examples/online_serving/text_to_image/openai_chat_client.py --server http://localhost:8091 --prompt "A weathered lighthouse on a rocky coastline at golden hour." --height 1024 --width 1024 --steps 50 --seed 42 --output nucleus_output.png
 ```
 
 ## Generation Parameters
@@ -77,5 +77,7 @@ python examples/online_serving/nucleus_image/openai_chat_client.py   --prompt "A
 ## Notes
 
 - This example focuses on the standard `/v1/images/generations` path.
+- FP8 only quantizes eligible transformer linears; see the
+  [FP8 guide](../../../docs/user_guide/quantization/fp8.md) for the scope.
 - For offline inference, see `examples/offline_inference/nucleus_image/`.
 - For benchmark-oriented commands and H20-specific measurements, see `recipes/NucleusAI/Nucleus-Image.md`.

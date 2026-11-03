@@ -20,6 +20,11 @@ This model currently supports:
 - **SP (Ulysses / Ring)**
 - **Layerwise CPU offload**
 
+Step execution uses the same default guidance scale (`4.0`) as full forward
+and decodes at the aligned dimensions prepared for the request. Ulysses and
+Ring use global expert-choice routing; padding does not participate in
+expert selection.
+
 ## References
 
 - Upstream model card: <https://huggingface.co/NucleusAI/Nucleus-Image>
@@ -31,6 +36,12 @@ This model currently supports:
 ## Hardware Support
 
 This recipe documents a tested CUDA configuration for `2x H20`.
+AMD, Ascend NPU, and Intel GPU execution have not been validated for this model.
+
+FP8 is optional and partial: attention projections, the router, dense MLPs,
+and shared experts are quantizable. Routed SwiGLU expert weights, the text
+encoder, and VAE stay in checkpoint precision. See the
+[FP8 scope guide](../../docs/user_guide/quantization/fp8.md).
 
 ## GPU
 
@@ -45,14 +56,14 @@ This recipe documents a tested CUDA configuration for `2x H20`.
 
 #### Command
 
-**Baseline**
+##### Baseline
 
 ```bash
 vllm serve NucleusAI/Nucleus-Image --omni \
   --port 8091
 ```
 
-**TP=2**
+##### TP=2
 
 ```bash
 vllm serve NucleusAI/Nucleus-Image --omni \
@@ -60,23 +71,23 @@ vllm serve NucleusAI/Nucleus-Image --omni \
   --port 8091
 ```
 
-**USP=2**
+##### USP=2
 
 ```bash
 vllm serve NucleusAI/Nucleus-Image --omni \
-  --usp 2 \
+  --ulysses-degree 2 \
   --port 8091
 ```
 
-**RING=2**
+##### RING=2
 
 ```bash
 vllm serve NucleusAI/Nucleus-Image --omni \
-  --ring 2 \
+  --ring-degree 2 \
   --port 8091
 ```
 
-**Optional layerwise offload variant**
+##### Optional layerwise offload variant
 
 ```bash
 vllm serve NucleusAI/Nucleus-Image --omni \
@@ -99,19 +110,19 @@ curl -X POST http://localhost:8091/v1/images/generations   -H "Content-Type: app
   }' | jq -r '.data[0].b64_json' | base64 -d > output.png
 ```
 
-#### Benchmark Summary
+#### Historical Benchmark Summary
 
-| Metric | Baseline | TP=2 | USP=2 | RING=2 |
-|--------|---------:|-----:|------:|-------:|
-| Latency | 21s | 17s | 16s | 15s |
+These numbers were reported in the original PR before the global MoE routing
+fix. They have not been rerun with the corrected SP path and do not establish
+a speedup or output equivalence for the current implementation.
+
+| Metric  | Baseline | TP=2 | USP=2 | RING=2 |
+|---------|---------:|-----:|------:|-------:|
+| Latency |      21s |  17s |   16s |    15s |
 
 #### Notes
 
 - **Parallel support:** For this model, the currently relevant multi-GPU modes are
-  TP (`--tensor-parallel-size`), USP (`--usp`), and Ring (`--ring`).
-- **Measured result:** On `2x H20`, both SP modes improved latency over
-  the baseline, with `RING=2` giving the best result in this measurement.
-- **Memory behavior:** `TP=2` reduced peak RAM the most in this comparison,
-  while `USP=2` and `RING=2` also improved latency with similar memory usage.
+  TP (`--tensor-parallel-size`), Ulysses (`--ulysses-degree`), and Ring (`--ring`).
 - **Layer offload:** `--enable-layerwise-offload` is supported as an optional
   memory-saving mode when you need extra headroom.

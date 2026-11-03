@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Adapted from https://github.com/huggingface/diffusers.
 
@@ -36,11 +36,12 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 
 logger = init_logger(__name__)
 
@@ -547,24 +548,30 @@ class NucleusMoELayer(nn.Module):
         else:
             scores = F.softmax(logits.float(), dim=-1).to(logits.dtype)
 
+        sp_group = None
+        global_slen = slen
+        if is_forward_context_available() and get_forward_context().sp_active:
+            sp_group = get_sp_group()
+            # Expert choice ranks tokens across the entire image, not each shard.
+            scores = sp_group.all_gather(scores, dim=1)
+            global_slen = get_forward_context().sp_original_seq_len or scores.shape[1]
+            scores = scores[:, :global_slen]
+
         affinity = scores.transpose(1, 2)
-        capacity = max(1, math.ceil(self.capacity_factor * slen / self.num_experts))
+        capacity = min(global_slen, max(1, math.ceil(self.capacity_factor * global_slen / self.num_experts)))
 
         topk = torch.topk(affinity, k=capacity, dim=-1)
         top_indices = topk.indices
         gating = affinity.gather(dim=-1, index=top_indices)
 
-        batch_offsets = torch.arange(bs, device=hidden_states.device, dtype=torch.long).view(bs, 1, 1) * slen
+        batch_offsets = torch.arange(bs, device=hidden_states.device, dtype=torch.long).view(bs, 1, 1) * global_slen
         global_token_indices = (batch_offsets + top_indices).transpose(0, 1).reshape(self.num_experts, -1).reshape(-1)
         gating_flat = gating.transpose(0, 1).reshape(self.num_experts, -1).reshape(-1)
 
-        token_score_sums = torch.zeros(bs * slen, device=hidden_states.device, dtype=gating_flat.dtype)
+        token_score_sums = torch.zeros(bs * global_slen, device=hidden_states.device, dtype=gating_flat.dtype)
         token_score_sums.scatter_add_(0, global_token_indices, gating_flat)
         gating_flat = gating_flat / (token_score_sums[global_token_indices] + 1e-12)
         gating_flat = gating_flat * self.route_scale
-
-        x_flat = hidden_states.reshape(bs * slen, dim)
-        routed_input = x_flat[global_token_indices]
 
         tokens_per_expert = bs * capacity
         num_tokens_per_expert = torch.full(
@@ -573,6 +580,18 @@ class NucleusMoELayer(nn.Module):
             device=hidden_states.device,
             dtype=torch.long,
         )
+        if sp_group is not None:
+            offset = sp_group.rank_in_group * slen
+            local_mask = (top_indices >= offset) & (top_indices < offset + slen)
+            num_tokens_per_expert = local_mask.sum(dim=(0, 2))
+            local_mask_flat = local_mask.transpose(0, 1).reshape(-1)
+            local_batch_offsets = torch.arange(bs, device=hidden_states.device).view(bs, 1, 1) * slen
+            local_indices = (local_batch_offsets + top_indices - offset).transpose(0, 1).reshape(-1)
+            global_token_indices = local_indices[local_mask_flat]
+            gating_flat = gating_flat[local_mask_flat]
+
+        x_flat = hidden_states.reshape(bs * slen, dim)
+        routed_input = x_flat[global_token_indices]
         routed_output = self.experts(routed_input, num_tokens_per_expert)
         routed_output = (routed_output.float() * gating_flat.unsqueeze(-1)).to(hidden_states.dtype)
 
@@ -739,6 +758,7 @@ class NucleusMoEImageTransformerBlock(nn.Module):
         self,
         encoder_hidden_states: torch.Tensor,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cache_source: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not hasattr(self, "_text_kv_cache"):
             self._text_kv_cache = {}
@@ -747,11 +767,12 @@ class NucleusMoEImageTransformerBlock(nn.Module):
         if image_rotary_emb is not None:
             txt_freqs_ptr = image_rotary_emb[1].data_ptr()
 
+        cache_source = encoder_hidden_states if cache_source is None else cache_source
         cache_key = (
-            encoder_hidden_states.data_ptr(),
-            tuple(encoder_hidden_states.shape),
-            str(encoder_hidden_states.dtype),
-            str(encoder_hidden_states.device),
+            cache_source.data_ptr(),
+            tuple(cache_source.shape),
+            str(cache_source.dtype),
+            str(cache_source.device),
             txt_freqs_ptr,
         )
         cached = self._text_kv_cache.get(cache_key)
@@ -967,6 +988,9 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
         timestep = timestep.to(hidden_states.dtype)
         temb = self.time_text_embed(timestep, hidden_states)
 
+        # RMSNorm creates a temporary tensor whose address may be reused for
+        # another CFG branch. Key the KV cache by the persistent input instead.
+        text_cache_source = encoder_hidden_states
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
 
         for block in self.transformer_blocks:
@@ -976,6 +1000,7 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
                 cached_txt_key, cached_txt_value = block._get_cached_text_kv(
                     encoder_hidden_states,
                     image_rotary_emb,
+                    cache_source=text_cache_source,
                 )
             hidden_states = block(
                 hidden_states=hidden_states,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Adapted from https://github.com/huggingface/diffusers.
 
@@ -29,15 +29,17 @@ from vllm_omni.diffusion.models.nucleus_image.nucleus_image_transformer import (
     NucleusMoEImageTransformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 logger = init_logger(__name__)
 
@@ -65,7 +67,10 @@ def get_nucleus_image_post_process_func(
 
     def post_process_func(
         images: torch.Tensor,
+        sampling_params: "OmniDiffusionSamplingParams | None" = None,
     ):
+        if sampling_params is not None and sampling_params.output_type == "latent":
+            return images
         return image_processor.postprocess(images)
 
     return post_process_func
@@ -189,6 +194,7 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         )
 
         self.stage = None
+        self._text_kv_request_ids: tuple[str, ...] = ()
 
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
         self.default_sample_size = 128
@@ -553,11 +559,11 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def prepare_encode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
-    ) -> "DiffusionRequestState":
+    ) -> "StepRequestState":
         sampling = state.sampling
-        prompt, negative_prompt = self._extract_prompts(state.prompts or [])
+        prompt, negative_prompt = self._extract_prompts([state.prompt] if state.prompt is not None else [])
 
         height = sampling.height or self.default_sample_size * self.vae_scale_factor
         width = sampling.width or self.default_sample_size * self.vae_scale_factor
@@ -570,7 +576,7 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             width=width,
             num_inference_steps=sampling.num_inference_steps or 50,
             sigmas=sampling.sigmas,
-            guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 1.0,
+            guidance_scale=sampling.guidance_scale if sampling.guidance_scale_provided else 4.0,
             num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
             generator=sampling.generator,
             max_sequence_length=sampling.max_sequence_length or self.default_max_sequence_length,
@@ -586,12 +592,15 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         state.negative_prompt_embeds = ctx["negative_prompt_embeds"]
         state.negative_prompt_embeds_mask = ctx["negative_prompt_embeds_mask"]
         state.do_true_cfg = ctx["do_true_cfg"]
-        state.true_cfg_scale = ctx["true_cfg_scale"]
+        sampling.true_cfg_scale = ctx["true_cfg_scale"]
+        sampling.cfg_normalize = True
         state.latents = ctx["latents"]
         state.timesteps = ctx["timesteps"]
         state.step_index = 0
         state.scheduler = req_scheduler
         state.img_shapes = ctx["img_shapes"]
+        state.extra["height"] = height
+        state.extra["width"] = width
 
         return state
 
@@ -617,45 +626,52 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def denoise_step(
         self,
-        state: "DiffusionRequestState",
+        input_batch: "InputBatch",
         **kwargs: Any,
     ) -> torch.Tensor | None:
         if self.interrupt:
             return None
 
-        t = state.current_timestep
+        request_ids = tuple(input_batch.request_ids)
+        if request_ids != self._text_kv_request_ids:
+            # InputBatch overwrites embedding buffers when composition/order
+            # changes, so their addresses alone cannot identify cached text KV.
+            self.transformer.reset_text_kv_cache()
+            self._text_kv_request_ids = request_ids
+
+        t = input_batch.timesteps
         self._current_timestep = t
 
         if not torch.is_tensor(t):
-            t = torch.tensor(t, device=state.latents.device, dtype=state.latents.dtype)
+            t = torch.tensor(t, device=input_batch.latents.device, dtype=input_batch.latents.dtype)
 
-        t_for_model = t.expand(state.latents.shape[0]).to(
-            device=state.latents.device,
-            dtype=state.latents.dtype,
+        t_for_model = t.expand(input_batch.latents.shape[0]).to(
+            device=input_batch.latents.device,
+            dtype=input_batch.latents.dtype,
         )
 
         noise_pred = self._predict_noise(
-            state.latents,
-            state.img_shapes,
-            state.prompt_embeds,
-            state.prompt_embeds_mask,
+            input_batch.latents,
+            input_batch.img_shapes,
+            input_batch.prompt_embeds,
+            input_batch.prompt_embeds_mask,
             t_for_model,
             self.attention_kwargs,
         )
-        if state.do_true_cfg:
+        if input_batch.do_true_cfg:
             negative_noise_pred = self._predict_noise(
-                state.latents,
-                state.img_shapes,
-                state.negative_prompt_embeds,
-                state.negative_prompt_embeds_mask,
+                input_batch.latents,
+                input_batch.img_shapes,
+                input_batch.negative_prompt_embeds,
+                input_batch.negative_prompt_embeds_mask,
                 t_for_model,
                 self.attention_kwargs,
             )
             combined_noise_pred = _combine_cfg_noise(
                 noise_pred,
                 negative_noise_pred,
-                state.true_cfg_scale,
-                True,
+                input_batch.true_cfg_scale,
+                input_batch.cfg_normalize,
             )
             noise_pred = combined_noise_pred
 
@@ -665,7 +681,7 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def step_scheduler(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         noise_pred: torch.Tensor,
         **kwargs: Any,
     ) -> None:
@@ -683,20 +699,20 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     def post_decode(
         self,
-        state: "DiffusionRequestState",
+        state: "StepRequestState",
         **kwargs: Any,
     ) -> DiffusionOutput:
         self._current_timestep = None
 
-        height = state.sampling.height or self.default_sample_size * self.vae_scale_factor
-        width = state.sampling.width or self.default_sample_size * self.vae_scale_factor
-        output_type = kwargs.get("output_type", "pil")
+        height = state.extra["height"]
+        width = state.extra["width"]
+        output_type = kwargs.get("output_type") or state.sampling.output_type or "pil"
 
         return self._decode_latents(state.latents, height, width, output_type)
 
     def forward(
         self,
-        req: OmniDiffusionRequest,
+        req: DiffusionRequestBatch,
         prompt: str | list[str] | None = None,
         negative_prompt: str | list[str] | None = None,
         height: int | None = None,
@@ -729,6 +745,7 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         )
         generator = req.sampling_params.generator or generator
         return_index = return_index if return_index is not None else self.default_return_index
+        output_type = req.sampling_params.output_type or output_type or "pil"
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (

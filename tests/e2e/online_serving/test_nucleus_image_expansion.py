@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient, dummy_messages_from_mix_data
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model, pytest.mark.slow]
 
@@ -51,12 +52,13 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_nucleus_image_text_to_image(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_nucleus_image_text_to_image(omni_server: OmniServer, online_client: OnlineOmniClient):
     messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
@@ -71,15 +73,16 @@ def test_nucleus_image_text_to_image(omni_server: OmniServer, openai_client: Ope
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_nucleus_image_high_resolution(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_nucleus_image_high_resolution(omni_server: OmniServer, online_client: OnlineOmniClient):
     messages = dummy_messages_from_mix_data(content_text="A beautiful landscape with mountains and a lake")
     request_config = {
         "model": omni_server.model,
@@ -94,15 +97,16 @@ def test_nucleus_image_high_resolution(omni_server: OmniServer, openai_client: O
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)
 
 
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),
     indirect=True,
 )
-def test_nucleus_image_multiple_outputs(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+def test_nucleus_image_multiple_outputs(omni_server: OmniServer, online_client: OnlineOmniClient):
     messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
@@ -118,4 +122,4 @@ def test_nucleus_image_multiple_outputs(omni_server: OmniServer, openai_client: 
         },
     }
 
-    openai_client.send_diffusion_request(request_config)
+    online_client.send_diffusion_request(request_config)

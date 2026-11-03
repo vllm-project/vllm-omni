@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """End-to-end test for Nucleus-Image text-to-image generation."""
 
 import pytest
 
-from tests.helpers.runtime import OmniRunnerHandler
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OfflineOmniClient
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -29,9 +30,8 @@ pytestmark = [
 ]
 
 
-@pytest.mark.cuda
-@pytest.mark.distributed_cuda(num_cards=2)
-def test_nucleus_image_text_to_image(omni_runner_handler: OmniRunnerHandler) -> None:
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=2)
+def test_nucleus_image_text_to_image(offline_client: OfflineOmniClient) -> None:
     request_config = {
         "model": MODEL,
         "prompt": "A cat holding a sign that says hello world",
@@ -43,4 +43,4 @@ def test_nucleus_image_text_to_image(omni_runner_handler: OmniRunnerHandler) -> 
             seed=42,
         ),
     }
-    omni_runner_handler.send_diffusion_request(request_config)
+    offline_client.send_diffusion_request(request_config)

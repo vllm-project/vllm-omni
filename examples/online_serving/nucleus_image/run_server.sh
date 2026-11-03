@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Nucleus-Image online serving startup script
 
 MODEL="${MODEL:-NucleusAI/Nucleus-Image}"
@@ -13,7 +16,7 @@ if [[ "$TP" != "1" ]]; then
   CMD+=(--tensor-parallel-size "$TP")
 fi
 if [[ "$USP" != "1" ]]; then
-  CMD+=(--usp "$USP")
+  CMD+=(--ulysses-degree "$USP")
 fi
 if [[ -n "$QUANTIZATION" ]]; then
   CMD+=(--quantization "$QUANTIZATION")

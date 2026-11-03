@@ -528,7 +528,11 @@ def initialize_model(
     Raises:
         ValueError: If the model class is not found in the registry.
     """
-    model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+    model_class = (
+        DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+        if od_config.model_class_name is not None
+        else None
+    )
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)
         with set_current_diffusion_config(od_config):

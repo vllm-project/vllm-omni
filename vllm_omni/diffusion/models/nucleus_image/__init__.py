@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """NucleusMoE Image diffusion model components."""
 
 from vllm_omni.diffusion.models.nucleus_image.nucleus_image_transformer import (

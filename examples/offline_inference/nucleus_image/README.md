@@ -11,27 +11,32 @@ For serving-oriented guidance and H20 notes, see the recipe:
 ### Baseline
 
 ```bash
-python examples/offline_inference/nucleus_image/end2end.py   --model NucleusAI/Nucleus-Image   --prompt "A weathered lighthouse on a rocky coastline at golden hour."   --height 1024   --width 1024   --num-inference-steps 50   --guidance-scale 4.0   --output nucleus_baseline.png
+python examples/offline_inference/text_to_image/text_to_image.py --model NucleusAI/Nucleus-Image --prompt "A weathered lighthouse on a rocky coastline at golden hour." --height 1024 --width 1024 --num-inference-steps 50 --guidance-scale 4.0 --output nucleus_baseline.png
 ```
 
 ### Parallelism
 
 ```bash
 # Tensor parallelism
-python examples/offline_inference/nucleus_image/end2end.py   --model NucleusAI/Nucleus-Image   --tensor-parallel-size <tp_size>   --prompt "A cinematic portrait of a red fox in the snow."   --output nucleus_tp.png
+python examples/offline_inference/text_to_image/text_to_image.py --model NucleusAI/Nucleus-Image --tensor-parallel-size 2 --guidance-scale 4.0 --prompt "A cinematic portrait of a red fox in the snow." --output nucleus_tp.png
 
 # Ulysses sequence parallelism
-python examples/offline_inference/nucleus_image/end2end.py   --model NucleusAI/Nucleus-Image   --ulysses-degree <ulysses_degree>   --prompt "A futuristic city skyline at sunrise, volumetric lighting."   --output nucleus_ulysses.png
+python examples/offline_inference/text_to_image/text_to_image.py --model NucleusAI/Nucleus-Image --ulysses-degree 2 --guidance-scale 4.0 --prompt "A futuristic city skyline at sunrise, volumetric lighting." --output nucleus_ulysses.png
 
 # Ring sequence parallelism
-python examples/offline_inference/nucleus_image/end2end.py   --model NucleusAI/Nucleus-Image   --ring-degree <ring_degree>   --prompt "A futuristic city skyline at sunrise, volumetric lighting."   --output nucleus_ring.png
+python examples/offline_inference/text_to_image/text_to_image.py --model NucleusAI/Nucleus-Image --ring-degree 2 --guidance-scale 4.0 --prompt "A futuristic city skyline at sunrise, volumetric lighting." --output nucleus_ring.png
 ```
 
 ### Quantization
 
 ```bash
-python examples/offline_inference/nucleus_image/end2end.py   --model NucleusAI/Nucleus-Image   --quantization fp8   --prompt "A studio product photo of a glass perfume bottle."   --output nucleus_fp8.png
+python examples/offline_inference/text_to_image/text_to_image.py --model NucleusAI/Nucleus-Image --quantization fp8 --guidance-scale 4.0 --prompt "A studio product photo of a glass perfume bottle." --output nucleus_fp8.png
 ```
+
+FP8 quantizes eligible transformer linears only. Routed SwiGLU expert weights
+remain in checkpoint precision, as do the text encoder and VAE. See the
+[FP8 guide](../../../docs/user_guide/quantization/fp8.md) for the exact scope.
+This model does not currently advertise Int8 or GGUF support.
 
 ## Key Arguments
 
