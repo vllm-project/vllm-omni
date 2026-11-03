@@ -28,7 +28,9 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVPar
 from vllm_omni.lora.binding import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
+    detach_moe_lora_context,
     from_layer,
+    moe_lora_kernel_requires_context,
 )
 from vllm_omni.lora.merged_weights import MergedLinearWeights
 from vllm_omni.lora.request import TensorLoRARequest
@@ -1346,6 +1348,21 @@ class LoRAManager:
         moe_wrappers = [ll for ll in self._lora_modules.values() if isinstance(ll, FusedMoEWithLoRA)]
         if not moe_wrappers:
             return
+        if self._active_adapter_id is None:
+            # Some kernels treat a published context as the LoRA enable switch.
+            # Detach it while idle where possible, but retain a mapping for
+            # kernels that require a context to take their no-adapter fast path.
+            needs_context = [
+                layer
+                for layer in moe_wrappers
+                if moe_lora_kernel_requires_context(layer) or not detach_moe_lora_context(layer)
+            ]
+            detached = len(moe_wrappers) - len(needs_context)
+            if detached:
+                logger.debug("Detached idle MoE LoRA context on %d wrapper(s)", detached)
+            if not needs_context:
+                return
+            moe_wrappers = needs_context
         punica = self._get_moe_punica_wrapper()
         mapping, lora_index_to_id = self._moe_token_lora_mapping()
         punica.update_metadata(mapping, lora_index_to_id, 1, 0)

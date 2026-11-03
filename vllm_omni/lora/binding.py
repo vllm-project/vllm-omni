@@ -79,6 +79,36 @@ def _validate_moe_lora_token_capacity(hidden_states: torch.Tensor, max_tokens: i
         )
 
 
+def moe_lora_kernel_requires_context(layer: nn.Module) -> bool:
+    """Whether this wrapper's MoE kernel needs a context with no adapter."""
+    experts = getattr(getattr(layer, "_moe_kernel", None), "fused_experts", None)
+    return callable(getattr(experts, "_batch_has_no_lora", None))
+
+
+def detach_moe_lora_context(layer: nn.Module) -> bool:
+    """Detach an idle LoRA context when the MoE runner supports it.
+
+    Return False when there is no detach hook, allowing the caller to retain a
+    no-adapter mapping for kernels that still require a context.
+    """
+    set_runner_idle = getattr(layer, "_set_diffusion_moe_lora_idle", None)
+    if callable(set_runner_idle):
+        set_runner_idle()
+        return True
+
+    moe_kernel = getattr(layer, "_moe_kernel", None)
+    detached = False
+    for target in (
+        getattr(moe_kernel, "fused_experts", None),
+        getattr(moe_kernel, "prepare_finalize", None),
+    ):
+        set_lora_context = getattr(target, "set_lora_context", None)
+        if callable(set_lora_context):
+            set_lora_context(None)
+            detached = True
+    return detached
+
+
 def _match_target_modules(module_name: str, target_modules: list[str]) -> bool:
     """from vllm/lora/model_manager.py _match_target_modules, helper function"""
     import regex as re
@@ -134,6 +164,13 @@ def from_layer(
             raise RuntimeError("MoE LoRA token capacity was not configured")
         wrapper_cls = _select_moe_lora_wrapper_cls()
         instance = wrapper_cls(layer)
+        publish_to_runner = getattr(layer, "set_lora_context", None)
+        if callable(publish_to_runner):
+
+            def _set_diffusion_moe_lora_idle() -> None:
+                publish_to_runner(None)
+
+            instance._set_diffusion_moe_lora_idle = _set_diffusion_moe_lora_idle  # type: ignore[method-assign]
         buffer_device: list[torch.device | None] = [None]
         _suspended: list[int | None] = [None]
         original_create_lora_weights = instance.create_lora_weights
