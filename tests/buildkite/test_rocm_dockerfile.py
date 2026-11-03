@@ -38,10 +38,11 @@ def test_rocm_base_tracks_cuda_bootstrap_release() -> None:
     assert "@sha256:" in _docker_arg(CUDA_CI_DOCKERFILE, "VLLM_BASE_TAG")
     assert len(_docker_arg(CUDA_CI_DOCKERFILE, "VLLM_PRECOMPILED_WHEEL_COMMIT")) == 40
 
-    cuda_image, _, cuda_release_tag = _docker_arg(CUDA_RELEASE_DOCKERFILE, "BASE_IMAGE").rpartition(":")
+    cuda_base = _docker_arg(CUDA_RELEASE_DOCKERFILE, "BASE_IMAGE").partition("@")[0]
+    cuda_image, _, cuda_release_tag = cuda_base.rpartition(":")
     rocm_base = _docker_arg(ROCM_DOCKERFILE, "BASE_IMAGE")
 
-    image_ref, separator, image_tag = rocm_base.rpartition(":")
+    image_ref, separator, image_tag = rocm_base.partition("@")[0].rpartition(":")
     assert separator, f"expected a tagged ROCm base image, got {rocm_base}"
     assert cuda_image == "vllm/vllm-openai"
     assert image_ref == "vllm/vllm-openai-rocm"
