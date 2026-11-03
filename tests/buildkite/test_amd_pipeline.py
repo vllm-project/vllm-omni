@@ -3143,24 +3143,50 @@ _MINICPMO_MERGE_JOBS = (
 )
 
 
+_MINICPMO_MERGE_ADVANCED_MARKER = "advanced_model and omni and rocm and MI325 and cards_1"
+
+
 def test_minicpmo_merge_jobs_repeat_the_ready_nodes() -> None:
-    """MERGE blocks on the same one-card nodes READY already gates."""
-    for label, artifact, nodes in _MINICPMO_MERGE_JOBS:
+    """Offline and online MERGE reuse READY's nodes at advanced_model.
+
+    Duplex stays the READY core smoke. Changing that YAML marker would not
+    create advanced duplex coverage.
+    """
+    advanced_jobs = _MINICPMO_MERGE_JOBS[:2]
+    duplex_job = _MINICPMO_MERGE_JOBS[2]
+    for label, artifact, nodes in advanced_jobs:
         step = _find_step(label, AMD_MERGE_PIPELINE)
         command = "\n".join(step["commands"])
         assert step["agent_pool"] == "mi300_1"
         assert step["grade"] == "Blocking"
         assert step["mirror_hardwares"] == ["amdproduction"]
         assert step["artifact_paths"] == [f"{artifact}/**/*"]
-        assert _MINICPMO_READY_MARKER in command
-        assert "--run-level core_model" in command
+        assert _MINICPMO_MERGE_ADVANCED_MARKER in command
+        assert "--run-level advanced_model" in command
+        assert "--run-level core_model" not in command
+        assert _MINICPMO_READY_MARKER not in command
         assert "test_minicpmo_4_5_duplex_mrv2.py" not in command
         assert "--junitxml=" in command
         for node in nodes:
             assert command.count(node) == 2
+
+    label, artifact, nodes = duplex_job
+    step = _find_step(label, AMD_MERGE_PIPELINE)
+    command = "\n".join(step["commands"])
+    assert step["grade"] == "Blocking"
+    assert step["artifact_paths"] == [f"{artifact}/**/*"]
+    assert _MINICPMO_READY_MARKER in command
+    assert "--run-level core_model" in command
+    assert "advanced_model" not in command
+    assert "test_minicpmo_4_5_duplex_mrv2.py" not in command
+    for node in nodes:
+        assert command.count(node) == 2
+
     ready_labels = {label for label, *_rest in _MINICPMO_READY_JOBS}
     merge_labels = {label for label, *_rest in _MINICPMO_MERGE_JOBS}
     assert ready_labels.isdisjoint(merge_labels)
+    ready = _find_step("ROCm · MiniCPM-o 4.5 Offline Coverage", AMD_READY_PIPELINE)
+    assert "--run-level core_model" in "\n".join(ready["commands"])
 
 
 def test_minicpmo_ready_core_model_cases_declare_mi325() -> None:
