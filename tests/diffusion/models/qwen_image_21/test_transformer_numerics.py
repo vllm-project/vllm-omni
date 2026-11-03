@@ -69,7 +69,12 @@ def test_rope_frequencies_do_not_depend_on_loader_device(device):
     ],
 )
 def test_batched_rope_preserves_positions_from_each_requests_text_mask(valid_lengths, row_index):
-    """Acceptance check for per-row positions derived from the text validity mask."""
+    """Helper-level tracking check for positions derived from each text mask.
+
+    This intentionally exercises ``QwenImage21Rope`` directly, rather than the
+    full batched Transformer path. A row-aware RoPE fix will change this
+    helper's signature; rewrite this strict xfail before removing it.
+    """
     rope = transformer.QwenImage21Rope(theta=10000, axes_dim=[16, 56, 56])
     device = torch.device("cpu")
     padded_length = max(valid_lengths)

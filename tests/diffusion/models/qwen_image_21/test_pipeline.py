@@ -585,23 +585,47 @@ def test_negative_conditioning_presence_accepts_explicit_string_batches(true_cfg
     )
 
 
-@pytest.mark.parametrize("true_cfg_scale", [None, 1.0, 3.0])
 @pytest.mark.parametrize("negative_prompt", [[], [None], ["blurry", 1], ("blurry",), 1])
-def test_encode_conditioning_rejects_invalid_negative_prompts_before_encoding(mocker, true_cfg_scale, negative_prompt):
+def test_encode_conditioning_rejects_invalid_negative_prompts_before_encoding(mocker, negative_prompt):
     pipeline = _toy_pipeline()
     encoder = mocker.patch.object(pipeline, "encode_prompt")
     with pytest.raises(ValueError, match="non-empty list of strings"):
-        pipeline._encode_conditioning(["prompt"], negative_prompt, [], true_cfg_scale, 128)
+        pipeline._encode_conditioning(["prompt"], negative_prompt, [], 3.0, 128)
     encoder.assert_not_called()
 
 
-@pytest.mark.parametrize("true_cfg_scale", [1.0, 3.0])
-def test_encode_conditioning_requires_one_negative_per_positive_prompt(mocker, true_cfg_scale):
+def test_encode_conditioning_requires_one_negative_per_positive_prompt(mocker):
     pipeline = _toy_pipeline()
     encoder = mocker.patch.object(pipeline, "encode_prompt")
     with pytest.raises(ValueError, match="one string per prompt"):
-        pipeline._encode_conditioning(["one", "two"], ["blurry"], [], true_cfg_scale, 128)
+        pipeline._encode_conditioning(["one", "two"], ["blurry"], [], 3.0, 128)
     encoder.assert_not_called()
+
+
+@pytest.mark.parametrize("true_cfg_scale", [None, 0.0, 1.0])
+@pytest.mark.parametrize("negative_prompt", [[], [None], ["one", "two"], ("placeholder",), 1])
+def test_cfg_disabled_ignores_negative_prompt_placeholders(mocker, true_cfg_scale, negative_prompt):
+    pipeline = _toy_pipeline()
+    mocker.patch.object(
+        pipeline,
+        "encode_prompt",
+        return_value=(torch.ones(1, 2, 4), torch.ones(1, 2), torch.zeros(1, 2, dtype=torch.bool)),
+    )
+    conditioning = pipeline._encode_conditioning(["prompt"], negative_prompt, [], true_cfg_scale, 128)
+    assert conditioning["negative_prompt_embeds"] is None
+    pipeline.encode_prompt.assert_called_once()
+
+
+def test_encode_conditioning_treats_bare_positive_prompt_as_one_request(mocker):
+    pipeline = _toy_pipeline()
+    encoder = mocker.patch.object(
+        pipeline,
+        "encode_prompt",
+        return_value=(torch.ones(1, 2, 4), torch.ones(1, 2), torch.zeros(1, 2, dtype=torch.bool)),
+    )
+    output = pipeline._encode_conditioning("a long prompt", ["blurry"], [], 3.0, 128)
+    assert output["negative_prompt_embeds"] is not None
+    assert encoder.call_count == 2
 
 
 @pytest.mark.parametrize("true_cfg_scale", [None, 1.0, 3.0])

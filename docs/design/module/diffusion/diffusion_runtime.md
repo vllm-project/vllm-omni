@@ -351,11 +351,15 @@ must support row-specific positions, including prefix-cache reuse and step
 execution; changing the attention mask alone is insufficient.
 
 `test_batched_rope_preserves_positions_from_each_requests_text_mask` in
-`tests/diffusion/models/qwen_image_21/test_transformer_numerics.py` derives
-standalone reference offsets from each request's mask. Its strict expected
-failures for padded rows track this gap; unpadded controls must pass. A repair
-must satisfy those positional checks and cover condition-image layouts,
-positive/negative branches, request/step execution, and cache reuse before
+`tests/diffusion/models/qwen_image_21/test_transformer_numerics.py` is a
+helper-level tracking test, rather than a batched Transformer or pipeline
+acceptance test. It derives standalone reference offsets from each request's
+mask. Its strict expected failures for padded rows track this gap; the
+unpadded controls guard the existing helper path. A row-aware helper signature
+will require rewriting the test, not simply removing its xfail markers. A
+repair must add integration coverage for those positional checks and cover
+condition-image layouts, positive/negative branches, request/step execution,
+and cache reuse before
 claiming that padding preserves standalone semantics. BF16 numerical
 equivalence requires separate validation even once positions agree.
 

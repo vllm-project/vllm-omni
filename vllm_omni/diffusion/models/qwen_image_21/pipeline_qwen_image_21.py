@@ -157,12 +157,14 @@ def _should_encode_negative_prompt(true_cfg_scale: float | None, negative_prompt
     An absent negative prompt does not imply an empty/default negative prompt.
     Explicit empty strings do request negative conditioning when CFG is enabled.
     """
+    if true_cfg_scale is None or true_cfg_scale <= 1 or negative_prompt is None:
+        return False
     if isinstance(negative_prompt, list):
         if not negative_prompt or any(not isinstance(prompt, str) for prompt in negative_prompt):
             raise ValueError("negative_prompt must be a string, a non-empty list of strings, or None.")
     elif negative_prompt is not None and not isinstance(negative_prompt, str):
         raise ValueError("negative_prompt must be a string, a non-empty list of strings, or None.")
-    return true_cfg_scale is not None and true_cfg_scale > 1 and negative_prompt is not None
+    return True
 
 
 def get_qwen_image_21_pre_process_func(
@@ -1058,7 +1060,8 @@ class QwenImage21Pipeline(
     ):
         """Encode one row per prompt, keeping condition latents in BCTHW VAE layout."""
         encode_negative = _should_encode_negative_prompt(true_cfg_scale, negative_prompt)
-        if isinstance(negative_prompt, list) and len(negative_prompt) != len(prompt):
+        prompt_count = len(prompt) if isinstance(prompt, list) else 1
+        if encode_negative and isinstance(negative_prompt, list) and len(negative_prompt) != prompt_count:
             raise ValueError("negative_prompt must contain one string per prompt.")
         images_per_prompt = [entry["prompt_images"] for entry in per_request_images]
         has_images = any(images_per_prompt)
@@ -1405,6 +1408,8 @@ class QwenImage21Pipeline(
                     if value is None or reference is None:
                         matches = value is reference
                     elif isinstance(value, torch.Tensor) or isinstance(reference, torch.Tensor):
+                        # Deliberately compare stored values across dtypes;
+                        # casting to value.dtype would hide precision mismatches.
                         value = value if isinstance(value, torch.Tensor) else torch.from_numpy(np.asarray(value))
                         reference = (
                             reference
