@@ -40,10 +40,10 @@ measures the deployed service rather than an in-process pipeline.
 
 | `--endpoint` | Tasks | Request shape | Notes |
 | --- | --- | --- | --- |
-| `/v1/videos` | `t2v`, `i2v`, `ti2v`, `v2v` | JSON job, then poll | Asynchronous: the script creates the job and polls it until it finishes. |
-| `/v1/chat/completions` | `t2i`, `i2i` | OpenAI chat request | The image comes back in the chat response. |
-| `/v1/images/edits` | `ti2i`, `it2i` | Multipart form upload | Supports `--bot-task` for image-conditioned models. |
-| `/v1/images/generations` | `t2i` | OpenAI image request | Text-to-image only. |
+| `/v1/videos` | `t2v`, `i2v`, `ti2v`, `v2v` | Multipart form upload, then poll | Asynchronous: the script creates the job and polls it until it finishes. |
+| `/v1/chat/completions` | `t2i`, `i2i`, `ti2i`, `it2i` | OpenAI chat request | The image comes back in the chat response. Input images are sent as `image_url` content parts. |
+| `/v1/images/edits` | `i2i`, `ti2i`, `it2i` | Multipart form upload | Needs at least one input image. Supports `--bot-task` for image-conditioned models. |
+| `/v1/images/generations` | `t2i` | OpenAI image request | Text-to-image only: input images are not sent. |
 
 `--endpoint` is optional. When it is omitted, the endpoint follows the task:
 
@@ -59,7 +59,8 @@ select, for example `--endpoint /v1/images/generations --task t2i`.
 The endpoint has to match the task family: the image tasks (`t2i`, `i2i`,
 `ti2i`, `it2i`) use the image endpoints, the video tasks (`t2v`, `i2v`, `ti2v`,
 `v2v`) use `/v1/videos`. A mismatch fails with the list of endpoints that fit
-the task.
+the task. `/v1/images/edits` additionally needs an image-conditioned task,
+because it uploads the input image as a file.
 
 The legacy `--backend vllm-omni` and `--backend openai` values are aliases for
 `/v1/chat/completions` and `/v1/images/generations`.
@@ -127,9 +128,10 @@ You can point to your own trace using `--dataset-path`.
 
 `--dataset random` synthesizes requests from `--random-request-config`, a JSON
 list of request profiles. Each profile may set `width`, `height`,
-`num_inference_steps`, `num_frames`, `fps` and `seed`; the `weight` field
-controls how often the profile is drawn, so one run can mix several
-resolutions and step counts.
+`num_inference_steps`, `num_frames`, `fps` and `prompt`; the `weight` field is
+required for every profile and controls how often the profile is drawn, so one
+run can mix several resolutions and step counts. The seed comes from `--seed`,
+not from the profile.
 
 ```bash
 python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
@@ -156,8 +158,10 @@ generated requests.
 | `width`, `height` | no | Requested output size. |
 | `num_inference_steps` | no | Diffusion steps. |
 | `seed` | no | Random seed. |
-| `image_paths` | no | Input image paths, for `i2i` / `i2v` / `ti2i`. |
+| `image_paths` | no | Input image paths, for the image-conditioned tasks (`i2i` / `i2v` / `ti2i` / `it2i`). |
 | `image_urls` | no | Input image URLs, as an alternative to `image_paths`. |
+| `video_paths` | no | Input video paths, for `v2v`. |
+| `video_urls` | no | Input video URLs, as an alternative to `video_paths`. |
 
 ```bash
 python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
@@ -203,9 +207,11 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
   image-conditioned tasks with the `random` dataset (default: 1).
 - `--bot-task`: `bot_task` form field for `/v1/images/edits` (`think`,
   `recaption`, `think_recaption`, `vanilla`).
-- `--return-stage-metrics`: Ask the server for per-stage durations. Only
-  `/v1/chat/completions` reports them, so the flag has no effect on the other
-  endpoints.
+- `--return-stage-metrics`: Ask the server for per-stage durations. The flag only
+  adds the request field on `/v1/chat/completions`. `/v1/videos` returns stage
+  durations in its job-status response instead, and only when the server runs
+  with `--enable-diffusion-pipeline-profiler`; the image endpoints do not report
+  them.
 
 ### Resolution / frames / steps: CLI defaults vs dataset fields
 
@@ -302,7 +308,7 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 ```bash
 python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --base-url http://localhost:8091 --model HunyuanImage-3.0 \
+    --base-url http://localhost:8091 --model tencent/HunyuanImage-3.0 \
     --endpoint /v1/images/edits --dataset random --task ti2i --num-prompts 10 \
     --bot-task think --num-input-images 1
 ```
@@ -324,7 +330,7 @@ For example, the text-to-video case above becomes:
 
 ```bash
 vllm bench serve --omni \
-    --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+    --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
     --endpoint /v1/videos \
     --dataset-name random-mm \
     --tokenizer gpt2 \
