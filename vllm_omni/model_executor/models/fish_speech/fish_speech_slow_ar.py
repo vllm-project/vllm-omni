@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Fish Speech S2 Pro -- Slow AR model (Stage 0).
 
 Uses vLLM's ``Qwen3Model`` as the transformer backbone.  Adds:
@@ -14,7 +17,7 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import numpy as np
@@ -34,6 +37,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.speaker_cache import get_speaker_cache
+from vllm_omni.worker.sampling_utils import get_tts_local_seed
 
 from .configuration_fish_speech import FishSpeechConfig, FishSpeechFastARConfig, FishSpeechSlowARConfig
 from .dac_encoder import _load_dac_codec, encode_reference_audio_codes
@@ -174,6 +178,12 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
     Stage 0: text → semantic tokens (+ residual codebook codes via Fast AR).
     """
 
+    # Set by the MRV2 model state once eager frames are enabled.
+    eager_frames_active = False
+
+    # Postprocess only stores the last hidden for the V1 next-step MTP.
+    eager_frames_need_postprocess = False
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config
@@ -201,6 +211,14 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         # MTP eager on NPU to fall back to native (non-graph) execution. Mirrors
         # the 310P patch for Qwen3-TTS (talker_mtp_graph_safe=False).
         self.talker_mtp_graph_safe = not current_omni_platform.is_npu()
+        # The Fast AR needs only the Slow AR hidden and the CB0 of the step that
+        # sampled it, so MRV2 completes each frame at the end of that step.
+        self.has_talker_mtp = True
+        raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
+        self.mtp_sampling_params: dict[str, Any] = (
+            dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
+        )
+        self._eager_text_step: torch.Tensor | None = None
 
         # Qwen3 transformer backbone.
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
@@ -302,6 +320,11 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             )
         logger.info("Fixed RoPE style to interleaved (GPT-J) for %d layers", len(self.model.layers))
 
+    def create_mrv2_model_state(self, vllm_config, encoder_cache, device):
+        from .model_state import FishSpeechModelState
+
+        return FishSpeechModelState(vllm_config, self, encoder_cache, device)
+
     # -------------------- vLLM required hooks --------------------
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -336,11 +359,27 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
     # -------------------- Omni multimodal output plumbing --------------------
 
+    @property
+    def mm_outputs_fresh_per_step(self) -> bool:
+        """MRV2 outputs come from :meth:`_make_eager_omni_output`, allocated per step."""
+        return self.eager_frames_active
+
+    @property
+    def omni_pooler_payload_include_hidden(self) -> bool:
+        """The DAC stage reads only codes; MRV2 then skips the per-step hidden copy.
+
+        V1 reads this once at load, before eager frames are enabled, so it keeps the default.
+        """
+        return not self.eager_frames_active
+
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
 
         hidden = model_outputs
+        spans = kwargs.get("request_token_spans")
+        if self.eager_frames_active and spans is not None:
+            return self._make_eager_omni_output(hidden, spans)
         info_dicts = kwargs.get("model_intermediate_buffer")
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information") or []
@@ -363,6 +402,19 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         mm: dict[str, torch.Tensor] = {"audio_codes": audio_codes}
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
+    def _make_eager_omni_output(self, hidden: torch.Tensor, spans: list[tuple[int, int]]) -> OmniOutput:
+        """MRV2 output: the runner's eager MTP fills each sampled row's frame and validity.
+
+        Rows that sampled nothing this step (non-final prefill chunks) keep an
+        invalid zero frame.
+        """
+        num_tokens = spans[-1][1] if spans else 0
+        mm = {
+            "codes": {"audio": torch.zeros((num_tokens, self._num_codebooks), dtype=torch.long, device=hidden.device)},
+            "meta": {"codec_frame_valid": torch.zeros((num_tokens,), dtype=torch.int8, device=hidden.device)},
+        }
+        return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
+
     # -------------------- preprocess / postprocess --------------------
 
     def preprocess(
@@ -382,7 +434,10 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         if span_len <= 0:
             return input_ids, input_embeds if input_embeds is not None else self.embed_input_ids(input_ids), {}
 
-        if span_len > 1:
+        is_prefill = info_dict.get("_omni_is_prefill")
+        if is_prefill is None:
+            is_prefill = span_len > 1
+        if is_prefill:
             # --- Prefill ---
             embed = info_dict.get("embed", {})
             prompt_embeds_buf = embed.get("prefill")
@@ -455,6 +510,13 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
         # --- Decode: span_len == 1 ---
         dev = input_ids.device
+
+        if self.eager_frames_active:
+            # The runner feeds the frame embedding it completed when this token
+            # was sampled; Fish adds no text conditioning on top of it.
+            step = self.eager_settled_text_step()
+            embeds = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
+            return input_ids, embeds, {"mtp_inputs": (step, step)}
 
         hs = info_dict.get("hidden_states", {})
         last_hidden = hs.get("last")
@@ -673,7 +735,8 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
 
         This matches the reference Fish Speech inference flow:
         - At step t, the Slow AR embedding includes codes from FastAR(hidden_{t-1})
-        - last_talker_hidden IS hidden_{t-1} (from postprocess of the previous step)
+        - last_talker_hidden IS hidden_{t-1}: V1 reads it from the previous step's
+          postprocess at step t; MRV2 runs this at the end of step t-1 instead
         - Preprocess provides the plain text embed; we add codebook embeddings here
         """
         bsz = int(input_ids.shape[0])
@@ -712,6 +775,36 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         inputs_embeds_out = torch.where(semantic_mask.unsqueeze(-1), norm_embeds, inputs_embeds_out)
 
         return inputs_embeds_out, audio_codes.to(dtype=torch.long)
+
+    # MRV2 capability names read the V1 canonical values so platform patches
+    # such as the NPU graph-safety override apply to both runners.
+    mtp = talker_mtp
+    get_mtp_seed = staticmethod(get_tts_local_seed)
+
+    def eager_decode_settled(self, info: dict[str, Any]) -> bool:
+        """Decode preprocess never changes per-request state, so every decode row is settled."""
+        return True
+
+    def eager_settled_text_step(self) -> torch.Tensor:
+        """Zero: a decode input is the previous frame's embedding with no text added."""
+        step = self._eager_text_step
+        if step is None:
+            weight = self.codebook_embeddings.weight
+            step = torch.zeros((1, int(weight.shape[1])), dtype=weight.dtype, device=weight.device)
+            self._eager_text_step = step
+        return step
+
+    def mtp_frame_valid(self, layer0: torch.Tensor) -> torch.Tensor:
+        """Rows whose CB0 is a semantic token rather than im_end; matches talker_mtp's semantic mask."""
+        return (layer0 >= self._semantic_begin_id) & (layer0 <= self._semantic_end_id)
+
+    @property
+    def mtp_output_key(self) -> tuple[str, str]:
+        return self.talker_mtp_output_key
+
+    @property
+    def mtp_graph_safe(self) -> bool:
+        return self.talker_mtp_graph_safe
 
     # -------------------- Prompt length estimation --------------------
 

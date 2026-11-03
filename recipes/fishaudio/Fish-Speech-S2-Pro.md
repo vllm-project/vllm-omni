@@ -75,11 +75,10 @@ Notes:
 - `--omni` is required.
 - The default deploy config `vllm_omni/deploy/fish_qwen3_omni.yaml` is loaded
   automatically by model registry (HF `model_type=fish_qwen3_omni`).
-- On CUDA, stage 1 (the DAC decoder) runs on Model Runner V2 in every Fish
-  Speech deploy config, and stage 0 (Slow AR) runs on V1. To run stage 1 on V1,
-  set `model_runner: v1` for stage 1 under `platforms.cuda` in a copy of the
-  file. A `model_runner` set at the top level or under `stages:` does not
-  override that entry.
+- On CUDA, both stages (Slow AR and the DAC decoder) run on Model Runner V2 in
+  every Fish Speech deploy config. To run them on V1, set `model_runner: v1`
+  under `platforms.cuda` in a copy of the file; a top-level `model_runner` does
+  not override it.
 
 #### Verification
 
