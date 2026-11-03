@@ -649,14 +649,20 @@ class BatchedToken2Wav(nn.Module):
         not the solve: a CUDA graph replay and most eager kernels return as
         soon as the work is queued. With the stats enabled (a debug knob)
         synchronize the tensor's device so ``duration`` is real device time.
-        A CPU host has nothing to drain; a torch build without accelerator
-        dispatch for this backend (older torch_npu) keeps the enqueue timing
-        rather than failing the solve.
+        A CPU host has nothing to drain. A backend that reports no
+        accelerator, or one whose synchronize is not implemented (older
+        torch_npu), keeps the enqueue timing rather than failing the solve.
         """
         if not self._solve_stats.enabled or device.type == "cpu":
             return
-        if torch.accelerator.is_available():
+        if not torch.accelerator.is_available():
+            return
+        try:
             torch.accelerator.synchronize(device)
+        except (RuntimeError, NotImplementedError):
+            # A reported-but-unimplemented sync is a debug-knob degradation,
+            # not a solve failure: keep the enqueue timing.
+            pass
 
     def _hift_inference(
         self,
