@@ -3476,6 +3476,7 @@ def test_worker_one_card_ready_stays_outside_r2_01() -> None:
 
 
 _DRAMA3_READY_MARKER = "core_model and tts and rocm and MI325 and cards_1"
+_DRAMA3_MERGE_MARKER = "advanced_model and tts and rocm and MI325 and cards_1"
 _DRAMA3_READY_NODE = "tests/e2e/online_serving/test_drama_3.py::test_text_to_audio_001[drama_3-rocm]"
 _DRAMA3_EXCLUDED = (
     "test_voice_clone_streaming_002",
@@ -3526,25 +3527,54 @@ def test_drama3_ready_adds_one_nonblocking_text_to_audio_node() -> None:
 
 
 def test_drama3_merge_requires_the_same_text_to_audio_node() -> None:
-    """MERGE gates the one ROCm text-to-audio case. READY keeps its own job."""
+    """MERGE runs the READY node at advanced_model. READY stays core_model.
+
+    ``--run-level advanced_model`` drops dummy weights and enables the shared
+    speech transcript check. Voice-clone nodes stay unmarked for ROCm.
+    """
     ready = _find_step("Drama 3 E2E Test", AMD_READY_PIPELINE)
     step = _find_step("MERGE · Drama 3 Text-to-Audio", AMD_MERGE_PIPELINE)
     command = "\n".join(step["commands"])
+    source = Path("tests/e2e/online_serving/test_drama_3.py").read_text(encoding="utf-8")
+    selected = source.split("def test_text_to_audio_001", 1)[0].rsplit("\n\n", 1)[1]
+    speech_gate = (
+        Path("tests/helpers/assertions.py")
+        .read_text(encoding="utf-8")
+        .split("def _speech_assertion_needs_audio_transcript", 1)[1]
+        .split("\ndef ", 1)[0]
+    )
+    weight_selector = (
+        Path("tests/helpers/stage_config.py")
+        .read_text(encoding="utf-8")
+        .split("def stage_config_path_for_run_level", 1)[1]
+        .split("\ndef ", 1)[0]
+    )
 
     assert ready["grade"] == "NonBlocking"
+    assert _marker_expressions(ready) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
     assert step["agent_pool"] == "mi300_1"
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "Blocking"
     assert step["timeout_in_minutes"] == 40
     assert step["artifact_paths"] == ["artifacts/rocm-drama3-merge/**/*"]
     assert "timeout 30m" in command
-    assert _marker_expressions(step) == [_DRAMA3_READY_MARKER, _DRAMA3_READY_MARKER]
-    assert command.count('--run-level "core_model"') == 2
+    assert _marker_expressions(step) == [_DRAMA3_MERGE_MARKER, _DRAMA3_MERGE_MARKER]
+    assert command.count('--run-level "advanced_model"') == 2
+    assert "core_model" not in command
+    assert "full_model" not in command
     assert command.count(_DRAMA3_READY_NODE) == 1
     assert "diff -u /tmp/drama3-merge-expected.txt" in command
     assert "Expected exactly one executed Drama 3 MERGE test" in command
+    assert "@pytest.mark.core_model" in selected
+    assert "@pytest.mark.advanced_model" in selected
+    text_to_audio = source.split("def test_voice_clone_streaming_002", 1)[0]
+    assert "send_audio_speech_request" in text_to_audio
+    assert 'run_level not in {"advanced_model", "full_model"}' in speech_gate
+    assert 'run_level in {"advanced_model", "full_model"}' in weight_selector
+    assert "_delete_dummy_load_format" in weight_selector
     for name in _DRAMA3_EXCLUDED:
         assert name not in command
+        assert "rocm" not in _hardware_decorator(source, name)
 
 
 _DEVICE_REDUCTION_READY_MARKER = "core_model and diffusion and rocm and MI325 and cards_1"
