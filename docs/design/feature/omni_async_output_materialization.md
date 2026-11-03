@@ -195,6 +195,19 @@ Independent pooling results, client-facing `multimodal_outputs`, and inline
 payloads for stages without a native send path remain available. Terminal
 ordering and payload delivery stay owned by the native data plane.
 
+`OmniAsyncOutput.get_output()` assigns the same list to `pooler_output` and
+`inter_stage_outputs` in both full-payload branches, including model-owned
+snapshots. Producer tests protect this identity contract. Async-chunk output
+already leaves `pooler_output` empty. Publication does not compare tensor
+contents or discard separately constructed pooling lists.
+
+Enqueueing transfers a reference to `_NativeOutputBatch`; it does not wait for
+downstream delivery. Clearing a field on the returned model output neither
+clears the queued list nor its per-request entries. The queue retains those
+objects until the output worker consumes them, including batches with absent
+payloads for some requests. Delivery completion and terminal cleanup retain
+their existing ordering; publication adds no synchronous delivery wait.
+
 ### Safe State Snapshots
 
 The next scheduler step can mutate runner state while the background builder is

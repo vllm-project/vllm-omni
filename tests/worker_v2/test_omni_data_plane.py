@@ -648,9 +648,9 @@ def test_native_worker_capacity_error_cache_and_tp_gates():
     "publication,can_send",
     [("worker", True), ("worker", False), ("inline", True), ("inline", False), ("legacy", False)],
 )
-@pytest.mark.parametrize("duplicate_pooler", [True, False])
+@pytest.mark.parametrize("pooler_kind", ["alias", "shallow_copy", "independent"])
 def test_native_publication_omits_only_transported_pooler_payload(
-    plane, monkeypatch, publication, can_send, duplicate_pooler
+    plane, monkeypatch, publication, can_send, pooler_kind
 ):
     from vllm.v1.request import Request
 
@@ -665,7 +665,11 @@ def test_native_publication_omits_only_transported_pooler_payload(
     plane.reserve_outputs(["internal"])
     hidden = torch.arange(12).reshape(3, 4)
     payloads = [{"hidden": hidden}]
-    pooler = payloads if duplicate_pooler else [{"embedding": torch.ones(1, 4)}]
+    pooler = {
+        "alias": payloads,
+        "shallow_copy": list(payloads),
+        "independent": [{"embedding": torch.ones(1, 4)}],
+    }[pooler_kind]
     client = [{"audio": torch.tensor([0.25])}]
     output = OmniModelRunnerOutput(
         req_ids=["internal"],
@@ -714,12 +718,87 @@ def test_native_publication_omits_only_transported_pooler_payload(
         pooling_output=result.pooler_output[0] if result.pooler_output else None,
         multimodal_output=result.multimodal_outputs[0],
     )
-    omitted = publication != "legacy" and can_send and duplicate_pooler
+    omitted = publication != "legacy" and can_send and pooler_kind == "alias"
     assert (engine_output.pooling_output_payload is None) == omitted
     if not omitted:
         assert result.pooler_output is pooler
     assert engine_output.new_token_ids == [21]
     assert engine_output.multimodal_output is client[0]
+
+
+@pytest.mark.parametrize("publication", ["worker", "inline"])
+@pytest.mark.parametrize("async_chunk", [False, True])
+def test_native_publication_retains_queued_mixed_batch(plane, monkeypatch, publication, async_chunk):
+    from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
+
+    plane._async_chunk = async_chunk
+    plane._can_send = True
+    plane._full_payload_replace_keys_cached = frozenset()
+    entered, release = threading.Event(), threading.Event()
+    complete_outputs = plane.complete_outputs
+
+    def delayed_complete(**kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return complete_outputs(**kwargs)
+
+    monkeypatch.setattr(plane, "complete_outputs", delayed_complete)
+    plane._start_output_worker(max_pending_batches=2)
+    req_ids = ["first", "no-payload", "last"]
+    for req_id in req_ids:
+        plane.register_request(_new_request(req_id, f"external-{req_id}"))
+    plane.reserve_outputs(req_ids)
+    first, last = torch.arange(6).reshape(2, 3), torch.arange(9, 12).reshape(1, 3)
+    payloads = [{"hidden": first}, None, {"hidden": last}]
+    tokens = [[21], [22], [23]]
+    output = OmniModelRunnerOutput(
+        req_ids=req_ids,
+        req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+        sampled_token_ids=tokens,
+        prompt_logprobs_dict={},
+        pooler_output=None if async_chunk else payloads,
+        inter_stage_outputs=payloads,
+        sampled_token_ids_materialized=True,
+    )
+    del payloads
+    worker = None
+    try:
+        if publication == "worker":
+            source = _Output()
+            monkeypatch.setattr(source, "get_output", lambda: output)
+            worker = NativeOutputWorker(1)
+            result = worker.submit(source, plane).get_output()
+        else:
+            runner = object.__new__(OmniGPUModelRunner)
+            runner._omni_data_plane = plane
+            result = runner._finalize_native_data_plane_output(output)
+
+        assert entered.wait(timeout=5)
+        # Publication has returned before transport consumes the payload. Only
+        # the model output's aliases are cleared; the queued batch owns its data.
+        assert not plane.record.batches
+        assert result.inter_stage_outputs is None and result.pooler_output is None
+        assert result.req_ids == req_ids and result.sampled_token_ids == tokens
+    finally:
+        release.set()
+        if worker is not None:
+            worker.close()
+
+    plane.drain_outputs()
+    plane.request_terminal(set(req_ids))
+    delivered = {
+        request.req_id: (request, payload)
+        for batch in plane.record.batches
+        for request, payload in batch
+        if payload is not None
+    }
+    assert set(delivered) == {"first", "last"}
+    for req_id, expected, token in [("first", first, 21), ("last", last, 23)]:
+        request, payload = delivered[req_id]
+        torch.testing.assert_close(payload["hidden"], expected)
+        assert request.output_token_ids == [token]
+        assert request.is_finished() == (not async_chunk)
+    assert sorted(plane.record.cleaned) == sorted(req_ids)
 
 
 def test_abort_before_first_chunk_cleans_receiver_state():

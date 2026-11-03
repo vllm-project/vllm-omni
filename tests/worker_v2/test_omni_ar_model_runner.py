@@ -530,6 +530,12 @@ def test_async_output_slices_request_payloads_with_graph_padding(
         async_chunk=async_chunk,
     ).get_output()
 
+    # Native publication recognizes the redundant full-payload channel by
+    # identity, so a producer refactor must not introduce a shallow list copy.
+    if async_chunk:
+        assert output.pooler_output is None
+    else:
+        assert output.pooler_output is output.inter_stage_outputs
     for i, payload in enumerate(output.inter_stage_outputs):
         torch.testing.assert_close(payload["codes.audio"], codes[offsets[i] : offsets[i + 1]])
         torch.testing.assert_close(payload["codes.ref"], refs[i])
@@ -649,6 +655,7 @@ def test_finalized_full_payload_latent_ledger_is_accumulated_once(monkeypatch):
         finalize_multimodal=lambda payload, _num_sampled: payload,
     ).get_output()
     assert output.multimodal_outputs is None
+    assert output.pooler_output is output.inter_stage_outputs
     engine_output = _rehydrated_output(pooling_output=output.pooler_output[0])
     if output.multimodal_outputs:
         engine_output.multimodal_output = output.multimodal_outputs[0]
@@ -1166,6 +1173,8 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
     assert result.inter_stage_outputs[1] is None
     assert (result.pooler_output is None) == streaming
+    if not streaming:
+        assert result.pooler_output is result.inter_stage_outputs
 
 
 @pytest.mark.cpu
