@@ -57,7 +57,7 @@ def get_skyreels_v2_pre_process_func(od_config: OmniDiffusionConfig):
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         # Startup warmup sets its own lightweight shape; keep it as Wan does.
-        if request.is_dummy_run:
+        if request.is_dummy_run():
             return wan_pre_process_func(request)
         sampling_params = request.sampling_params
         for field in ("height", "width"):
