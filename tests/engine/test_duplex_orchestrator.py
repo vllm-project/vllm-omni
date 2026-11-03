@@ -439,6 +439,54 @@ def ephemeral_submissions(mocker):
 
 
 @pytest.mark.asyncio
+async def test_full_prompt_resume_processes_inputs_without_propagating_resumable(ephemeral_submissions, mocker):
+    from dataclasses import replace
+
+    orchestrator, clients, submissions, builder = ephemeral_submissions
+    submission = replace(submissions[0], resumable=True, resume_from_full_prompt=True)
+    prewarm = mocker.patch.object(orchestrator, "_prewarm_async_chunk_stages", return_value=True)
+    orchestrator.async_chunk = True
+    await orchestrator.submit(submission)
+    assert builder.call_args.kwargs["resumable"] is True
+    first = clients[0].add_request_calls[-1][0]
+    assert first.resumable and first.resume_from_full_prompt
+    assert orchestrator.request_states[first.request_id].streaming.enabled
+    assert prewarm.call_args.args[1].resumable is False
+    # Re-enter through the ordinary processor, retaining the core request ID.
+    mocker.patch.object(orchestrator.stage_pools[0].output_processor, "remove_request", create=True)
+    await orchestrator.submit(replace(submission, already_submitted=True))
+    assert clients[0].add_request_calls[-1][0].request_id == first.request_id
+    assert builder.call_count == 2
+    assert prewarm.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_finish_turn_keeps_entry_request_and_releases_downstream(ephemeral_submissions, mocker):
+    orchestrator, clients, submissions, _ = ephemeral_submissions
+    request_id = submissions[0].context.request_id
+    await orchestrator.submit(submissions[0])
+    downstream = orchestrator.stage_pools[1]
+    downstream.bind_request_to_replica(request_id, 0)
+    remove = mocker.patch.object(downstream.output_processor, "remove_request", create=True)
+    state = orchestrator.request_states[request_id]
+    state.stage_submit_ts[1] = 1.0
+    state.upstream_first_audio = True
+    state.pending_first_audio_outputs.append((1, 0, object()))
+    state.streaming.bridge_states["previous_turn"] = object()
+    await orchestrator.finish_turn(request_id)
+    assert clients[0].abort_calls == []
+    assert clients[1].abort_calls == [[request_id]]
+    remove.assert_called_once_with(request_id)
+    assert orchestrator.stage_pools[0].get_bound_replica_id(request_id) == 0
+    assert downstream.get_bound_replica_id(request_id) is None
+    assert orchestrator.request_states[request_id] is state
+    assert 0 in state.stage_submit_ts and 1 not in state.stage_submit_ts
+    assert not state.upstream_first_audio
+    assert not state.pending_first_audio_outputs
+    assert not state.streaming.bridge_states
+
+
+@pytest.mark.asyncio
 async def test_nonzero_entry_stage_retains_direct_entry_routing(mocker):
     orchestrator, clients, _, _ = _build(stages=4)
     context = DuplexStageRequestContext(

@@ -65,6 +65,38 @@ for the [stage-output cache](../design/feature/prefix_caching.md).
 Non-CUDA platform overrides keep this cache disabled. To disable it on CUDA,
 set `enable_prefix_caching: false` on stage 0 in a deployment overlay.
 
+### Opt-in resident Thinker KV continuation
+
+`qwen3_omni_duplex_kv.yaml` enables experimental same-request continuation with
+`duplex_session.turn_kv_continuation: true`. It requires CUDA Model Runner V1,
+stage-0 prefix caching, `async_chunk: true`, synchronous scheduling on stage 0,
+and no speculative decoding. The ordinary V1 and MRv2 profiles keep their
+per-turn request behavior.
+
+The Thinker request and its KV allocation survive a completed turn. Each new
+commit still renders and processes the complete current multimodal history.
+The scheduler compares its block hashes against the resident request: when all
+completed blocks match and the new prompt extends them, it retains those KV
+blocks and computes only the partial-block tail and new suffix. Otherwise it
+releases the old allocation and rebuilds from the current prompt. Block hashes
+include multimodal identities and cache salt, so equal audio placeholder tokens
+alone do not authorize reuse.
+
+Talker and Code2Wav terminate each turn. Their next requests receive the complete
+Thinker conditioning rows, replayed from the stage-output cache where KV was
+retained. They do not inherit the Thinker's resumable lifetime. The session
+advertises `supports_turn_kv_continuation`; the native streaming-input policy
+selected by `supports_core_resumable_request` remains disabled for Qwen.
+
+Commit, VAD interruption and playback acknowledgement retain their turn-based
+semantics. Cancellation advances the epoch and aborts the resident request;
+the next turn rebuilds it. Closing or expiring a session releases its resident
+resources. New audio may buffer during a response, but another generation must
+wait for that response to complete or be cancelled. Idle sessions retain KV
+until teardown, which must be included in
+deployment memory and session-capacity planning. Full input preprocessing is
+still performed; this feature does not claim a measured latency improvement.
+
 ### Qwen3-Omni voice selection
 
 The duplex session forwards the configured voice to the Talker as the

@@ -335,6 +335,7 @@ class QwenDataPlane(DuplexDataPlane):
 class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
     plugin_id = "qwen3-omni"
     projects_intermediate_outputs = True
+    supports_turn_kv_continuation = True
 
     def __init__(self, encode_audio):
         self.data_plane = QwenDataPlane(encode_audio)
@@ -1169,7 +1170,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         debug_dir = os.environ.get("VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR")
         if debug_dir:
             try:
-                target = Path(debug_dir) / hashlib.sha256(request_id.encode()).hexdigest()[:24]
+                target = Path(debug_dir) / hashlib.sha256(f"{request_id}:{seq}".encode()).hexdigest()[:24]
                 target.mkdir(parents=True, exist_ok=True)
                 filenames = []
                 for index, image in enumerate(images):

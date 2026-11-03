@@ -107,6 +107,8 @@ class DuplexCapabilities:
     supports_stage_resumption: bool = False
     supports_scheduler_native_append: bool = False
     supports_core_resumable_request: bool = False
+    # Keep only the entry request resident; commit/playback remain turn-based.
+    supports_turn_kv_continuation: bool = False
     # Prior assistant TTS may keep draining while a new user commit is admitted.
     # Not barge-in (which aborts prior TTS).
     supports_concurrent_turn_requests: bool = False
@@ -166,6 +168,7 @@ class DuplexCapabilities:
             "supports_stage_resumption": self.supports_stage_resumption,
             "supports_scheduler_native_append": self.supports_scheduler_native_append,
             "supports_core_resumable_request": self.supports_core_resumable_request,
+            "supports_turn_kv_continuation": self.supports_turn_kv_continuation,
             "supports_concurrent_turn_requests": self.supports_concurrent_turn_requests,
             "required_input_modalities": sorted(self.required_input_modalities),
             "optional_input_modalities": sorted(self.optional_input_modalities),

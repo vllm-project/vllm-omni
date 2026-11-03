@@ -45,6 +45,7 @@ class OmniRequest(Request):
         additional_information: AdditionalInformationPayload | None = None,
         model_intermediate_buffer: dict | None = None,
         payload_sender_info: PayloadSenderInfo | None = None,
+        resume_from_full_prompt: bool = False,
         **kwargs,
     ):
         if prompt_embeds is not None:
@@ -66,6 +67,7 @@ class OmniRequest(Request):
         self.model_intermediate_buffer: dict | None = model_intermediate_buffer
         # Sender's connector address, or the payload itself for run requests.
         self.payload_sender_info: PayloadSenderInfo | None = payload_sender_info
+        self.resume_from_full_prompt = resume_from_full_prompt
 
     @staticmethod
     def _maybe_decode_prompt_embeds(
@@ -115,6 +117,7 @@ class OmniRequest(Request):
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             payload_sender_info=request.payload_sender_info,
             resumable=request.resumable,
+            resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
             session_id=request.session_id,
             kv_hints=request.kv_hints,
             reasoning_ended=request.reasoning_ended,
@@ -140,6 +143,8 @@ class OmniStreamingUpdate:
     sampling_params: SamplingParams | None
     additional_information: AdditionalInformationPayload | None = None
     model_intermediate_buffer: dict | None = None
+    resume_from_full_prompt: bool = False
+    block_hashes: "tuple[BlockHash, ...]" = ()
 
     @classmethod
     def from_request(cls, request: "Request") -> "OmniStreamingUpdate | None":
@@ -153,4 +158,6 @@ class OmniStreamingUpdate:
             sampling_params=request.sampling_params,
             additional_information=request.additional_information,
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
+            resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
+            block_hashes=tuple(request.block_hashes) if getattr(request, "resume_from_full_prompt", False) else (),
         )

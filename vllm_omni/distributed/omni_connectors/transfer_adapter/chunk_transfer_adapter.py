@@ -478,7 +478,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         duplex_perf_chunk: tuple[int, int] | None = None,
     ) -> dict[str, Any] | None:
         """Per-request admission of a chunk; returns the task to queue, or None."""
-        is_finished = force_request_finished or (request.is_finished() and not request.resumable)
+        turn_continuation = getattr(request, "resume_from_full_prompt", False) is True
+        is_finished = (
+            force_request_finished
+            or (request.is_finished() and not request.resumable)
+            or (turn_continuation and is_segment_finished)
+        )
         if not hasattr(self, "_segment_generation"):
             self._segment_generation = defaultdict(int)
         external_req_id = request.external_req_id
@@ -504,6 +509,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if confirmed_num_computed_tokens is None:
             confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
         processor_request = self._snapshot_processor_request(request) if snapshot else request
+        if turn_continuation:
+            # The entry request remains resident, but each downstream speech
+            # pipeline receives a complete, independently terminating turn.
+            if processor_request is request:
+                processor_request = self._snapshot_processor_request(request)
+            processor_request.resumable = False
         task = {
             "multimodal_output": multimodal_output,
             "request": processor_request,

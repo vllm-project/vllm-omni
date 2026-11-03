@@ -83,6 +83,7 @@ class DuplexStageSubmission:
     # True: resume/update an existing stage0 id. False: open a new ephemeral id.
     # Distinct from DuplexCapabilities.supports_core_resumable_request.
     resumable: bool = True
+    resume_from_full_prompt: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "prompt", MappingProxyType(dict(self.prompt)))
@@ -118,6 +119,10 @@ class DuplexOutputContext:
 
 class DuplexStagePort(ABC):
     """Narrow stage-management surface the session runner/manager use (implemented by DuplexOrchestrator)."""
+
+    async def finish_turn(self, request_id: str) -> None:
+        """Release per-turn downstream state while retaining entry-stage KV."""
+        raise NotImplementedError("This stage port does not support turn KV continuation")
 
     def reserve_session(self, session_id: str) -> None:
         """Atomically reserve capacity, leaving none on error; legacy ports do nothing."""

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm_omni.engine.duplex.config import DuplexCapabilities
 from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexOutputContext, DuplexRequestIdentity
 from vllm_omni.engine.duplex.session.context import StageOutput
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
@@ -17,12 +18,17 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _channel(*, projects_intermediate: bool = False) -> ModelChannel:
+def _channel(*, projects_intermediate: bool = False, turn_kv_continuation: bool = False) -> ModelChannel:
     async def _unused(*args, **kwargs):
         del args, kwargs
 
     return ModelChannel(
-        SimpleNamespace(plugin=SimpleNamespace(projects_intermediate_outputs=projects_intermediate)),
+        SimpleNamespace(
+            plugin=SimpleNamespace(projects_intermediate_outputs=projects_intermediate),
+            session=SimpleNamespace(
+                capabilities=DuplexCapabilities(supports_turn_kv_continuation=turn_kv_continuation)
+            ),
+        ),
         SimpleNamespace(),
         close_from_runtime=_unused,
         schedule_silence_continuation=_unused,
@@ -61,6 +67,15 @@ def test_real_stop_stays_finished() -> None:
     output = SimpleNamespace(request_id="duplex-s.seg.e.0.r.stage0-turn0", finished=True, outputs=[])
     built = _channel()._build_stage_output(_item(output, segment_finished=False))
     assert built.finished is True
+
+
+def test_resident_turn_thinker_segment_finishes_a_text_only_response() -> None:
+    output = SimpleNamespace(request_id="resident", finished=False, outputs=[])
+    built = _channel(turn_kv_continuation=True)._build_stage_output(
+        _item(output, segment_finished=True, stage_id=0, final_stage_id=0)
+    )
+    assert built.finished is True
+    assert output.finished is False
 
 
 def test_intermediate_stage_stays_unfinished() -> None:

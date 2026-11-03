@@ -87,6 +87,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     # additional_information request transport.
     model_intermediate_buffer: dict[str, Any] | None = None
     payload_sender_info: PayloadSenderInfo | None = None
+    resume_from_full_prompt: bool = False
 
     @classmethod
     def from_request(
@@ -126,6 +127,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             priority=request.priority,
             trace_headers=request.trace_headers,
             resumable=request.resumable,
+            resume_from_full_prompt=getattr(request, "resume_from_full_prompt", False),
             external_req_id=request.external_req_id,
             session_id=request.session_id,
             kv_hints=request.kv_hints,

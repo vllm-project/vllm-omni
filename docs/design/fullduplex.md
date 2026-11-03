@@ -693,6 +693,15 @@ to reuse matching Thinker KV and stage-output rows across those requests.
 This cache is owned by the engine, not the session; cancel/epoch fencing,
 history calibration and per-turn Talker/Code2Wav lifetimes are unchanged.
 
+An explicit `duplex_session.turn_kv_continuation` deployment selects a different
+entry-stage lifetime for Qwen: `supports_turn_kv_continuation` keeps Stage0
+resident while leaving commit, playback and VAD policy turn-based. Full prompt
+snapshots go through normal multimodal preprocessing before scheduler-side
+prefix validation. `DuplexStagePort.finish_turn` releases only downstream turn
+state. Cancel, close and expiry still clean up every owned stage, including the
+resident Thinker. See the [resident KV guide](../serving/realtime_duplex_api.md#opt-in-resident-thinker-kv-continuation)
+for runner restrictions and fallback behavior.
+
 ## Model plugin
 
 `DuplexModelPlugin` (ABC, `engine/duplex/plugin.py`) is the one class a model

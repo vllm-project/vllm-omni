@@ -12,6 +12,7 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
+import copy
 import time as _time
 from collections.abc import Coroutine
 from contextlib import nullcontext
@@ -95,6 +96,16 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         super().__init__(*args, **kwargs)
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
+        if duplex_session_config.turn_kv_continuation:
+            config = self.stage_pools[0].stage_vllm_config
+            if not plugin.supports_turn_kv_continuation:
+                raise ValueError("This model does not support turn KV continuation")
+            if config.model_config.use_v2_model_runner or config.scheduler_config.async_scheduling:
+                raise ValueError("Turn KV continuation requires stage 0 model runner V1 and async_scheduling: false")
+            if not config.cache_config.enable_prefix_caching:
+                raise ValueError("Turn KV continuation requires stage 0 prefix caching for Talker hidden-state replay")
+            if not self.async_chunk or config.speculative_config is not None:
+                raise ValueError("Turn KV continuation requires async_chunk and does not support speculative decoding")
         self.replica_placement: DuplexReplicaPlacement | None = None
         admission_limit = None
         if duplex_session_config.replica_policy == "least_sessions":
@@ -347,9 +358,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             return False
         # Resumable resident Stage0: stage failure closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
-        close_session = (
-            not duplex_is_auxiliary_request(req_id)
-            and self.plugin.capabilities(
+        close_session = not duplex_is_auxiliary_request(req_id) and (
+            self.duplex_session_config.turn_kv_continuation
+            or self.plugin.capabilities(
                 max_sessions=self.duplex_session_config.max_sessions
             ).supports_core_resumable_request
         )
@@ -573,7 +584,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
 
     async def submit(self, submission: DuplexStageSubmission) -> DuplexStageSubmissionResult:
         context = submission.context
-        input_guard = nullcontext() if submission.resumable else self._stage_input_submission(context.stage_id)
+        input_guard = (
+            nullcontext()
+            if submission.resumable and not submission.resume_from_full_prompt
+            else self._stage_input_submission(context.stage_id)
+        )
         async with input_guard as mark_submitting:
             request_state = self.request_states.get(context.request_id)
             if not isinstance(request_state, DuplexOrchestratorRequestState):
@@ -582,8 +597,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             if pinned_replica_id is not None:
                 self.stage_pools[context.stage_id].bind_request_to_replica(context.request_id, pinned_replica_id)
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
+            # Record core segment boundaries even when downstream stages use
+            # fresh, non-resumable requests for each committed turn.
             request_state.streaming.enabled = submission.resumable
-            if submission.resumable:
+            if submission.resumable and not submission.resume_from_full_prompt:
                 request = build_engine_core_request_from_tokens(
                     request_id=context.request_id,
                     prompt=dict(submission.prompt),
@@ -604,11 +621,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                     context.stage_id,
                     dict(submission.prompt),
                     context.stage_sampling_params,
-                    resumable=False,
+                    resumable=submission.resumable,
                 )
                 if self.request_states.get(context.request_id) is not request_state:
                     raise RuntimeError("duplex request cancelled during input preprocessing")
             request.external_req_id = request.request_id
+            request.resume_from_full_prompt = submission.resume_from_full_prompt
             mm_features = getattr(request, "mm_features", None)
             if mm_features is not None:
                 request_state.mm_features = mm_features
@@ -619,6 +637,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
                 if submission.already_submitted:
                     if not submission.resumable:
                         raise RuntimeError(f"ephemeral duplex request cannot submit_update: {context.request_id}")
+                    if submission.resume_from_full_prompt:
+                        # A complete prompt snapshot starts a fresh detokenizer
+                        # turn while the EngineCore request and its KV stay live.
+                        pool.output_processor.remove_request(context.request_id)
                     replica_id = await pool.submit_update(context.request_id, request_state, request, **route_kwargs)
                 else:
                     replica_id = await pool.submit_initial(
@@ -635,8 +657,16 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
 
         # The current-stage send has completed. Downstream prewarm
         # must not hold up another session's use of this stage's sender cache.
-        if not submission.already_submitted and self.async_chunk and context.stage_id == 0:
-            prewarmed = await self._prewarm_async_chunk_stages(context.request_id, request, request_state)
+        if (
+            (not submission.already_submitted or submission.resume_from_full_prompt)
+            and self.async_chunk
+            and context.stage_id == 0
+        ):
+            downstream_entry = request
+            if submission.resume_from_full_prompt:
+                downstream_entry = copy.copy(request)
+                downstream_entry.resumable = False
+            prewarmed = await self._prewarm_async_chunk_stages(context.request_id, downstream_entry, request_state)
             if not prewarmed:
                 # The prewarm already failed the request, aborted it and
                 # popped its state; the runner turns this into an append
@@ -696,6 +726,25 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
         finally:
             req_state.skip_legacy_stage_forward = False
+
+    async def finish_turn(self, request_id: str) -> None:
+        state = self.request_states.get(request_id)
+        if state is None:
+            return
+        for stage_id, pool in enumerate(self.stage_pools[1:], 1):
+            await pool.abort_requests([request_id])
+            pool.output_processor.remove_request(request_id)
+            pool.release_binding(request_id)
+            state.stage_submit_ts.pop(stage_id, None)
+        state.finished_stage_ids.clear()
+        state.finished_final_output_stage_ids.clear()
+        state.pending_final_output = None
+        state.upstream_first_audio = False
+        state.pending_upstream_first_audio = None
+        state.pending_first_audio_outputs.clear()
+        state.streaming.segments.clear()
+        state.streaming.bridge_states.clear()
+        state.yield_stage_output = None
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)

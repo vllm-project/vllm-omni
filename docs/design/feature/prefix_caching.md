@@ -60,6 +60,15 @@ hash-based reuse and eviction, rather than being pinned to the duplex session.
 See the [duplex API guide](../../serving/realtime_duplex_api.md#qwen3-omni-cross-turn-thinker-kv-reuse)
 for deployment and latency considerations.
 
+The opt-in `qwen3_omni_duplex_kv.yaml` profile additionally retains the Thinker
+EngineCore request across committed turns. It uses block hashes to validate
+the resident KV rather than looking those KV blocks up in the shared prefix
+cache. Reuse requires all completed blocks to match; otherwise the old
+allocation is released before rebuilding. The partial block is recomputed.
+Stage-output caching remains required to replay complete conditioning rows to
+each fresh downstream speech pipeline. A worker retirement/arrival pair resets
+per-turn delivery state without releasing scheduler-owned matching KV.
+
 ### Example
 
 !!! note "Note 3"
