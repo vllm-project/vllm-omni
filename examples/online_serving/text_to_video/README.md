@@ -72,6 +72,8 @@ curl -X POST http://localhost:8091/v1/videos/sync \
 
 For 720P, serve `Skywork/SkyReels-V2-T2V-14B-720P-Diffusers` and use `size=1280x720`.
 
+A prompt-only request runs the full defaults (97 frames, 50 steps at 540P), which took about 13 minutes on one H100 PCIe. That is longer than the default 600 s limit of `/v1/videos/sync`, so set `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` (for example `export VLLM_OMNI_VIDEO_SYNC_TIMEOUT=2400`) before `vllm serve`, or use the async `/v1/videos` endpoint.
+
 ## Async Job Behavior
 
 `POST /v1/videos` is asynchronous. It creates a video job and immediately
