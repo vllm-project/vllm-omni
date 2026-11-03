@@ -64,13 +64,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._pending_finish_reqs: list[Request] = []
         self._generation_pending_inputs: set[str] = set()
         self._pending_chunk_error_outputs: list[tuple[int, EngineCoreOutput]] = []
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        extra = (
-            connector_config.get("extra", connector_config)
-            if isinstance(connector_config, dict)
-            else getattr(connector_config, "extra", None)
-        ) or {}
-        self._init_generation_coalescing(extra)
+        self._init_generation_coalescing(self._get_scheduler_extra_config())
 
     def _init_generation_coalescing(self, extra: Mapping[str, Any]) -> None:
         """Initialize generation-specific batch and express scheduling policy."""
