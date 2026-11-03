@@ -51,6 +51,22 @@ def _dist_env():
             cleanup_dist_env_and_memory()
 
 
+@pytest.fixture
+def _torch_sdpa_env(_dist_env):
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec, OmniDiffusionConfig
+
+    # Gate/fallback tests include head_dim=192, which the default cuDNN backend
+    # cannot execute on SM120. Select a portable backend for these tests.
+    config = OmniDiffusionConfig(
+        model=None,
+        enforce_eager=True,
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
+    )
+    with set_current_diffusion_config(config):
+        yield config
+
+
 def _rope(seq_len: int):
     torch.manual_seed(seq_len)
     angles = torch.randn(seq_len, _HEAD_DIM // 2, device="cuda")
@@ -119,13 +135,13 @@ def test_ovis_attention_fused_matches_eager(_dist_env, double_stream, batch, txt
 
 @pytest.mark.parametrize("head_dim", [128, 192])
 @pytest.mark.parametrize("threshold", [None, "48", "49"])
-def test_ovis_forward_fusion_gate(_dist_env, monkeypatch, head_dim, threshold):
+def test_ovis_forward_fusion_gate(_torch_sdpa_env, monkeypatch, head_dim, threshold):
     """Cover the real pack call site, the B*(text+image) boundary and partial RoPE."""
-    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+    from vllm_omni.diffusion.data import TransformerConfig
     from vllm_omni.diffusion.models.ovis_image import ovis_image_transformer as model_module
 
     torch.manual_seed(4)
-    config = OmniDiffusionConfig(model=None, enforce_eager=True)
+    config = _torch_sdpa_env
     config.set_tf_model_config(TransformerConfig.from_dict({"num_layers": 1}))
     with torch.device("cuda"):
         model = (
@@ -189,7 +205,7 @@ def test_ovis_forward_fusion_gate(_dist_env, monkeypatch, head_dim, threshold):
 
 
 @pytest.mark.parametrize("double_stream", [True, False])
-def test_ovis_attention_rejects_partial_rope_table(_dist_env, double_stream):
+def test_ovis_attention_rejects_partial_rope_table(_torch_sdpa_env, double_stream):
     """An externally supplied table must also respect the CUDA RMSNorm contract."""
     from vllm_omni.diffusion.models.ovis_image import ovis_image_transformer as model_module
 
@@ -201,6 +217,7 @@ def test_ovis_attention_rejects_partial_rope_table(_dist_env, double_stream):
             .to(torch.bfloat16)
             .eval()
         )
+    assert attn.attn.attn_backend.get_name() == "SDPA"
     with torch.no_grad():
         for p in attn.parameters():
             p.fill_(0.02)
