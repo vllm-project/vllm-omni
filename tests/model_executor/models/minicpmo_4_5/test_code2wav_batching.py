@@ -213,14 +213,14 @@ def test_hift_exact_graph_defaults_and_overrides(extra, frames, batches):
 @pytest.mark.parametrize(
     ("extra", "expected"),
     [
-        ({}, [1]),
+        ({}, [1, 2]),
         ({"hift_graph_exact_batch_sizes": []}, []),
         ({"hift_graph_exact_batch_sizes": [2, 2, 0]}, [2]),
     ],
-)
+    )
 def test_hift_exact_batch_sizes_distinguish_missing_key_from_explicit_empty(extra, expected):
     # An explicit empty list must disable exact-shape graphs; only a missing
-    # key means the (1,) default.
+    # key means the shared (1, 2) default.
     from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import _exact_batch_sizes
 
     assert _exact_batch_sizes(extra) == expected

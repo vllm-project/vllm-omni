@@ -1519,6 +1519,43 @@ def test_host_temperature_zero_takes_the_argmax_not_a_draw():
     assert got == {42}
 
 
+def test_host_sampler_carries_the_generator_across_a_condition_reset():
+    """A duplex condition reset carries the draw stream instead of replaying the seed.
+
+    amy-why-3459 review follow-up: the segment reset pops the host state while
+    the codec seed stays the same, so a rebuilt state would replay the same
+    draw sequence for every condition of the request. The reset parks the
+    generator and the rebuild picks it up, so the stream keeps advancing.
+    """
+    model = _real_boundary_talker(1.0)
+    _real_host(model)
+    _set_head_logits(model, {42: 8.0, 43: 7.9, 44: 7.8})
+    hidden = torch.ones(1, 8)
+    request_state = {
+        "codec_seed": 7,
+        "codec_temperature": 1.0,
+        "codec_top_k": 0,
+        "codec_top_p": 1.0,
+        "codec_repetition_penalty": 1.0,
+    }
+
+    def draws(request_id: str, count: int) -> list[int]:
+        return [
+            model._sample_audio_code_host(hidden, torch.tensor([10, 11]), request_id, request_state, 0, 0, 100, False)[0]
+            for _ in range(count)
+        ]
+
+    first_segment = draws("duplex", 12)
+    # The reset path: park the generator, drop the state.
+    dropped = model._request_host_codec_states.pop("duplex")
+    model._request_host_codec_generators = {"duplex": dropped["generator"]}
+    second_segment = draws("duplex", 12)
+    # A fresh request with the same seed replays the first segment exactly --
+    # the replay the carried generator must avoid.
+    assert draws("fresh", 12) == first_segment
+    assert second_segment != first_segment
+
+
 def test_stop_id_finishes_request_through_device_state_greedy():
     """A codec stop id finishes the request via the device state alone.
 

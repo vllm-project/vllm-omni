@@ -1224,7 +1224,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 if isinstance(host_states, dict):
                     # Same reset for the host sampler: a stale "finished"
                     # would keep every later frame of the new segment silent.
-                    host_states.pop(request_id, None)
+                    # The draw generator is carried across the reset, so the
+                    # next duplex condition keeps advancing one draw stream
+                    # instead of replaying the codec seed's sequence.
+                    old_host_state = host_states.pop(request_id, None)
+                    if isinstance(old_host_state, dict) and old_host_state.get("generator") is not None:
+                        carried = getattr(self, "_request_host_codec_generators", None)
+                        if not isinstance(carried, dict):
+                            carried = {}
+                            self._request_host_codec_generators = carried
+                        carried[request_id] = old_host_state["generator"]
             empty_codes = torch.empty(0, dtype=torch.long, device="cpu")
             return (
                 input_ids,
@@ -2327,8 +2336,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_host_codec_states = states
         hstate = states.get(request_id)
         if hstate is None:
-            seed = _codec_int_param(request_state, "codec_seed", self._codec_seed)
-            generator = random.Random(int(seed))
+            # A carried generator (a duplex condition reset) keeps advancing
+            # the request's draw stream; a fresh request seeds its own.
+            carried = getattr(self, "_request_host_codec_generators", None)
+            generator = carried.pop(request_id, None) if isinstance(carried, dict) else None
+            if generator is None:
+                seed = _codec_int_param(request_state, "codec_seed", self._codec_seed)
+                generator = random.Random(int(seed))
             window: list[int] = []
             if isinstance(history, torch.Tensor) and history.numel() > 0:
                 window = [int(t) for t in history.detach().to(torch.long).reshape(-1).cpu().tolist()]

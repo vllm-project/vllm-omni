@@ -27,11 +27,12 @@ def test_attention_cache_and_replay(cached, alias, mask_kind, qkv_bias, extra_ca
     batch, frames, heads, dim = 2, 6, 2, 16
     attn = decoder.Attention(heads * dim, heads, dim, qkv_bias=qkv_bias, qk_norm=True).npu().eval()
     x = torch.randn(batch, frames, heads * dim, device="npu")
-    kv = torch.randn(batch, heads, frames + cached + extra_capacity, 2 * dim, device="npu")
-    tail = kv[:, :, frames + cached :].clone()
-    cache = kv[:, :, frames : frames + cached] if cached else None
+    # Split K/V rows: K and V on their own axis, as ``_attend_in_place`` keeps them.
+    kv = torch.randn(2, batch, heads, frames + cached + extra_capacity, dim, device="npu")
+    cache = kv[:, :, :, frames : frames + cached] if cached else None
     if cache is not None and not alias:
         cache = cache.clone()
+    packed_cache = None if cache is None else torch.cat((cache[0], cache[1]), dim=-1)
     mask = None
     if mask_kind != "none":
         mask = torch.ones(
@@ -40,11 +41,14 @@ def test_attention_cache_and_replay(cached, alias, mask_kind, qkv_bias, extra_ca
         mask[..., -2:] = False
 
     with npu_token2wav_sdpa_context(require_math=True):
-        expected, expected_cache = attn.forward_chunk(x, cache, mask)
+        expected, expected_cache = attn.forward_chunk(x, packed_cache, mask)
         actual = BatchedToken2Wav._attend_in_place(attn, x, cache, mask, kv)
         torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
-        torch.testing.assert_close(kv[:, :, : frames + cached], expected_cache)
-        torch.testing.assert_close(kv[:, :, frames + cached :], tail)
+        live = torch.cat((kv[0, :, :, : frames + cached], kv[1, :, :, : frames + cached]), dim=-1)
+        torch.testing.assert_close(live, expected_cache)
+        # The padded tail past the live span is zeroed unconditionally: a NaN
+        # there must never reach the attention epilogue through 0 * NaN.
+        assert (kv[:, :, :, frames + cached :] == 0).all()
 
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
@@ -54,12 +58,14 @@ def test_attention_cache_and_replay(cached, alias, mask_kind, qkv_bias, extra_ca
             x.copy_(torch.randn_like(x))
             if cache is not None:
                 cache.copy_(torch.randn_like(cache))
-            expected, expected_cache = attn.forward_chunk(x, cache, mask)
+            packed_cache = None if cache is None else torch.cat((cache[0], cache[1]), dim=-1)
+            expected, expected_cache = attn.forward_chunk(x, packed_cache, mask)
             graph.replay()
             torch.npu.synchronize()
             torch.testing.assert_close(replayed, expected, atol=2e-5, rtol=2e-5)
-            torch.testing.assert_close(kv[:, :, : frames + cached], expected_cache)
-            torch.testing.assert_close(kv[:, :, frames + cached :], tail)
+            live = torch.cat((kv[0, :, :, : frames + cached], kv[1, :, :, : frames + cached]), dim=-1)
+            torch.testing.assert_close(live, expected_cache)
+            assert (kv[:, :, :, frames + cached :] == 0).all()
 
 
 @pytest.mark.parametrize("inference", [False, True])
@@ -129,7 +135,7 @@ def test_original_and_packed_graphs_share_stable_weights():
     prepare_estimator(SimpleNamespace(blocks=[SimpleNamespace(attn=attn)]))
     pointers = [p.weight.data_ptr() for p in (attn.to_q, attn.to_k, attn.to_v)]
     x = torch.randn(2, 6, 32, device="npu")
-    kv = torch.empty(2, 2, 6, 32, device="npu")
+    kv = torch.empty(2, 2, 2, 6, 16, device="npu")
     with npu_token2wav_sdpa_context(require_math=True):
         attn.forward_chunk(x)
         old_graph = torch.npu.NPUGraph()

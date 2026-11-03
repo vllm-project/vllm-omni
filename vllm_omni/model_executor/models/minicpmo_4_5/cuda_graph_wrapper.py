@@ -61,11 +61,20 @@ def codec_frame_range(value, *, name: str) -> range:
     return range(int(value[0]), int(value[1]) + 1)
 
 
+# The HiFT exact-shape graph batch sizes both the connector profile and this
+# wrapper fall back to when ``hift_graph_exact_batch_sizes`` is missing; one
+# constant so the two defaults cannot drift apart.
+DEFAULT_HIFT_GRAPH_EXACT_BATCH_SIZES = (1, 2)
+
+
 def _exact_batch_sizes(connector_config) -> list[int]:
-    """``hift_graph_exact_batch_sizes``: a missing key defaults to ``(1,)``,
-    an explicit empty list disables exact-shape graphs."""
+    """``hift_graph_exact_batch_sizes``: a missing key defaults to
+    ``DEFAULT_HIFT_GRAPH_EXACT_BATCH_SIZES``, an explicit empty list disables
+    exact-shape graphs."""
     sizes = connector_config.get("hift_graph_exact_batch_sizes")
-    return sorted({int(b) for b in (sizes if sizes is not None else (1,)) if int(b) > 0})
+    return sorted(
+        {int(b) for b in (sizes if sizes is not None else DEFAULT_HIFT_GRAPH_EXACT_BATCH_SIZES) if int(b) > 0}
+    )
 
 
 def empty_hift_outputs(speech_feat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -280,10 +280,12 @@ def attention_npu(attn, hidden, att_cache, attn_mask, kv, slots=None):
     current_keys = attn.k_norm(packed[:, :, 1].transpose(1, 2))
     current_values = packed[:, :, 2].transpose(1, 2)
     # A masked gap past the real cache must stay finite: an uninitialized key
-    # poisons real rows through ``0 * NaN`` in the attention epilogue.
-    if logical_cache > cached:
-        behind_keys[:, :, cached:].zero_()
-        behind_values[:, :, cached:].zero_()
+    # poisons real rows through ``0 * NaN`` in the attention epilogue. The
+    # zeroing is unconditional: when ``logical_cache == cached`` no writer
+    # touches the padded tail between the live span and the capacity, and the
+    # arena's zero-filled allocation is a detail of another file.
+    behind_keys[:, :, cached:].zero_()
+    behind_values[:, :, cached:].zero_()
     keys[:, :, :frames].copy_(current_keys)
     values[:, :, :frames].copy_(current_values)
     mask = _expand_attn_mask_for_npu(attn_mask, frames, capacity)

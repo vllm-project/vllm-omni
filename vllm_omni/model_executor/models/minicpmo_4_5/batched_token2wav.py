@@ -674,7 +674,9 @@ class BatchedToken2Wav(nn.Module):
         total_frames = int(old_mel.shape[2] + chunk_mel.shape[2])
         keep = min(self.mel_cache_len, total_frames) if self.mel_cache_len else total_frames
         if keep <= chunk_mel.shape[2]:
-            next_mel = chunk_mel[..., chunk_mel.shape[2] - keep :]
+            # A view into the batch-wide ``chunk_mel`` would pin the whole
+            # step's mel tensor until the next decode; own this slice.
+            next_mel = chunk_mel[..., chunk_mel.shape[2] - keep :].clone()
         else:
             next_mel = torch.cat((old_mel[..., -(keep - chunk_mel.shape[2]) :], chunk_mel), dim=2)
         return speech, source, next_mel.detach()
