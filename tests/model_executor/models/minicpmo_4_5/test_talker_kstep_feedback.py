@@ -1110,7 +1110,7 @@ def test_request_min_tokens_reaches_codec_state():
     in-model codec sampler is the only min-length guard left (PR #7929
     review). The value merged here is the *resolved* request parameter:
     both entrypoints fold the deploy defaults in before the engine sees
-    it (``serving_chat._apply_request_overrides`` and
+    it (``serving_chat._merge_llm_sampling_params`` and
     ``omni_base.resolve_sampling_params_list``), so the deployment
     minimum arrives as a positive 50, and an explicit caller 0 arrives
     as 0 -- floor disabled. vLLM 0.30.0's SamplingParams is a plain

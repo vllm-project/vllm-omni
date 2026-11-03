@@ -13,6 +13,8 @@ nav:
         - Audio Generation: serving/audio_generate_api.md
         - Image Generation: serving/image_generation_api.md
         - Image Edit: serving/image_edit_api.md
+        - Image Segmentation: serving/image_segmentation_api.md
+        - Video Segmentation: serving/video_segmentation_api.md
         - Videos: serving/videos_api.md
       - Streaming and Realtime:
         - Full Duplex OpenAI: serving/realtime_openai_duplex_api.md
@@ -38,7 +40,7 @@ nav:
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
       - Speech-To-Video: user_guide/examples/online_serving/speech_to_video.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
-      - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
+      - Text-To-Speech (Online Serving): user_guide/examples/online_serving/text_to_speech.md
       - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
   - General:
     - usage/*
@@ -53,8 +55,10 @@ nav:
     - Runtime and Stage Execution:
       - Execution Modes and Streaming: user_guide/diffusion/execution_modes.md
       - Prefill-Decode Disaggregation (experimental): features/pd_disaggregation.md
+      - Independent Stage Execution (experimental): features/independent_stage_execution.md
       - Sleep Mode: features/sleep_mode.md
       - HF Numerics for RL Rollouts: features/hf_numerics.md
+    - Watermarking: features/watermarking.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
       - Online Quantization: user_guide/quantization/online.md
@@ -103,6 +107,7 @@ nav:
         - RainFusion: user_guide/diffusion/attention_backends/rainfusion.md
         - VDN-H3 Hybrid Attention: user_guide/diffusion/attention_backends/vdnh3_attn.md
       - Regional Compilation: user_guide/diffusion/regional_compilation.md
+      - MiniMax-H3 LiteVAE Decoder: user_guide/diffusion/light_vae.md
       - Wan VAE Decoder Fast Path: user_guide/diffusion/vae_fast_path.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Startup and Loading: user_guide/diffusion/startup_and_loading.md

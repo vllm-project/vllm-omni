@@ -15,6 +15,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     Cell,
     CellPlan,
     Inflight,
+    Ordering,
     RequestKVTransfer,
     union_transfers,
     union_wait_ready,
@@ -462,7 +463,10 @@ class NoisyKVCache:
         self.max_batch_size = max(1, max_batch_size)
         self.blocks_per_rank = max(1, blocks_per_rank)
         chunk_blocks = spec.max_chunk_tokens // spec.block_size
-        # Per-layer residency ~ H+2+G; capacity is per layer.
+        # Capacity is per layer. Same-Step needs at most H+2 resident versions:
+        # one fixed clean sink, up to H recent chunks, and the current write;
+        # chunk 0 is deduplicated while inside the recent window. The G/step
+        # margins below also cover pipeline overlap and transfers.
         per_req = max(spec.max_history_chunks + 2 + layer_groups, spec.max_history_chunks + step_replicas)
         desired = self.max_batch_size * per_req
         bytes_per_version = (
@@ -645,8 +649,14 @@ class NoisyKVState:
         spec = self.cache.spec
         pool = self.cache.pool
         h = spec.max_history_chunks
-        width = (h + 1) * pool.chunk_blocks
-        max_seq_len = (h + 1) * spec.max_chunk_tokens
+        sink = int(
+            any(
+                plan.schedule.ordering is Ordering.SAME_STEP and plan.schedule.chunks > 1
+                for plan in self._plans.values()
+            )
+        )
+        width = (h + 1 + sink) * pool.chunk_blocks
+        max_seq_len = (h + 1 + sink) * spec.max_chunk_tokens
         max_query_len = self.cache.max_batch_size * spec.max_chunk_tokens
         batch: list[list[NoisyLayerContext]] = []
         device = pool.k_pools[0].device

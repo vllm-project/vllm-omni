@@ -368,13 +368,6 @@ class CausVidWanPipeline(nn.Module):
             # S>=2 here (S=1 is always in the set above); infer D = S-1 → S = D+1.
             denoise = step_replicas - 1
         extra["num_denoise_steps"] = denoise
-        # Clean@0 is an ordering property, independent of the history window:
-        # self_forcing and latest_kv always run it; same_step is not offered.
-        if "has_clean" in extra:
-            raise ValueError(
-                "has_clean is derived from the topology (self_forcing / latest_kv: always, "
-                "same_step: never) and is no longer a request knob; remove it from extra_args"
-            )
         if step_replicas == 1 and self.layer_groups > 1 and bool(extra.get("stream_decode", False)):
             # S=1 finish rank is G-1, but only pp_rank 0 owns the VAE; with
             # G>1 the local path would crash non-VAE ranks and there is no
