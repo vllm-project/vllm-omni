@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Packaging tests that need no GPU, no server, and no ffmpeg.
 
 The fMP4 structures are built in memory with the boxes that carry timing and
@@ -188,6 +188,53 @@ def test_segments_close_on_keyframes(tmp_path: Path) -> None:
     assert (tmp_path / "segment00001.m4s").read_bytes() == b"".join(frags[3:7])
 
 
+def test_long_gop_is_split_at_the_segment_cap(tmp_path: Path) -> None:
+    """One keyframe, then a GOP longer than max_segment_seconds (6 s by default).
+
+    Ten parts make 5.625 s. An eleventh would make 6.1875 s, past the cap, so the
+    segment closes after ten. EXTINF must never exceed TARGETDURATION.
+    """
+    stream, _, _ = build_stream(keyframes=(True,) + (False,) * 12)
+    package(tmp_path, stream)
+
+    playlist = (tmp_path / "stream.m3u8").read_text()
+    assert "#EXT-X-TARGETDURATION:6" in playlist
+    extinfs = [
+        float(line.removeprefix("#EXTINF:").rstrip(","))
+        for line in playlist.splitlines()
+        if line.startswith("#EXTINF:")
+    ]
+    assert extinfs == pytest.approx([10 * PART_SECONDS, 3 * PART_SECONDS])
+    assert playlist.count("INDEPENDENT=YES") == 1
+
+
+def test_header_tags_stay_fixed_while_the_stream_grows(tmp_path: Path) -> None:
+    """RFC 8216 section 6.2.1: EXT-X-TARGETDURATION must not change in a live playlist.
+    The LL-HLS part target is held to the same rule here."""
+    stream, _, _ = build_stream()
+    headers: set[tuple[str, ...]] = set()
+
+    def record(out: Path) -> None:
+        lines = (out / "stream.m3u8").read_text().splitlines()
+        headers.add(
+            tuple(
+                line
+                for line in lines
+                if line.startswith(("#EXT-X-TARGETDURATION", "#EXT-X-PART-INF", "#EXT-X-SERVER-CONTROL"))
+            )
+        )
+
+    package(tmp_path, stream, after_each=record)
+    assert len(headers) == 1, f"header tags changed between playlist versions: {headers}"
+
+
+def test_part_longer_than_declared_part_target_is_rejected(tmp_path: Path) -> None:
+    packager = LLHLSPackager(out_dir=tmp_path, part_target=0.5)
+    packager.start(build_init())
+    with pytest.raises(ValueError, match="longer than the declared PART-TARGET"):
+        packager.add_fragment(build_fragment(0))  # 0.5625 s
+
+
 def test_playlist_never_lists_a_file_before_it_exists(tmp_path: Path) -> None:
     """Checked after every fragment, so a live player never sees a 404."""
     stream, _, _ = build_stream(keyframes=(True, False, True, False, False, True))
@@ -261,9 +308,20 @@ def test_server_error_still_closes_playlist(tmp_path: Path, monkeypatch: pytest.
 
     out = tmp_path / "out"
     args = argparse.Namespace(
-        host="127.0.0.1", port=8000, model="m", prompt="p", width=640, height=384, fps=16,
-        num_frames=99, seed=None, guidance_scale=None, helios_preset=False, extra_params=None,
-        timeout=30.0, out=str(out),
+        host="127.0.0.1",
+        port=8000,
+        model="m",
+        prompt="p",
+        width=640,
+        height=384,
+        fps=16,
+        num_frames=99,
+        seed=None,
+        guidance_scale=None,
+        helios_preset=False,
+        extra_params=None,
+        timeout=30.0,
+        out=str(out),
     )
     assert asyncio.run(hls_client.run(args)) == 1
 

@@ -14,7 +14,7 @@ emits.
 replace it. The two consumers there stop at different points:
 
 | Existing | Ends at |
-|---|---|
+| --- | --- |
 | `streaming_video_client.py` | Saves chunks, remuxes to a progressive MP4 after `session.done` |
 | `gradio_demo.py` | Appends fragments through MSE in one attached browser |
 
@@ -25,7 +25,7 @@ step from LL-HLS. This takes that step.
 ## Files
 
 | File | Purpose |
-|---|---|
+| --- | --- |
 | `fmp4.py` | Incremental fMP4 splitter. Emits the init segment once, then one buffer per `moof`+`mdat` |
 | `llhls.py` | Publishes each fragment as an LL-HLS part, maintains the playlist, records latency |
 | `hls_client.py` | Connects to the server and drives the two above |
@@ -36,9 +36,12 @@ in any slicing rather than assuming one binary frame equals one fragment.
 Each part's duration and keyframe flag come from its fragment's own `trun` and `tfhd`
 boxes, not from the generation chunk size. A parent segment closes at every fragment
 that starts on a keyframe, so each segment starts on a keyframe and a late joiner can
-begin decoding at any segment. Segment length therefore follows the server's keyframe
-interval. The playlist does not advertise blocking reload: a static file server cannot
-hold a reload, so players poll and use the preload hint for the live edge.
+begin decoding at any segment. A segment also closes before it would pass
+`max_segment_seconds` (6 s), so a long GOP is split and `EXT-X-TARGETDURATION` never
+changes, as RFC 8216 requires. Those forced splits can start mid-GOP. `PART-TARGET` is
+declared up front (9/16 s, the reference chunk), and a part longer than that is an error.
+The playlist does not advertise blocking reload: a static file server cannot hold a
+reload, so players poll and use the preload hint for the live edge.
 
 ## Run
 

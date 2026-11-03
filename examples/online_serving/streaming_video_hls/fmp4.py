@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Incremental fragmented-MP4 splitter.
 
 vLLM-Omni's ``WS /v1/realtime/video`` sends fragmented MP4 over a WebSocket: one

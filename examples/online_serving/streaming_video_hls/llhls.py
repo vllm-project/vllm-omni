@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Low-Latency HLS packager for a live fragmented-MP4 fragment stream.
 
 Why this exists
@@ -23,12 +23,19 @@ write, publish, fetch, decode, first frame. This records the terms it can see.
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from itertools import groupby
 from pathlib import Path
 
 from fmp4 import fragment_timing, track_timescale
+
+# Reference chunk: 9 frames at 16 fps. Used as the declared PART-TARGET unless the
+# caller says otherwise.
+REFERENCE_PART_SECONDS = 9 / 16
+
+_EPSILON = 1e-6
 
 
 @dataclass
@@ -56,11 +63,19 @@ class LLHLSPackager:
 
     Each fragment is one part. A parent segment closes when a keyframe-led part
     arrives, so every segment starts on a keyframe and a late joiner can begin
-    decoding at any segment boundary. Segment length follows the stream's GOP
-    structure rather than a fixed part count.
+    decoding at any segment boundary. A long GOP would otherwise make one segment
+    as long as the GOP, so a segment also closes before it would pass
+    ``max_segment_seconds``. Those forced splits can start mid-GOP, which is the
+    cost of a bounded target duration.
+
+    The playlist header is fixed for its whole life, as RFC 8216 section 6.2.1
+    requires for EXT-X-TARGETDURATION. ``part_target`` is the declared
+    EXT-X-PART-INF PART-TARGET, and any part longer than it is an error.
     """
 
     out_dir: Path
+    part_target: float = REFERENCE_PART_SECONDS
+    max_segment_seconds: float = 6.0
     playlist_name: str = "stream.m3u8"
 
     _timescale: int = 0
@@ -72,6 +87,8 @@ class LLHLSPackager:
     started_at: float | None = None
 
     def __post_init__(self) -> None:
+        if self.part_target <= 0 or self.max_segment_seconds <= 0:
+            raise ValueError("part_target and max_segment_seconds must be positive")
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
     # -- lifecycle -----------------------------------------------------------
@@ -91,18 +108,31 @@ class LLHLSPackager:
     def add_fragment(self, data: bytes, received_at: float | None = None) -> PartRecord:
         """Publish one fragment as the next LL-HLS part.
 
-        The fragment is written verbatim. No transcode, no remux: the server
-        already produced a valid fMP4 fragment, and re-encoding here would both
-        add latency and make any quality measurement meaningless.
+        The fragment is written verbatim. No transcode, no remux: the server already
+        produced a valid fMP4 fragment, and re-encoding here would both add latency
+        and make any quality measurement meaningless.
         """
         if self._t0 is None:
             raise RuntimeError("start() must be called with the init segment first")
         received_at = received_at if received_at is not None else time.perf_counter()
         timing = fragment_timing(data, self._timescale)
+        if timing.duration > self.part_target + _EPSILON:
+            raise ValueError(
+                f"part {len(self._parts)} is {timing.duration:.4f}s, longer than the declared "
+                f"PART-TARGET of {self.part_target:.4f}s; pass a larger part_target"
+            )
+        if timing.duration > self.max_segment_seconds + _EPSILON:
+            raise ValueError(
+                f"part {len(self._parts)} is {timing.duration:.4f}s, longer than "
+                f"max_segment_seconds of {self.max_segment_seconds:.4f}s"
+            )
 
-        # A keyframe starts a new parent segment. The segment being closed is written
-        # to disk here, before the playlist that lists it is updated.
-        if self._pending and timing.independent:
+        # A keyframe starts a new parent segment. So does a part that would push the
+        # open segment past the declared target duration. The closed segment is
+        # written to disk before the playlist that lists it is updated.
+        if self._pending and (
+            timing.independent or self._pending_duration + timing.duration > self.max_segment_seconds + _EPSILON
+        ):
             self._close_segment()
 
         index = len(self._parts)
@@ -143,24 +173,24 @@ class LLHLSPackager:
     # -- playlist ------------------------------------------------------------
 
     def _write_playlist(self, ended: bool = False) -> None:
-        part_target = max((p.duration for p in self._parts), default=0.0)
-        durations = self._segment_durations
-        longest = max([*durations, self._pending_duration])
         lines = [
             "#EXTM3U",
             "#EXT-X-VERSION:9",
-            f"#EXT-X-TARGETDURATION:{max(1, round(longest))}",
-            f"#EXT-X-PART-INF:PART-TARGET={part_target:.5f}",
-            # Hold-back is three part targets, as the spec requires. There is no
-            # CAN-BLOCK-RELOAD: a static file server cannot hold a playlist reload,
-            # so the playlist does not claim one.
-            f"#EXT-X-SERVER-CONTROL:PART-HOLD-BACK={part_target * 3:.5f}",
+            # Fixed for the playlist's life (RFC 8216 section 6.2.1). Every segment is
+            # at most max_segment_seconds, so this is always >= each EXTINF when rounded.
+            f"#EXT-X-TARGETDURATION:{math.ceil(self.max_segment_seconds - _EPSILON)}",
+            f"#EXT-X-PART-INF:PART-TARGET={self.part_target:.5f}",
+            # Hold-back is three part targets. The spec's minimum is two. There is no
+            # CAN-BLOCK-RELOAD: a static file server cannot hold a playlist reload, so
+            # the playlist does not claim one.
+            f"#EXT-X-SERVER-CONTROL:PART-HOLD-BACK={self.part_target * 3:.5f}",
             "#EXT-X-MEDIA-SEQUENCE:0",
             '#EXT-X-MAP:URI="init.mp4"',
         ]
 
         # Each segment's parts are listed, then its EXTINF and URI. The URI appears
         # only once the segment is closed and its file is on disk.
+        durations = self._segment_durations
         for seg, parts in groupby(self._parts, key=lambda p: p.segment):
             for part in parts:
                 attrs = f'DURATION={part.duration:.5f},URI="{part.uri}"'

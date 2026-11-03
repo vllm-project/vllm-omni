@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Live client: vLLM-Omni ``WS /v1/realtime/video`` to an LL-HLS playlist.
 
 Connects to a running vLLM-Omni server, streams generated fragments straight into
@@ -119,8 +119,10 @@ async def run(a: argparse.Namespace) -> int:
                         marks.setdefault("first_part_published", rec.published_at)
                         chunks += 1
                         frame_type = "keyframe" if rec.independent else "delta"
-                        print(f"  part {rec.index:>3}  {rec.duration:.4f}s  {frame_type:<8}  "
-                              f"{rec.bytes:>8}B  publish {rec.publish_latency * 1000:.2f}ms")
+                        print(
+                            f"  part {rec.index:>3}  {rec.duration:.4f}s  {frame_type:<8}  "
+                            f"{rec.bytes:>8}B  publish {rec.publish_latency * 1000:.2f}ms"
+                        )
                     continue
 
                 msg = json.loads(message)
