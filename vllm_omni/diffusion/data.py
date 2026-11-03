@@ -850,6 +850,10 @@ class OmniDiffusionConfig:
     # Attention
     diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
     fa_deterministic: bool = False
+    # Run the positive and negative CFG branches as one batched denoiser call
+    # when CFG is not split across ranks. Only pipelines that declare
+    # ``supports_cfg_batching`` use it; it halves the denoiser calls per step.
+    enable_cfg_batching: bool = True
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
