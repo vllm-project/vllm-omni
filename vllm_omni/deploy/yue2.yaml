@@ -42,6 +42,10 @@ stages:
     tokenizer: gpt2
     hf_overrides:
       architectures: ["Yue2ForCausalLM"]
+      # Opt in to FA2 prefill CUDA graphs; independent of AR enforce_eager.
+      # FA3 prefill graphs have not been validated and are not enabled yet.
+      # Does not control the existing NAR ODE or sampler graphs.
+      yue2_prefill_graph: false
     default_sampling_params:
       # Defaults for callers that omit model-owned sampling options. The
       # opt-in prepare_runner_inputs hook reads each request's extra_args;
