@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import httpx
 import numpy as np
 import pytest
 import websockets
@@ -37,6 +38,7 @@ from openai.types.realtime import (
 )
 from openai.types.realtime.realtime_client_event import RealtimeClientEvent
 from openai.types.realtime.realtime_conversation_item_user_message import Content
+from prometheus_client.parser import text_string_to_metric_families
 
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import validated_input_wav, validated_soft_interrupt_wav
 from tests.helpers.mark import hardware_test
@@ -1081,7 +1083,7 @@ class _DuplexTestRuntime(NamedTuple):
 
 
 @pytest.fixture(scope="class")
-def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, cached_smart_turn_artifact, run_level):
+def qwen_duplex_server(request, tmp_path_factory, cached_silero_vad_artifact, cached_smart_turn_artifact, run_level):
     """Load real weights once for all interruption repetitions and history checks."""
     from transformers import AutoProcessor
 
@@ -1093,7 +1095,7 @@ def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, cached_smar
     deploy.write_text(
         yaml.safe_dump(
             {
-                "base_config": get_deploy_config_path("qwen3_omni_duplex.yaml"),
+                "base_config": get_deploy_config_path(getattr(request, "param", "qwen3_omni_duplex.yaml")),
                 "duplex_session": {
                     "server_vad_model_path": cached_silero_vad_artifact,
                     "semantic_vad_model_path": cached_smart_turn_artifact,
@@ -1106,7 +1108,7 @@ def qwen_duplex_server(tmp_path_factory, cached_silero_vad_artifact, cached_smar
     processor = AutoProcessor.from_pretrained(model, trust_remote_code=True)
     with OmniServer(
         model,
-        ["--deploy-config", str(deploy), "--init-timeout", "900", "--stage-init-timeout", "600"],
+        ["--deploy-config", str(deploy), "--init-timeout", "900", "--stage-init-timeout", "600", "--log-stats"],
         env_dict={"VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR": str(artifacts)},
     ) as server:
         yield _DuplexTestRuntime(server=server, processor=processor, artifacts=artifacts)
@@ -1429,7 +1431,25 @@ async def _run_semantic_vad_endpoint(runtime, log_path: Path, *, fixture: str) -
     return events
 
 
-async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
+async def _duplex_thinker_cache_stats(runtime) -> dict[str, float]:
+    server = runtime.server
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"http://{server.host}:{server.port}/metrics", timeout=10)
+    response.raise_for_status()
+    stats: dict[str, float] = {}
+    for family in text_string_to_metric_families(response.text):
+        for sample in family.samples:
+            if sample.labels.get("stage") != "0":
+                continue
+            for key in ("queries", "hits"):
+                if sample.name == f"vllm:prefix_cache_{key}_total":
+                    stats[key] = stats.get(key, 0) + sample.value
+    assert stats.keys() == {"queries", "hits"}, "Thinker prefix-cache metrics must be enabled"
+    return stats
+
+
+async def _run_duplex_history_pruning(runtime, log_path: Path) -> list[dict[str, float]]:
+    cache_stats = [await _duplex_thinker_cache_stats(runtime)]
     async with _duplex_recorded_session(runtime, log_path, instructions=_DUPLEX_SHORT_INSTRUCTIONS, vad=False) as (
         ws,
         events,
@@ -1486,8 +1506,10 @@ async def _run_duplex_history_pruning(runtime, log_path: Path) -> None:
             assert ack["item_id"] == f"item_{response_id}"
             assert ack["committed_ms"] == ack["playback"]["sent_ms"] == played_ms
             assert ack["history_committed"] is True
+            cache_stats.append(await _duplex_thinker_cache_stats(runtime))
     for response_id in response_ids:
         _duplex_assert_completed_audio(events, response_id)
+    return cache_stats
 
 
 @pytest.mark.omni
@@ -1607,5 +1629,18 @@ class TestQwen3OmniDuplexPlayback:
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
+    @pytest.mark.parametrize(
+        "qwen_duplex_server",
+        ["qwen3_omni_duplex.yaml", "qwen3_omni_duplex_mrv2.yaml"],
+        indirect=True,
+    )
     def test_mixed_image_audio_history_pruning(self, qwen_duplex_server, tmp_path: Path):
-        asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, tmp_path / "events.json"))
+        stats = asyncio.run(_run_duplex_history_pruning(qwen_duplex_server, tmp_path / "events.json"))
+        # Six turns preserve multimodal history, then prune its oldest turn.
+        # The helper checks audio, transcript and the exact submitted history;
+        # require substantial reuse of turn one's prompt on turn two, rather
+        # than accepting hits on only a short shared system instruction.
+        first_prompt_tokens = stats[1]["queries"] - stats[0]["queries"]
+        second_turn_hits = stats[2]["hits"] - stats[1]["hits"]
+        assert first_prompt_tokens > 0
+        assert second_turn_hits > first_prompt_tokens / 2, stats

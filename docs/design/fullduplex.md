@@ -686,6 +686,13 @@ carries the session identity (`session_id`, `fence`, `epoch`, `turn_id`,
 `model_turn_id`), the public session config and the server-owned runtime
 config for the worker-side model hooks.
 
+Qwen3-Omni instead submits a fresh non-resumable Thinker request per committed
+turn, rendering the current history through its normal multimodal processor.
+Its CUDA duplex profiles enable [prefix caching](feature/prefix_caching.md#qwen3-omni-duplex-reuse)
+to reuse matching Thinker KV and stage-output rows across those requests.
+This cache is owned by the engine, not the session; cancel/epoch fencing,
+history calibration and per-turn Talker/Code2Wav lifetimes are unchanged.
+
 ## Model plugin
 
 `DuplexModelPlugin` (ABC, `engine/duplex/plugin.py`) is the one class a model

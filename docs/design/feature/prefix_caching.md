@@ -43,6 +43,23 @@ With this in mind, consider the set of blocks in a 2D layout, where the row repr
 
 Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of pageable CPU memory, allocated without zero-filling on the first `save_outputs` that sees the key. Device→host copies use separate pinned staging buffers. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
 
+### Qwen3-Omni duplex reuse
+
+The CUDA `qwen3_omni_duplex.yaml` (V1) and
+`qwen3_omni_duplex_mrv2.yaml` (V2) profiles enable stage-0 prefix caching.
+Both submit a fresh, non-resumable Thinker request for each committed turn.
+Cross-turn reuse follows the current rendered prompt's token and multimodal
+block hashes, not a session ID or a retained request. Cached stage-output rows
+are merged with the new suffix before downstream consumption. Talker and
+Code2Wav caching stays disabled.
+
+History edits, pruning and playback calibration may shorten the matching
+prefix; they do not authorize reuse of a mismatching suffix. Cancellation still
+aborts the active requests. Freed cache blocks remain eligible for normal
+hash-based reuse and eviction, rather than being pinned to the duplex session.
+See the [duplex API guide](../../serving/realtime_duplex_api.md#qwen3-omni-cross-turn-thinker-kv-reuse)
+for deployment and latency considerations.
+
 ### Example
 
 !!! note "Note 3"

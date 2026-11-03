@@ -2104,8 +2104,13 @@ stages:
             ("qwen3_omni_moe.yaml", "cuda", True),
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
-            ("qwen3_omni_duplex.yaml", "cuda", False),
-            ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
+            ("qwen3_omni_duplex.yaml", "cuda", True),
+            ("qwen3_omni_duplex_mrv2.yaml", "cuda", True),
+            *(
+                (profile, platform, False)
+                for profile in ("qwen3_omni_duplex.yaml", "qwen3_omni_duplex_mrv2.yaml")
+                for platform in ("npu", "rocm", "xpu", "musa")
+            ),
             ("minicpmo_4_5_turn.yaml", "cuda", True),
             *(
                 (yaml_name, platform, False)
@@ -2123,7 +2128,7 @@ stages:
         ],
     )
     def test_thinker_prefix_cache_defaults(self, monkeypatch, yaml_name: str, platform: str, enabled: bool):
-        """Stage-0 prefix caching ships on only for the validated CUDA turn profiles.
+        """Stage-0 prefix caching is enabled only in selected CUDA profiles.
 
         Checked on the final engine args: the stage value rides in
         ``engine_extras`` and must keep winning over the pipeline-wide flag.
@@ -2143,8 +2148,11 @@ stages:
             else resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
         )
         assert pipeline is not None
-        stage0 = next(stage for stage in merge_pipeline_deploy(pipeline, deploy) if stage.stage_id == 0)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        stage0 = next(stage for stage in stages if stage.stage_id == 0)
         assert stage0.yaml_engine_args["enable_prefix_caching"] is enabled
+        if yaml_name in ("qwen3_omni_duplex.yaml", "qwen3_omni_duplex_mrv2.yaml"):
+            assert all(not stage.yaml_engine_args["enable_prefix_caching"] for stage in stages if stage.stage_id > 0)
 
     @pytest.mark.parametrize("runner", ["v1", "v2"])
     @pytest.mark.parametrize("disable_prefix_cache", [False, True])
